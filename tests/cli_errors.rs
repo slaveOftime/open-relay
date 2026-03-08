@@ -1,0 +1,356 @@
+/// Integration tests verifying that CLI commands return non-zero exit codes
+/// with clear error messages when the daemon is unavailable or a session is
+/// not found (Milestone 2 Verification – error paths).
+///
+/// Each test uses an isolated temporary state directory so it never
+/// accidentally connects to a real running daemon.
+use std::{env, fs, path::PathBuf, process::Command};
+
+// Path to the compiled `oly` binary, set by Cargo when building tests.
+fn oly_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_oly"))
+}
+
+/// Build a `Command` for `oly` with a self-contained state directory so the
+/// tests never interact with a real daemon.
+fn oly_cmd(tmp_dir: &PathBuf) -> Command {
+    let mut cmd = Command::new(oly_bin());
+
+    // Point the platform-specific state resolver at our temp dir.
+    // storage::resolve_state_dir() picks up LOCALAPPDATA on Windows,
+    // XDG_STATE_HOME on Linux, and HOME on macOS.
+    #[cfg(target_os = "windows")]
+    cmd.env("LOCALAPPDATA", tmp_dir);
+    #[cfg(target_os = "linux")]
+    cmd.env("XDG_STATE_HOME", tmp_dir);
+    #[cfg(target_os = "macos")]
+    cmd.env("HOME", tmp_dir);
+
+    cmd
+}
+
+fn make_tmp_dir(name: &str) -> PathBuf {
+    let dir = env::temp_dir().join(format!("oly_test_{name}"));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+// ---------------------------------------------------------------------------
+// oly ls – works without daemon (reads from disk)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_without_daemon_succeeds_gracefully() {
+    let tmp = make_tmp_dir("list_no_daemon");
+    let output = oly_cmd(&tmp)
+        .args(["ls"])
+        .output()
+        .expect("failed to run oly ls");
+
+    // oly list reads persisted session metadata from disk and must not require
+    // a live daemon – it should always exit 0 even with an empty state dir.
+    assert!(
+        output.status.success(),
+        "`oly ls` should exit 0 without a daemon (reads from disk); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No sessions") || stdout.contains("ID"),
+        "expected list output, got: {stdout}"
+    );
+    if stdout.contains("No sessions") {
+        assert!(
+            stdout.contains("Start one with: oly start --detach <cmd>"),
+            "expected next-step hint for empty list, got: {stdout}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// oly --help – short, neutral language
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_text_is_neutral_and_simple() {
+    let tmp = make_tmp_dir("help_text_neutral");
+    let output = oly_cmd(&tmp)
+        .args(["--help"])
+        .output()
+        .expect("failed to run oly --help");
+
+    assert!(output.status.success(), "`oly --help` should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Agent guidance")
+            && !stdout.contains("agent-driven")
+            && !stdout.contains("agents consuming"),
+        "help text should not distinguish users, got: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly stop – daemon unavailable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stop_without_daemon_exits_nonzero() {
+    let tmp = make_tmp_dir("stop_no_daemon");
+    let output = oly_cmd(&tmp)
+        .args(["stop", "abc1234"])
+        .output()
+        .expect("failed to run oly stop");
+
+    assert!(
+        !output.status.success(),
+        "`oly stop` should exit non-zero when daemon is not running"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error"),
+        "expected error message, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly start – daemon unavailable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn start_without_daemon_exits_nonzero() {
+    let tmp = make_tmp_dir("start_no_daemon");
+    let output = oly_cmd(&tmp)
+        .args(["start", "--detach", "echo", "hello"])
+        .output()
+        .expect("failed to run oly start");
+
+    assert!(
+        !output.status.success(),
+        "`oly start` should exit non-zero when daemon is not running"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error"),
+        "expected error message, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly input – daemon unavailable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn input_without_daemon_exits_nonzero() {
+    let tmp = make_tmp_dir("input_no_daemon");
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "hello"])
+        .output()
+        .expect("failed to run oly input");
+
+    assert!(
+        !output.status.success(),
+        "`oly input` should exit non-zero when daemon is not running"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error"),
+        "expected error message, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly logs – session not found on disk
+// ---------------------------------------------------------------------------
+
+#[test]
+fn logs_session_not_found_exits_nonzero() {
+    let tmp = make_tmp_dir("logs_not_found");
+    // Create the state/sessions directory so storage can scan it (empty)
+    fs::create_dir_all(tmp.join("oly").join("sessions")).expect("create sessions dir");
+
+    let output = oly_cmd(&tmp)
+        .args(["logs", "abc1234"])
+        .output()
+        .expect("failed to run oly logs");
+
+    assert!(
+        !output.status.success(),
+        "`oly logs` should exit non-zero for a missing session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found") || stderr.contains("session") || stderr.contains("error"),
+        "expected session-not-found message, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly input – key validation errors (no daemon required)
+//
+// Key spec errors are caught in parse_key_inputs() BEFORE any IPC attempt.
+// These tests verify that invalid --key values produce clear, non-zero exits.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn input_unsupported_key_spec_exits_nonzero_with_message() {
+    let tmp = make_tmp_dir("input_bad_key");
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "--key", "foobar"])
+        .output()
+        .expect("failed to run oly input");
+
+    // "foobar" is not a recognised key name → parse error before IPC.
+    assert!(
+        !output.status.success(),
+        "`oly input --key foobar` should exit non-zero (unsupported key)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unsupported") || stderr.contains("error"),
+        "expected unsupported-key message, got: {stderr}"
+    );
+}
+
+#[test]
+fn input_modifier_only_key_exits_nonzero_with_message() {
+    let tmp = make_tmp_dir("input_modifier_only");
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "--key", "ctrl"])
+        .output()
+        .expect("failed to run oly input");
+
+    // Lone modifier → error: "modifier --key `ctrl` must be followed by a key value".
+    assert!(
+        !output.status.success(),
+        "`oly input --key ctrl` (modifier alone) should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("modifier") || stderr.contains("error"),
+        "expected modifier-only error message, got: {stderr}"
+    );
+}
+
+#[test]
+fn input_ctrl_multichar_key_exits_nonzero() {
+    let tmp = make_tmp_dir("input_ctrl_multichar");
+    // "ctrl+ab" – ctrl sequences require exactly one character.
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "--key", "ctrl+ab"])
+        .output()
+        .expect("failed to run oly input");
+
+    assert!(
+        !output.status.success(),
+        "`oly input --key ctrl+ab` should exit non-zero (multi-char ctrl)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error"),
+        "expected error message, got: {stderr}"
+    );
+}
+
+#[test]
+fn input_two_consecutive_modifiers_exits_nonzero() {
+    let tmp = make_tmp_dir("input_double_modifier");
+    // --key ctrl --key alt → second modifier before a key value for the first.
+    let output = oly_cmd(&tmp)
+        .args([
+            "input", "abc1234", "--key", "ctrl", "--key", "alt", "--key", "c",
+        ])
+        .output()
+        .expect("failed to run oly input");
+
+    assert!(
+        !output.status.success(),
+        "two consecutive modifiers should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("modifier") || stderr.contains("error"),
+        "expected modifier-ordering error, got: {stderr}"
+    );
+}
+
+#[test]
+fn input_empty_key_value_exits_nonzero() {
+    let tmp = make_tmp_dir("input_empty_key");
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "--key", ""])
+        .output()
+        .expect("failed to run oly input");
+
+    assert!(
+        !output.status.success(),
+        "`oly input --key ''` should exit non-zero (empty key)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error"),
+        "expected error message for empty key, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// oly input – valid key specs exit non-zero only because daemon unavailable
+// (verifies that valid specs are accepted by the parser and reach IPC stage)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn input_valid_ctrl_c_reaches_daemon_check() {
+    let tmp = make_tmp_dir("input_valid_ctrl");
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "--key", "ctrl+c"])
+        .output()
+        .expect("failed to run oly input");
+
+    // Key is valid → gets past parser → fails at daemon connection.
+    // The error must mention "daemon" or "connection", NOT "unsupported" or "modifier".
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should exit non-zero when daemon is unavailable"
+    );
+    assert!(
+        !stderr.contains("unsupported --key") && !stderr.contains("modifier-only"),
+        "error should be about daemon, not key parsing; got: {stderr}"
+    );
+}
+
+#[test]
+fn input_valid_shift_tab_reaches_daemon_check() {
+    let tmp = make_tmp_dir("input_valid_shift_tab");
+    let output = oly_cmd(&tmp)
+        .args(["input", "abc1234", "--key", "shift+tab"])
+        .output()
+        .expect("failed to run oly input");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        !stderr.contains("unsupported --key"),
+        "shift+tab should be a valid key spec; got: {stderr}"
+    );
+}
+
+#[test]
+fn input_valid_arrow_keys_reach_daemon_check() {
+    for key in &["up", "down", "left", "right"] {
+        let tmp = make_tmp_dir(&format!("input_arrow_{key}"));
+        let output = oly_cmd(&tmp)
+            .args(["input", "abc1234", "--key", key])
+            .output()
+            .expect("failed to run oly input");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "`oly input --key {key}` should fail (no daemon), not from key parse error"
+        );
+        assert!(
+            !stderr.contains("unsupported --key"),
+            "arrow key '{key}' should be a valid key spec; got: {stderr}"
+        );
+    }
+}

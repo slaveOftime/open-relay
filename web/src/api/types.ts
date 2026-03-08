@@ -1,0 +1,139 @@
+// ---------------------------------------------------------------------------
+// Session types (mirrors Rust protocol.rs)
+// ---------------------------------------------------------------------------
+
+export type SessionStatus = 'created' | 'running' | 'stopping' | 'stopped' | 'failed'
+
+export interface SessionSummary {
+  id: string
+  title: string | null
+  command: string
+  args: string[]
+  pid: number | null
+  status: SessionStatus
+  age: string
+  created_at: string // ISO 8601
+  cwd: string | null
+  input_needed: boolean
+}
+
+export interface CreateSessionSpec {
+  cmd: string
+  args?: string[]
+  title?: string
+  cwd?: string
+  rows?: number
+  cols?: number
+  /** If set, create the session on this connected secondary node. */
+  node?: string
+}
+
+// ---------------------------------------------------------------------------
+// Node federation types
+// ---------------------------------------------------------------------------
+
+export interface NodeSummary {
+  name: string
+  connected: boolean
+}
+
+export interface AttachSnapshotResponse {
+  lines: string[]
+  cursor: number
+  running: boolean
+  bracketed_paste_mode: boolean
+  app_cursor_keys: boolean
+}
+
+export interface LogsResponse {
+  lines: string[]
+  offset: number
+  next_offset: number
+  total: number
+  has_more: boolean
+  limit: number
+  running: boolean
+}
+
+export interface ListPage<T> {
+  items: T[]
+  total: number
+  offset: number
+  limit: number
+}
+
+export interface PushSubscriptionKeys {
+  auth: string
+  p256dh: string
+}
+
+export interface PushSubscriptionInput {
+  endpoint: string
+  keys: PushSubscriptionKeys
+}
+
+// ---------------------------------------------------------------------------
+// SSE event types
+// ---------------------------------------------------------------------------
+
+export type SessionEvent =
+  | { event: 'snapshot'; data: SessionSummary[] }
+  | { event: 'session_created'; data: SessionSummary }
+  | { event: 'session_updated'; data: SessionSummary }
+  | { event: 'session_deleted'; data: { id: string } }
+  | {
+      event: 'session_notification'
+      data: {
+        kind: string
+        summary: string
+        body: string
+        session_ids: string[]
+        trigger_rule?: string
+        trigger_detail?: string
+      }
+    }
+
+// ---------------------------------------------------------------------------
+// WebSocket protocol
+// ---------------------------------------------------------------------------
+
+export type WsServerMessage =
+  | { type: 'snapshot'; lines: string[]; cursor: number; running: boolean }
+  | { type: 'output'; lines: string[]; cursor: number }
+  | { type: 'end'; exit_code: number | null }
+  | { type: 'error'; message: string }
+
+export type WsClientMessage =
+  | { type: 'input'; data: string }
+  | { type: 'resize'; rows: number; cols: number }
+  | { type: 'detach' }
+
+// ---------------------------------------------------------------------------
+// Auth types
+// ---------------------------------------------------------------------------
+
+export interface AuthStatus {
+  auth_required: boolean
+}
+
+export interface LoginResponse {
+  token: string
+}
+
+/** Thrown by req<T>() when the server returns 401 Unauthorized. */
+export class AuthRequiredError extends Error {
+  constructor() {
+    super('authentication required')
+    this.name = 'AuthRequiredError'
+  }
+}
+
+/** Thrown by login() when the server returns 429 Too Many Requests. */
+export class TooManyAttemptsError extends Error {
+  retryAfterSeconds: number
+  constructor(retryAfterSeconds: number) {
+    super('too many failed login attempts')
+    this.name = 'TooManyAttemptsError'
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+}

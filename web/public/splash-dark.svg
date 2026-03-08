@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="2732" viewBox="0 0 2048 2732" role="img" aria-label="Open Relay launch screen">
+  <rect width="2048" height="2732" fill="#18181b" />
+  <g fill="#a1a1aa" opacity="0.95">
+    <circle cx="1024" cy="1280" r="74" />
+    <rect x="950" y="1378" width="148" height="14" rx="7" />
+  </g>
+</svg>

@@ -1,0 +1,57 @@
+[package]
+name = "oly"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "oly"
+path = "src/main.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "z"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "net", "sync"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+interprocess = { version = "2.4", features = ["tokio"] }
+portable-pty = "0.9"
+regex = "1"
+notify-rust = "4.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+uuid = { version = "1.16", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+dirs = "6.0"
+thiserror = "2.0"
+crossterm = "0.29"
+vt100 = "0.16.2"
+which = "8"
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rust-embed = "8"
+mime_guess = "2"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+rand = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+argon2 = "0.5"
+rpassword = "7"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+mimalloc = "0.1.48"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"

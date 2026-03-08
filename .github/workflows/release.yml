@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: build-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: oly
+            asset_name: oly-linux-amd64.zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: oly
+            asset_name: oly-macos-arm64.zip
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: oly.exe
+            asset_name: oly-windows-amd64.zip
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # - name: Test
+      #   run: cargo test --target ${{ matrix.target }}
+        
+      - name: Build release binary
+        env:
+          NPM_CONFIG_INCLUDE: optional
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary (zip)
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" -DestinationPath "target/${{ matrix.target }}/release/${{ matrix.asset_name }}" -Force
+        shell: pwsh
+
+      - name: Upload binary to Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
