@@ -984,7 +984,7 @@ export default function SessionDetailPage() {
           >
             <div
               ref={termContainerRef}
-              className={`flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4 ${mode === 'logs' ? 'overflow-x-auto' : ''}`}
+              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4 ${mode === 'logs' ? 'overflow-x-auto' : ''}`}
             >
               <div className={`h-full ${mode === 'logs' ? 'w-500 min-w-full' : ''}`}>
                 <XTerm
@@ -994,6 +994,11 @@ export default function SessionDetailPage() {
                   className="h-full"
                 />
               </div>
+              <div className='absolute sm:hidden right-0 top-0 bottom-0 w-10 bg-transparent'
+                onPointerMove={(e) => {
+                  termRef?.current?.scrollLines(e.movementY)
+                }}
+              ></div>
             </div>
 
             {/* Scrubber (logs mode) */}
