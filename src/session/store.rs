@@ -1109,7 +1109,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // attach_snapshot — marks attach activity, returns ring + cursor
+    // attach_snapshot — returns ring + cursor (does not mark attach activity)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1125,8 +1125,8 @@ mod tests {
 
         let locked = rt_clone.lock().unwrap();
         assert!(
-            locked.last_attach_activity_at.is_some(),
-            "attach_snapshot should mark attach activity"
+            locked.last_attach_activity_at.is_none(),
+            "attach_snapshot should not mark attach activity"
         );
     }
 
@@ -1153,7 +1153,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // attach_poll — marks attach activity, returns lines from cursor
+    // attach_poll — returns lines from cursor (does not mark attach activity)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1172,8 +1172,8 @@ mod tests {
 
         let locked = rt_clone.lock().unwrap();
         assert!(
-            locked.last_attach_activity_at.is_some(),
-            "attach_poll should mark attach activity"
+            locked.last_attach_activity_at.is_none(),
+            "attach_poll should not mark attach activity"
         );
     }
 
