@@ -29,6 +29,14 @@ pub struct SessionStore {
     db: Arc<Database>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SilentCandidate {
+    pub session_id: String,
+    pub raw_excerpt: String,
+    pub output_epoch: Instant,
+    pub notifications_enabled: bool,
+}
+
 impl SessionStore {
     pub fn new(eviction_seconds: u64, db: Arc<Database>) -> Self {
         Self {
@@ -99,7 +107,14 @@ impl SessionStore {
         self.db.insert_session(&meta).await?;
 
         let session_dir = config.sessions_dir.join(&id);
-        let runtime = spawn_session(config, &mut meta, session_dir, rows, cols)?;
+        let runtime = spawn_session(
+            config,
+            &mut meta,
+            session_dir,
+            rows,
+            cols,
+            spec.notifications_enabled,
+        )?;
 
         self.db.update_session(&meta).await?;
 
@@ -449,12 +464,13 @@ impl SessionStore {
             .retain(|_, evicted_at| now.duration_since(*evicted_at) < self.eviction_ttl);
     }
 
-    /// Returns `(session_id, raw_excerpt, output_epoch)`
+    /// Returns silent-notification candidates with session id, raw excerpt,
+    /// and output epoch.
     pub fn silent_candidates(
         &self,
         suppression_window: Duration,
         min_notification_interval: Duration,
-    ) -> Vec<(String, String, Instant)> {
+    ) -> Vec<SilentCandidate> {
         let now = Instant::now();
         self.sessions
             .values()
@@ -498,7 +514,12 @@ impl SessionStore {
                 }
                 let excerpt = parser.screen().contents();
 
-                Some((rt.meta.id.clone(), excerpt, last_output))
+                Some(SilentCandidate {
+                    session_id: rt.meta.id.clone(),
+                    raw_excerpt: excerpt,
+                    output_epoch: last_output,
+                    notifications_enabled: rt.notifications_enabled,
+                })
             })
             .collect()
     }
@@ -576,6 +597,7 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }))
     }
 
@@ -654,7 +676,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, "abc1234");
+        assert_eq!(candidates[0].session_id, "abc1234");
     }
 
     #[tokio::test]
@@ -671,7 +693,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, "abc1234");
+        assert_eq!(candidates[0].session_id, "abc1234");
     }
 
     #[tokio::test]
@@ -718,10 +740,11 @@ mod tests {
         // First call returns a candidate with an output epoch.
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
-        let (id, _, epoch) = &first[0];
+        let id = &first[0].session_id;
+        let epoch = first[0].output_epoch;
 
         // Mark as notified at this output epoch.
-        store.mark_notified(id, *epoch, Instant::now());
+        store.mark_notified(id, epoch, Instant::now());
 
         // Second call: same output epoch → suppressed.
         let second = store.silent_candidates(silence, min_interval);
@@ -745,8 +768,9 @@ mod tests {
 
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
-        let (id, _, epoch) = &first[0];
-        store.mark_notified(id, *epoch, Instant::now());
+        let id = &first[0].session_id;
+        let epoch = first[0].output_epoch;
+        store.mark_notified(id, epoch, Instant::now());
 
         // Simulate new output by advancing last_output_at on the runtime.
         {
@@ -777,8 +801,9 @@ mod tests {
 
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
-        let (id, _, epoch) = &first[0];
-        store.mark_notified(id, *epoch, Instant::now());
+        let id = &first[0].session_id;
+        let epoch = first[0].output_epoch;
+        store.mark_notified(id, epoch, Instant::now());
 
         // Same output epoch -> suppressed.
         let suppressed = store.silent_candidates(silence, min_interval);
@@ -916,6 +941,7 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }))
     }
 
@@ -964,6 +990,7 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }))
     }
 

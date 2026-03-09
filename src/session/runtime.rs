@@ -100,6 +100,7 @@ pub struct SessionRuntime {
     /// (DECCKM, `\x1b[?1h`). When active, arrow key sequences sent to the
     /// child must use `\x1bO{A,B,C,D}` instead of `\x1b[{A,B,C,D}`.
     pub app_cursor_keys: bool,
+    pub notifications_enabled: bool,
 }
 
 impl SessionRuntime {
@@ -337,6 +338,7 @@ pub fn spawn_session(
     session_dir: PathBuf,
     rows: u16,
     cols: u16,
+    notifications_enabled: bool,
 ) -> Result<Arc<Mutex<SessionRuntime>>> {
     let full_dir = session_dir;
     std::fs::create_dir_all(&full_dir)?;
@@ -415,6 +417,7 @@ pub fn spawn_session(
         bracketed_paste_mode: false,
         pending_terminal_query_tail: String::new(),
         app_cursor_keys: false,
+        notifications_enabled,
     }));
 
     // Spawn reader thread that feeds PTY output into the runtime buffer.
@@ -899,6 +902,7 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }
     }
 

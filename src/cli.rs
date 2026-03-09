@@ -130,6 +130,9 @@ pub struct StartArgs {
     /// Start the session detached (in the background).
     #[arg(long, short = 'd')]
     pub detach: bool,
+    /// Disable notifications for this session.
+    #[arg(long)]
+    pub disable_notifications: bool,
     /// Command and arguments to run. Passed through as-is.
     #[arg(
         trailing_var_arg = true,

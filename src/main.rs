@@ -98,6 +98,7 @@ async fn run() -> Result<()> {
                 cwd,
                 rows,
                 cols,
+                disable_notifications: start_args.disable_notifications,
             };
             let request = node_wrap(start_args.node, inner);
             match ipc::send_request(&config, request).await? {

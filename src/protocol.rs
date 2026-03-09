@@ -24,6 +24,8 @@ pub enum RpcRequest {
         cwd: Option<String>,
         rows: Option<u16>,
         cols: Option<u16>,
+        #[serde(default)]
+        disable_notifications: bool,
     },
     AttachSnapshot {
         id: String,

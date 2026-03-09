@@ -233,6 +233,8 @@ pub struct CreateSessionBody {
     pub cwd: Option<String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
+    #[serde(default)]
+    pub disable_notifications: bool,
     /// If set, create the session on this connected secondary node instead of locally.
     pub node: Option<String>,
 }
@@ -250,6 +252,7 @@ pub async fn create(
             cwd: body.cwd.clone(),
             rows: body.rows,
             cols: body.cols,
+            disable_notifications: body.disable_notifications,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::Start { session_id }) => {
@@ -290,6 +293,7 @@ pub async fn create(
         cwd: body.cwd.clone(),
         rows: body.rows,
         cols: body.cols,
+        notifications_enabled: !body.disable_notifications,
     };
 
     let result = {

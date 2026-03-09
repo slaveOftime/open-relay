@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use crate::protocol::SessionSummary;
 pub use store::SessionStore;
+pub use store::SilentCandidate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +54,7 @@ pub struct StartSpec {
     pub cwd: Option<String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
+    pub notifications_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -67,7 +67,21 @@ async fn dispatch_request(
             cwd,
             rows,
             cols,
-        } => handle_start(config, session_store, title, cmd, args, cwd, rows, cols).await,
+            disable_notifications,
+        } => {
+            handle_start(
+                config,
+                session_store,
+                title,
+                cmd,
+                args,
+                cwd,
+                rows,
+                cols,
+                disable_notifications,
+            )
+            .await
+        }
         RpcRequest::AttachSnapshot { id } => handle_attach_snapshot(id, session_store).await,
         RpcRequest::AttachPoll { id, cursor } => {
             handle_attach_poll(id, cursor, session_store).await
@@ -137,6 +151,7 @@ async fn handle_start(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    disable_notifications: bool,
 ) -> RpcResponse {
     let mut store = session_store.lock().await;
     match store
@@ -149,6 +164,7 @@ async fn handle_start(
                 cwd: cwd.clone(),
                 rows,
                 cols,
+                notifications_enabled: !disable_notifications,
             },
         )
         .await
