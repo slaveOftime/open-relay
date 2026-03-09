@@ -3,7 +3,6 @@ import { createRoot } from 'react-dom/client'
 import { registerSW } from 'virtual:pwa-register'
 import './index.css'
 import App from './App'
-import { syncPushSubscription } from '@/lib/push'
 import ErrorBoundary from '@/components/ErrorBoundary'
 
 const LAST_ROUTE_KEY = 'open-relay:last-route'
@@ -24,7 +23,6 @@ function restoreLaunchRoute() {
 restoreLaunchRoute()
 
 registerSW({ immediate: true })
-void syncPushSubscription(false).catch(() => {})
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

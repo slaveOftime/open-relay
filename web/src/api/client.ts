@@ -230,20 +230,25 @@ export function subscribeEvents(
     onStateChange?.(state)
   }
 
+  const scheduleReconnect = () => {
+    if (stopped || retryTimer) return
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      connect()
+    }, retryDelay)
+  }
+
   function connect() {
     if (stopped) return
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       setState('offline')
-      if (!retryTimer) {
-        retryTimer = setTimeout(() => {
-          retryTimer = null
-          connect()
-        }, retryDelay)
-      }
+      scheduleReconnect()
       return
     }
 
     setState('reconnecting')
+    es?.close()
+    es = null
     const tok = getToken()
     const evUrl = tok
       ? `${BASE}/sessions/events?token=${encodeURIComponent(tok)}`
@@ -288,12 +293,10 @@ export function subscribeEvents(
 
     es.onerror = () => {
       es?.close()
+      es = null
       if (!stopped) {
         setState(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting')
-        retryTimer = setTimeout(() => {
-          retryTimer = null
-          connect()
-        }, retryDelay)
+        scheduleReconnect()
         retryDelay = Math.min(retryDelay * 2, 30_000)
       }
     }

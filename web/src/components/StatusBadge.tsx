@@ -26,7 +26,8 @@ function statusVariant(status: SessionStatus, inputNeeded: boolean): BadgeVarian
   }
 }
 
-function dotColor(status: SessionStatus): string {
+function dotColor(status: SessionStatus, inputNeeded: boolean): string {
+  if (inputNeeded) return 'bg-amber-400'
   switch (status) {
     case 'running':
       return 'bg-green-400'
@@ -47,8 +48,8 @@ export default function StatusBadge({ status, inputNeeded, showDot = true }: Pro
     >
       {showDot && (
         <span
-          className={`w-1.5 h-1.5 rounded-full ${dotColor(status)} ${
-            status === 'running' ? 'animate-pulse' : ''
+          className={`w-1.5 h-1.5 rounded-full ${dotColor(status, inputNeeded)} ${
+            inputNeeded || status === 'running' ? 'animate-pulse' : ''
           }`}
         />
       )}

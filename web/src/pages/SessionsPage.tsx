@@ -180,12 +180,7 @@ function matchesSearch(session: SessionSummary, rawSearch: string): boolean {
   const needle = rawSearch.trim().toLowerCase()
   if (!needle) return true
 
-  const haystacks = [
-    session.id,
-    session.title ?? '',
-    session.command,
-    session.args.join(' '),
-  ]
+  const haystacks = [session.id, session.title ?? '', session.command, session.args.join(' ')]
 
   return haystacks.some((value) => value.toLowerCase().includes(needle))
 }
@@ -298,7 +293,7 @@ function SessionRow({
           className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
           onClick={(e) => {
             e.stopPropagation()
-            navigator.clipboard.writeText(session.id).catch(() => { })
+            navigator.clipboard.writeText(session.id).catch(() => {})
           }}
         >
           <Tooltip>
@@ -347,7 +342,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg series={series} />
+          <SparklineSvg series={series} enableAnimation={isRunning} />
         </TableCell>
 
         {/* PID */}
@@ -436,6 +431,7 @@ function SessionRow({
 
 function SessionCard({
   session,
+  series,
   animateIn,
   onStop,
   onKill,
@@ -443,6 +439,7 @@ function SessionCard({
   node,
 }: {
   session: SessionSummary
+  series: number[]
   animateIn?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
@@ -521,6 +518,11 @@ function SessionCard({
               </Tooltip>
             </div>
           )}
+
+          {/* Row 4: activity sparkline */}
+          <div className={`pt-1 w-full ${session.status === 'running' ? 'opacity-90' : 'opacity-40'}`}>
+            <SparklineSvg series={series} fullWidth className="w-full" enableAnimation={isRunning} />
+          </div>
         </CardContent>
 
         <div className="border-t border-[hsl(var(--border))]" />
@@ -876,6 +878,11 @@ export default function SessionsPage() {
   const prevIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
   const localRevisionRef = useRef(0)
+  const pushStateRef = useRef<PushSetupState>('idle')
+
+  useEffect(() => {
+    pushStateRef.current = pushState
+  }, [pushState])
 
   const applySessionItems = useCallback((items: SessionSummary[]) => {
     setSessions(items)
@@ -994,7 +1001,7 @@ export default function SessionsPage() {
   useEffect(() => {
     fetchNodes()
       .then(setNodes)
-      .catch(() => { })
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -1081,6 +1088,7 @@ export default function SessionsPage() {
         return
       }
       if (ev.event === 'session_notification') {
+        if (pushStateRef.current === 'subscribed') return
         const tag = ev.data.session_ids[0] ?? 'open-relay-session-notification'
         void showSessionNotification(ev.data.summary, ev.data.body, tag)
         return
@@ -1156,11 +1164,11 @@ export default function SessionsPage() {
   }
 
   async function handleStop(id: string) {
-    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => { })
+    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
   }
   async function handleKill(id: string) {
-    await killSession(id, selectedNode ?? undefined).catch(() => { })
+    await killSession(id, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
   }
 
@@ -1221,7 +1229,7 @@ export default function SessionsPage() {
 
   async function handleTogglePush() {
     if (pushEnabled) {
-      await disablePushNotifications().catch(() => { })
+      await disablePushNotifications().catch(() => {})
       setPushState(Notification.permission === 'denied' ? 'denied' : 'idle')
       return
     }
@@ -1235,8 +1243,9 @@ export default function SessionsPage() {
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
           <div className="flex items-center gap-2 px-3 py-2 md:hidden">
-            <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
-                onClick={() => void reloadSessions({ background: true })}
+            <div
+              className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
+              onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
               <span>Open Relay</span>
@@ -1259,7 +1268,7 @@ export default function SessionsPage() {
               )}
             </Button>
             <Button
-              variant={pushEnabled ? 'secondary' : 'default'}
+              variant={pushEnabled ? 'secondary' : 'ghost'}
               size="icon"
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
@@ -1375,7 +1384,8 @@ export default function SessionsPage() {
 
           {/* Desktop row */}
           <div className="hidden md:flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5">
-            <div className="flex items-center gap-1 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
+            <div
+              className="flex items-center gap-1 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
               onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
@@ -1448,7 +1458,7 @@ export default function SessionsPage() {
 
             <Button
               size="sm"
-              variant={pushEnabled ? 'secondary' : 'outline'}
+              variant={pushEnabled ? 'secondary' : 'ghost'}
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
             >
@@ -1484,6 +1494,7 @@ export default function SessionsPage() {
                     <SessionCard
                       key={s.id}
                       session={s}
+                      series={seriesMap.get(s.id) ?? []}
                       animateIn={enteringIds.has(s.id)}
                       onStop={handleStop}
                       onKill={handleKill}
@@ -1541,10 +1552,11 @@ export default function SessionsPage() {
                   ).map((col) => (
                     <TableHead
                       key={col.key}
-                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${col.sortField
-                        ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
-                        : 'text-[hsl(var(--muted-foreground))]'
-                        } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
+                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
+                        col.sortField
+                          ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
+                          : 'text-[hsl(var(--muted-foreground))]'
+                      } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
                       onClick={col.sortField ? () => handleSort(col.sortField!) : undefined}
                     >
                       <span className="inline-flex items-center gap-1">
@@ -1600,7 +1612,7 @@ export default function SessionsPage() {
             <span className="text-[hsl(var(--muted-foreground))]">Refreshing…</span>
           )}
           <div className="flex-1"></div>
-          <span className='text-sm'>
+          <span className="text-sm">
             {PAGE_SIZE} / {total}
           </span>
           <div />
@@ -1639,13 +1651,13 @@ export default function SessionsPage() {
           initialValues={
             rerunSession
               ? {
-                cmd: rerunSession.command,
-                args: rerunSession.args
-                  .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
-                  .join(' '),
-                title: rerunSession.title ?? '',
-                cwd: rerunSession.cwd ?? '',
-              }
+                  cmd: rerunSession.command,
+                  args: rerunSession.args
+                    .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+                    .join(' '),
+                  title: rerunSession.title ?? '',
+                  cwd: rerunSession.cwd ?? '',
+                }
               : undefined
           }
           node={selectedNode ?? undefined}
