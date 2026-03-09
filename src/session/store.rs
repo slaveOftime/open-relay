@@ -6,7 +6,6 @@ use std::{
 };
 
 use chrono::Utc;
-use tracing;
 
 use crate::{
     config::AppConfig,
@@ -539,12 +538,14 @@ impl SessionStore {
                 if rt.notified_output_epoch == Some(last_output) {
                     return None;
                 }
+
                 // Build excerpt from the last 10 ring entries.
                 let n = rt.ring.len();
-                let excerpt: String = rt.ring.iter().skip(n.saturating_sub(10)).cloned().collect();
-                if excerpt.trim().is_empty() {
-                    return None;
+                let mut parser = vt100::Parser::new(5, 2000, 0);
+                for ring in rt.ring.iter().skip(n.saturating_sub(10)) {
+                    parser.process(ring.as_bytes());
                 }
+                let excerpt = parser.screen().contents();
 
                 Some((rt.meta.id.clone(), excerpt, last_output))
             })
