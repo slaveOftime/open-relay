@@ -77,7 +77,7 @@ impl AppConfig {
         ensure_config_file(&state_dir);
         let sessions_dir = state_dir.join("sessions");
         let overrides = load_overrides(&state_dir);
-        let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(900).max(1);
+        let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
         let http_port = overrides.http_port.unwrap_or(15443);
         let prompt_patterns = overrides.prompt_patterns.unwrap_or_else(|| {
             DEFAULT_PROMPT_PATTERNS
