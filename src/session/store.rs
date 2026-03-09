@@ -455,10 +455,10 @@ impl SessionStore {
                     return None;
                 }
 
-                // Build excerpt from the last 10 ring entries.
                 let n = rt.ring.len();
-                let mut parser = vt100::Parser::new(5, 2000, 0);
-                for ring in rt.ring.iter().skip(n.saturating_sub(10)) {
+                let limit = 20;
+                let mut parser = vt100::Parser::new(limit, 2000, 0);
+                for ring in rt.ring.iter().skip(n.saturating_sub(limit as usize)) {
                     parser.process(ring.as_bytes());
                 }
                 let excerpt = parser.screen().contents();
