@@ -207,7 +207,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let listener = ipc::bind(&config)?;
     info!(socket_file = ?config.socket_file, "ipc listener bound");
     let (store, startup_failed_sessions) = {
-        let mut store = SessionStore::new(config.session_eviction_seconds).with_db(db.clone());
+        let mut store = SessionStore::new(config.session_eviction_seconds, db.clone());
         let startup_failed_sessions = store.load_running_stopping_sessions().await;
         (store, startup_failed_sessions)
     };

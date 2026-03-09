@@ -106,8 +106,11 @@ pub async fn serve(state: AppState) {
                     since: None,
                     until: None,
                     limit: 1000,
+                    offset: 0,
+                    sort: None,
+                    order: None,
                 };
-                store.list_summaries(&q).await
+                store.list_summaries(&q).await.unwrap_or_default()
             };
 
             let mut seen_ids = std::collections::HashSet::new();

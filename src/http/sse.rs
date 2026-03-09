@@ -25,8 +25,11 @@ pub async fn events_handler(
             since: None,
             until: None,
             limit: 200,
+            offset: 0,
+            sort: None,
+            order: None,
         };
-        store.list_summaries(&q).await
+        store.list_summaries(&q).await.unwrap_or_default()
     };
 
     debug!(snapshot_count = initial.len(), "SSE client connected");

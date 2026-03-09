@@ -59,7 +59,7 @@ async fn dispatch_request(
             daemon_pid: std::process::id(),
         },
         RpcRequest::DaemonStop => handle_daemon_stop(config, session_store, shutdown_tx).await,
-        RpcRequest::List { query } => handle_list(query, session_store).await,
+        RpcRequest::List { query } => handle_list(query, session_store, db).await?,
         RpcRequest::Start {
             title,
             cmd,
@@ -116,11 +116,15 @@ async fn handle_daemon_stop(
     RpcResponse::DaemonStop { stopped }
 }
 
-async fn handle_list(query: ListQuery, session_store: &SessionStoreHandle) -> RpcResponse {
+async fn handle_list(
+    query: ListQuery,
+    session_store: &SessionStoreHandle,
+    db: &Arc<Database>,
+) -> Result<RpcResponse> {
+    let total = db.count_summaries(&query).await?;
     let mut store = session_store.lock().await;
-    RpcResponse::List {
-        sessions: store.list_summaries(&query).await,
-    }
+    let sessions = store.list_summaries(&query).await?;
+    Ok(RpcResponse::List { total, sessions })
 }
 
 #[allow(clippy::too_many_arguments)]
