@@ -93,6 +93,33 @@ pub enum RpcRequest {
     NodeList,
 }
 
+impl RpcRequest {
+    pub fn name(&self) -> &'static str {
+        match self {
+            RpcRequest::Health => "health",
+            RpcRequest::DaemonStop => "daemon_stop",
+            RpcRequest::List { .. } => "list",
+            RpcRequest::Start { .. } => "start",
+            RpcRequest::AttachSnapshot { .. } => "attach_snapshot",
+            RpcRequest::AttachPoll { .. } => "attach_poll",
+            RpcRequest::AttachInput { .. } => "attach_input",
+            RpcRequest::AttachResize { .. } => "attach_resize",
+            RpcRequest::Stop { .. } => "stop",
+            RpcRequest::LogsSnapshot { .. } => "logs_snapshot",
+            RpcRequest::LogsPoll { .. } => "logs_poll",
+            RpcRequest::LogsWait { .. } => "logs_wait",
+            RpcRequest::NodeProxy { .. } => "node_proxy",
+            RpcRequest::ApiKeyAdd { .. } => "api_key_add",
+            RpcRequest::ApiKeyList => "api_key_list",
+            RpcRequest::ApiKeyRemove { .. } => "api_key_remove",
+            RpcRequest::JoinStart { .. } => "join_start",
+            RpcRequest::JoinStop { .. } => "join_stop",
+            RpcRequest::JoinList => "join_list",
+            RpcRequest::NodeList => "node_list",
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
