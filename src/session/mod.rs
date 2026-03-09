@@ -2,10 +2,12 @@ pub(crate) mod persist;
 mod runtime;
 mod store;
 
-pub use store::SessionStore;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+use crate::protocol::SessionSummary;
+pub use store::SessionStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,4 +68,9 @@ impl SessionLookupError {
             Self::Evicted => format!("session evicted from memory: {id}"),
         }
     }
+}
+
+pub struct SessionLiveSummary {
+    pub summary: SessionSummary,
+    pub last_output_at: Option<Instant>,
 }

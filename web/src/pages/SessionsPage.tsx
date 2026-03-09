@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import type { ListParams } from '@/api/client'
 import type { SessionSummary, NodeSummary } from '@/api/types'
 import {
   fetchSessions,
@@ -73,6 +74,7 @@ const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
 const PAGE_SIZE = 15
 
 const sparklines = new SparklineStore()
+const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
 
 type GroupBy = 'none' | 'cwd' | 'command'
 type SortField = 'created_at' | 'status' | 'title'
@@ -131,6 +133,86 @@ function saveSessionPrefs(prefs: SessionPrefs) {
   } catch {
     /* ignore */
   }
+}
+
+function getSessionListRequestKey(params: ListParams): string {
+  return JSON.stringify({
+    search: params.search ?? '',
+    status: params.status ?? '',
+    limit: params.limit ?? null,
+    offset: params.offset ?? null,
+    sort: params.sort ?? '',
+    order: params.order ?? '',
+    node: params.node ?? '',
+  })
+}
+
+function fetchSessionsOnce(params: ListParams) {
+  const key = getSessionListRequestKey(params)
+  const existing = sessionPageRequests.get(key)
+  if (existing) return existing
+
+  const request = fetchSessions(params).finally(() => {
+    if (sessionPageRequests.get(key) === request) {
+      sessionPageRequests.delete(key)
+    }
+  })
+  sessionPageRequests.set(key, request)
+  return request
+}
+
+function buildSeriesMap(items: SessionSummary[]) {
+  items.forEach((session) => {
+    sparklines.ensure(session.id)
+  })
+  return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
+}
+
+function syncSeriesMap(items: SessionSummary[]) {
+  return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
+}
+
+function updateSparklineForSession(session: SessionSummary) {
+  sparklines.touch(session.id)
+}
+
+function matchesSearch(session: SessionSummary, rawSearch: string): boolean {
+  const needle = rawSearch.trim().toLowerCase()
+  if (!needle) return true
+
+  const haystacks = [
+    session.id,
+    session.title ?? '',
+    session.command,
+    session.args.join(' '),
+  ]
+
+  return haystacks.some((value) => value.toLowerCase().includes(needle))
+}
+
+function compareSessions(a: SessionSummary, b: SessionSummary, field: SortField, order: SortOrder) {
+  const direction = order === 'asc' ? 1 : -1
+
+  let result = 0
+  if (field === 'status') {
+    result = a.status.localeCompare(b.status)
+  } else if (field === 'title') {
+    result = (a.title ?? '').localeCompare(b.title ?? '')
+  } else {
+    result = a.created_at.localeCompare(b.created_at)
+  }
+
+  if (result !== 0) return result * direction
+  return a.id.localeCompare(b.id) * direction
+}
+
+function upsertSession(items: SessionSummary[], nextSession: SessionSummary) {
+  const index = items.findIndex((session) => session.id === nextSession.id)
+  if (index === -1) return [nextSession, ...items]
+
+  const nextItems = [...items]
+  nextItems[index] = nextSession
+  return nextItems
 }
 
 // ── Skeleton loading ───────────────────────────────────────────────────────
@@ -767,9 +849,10 @@ export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedNode, setSelectedNode] = useState<string | null>(() => searchParams.get('node'))
+  const isRemoteNodeView = selectedNode !== null
   const [nodes, setNodes] = useState<NodeSummary[]>([])
   const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [total, setTotal] = useState(0)
+  const [remoteTotal, setRemoteTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [search, setSearch] = useState(initialPrefs.search)
@@ -788,33 +871,52 @@ export default function SessionsPage() {
   const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
 
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
+  const hasLoadedRef = useRef(false)
+  const localRevisionRef = useRef(0)
 
-  const load = useCallback(
+  const applySessionItems = useCallback((items: SessionSummary[]) => {
+    setSessions(items)
+    setSeriesMap(buildSeriesMap(items))
+  }, [])
+
+  const upsertSessionState = useCallback((nextSession: SessionSummary) => {
+    updateSparklineForSession(nextSession)
+    setSessions((prev) => {
+      const next = upsertSession(prev, nextSession)
+      setSeriesMap(syncSeriesMap(next))
+      return next
+    })
+  }, [])
+
+  const removeSessionState = useCallback((id: string) => {
+    sparklines.remove(id)
+    setSessions((prev) => {
+      const next = prev.filter((session) => session.id !== id)
+      setSeriesMap(syncSeriesMap(next))
+      return next
+    })
+  }, [])
+
+  const loadLocal = useCallback(
     async (opts?: { background?: boolean }) => {
-      const shouldShowSkeleton = !opts?.background && sessions.length === 0
+      if (selectedNode) return
+
+      const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
       if (shouldShowSkeleton) setLoading(true)
       else setRefreshing(true)
+
+      const localRevisionAtStart = localRevisionRef.current
       try {
-        const res = await fetchSessions({
-          search: search || undefined,
-          status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: PAGE_SIZE,
-          offset: page * PAGE_SIZE,
-          sort: sortField,
-          order: sortOrder,
-          node: selectedNode ?? undefined,
-        })
+        const res = await fetchSessionsOnce({})
         if (!isMounted.current) return
-        setSessions(res.items)
-        setTotal(res.total)
-        res.items.forEach((s) => {
-          sparklines.update(s.id, (s as unknown as { line_count?: number }).line_count ?? 0)
-        })
-        setSeriesMap(new Map(res.items.map((s) => [s.id, sparklines.getSeries(s.id)])))
+        if (selectedNode || localRevisionRef.current !== localRevisionAtStart) return
+
+        hasLoadedRef.current = true
+        applySessionItems(res.items)
+        setRemoteTotal(res.items.length)
       } catch {
         /* ignore */
       } finally {
@@ -824,15 +926,55 @@ export default function SessionsPage() {
         }
       }
     },
-    [search, statusFilter, sortField, sortOrder, page, sessions.length, selectedNode]
+    [applySessionItems, selectedNode]
   )
 
-  const scheduleReload = useCallback(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current)
-    debounceRef.current = setTimeout(() => {
-      void load({ background: true })
-    }, 250)
-  }, [load])
+  const loadRemote = useCallback(
+    async (opts?: { background?: boolean }) => {
+      if (!selectedNode) return
+
+      const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
+      if (shouldShowSkeleton) setLoading(true)
+      else setRefreshing(true)
+
+      try {
+        const params: ListParams = {
+          search: search || undefined,
+          status: statusFilter === 'all' ? undefined : statusFilter,
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+          sort: sortField,
+          order: sortOrder,
+          node: selectedNode,
+        }
+        const res = await fetchSessionsOnce(params)
+        if (!isMounted.current || !selectedNode) return
+
+        hasLoadedRef.current = true
+        applySessionItems(res.items)
+        setRemoteTotal(res.total)
+      } catch {
+        /* ignore */
+      } finally {
+        if (isMounted.current) {
+          if (shouldShowSkeleton) setLoading(false)
+          setRefreshing(false)
+        }
+      }
+    },
+    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
+  )
+
+  const reloadSessions = useCallback(
+    async (opts?: { background?: boolean }) => {
+      if (selectedNode) {
+        await loadRemote(opts)
+        return
+      }
+      await loadLocal(opts)
+    },
+    [loadLocal, loadRemote, selectedNode]
+  )
 
   useEffect(() => {
     const nextIds = new Set(sessions.map((s) => s.id))
@@ -862,6 +1004,18 @@ export default function SessionsPage() {
     }
   }, [])
 
+  // Periodically advance sparkline buckets so activity decays visually
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!isMounted.current) return
+      setSessions((prev) => {
+        setSeriesMap(syncSeriesMap(prev))
+        return prev
+      })
+    }, 2_000)
+    return () => clearInterval(id)
+  }, [])
+
   useEffect(() => {
     const handleOnline = () => setSseStatus('reconnecting')
     const handleOffline = () => setSseStatus('offline')
@@ -878,8 +1032,16 @@ export default function SessionsPage() {
   }, [search, statusFilter, groupBy, sortField, sortOrder])
 
   useEffect(() => {
-    void load()
-  }, [load])
+    if (!selectedNode) {
+      void loadLocal()
+    }
+  }, [loadLocal, selectedNode])
+
+  useEffect(() => {
+    if (selectedNode) {
+      void loadRemote()
+    }
+  }, [loadRemote, selectedNode])
 
   useEffect(() => {
     void syncPushSubscription(false)
@@ -895,21 +1057,27 @@ export default function SessionsPage() {
     const cleanup = subscribeEvents((ev) => {
       if (ev.event === 'snapshot') {
         if (selectedNode) return
-        ev.data.forEach((s) => {
-          sparklines.update(s.id, (s as unknown as { line_count?: number }).line_count ?? 0)
-        })
-        scheduleReload()
+        localRevisionRef.current += 1
+        hasLoadedRef.current = true
+        applySessionItems(ev.data)
+        return
+      }
+      if (ev.event === 'session_created') {
+        if (selectedNode) return
+        localRevisionRef.current += 1
+        upsertSessionState(ev.data)
         return
       }
       if (ev.event === 'session_updated') {
         if (selectedNode) return
-        setSessions((prev) => prev.map((s) => (s.id === ev.data.id ? ev.data : s)))
-        sparklines.update(
-          ev.data.id,
-          (ev.data as unknown as { line_count?: number }).line_count ?? 0
-        )
-        setSeriesMap((prev) => new Map([...prev, [ev.data.id, sparklines.getSeries(ev.data.id)]]))
-        scheduleReload()
+        localRevisionRef.current += 1
+        upsertSessionState(ev.data)
+        return
+      }
+      if (ev.event === 'session_deleted') {
+        if (selectedNode) return
+        localRevisionRef.current += 1
+        removeSessionState(ev.data.id)
         return
       }
       if (ev.event === 'session_notification') {
@@ -917,20 +1085,42 @@ export default function SessionsPage() {
         void showSessionNotification(ev.data.summary, ev.data.body, tag)
         return
       }
-      if (!selectedNode) scheduleReload()
     }, setSseStatus)
     return () => {
       cleanup()
-      if (debounceRef.current) clearTimeout(debounceRef.current)
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
     }
-  }, [scheduleReload, selectedNode])
+  }, [applySessionItems, removeSessionState, selectedNode, upsertSessionState])
+
+  const visibleSessions = useMemo(() => {
+    if (isRemoteNodeView) return sessions
+
+    return [...sessions]
+      .filter((session) => {
+        const matchesStatus = statusFilter === 'all' || session.status === statusFilter
+        return matchesStatus && matchesSearch(session, search)
+      })
+      .sort((left, right) => compareSessions(left, right, sortField, sortOrder))
+  }, [isRemoteNodeView, search, sessions, sortField, sortOrder, statusFilter])
+
+  const pagedSessions = useMemo(() => {
+    if (isRemoteNodeView) return sessions
+    const start = page * PAGE_SIZE
+    return visibleSessions.slice(start, start + PAGE_SIZE)
+  }, [isRemoteNodeView, page, sessions, visibleSessions])
+
+  const total = isRemoteNodeView ? remoteTotal : visibleSessions.length
+
+  useEffect(() => {
+    const lastPage = Math.max(Math.ceil(total / PAGE_SIZE) - 1, 0)
+    setPage((prev) => Math.min(prev, lastPage))
+  }, [total])
 
   const grouped = useMemo<Array<{ key: string; items: SessionSummary[] }>>(() => {
-    if (groupBy === 'none') return [{ key: '', items: sessions }]
+    if (groupBy === 'none') return [{ key: '', items: pagedSessions }]
     if (groupBy === 'cwd') {
       const map = new Map<string, SessionSummary[]>()
-      for (const s of sessions) {
+      for (const s of pagedSessions) {
         const k = cwdBasename(s.cwd) || '(no cwd)'
         if (!map.has(k)) map.set(k, [])
         map.get(k)!.push(s)
@@ -938,13 +1128,13 @@ export default function SessionsPage() {
       return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
     }
     const map = new Map<string, SessionSummary[]>()
-    for (const s of sessions) {
+    for (const s of pagedSessions) {
       const k = agentName(s.command)
       if (!map.has(k)) map.set(k, [])
       map.get(k)!.push(s)
     }
     return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
-  }, [sessions, groupBy])
+  }, [groupBy, pagedSessions])
 
   function handleRunAgain(session: SessionSummary) {
     setRerunSession(session)
@@ -967,11 +1157,11 @@ export default function SessionsPage() {
 
   async function handleStop(id: string) {
     await stopSession(id, undefined, selectedNode ?? undefined).catch(() => { })
-    void load()
+    if (selectedNode) void loadRemote()
   }
   async function handleKill(id: string) {
     await killSession(id, selectedNode ?? undefined).catch(() => { })
-    void load()
+    if (selectedNode) void loadRemote()
   }
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
@@ -1046,7 +1236,7 @@ export default function SessionsPage() {
           {/* Mobile row */}
           <div className="flex items-center gap-2 px-3 py-2 md:hidden">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
-              onClick={() => load({ background: true })}
+                onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
               <span>Open Relay</span>
@@ -1186,7 +1376,7 @@ export default function SessionsPage() {
           {/* Desktop row */}
           <div className="hidden md:flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5">
             <div className="flex items-center gap-1 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
-              onClick={() => load({ background: true })}
+              onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
               <span>Open Relay</span>
@@ -1444,7 +1634,7 @@ export default function SessionsPage() {
           onClose={() => {
             setShowNewSession(false)
             setRerunSession(null)
-            load({ background: true })
+            void reloadSessions({ background: true })
           }}
           initialValues={
             rerunSession

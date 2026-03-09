@@ -112,31 +112,60 @@ export function cwdBasename(cwd: string | null): string {
 // Sparkline data
 // ---------------------------------------------------------------------------
 
-/** Rolling activity history: map of session id → array of line-count samples */
+/** Rolling activity history using time-bucketed counts (bucketMs-wide slots). */
 export class SparklineStore {
-  private data = new Map<string, number[]>()
-  private prev = new Map<string, number>()
-  private readonly maxPoints = 20
+  private readonly numBuckets = 20
+  private readonly bucketMs = 2_000 // 2 s per bucket → 40 s window
 
-  /** Record the current output line count for a session, returns delta. */
-  update(id: string, lineCount: number): void {
-    const prev = this.prev.get(id) ?? 0
-    const delta = Math.max(0, lineCount - prev)
-    this.prev.set(id, lineCount)
+  private data = new Map<string, { counts: number[]; lastBucket: number }>()
 
-    const series = this.data.get(id) ?? []
-    series.push(delta)
-    if (series.length > this.maxPoints) series.shift()
-    this.data.set(id, series)
+  private nowBucket(): number {
+    return Math.floor(Date.now() / this.bucketMs)
   }
 
+  private getOrCreate(id: string) {
+    let entry = this.data.get(id)
+    if (!entry) {
+      entry = { counts: new Array(this.numBuckets).fill(0), lastBucket: this.nowBucket() }
+      this.data.set(id, entry)
+    }
+    return entry
+  }
+
+  /** Advance the ring buffer to the current bucket, zero-filling gaps. */
+  private advance(entry: { counts: number[]; lastBucket: number }) {
+    const now = this.nowBucket()
+    const delta = now - entry.lastBucket
+    if (delta <= 0) return
+    const gap = Math.min(delta, this.numBuckets)
+    for (let i = 0; i < gap; i++) {
+      entry.counts.shift()
+      entry.counts.push(0)
+    }
+    entry.lastBucket = now
+  }
+
+  ensure(id: string): void {
+    this.getOrCreate(id)
+  }
+
+  /** Increment the current time bucket for this session. */
+  touch(id: string, value = 1): void {
+    const entry = this.getOrCreate(id)
+    this.advance(entry)
+    entry.counts[entry.counts.length - 1] += value
+  }
+
+  /** Returns the current bucket series (advances to now first). */
   getSeries(id: string): number[] {
-    return this.data.get(id) ?? []
+    const entry = this.data.get(id)
+    if (!entry) return new Array(this.numBuckets).fill(0)
+    this.advance(entry)
+    return [...entry.counts]
   }
 
   remove(id: string) {
     this.data.delete(id)
-    this.prev.delete(id)
   }
 }
 

@@ -4,8 +4,6 @@ pub mod sessions;
 pub mod sse;
 pub mod ws;
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
-
 #[allow(unused_imports)]
 use axum::{
     Router,
@@ -13,6 +11,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Serialize;
+use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
@@ -20,10 +19,7 @@ use tracing::{error, info};
 pub use auth::AuthState;
 
 use crate::{
-    config::AppConfig,
-    db::Database,
-    node::NodeRegistry,
-    protocol::{ListQuery, SessionSummary},
+    config::AppConfig, db::Database, node::NodeRegistry, protocol::SessionSummary,
     session::SessionStore,
 };
 
@@ -60,23 +56,6 @@ pub enum SessionEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionFingerprint {
-    status: String,
-    pid: Option<u32>,
-    input_needed: bool,
-}
-
-impl From<&SessionSummary> for SessionFingerprint {
-    fn from(value: &SessionSummary) -> Self {
-        Self {
-            status: value.status.clone(),
-            pid: value.pid,
-            input_needed: value.input_needed,
-        }
-    }
-}
-
 // ── Release-only: embed the contents of web/dist into the binary ─────────────
 // `build.rs` guarantees that `npm run build` has already run in release mode,
 // so the folder is always present when this crate is compiled with --release.
@@ -89,63 +68,11 @@ pub async fn serve(state: AppState) {
     let port = state.config.http_port;
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
 
-    // Background task: detect session state changes and push only deltas.
-    let bg_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
-        let mut last_sent: HashMap<String, SessionFingerprint> = HashMap::new();
-        let mut initialized = false;
-
-        loop {
-            interval.tick().await;
-            let sessions = {
-                let mut store = bg_state.store.lock().await;
-                let q = ListQuery {
-                    search: None,
-                    statuses: vec![],
-                    since: None,
-                    until: None,
-                    limit: 1000,
-                    offset: 0,
-                    sort: None,
-                    order: None,
-                };
-                store.list_summaries(&q).await.unwrap_or_default()
-            };
-
-            let mut seen_ids = std::collections::HashSet::new();
-
-            // First poll establishes a baseline; snapshot already covers current state.
-            if !initialized {
-                for s in sessions {
-                    seen_ids.insert(s.id.clone());
-                    last_sent.insert(s.id.clone(), SessionFingerprint::from(&s));
-                }
-                initialized = true;
-                continue;
-            }
-
-            for s in sessions {
-                let fp = SessionFingerprint::from(&s);
-                seen_ids.insert(s.id.clone());
-
-                let changed = match last_sent.get(&s.id) {
-                    Some(prev) => prev != &fp,
-                    None => true,
-                };
-
-                if changed {
-                    let _ = bg_state
-                        .event_tx
-                        .send(SessionEvent::SessionUpdated(s.clone()));
-                    last_sent.insert(s.id.clone(), fp);
-                }
-            }
-
-            // Drop fingerprints for sessions no longer listed.
-            last_sent.retain(|id, _| seen_ids.contains(id));
-        }
-    });
+    // Background task: detect live session state changes and push only deltas.
+    tokio::spawn(sse::run_session_poller(
+        state.store.clone(),
+        state.event_tx.clone(),
+    ));
 
     let protected_router = Router::new()
         .route("/api/auth/status", get(auth::status))

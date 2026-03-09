@@ -13,6 +13,7 @@ use crate::{
     db::Database,
     error::Result,
     protocol::{ListQuery, SessionSummary},
+    session::SessionLiveSummary,
 };
 
 use super::{
@@ -20,6 +21,7 @@ use super::{
     persist::{append_event, append_resize_event, current_output_offset, format_age},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
+
 pub struct SessionStore {
     sessions: HashMap<String, Arc<Mutex<SessionRuntime>>>,
     evicted_sessions: HashMap<String, Instant>,
@@ -146,6 +148,39 @@ impl SessionStore {
             cwd: rt.meta.cwd.clone(),
             input_needed,
         })
+    }
+
+    /// Returns summaries for all sessions that are currently held in memory
+    /// (live or recently evicted), without touching the database.
+    /// Used by the SSE session poller to avoid a DB query every 500 ms.
+    pub fn list_live_summaries(&mut self) -> Vec<SessionLiveSummary> {
+        let mut out = Vec::with_capacity(self.sessions.len());
+        for runtime in self.sessions.values() {
+            if let Ok(mut rt) = runtime.lock() {
+                rt.refresh_status();
+                let input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
+                    && rt.notified_output_epoch.is_some()
+                    && rt.notified_output_epoch == rt.last_output_at;
+                out.push(SessionLiveSummary {
+                    last_output_at: rt.last_output_at,
+                    summary: SessionSummary {
+                        id: rt.meta.id.clone(),
+                        title: rt.meta.title.clone(),
+                        command: rt.meta.command.clone(),
+                        args: rt.meta.args.clone(),
+                        pid: rt.meta.pid,
+                        status: rt.meta.status.as_str().to_string(),
+                        age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
+                        created_at: rt.meta.created_at,
+                        cwd: rt.meta.cwd.clone(),
+                        input_needed,
+                    },
+                });
+            } else {
+                tracing::warn!("failed to lock session runtime in list_live_summaries");
+            }
+        }
+        out
     }
 
     pub fn get_exit_code(&self, id: &str) -> Option<i32> {

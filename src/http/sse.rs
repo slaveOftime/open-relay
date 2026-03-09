@@ -1,17 +1,103 @@
-use std::convert::Infallible;
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::State,
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::{Stream, StreamExt};
+use tokio::sync::{Mutex, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::protocol::ListQuery;
+use crate::{
+    protocol::ListQuery,
+    session::{SessionLiveSummary, SessionStore},
+};
 
-use super::AppState;
+use super::{AppState, SessionEvent};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionFingerprint {
+    status: String,
+    pid: Option<u32>,
+    input_needed: bool,
+    last_output_at: Option<Instant>,
+}
+
+impl From<&SessionLiveSummary> for SessionFingerprint {
+    fn from(value: &SessionLiveSummary) -> Self {
+        Self {
+            status: value.summary.status.clone(),
+            pid: value.summary.pid,
+            input_needed: value.summary.input_needed,
+            last_output_at: value.last_output_at,
+        }
+    }
+}
+
+// ── Session poller ────────────────────────────────────────────────────────────
+
+/// Background task that polls live in-memory sessions every 500 ms and emits
+/// `SessionEvent::SessionUpdated` only when a session's fingerprint changes.
+/// This avoids a database round-trip on every tick.
+pub(super) async fn run_session_poller(
+    store: Arc<Mutex<SessionStore>>,
+    event_tx: broadcast::Sender<SessionEvent>,
+) {
+    info!("session poller started");
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    let mut last_sent: HashMap<String, SessionFingerprint> = HashMap::new();
+    let mut initialized = false;
+
+    loop {
+        interval.tick().await;
+        let sessions = {
+            let mut store = store.lock().await;
+            store.list_live_summaries()
+        };
+
+        let mut seen_ids = std::collections::HashSet::with_capacity(last_sent.len());
+
+        // First poll establishes a baseline without emitting any events.
+        if !initialized {
+            for s in sessions {
+                seen_ids.insert(s.summary.id.clone());
+                last_sent.insert(s.summary.id.clone(), SessionFingerprint::from(&s));
+            }
+            initialized = true;
+            continue;
+        }
+
+        for s in sessions {
+            seen_ids.insert(s.summary.id.clone());
+            let fp = SessionFingerprint::from(&s);
+
+            let changed = match last_sent.get(&s.summary.id) {
+                Some(prev) => prev != &fp,
+                None => true,
+            };
+
+            if changed {
+                debug!(
+                    id = %s.summary.id,
+                    status = %s.summary.status,
+                    "session state changed, broadcasting update"
+                );
+                last_sent.insert(s.summary.id.clone(), fp);
+                let _ = event_tx.send(SessionEvent::SessionUpdated(s.summary));
+            }
+        }
+
+        // Drop fingerprints for sessions no longer in memory.
+        last_sent.retain(|id, _| seen_ids.contains(id));
+    }
+}
 
 pub async fn events_handler(
     State(state): State<AppState>,
