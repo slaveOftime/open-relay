@@ -61,7 +61,7 @@ pub async fn start(
     };
 
     if detach && !foreground_internal {
-        spawn_detached(no_auth, no_http, auth_hash.as_deref())?;
+        spawn_detached(no_auth, no_http, auth_hash.as_deref(), config.http_port)?;
         wait_for_daemon_ready(&config, std::time::Duration::from_secs(60)).await?;
         println!(
             "Daemon started in background. To create a session, run `oly start --detach <cmd>`"
@@ -104,12 +104,14 @@ async fn wait_for_daemon_ready(config: &AppConfig, timeout: std::time::Duration)
     ))
 }
 
-fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>) -> Result<()> {
+fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u16) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
         .arg("start")
         .arg("--foreground-internal")
+        .arg("--port")
+        .arg(port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
