@@ -59,15 +59,15 @@ pub struct StartSpec {
 
 #[derive(Debug, Clone, Copy)]
 pub enum SessionLookupError {
-    NotFound,
     Evicted,
+    NotRunning,
 }
 
 impl SessionLookupError {
     pub fn message(self, id: &str) -> String {
         match self {
-            Self::NotFound => format!("session not found: {id}"),
             Self::Evicted => format!("session evicted from memory: {id}"),
+            Self::NotRunning => format!("session not running: {id}"),
         }
     }
 }

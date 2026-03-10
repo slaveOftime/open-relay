@@ -224,7 +224,7 @@ impl SessionStore {
     ) -> std::result::Result<(Vec<String>, usize, bool, bool, bool), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
         let lines = rt.ring.iter().cloned().collect();
@@ -248,7 +248,7 @@ impl SessionStore {
     ) -> std::result::Result<(Vec<String>, usize, bool, bool, bool), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
         let lines = rt.output_lines.get(cursor..).unwrap_or(&[]).to_vec();
@@ -277,7 +277,7 @@ impl SessionStore {
 
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         // When the child process has enabled DECCKM (application cursor key
         // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
@@ -305,7 +305,7 @@ impl SessionStore {
             rt.last_input_at = Some(Instant::now());
             Ok(())
         } else {
-            Err(SessionLookupError::NotFound)
+            Err(SessionLookupError::Evicted)
         }
     }
 
@@ -317,7 +317,7 @@ impl SessionStore {
     ) -> std::result::Result<(), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         rt.mark_attach_activity();
         if rt.resize_pty(rows, cols) {
@@ -325,7 +325,7 @@ impl SessionStore {
             let _ = append_resize_event(&rt.dir, offset, rows, cols);
             Ok(())
         } else {
-            Err(SessionLookupError::NotFound)
+            Err(SessionLookupError::Evicted)
         }
     }
 
@@ -424,7 +424,7 @@ impl SessionStore {
             return Err(SessionLookupError::Evicted);
         }
 
-        Err(SessionLookupError::NotFound)
+        Err(SessionLookupError::NotRunning)
     }
 
     async fn prune_evicted_sessions(&mut self) {
