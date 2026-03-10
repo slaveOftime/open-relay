@@ -121,6 +121,18 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>) -> Resu
     if no_http {
         cmd.arg("--no-http");
     }
+    // On Windows the spawned process must be placed in its own process group
+    // and detached from the parent console.  Without these flags the daemon
+    // stays in the same console process group as the launching terminal; closing
+    // that terminal sends CTRL_CLOSE_EVENT to every process in the group and
+    // kills the daemon silently.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS  (0x00000008): no console window, detached from parent console
+        // CREATE_NEW_PROCESS_GROUP (0x00000200): own signal group, won't receive Ctrl+C/Break from parent
+        cmd.creation_flags(0x00000008 | 0x00000200);
+    }
     cmd.spawn()?;
     Ok(())
 }
@@ -188,7 +200,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     info!(db_file = ?config.db_file, "database opened");
 
     let node_registry = Arc::new(NodeRegistry::new());
-    let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(512);
+    let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
     for join in client::join::load_join_configs(&config) {
@@ -214,7 +226,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let session_store = Arc::new(Mutex::new(store));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
-    let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(512);
+    let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(100);
 
     let auth_state = auth_hash.map(AuthState::new);
     if !no_http {

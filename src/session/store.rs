@@ -228,7 +228,7 @@ impl SessionStore {
         };
         rt.refresh_status();
         let lines = rt.ring.iter().cloned().collect();
-        let cursor = rt.output_lines.len();
+        let cursor = rt.output_line_count;
         let running = rt.meta.status.as_str() == "running";
         let bracketed_paste_mode = rt.bracketed_paste_mode;
         let app_cursor_keys = rt.app_cursor_keys;
@@ -251,8 +251,18 @@ impl SessionStore {
             return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
-        let lines = rt.output_lines.get(cursor..).unwrap_or(&[]).to_vec();
-        let next_cursor = rt.output_lines.len();
+        let total = rt.output_line_count;
+        let ring_len = rt.ring.len();
+        // The ring holds the last `ring_len` lines; compute where it starts in
+        // the global line number space so cursor-based indexing still works.
+        let ring_start = total.saturating_sub(ring_len);
+        let lines: Vec<String> = if cursor >= total {
+            Vec::new()
+        } else {
+            let offset = cursor.saturating_sub(ring_start);
+            rt.ring.iter().skip(offset).cloned().collect()
+        };
+        let next_cursor = total;
         let running = rt.meta.status.as_str() == "running";
         let bracketed_paste_mode = rt.bracketed_paste_mode;
         let app_cursor_keys = rt.app_cursor_keys;
@@ -392,9 +402,10 @@ impl SessionStore {
         let runtime = self.sessions.get(id)?;
         let mut rt = runtime.lock().ok()?;
         rt.refresh_status();
-        let len = rt.output_lines.len();
-        let start = len.saturating_sub(tail);
-        let lines = rt.output_lines[start..].to_vec();
+        let len = rt.output_line_count;
+        let ring_len = rt.ring.len();
+        let skip = ring_len.saturating_sub(tail);
+        let lines: Vec<String> = rt.ring.iter().skip(skip).cloned().collect();
         let running = rt.meta.status.as_str() == "running";
         Some((lines, len, running))
     }
@@ -593,7 +604,7 @@ mod tests {
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            output_lines: vec![],
+            output_line_count: 0,
             ring,
             ring_limit: 100,
             // We only need a writer stub; use a Vec sink.
@@ -938,7 +949,7 @@ mod tests {
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            output_lines: Vec::new(),
+            output_line_count: 0,
             ring: VecDeque::new(),
             ring_limit: 100,
             writer: Box::new(CaptureWriter(buf)),
@@ -987,7 +998,7 @@ mod tests {
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            output_lines: lines,
+            output_line_count: lines.len(),
             ring,
             ring_limit: 100,
             writer: Box::new(std::io::sink()),
@@ -1210,7 +1221,7 @@ mod tests {
             .expect("snapshot should succeed");
 
         assert_eq!(lines, vec!["output line".to_string()]);
-        assert_eq!(cursor, 0, "cursor should equal output_lines.len()");
+        assert_eq!(cursor, 0, "cursor should equal output_line_count");
         assert!(running, "session should be reported as running");
     }
 
@@ -1269,7 +1280,7 @@ mod tests {
             vec!["line2\n".to_string(), "line3\n".to_string()],
             "poll from cursor=2 should return lines[2..]"
         );
-        assert_eq!(next_cursor, 4, "next_cursor should be output_lines.len()");
+        assert_eq!(next_cursor, 4, "next_cursor should be output_line_count");
         assert!(running);
     }
 

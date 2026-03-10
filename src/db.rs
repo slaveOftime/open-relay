@@ -75,7 +75,10 @@ impl Database {
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
-        let pool = SqlitePool::connect_with(opts).await?;
+        let pool = sqlx::pool::PoolOptions::new()
+            .max_connections(2)
+            .connect_with(opts)
+            .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
         Ok(Self { pool, sessions_dir })
     }

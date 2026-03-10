@@ -39,7 +39,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         initial_lines,
         mut cursor,
         mut running,
-        mut child_bracketed_paste,
+        mut _child_bracketed_paste,
         mut child_app_cursor_keys,
     ) = match snapshot {
         RpcResponse::AttachSnapshot {
@@ -130,7 +130,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     render_lines(config, id, lines, &mut query_tail, node).await?;
                     cursor = next_cursor;
                     running = next_running;
-                    child_bracketed_paste = bracketed_paste_mode;
+                    _child_bracketed_paste = bracketed_paste_mode;
                     child_app_cursor_keys = app_cursor_keys;
                 }
                 RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
@@ -142,8 +142,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     }
 
     if detached {
-        println!("");
-        println!("\nDetached from session {id}");
+        println!("\r\nDetached from session {id}");
+    } else {
+        println!("\r\nSession {id} has ended.");
     }
 
     Ok(())

@@ -94,16 +94,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
     info!(node = %name, "secondary node connected");
 
-    // ── Step 4: send Joined ───────────────────────────────────────────────
-    let joined_text = match serde_json::to_string(&NodeWsMessage::Joined) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-    if ws_tx.send(Message::Text(joined_text.into())).await.is_err() {
-        return;
-    }
-
-    // ── Step 5: set up RPC relay channel ─────────────────────────────────
+    // ── Step 4: set up RPC relay channel and register node ───────────────
     let (send_tx, mut send_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
     let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<RpcResponse>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -112,6 +103,19 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
     let handle = NodeHandle { send_tx, pending };
     state.node_registry.connect(name.clone(), handle).await;
+
+    // ── Step 5: send Joined (node is already visible in registry) ────────
+    let joined_text = match serde_json::to_string(&NodeWsMessage::Joined) {
+        Ok(t) => t,
+        Err(_) => {
+            state.node_registry.disconnect(&name).await;
+            return;
+        }
+    };
+    if ws_tx.send(Message::Text(joined_text.into())).await.is_err() {
+        state.node_registry.disconnect(&name).await;
+        return;
+    }
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
     loop {
