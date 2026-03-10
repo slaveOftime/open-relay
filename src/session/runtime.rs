@@ -58,7 +58,9 @@ const ATTACH_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct SessionRuntime {
     pub meta: SessionMeta,
     pub dir: PathBuf,
-    pub output_lines: Vec<String>,
+    /// Total number of lines ever pushed to this session's output.
+    /// Used as a cursor for incremental polling via `attach_poll` / `logs_poll`.
+    pub output_line_count: usize,
     pub ring: VecDeque<String>,
     pub ring_limit: usize,
     pub writer: Box<dyn Write + Send>,
@@ -120,7 +122,7 @@ impl SessionRuntime {
         let chunk = filter_cpr_chunk(&mut self.pending_cpr_prefix, &chunk);
         for line in chunk.split_inclusive('\n') {
             let normalized = line.to_string();
-            self.output_lines.push(normalized.clone());
+            self.output_line_count += 1;
             self.ring.push_back(normalized.clone());
             while self.ring.len() > self.ring_limit {
                 let _ = self.ring.pop_front();
@@ -400,7 +402,7 @@ pub fn spawn_session(
     let runtime = Arc::new(Mutex::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
-        output_lines: Vec::new(),
+        output_line_count: 0,
         ring: VecDeque::new(),
         ring_limit: config.ring_buffer_lines,
         writer,
@@ -885,7 +887,7 @@ mod tests {
         SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
-            output_lines: Vec::new(),
+            output_line_count: 0,
             ring: VecDeque::new(),
             ring_limit: 4, // small limit to test eviction
             writer,
@@ -972,12 +974,17 @@ mod tests {
     }
 
     #[test]
-    fn test_push_output_output_lines_grows_without_limit() {
+    fn test_push_output_line_count_tracks_total_lines() {
         let mut rt = new_runtime(Box::new(std::io::sink()));
         for i in 0..10usize {
             rt.push_output(format!("line{i}\n"));
         }
-        assert_eq!(rt.output_lines.len(), 10, "output_lines grows unbounded");
+        assert_eq!(
+            rt.output_line_count, 10,
+            "output_line_count tracks total lines pushed"
+        );
+        // ring_limit is 4, so ring only holds last 4 lines
+        assert_eq!(rt.ring.len(), 4, "ring is bounded by ring_limit");
     }
 
     // -----------------------------------------------------------------------

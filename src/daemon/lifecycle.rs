@@ -200,7 +200,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     info!(db_file = ?config.db_file, "database opened");
 
     let node_registry = Arc::new(NodeRegistry::new());
-    let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(512);
+    let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
     for join in client::join::load_join_configs(&config) {
@@ -226,7 +226,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let session_store = Arc::new(Mutex::new(store));
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
-    let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(512);
+    let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(100);
 
     let auth_state = auth_hash.map(AuthState::new);
     if !no_http {
