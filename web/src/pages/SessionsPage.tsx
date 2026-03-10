@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
+import type { ListParams } from '@/api/client'
 import type { SessionSummary, NodeSummary } from '@/api/types'
 import {
   fetchSessions,
@@ -13,7 +14,6 @@ import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
   cwdBasename,
-  SparklineStore,
   formatAge,
   sessionDisplayName,
   parseArgString,
@@ -21,7 +21,7 @@ import {
 import Logo from '@/components/Logo'
 import SseStatusDot from '@/components/SseStatusDot'
 import StatusBadge from '@/components/StatusBadge'
-import SparklineSvg from '@/components/SparklineSvg'
+import SparklineSvg, { SparklineStore } from '@/components/SparklineSvg'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -53,6 +53,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ChevronUpIcon,
+  CopyIcon,
   Cross2Icon,
   FileTextIcon,
   Link2Icon,
@@ -73,6 +74,7 @@ const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
 const PAGE_SIZE = 15
 
 const sparklines = new SparklineStore()
+const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
 
 type GroupBy = 'none' | 'cwd' | 'command'
 type SortField = 'created_at' | 'status' | 'title'
@@ -131,6 +133,81 @@ function saveSessionPrefs(prefs: SessionPrefs) {
   } catch {
     /* ignore */
   }
+}
+
+function getSessionListRequestKey(params: ListParams): string {
+  return JSON.stringify({
+    search: params.search ?? '',
+    status: params.status ?? '',
+    limit: params.limit ?? null,
+    offset: params.offset ?? null,
+    sort: params.sort ?? '',
+    order: params.order ?? '',
+    node: params.node ?? '',
+  })
+}
+
+function fetchSessionsOnce(params: ListParams) {
+  const key = getSessionListRequestKey(params)
+  const existing = sessionPageRequests.get(key)
+  if (existing) return existing
+
+  const request = fetchSessions(params).finally(() => {
+    if (sessionPageRequests.get(key) === request) {
+      sessionPageRequests.delete(key)
+    }
+  })
+  sessionPageRequests.set(key, request)
+  return request
+}
+
+function buildSeriesMap(items: SessionSummary[]) {
+  items.forEach((session) => {
+    sparklines.ensure(session.id)
+  })
+  return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
+}
+
+function syncSeriesMap(items: SessionSummary[]) {
+  return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
+}
+
+function updateSparklineForSession(session: SessionSummary) {
+  sparklines.touch(session.id)
+}
+
+function matchesSearch(session: SessionSummary, rawSearch: string): boolean {
+  const needle = rawSearch.trim().toLowerCase()
+  if (!needle) return true
+
+  const haystacks = [session.id, session.title ?? '', session.command, session.args.join(' ')]
+
+  return haystacks.some((value) => value.toLowerCase().includes(needle))
+}
+
+function compareSessions(a: SessionSummary, b: SessionSummary, field: SortField, order: SortOrder) {
+  const direction = order === 'asc' ? 1 : -1
+
+  let result = 0
+  if (field === 'status') {
+    result = a.status.localeCompare(b.status)
+  } else if (field === 'title') {
+    result = (a.title ?? '').localeCompare(b.title ?? '')
+  } else {
+    result = a.created_at.localeCompare(b.created_at)
+  }
+
+  if (result !== 0) return result * direction
+  return a.id.localeCompare(b.id) * direction
+}
+
+function upsertSession(items: SessionSummary[], nextSession: SessionSummary) {
+  const index = items.findIndex((session) => session.id === nextSession.id)
+  if (index === -1) return [nextSession, ...items]
+
+  const nextItems = [...items]
+  nextItems[index] = nextSession
+  return nextItems
 }
 
 // ── Skeleton loading ───────────────────────────────────────────────────────
@@ -216,7 +293,7 @@ function SessionRow({
           className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
           onClick={(e) => {
             e.stopPropagation()
-            navigator.clipboard.writeText(session.id).catch(() => { })
+            navigator.clipboard.writeText(session.id).catch(() => {})
           }}
         >
           <Tooltip>
@@ -265,7 +342,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg series={series} />
+          <SparklineSvg series={series} enableAnimation={isRunning} />
         </TableCell>
 
         {/* PID */}
@@ -279,21 +356,13 @@ function SessionRow({
             {isRunning && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" onClick={() => openSession('attach')}>
+                  <Button variant="link" size="icon" onClick={() => openSession('attach')}>
                     <Link2Icon className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Attach</TooltipContent>
               </Tooltip>
             )}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
-                  <FileTextIcon className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Logs</TooltipContent>
-            </Tooltip>
             {isRunning && (
               <>
                 <Tooltip>
@@ -326,8 +395,16 @@ function SessionRow({
             )}
             <Tooltip>
               <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
+                  <FileTextIcon className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Logs</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={() => onRunAgain(session)}>
-                  <ReloadIcon className="h-4 w-4" />
+                  <CopyIcon className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Run Again</TooltipContent>
@@ -354,6 +431,7 @@ function SessionRow({
 
 function SessionCard({
   session,
+  series,
   animateIn,
   onStop,
   onKill,
@@ -361,6 +439,7 @@ function SessionCard({
   node,
 }: {
   session: SessionSummary
+  series: number[]
   animateIn?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
@@ -387,7 +466,7 @@ function SessionCard({
   return (
     <>
       <Card
-        className={`relative rounded-xl shadow-sm mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
+        className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
         <CardContent className="px-4 pt-3.5 pb-3 flex flex-col gap-2">
           {/* Row 1: id, status, pid, age */}
@@ -396,11 +475,6 @@ function SessionCard({
               {session.id.slice(0, 7)}
             </span>
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
-            {session.pid != null && (
-              <span className="text-xs text-[hsl(var(--muted-foreground))] font-mono">
-                PID:{session.pid}
-              </span>
-            )}
             <div className="flex-1" />
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
               {formatAge(session.created_at)}
@@ -439,6 +513,18 @@ function SessionCard({
               </Tooltip>
             </div>
           )}
+
+          {/* Row 4: activity sparkline */}
+          {session.status === 'running' && (
+            <div className="pt-1 w-full opacity-90">
+              <SparklineSvg
+                series={series}
+                fullWidth
+                className="w-full"
+                enableAnimation={isRunning}
+              />
+            </div>
+          )}
         </CardContent>
 
         <div className="border-t border-[hsl(var(--border))]" />
@@ -449,15 +535,16 @@ function SessionCard({
           onClick={(e) => e.stopPropagation()}
         >
           {isRunning && (
-            <Button variant="outline" size="sm" onClick={() => openSession('attach')}>
+            <Button
+              variant="outline"
+              className="border-[hsl(var(--primary))] text-[hsl(var(--primary))]"
+              size="sm"
+              onClick={() => openSession('attach')}
+            >
               <Link2Icon className="h-4 w-4" />
               Attach
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={() => openSession('logs')}>
-            <FileTextIcon className="h-4 w-4" />
-            Logs
-          </Button>
           {isRunning && (
             <>
               <Tooltip>
@@ -478,15 +565,19 @@ function SessionCard({
               </Tooltip>
             </>
           )}
+          <Button variant="ghost" size="sm" onClick={() => openSession('logs')}>
+            <FileTextIcon className="h-4 w-4" />
+            Logs
+          </Button>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
-                variant="outline"
+                variant="ghost"
                 size="icon"
                 className="ml-auto shrink-0"
                 onClick={() => onRunAgain(session)}
               >
-                <ReloadIcon className="h-4 w-4" />
+                <CopyIcon className="h-4 w-4" />
               </Button>
             </TooltipTrigger>
             <TooltipContent>Run Again</TooltipContent>
@@ -767,9 +858,10 @@ export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedNode, setSelectedNode] = useState<string | null>(() => searchParams.get('node'))
+  const isRemoteNodeView = selectedNode !== null
   const [nodes, setNodes] = useState<NodeSummary[]>([])
   const [sessions, setSessions] = useState<SessionSummary[]>([])
-  const [total, setTotal] = useState(0)
+  const [remoteTotal, setRemoteTotal] = useState(0)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [search, setSearch] = useState(initialPrefs.search)
@@ -788,33 +880,57 @@ export default function SessionsPage() {
   const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
 
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
+  const hasLoadedRef = useRef(false)
+  const localRevisionRef = useRef(0)
+  const pushStateRef = useRef<PushSetupState>('idle')
 
-  const load = useCallback(
+  useEffect(() => {
+    pushStateRef.current = pushState
+  }, [pushState])
+
+  const applySessionItems = useCallback((items: SessionSummary[]) => {
+    setSessions(items)
+    setSeriesMap(buildSeriesMap(items))
+  }, [])
+
+  const upsertSessionState = useCallback((nextSession: SessionSummary) => {
+    updateSparklineForSession(nextSession)
+    setSessions((prev) => {
+      const next = upsertSession(prev, nextSession)
+      setSeriesMap(syncSeriesMap(next))
+      return next
+    })
+  }, [])
+
+  const removeSessionState = useCallback((id: string) => {
+    sparklines.remove(id)
+    setSessions((prev) => {
+      const next = prev.filter((session) => session.id !== id)
+      setSeriesMap(syncSeriesMap(next))
+      return next
+    })
+  }, [])
+
+  const loadLocal = useCallback(
     async (opts?: { background?: boolean }) => {
-      const shouldShowSkeleton = !opts?.background && sessions.length === 0
+      if (selectedNode) return
+
+      const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
       if (shouldShowSkeleton) setLoading(true)
       else setRefreshing(true)
+
+      const localRevisionAtStart = localRevisionRef.current
       try {
-        const res = await fetchSessions({
-          search: search || undefined,
-          status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: PAGE_SIZE,
-          offset: page * PAGE_SIZE,
-          sort: sortField,
-          order: sortOrder,
-          node: selectedNode ?? undefined,
-        })
+        const res = await fetchSessionsOnce({})
         if (!isMounted.current) return
-        setSessions(res.items)
-        setTotal(res.total)
-        res.items.forEach((s) => {
-          sparklines.update(s.id, (s as unknown as { line_count?: number }).line_count ?? 0)
-        })
-        setSeriesMap(new Map(res.items.map((s) => [s.id, sparklines.getSeries(s.id)])))
+        if (selectedNode || localRevisionRef.current !== localRevisionAtStart) return
+
+        hasLoadedRef.current = true
+        applySessionItems(res.items)
+        setRemoteTotal(res.items.length)
       } catch {
         /* ignore */
       } finally {
@@ -824,15 +940,55 @@ export default function SessionsPage() {
         }
       }
     },
-    [search, statusFilter, sortField, sortOrder, page, sessions.length, selectedNode]
+    [applySessionItems, selectedNode]
   )
 
-  const scheduleReload = useCallback(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current)
-    debounceRef.current = setTimeout(() => {
-      void load({ background: true })
-    }, 250)
-  }, [load])
+  const loadRemote = useCallback(
+    async (opts?: { background?: boolean }) => {
+      if (!selectedNode) return
+
+      const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
+      if (shouldShowSkeleton) setLoading(true)
+      else setRefreshing(true)
+
+      try {
+        const params: ListParams = {
+          search: search || undefined,
+          status: statusFilter === 'all' ? undefined : statusFilter,
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+          sort: sortField,
+          order: sortOrder,
+          node: selectedNode,
+        }
+        const res = await fetchSessionsOnce(params)
+        if (!isMounted.current || !selectedNode) return
+
+        hasLoadedRef.current = true
+        applySessionItems(res.items)
+        setRemoteTotal(res.total)
+      } catch {
+        /* ignore */
+      } finally {
+        if (isMounted.current) {
+          if (shouldShowSkeleton) setLoading(false)
+          setRefreshing(false)
+        }
+      }
+    },
+    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
+  )
+
+  const reloadSessions = useCallback(
+    async (opts?: { background?: boolean }) => {
+      if (selectedNode) {
+        await loadRemote(opts)
+        return
+      }
+      await loadLocal(opts)
+    },
+    [loadLocal, loadRemote, selectedNode]
+  )
 
   useEffect(() => {
     const nextIds = new Set(sessions.map((s) => s.id))
@@ -852,7 +1008,7 @@ export default function SessionsPage() {
   useEffect(() => {
     fetchNodes()
       .then(setNodes)
-      .catch(() => { })
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -860,6 +1016,18 @@ export default function SessionsPage() {
     return () => {
       isMounted.current = false
     }
+  }, [])
+
+  // Periodically advance sparkline buckets so activity decays visually
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!isMounted.current) return
+      setSessions((prev) => {
+        setSeriesMap(syncSeriesMap(prev))
+        return prev
+      })
+    }, 2_000)
+    return () => clearInterval(id)
   }, [])
 
   useEffect(() => {
@@ -878,8 +1046,16 @@ export default function SessionsPage() {
   }, [search, statusFilter, groupBy, sortField, sortOrder])
 
   useEffect(() => {
-    void load()
-  }, [load])
+    if (!selectedNode) {
+      void loadLocal()
+    }
+  }, [loadLocal, selectedNode])
+
+  useEffect(() => {
+    if (selectedNode) {
+      void loadRemote()
+    }
+  }, [loadRemote, selectedNode])
 
   useEffect(() => {
     void syncPushSubscription(false)
@@ -895,42 +1071,71 @@ export default function SessionsPage() {
     const cleanup = subscribeEvents((ev) => {
       if (ev.event === 'snapshot') {
         if (selectedNode) return
-        ev.data.forEach((s) => {
-          sparklines.update(s.id, (s as unknown as { line_count?: number }).line_count ?? 0)
-        })
-        scheduleReload()
+        localRevisionRef.current += 1
+        hasLoadedRef.current = true
+        applySessionItems(ev.data)
+        return
+      }
+      if (ev.event === 'session_created') {
+        if (selectedNode) return
+        localRevisionRef.current += 1
+        upsertSessionState(ev.data)
         return
       }
       if (ev.event === 'session_updated') {
         if (selectedNode) return
-        setSessions((prev) => prev.map((s) => (s.id === ev.data.id ? ev.data : s)))
-        sparklines.update(
-          ev.data.id,
-          (ev.data as unknown as { line_count?: number }).line_count ?? 0
-        )
-        setSeriesMap((prev) => new Map([...prev, [ev.data.id, sparklines.getSeries(ev.data.id)]]))
-        scheduleReload()
+        localRevisionRef.current += 1
+        upsertSessionState(ev.data)
+        return
+      }
+      if (ev.event === 'session_deleted') {
+        if (selectedNode) return
+        localRevisionRef.current += 1
+        removeSessionState(ev.data.id)
         return
       }
       if (ev.event === 'session_notification') {
+        if (pushStateRef.current === 'subscribed') return
         const tag = ev.data.session_ids[0] ?? 'open-relay-session-notification'
         void showSessionNotification(ev.data.summary, ev.data.body, tag)
         return
       }
-      if (!selectedNode) scheduleReload()
     }, setSseStatus)
     return () => {
       cleanup()
-      if (debounceRef.current) clearTimeout(debounceRef.current)
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
     }
-  }, [scheduleReload, selectedNode])
+  }, [applySessionItems, removeSessionState, selectedNode, upsertSessionState])
+
+  const visibleSessions = useMemo(() => {
+    if (isRemoteNodeView) return sessions
+
+    return [...sessions]
+      .filter((session) => {
+        const matchesStatus = statusFilter === 'all' || session.status === statusFilter
+        return matchesStatus && matchesSearch(session, search)
+      })
+      .sort((left, right) => compareSessions(left, right, sortField, sortOrder))
+  }, [isRemoteNodeView, search, sessions, sortField, sortOrder, statusFilter])
+
+  const pagedSessions = useMemo(() => {
+    if (isRemoteNodeView) return sessions
+    const start = page * PAGE_SIZE
+    return visibleSessions.slice(start, start + PAGE_SIZE)
+  }, [isRemoteNodeView, page, sessions, visibleSessions])
+
+  const total = isRemoteNodeView ? remoteTotal : visibleSessions.length
+
+  useEffect(() => {
+    const lastPage = Math.max(Math.ceil(total / PAGE_SIZE) - 1, 0)
+    setPage((prev) => Math.min(prev, lastPage))
+  }, [total])
 
   const grouped = useMemo<Array<{ key: string; items: SessionSummary[] }>>(() => {
-    if (groupBy === 'none') return [{ key: '', items: sessions }]
+    if (groupBy === 'none') return [{ key: '', items: pagedSessions }]
     if (groupBy === 'cwd') {
       const map = new Map<string, SessionSummary[]>()
-      for (const s of sessions) {
+      for (const s of pagedSessions) {
         const k = cwdBasename(s.cwd) || '(no cwd)'
         if (!map.has(k)) map.set(k, [])
         map.get(k)!.push(s)
@@ -938,13 +1143,13 @@ export default function SessionsPage() {
       return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
     }
     const map = new Map<string, SessionSummary[]>()
-    for (const s of sessions) {
+    for (const s of pagedSessions) {
       const k = agentName(s.command)
       if (!map.has(k)) map.set(k, [])
       map.get(k)!.push(s)
     }
     return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
-  }, [sessions, groupBy])
+  }, [groupBy, pagedSessions])
 
   function handleRunAgain(session: SessionSummary) {
     setRerunSession(session)
@@ -966,12 +1171,12 @@ export default function SessionsPage() {
   }
 
   async function handleStop(id: string) {
-    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => { })
-    void load()
+    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
+    if (selectedNode) void loadRemote()
   }
   async function handleKill(id: string) {
-    await killSession(id, selectedNode ?? undefined).catch(() => { })
-    void load()
+    await killSession(id, selectedNode ?? undefined).catch(() => {})
+    if (selectedNode) void loadRemote()
   }
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
@@ -1031,7 +1236,7 @@ export default function SessionsPage() {
 
   async function handleTogglePush() {
     if (pushEnabled) {
-      await disablePushNotifications().catch(() => { })
+      await disablePushNotifications().catch(() => {})
       setPushState(Notification.permission === 'denied' ? 'denied' : 'idle')
       return
     }
@@ -1045,8 +1250,9 @@ export default function SessionsPage() {
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
           <div className="flex items-center gap-2 px-3 py-2 md:hidden">
-            <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
-              onClick={() => load({ background: true })}
+            <div
+              className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
+              onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
               <span>Open Relay</span>
@@ -1069,7 +1275,7 @@ export default function SessionsPage() {
               )}
             </Button>
             <Button
-              variant={pushEnabled ? 'secondary' : 'default'}
+              variant={pushEnabled ? 'link' : 'ghost'}
               size="icon"
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
@@ -1185,8 +1391,9 @@ export default function SessionsPage() {
 
           {/* Desktop row */}
           <div className="hidden md:flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5">
-            <div className="flex items-center gap-1 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
-              onClick={() => load({ background: true })}
+            <div
+              className="flex items-center gap-1 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
+              onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
               <span>Open Relay</span>
@@ -1258,7 +1465,7 @@ export default function SessionsPage() {
 
             <Button
               size="sm"
-              variant={pushEnabled ? 'secondary' : 'outline'}
+              variant={pushEnabled ? 'link' : 'ghost'}
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
             >
@@ -1294,6 +1501,7 @@ export default function SessionsPage() {
                     <SessionCard
                       key={s.id}
                       session={s}
+                      series={seriesMap.get(s.id) ?? []}
                       animateIn={enteringIds.has(s.id)}
                       onStop={handleStop}
                       onKill={handleKill}
@@ -1351,10 +1559,11 @@ export default function SessionsPage() {
                   ).map((col) => (
                     <TableHead
                       key={col.key}
-                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${col.sortField
-                        ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
-                        : 'text-[hsl(var(--muted-foreground))]'
-                        } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
+                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
+                        col.sortField
+                          ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
+                          : 'text-[hsl(var(--muted-foreground))]'
+                      } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
                       onClick={col.sortField ? () => handleSort(col.sortField!) : undefined}
                     >
                       <span className="inline-flex items-center gap-1">
@@ -1410,7 +1619,7 @@ export default function SessionsPage() {
             <span className="text-[hsl(var(--muted-foreground))]">Refreshing…</span>
           )}
           <div className="flex-1"></div>
-          <span className='text-sm'>
+          <span className="text-sm">
             {PAGE_SIZE} / {total}
           </span>
           <div />
@@ -1444,18 +1653,18 @@ export default function SessionsPage() {
           onClose={() => {
             setShowNewSession(false)
             setRerunSession(null)
-            load({ background: true })
+            void reloadSessions({ background: true })
           }}
           initialValues={
             rerunSession
               ? {
-                cmd: rerunSession.command,
-                args: rerunSession.args
-                  .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
-                  .join(' '),
-                title: rerunSession.title ?? '',
-                cwd: rerunSession.cwd ?? '',
-              }
+                  cmd: rerunSession.command,
+                  args: rerunSession.args
+                    .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+                    .join(' '),
+                  title: rerunSession.title ?? '',
+                  cwd: rerunSession.cwd ?? '',
+                }
               : undefined
           }
           node={selectedNode ?? undefined}

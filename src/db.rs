@@ -20,6 +20,48 @@ pub struct Database {
 }
 
 impl Database {
+    fn push_list_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, query: &ListQuery) {
+        if !query.statuses.is_empty() {
+            qb.push(" AND LOWER(status) IN (");
+            let mut sep = qb.separated(", ");
+            for s in &query.statuses {
+                sep.push_bind(s.to_ascii_lowercase());
+            }
+            qb.push(")");
+        }
+
+        if let Some(since) = query.since {
+            qb.push(" AND created_at >= ");
+            qb.push_bind(since.to_rfc3339());
+        }
+
+        if let Some(until) = query.until {
+            qb.push(" AND created_at <= ");
+            qb.push_bind(until.to_rfc3339());
+        }
+
+        if let Some(search) = query.search.as_deref() {
+            let needle = format!("%{}%", search.to_ascii_lowercase());
+            qb.push(" AND (LOWER(id) LIKE ");
+            qb.push_bind(needle.clone());
+            qb.push(" OR LOWER(COALESCE(title,'')) LIKE ");
+            qb.push_bind(needle.clone());
+            qb.push(" OR LOWER(command) LIKE ");
+            qb.push_bind(needle.clone());
+            qb.push(" OR LOWER(args) LIKE ");
+            qb.push_bind(needle);
+            qb.push(")");
+        }
+    }
+
+    pub async fn count_summaries(&self, query: &ListQuery) -> Result<usize> {
+        let mut qb = sqlx::QueryBuilder::new("SELECT COUNT(*) AS total FROM sessions WHERE 1=1");
+        Self::push_list_filters(&mut qb, query);
+        let row = qb.build().fetch_one(&self.pool).await?;
+        let total: i64 = row.get("total");
+        Ok(total.max(0) as usize)
+    }
+
     /// Open (or create) the SQLite database at `db_path` and run pending migrations.
     /// `sessions_dir` is the root under which session files live (`<sessions_dir>/<id>/`);
     /// it is stored so callers never need to pass it again.
@@ -134,20 +176,41 @@ impl Database {
 
     /// List all sessions as `SessionSummary` DTOs, applying the `ListQuery` filter.
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
-        let rows = sqlx::query(
+        let limit = query.limit.max(1) as i64;
+        let offset = query.offset.max(0) as i64;
+
+        let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at \
-             FROM sessions ORDER BY created_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+             FROM sessions WHERE 1=1",
+        );
+
+        Self::push_list_filters(&mut qb, query);
+
+        // Sorting
+        let sort_field = match query.sort.as_deref() {
+            Some("status") => "status",
+            Some("title") => "title",
+            _ => "created_at",
+        };
+        let order = match query.order.as_deref() {
+            Some("desc") => "DESC",
+            _ => "ASC",
+        };
+        qb.push(&format!(" ORDER BY {} {}", sort_field, order));
+        qb.push(" LIMIT ");
+        qb.push_bind(limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(offset);
+
+        let rows = qb.build().fetch_all(&self.pool).await?;
 
         let summaries: Vec<SessionSummary> = rows
             .iter()
             .map(|r| meta_to_summary(&row_to_meta(r), false))
             .collect();
 
-        Ok(query.apply(summaries))
+        Ok(summaries)
     }
 
     /// Load sessions whose status is included in `statuses`.

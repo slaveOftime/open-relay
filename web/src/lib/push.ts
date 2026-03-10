@@ -36,78 +36,73 @@ function toPushSubscriptionInput(sub: PushSubscription): PushSubscriptionInput |
 }
 
 export async function syncPushSubscription(requestPermission: boolean): Promise<PushSetupState> {
-  if (!requestPermission) {
-    if (passiveSyncCachedState) return passiveSyncCachedState
-    if (passiveSyncInFlight) return passiveSyncInFlight
+  if (!requestPermission && passiveSyncCachedState) {
+    return passiveSyncCachedState
   }
-
-  if (requestPermission && passiveSyncInFlight) {
+  if (passiveSyncInFlight) {
+    if (!requestPermission) return passiveSyncInFlight
     await passiveSyncInFlight.catch(() => {})
   }
 
   const run = (async (): Promise<PushSetupState> => {
-  if (
-    !('serviceWorker' in navigator) ||
-    !('PushManager' in window) ||
-    !('Notification' in window)
-  ) {
-    return 'unsupported'
-  }
-
-  const res = await fetchPushPublicKey()
-  if (!res.public_key) return 'unconfigured'
-  const publicKey = res.public_key
-
-  const registration = await registerPushWorker()
-  if (!registration) return 'unsupported'
-
-  let permission = Notification.permission
-  if (permission === 'default' && requestPermission) {
-    permission = await Notification.requestPermission()
-  }
-
-  if (permission === 'denied') {
-    const deniedSub = await registration.pushManager.getSubscription()
-    if (deniedSub) {
-      await deletePushSubscription(deniedSub.endpoint).catch(() => {})
-      await deniedSub.unsubscribe().catch(() => {})
+    if (
+      !('serviceWorker' in navigator) ||
+      !('PushManager' in window) ||
+      !('Notification' in window)
+    ) {
+      return 'unsupported'
     }
-    return 'denied'
-  }
-  if (permission !== 'granted') return 'idle'
 
-  let subscription = await registration.pushManager.getSubscription()
-  if (!subscription) {
-    subscription = await registration.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToArrayBuffer(publicKey),
-    })
-  }
+    const res = await fetchPushPublicKey()
+    if (!res.public_key) return 'unconfigured'
+    const publicKey = res.public_key
 
-  const payload = toPushSubscriptionInput(subscription)
-  if (!payload) return 'idle'
+    const registration = await registerPushWorker()
+    if (!registration) return 'unsupported'
 
-  await upsertPushSubscription(payload)
-  return 'subscribed'
+    let permission = Notification.permission
+    if (permission === 'default' && requestPermission) {
+      permission = await Notification.requestPermission()
+    }
+
+    if (permission === 'denied') {
+      const deniedSub = await registration.pushManager.getSubscription()
+      if (deniedSub) {
+        await deletePushSubscription(deniedSub.endpoint).catch(() => {})
+        await deniedSub.unsubscribe().catch(() => {})
+      }
+      return 'denied'
+    }
+    if (permission !== 'granted') return 'idle'
+
+    let subscription = await registration.pushManager.getSubscription()
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToArrayBuffer(publicKey),
+      })
+    }
+
+    const payload = toPushSubscriptionInput(subscription)
+    if (!payload) return 'idle'
+
+    await upsertPushSubscription(payload)
+    return 'subscribed'
   })()
 
-  if (!requestPermission) {
-    passiveSyncInFlight = run
-    run
-      .then((state) => {
-        passiveSyncCachedState = state
-      })
-      .finally(() => {
-        passiveSyncInFlight = null
-      })
-    return run
-  }
-
+  passiveSyncInFlight = run
+  run
+    .then((state) => {
+      passiveSyncCachedState = state
+    })
+    .finally(() => {
+      passiveSyncInFlight = null
+    })
   return run
 }
 
 export async function disablePushNotifications(): Promise<void> {
-  passiveSyncCachedState = null
+  passiveSyncCachedState = Notification.permission === 'denied' ? 'denied' : 'idle'
   if (!('serviceWorker' in navigator)) return
   const registration = await navigator.serviceWorker.getRegistration(PUSH_SW_SCOPE)
   const subscription = await registration?.pushManager.getSubscription()

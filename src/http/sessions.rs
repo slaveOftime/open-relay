@@ -144,51 +144,30 @@ pub async fn list(
     let page_limit = params.limit.unwrap_or(20).max(1).min(200);
     let offset = params.offset.unwrap_or(0);
 
-    // Use usize::MAX so apply() doesn't truncate — we do pagination ourselves
     let query = ListQuery {
         search: params.search,
         statuses,
         since: None,
         until: None,
-        limit: usize::MAX,
+        limit: page_limit,
+        offset: offset,
+        sort: params.sort.clone(),
+        order: params.order.clone(),
     };
 
     // If a node is specified, proxy the request to that secondary node.
     if let Some(ref node) = params.node {
-        let rpc = RpcRequest::List { query };
+        let rpc = RpcRequest::List {
+            query: query.clone(),
+        };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::List {
-                sessions: mut remote_sessions,
-            }) => {
-                if let Some(sort_field) = &params.sort {
-                    let desc = params.order.as_deref() == Some("desc");
-                    remote_sessions.sort_by(|a, b| {
-                        let ord = match sort_field.as_str() {
-                            "status" => a.status.cmp(&b.status),
-                            "title" => a
-                                .title
-                                .as_deref()
-                                .unwrap_or("")
-                                .cmp(b.title.as_deref().unwrap_or("")),
-                            _ => a.created_at.cmp(&b.created_at),
-                        };
-                        if desc { ord.reverse() } else { ord }
-                    });
-                }
-                let total = remote_sessions.len();
-                let items: Vec<_> = remote_sessions
-                    .into_iter()
-                    .skip(offset)
-                    .take(page_limit)
-                    .collect();
-                Json(serde_json::json!({
-                    "items": items,
-                    "total": total,
-                    "offset": offset,
-                    "limit": page_limit,
-                }))
-                .into_response()
-            }
+            Ok(RpcResponse::List { total, sessions }) => Json(serde_json::json!({
+                "items": sessions,
+                "total": total,
+                "offset": offset,
+                "limit": page_limit,
+            }))
+            .into_response(),
             Ok(RpcResponse::Error { message }) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
@@ -207,30 +186,34 @@ pub async fn list(
         };
     }
 
+    let total = match state.db.count_summaries(&query).await {
+        Ok(total) => total,
+        Err(err) => {
+            error!(%err, "failed to count sessions from DB");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let mut store = state.store.lock().await;
-    let mut sessions = store.list_summaries(&query).await;
-
-    if let Some(sort_field) = &params.sort {
-        let desc = params.order.as_deref() == Some("desc");
-        sessions.sort_by(|a, b| {
-            let ord = match sort_field.as_str() {
-                "status" => a.status.cmp(&b.status),
-                "title" => a
-                    .title
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(b.title.as_deref().unwrap_or("")),
-                _ => a.created_at.cmp(&b.created_at),
-            };
-            if desc { ord.reverse() } else { ord }
-        });
-    }
-
-    let total = sessions.len();
-    let items: Vec<_> = sessions.into_iter().skip(offset).take(page_limit).collect();
+    let sessions = match store.list_summaries(&query).await {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            error!(%err, "failed to list sessions from store");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    drop(store);
 
     Json(serde_json::json!({
-        "items": items,
+        "items": sessions,
         "total": total,
         "offset": offset,
         "limit": page_limit,
@@ -250,6 +233,8 @@ pub struct CreateSessionBody {
     pub cwd: Option<String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
+    #[serde(default)]
+    pub disable_notifications: bool,
     /// If set, create the session on this connected secondary node instead of locally.
     pub node: Option<String>,
 }
@@ -267,6 +252,7 @@ pub async fn create(
             cwd: body.cwd.clone(),
             rows: body.rows,
             cols: body.cols,
+            disable_notifications: body.disable_notifications,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::Start { session_id }) => {
@@ -307,6 +293,7 @@ pub async fn create(
         cwd: body.cwd.clone(),
         rows: body.rows,
         cols: body.cols,
+        notifications_enabled: !body.disable_notifications,
     };
 
     let result = {
@@ -365,11 +352,14 @@ pub async fn get_session(
                 statuses: vec![],
                 since: None,
                 until: None,
-                limit: 1000,
+                limit: 1,
+                offset: 0,
+                sort: None,
+                order: None,
             },
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::List { sessions }) => {
+            Ok(RpcResponse::List { sessions, .. }) => {
                 if let Some(s) = sessions.into_iter().find(|s| s.id == id) {
                     Json(s).into_response()
                 } else {

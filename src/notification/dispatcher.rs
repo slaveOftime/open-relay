@@ -22,9 +22,9 @@ pub struct Notifier {
 
 impl Notifier {
     #[allow(dead_code)]
-    pub fn default_local() -> Self {
+    pub fn default_local(hook: Option<String>) -> Self {
         Self {
-            channels: vec![Box::new(LocalOsNotificationChannel)],
+            channels: vec![Box::new(LocalOsNotificationChannel { hook })],
         }
     }
 

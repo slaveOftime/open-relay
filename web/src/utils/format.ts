@@ -77,10 +77,7 @@ function shellQuote(token: string): string {
   return token
 }
 
-export function sessionDisplayName(s: {
-  command: string
-  args: string[]
-}): string {
+export function sessionDisplayName(s: { command: string; args: string[] }): string {
   return [s.command, ...s.args].map(shellQuote).join(' ').slice(0, 64)
 }
 
@@ -107,65 +104,6 @@ export function cwdBasename(cwd: string | null): string {
   if (!cwd) return ''
   return cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? cwd
 }
-
-// ---------------------------------------------------------------------------
-// Sparkline data
-// ---------------------------------------------------------------------------
-
-/** Rolling activity history: map of session id → array of line-count samples */
-export class SparklineStore {
-  private data = new Map<string, number[]>()
-  private prev = new Map<string, number>()
-  private readonly maxPoints = 20
-
-  /** Record the current output line count for a session, returns delta. */
-  update(id: string, lineCount: number): void {
-    const prev = this.prev.get(id) ?? 0
-    const delta = Math.max(0, lineCount - prev)
-    this.prev.set(id, lineCount)
-
-    const series = this.data.get(id) ?? []
-    series.push(delta)
-    if (series.length > this.maxPoints) series.shift()
-    this.data.set(id, series)
-  }
-
-  getSeries(id: string): number[] {
-    return this.data.get(id) ?? []
-  }
-
-  remove(id: string) {
-    this.data.delete(id)
-    this.prev.delete(id)
-  }
-}
-
-/** Build an SVG sparkline polyline string from a series of values. */
-export function buildSparklineSvg(series: number[], width = 80, height = 22): string {
-  if (series.length < 2) {
-    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
-      <line x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}" stroke="#374151" stroke-width="1"/>
-    </svg>`
-  }
-
-  const max = Math.max(...series, 1)
-  const step = width / (series.length - 1)
-  const pts = series
-    .map((v, i) => {
-      const x = i * step
-      const y = height - (v / max) * (height - 4) - 2
-      return `${x.toFixed(1)},${y.toFixed(1)}`
-    })
-    .join(' ')
-
-  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
-      xmlns="http://www.w3.org/2000/svg" style="overflow:visible">
-    <polyline points="${pts}" fill="none" stroke="#4ADE80" stroke-width="1.5"
-      stroke-linejoin="round" stroke-linecap="round"
-      style="filter:drop-shadow(0 0 3px #4ADE8088)"/>
-  </svg>`
-}
-
 
 // ── Shell arg parser ─────────────────────────────────────────────────────────
 // Handles single/double quotes and backslash escapes, e.g.:

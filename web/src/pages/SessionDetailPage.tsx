@@ -22,6 +22,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Slider } from '@/components/ui/slider'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   ChevronLeftIcon,
@@ -377,7 +378,7 @@ export default function SessionDetailPage() {
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
     return () => {
       isMounted.current = false
     }
@@ -495,7 +496,7 @@ export default function SessionDetailPage() {
             .then((s) => {
               if (isMounted.current) setSession(s)
             })
-            .catch(() => { })
+            .catch(() => {})
         },
         onError: (msg) => {
           lastWsFrameAtRef.current = Date.now()
@@ -539,7 +540,7 @@ export default function SessionDetailPage() {
       setWsConnected(false)
       setWsConnecting(false)
     }
-  }, [mode, id, node, pushConnectTrace, setSearchParams, wsReconnectKey])
+  }, [mode, id, node, pushConnectTrace, setSearchParams, wsReconnectKey, enqueueTerminalOutput])
 
   useEffect(() => {
     if (mode !== 'attach') setWsConnecting(false)
@@ -599,10 +600,7 @@ export default function SessionDetailPage() {
       const minimumElapsed = currentlyConnecting ? 8000 : 2500
       if (elapsed < minimumElapsed) return
 
-      requestReconnect(
-        `watchdog${currentlyConnecting ? ' (stalled connect attempt)' : ''}`,
-        true
-      )
+      requestReconnect(`watchdog${currentlyConnecting ? ' (stalled connect attempt)' : ''}`, true)
     }, 1600)
 
     return () => window.clearInterval(tick)
@@ -643,14 +641,14 @@ export default function SessionDetailPage() {
           .then((s) => {
             if (isMounted.current) setSession(s)
           })
-          .catch(() => { })
+          .catch(() => {})
       })
-      .catch(() => { })
+      .catch(() => {})
 
     return () => {
       cancelled = true
     }
-  }, [mode, id])
+  }, [mode, id, node])
 
   const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
@@ -745,21 +743,21 @@ export default function SessionDetailPage() {
 
   async function handleStop() {
     if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => { })
+    await stopSession(id, undefined, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
   async function handleKill() {
     if (!id) return
-    await killSession(id, node ?? undefined).catch(() => { })
+    await killSession(id, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -794,7 +792,7 @@ export default function SessionDetailPage() {
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
-              <span className='hidden sm:inline'>Open Relay</span>
+              <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
           <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -976,7 +974,7 @@ export default function SessionDetailPage() {
           id="main-container"
           className="sm:flex overflow-y-auto sm:overflow-hidden flex-1 min-h-0"
         >
-          {wsError && (<div className='text-red-500 text-sm'>{wsError}</div>)}
+          {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
 
           {/* Terminal area */}
           <div
@@ -984,46 +982,57 @@ export default function SessionDetailPage() {
           >
             <div
               ref={termContainerRef}
-              className={`flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4 ${mode === 'logs' ? 'overflow-x-auto' : ''}`}
+              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4`}
             >
-              <div className={`h-full ${mode === 'logs' ? 'w-500 min-w-full' : ''}`}>
-                <XTerm
-                  ref={termRef}
-                  onData={mode === 'attach' ? sendInput : undefined}
-                  onResize={mode === 'attach' ? handleTermResize : undefined}
-                  className="h-full"
-                />
+              <div className="h-full w-full overflow-x-auto">
+                <div className={`h-full ${mode === 'logs' ? 'w-500 min-w-full' : ''}`}>
+                  <XTerm
+                    ref={termRef}
+                    onData={mode === 'attach' ? sendInput : undefined}
+                    onResize={mode === 'attach' ? handleTermResize : undefined}
+                    className="h-full"
+                  />
+                </div>
               </div>
+              <div
+                className="absolute sm:hidden right-0 top-0 bottom-0 w-10 bg-transparent"
+                onPointerMove={(e) => {
+                  if (mode === 'logs') {
+                    handleScrubRef.current?.(Math.max(0, replayIdxRef.current + e.movementY * 2))
+                  } else {
+                    termRef?.current?.scrollLines(e.movementY)
+                  }
+                }}
+              ></div>
             </div>
 
             {/* Scrubber (logs mode) */}
             {mode === 'logs' && scrubberMax > 0 && (
-              <div className="flex flex-col sm:flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+              <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
                 <div className="flex flex-1 items-center gap-2">
-                  <input
-                    type="range"
-                    className="flex-1 h-2 rounded-full bg-[hsl(var(--secondary))] appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-[hsl(var(--primary))] [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-[hsl(var(--primary))]"
+                  <Slider
+                    className="flex-1"
                     min={0}
                     max={scrubberMax}
-                    value={replayIdx}
-                    onChange={(e) => handleScrub(Number(e.target.value))}
+                    value={[replayIdx]}
+                    onValueChange={(value) => handleScrub(value[0] ?? 0)}
+                    aria-label="Replay scrubber"
                   />
-                  <span className="text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
+                  <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
                     {totalLines > scrubberMax ? `${scrubberMax}/${totalLines}` : scrubberMax}
                   </span>
                 </div>
-                <div className="flex items-center gap-1.5 flex-wrap">
+                <div className="flex items-center gap-1.5">
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
                         variant="secondary"
                         size="icon"
-                        className="h-10 w-10"
                         onClick={() =>
                           handleScrubRef.current?.(Math.max(0, replayIdxRef.current - 10))
                         }
                       >
-                        <ChevronLeftIcon className="h-5 w-5" />
+                        <ChevronLeftIcon className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>Back 10 lines</TooltipContent>
@@ -1031,13 +1040,8 @@ export default function SessionDetailPage() {
                   {totalLines > scrubberMax && (
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button
-                          variant="secondary"
-                          size="icon"
-                          className="h-10 w-10"
-                          onClick={handleLoadPageAndReplay}
-                        >
-                          <ChevronRightIcon className="h-5 w-5" />
+                        <Button variant="secondary" size="icon" onClick={handleLoadPageAndReplay}>
+                          <ChevronRightIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent>Load next page</TooltipContent>
@@ -1046,18 +1050,13 @@ export default function SessionDetailPage() {
                   <div className="flex items-center gap-1 ml-auto">
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button
-                          variant="secondary"
-                          size="icon"
-                          className="h-10 w-10"
-                          onClick={handleReplayButton}
-                        >
+                        <Button variant="secondary" size="icon" onClick={handleReplayButton}>
                           {!isReplaying ? (
-                            <PlayIcon className="h-5 w-55" />
+                            <PlayIcon className="h-4 w-4" />
                           ) : isPaused ? (
-                            <PlayIcon className="h-5 w-5" />
+                            <PlayIcon className="h-4 w-4" />
                           ) : (
-                            <PauseIcon className="h-5 w-5" />
+                            <PauseIcon className="h-4 w-4" />
                           )}
                         </Button>
                       </TooltipTrigger>
@@ -1069,7 +1068,7 @@ export default function SessionDetailPage() {
                       value={String(replaySpeed)}
                       onValueChange={(v) => setReplaySpeed(Number(v))}
                     >
-                      <SelectTrigger className="h-10 w-12 text-sm px-2">
+                      <SelectTrigger className="h-8 w-15 text-sm px-2">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -1087,9 +1086,7 @@ export default function SessionDetailPage() {
           </div>
 
           {mode === 'attach' && (
-            <div
-              className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none"
-            >
+            <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none">
               <AttachPanel sendInput={sendInput} showKeyError={showKeyError} />
             </div>
           )}

@@ -4,7 +4,12 @@ import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
-import { ArrowDownIcon, ArrowUpIcon, DoubleArrowDownIcon, DoubleArrowUpIcon } from '@radix-ui/react-icons'
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  DoubleArrowDownIcon,
+  DoubleArrowUpIcon,
+} from '@radix-ui/react-icons'
 
 // ── Input history ─────────────────────────────────────────────────────────────
 const INPUT_HISTORY_KEY = 'open-relay:input-history'
@@ -121,10 +126,14 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
 
   return (
     <div>
-      <div className={`${drawerOpen ? '' : 'h-0 sm:h-full sm:visible sm:w-[200px] md:w-[300px]'} overflow-hidden transition-all`}>
+      <div
+        className={`${drawerOpen ? '' : 'h-0 sm:h-full sm:visible sm:w-[200px] md:w-[300px]'} overflow-hidden transition-all`}
+      >
         <div className={`flex flex-col gap-4 p-3 `}>
           <div>
-            <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">Text Input</p>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
+              Text Input
+            </p>
             <datalist id="or-input-history">
               {historyTop.map((e) => (
                 <option key={e.text} value={e.text} />
@@ -156,8 +165,19 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                       handleSendKeySpec('enter') // send an extra enter to trigger processing, since some inputs may be buffered until enter is pressed
                     }}
                   >
-                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" className="w-4 h-4">
-                      <path stroke-linecap="round" stroke-linejoin="round" d="m7.49 12-3.75 3.75m0 0 3.75 3.75m-3.75-3.75h16.5V4.499" />
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke-width="1.5"
+                      stroke="currentColor"
+                      className="w-4 h-4"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="m7.49 12-3.75 3.75m0 0 3.75 3.75m-3.75-3.75h16.5V4.499"
+                      />
                     </svg>
                   </Button>
                 </TooltipTrigger>
@@ -165,7 +185,9 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
             </div>
           </div>
           <div>
-            <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">Quick Keys</p>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
+              Quick Keys
+            </p>
             <div className="grid grid-cols-4 gap-1.5 max-h-27 sm:max-h-fit overflow-y-auto">
               {popularKeys.map(({ key, label, instant }) => (
                 <Tooltip key={key}>
@@ -185,7 +207,9 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                           }
                           return
                         }
-                        setCustomKeys((prev) => (prev.trim() ? `${prev.trim()} ${key} ` : key + ' '))
+                        setCustomKeys((prev) =>
+                          prev.trim() ? `${prev.trim()} ${key} ` : key + ' '
+                        )
                         document.getElementById('custom-keys')?.focus()
                       }}
                     >
@@ -196,7 +220,9 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                 </Tooltip>
               ))}
             </div>
-            <p className="mt-1 text-xs text-[hsl(var(--primary))]">⚡colorful key will be sent immediately</p>
+            <p className="mt-1 text-xs text-[hsl(var(--primary))]">
+              ⚡colorful key will be sent immediately
+            </p>
             <div className="mt-2 flex items-center gap-1">
               <Input
                 id="custom-keys"
@@ -223,22 +249,32 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
         </div>
       </div>
       <div className="sm:hidden w-full h-10 flex justify-between items-center">
-        <Button variant={"ghost"} onClick={() => handleSendKeySpec('up')} aria-label="Scroll to top">
+        <Button
+          variant={'ghost'}
+          className="text-[hsl(var(--primary))]"
+          onClick={() => handleSendKeySpec('up')}
+          aria-label="Up"
+        >
           <ArrowUpIcon className="w-6 h-6" />
         </Button>
-        <Button variant={"ghost"} onClick={() => handleSendKeySpec('down')} aria-label="Scroll to bottom">
+        <Button
+          variant={'ghost'}
+          className="text-[hsl(var(--primary))]"
+          onClick={() => handleSendKeySpec('down')}
+          aria-label="Down"
+        >
           <ArrowDownIcon className="w-6 h-6" />
         </Button>
-        <Button variant={"ghost"} onClick={() => handleSendKeySpec('enter')} aria-label="Scroll to bottom">
+        <Button
+          variant={'ghost'}
+          className="text-[hsl(var(--primary))]"
+          onClick={() => handleSendKeySpec('enter')}
+          aria-label="Enter"
+        >
           Enter
         </Button>
-        <div className='flex-1 h-full' onClick={toggleDrawer}>
-        </div>
-        <Button
-          variant="ghost"
-          onClick={toggleDrawer}
-          aria-label="Open input panel"
-        >
+        <div className="flex-1 h-full" onClick={toggleDrawer}></div>
+        <Button variant="ghost" onClick={toggleDrawer} aria-label="Open input panel">
           {drawerOpen ? (
             <DoubleArrowDownIcon className="w-6 h-6" />
           ) : (

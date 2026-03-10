@@ -217,7 +217,9 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
 fn build_notifier(db: std::sync::Arc<Database>, config: &crate::config::AppConfig) -> Notifier {
     let mut channels: Vec<Box<dyn NotificationChannel + Send + Sync>> =
-        vec![Box::new(LocalOsNotificationChannel)];
+        vec![Box::new(LocalOsNotificationChannel {
+            hook: config.notification_hook.clone(),
+        })];
 
     if let (Some(vapid_public_key), Some(vapid_private_key), Some(vapid_subject)) = (
         config.web_push_vapid_public_key.clone(),

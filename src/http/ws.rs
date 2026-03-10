@@ -187,7 +187,7 @@ async fn handle_ws(mut socket: WebSocket, state: AppState, id: String, node: Opt
             (cursor, running)
         }
         Err(message) => {
-            warn!(session_id = %id, error = %message, "WS attach failed: session not found");
+            warn!(session_id = %id, error = %message, "WS attach failed");
             let msg = ServerMessage::Error { message };
             let _ = send_json(&mut socket, &msg).await;
             return;

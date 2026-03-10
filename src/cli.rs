@@ -17,9 +17,6 @@ pub enum Commands {
     Daemon(DaemonArgs),
     /// Create a session and run a command. Example: `oly start --detach --title "my fun demo" copilot`.
     Start(StartArgs),
-    /// Create a session and run a command. Short name for start. Example: `oly > copilot`.
-    #[command(name = ">")]
-    StartAlias(StartArgs),
     /// List sessions. Order is most recently created last.
     #[command(name = "ls")]
     List(ListArgs),
@@ -133,6 +130,9 @@ pub struct StartArgs {
     /// Start the session detached (in the background).
     #[arg(long, short = 'd')]
     pub detach: bool,
+    /// Disable notifications for this session.
+    #[arg(long)]
+    pub disable_notifications: bool,
     /// Command and arguments to run. Passed through as-is.
     #[arg(
         trailing_var_arg = true,

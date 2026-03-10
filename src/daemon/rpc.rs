@@ -59,7 +59,7 @@ async fn dispatch_request(
             daemon_pid: std::process::id(),
         },
         RpcRequest::DaemonStop => handle_daemon_stop(config, session_store, shutdown_tx).await,
-        RpcRequest::List { query } => handle_list(query, session_store).await,
+        RpcRequest::List { query } => handle_list(query, session_store, db).await?,
         RpcRequest::Start {
             title,
             cmd,
@@ -67,7 +67,21 @@ async fn dispatch_request(
             cwd,
             rows,
             cols,
-        } => handle_start(config, session_store, title, cmd, args, cwd, rows, cols).await,
+            disable_notifications,
+        } => {
+            handle_start(
+                config,
+                session_store,
+                title,
+                cmd,
+                args,
+                cwd,
+                rows,
+                cols,
+                disable_notifications,
+            )
+            .await
+        }
         RpcRequest::AttachSnapshot { id } => handle_attach_snapshot(id, session_store).await,
         RpcRequest::AttachPoll { id, cursor } => {
             handle_attach_poll(id, cursor, session_store).await
@@ -116,11 +130,15 @@ async fn handle_daemon_stop(
     RpcResponse::DaemonStop { stopped }
 }
 
-async fn handle_list(query: ListQuery, session_store: &SessionStoreHandle) -> RpcResponse {
+async fn handle_list(
+    query: ListQuery,
+    session_store: &SessionStoreHandle,
+    db: &Arc<Database>,
+) -> Result<RpcResponse> {
+    let total = db.count_summaries(&query).await?;
     let mut store = session_store.lock().await;
-    RpcResponse::List {
-        sessions: store.list_summaries(&query).await,
-    }
+    let sessions = store.list_summaries(&query).await?;
+    Ok(RpcResponse::List { total, sessions })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,6 +151,7 @@ async fn handle_start(
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
+    disable_notifications: bool,
 ) -> RpcResponse {
     let mut store = session_store.lock().await;
     match store
@@ -145,6 +164,7 @@ async fn handle_start(
                 cwd: cwd.clone(),
                 rows,
                 cols,
+                notifications_enabled: !disable_notifications,
             },
         )
         .await

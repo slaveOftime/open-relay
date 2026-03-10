@@ -24,6 +24,8 @@ pub enum AppError {
     Protocol(String),
     #[error("node not connected: {0}")]
     NodeNotConnected(String),
+    #[error("max running sessions limit reached ({0})")]
+    MaxSessionsReached(usize),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

@@ -62,6 +62,8 @@ export interface XTermHandle {
   clear(): void
   reset(): void
   scrollToBottom(): void
+  scrollToTop(): void
+  scrollLines(amount: number): void
   getSize(): { cols: number; rows: number } | null
 }
 
@@ -104,6 +106,12 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
     },
     scrollToBottom() {
       termRef.current?.scrollToBottom()
+    },
+    scrollToTop() {
+      termRef.current?.scrollToTop()
+    },
+    scrollLines(amount: number) {
+      termRef.current?.scrollLines(amount)
     },
     getSize() {
       if (!termRef.current) return null

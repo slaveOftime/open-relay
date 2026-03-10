@@ -2,10 +2,13 @@ pub(crate) mod persist;
 mod runtime;
 mod store;
 
-pub use store::SessionStore;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+use crate::protocol::SessionSummary;
+pub use store::SessionStore;
+pub use store::SilentCandidate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,19 +54,25 @@ pub struct StartSpec {
     pub cwd: Option<String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
+    pub notifications_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum SessionLookupError {
-    NotFound,
     Evicted,
+    NotRunning,
 }
 
 impl SessionLookupError {
     pub fn message(self, id: &str) -> String {
         match self {
-            Self::NotFound => format!("session not found: {id}"),
             Self::Evicted => format!("session evicted from memory: {id}"),
+            Self::NotRunning => format!("session not running: {id}"),
         }
     }
+}
+
+pub struct SessionLiveSummary {
+    pub summary: SessionSummary,
+    pub last_output_at: Option<Instant>,
 }

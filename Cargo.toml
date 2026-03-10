@@ -2,6 +2,13 @@
 name = "oly"
 version = "0.1.0"
 edition = "2024"
+description = "Session-persistent PTY daemon for long-running CLI agents — keep agents alive, get notified when they need input, intervene from anywhere."
+license = "MIT"
+repository = "https://github.com/slaveOftime/open-relay"
+homepage = "https://github.com/slaveOftime/open-relay"
+keywords = ["cli", "agent", "pty", "daemon", "terminal"]
+categories = ["command-line-utilities", "asynchronous"]
+readme = "README.md"
 
 [[bin]]
 name = "oly"

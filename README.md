@@ -35,11 +35,12 @@ You can run one agent to supervise another. When the supervisor hits something i
 ## Install 📦
 
 ### Pre-built Binaries
+
 Download the latest release for your platform from the [Releases page](https://github.com/Slaveoftime/open-relay/releases).
 
-- **macOS**: Download `oly-macos-arm64`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
-- **Linux**: Download `oly-linux-amd64`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
-- **Windows**: Download `oly-windows-amd64`, unzip, and add to your PATH.
+- **macOS**: Download `oly-macos-arm64.zip`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
+- **Linux**: Download `oly-linux-amd64.zip`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
+- **Windows**: Download `oly-windows-amd64.zip`, unzip, and add to your PATH.
 
 ### From Source
 
@@ -98,7 +99,7 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 | Command | What it does |
 |---|---|
 | `oly daemon start` | Start background daemon |
-| `oly start [--detach] <cmd>` | Launch session in PTY |
+| `oly start [--detach] [--disable-notifications] <cmd>` | Launch session in PTY |
 | `oly ls` | Show sessions (supports search/status/time filters) |
 | `oly attach <id>` | Reattach (replays buffer first) |
 | `oly logs <id> [--tail N] [--wait-for-prompt]` | Read logs without attaching |

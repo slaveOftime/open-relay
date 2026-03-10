@@ -17,7 +17,7 @@ use crate::{
         event::{NotificationEvent, NotificationTriggerRule},
         prompt::{compile_prompt_patterns, find_prompt_match, sanitize_body, strip_ansi_for_body},
     },
-    session::SessionStore,
+    session::{SessionStore, SilentCandidate},
 };
 
 /// Periodically checks all running sessions for silence and emits local OS
@@ -47,7 +47,7 @@ pub(super) async fn run_notification_monitor(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let candidates: Vec<(String, String, std::time::Instant)> = {
+        let candidates: Vec<SilentCandidate> = {
             let store = session_store.lock().await;
             store.silent_candidates(suppression_window, min_notification_interval)
         };
@@ -56,7 +56,10 @@ pub(super) async fn run_notification_monitor(
             debug!(count = candidates.len(), "notification candidates detected");
         }
 
-        for (session_id, excerpt, output_epoch) in candidates {
+        for candidate in candidates {
+            let session_id = candidate.session_id;
+            let excerpt = candidate.raw_excerpt;
+            let output_epoch = candidate.output_epoch;
             debug!(
                 session_id,
                 excerpt = excerpt.as_str(),
@@ -67,24 +70,7 @@ pub(super) async fn run_notification_monitor(
             let clean = strip_ansi_for_body(&excerpt);
 
             let (trigger_rule, trigger_detail, body) =
-                if let Some(llm_detail) = evaluate_llm_direct_trigger(&clean) {
-                    info!(
-                        session_id,
-                        trigger_rule = NotificationTriggerRule::LlmCheck.as_str(),
-                        "notification triggered"
-                    );
-                    let raw = clean
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .last()
-                        .unwrap_or("")
-                        .trim();
-                    (
-                        NotificationTriggerRule::LlmCheck,
-                        Some(llm_detail),
-                        sanitize_body(raw),
-                    )
-                } else if let Some(pattern) = find_prompt_match(&excerpt, &patterns) {
+                if let Some(pattern) = find_prompt_match(&excerpt, &patterns) {
                     info!(
                         session_id,
                         trigger_rule = NotificationTriggerRule::RegexPattern.as_str(),
@@ -104,6 +90,23 @@ pub(super) async fn run_notification_monitor(
                     (
                         NotificationTriggerRule::RegexPattern,
                         Some(pattern.clone()),
+                        sanitize_body(raw),
+                    )
+                } else if let Some(llm_detail) = evaluate_llm_direct_trigger(&clean) {
+                    info!(
+                        session_id,
+                        trigger_rule = NotificationTriggerRule::LlmCheck.as_str(),
+                        "notification triggered"
+                    );
+                    let raw = clean
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .last()
+                        .unwrap_or("")
+                        .trim();
+                    (
+                        NotificationTriggerRule::LlmCheck,
+                        Some(llm_detail),
                         sanitize_body(raw),
                     )
                 } else if Instant::now().duration_since(output_epoch) >= silence {
@@ -129,8 +132,15 @@ pub(super) async fn run_notification_monitor(
                 trigger_rule,
                 trigger_detail,
             );
-            let outcome = notifier.dispatch(&event).await;
-            if outcome.any_delivered() {
+
+            let dispatched = if candidate.notifications_enabled {
+                notifier.dispatch(&event).await.any_delivered()
+            } else {
+                // This is useful for supervisor agent to take over when to send notifications
+                true
+            };
+
+            if dispatched {
                 {
                     let mut store = session_store.lock().await;
                     store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
@@ -146,12 +156,7 @@ pub(super) async fn run_notification_monitor(
                     trigger_detail: event.trigger_detail,
                 });
             } else {
-                warn!(
-                    session_id,
-                    attempted = outcome.attempted,
-                    failed_channels = ?outcome.failed_channels,
-                    "notification delivery failed on all channels"
-                );
+                warn!(session_id, "notification delivery failed on all channels");
             }
         }
     }
@@ -163,7 +168,9 @@ fn evaluate_llm_direct_trigger(_excerpt: &str) -> Option<String> {
 
 pub(super) fn build_notifier(db: Arc<Database>, config: &AppConfig) -> Notifier {
     let mut channels: Vec<Box<dyn NotificationChannel + Send + Sync>> =
-        vec![Box::new(LocalOsNotificationChannel)];
+        vec![Box::new(LocalOsNotificationChannel {
+            hook: config.notification_hook.clone(),
+        })];
 
     if let (Some(vapid_public_key), Some(vapid_private_key), Some(vapid_subject)) = (
         config.web_push_vapid_public_key.clone(),

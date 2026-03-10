@@ -9,6 +9,7 @@ use crate::{
     error::{AppError, Result},
     ipc,
     notification::event::NotificationEvent,
+    protocol::RpcRequest,
     protocol::{JoinSummary, NodeWsMessage, RpcResponse},
 };
 
@@ -292,10 +293,28 @@ async fn connect_and_relay(
 
                 match node_msg {
                     NodeWsMessage::Rpc { id, request } => {
-                        let req = match serde_json::from_value::<crate::protocol::RpcRequest>(request) {
-                            Ok(r) => r,
+                        let req = match serde_json::from_value::<RpcRequest>(request) {
+                            Ok(r) => {
+                                match r {
+                                    RpcRequest::Health { .. }
+                                    | RpcRequest::List { .. }
+                                    | RpcRequest::Start { .. }
+                                    | RpcRequest::AttachSnapshot { .. }
+                                    | RpcRequest::AttachPoll { .. }
+                                    | RpcRequest::AttachInput { .. }
+                                    | RpcRequest::AttachResize { .. }
+                                    | RpcRequest::Stop { .. }
+                                    | RpcRequest::LogsPoll { .. }
+                                    | RpcRequest::LogsSnapshot { .. }
+                                    | RpcRequest::LogsWait { .. } => r,
+                                    _ => {
+                                        warn!(%id, request_type = r.name(), "unsupported proxied RPC method");
+                                        continue;
+                                    }
+                                }
+                            },
                             Err(err) => {
-                                warn!(%err, rpc_id = %id, "failed to deserialise proxied RPC");
+                                warn!(%err, id = %id, "failed to deserialise proxied RPC");
                                 continue;
                             }
                         };

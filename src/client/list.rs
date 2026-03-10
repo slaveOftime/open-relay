@@ -17,7 +17,7 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
 
     let query = build_list_query(&list_args)?;
 
-    let sessions: Vec<SessionSummary> = if let Some(node_name) = node {
+    let mut sessions: Vec<SessionSummary> = if let Some(node_name) = node {
         // Remote list via IPC NodeProxy.
         let inner = RpcRequest::List { query };
         let req = RpcRequest::NodeProxy {
@@ -25,15 +25,35 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
             inner: Box::new(inner),
         };
         match ipc::send_request(config, req).await? {
-            RpcResponse::List { sessions } => sessions,
+            RpcResponse::List { sessions, .. } => sessions,
             RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
             _ => return Err(AppError::Protocol("unexpected response type".to_string())),
         }
     } else {
-        // Local list reads directly from the DB.
-        let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
-        db.list_summaries(&query).await?
+        // Daemon handles DB + in-memory overlay; fall back to DB-only when unavailable.
+        match ipc::send_request(
+            config,
+            RpcRequest::List {
+                query: query.clone(),
+            },
+        )
+        .await
+        {
+            Ok(RpcResponse::List { sessions, .. }) => sessions,
+            Ok(RpcResponse::Error { message }) => return Err(AppError::DaemonUnavailable(message)),
+            Ok(_) => return Err(AppError::Protocol("unexpected response type".to_string())),
+            Err(AppError::DaemonUnavailable(_)) => {
+                println!(
+                    "⚠️ Daemon unavailable; falling back to direct DB access (data may be stale)"
+                );
+                let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
+                db.list_summaries(&query).await?
+            }
+            Err(e) => return Err(e),
+        }
     };
+
+    sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
     if sessions.is_empty() {
         println!("No sessions. Start one with: oly start --detach <cmd>");
@@ -73,13 +93,18 @@ fn print_session_row(
     let created = session
         .created_at
         .to_rfc3339_opts(SecondsFormat::Secs, true);
+    let status = if session.input_needed {
+        format!("{}!", session.status)
+    } else {
+        session.status.clone()
+    };
     println!(
         "{:<7} {:<9} {:<12} {:<6} {:<6} {:<21} {:<12} {}",
-        session.id, session.status, command, age, pid, created, title, args
+        session.id, status, command, age, pid, created, title, args
     );
 }
 
-pub fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
+fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
     let since = parse_datetime_arg(args.since.as_deref(), "since")?;
     let until = parse_datetime_arg(args.until.as_deref(), "until")?;
 
@@ -93,6 +118,9 @@ pub fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
         since,
         until,
         limit: args.limit.max(1),
+        offset: 0,
+        sort: Some("created_at".to_string()),
+        order: Some("desc".to_string()),
     })
 }
 

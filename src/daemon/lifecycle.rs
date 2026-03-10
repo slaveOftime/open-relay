@@ -104,7 +104,7 @@ async fn wait_for_daemon_ready(config: &AppConfig, timeout: std::time::Duration)
     ))
 }
 
-fn spawn_detached(no_auth: bool, no_web: bool, auth_hash: Option<&str>) -> Result<()> {
+fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
@@ -118,16 +118,16 @@ fn spawn_detached(no_auth: bool, no_web: bool, auth_hash: Option<&str>) -> Resul
     } else if let Some(hash) = auth_hash {
         cmd.arg("--auth-hash-internal").arg(hash);
     }
-    if no_web {
-        cmd.arg("--no-web");
+    if no_http {
+        cmd.arg("--no-http");
     }
     cmd.spawn()?;
     Ok(())
 }
 
-async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_web: bool) -> Result<()> {
+async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: bool) -> Result<()> {
     info!(
-        no_web,
+        no_http,
         auth_enabled = auth_hash.is_some(),
         state_dir = ?config.state_dir,
         sessions_dir = ?config.sessions_dir,
@@ -207,7 +207,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_web: bo
     let listener = ipc::bind(&config)?;
     info!(socket_file = ?config.socket_file, "ipc listener bound");
     let (store, startup_failed_sessions) = {
-        let mut store = SessionStore::new(config.session_eviction_seconds).with_db(db.clone());
+        let mut store = SessionStore::new(config.session_eviction_seconds, db.clone());
         let startup_failed_sessions = store.load_running_stopping_sessions().await;
         (store, startup_failed_sessions)
     };
@@ -217,7 +217,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_web: bo
     let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(512);
 
     let auth_state = auth_hash.map(AuthState::new);
-    if !no_web {
+    if !no_http {
         let http_state = http::AppState {
             store: session_store.clone(),
             config: config.clone(),

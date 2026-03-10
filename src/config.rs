@@ -44,31 +44,39 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    pub ring_buffer_lines: usize,
-    pub silence_seconds: u64,
-    pub stop_grace_seconds: u64,
-    pub session_eviction_seconds: u64,
     pub http_port: u16,
+    pub ring_buffer_lines: usize,
+    pub stop_grace_seconds: u64,
     pub prompt_patterns: Vec<String>,
+    pub web_push_subject: Option<String>,
     pub web_push_vapid_public_key: Option<String>,
     pub web_push_vapid_private_key: Option<String>,
-    pub web_push_subject: Option<String>,
     pub state_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub db_file: PathBuf,
+    pub lock_file: PathBuf,
     pub socket_name: String,
     pub socket_file: PathBuf,
-    pub lock_file: PathBuf,
+    pub silence_seconds: u64,
+    pub session_eviction_seconds: u64,
+    pub max_running_sessions: usize,
+    /// Optional path to an executable invoked on every local OS notification.
+    /// If this is provided, the default local notification mechanism is disabled and this hook is used instead.
+    pub notification_hook: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct AppConfigOverrides {
-    session_eviction_seconds: Option<u64>,
     http_port: Option<u16>,
     prompt_patterns: Option<Vec<String>>,
+    web_push_subject: Option<String>,
     web_push_vapid_public_key: Option<String>,
     web_push_vapid_private_key: Option<String>,
-    web_push_subject: Option<String>,
+    max_running_sessions: Option<usize>,
+    session_eviction_seconds: Option<u64>,
+    /// Path to an executable invoked on every local OS notification.
+    /// Event data is provided via environment variables (OLY_EVENT_*).
+    notification_hook: Option<String>,
 }
 
 impl AppConfig {
@@ -77,7 +85,7 @@ impl AppConfig {
         ensure_config_file(&state_dir);
         let sessions_dir = state_dir.join("sessions");
         let overrides = load_overrides(&state_dir);
-        let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(900).max(1);
+        let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
         let http_port = overrides.http_port.unwrap_or(15443);
         let prompt_patterns = overrides.prompt_patterns.unwrap_or_else(|| {
             DEFAULT_PROMPT_PATTERNS
@@ -99,6 +107,11 @@ impl AppConfig {
             .and_then(normalize_optional_string)
             .unwrap_or_else(|| "open-relay.oly.sock".to_string());
 
+        let max_running_sessions = overrides.max_running_sessions.unwrap_or(50);
+        let notification_hook = overrides
+            .notification_hook
+            .and_then(normalize_optional_string);
+
         Ok(Self {
             ring_buffer_lines: 10_000,
             silence_seconds: 10,
@@ -115,6 +128,8 @@ impl AppConfig {
             db_file: state_dir.join("oly.db"),
             state_dir,
             sessions_dir,
+            max_running_sessions,
+            notification_hook,
         })
     }
 }

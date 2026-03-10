@@ -78,7 +78,7 @@ async fn run() -> Result<()> {
             client::run_list(&config, list_args, node).await
         }
 
-        Commands::Start(start_args) | Commands::StartAlias(start_args) => {
+        Commands::Start(start_args) => {
             let mut iter = start_args.cmd_and_args.into_iter();
             let cmd = iter.next().unwrap(); // guaranteed by num_args = 1..
             let args: Vec<String> = iter.collect();
@@ -98,6 +98,7 @@ async fn run() -> Result<()> {
                 cwd,
                 rows,
                 cols,
+                disable_notifications: start_args.disable_notifications,
             };
             let request = node_wrap(start_args.node, inner);
             match ipc::send_request(&config, request).await? {

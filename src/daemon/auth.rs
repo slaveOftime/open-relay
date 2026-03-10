@@ -26,15 +26,15 @@ pub(super) fn prompt_and_hash_password() -> Result<String> {
 /// Print a risk warning for `--no-auth` mode and require explicit confirmation.
 pub(super) fn confirm_no_auth_risk() -> Result<()> {
     eprintln!();
-    eprintln!("  🚨🚨🚨  WARNING: --no-auth disables HTTP authentication  ⚠️⚠️⚠️");
+    eprintln!("🚨🚨🚨  WARNING: --no-auth disables HTTP authentication  ⚠️⚠️⚠️");
     eprintln!();
-    eprintln!("  Anyone who can reach the HTTP port will have FULL CONTROL over");
-    eprintln!("  all sessions, including the ability to send arbitrary input.");
+    eprintln!("Anyone who can reach the HTTP port will have FULL CONTROL over");
+    eprintln!("all sessions, including the ability to send arbitrary input.");
     eprintln!();
-    eprintln!("  Only proceed if you are CERTAIN the port is not publicly");
-    eprintln!("  accessible (e.g. behind a secure gateway or firewall).");
+    eprintln!("Only proceed if you are CERTAIN the port is not publicly");
+    eprintln!("accessible (e.g. behind a secure gateway or firewall).");
     eprintln!();
-    eprint!("  Type 'yes' to confirm and continue: ");
+    eprint!("Type 'yes' to confirm and continue: ");
     std::io::stderr().flush().ok();
 
     let mut input = String::new();

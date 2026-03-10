@@ -6,13 +6,14 @@ use std::{
 };
 
 use chrono::Utc;
-use tracing;
+use tracing::warn;
 
 use crate::{
     config::AppConfig,
     db::Database,
-    error::Result,
+    error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
+    session::SessionLiveSummary,
 };
 
 use super::{
@@ -20,37 +21,30 @@ use super::{
     persist::{append_event, append_resize_event, current_output_offset, format_age},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
+
 pub struct SessionStore {
     sessions: HashMap<String, Arc<Mutex<SessionRuntime>>>,
     evicted_sessions: HashMap<String, Instant>,
     eviction_ttl: Duration,
-    /// Metadata for sessions that have been evicted from memory or loaded from DB.
-    history: HashMap<String, SessionMeta>,
-    /// SQLite database handle.  `None` in unit tests.
-    db: Option<Arc<Database>>,
+    db: Arc<Database>,
 }
 
-impl Default for SessionStore {
-    fn default() -> Self {
-        Self::new(900)
-    }
+#[derive(Debug, Clone)]
+pub struct SilentCandidate {
+    pub session_id: String,
+    pub raw_excerpt: String,
+    pub output_epoch: Instant,
+    pub notifications_enabled: bool,
 }
 
 impl SessionStore {
-    pub fn new(eviction_seconds: u64) -> Self {
+    pub fn new(eviction_seconds: u64, db: Arc<Database>) -> Self {
         Self {
             sessions: HashMap::new(),
             evicted_sessions: HashMap::new(),
             eviction_ttl: Duration::from_secs(eviction_seconds.max(1)),
-            history: HashMap::new(),
-            db: None,
+            db,
         }
-    }
-
-    /// Attach a database handle.  Call this once after construction in production.
-    pub fn with_db(mut self, db: Arc<Database>) -> Self {
-        self.db = Some(db);
-        self
     }
 
     /// Load session history from the SQLite database on daemon startup.
@@ -59,9 +53,7 @@ impl SessionStore {
     /// persisted back to SQLite, and returned so callers can emit user-facing
     /// startup notifications.
     pub async fn load_running_stopping_sessions(&mut self) -> Vec<SessionMeta> {
-        let Some(db) = self.db.clone() else {
-            return Vec::new();
-        };
+        let db = self.db.clone();
 
         let mut startup_failed = Vec::new();
 
@@ -70,7 +62,7 @@ impl SessionStore {
             .await
         {
             Ok(rows) => {
-                for (id, mut meta) in rows {
+                for (_, mut meta) in rows {
                     meta.status = SessionStatus::Failed;
                     meta.exit_code = None;
                     if let Err(err) = db.update_session(&meta).await {
@@ -80,11 +72,7 @@ impl SessionStore {
                             "failed to persist startup stale-session reconciliation"
                         );
                     }
-                    startup_failed.push(meta.clone());
-
-                    if !self.sessions.contains_key(&id) {
-                        self.history.insert(id, meta);
-                    }
+                    startup_failed.push(meta);
                 }
             }
             Err(err) => {
@@ -92,33 +80,25 @@ impl SessionStore {
             }
         }
 
-        match db
-            .load_sessions_with_status(&[
-                SessionStatus::Created,
-                SessionStatus::Stopped,
-                SessionStatus::Failed,
-            ])
-            .await
-        {
-            Ok(rows) => {
-                for (id, meta) in rows {
-                    if !self.sessions.contains_key(&id) {
-                        self.history.insert(id, meta);
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(%err, "failed to load startup historical-status sessions from DB");
-            }
-        }
-
         startup_failed
     }
 
     pub async fn start_session(&mut self, config: &AppConfig, spec: StartSpec) -> Result<String> {
-        let id = generate_session_id(|candidate| {
-            self.sessions.contains_key(candidate) || self.history.contains_key(candidate)
-        });
+        let running_count = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.lock()
+                    .map(|rt| matches!(rt.meta.status, SessionStatus::Running))
+                    .unwrap_or(false)
+            })
+            .count();
+
+        if running_count >= config.max_running_sessions {
+            return Err(AppError::MaxSessionsReached(config.max_running_sessions));
+        }
+
+        let id = generate_session_id(|candidate| self.sessions.contains_key(candidate));
 
         let rows = spec.rows.unwrap_or(24).max(1);
         let cols = spec.cols.unwrap_or(80).max(1);
@@ -138,75 +118,44 @@ impl SessionStore {
             exit_code: None,
         };
 
-        let session_dir = config.sessions_dir.join(&id);
-        let runtime = spawn_session(config, &mut meta, session_dir.clone(), rows, cols)?;
-        self.sessions.insert(id.clone(), runtime);
+        self.db.insert_session(&meta).await?;
 
-        if let Some(db) = &self.db {
-            if let Err(err) = db.insert_session(&meta).await {
-                tracing::error!(%err, session_id = id, "failed to persist new session to DB");
-            }
-        }
+        let session_dir = config.sessions_dir.join(&id);
+        let runtime = spawn_session(
+            config,
+            &mut meta,
+            session_dir,
+            rows,
+            cols,
+            spec.notifications_enabled,
+        )?;
+
+        self.db.update_session(&meta).await?;
+
+        self.sessions.insert(id.clone(), runtime);
 
         Ok(id)
     }
 
-    pub async fn list_summaries(&mut self, query: &ListQuery) -> Vec<SessionSummary> {
+    pub async fn list_summaries(&mut self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
+        let mut sessions = self.db.list_summaries(query).await?;
+
         self.prune_evicted_sessions().await;
+        for runtime in self.sessions.values() {
+            if let Ok(mut rt) = runtime.lock() {
+                if let Some(session) = sessions.iter_mut().find(|s| s.id == rt.meta.id) {
+                    rt.refresh_status();
 
-        let entries = self
-            .sessions
-            .values()
-            .filter_map(|runtime| {
-                let mut rt = runtime.lock().ok()?;
-                rt.refresh_status();
-                let input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
-                    && rt.notified_output_epoch.is_some()
-                    && rt.notified_output_epoch == rt.last_output_at;
-                Some((rt.meta.clone(), input_needed))
-            })
-            .collect::<Vec<_>>();
+                    session.input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
+                        && rt.notified_output_epoch.is_some()
+                        && rt.notified_output_epoch == rt.last_output_at;
+                }
+            } else {
+                warn!("failed to lock session runtime for summary refresh");
+            }
+        }
 
-        let mut summaries = entries
-            .into_iter()
-            .map(|(meta, input_needed)| SessionSummary {
-                id: meta.id,
-                title: meta.title,
-                command: meta.command,
-                args: meta.args,
-                pid: meta.pid,
-                status: meta.status.as_str().to_string(),
-                age: format_age(meta.created_at, meta.started_at, meta.ended_at),
-                created_at: meta.created_at,
-                cwd: meta.cwd,
-                input_needed,
-            })
-            .collect::<Vec<_>>();
-
-        // Also include sessions that were evicted from memory or loaded from disk.
-        let extras: Vec<SessionSummary> = {
-            let active_ids: std::collections::HashSet<&str> =
-                summaries.iter().map(|s| s.id.as_str()).collect();
-            self.history
-                .values()
-                .filter(|meta| !active_ids.contains(meta.id.as_str()))
-                .map(|meta| SessionSummary {
-                    id: meta.id.clone(),
-                    title: meta.title.clone(),
-                    command: meta.command.clone(),
-                    args: meta.args.clone(),
-                    pid: meta.pid,
-                    status: meta.status.as_str().to_string(),
-                    age: format_age(meta.created_at, meta.started_at, meta.ended_at),
-                    created_at: meta.created_at,
-                    cwd: meta.cwd.clone(),
-                    input_needed: false,
-                })
-                .collect()
-        };
-        summaries.extend(extras);
-
-        query.apply(summaries)
+        Ok(sessions)
     }
 
     pub fn get_summary(&mut self, id: &str) -> Option<SessionSummary> {
@@ -230,6 +179,39 @@ impl SessionStore {
         })
     }
 
+    /// Returns summaries for all sessions that are currently held in memory
+    /// (live or recently evicted), without touching the database.
+    /// Used by the SSE session poller to avoid a DB query every 500 ms.
+    pub fn list_live_summaries(&mut self) -> Vec<SessionLiveSummary> {
+        let mut out = Vec::with_capacity(self.sessions.len());
+        for runtime in self.sessions.values() {
+            if let Ok(mut rt) = runtime.lock() {
+                rt.refresh_status();
+                let input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
+                    && rt.notified_output_epoch.is_some()
+                    && rt.notified_output_epoch == rt.last_output_at;
+                out.push(SessionLiveSummary {
+                    last_output_at: rt.last_output_at,
+                    summary: SessionSummary {
+                        id: rt.meta.id.clone(),
+                        title: rt.meta.title.clone(),
+                        command: rt.meta.command.clone(),
+                        args: rt.meta.args.clone(),
+                        pid: rt.meta.pid,
+                        status: rt.meta.status.as_str().to_string(),
+                        age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
+                        created_at: rt.meta.created_at,
+                        cwd: rt.meta.cwd.clone(),
+                        input_needed,
+                    },
+                });
+            } else {
+                tracing::warn!("failed to lock session runtime in list_live_summaries");
+            }
+        }
+        out
+    }
+
     pub fn get_exit_code(&self, id: &str) -> Option<i32> {
         let runtime = self.sessions.get(id)?;
         let rt = runtime.lock().ok()?;
@@ -242,7 +224,7 @@ impl SessionStore {
     ) -> std::result::Result<(Vec<String>, usize, bool, bool, bool), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
         let lines = rt.ring.iter().cloned().collect();
@@ -266,7 +248,7 @@ impl SessionStore {
     ) -> std::result::Result<(Vec<String>, usize, bool, bool, bool), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
         let lines = rt.output_lines.get(cursor..).unwrap_or(&[]).to_vec();
@@ -295,7 +277,7 @@ impl SessionStore {
 
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         // When the child process has enabled DECCKM (application cursor key
         // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
@@ -323,7 +305,7 @@ impl SessionStore {
             rt.last_input_at = Some(Instant::now());
             Ok(())
         } else {
-            Err(SessionLookupError::NotFound)
+            Err(SessionLookupError::Evicted)
         }
     }
 
@@ -335,7 +317,7 @@ impl SessionStore {
     ) -> std::result::Result<(), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::NotFound);
+            return Err(SessionLookupError::Evicted);
         };
         rt.mark_attach_activity();
         if rt.resize_pty(rows, cols) {
@@ -343,7 +325,7 @@ impl SessionStore {
             let _ = append_resize_event(&rt.dir, offset, rows, cols);
             Ok(())
         } else {
-            Err(SessionLookupError::NotFound)
+            Err(SessionLookupError::Evicted)
         }
     }
 
@@ -442,13 +424,13 @@ impl SessionStore {
             return Err(SessionLookupError::Evicted);
         }
 
-        Err(SessionLookupError::NotFound)
+        Err(SessionLookupError::NotRunning)
     }
 
     async fn prune_evicted_sessions(&mut self) {
         let now = Instant::now();
         let mut to_persist: Vec<SessionMeta> = Vec::new();
-        let mut evicted: Vec<(String, SessionMeta)> = Vec::new();
+        let mut evicted_ids: Vec<String> = Vec::new();
 
         self.sessions.retain(|id, runtime| {
             let Ok(mut rt) = runtime.lock() else {
@@ -471,23 +453,20 @@ impl SessionStore {
             };
             if now.duration_since(completed_at) >= self.eviction_ttl {
                 let _ = append_event(&rt.dir, "session evicted from memory");
-                evicted.push((id.clone(), rt.meta.clone()));
+                evicted_ids.push(id.clone());
                 return false;
             }
             true
         });
 
         // Persist completed sessions outside the borrow of `self.sessions`.
-        if let Some(db) = &self.db {
-            for meta in to_persist {
-                if let Err(err) = db.update_session(&meta).await {
-                    tracing::error!(%err, session_id = meta.id, "failed to persist completed session");
-                }
+        for meta in to_persist {
+            if let Err(err) = self.db.update_session(&meta).await {
+                tracing::error!(%err, session_id = meta.id, "failed to persist completed session");
             }
         }
 
-        for (id, meta) in evicted {
-            self.history.insert(id.clone(), meta);
+        for id in evicted_ids {
             self.evicted_sessions.insert(id, now);
         }
 
@@ -499,12 +478,13 @@ impl SessionStore {
             .retain(|_, evicted_at| now.duration_since(*evicted_at) < self.eviction_ttl);
     }
 
-    /// Returns `(session_id, raw_excerpt, output_epoch)`
+    /// Returns silent-notification candidates with session id, raw excerpt,
+    /// and output epoch.
     pub fn silent_candidates(
         &self,
         suppression_window: Duration,
         min_notification_interval: Duration,
-    ) -> Vec<(String, String, Instant)> {
+    ) -> Vec<SilentCandidate> {
         let now = Instant::now();
         self.sessions
             .values()
@@ -539,14 +519,21 @@ impl SessionStore {
                 if rt.notified_output_epoch == Some(last_output) {
                     return None;
                 }
-                // Build excerpt from the last 10 ring entries.
-                let n = rt.ring.len();
-                let excerpt: String = rt.ring.iter().skip(n.saturating_sub(10)).cloned().collect();
-                if excerpt.trim().is_empty() {
-                    return None;
-                }
 
-                Some((rt.meta.id.clone(), excerpt, last_output))
+                let n = rt.ring.len();
+                let limit = 20;
+                let mut parser = vt100::Parser::new(limit, 2000, 0);
+                for ring in rt.ring.iter().skip(n.saturating_sub(limit as usize)) {
+                    parser.process(ring.as_bytes());
+                }
+                let excerpt = parser.screen().contents();
+
+                Some(SilentCandidate {
+                    session_id: rt.meta.id.clone(),
+                    raw_excerpt: excerpt,
+                    output_epoch: last_output,
+                    notifications_enabled: rt.notifications_enabled,
+                })
             })
             .collect()
     }
@@ -602,6 +589,7 @@ mod tests {
             ring.push_back(excerpt.to_string());
         }
 
+        let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
@@ -610,9 +598,9 @@ mod tests {
             ring_limit: 100,
             // We only need a writer stub; use a Vec sink.
             writer: Box::new(std::io::sink()),
-            child: make_dummy_child(),
+            child,
             completed_at: None,
-            _pty_master: None,
+            _pty_master: Some(pty_master),
             persisted: false,
             last_output_at,
             last_input_at: None,
@@ -623,21 +611,25 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }))
     }
 
-    fn make_dummy_child() -> super::super::runtime::RuntimeChild {
-        // We cannot construct a real PTY child in unit tests.
-        // Use the internal enum variant with a stub. Since RuntimeChild::Pty wraps
-        // a Box<dyn portable_pty::Child>, we need a concrete type.
-        // Work around by constructing one via a tiny forked process.
-        // On all platforms `cmd /c echo x` / `true` runs quickly and exits.
+    fn make_dummy_child() -> (
+        super::super::runtime::RuntimeChild,
+        Box<dyn portable_pty::MasterPty + Send>,
+    ) {
+        // Spawn a long-running process so refresh_status() sees it still alive.
+        // We must also return the PTY master to keep the child alive — dropping
+        // the master sends EOF/HUP to the child, which would cause it to exit.
         #[cfg(target_os = "windows")]
         let mut cmd = portable_pty::CommandBuilder::new("cmd.exe");
         #[cfg(target_os = "windows")]
-        cmd.args(["/c", "exit", "0"]);
+        cmd.args(["/c", "ping", "127.0.0.1", "-n", "120"]);
         #[cfg(not(target_os = "windows"))]
-        let mut cmd = portable_pty::CommandBuilder::new("true");
+        let mut cmd = portable_pty::CommandBuilder::new("sleep");
+        #[cfg(not(target_os = "windows"))]
+        cmd.args(["60"]);
 
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
@@ -648,13 +640,31 @@ mod tests {
             })
             .expect("openpty in test");
         let child = pty.slave.spawn_command(cmd).expect("spawn in test");
-        super::super::runtime::RuntimeChild::Pty(child)
+        (super::super::runtime::RuntimeChild::Pty(child), pty.master)
+    }
+
+    async fn make_test_db() -> Arc<Database> {
+        // Use a unique per-test file-based DB in the temp directory so
+        // concurrent tests don't interfere with each other.
+        let path = std::env::temp_dir().join(format!(
+            "oly_test_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        Arc::new(
+            Database::open(&path, std::env::temp_dir())
+                .await
+                .expect("open test DB"),
+        )
     }
 
     fn store_with(
         runtimes: Vec<Arc<Mutex<super::super::runtime::SessionRuntime>>>,
+        db: Arc<Database>,
     ) -> SessionStore {
-        let mut store = SessionStore::new(900);
+        let mut store = SessionStore::new(900, db);
         for rt in runtimes {
             let id = rt.lock().unwrap().meta.id.clone();
             store.sessions.insert(id, rt);
@@ -666,8 +676,8 @@ mod tests {
     // silent_candidates
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_silent_candidates_returns_running_past_silence() {
+    #[tokio::test]
+    async fn test_silent_candidates_returns_running_past_silence() {
         let silence = Duration::from_secs(5);
         let min_interval = Duration::from_secs(10);
         // last output was 10s ago → past silence
@@ -677,14 +687,14 @@ mod tests {
             "password: ",
             Some(Duration::from_secs(10)),
         );
-        let store = store_with(vec![rt]);
+        let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, "abc1234");
+        assert_eq!(candidates[0].session_id, "abc1234");
     }
 
-    #[test]
-    fn test_silent_candidates_allows_recent_output_when_not_suppressed() {
+    #[tokio::test]
+    async fn test_silent_candidates_allows_recent_output_when_not_suppressed() {
         let silence = Duration::from_secs(5);
         let min_interval = Duration::from_secs(10);
         // Current implementation only requires an output epoch to exist.
@@ -694,14 +704,14 @@ mod tests {
             "prompt> ",
             Some(Duration::from_millis(500)),
         );
-        let store = store_with(vec![rt]);
+        let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].0, "abc1234");
+        assert_eq!(candidates[0].session_id, "abc1234");
     }
 
-    #[test]
-    fn test_silent_candidates_ignores_non_running_session() {
+    #[tokio::test]
+    async fn test_silent_candidates_ignores_non_running_session() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -710,17 +720,17 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(10)),
         );
-        let store = store_with(vec![rt]);
+        let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(candidates.is_empty());
     }
 
-    #[test]
-    fn test_silent_candidates_ignores_no_output_yet() {
+    #[tokio::test]
+    async fn test_silent_candidates_ignores_no_output_yet() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime("abc1234", SessionStatus::Running, "prompt> ", None);
-        let store = store_with(vec![rt]);
+        let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(candidates.is_empty());
     }
@@ -729,8 +739,8 @@ mod tests {
     // mark_notified + output-epoch gating
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_mark_notified_suppresses_until_new_output() {
+    #[tokio::test]
+    async fn test_mark_notified_suppresses_until_new_output() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -739,15 +749,16 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         // First call returns a candidate with an output epoch.
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
-        let (id, _, epoch) = &first[0];
+        let id = &first[0].session_id;
+        let epoch = first[0].output_epoch;
 
         // Mark as notified at this output epoch.
-        store.mark_notified(id, *epoch, Instant::now());
+        store.mark_notified(id, epoch, Instant::now());
 
         // Second call: same output epoch → suppressed.
         let second = store.silent_candidates(silence, min_interval);
@@ -757,8 +768,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mark_notified_allows_after_new_output() {
+    #[tokio::test]
+    async fn test_mark_notified_allows_after_new_output() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -767,12 +778,13 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
-        let (id, _, epoch) = &first[0];
-        store.mark_notified(id, *epoch, Instant::now());
+        let id = &first[0].session_id;
+        let epoch = first[0].output_epoch;
+        store.mark_notified(id, epoch, Instant::now());
 
         // Simulate new output by advancing last_output_at on the runtime.
         {
@@ -789,8 +801,8 @@ mod tests {
         assert_eq!(after_output.len(), 1);
     }
 
-    #[test]
-    fn test_mark_notified_stays_suppressed_without_new_output() {
+    #[tokio::test]
+    async fn test_mark_notified_stays_suppressed_without_new_output() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -799,12 +811,13 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
-        let (id, _, epoch) = &first[0];
-        store.mark_notified(id, *epoch, Instant::now());
+        let id = &first[0].session_id;
+        let epoch = first[0].output_epoch;
+        store.mark_notified(id, epoch, Instant::now());
 
         // Same output epoch -> suppressed.
         let suppressed = store.silent_candidates(silence, min_interval);
@@ -824,16 +837,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mark_notified_on_unknown_id_is_noop() {
-        let mut store = SessionStore::new(900);
+    #[tokio::test]
+    async fn test_mark_notified_on_unknown_id_is_noop() {
+        let mut store = SessionStore::new(900, make_test_db().await);
         // Should not panic.
         let now = Instant::now();
         store.mark_notified("does_not_exist", now, now);
     }
 
-    #[test]
-    fn test_silent_candidates_suppressed_during_recent_attach_activity() {
+    #[tokio::test]
+    async fn test_silent_candidates_suppressed_during_recent_attach_activity() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -847,7 +860,7 @@ mod tests {
             let mut locked = rt.lock().unwrap();
             locked.last_attach_activity_at = Some(Instant::now());
         }
-        let store = store_with(vec![rt]);
+        let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(
             candidates.is_empty(),
@@ -862,8 +875,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_silent_candidates_drops_short_age_notifications() {
+    #[tokio::test]
+    async fn test_silent_candidates_drops_short_age_notifications() {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -876,7 +889,7 @@ mod tests {
             let mut locked = rt.lock().unwrap();
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
-        let store = store_with(vec![rt]);
+        let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(
             candidates.is_empty(),
@@ -921,6 +934,7 @@ mod tests {
             pid: None,
             exit_code: None,
         };
+        let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
@@ -928,9 +942,9 @@ mod tests {
             ring: VecDeque::new(),
             ring_limit: 100,
             writer: Box::new(CaptureWriter(buf)),
-            child: make_dummy_child(),
+            child,
             completed_at: None,
-            _pty_master: None,
+            _pty_master: Some(pty_master),
             persisted: false,
             last_output_at: None,
             last_input_at: None,
@@ -941,6 +955,7 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }))
     }
 
@@ -968,6 +983,7 @@ mod tests {
         for line in &lines {
             ring.push_back(line.clone());
         }
+        let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
@@ -975,9 +991,9 @@ mod tests {
             ring,
             ring_limit: 100,
             writer: Box::new(std::io::sink()),
-            child: make_dummy_child(),
+            child,
             completed_at: None,
-            _pty_master: None,
+            _pty_master: Some(pty_master),
             persisted: false,
             last_output_at: None,
             last_input_at: None,
@@ -988,7 +1004,61 @@ mod tests {
             bracketed_paste_mode: false,
             pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            notifications_enabled: true,
         }))
+    }
+
+    fn make_test_config(max_running_sessions: usize) -> AppConfig {
+        use std::path::PathBuf;
+        AppConfig {
+            ring_buffer_lines: 10_000,
+            silence_seconds: 10,
+            stop_grace_seconds: 5,
+            session_eviction_seconds: 15,
+            http_port: 0,
+            prompt_patterns: vec![],
+            web_push_vapid_public_key: None,
+            web_push_vapid_private_key: None,
+            web_push_subject: None,
+            state_dir: PathBuf::from("."),
+            sessions_dir: PathBuf::from("."),
+            db_file: PathBuf::from("."),
+            socket_name: "test.sock".into(),
+            socket_file: PathBuf::from("."),
+            lock_file: PathBuf::from("."),
+            max_running_sessions,
+            notification_hook: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_session_enforces_limit() {
+        let config = make_test_config(1);
+        // Create 1 running session
+        let rt = make_runtime("s1", SessionStatus::Running, "", None);
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        // Try to start a 2nd session
+        let spec = StartSpec {
+            title: None,
+            cmd: "echo".into(),
+            args: vec![],
+            cwd: None,
+            rows: None,
+            cols: None,
+            notifications_enabled: true,
+        };
+
+        let result = store.start_session(&config, spec).await;
+
+        // Assert it fails with MaxSessionsReached
+        assert!(result.is_err());
+        match result {
+            Err(crate::error::AppError::MaxSessionsReached(limit)) => {
+                assert_eq!(limit, 1);
+            }
+            _ => panic!("Expected MaxSessionsReached error, got {:?}", result),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -999,7 +1069,7 @@ mod tests {
     async fn test_attach_input_writes_data_to_writer() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let rt = make_runtime_writable("inp0001", SessionStatus::Running, buf.clone());
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0001", "hello\r")
@@ -1018,7 +1088,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let rt = make_runtime_writable("inp0002", SessionStatus::Running, buf.clone());
         let rt_clone = rt.clone();
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0002", "x")
@@ -1041,7 +1111,7 @@ mod tests {
             let mut locked = rt.lock().unwrap();
             locked.app_cursor_keys = true;
         }
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0003", "\x1b[A")
@@ -1063,7 +1133,7 @@ mod tests {
             let mut locked = rt.lock().unwrap();
             locked.app_cursor_keys = true;
         }
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         // Send all four arrow sequences at once.
         store
@@ -1083,7 +1153,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let rt = make_runtime_writable("inp0005", SessionStatus::Running, buf.clone());
         // app_cursor_keys is false by default.
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0005", "\x1b[A\x1b[B")
@@ -1099,7 +1169,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_input_not_found_for_unknown_session() {
-        let mut store = SessionStore::new(900);
+        let mut store = SessionStore::new(900, make_test_db().await);
         let result = store.attach_input("no_such_id", "data").await;
         assert!(
             result.is_err(),
@@ -1108,14 +1178,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // attach_snapshot — marks attach activity, returns ring + cursor
+    // attach_snapshot — returns ring + cursor (does not mark attach activity)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_attach_snapshot_marks_attach_activity() {
         let rt = make_runtime("snap001", SessionStatus::Running, "$ prompt", None);
         let rt_clone = rt.clone();
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_snapshot("snap001")
@@ -1124,15 +1194,15 @@ mod tests {
 
         let locked = rt_clone.lock().unwrap();
         assert!(
-            locked.last_attach_activity_at.is_some(),
-            "attach_snapshot should mark attach activity"
+            locked.last_attach_activity_at.is_none(),
+            "attach_snapshot should not mark attach activity"
         );
     }
 
     #[tokio::test]
     async fn test_attach_snapshot_returns_ring_contents() {
         let rt = make_runtime("snap002", SessionStatus::Running, "output line", None);
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         let (lines, cursor, running, _, _) = store
             .attach_snapshot("snap002")
@@ -1146,13 +1216,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_snapshot_not_found_for_unknown_session() {
-        let mut store = SessionStore::new(900);
+        let mut store = SessionStore::new(900, make_test_db().await);
         let result = store.attach_snapshot("no_such_id").await;
         assert!(result.is_err(), "snapshot of unknown session should fail");
     }
 
     // -----------------------------------------------------------------------
-    // attach_poll — marks attach activity, returns lines from cursor
+    // attach_poll — returns lines from cursor (does not mark attach activity)
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1162,7 +1232,7 @@ mod tests {
             vec!["line1\n".to_string(), "line2\n".to_string()],
         );
         let rt_clone = rt.clone();
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_poll("poll001", 0)
@@ -1171,8 +1241,8 @@ mod tests {
 
         let locked = rt_clone.lock().unwrap();
         assert!(
-            locked.last_attach_activity_at.is_some(),
-            "attach_poll should mark attach activity"
+            locked.last_attach_activity_at.is_none(),
+            "attach_poll should not mark attach activity"
         );
     }
 
@@ -1187,7 +1257,7 @@ mod tests {
                 "line3\n".to_string(),
             ],
         );
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         let (lines, next_cursor, running, _, _) = store
             .attach_poll("poll002", 2)
@@ -1209,7 +1279,7 @@ mod tests {
             "poll003",
             vec!["line0\n".to_string(), "line1\n".to_string()],
         );
-        let mut store = store_with(vec![rt]);
+        let mut store = store_with(vec![rt], make_test_db().await);
 
         let (lines, next_cursor, _, _, _) = store
             .attach_poll("poll003", 2)
@@ -1222,7 +1292,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_poll_not_found_for_unknown_session() {
-        let mut store = SessionStore::new(900);
+        let mut store = SessionStore::new(900, make_test_db().await);
         let result = store.attach_poll("no_such_id", 0).await;
         assert!(result.is_err(), "poll of unknown session should fail");
     }
