@@ -1,0 +1,16 @@
+PackageIdentifier: Slaveoftime.oly
+PackageVersion: 0.1.0
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.0.0
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: oly.exe
+    PortableCommandAlias: oly
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/slaveOftime/open-relay/releases/download/v0.1.0/oly-windows-amd64.zip
+    InstallerSha256: WINGET_SHA256_WINDOWS_AMD64
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -1,0 +1,24 @@
+PackageIdentifier: Slaveoftime.oly
+PackageVersion: 0.1.0
+PackageName: oly
+Publisher: slaveOftime
+PublisherUrl: https://github.com/slaveOftime
+PublisherSupportUrl: https://github.com/slaveOftime/open-relay/issues
+PrivacyUrl: https://github.com/slaveOftime/open-relay
+Author: slaveOftime
+PackageUrl: https://github.com/slaveOftime/open-relay
+License: MIT
+LicenseUrl: https://github.com/slaveOftime/open-relay/blob/main/LICENSE
+Copyright: Copyright (c) slaveOftime
+ShortDescription: Session-persistent PTY daemon for long-running CLI agents
+Description: |-
+  oly keeps your CLI agent alive after you close the terminal,
+  notifies you when something needs a human, and lets you intervene from anywhere.
+Tags:
+  - cli
+  - agent
+  - pty
+  - daemon
+  - terminal
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
