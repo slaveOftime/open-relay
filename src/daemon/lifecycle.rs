@@ -121,6 +121,18 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>) -> Resu
     if no_http {
         cmd.arg("--no-http");
     }
+    // On Windows the spawned process must be placed in its own process group
+    // and detached from the parent console.  Without these flags the daemon
+    // stays in the same console process group as the launching terminal; closing
+    // that terminal sends CTRL_CLOSE_EVENT to every process in the group and
+    // kills the daemon silently.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS  (0x00000008): no console window, detached from parent console
+        // CREATE_NEW_PROCESS_GROUP (0x00000200): own signal group, won't receive Ctrl+C/Break from parent
+        cmd.creation_flags(0x00000008 | 0x00000200);
+    }
     cmd.spawn()?;
     Ok(())
 }
