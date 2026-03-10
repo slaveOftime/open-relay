@@ -2,6 +2,15 @@
 
 <p align="center"><img src="./assets/icon-demo.svg" width="160" /></p>
 
+<p align="center">
+	<video src="./assets/oly-full-demo.mp4" controls muted playsinline preload="metadata" width="960">
+		Your browser does not support embedded video.
+	</video>
+</p>
+
+<p align="center"><a href="./assets/oly-full-demo.mp4">Download or open the full demo video</a></p>
+
+
 > Run agents. Walk away. Intervene when it matters.
 
 `oly` is a session-persistent PTY daemon for long-running CLI agents (Claude Code, Gemini CLI, OpenCode, normal CLI etc.). It keeps your agent alive after you close the terminal, notifies you when something needs a human, and lets you intervene from anywhere.
@@ -33,6 +42,11 @@ You can run one agent to supervise another. When the supervisor hits something i
 ---
 
 ## Install 📦
+
+```sh
+brew tap slaveOftime/oly
+brew install oly
+```
 
 ### Pre-built Binaries
 
