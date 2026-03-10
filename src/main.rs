@@ -79,31 +79,42 @@ async fn run() -> Result<()> {
         }
 
         Commands::Start(start_args) => {
-            let mut iter = start_args.cmd_and_args.into_iter();
+            let cli::StartArgs {
+                title,
+                detach,
+                disable_notifications,
+                cwd,
+                cmd_and_args,
+                node,
+            } = start_args;
+
+            let mut iter = cmd_and_args.into_iter();
             let cmd = iter.next().unwrap(); // guaranteed by num_args = 1..
             let args: Vec<String> = iter.collect();
-            let cwd = std::env::current_dir()
-                .ok()
-                .map(|path| path.display().to_string());
-            let (rows, cols) = if start_args.detach {
+            let cwd = cwd.or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            });
+            let (rows, cols) = if detach {
                 (None, None)
             } else {
                 let (cols, rows) = terminal::size().unwrap_or((80, 24));
                 (Some(rows), Some(cols))
             };
             let inner = RpcRequest::Start {
-                title: start_args.title,
+                title,
                 cmd,
                 args,
                 cwd,
                 rows,
                 cols,
-                disable_notifications: start_args.disable_notifications,
+                disable_notifications,
             };
-            let request = node_wrap(start_args.node, inner);
+            let request = node_wrap(node, inner);
             match ipc::send_request(&config, request).await? {
                 RpcResponse::Start { session_id } => {
-                    if start_args.detach {
+                    if detach {
                         println!("{session_id}");
                         return Ok(());
                     }

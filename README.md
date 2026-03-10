@@ -109,7 +109,7 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 | Command | What it does |
 |---|---|
 | `oly daemon start` | Start background daemon |
-| `oly start [--detach] [--disable-notifications] <cmd>` | Launch session in PTY |
+| `oly start [--detach] [--disable-notifications] [--cwd DIR] <cmd>` | Launch session in PTY |
 | `oly ls` | Show sessions (supports search/status/time filters) |
 | `oly attach <id>` | Reattach (replays buffer first) |
 | `oly logs <id> [--tail N] [--wait-for-prompt]` | Read logs without attaching |

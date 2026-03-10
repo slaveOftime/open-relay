@@ -815,6 +815,49 @@ fn e2e_start_spawn_failure_exits_nonzero_with_clear_error() {
     );
 }
 
+#[test]
+fn e2e_start_respects_explicit_cwd() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_start_cwd");
+    let cwd = tmp.join("requested-cwd");
+    fs::create_dir_all(&cwd).expect("create requested cwd");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", "cd"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "pwd"];
+
+    let cwd_str = cwd.display().to_string();
+    let mut args = vec!["start", "--detach", "--cwd", cwd_str.as_str()];
+    args.extend_from_slice(cmd);
+
+    let output = oly_cmd(&tmp)
+        .args(&args)
+        .output()
+        .expect("`oly start --cwd` failed to execute");
+    assert!(
+        output.status.success(),
+        "`oly start --cwd` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert_eq!(id.len(), 7, "expected 7-char session ID, got: {id:?}");
+
+    let logged = wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains(&cwd_str),
+        Duration::from_secs(3),
+    );
+    assert!(
+        logged.is_some(),
+        "expected logs to contain cwd {cwd_str:?}.\nLogs:\n{}",
+        fetch_logs(&tmp, &id)
+    );
+}
+
 // ============================================================================
 // Test 9: interactive ops fail gracefully after session is evicted from memory
 //
