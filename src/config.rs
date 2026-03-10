@@ -44,33 +44,33 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
-    pub ring_buffer_lines: usize,
-    pub silence_seconds: u64,
-    pub stop_grace_seconds: u64,
-    pub session_eviction_seconds: u64,
     pub http_port: u16,
+    pub ring_buffer_lines: usize,
+    pub stop_grace_seconds: u64,
     pub prompt_patterns: Vec<String>,
+    pub web_push_subject: Option<String>,
     pub web_push_vapid_public_key: Option<String>,
     pub web_push_vapid_private_key: Option<String>,
-    pub web_push_subject: Option<String>,
     pub state_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub db_file: PathBuf,
+    pub lock_file: PathBuf,
     pub socket_name: String,
     pub socket_file: PathBuf,
-    pub lock_file: PathBuf,
+    pub silence_seconds: u64,
+    pub session_eviction_seconds: u64,
     pub max_running_sessions: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct AppConfigOverrides {
-    session_eviction_seconds: Option<u64>,
     http_port: Option<u16>,
     prompt_patterns: Option<Vec<String>>,
+    web_push_subject: Option<String>,
     web_push_vapid_public_key: Option<String>,
     web_push_vapid_private_key: Option<String>,
-    web_push_subject: Option<String>,
     max_running_sessions: Option<usize>,
+    session_eviction_seconds: Option<u64>,
 }
 
 impl AppConfig {
