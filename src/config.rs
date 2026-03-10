@@ -59,6 +59,7 @@ pub struct AppConfig {
     pub socket_name: String,
     pub socket_file: PathBuf,
     pub lock_file: PathBuf,
+    pub max_running_sessions: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -69,6 +70,7 @@ struct AppConfigOverrides {
     web_push_vapid_public_key: Option<String>,
     web_push_vapid_private_key: Option<String>,
     web_push_subject: Option<String>,
+    max_running_sessions: Option<usize>,
 }
 
 impl AppConfig {
@@ -99,6 +101,8 @@ impl AppConfig {
             .and_then(normalize_optional_string)
             .unwrap_or_else(|| "open-relay.oly.sock".to_string());
 
+        let max_running_sessions = overrides.max_running_sessions.unwrap_or(50);
+
         Ok(Self {
             ring_buffer_lines: 10_000,
             silence_seconds: 10,
@@ -115,6 +119,7 @@ impl AppConfig {
             db_file: state_dir.join("oly.db"),
             state_dir,
             sessions_dir,
+            max_running_sessions,
         })
     }
 }

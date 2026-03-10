@@ -11,7 +11,7 @@ use tracing::warn;
 use crate::{
     config::AppConfig,
     db::Database,
-    error::Result,
+    error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
     session::SessionLiveSummary,
 };
@@ -84,6 +84,20 @@ impl SessionStore {
     }
 
     pub async fn start_session(&mut self, config: &AppConfig, spec: StartSpec) -> Result<String> {
+        let running_count = self
+            .sessions
+            .values()
+            .filter(|s| {
+                s.lock()
+                    .map(|rt| matches!(rt.meta.status, SessionStatus::Running))
+                    .unwrap_or(false)
+            })
+            .count();
+
+        if running_count >= config.max_running_sessions {
+            return Err(AppError::MaxSessionsReached(config.max_running_sessions));
+        }
+
         let id = generate_session_id(|candidate| self.sessions.contains_key(candidate));
 
         let rows = spec.rows.unwrap_or(24).max(1);
@@ -992,6 +1006,58 @@ mod tests {
             app_cursor_keys: false,
             notifications_enabled: true,
         }))
+    }
+
+    fn make_test_config(max_running_sessions: usize) -> AppConfig {
+        use std::path::PathBuf;
+        AppConfig {
+            ring_buffer_lines: 10_000,
+            silence_seconds: 10,
+            stop_grace_seconds: 5,
+            session_eviction_seconds: 15,
+            http_port: 0,
+            prompt_patterns: vec![],
+            web_push_vapid_public_key: None,
+            web_push_vapid_private_key: None,
+            web_push_subject: None,
+            state_dir: PathBuf::from("."),
+            sessions_dir: PathBuf::from("."),
+            db_file: PathBuf::from("."),
+            socket_name: "test.sock".into(),
+            socket_file: PathBuf::from("."),
+            lock_file: PathBuf::from("."),
+            max_running_sessions,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_start_session_enforces_limit() {
+        let config = make_test_config(1);
+        // Create 1 running session
+        let rt = make_runtime("s1", SessionStatus::Running, "", None);
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        // Try to start a 2nd session
+        let spec = StartSpec {
+            title: None,
+            cmd: "echo".into(),
+            args: vec![],
+            cwd: None,
+            rows: None,
+            cols: None,
+            notifications_enabled: true,
+        };
+
+        let result = store.start_session(&config, spec).await;
+        
+        // Assert it fails with MaxSessionsReached
+        assert!(result.is_err());
+        match result {
+            Err(crate::error::AppError::MaxSessionsReached(limit)) => {
+                assert_eq!(limit, 1);
+            }
+            _ => panic!("Expected MaxSessionsReached error, got {:?}", result),
+        }
     }
 
     // -----------------------------------------------------------------------
