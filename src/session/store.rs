@@ -1027,6 +1027,7 @@ mod tests {
             socket_file: PathBuf::from("."),
             lock_file: PathBuf::from("."),
             max_running_sessions,
+            notification_hook: None,
         }
     }
 
@@ -1049,7 +1050,7 @@ mod tests {
         };
 
         let result = store.start_session(&config, spec).await;
-        
+
         // Assert it fails with MaxSessionsReached
         assert!(result.is_err());
         match result {

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use base64::Engine as _;
+use tracing::info;
 
 use crate::{
     db::Database,
@@ -19,7 +20,11 @@ pub trait NotificationChannel {
 // Local OS notifications
 // ---------------------------------------------------------------------------
 
-pub struct LocalOsNotificationChannel;
+pub struct LocalOsNotificationChannel {
+    /// Optional external command executed on every notification.
+    /// Event data is provided via `OLY_EVENT_*` environment variables.
+    pub hook: Option<String>,
+}
 
 impl LocalOsNotificationChannel {
     fn play_beep() {
@@ -27,6 +32,86 @@ impl LocalOsNotificationChannel {
         // Best-effort fallback: terminal bell.
         let _ = std::io::stdout().write_all(b"\x07");
         let _ = std::io::stdout().flush();
+    }
+
+    /// Spawn the hook process.
+    ///
+    /// The hook string is split into program + arguments using simple shell-word
+    /// rules (single-quoted, double-quoted, and unquoted tokens).  Each token
+    /// may contain `{placeholder}` substitutions that are replaced with the
+    /// corresponding event field before the process is spawned.
+    ///
+    /// Supported placeholders:
+    /// - `{kind}`           – e.g. `input_needed`
+    /// - `{summary}`        – one-line summary
+    /// - `{body}`           – notification body text
+    /// - `{session_ids}`    – comma-separated session IDs
+    /// - `{trigger_rule}`   – trigger rule name, or empty string
+    /// - `{trigger_detail}` – trigger detail, or empty string
+    ///
+    /// Event data is also available as `OLY_EVENT_*` environment variables
+    /// for scripts that prefer to read them from the environment.
+    ///
+    /// The hook runs fire-and-forget; failures are logged but do not block delivery.
+    fn run_hook(hook: &str, event: &NotificationEvent) {
+        info!(
+            session_ids = event.session_ids.join(","),
+            trigger_rule = event.trigger_rule.map(|r| r.as_str()).unwrap_or_default(),
+            trigger_detail = event.trigger_detail.as_deref().unwrap_or_default(),
+            "use notification hook"
+        );
+
+        let session_ids = event.session_ids.join(",");
+        let trigger_rule = event
+            .trigger_rule
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_default();
+        let trigger_detail = event.trigger_detail.clone().unwrap_or_default();
+
+        let tokens = match split_hook_command(hook) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(hook, "notification hook command is empty");
+                return;
+            }
+        };
+
+        let substitute = |s: String| -> String {
+            s.replace("{kind}", event.kind.as_str())
+                .replace("{summary}", &event.summary)
+                .replace("{body}", &event.body)
+                .replace("{session_ids}", &session_ids)
+                .replace("{trigger_rule}", &trigger_rule)
+                .replace("{trigger_detail}", &trigger_detail)
+        };
+
+        let mut iter = tokens.into_iter().map(substitute);
+        let program = iter
+            .next()
+            .expect("split_hook_command returned non-empty vec");
+        let args: Vec<String> = iter.collect();
+
+        let result = std::process::Command::new(&program)
+            .args(&args)
+            .env("OLY_EVENT_KIND", event.kind.as_str())
+            .env("OLY_EVENT_SUMMARY", &event.summary)
+            .env("OLY_EVENT_BODY", &event.body)
+            .env("OLY_EVENT_SESSION_IDS", &session_ids)
+            .env("OLY_EVENT_TRIGGER_RULE", &trigger_rule)
+            .env("OLY_EVENT_TRIGGER_DETAIL", &trigger_detail)
+            .spawn();
+
+        match result {
+            Ok(mut child) => {
+                // Reap in a background thread so we never block the async runtime.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(err) => {
+                tracing::warn!(hook, %err, "notification hook failed to start");
+            }
+        }
     }
 }
 
@@ -48,6 +133,10 @@ impl NotificationChannel for LocalOsNotificationChannel {
                 .map_err(|err| {
                     AppError::Protocol(format!("OS notification delivery failed: {err}"))
                 })?;
+        }
+
+        if let Some(hook) = &self.hook {
+            LocalOsNotificationChannel::run_hook(hook, event);
         }
 
         Ok(())
@@ -372,6 +461,84 @@ impl WebPushChannel {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Split a hook command string into tokens using basic shell-word rules:
+/// - Whitespace separates tokens.
+/// - Single-quoted (`'…'`) content is taken literally.
+/// - Double-quoted (`"…"`) content supports `\"` and `\\` escapes.
+/// - Outside quotes, `\` escapes the next character.
+///
+/// Returns `None` if the result is empty (blank / all-whitespace input).
+fn split_hook_command(s: &str) -> Option<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut chars = s.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            // Whitespace ends the current token (if any).
+            ' ' | '\t' | '\n' | '\r' => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut current));
+                    in_token = false;
+                }
+            }
+            // Single-quoted: everything until the closing `'` is literal.
+            '\'' => {
+                in_token = true;
+                for c in chars.by_ref() {
+                    if c == '\'' {
+                        break;
+                    }
+                    current.push(c);
+                }
+            }
+            // Double-quoted: supports `\"` and `\\`; other characters are literal.
+            '"' => {
+                in_token = true;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            if let Some(next) = chars.next() {
+                                match next {
+                                    '"' | '\\' => current.push(next),
+                                    other => {
+                                        current.push('\\');
+                                        current.push(other);
+                                    }
+                                }
+                            }
+                        }
+                        other => current.push(other),
+                    }
+                }
+            }
+            // Backslash outside quotes escapes the next character.
+            '\\' => {
+                in_token = true;
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            other => {
+                in_token = true;
+                current.push(other);
+            }
+        }
+    }
+
+    if in_token {
+        tokens.push(current);
+    }
+
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens)
+    }
+}
+
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
@@ -406,4 +573,79 @@ fn validate_vapid_subject(subject: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_hook_command;
+
+    #[test]
+    fn test_simple_tokens() {
+        assert_eq!(
+            split_hook_command("/usr/bin/notify {summary} {body}"),
+            Some(vec![
+                "/usr/bin/notify".to_string(),
+                "{summary}".to_string(),
+                "{body}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_single_quoted_arg() {
+        assert_eq!(
+            split_hook_command("/bin/sh -c 'echo {summary}'"),
+            Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo {summary}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_double_quoted_arg_with_escape() {
+        assert_eq!(
+            split_hook_command(r#"/bin/sh -c "echo \"hi\" {body}""#),
+            Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo \"hi\" {body}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_backslash_escape() {
+        assert_eq!(
+            split_hook_command(r"/path/with\ spaces/tool arg"),
+            Some(vec![
+                "/path/with spaces/tool".to_string(),
+                "arg".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_empty_and_whitespace() {
+        assert_eq!(split_hook_command(""), None);
+        assert_eq!(split_hook_command("   "), None);
+    }
+
+    #[test]
+    fn test_placeholder_substitution_in_all_tokens() {
+        // Verify that substitute logic (done in run_hook) works as expected
+        // by composing it here manually with the same replace chain.
+        let tokens = split_hook_command("/usr/bin/curl -d {body} {summary}").unwrap();
+        let body = "hello world";
+        let summary = "test-summary";
+        let result: Vec<String> = tokens
+            .into_iter()
+            .map(|t| t.replace("{body}", body).replace("{summary}", summary))
+            .collect();
+        assert_eq!(
+            result,
+            vec!["/usr/bin/curl", "-d", "hello world", "test-summary"]
+        );
+    }
 }

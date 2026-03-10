@@ -168,7 +168,9 @@ fn evaluate_llm_direct_trigger(_excerpt: &str) -> Option<String> {
 
 pub(super) fn build_notifier(db: Arc<Database>, config: &AppConfig) -> Notifier {
     let mut channels: Vec<Box<dyn NotificationChannel + Send + Sync>> =
-        vec![Box::new(LocalOsNotificationChannel)];
+        vec![Box::new(LocalOsNotificationChannel {
+            hook: config.notification_hook.clone(),
+        })];
 
     if let (Some(vapid_public_key), Some(vapid_private_key), Some(vapid_subject)) = (
         config.web_push_vapid_public_key.clone(),
