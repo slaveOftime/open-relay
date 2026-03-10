@@ -37,7 +37,7 @@
 1. Local daemon process managed by the same `oly` binary.
 2. CLI commands:
 	 - `oly daemon start`
-   - `oly start [--title <title>] [--detach] [--node <name>] <cmd> [args...]`
+   - `oly start [--title <title>] [--detach] [--cwd <dir>] [--node <name>] <cmd> [args...]`
    - `oly stop <id> [--grace <seconds>] [--node <name>]`
    - `oly ls [--search <text>] [--status <status>]... [--since <RFC3339>] [--until <RFC3339>] [--limit <n>] [--node <name>]`
    - `oly attach <id> [--node <name>]`
@@ -144,9 +144,10 @@ Each session has:
 
 ### 5.1 Create session
 
-`oly start [--title <title>] [--detach] [--node <name>] <cmd> [args...]`
+`oly start [--title <title>] [--detach] [--cwd <dir>] [--node <name>] <cmd> [args...]`
 
 - Spawns `<cmd>` in PTY under daemon ownership.
+- `--cwd` overrides the working directory; when omitted, the CLI sends its own current working directory.
 - Returns session id on success.
 - By default, immediately attaches to the newly created session after printing id.
 - `--detach` skips auto-attach and exits after printing id.
