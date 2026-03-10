@@ -6,7 +6,7 @@
 class Oly < Formula
   desc "Session-persistent PTY daemon for long-running CLI agents"
   homepage "https://github.com/slaveOftime/open-relay"
-  version "0.1.0"
+  version "0.0.3"
   license "MIT"
 
   on_macos do

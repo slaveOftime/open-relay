@@ -1,4 +1,5 @@
 obj
+bin
 node_modules
 /target
 /target-test
