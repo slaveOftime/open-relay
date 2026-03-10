@@ -115,33 +115,6 @@ jobs:
         run: npm publish --access public
         working-directory: npm
 
-  # publish-nuget:
-  #   name: publish-nuget
-  #   needs: build-release
-  #   runs-on: ubuntu-latest
-  #   if: startsWith(github.ref, 'refs/tags/')
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-
-  #     - name: Install .NET
-  #       uses: actions/setup-dotnet@v4
-  #       with:
-  #         dotnet-version: "10.x"
-
-  #     - name: Set version from tag
-  #       run: |
-  #         VERSION="${GITHUB_REF_NAME#v}"
-  #         sed -i "s|<Version>.*</Version>|<Version>$VERSION</Version>|" dotnet-tool/oly.csproj
-
-  #     - name: Pack NuGet tool
-  #       run: dotnet pack dotnet-tool/oly.csproj --configuration Release --output nupkg
-
-  #     - name: Push to NuGet.org
-  #       env:
-  #         NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-  #       run: dotnet nuget push nupkg/*.nupkg --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
-
   # publish-winget:
   #   name: publish-winget
   #   needs: build-release
