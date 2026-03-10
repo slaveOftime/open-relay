@@ -27,8 +27,8 @@ jobs:
         with:
           node-version: 22
 
-      - name: Build
-        run: cargo build --target x86_64-pc-windows-msvc
-
       - name: Test
         run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Build Release
+        run: cargo build --target x86_64-pc-windows-msvc --release
