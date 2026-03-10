@@ -1,5 +1,5 @@
 {
-  "name": "oly",
+  "name": "@slaveoftime/oly",
   "version": "0.1.0",
   "description": "Session-persistent PTY daemon for long-running CLI agents — keep agents alive, get notified when they need input, intervene from anywhere.",
   "keywords": ["cli", "agent", "pty", "daemon", "terminal"],
