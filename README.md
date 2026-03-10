@@ -2,11 +2,7 @@
 
 <p align="center"><img src="./assets/icon-demo.svg" width="160" /></p>
 
-<p align="center">
-	<video src="./assets/oly-full-demo.mp4" controls muted playsinline preload="metadata" width="960">
-		Your browser does not support embedded video.
-	</video>
-</p>
+[![Watch the video](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.png)](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.mp4)
 
 <p align="center"><a href="./assets/oly-full-demo.mp4">Download or open the full demo video</a></p>
 
