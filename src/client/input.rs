@@ -179,7 +179,7 @@ pub fn parse_key_spec(spec: &str) -> Result<String> {
     }
 
     Err(AppError::Protocol(format!(
-        "unsupported --key `{spec}`; use named keys (enter/esc/tab/up/down/left/right/home/end/pgup/pgdn/del/ins), ctrl+<char>, alt+<char|named-key>, shift+<char|tab>, or capslock+<letter>"
+        "unsupported --key `{spec}`; use named keys (enter/return/cr, lf/linefeed, tab, backspace/bs, esc/escape, up/down/left/right, home/end, pageup/pgup, pagedown/pgdn, delete/del, insert/ins), ctrl+<char>, alt+<char|named-key>, shift+<char|tab>, or capslock+<letter>"
     )))
 }
 

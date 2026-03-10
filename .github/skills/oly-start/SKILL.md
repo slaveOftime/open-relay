@@ -1,44 +1,103 @@
 ---
 name: oly-start
-description: Start a any CLI for a task which needs interaction
+description: Start an interactive CLI task with oly so the session can be supervised, audited, and resumed without tying up the main terminal.
 ---
 
-`oly start --title "task 1" --detach claude`
+Use this skill when you want to run a CLI that may block, prompt for input, or require later supervision.
 
-It will return with session `<id>`, use it to wait interaction and send input:
+Prefer `oly start` over launching the command directly in a terminal when:
 
-`oly logs <id> --tail 40 --no-truncate --wait-for-prompt --timeout 600`
+- the process may need interactive input later
+- you want a durable session with logs and auditability
+- you want to detach immediately and come back only if the task needs attention
 
-When you see a prompt, you can send input:
+## Start a supervised session
 
-`oly input <id> --text "yes" --key enter`
+```bash
+oly start --title "task 1" --cwd /path/to/working/directory --detach --disable-notifications the_command --arg1 --arg2
+```
 
-> You can send multiple keys like `--key shift --key tab` or `--key "ctrl+c"`.
-> `-k` is the short version of `--key`.
+Notes:
 
-Then you can wait for actions again:
+- `--detach` returns immediately after the session starts.
+- `--disable-notifications` is useful when you want to supervise the task yourself first and only escalate to the user when necessary.
+- `oly start` returns a session ID. Use that ID for later `logs`, `input`, `attach`, or `stop` commands.
 
-`oly logs <id> --tail 40 --no-truncate --wait-for-prompt --timeout 600`
+## Wait for a prompt or inspect progress
 
-Or you can stop it according to the output and history context:
+```bash
+oly logs <id> --tail 40 --no-truncate --wait-for-prompt --timeout 600
+```
 
-`oly stop <id>`
+Notes:
 
-You can check status for many sessions:
+- `--wait-for-prompt` blocks until the session reports that it needs input, or until the timeout expires.
+- `--timeout 600` means 600 seconds. Increase it when the command may take longer before prompting.
+- Remove `--wait-for-prompt` when you only want to inspect recent output without waiting.
 
-`oly ls`, it will return:
+## Send input
+
+Send normal text:
+
+```bash
+oly input <id> --text "yes" --key enter
+```
+
+Send multiple keys:
+
+```bash
+oly input <id> --key shift --key tab
+oly input <id> --key ctrl+c
+```
+
+Key syntax notes:
+
+- `-k` is the short form of `--key`.
+- You can split modifier sequences across repeated flags, for example `--key ctrl --key c`.
+- Supported named keys are: `enter`, `return`, `cr`, `lf`, `linefeed`, `tab`, `backspace`, `bs`, `esc`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pgup`, `pagedown`, `pgdn`, `delete`, `del`, `insert`, `ins`.
+- Supported modifier forms include: `ctrl+<char>`, `alt+<char|named-key>`, `meta+<char|named-key>`, `shift+<char|tab>`, `capslock+<letter>`.
+- Hex byte input is also supported, for example `0x1b` or `\x1b`.
+
+After sending input, you can wait again:
+
+```bash
+oly logs <id> --tail 40 --no-truncate --wait-for-prompt --timeout 600
+```
+
+## Stop or inspect sessions
+
+Stop a session when the task is complete or should be terminated:
+
+```bash
+oly stop <id>
+```
+
+List recent sessions:
+
+```bash
+oly ls
+```
+
+Typical output columns:
 
 ```text
 ID STATUS CMD AGE PID CREATE_AT↓ TITLE ARGS
 ```
 
-Below is some options for `oly ls` to filter sessions:
+Useful `oly ls` filters:
+
 ```text
-Options:
-      --search <SEARCH>  Filter by title or ID substring (case-insensitive)
-  -s, --status <STATUS>  Only show sessions with these statuses (repeatable) [possible values: created, running, stopping, stopped, failed, unknown]
-      --since <RFC3339>  Created at or after (RFC3339, e.g. 2026-03-04T15:04:05Z)
-      --until <RFC3339>  Created at or before (RFC3339, e.g. 2026-03-04T15:04:05Z)
-      --limit <LIMIT>    Maximum number of sessions to return [default: 10]
-  -n, --node <NODE>      Target a secondary node by name
+--search <SEARCH>   Filter by title or ID substring (case-insensitive)
+--status            Only show specific statuses; repeatable
+--since <RFC3339>   Created at or after the given timestamp
+--until <RFC3339>   Created at or before the given timestamp
+--limit <LIMIT>     Maximum number of sessions to return
 ```
+
+## Recommended workflow
+
+1. Start the command with `oly start --detach`.
+2. Watch with `oly logs <id> --no-truncate  --wait-for-prompt`.
+3. Decide whether to answer the prompt yourself or escalate to the user.
+4. Send input with `oly input <id> ...` if the context is clear.
+5. Repeat until the task finishes, then stop or leave the session running as appropriate.
