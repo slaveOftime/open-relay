@@ -377,7 +377,7 @@ export default function SessionDetailPage() {
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
     return () => {
       isMounted.current = false
     }
@@ -495,7 +495,7 @@ export default function SessionDetailPage() {
             .then((s) => {
               if (isMounted.current) setSession(s)
             })
-            .catch(() => { })
+            .catch(() => {})
         },
         onError: (msg) => {
           lastWsFrameAtRef.current = Date.now()
@@ -599,10 +599,7 @@ export default function SessionDetailPage() {
       const minimumElapsed = currentlyConnecting ? 8000 : 2500
       if (elapsed < minimumElapsed) return
 
-      requestReconnect(
-        `watchdog${currentlyConnecting ? ' (stalled connect attempt)' : ''}`,
-        true
-      )
+      requestReconnect(`watchdog${currentlyConnecting ? ' (stalled connect attempt)' : ''}`, true)
     }, 1600)
 
     return () => window.clearInterval(tick)
@@ -643,9 +640,9 @@ export default function SessionDetailPage() {
           .then((s) => {
             if (isMounted.current) setSession(s)
           })
-          .catch(() => { })
+          .catch(() => {})
       })
-      .catch(() => { })
+      .catch(() => {})
 
     return () => {
       cancelled = true
@@ -745,21 +742,21 @@ export default function SessionDetailPage() {
 
   async function handleStop() {
     if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => { })
+    await stopSession(id, undefined, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
   async function handleKill() {
     if (!id) return
-    await killSession(id, node ?? undefined).catch(() => { })
+    await killSession(id, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -794,7 +791,7 @@ export default function SessionDetailPage() {
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
-              <span className='hidden sm:inline'>Open Relay</span>
+              <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
           <div className="flex items-center gap-2 min-w-0 flex-1">
@@ -976,7 +973,7 @@ export default function SessionDetailPage() {
           id="main-container"
           className="sm:flex overflow-y-auto sm:overflow-hidden flex-1 min-h-0"
         >
-          {wsError && (<div className='text-red-500 text-sm'>{wsError}</div>)}
+          {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
 
           {/* Terminal area */}
           <div
@@ -994,7 +991,8 @@ export default function SessionDetailPage() {
                   className="h-full"
                 />
               </div>
-              <div className='absolute sm:hidden right-0 top-0 bottom-0 w-10 bg-transparent'
+              <div
+                className="absolute sm:hidden right-0 top-0 bottom-0 w-10 bg-transparent"
                 onPointerMove={(e) => {
                   termRef?.current?.scrollLines(e.movementY)
                 }}
@@ -1092,9 +1090,7 @@ export default function SessionDetailPage() {
           </div>
 
           {mode === 'attach' && (
-            <div
-              className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none"
-            >
+            <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none">
               <AttachPanel sendInput={sendInput} showKeyError={showKeyError} />
             </div>
           )}

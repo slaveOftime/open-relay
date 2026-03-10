@@ -251,7 +251,7 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
       <div className="sm:hidden w-full h-10 flex justify-between items-center">
         <Button
           variant={'ghost'}
-          className='text-[hsl(var(--primary))]'
+          className="text-[hsl(var(--primary))]"
           onClick={() => handleSendKeySpec('up')}
           aria-label="Up"
         >
@@ -259,7 +259,7 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
         </Button>
         <Button
           variant={'ghost'}
-          className='text-[hsl(var(--primary))]'
+          className="text-[hsl(var(--primary))]"
           onClick={() => handleSendKeySpec('down')}
           aria-label="Down"
         >
@@ -267,7 +267,7 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
         </Button>
         <Button
           variant={'ghost'}
-          className='text-[hsl(var(--primary))]'
+          className="text-[hsl(var(--primary))]"
           onClick={() => handleSendKeySpec('enter')}
           aria-label="Enter"
         >

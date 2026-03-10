@@ -14,7 +14,6 @@ import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
   cwdBasename,
-  SparklineStore,
   formatAge,
   sessionDisplayName,
   parseArgString,
@@ -22,7 +21,7 @@ import {
 import Logo from '@/components/Logo'
 import SseStatusDot from '@/components/SseStatusDot'
 import StatusBadge from '@/components/StatusBadge'
-import SparklineSvg from '@/components/SparklineSvg'
+import SparklineSvg, { SparklineStore } from '@/components/SparklineSvg'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -520,8 +519,15 @@ function SessionCard({
           )}
 
           {/* Row 4: activity sparkline */}
-          <div className={`pt-1 w-full ${session.status === 'running' ? 'opacity-90' : 'opacity-40'}`}>
-            <SparklineSvg series={series} fullWidth className="w-full" enableAnimation={isRunning} />
+          <div
+            className={`pt-1 w-full ${session.status === 'running' ? 'opacity-90' : 'opacity-40'}`}
+          >
+            <SparklineSvg
+              series={series}
+              fullWidth
+              className="w-full"
+              enableAnimation={isRunning}
+            />
           </div>
         </CardContent>
 
