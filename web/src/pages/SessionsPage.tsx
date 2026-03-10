@@ -1,7 +1,14 @@
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import type { ListParams } from '@/api/client'
-import type { SessionSummary, NodeSummary } from '@/api/types'
+import {
+  SessionSortField,
+  SortOrder,
+  isSessionSortField,
+  isSortOrder,
+  type SessionSummary,
+  type NodeSummary,
+} from '@/api/types'
 import {
   fetchSessions,
   stopSession,
@@ -14,7 +21,7 @@ import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
   cwdBasename,
-  formatAge,
+  formatTimestamp,
   sessionDisplayName,
   parseArgString,
 } from '@/utils/format'
@@ -60,6 +67,7 @@ import {
   MixerHorizontalIcon,
   PlayIcon,
   PlusIcon,
+  ReloadIcon,
   StopIcon,
 } from '@radix-ui/react-icons'
 import {
@@ -76,24 +84,34 @@ const sparklines = new SparklineStore()
 const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
 
 type GroupBy = 'none' | 'cwd' | 'command'
-type SortField = 'created_at' | 'status' | 'title'
-type SortOrder = 'asc' | 'desc'
 
 type SessionPrefs = {
   search: string
   statusFilter: string
   groupBy: GroupBy
-  sortField: SortField
+  node: string | null
+  sortField: SessionSortField
   sortOrder: SortOrder
 }
+
+const SORT_OPTIONS: Array<{ label: string; value: SessionSortField }> = [
+  { label: 'Created At', value: SessionSortField.CreatedAt },
+  { label: 'Status', value: SessionSortField.Status },
+  { label: 'Title', value: SessionSortField.Title },
+  { label: 'ID', value: SessionSortField.Id },
+  { label: 'Command', value: SessionSortField.Command },
+  { label: 'CWD', value: SessionSortField.Cwd },
+  { label: 'PID', value: SessionSortField.Pid },
+]
 
 function loadSessionPrefs(): SessionPrefs {
   const defaults: SessionPrefs = {
     search: '',
     statusFilter: 'all',
     groupBy: 'none',
-    sortField: 'created_at',
-    sortOrder: 'desc',
+    node: null,
+    sortField: SessionSortField.CreatedAt,
+    sortOrder: SortOrder.Desc,
   }
   if (typeof window === 'undefined') return defaults
   try {
@@ -102,6 +120,7 @@ function loadSessionPrefs(): SessionPrefs {
     if (!raw) return defaults
     const parsed = JSON.parse(raw) as Partial<SessionPrefs>
     const groupBy = parsed.groupBy
+    const node = parsed.node
     const sortField = parsed.sortField
     const sortOrder = parsed.sortOrder
     return {
@@ -114,11 +133,9 @@ function loadSessionPrefs(): SessionPrefs {
         groupBy === 'none' || groupBy === 'cwd' || groupBy === 'command'
           ? groupBy
           : defaults.groupBy,
-      sortField:
-        sortField === 'created_at' || sortField === 'status' || sortField === 'title'
-          ? sortField
-          : defaults.sortField,
-      sortOrder: sortOrder === 'asc' || sortOrder === 'desc' ? sortOrder : defaults.sortOrder,
+      node: normalizeStoredNode(node) ?? defaults.node,
+      sortField: isSessionSortField(sortField) ? sortField : defaults.sortField,
+      sortOrder: isSortOrder(sortOrder) ? sortOrder : defaults.sortOrder,
     }
   } catch {
     return defaults
@@ -132,6 +149,12 @@ function saveSessionPrefs(prefs: SessionPrefs) {
   } catch {
     /* ignore */
   }
+}
+
+function normalizeStoredNode(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed === '' ? null : trimmed
 }
 
 function getSessionListRequestKey(params: ListParams): string {
@@ -173,40 +196,6 @@ function syncSeriesMap(items: SessionSummary[]) {
 
 function updateSparklineForSession(session: SessionSummary) {
   sparklines.touch(session.id)
-}
-
-function matchesSearch(session: SessionSummary, rawSearch: string): boolean {
-  const needle = rawSearch.trim().toLowerCase()
-  if (!needle) return true
-
-  const haystacks = [session.id, session.title ?? '', session.command, session.args.join(' ')]
-
-  return haystacks.some((value) => value.toLowerCase().includes(needle))
-}
-
-function compareSessions(a: SessionSummary, b: SessionSummary, field: SortField, order: SortOrder) {
-  const direction = order === 'asc' ? 1 : -1
-
-  let result = 0
-  if (field === 'status') {
-    result = a.status.localeCompare(b.status)
-  } else if (field === 'title') {
-    result = (a.title ?? '').localeCompare(b.title ?? '')
-  } else {
-    result = a.created_at.localeCompare(b.created_at)
-  }
-
-  if (result !== 0) return result * direction
-  return a.id.localeCompare(b.id) * direction
-}
-
-function upsertSession(items: SessionSummary[], nextSession: SessionSummary) {
-  const index = items.findIndex((session) => session.id === nextSession.id)
-  if (index === -1) return [nextSession, ...items]
-
-  const nextItems = [...items]
-  nextItems[index] = nextSession
-  return nextItems
 }
 
 // ── Skeleton loading ───────────────────────────────────────────────────────
@@ -334,9 +323,9 @@ function SessionRow({
           <StatusBadge status={session.status} inputNeeded={session.input_needed} />
         </TableCell>
 
-        {/* Age */}
+        {/* Created at */}
         <TableCell className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs whitespace-nowrap">
-          {formatAge(session.created_at)}
+          {formatTimestamp(session.created_at)}
         </TableCell>
 
         {/* Activity */}
@@ -468,7 +457,7 @@ function SessionCard({
         className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
         <CardContent className="px-4 pt-3.5 pb-3 flex flex-col gap-2">
-          {/* Row 1: id, status, pid, age */}
+          {/* Row 1: id, status, pid, created at */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold">
               {session.id.slice(0, 7)}
@@ -476,7 +465,7 @@ function SessionCard({
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
             <div className="flex-1" />
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
-              {formatAge(session.created_at)}
+              {formatTimestamp(session.created_at)}
             </span>
           </div>
 
@@ -824,12 +813,12 @@ function SortIcon({
   sortField,
   sortOrder,
 }: {
-  field: SortField
-  sortField: SortField
+  field: SessionSortField
+  sortField: SessionSortField
   sortOrder: SortOrder
 }) {
   if (field !== sortField) return <CaretSortIcon className="w-3 h-3 opacity-40" />
-  return sortOrder === 'asc' ? (
+  return sortOrder === SortOrder.Asc ? (
     <ChevronUpIcon className="w-3 h-3" />
   ) : (
     <ChevronDownIcon className="w-3 h-3" />
@@ -856,8 +845,9 @@ function EmptyState({ onNewSession }: { onNewSession: () => void }) {
 export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
   const [searchParams, setSearchParams] = useSearchParams()
-  const [selectedNode, setSelectedNode] = useState<string | null>(() => searchParams.get('node'))
-  const isRemoteNodeView = selectedNode !== null
+  const [selectedNode, setSelectedNode] = useState<string | null>(
+    () => normalizeStoredNode(searchParams.get('node')) ?? initialPrefs.node
+  )
   const [nodes, setNodes] = useState<NodeSummary[]>([])
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [remoteTotal, setRemoteTotal] = useState(0)
@@ -866,7 +856,7 @@ export default function SessionsPage() {
   const [search, setSearch] = useState(initialPrefs.search)
   const [statusFilter, setStatusFilter] = useState(initialPrefs.statusFilter)
   const [groupBy, setGroupBy] = useState<GroupBy>(initialPrefs.groupBy)
-  const [sortField, setSortField] = useState<SortField>(initialPrefs.sortField)
+  const [sortField, setSortField] = useState<SessionSortField>(initialPrefs.sortField)
   const [sortOrder, setSortOrder] = useState<SortOrder>(initialPrefs.sortOrder)
   const [page, setPage] = useState(0)
   const [showNewSession, setShowNewSession] = useState(false)
@@ -883,7 +873,6 @@ export default function SessionsPage() {
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
-  const localRevisionRef = useRef(0)
   const pushStateRef = useRef<PushSetupState>('idle')
 
   useEffect(() => {
@@ -895,24 +884,6 @@ export default function SessionsPage() {
     setSeriesMap(buildSeriesMap(items))
   }, [])
 
-  const upsertSessionState = useCallback((nextSession: SessionSummary) => {
-    updateSparklineForSession(nextSession)
-    setSessions((prev) => {
-      const next = upsertSession(prev, nextSession)
-      setSeriesMap(syncSeriesMap(next))
-      return next
-    })
-  }, [])
-
-  const removeSessionState = useCallback((id: string) => {
-    sparklines.remove(id)
-    setSessions((prev) => {
-      const next = prev.filter((session) => session.id !== id)
-      setSeriesMap(syncSeriesMap(next))
-      return next
-    })
-  }, [])
-
   const loadLocal = useCallback(
     async (opts?: { background?: boolean }) => {
       if (selectedNode) return
@@ -921,15 +892,22 @@ export default function SessionsPage() {
       if (shouldShowSkeleton) setLoading(true)
       else setRefreshing(true)
 
-      const localRevisionAtStart = localRevisionRef.current
       try {
-        const res = await fetchSessionsOnce({})
+        const params: ListParams = {
+          search: search || undefined,
+          status: statusFilter === 'all' ? undefined : statusFilter,
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+          sort: sortField,
+          order: sortOrder,
+        }
+        const res = await fetchSessionsOnce(params)
         if (!isMounted.current) return
-        if (selectedNode || localRevisionRef.current !== localRevisionAtStart) return
+        if (selectedNode) return
 
         hasLoadedRef.current = true
         applySessionItems(res.items)
-        setRemoteTotal(res.items.length)
+        setRemoteTotal(res.total)
       } catch {
         /* ignore */
       } finally {
@@ -939,7 +917,7 @@ export default function SessionsPage() {
         }
       }
     },
-    [applySessionItems, selectedNode]
+    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
   )
 
   const loadRemote = useCallback(
@@ -1041,8 +1019,8 @@ export default function SessionsPage() {
   }, [])
 
   useEffect(() => {
-    saveSessionPrefs({ search, statusFilter, groupBy, sortField, sortOrder })
-  }, [search, statusFilter, groupBy, sortField, sortOrder])
+    saveSessionPrefs({ search, statusFilter, groupBy, node: selectedNode, sortField, sortOrder })
+  }, [search, selectedNode, statusFilter, groupBy, sortField, sortOrder])
 
   useEffect(() => {
     if (!selectedNode) {
@@ -1070,27 +1048,25 @@ export default function SessionsPage() {
     const cleanup = subscribeEvents((ev) => {
       if (ev.event === 'snapshot') {
         if (selectedNode) return
-        localRevisionRef.current += 1
-        hasLoadedRef.current = true
-        applySessionItems(ev.data)
+        void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_created') {
         if (selectedNode) return
-        localRevisionRef.current += 1
-        upsertSessionState(ev.data)
+        updateSparklineForSession(ev.data)
+        void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_updated') {
         if (selectedNode) return
-        localRevisionRef.current += 1
-        upsertSessionState(ev.data)
+        updateSparklineForSession(ev.data)
+        void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_deleted') {
         if (selectedNode) return
-        localRevisionRef.current += 1
-        removeSessionState(ev.data.id)
+        sparklines.remove(ev.data.id)
+        void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_notification') {
@@ -1104,26 +1080,11 @@ export default function SessionsPage() {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
     }
-  }, [applySessionItems, removeSessionState, selectedNode, upsertSessionState])
+  }, [reloadSessions, selectedNode])
 
-  const visibleSessions = useMemo(() => {
-    if (isRemoteNodeView) return sessions
+  const pagedSessions = sessions
 
-    return [...sessions]
-      .filter((session) => {
-        const matchesStatus = statusFilter === 'all' || session.status === statusFilter
-        return matchesStatus && matchesSearch(session, search)
-      })
-      .sort((left, right) => compareSessions(left, right, sortField, sortOrder))
-  }, [isRemoteNodeView, search, sessions, sortField, sortOrder, statusFilter])
-
-  const pagedSessions = useMemo(() => {
-    if (isRemoteNodeView) return sessions
-    const start = page * PAGE_SIZE
-    return visibleSessions.slice(start, start + PAGE_SIZE)
-  }, [isRemoteNodeView, page, sessions, visibleSessions])
-
-  const total = isRemoteNodeView ? remoteTotal : visibleSessions.length
+  const total = remoteTotal
 
   useEffect(() => {
     const lastPage = Math.max(Math.ceil(total / PAGE_SIZE) - 1, 0)
@@ -1180,15 +1141,15 @@ export default function SessionsPage() {
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
 
-  function handleSort(field: SortField) {
+  function handleSort(field: SessionSortField) {
     let nextSortField = sortField
     let nextSortOrder = sortOrder
     if (field === sortField) {
-      nextSortOrder = sortOrder === 'asc' ? 'desc' : 'asc'
+      nextSortOrder = sortOrder === SortOrder.Asc ? SortOrder.Desc : SortOrder.Asc
       setSortOrder(nextSortOrder)
     } else {
       nextSortField = field
-      nextSortOrder = 'asc'
+      nextSortOrder = SortOrder.Asc
       setSortField(nextSortField)
       setSortOrder(nextSortOrder)
     }
@@ -1196,6 +1157,7 @@ export default function SessionsPage() {
       search,
       statusFilter,
       groupBy,
+      node: selectedNode,
       sortField: nextSortField,
       sortOrder: nextSortOrder,
     })
@@ -1206,8 +1168,8 @@ export default function SessionsPage() {
     search !== '' ||
     statusFilter !== 'all' ||
     groupBy !== 'none' ||
-    sortField !== 'created_at' ||
-    sortOrder !== 'desc'
+    sortField !== SessionSortField.CreatedAt ||
+    sortOrder !== SortOrder.Desc
 
   const statusChips: { label: string; value: string }[] = [
     { label: 'All', value: 'all' },
@@ -1248,15 +1210,24 @@ export default function SessionsPage() {
         {/* ── Header ── */}
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
-          <div className="flex items-center gap-2 px-3 py-2 md:hidden">
+          <div className="flex flex-wrap items-center gap-2 px-3 py-2 md:hidden">
             <div
-              className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
+              className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer min-w-0"
               onClick={() => void reloadSessions({ background: true })}
             >
               <Logo />
-              <span>Open Relay</span>
+              <span className="truncate">Open Relay</span>
             </div>
-            <div className="flex-1" />
+            <div className="flex-1 min-w-0" />
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => void reloadSessions({ background: true })}
+              disabled={loading || refreshing}
+              aria-label="Refresh sessions"
+            >
+              <ReloadIcon className="h-4 w-4" />
+            </Button>
             <Button
               variant="ghost"
               size="icon"
@@ -1281,9 +1252,8 @@ export default function SessionsPage() {
             >
               <BellIcon className="h-4 w-4" />
             </Button>
-            <Button size="sm" onClick={() => setShowNewSession(true)}>
+            <Button size="icon" onClick={() => setShowNewSession(true)} aria-label="New session">
               <PlusIcon className="h-4 w-4" />
-              New
             </Button>
           </div>
 
@@ -1334,12 +1304,13 @@ export default function SessionsPage() {
                 <Select
                   value={sortField}
                   onValueChange={(v) => {
-                    const nextSortField = v as SortField
+                    const nextSortField = v as SessionSortField
                     setSortField(nextSortField)
                     saveSessionPrefs({
                       search,
                       statusFilter,
                       groupBy,
+                      node: selectedNode,
                       sortField: nextSortField,
                       sortOrder,
                     })
@@ -1350,9 +1321,11 @@ export default function SessionsPage() {
                     <SelectValue placeholder="Sort by" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="created_at">Sort by Age</SelectItem>
-                    <SelectItem value="status">Sort by Status</SelectItem>
-                    <SelectItem value="title">Sort by Title</SelectItem>
+                    {SORT_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {`Sort by ${option.label}`}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
                 <Select
@@ -1364,6 +1337,7 @@ export default function SessionsPage() {
                       search,
                       statusFilter,
                       groupBy,
+                      node: selectedNode,
                       sortField,
                       sortOrder: nextSortOrder,
                     })
@@ -1374,8 +1348,8 @@ export default function SessionsPage() {
                     <SelectValue placeholder="Order" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="desc">Descending</SelectItem>
-                    <SelectItem value="asc">Ascending</SelectItem>
+                    <SelectItem value={SortOrder.Desc}>Descending</SelectItem>
+                    <SelectItem value={SortOrder.Asc}>Ascending</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -1464,6 +1438,16 @@ export default function SessionsPage() {
 
             <Button
               size="sm"
+              variant="ghost"
+              onClick={() => void reloadSessions({ background: true })}
+              disabled={loading || refreshing}
+            >
+              <ReloadIcon className="h-4 w-4" />
+              <span className="hidden xl:inline">Refresh</span>
+            </Button>
+
+            <Button
+              size="sm"
               variant={pushEnabled ? 'link' : 'ghost'}
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
@@ -1536,7 +1520,7 @@ export default function SessionsPage() {
                 <col style={{ width: 'fit' }} />
                 <col style={{ width: 'auto' }} />
                 <col style={{ width: '8rem' }} />
-                <col style={{ width: '5rem' }} />
+                <col style={{ width: '10rem' }} />
                 <col style={{ width: '6rem' }} />
                 <col style={{ width: '4rem' }} />
                 <col style={{ width: 'fit' }} />
@@ -1545,14 +1529,22 @@ export default function SessionsPage() {
                 <TableRow>
                   {(
                     [
-                      { key: 'id', label: 'ID', sortField: undefined },
-                      { key: 'title', label: 'Title', sortField: 'title' as SortField },
-                      { key: 'command', label: 'Command', sortField: 'command' as SortField },
-                      { key: 'cwd', label: 'CWD', sortField: undefined },
-                      { key: 'status', label: 'Status', sortField: 'status' as SortField },
-                      { key: 'age', label: 'Age', sortField: 'created_at' as SortField },
+                      { key: 'id', label: 'ID', sortField: SessionSortField.Id },
+                      { key: 'title', label: 'Title', sortField: SessionSortField.Title },
+                      {
+                        key: 'command',
+                        label: 'Command',
+                        sortField: SessionSortField.Command,
+                      },
+                      { key: 'cwd', label: 'CWD', sortField: SessionSortField.Cwd },
+                      { key: 'status', label: 'Status', sortField: SessionSortField.Status },
+                      {
+                        key: 'created_at',
+                        label: 'Created At',
+                        sortField: SessionSortField.CreatedAt,
+                      },
                       { key: 'activity', label: 'Activity', sortField: undefined },
-                      { key: 'pid', label: 'PID', sortField: undefined },
+                      { key: 'pid', label: 'PID', sortField: SessionSortField.Pid },
                       { key: 'actions', label: 'Actions', sortField: undefined },
                     ] as const
                   ).map((col) => (

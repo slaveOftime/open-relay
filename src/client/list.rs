@@ -1,4 +1,4 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Local, Utc};
 
 use crate::{
     cli::ListArgs,
@@ -6,7 +6,7 @@ use crate::{
     db::Database,
     error::{AppError, Result},
     ipc,
-    protocol::{ListQuery, RpcRequest, RpcResponse, SessionSummary},
+    protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SessionSummary, SortOrder},
 };
 
 pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<String>) -> Result<()> {
@@ -53,8 +53,6 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
         }
     };
 
-    sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
     if sessions.is_empty() {
         println!("No sessions. Start one with: oly start --detach <cmd>");
         return Ok(());
@@ -63,6 +61,8 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
     println!(
         "ID      STATUS    CMD          AGE    PID    CREATE_AT↓            TITLE        ARGS"
     );
+
+    sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     for session in sessions {
         print_session_row(&session, CMD_WIDTH, AGE_WIDTH, TITLE_WIDTH, ARGS_WIDTH);
     }
@@ -92,7 +92,9 @@ fn print_session_row(
         .unwrap_or_else(|| "-".to_string());
     let created = session
         .created_at
-        .to_rfc3339_opts(SecondsFormat::Secs, true);
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
     let status = if session.input_needed {
         format!("{}!", session.status)
     } else {
@@ -119,8 +121,8 @@ fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
         until,
         limit: args.limit.max(1),
         offset: 0,
-        sort: Some("created_at".to_string()),
-        order: Some("desc".to_string()),
+        sort: ListSortField::CreatedAt,
+        order: SortOrder::Desc,
     })
 }
 

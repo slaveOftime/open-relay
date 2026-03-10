@@ -10,6 +10,8 @@ import type {
   AuthStatus,
   LoginResponse,
   NodeSummary,
+  SessionSortField,
+  SortOrder,
 } from './types.ts'
 import { AuthRequiredError, TooManyAttemptsError } from './types.ts'
 
@@ -114,8 +116,8 @@ export interface ListParams {
   status?: string
   limit?: number
   offset?: number
-  sort?: string
-  order?: 'asc' | 'desc'
+  sort?: SessionSortField
+  order?: SortOrder
   /** If set, list sessions on this connected secondary node. */
   node?: string
 }

@@ -191,16 +191,14 @@ impl Database {
         Self::push_list_filters(&mut qb, query);
 
         // Sorting
-        let sort_field = match query.sort.as_deref() {
-            Some("status") => "status",
-            Some("title") => "title",
-            _ => "created_at",
-        };
-        let order = match query.order.as_deref() {
-            Some("desc") => "DESC",
-            _ => "ASC",
-        };
-        qb.push(&format!(" ORDER BY {} {}", sort_field, order));
+        let sort_field = query.sort.sqlite_order_by();
+        let order = query.order.sql();
+        qb.push(" ORDER BY ");
+        qb.push(sort_field);
+        qb.push(" ");
+        qb.push(order);
+        qb.push(", id ");
+        qb.push(order);
         qb.push(" LIMIT ");
         qb.push_bind(limit);
         qb.push(" OFFSET ");

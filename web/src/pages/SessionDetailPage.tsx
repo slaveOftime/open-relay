@@ -35,6 +35,7 @@ import {
   LinkNone2Icon,
   PauseIcon,
   PlayIcon,
+  ReloadIcon,
   StopIcon,
   TrackNextIcon,
 } from '@radix-ui/react-icons'
@@ -137,6 +138,7 @@ export default function SessionDetailPage() {
   const [isPaused, setIsPaused] = useState(false)
   const [replaySpeed, setReplaySpeed] = useState(1)
   const [totalLines, setTotalLines] = useState(0)
+  const [reloadTick, setReloadTick] = useState(0)
   const [isOnline, setIsOnline] = useState(
     typeof navigator === 'undefined' ? true : navigator.onLine
   )
@@ -382,7 +384,7 @@ export default function SessionDetailPage() {
     return () => {
       isMounted.current = false
     }
-  }, [id, node])
+  }, [id, node, reloadTick])
 
   useEffect(() => {
     if (mode !== 'attach' || !id) return
@@ -466,6 +468,9 @@ export default function SessionDetailPage() {
           if (isMounted.current) setWsConnected(true)
 
           setTimeout(() => {
+            console.info(
+              'Forcing terminal resize after 1s to work around potential initial size issues'
+            )
             const size = termRef.current?.getSize()
             if (size) {
               handleTermResize(size.cols, size.rows)
@@ -648,7 +653,7 @@ export default function SessionDetailPage() {
     return () => {
       cancelled = true
     }
-  }, [mode, id, node])
+  }, [mode, id, node, reloadTick])
 
   const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
@@ -779,6 +784,13 @@ export default function SessionDetailPage() {
     }, 120)
   }
 
+  function handleManualRefresh() {
+    setReloadTick((tick) => tick + 1)
+    if (mode === 'attach') {
+      requestReconnect('manual refresh', true)
+    }
+  }
+
   const isRunning = isSessionRunning(session)
 
   // Unused var suppression
@@ -833,7 +845,11 @@ export default function SessionDetailPage() {
           </div>
 
           {/* Desktop actions */}
-          <div className="hidden sm:flex items-center gap-2">
+          <div className="hidden sm:flex items-center gap-2 flex-wrap justify-end">
+            <Button size="sm" variant="ghost" onClick={handleManualRefresh}>
+              <ReloadIcon className="h-4 w-4" />
+              Refresh
+            </Button>
             {mode === 'attach' && (
               <Button
                 size="sm"
@@ -876,64 +892,70 @@ export default function SessionDetailPage() {
           </div>
 
           {/* Mobile actions via dropdown */}
-          {(mode === 'attach' || isRunning) && (
-            <div className="sm:hidden">
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon">
-                    <DotsVerticalIcon className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  {mode === 'attach' && (
-                    <DropdownMenuItem
-                      onClick={() =>
-                        setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
-                      }
-                    >
-                      <FileTextIcon className="w-4 h-4" />
-                      View Logs
-                    </DropdownMenuItem>
-                  )}
-                  {mode === 'attach' && (
-                    <DropdownMenuItem onClick={() => setConnectTraceOpen(true)}>
-                      <TrackNextIcon className="w-4 h-4" />
-                      Trace
-                    </DropdownMenuItem>
-                  )}
-                  {isRunning && (
-                    <DropdownMenuItem
-                      className="text-amber-400 focus:text-amber-300"
-                      onClick={() => setPendingAction('stop')}
-                    >
-                      <StopIcon className="w-4 h-4" />
-                      Stop
-                    </DropdownMenuItem>
-                  )}
-                  {isRunning && (
-                    <DropdownMenuItem
-                      className="text-red-400 focus:text-red-300"
-                      onClick={() => setPendingAction('kill')}
-                    >
-                      <Cross2Icon className="w-4 h-4" />
-                      Kill
-                    </DropdownMenuItem>
-                  )}
-                  {mode === 'logs' && isRunning && (
-                    <DropdownMenuItem
-                      className="text-indigo-400 focus:text-indigo-300"
-                      onClick={() =>
-                        setSearchParams(node ? { mode: 'attach', node } : { mode: 'attach' })
-                      }
-                    >
-                      <LinkNone2Icon className="w-4 h-4" />
-                      Attach
-                    </DropdownMenuItem>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </div>
-          )}
+          <div className="sm:hidden shrink-0">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="ghost" size="icon" aria-label="Session actions">
+                  <DotsVerticalIcon className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onClick={handleManualRefresh}>
+                  <ReloadIcon className="w-4 h-4" />
+                  Refresh
+                </DropdownMenuItem>
+                {(mode === 'attach' || isRunning) && (
+                  <>
+                    {mode === 'attach' && (
+                      <DropdownMenuItem
+                        onClick={() =>
+                          setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
+                        }
+                      >
+                        <FileTextIcon className="w-4 h-4" />
+                        View Logs
+                      </DropdownMenuItem>
+                    )}
+                    {mode === 'attach' && (
+                      <DropdownMenuItem onClick={() => setConnectTraceOpen(true)}>
+                        <TrackNextIcon className="w-4 h-4" />
+                        Trace
+                      </DropdownMenuItem>
+                    )}
+                    {isRunning && (
+                      <DropdownMenuItem
+                        className="text-amber-400 focus:text-amber-300"
+                        onClick={() => setPendingAction('stop')}
+                      >
+                        <StopIcon className="w-4 h-4" />
+                        Stop
+                      </DropdownMenuItem>
+                    )}
+                    {isRunning && (
+                      <DropdownMenuItem
+                        className="text-red-400 focus:text-red-300"
+                        onClick={() => setPendingAction('kill')}
+                      >
+                        <Cross2Icon className="w-4 h-4" />
+                        Kill
+                      </DropdownMenuItem>
+                    )}
+                    {mode === 'logs' && isRunning && (
+                      <DropdownMenuItem
+                        className="text-indigo-400 focus:text-indigo-300"
+                        onClick={() =>
+                          setSearchParams(node ? { mode: 'attach', node } : { mode: 'attach' })
+                        }
+                      >
+                        <LinkNone2Icon className="w-4 h-4" />
+                        Attach
+                      </DropdownMenuItem>
+                    )}
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </header>
 
         {/* ── Info bar ── */}
