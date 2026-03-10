@@ -273,6 +273,60 @@ pub struct SessionSummary {
     pub input_needed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListSortField {
+    Id,
+    Title,
+    Command,
+    Cwd,
+    Status,
+    Pid,
+    CreatedAt,
+}
+
+impl Default for ListSortField {
+    fn default() -> Self {
+        Self::CreatedAt
+    }
+}
+
+impl ListSortField {
+    pub fn sqlite_order_by(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Title => "LOWER(COALESCE(title, ''))",
+            Self::Command => "LOWER(command)",
+            Self::Cwd => "LOWER(COALESCE(cwd, ''))",
+            Self::Status => "LOWER(status)",
+            Self::Pid => "COALESCE(pid, -1)",
+            Self::CreatedAt => "created_at",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl Default for SortOrder {
+    fn default() -> Self {
+        Self::Desc
+    }
+}
+
+impl SortOrder {
+    pub fn sql(self) -> &'static str {
+        match self {
+            Self::Asc => "ASC",
+            Self::Desc => "DESC",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListQuery {
     pub search: Option<String>,
@@ -281,8 +335,8 @@ pub struct ListQuery {
     pub until: Option<DateTime<Utc>>,
     pub limit: usize,
     pub offset: usize,
-    pub sort: Option<String>,
-    pub order: Option<String>,
+    pub sort: ListSortField,
+    pub order: SortOrder,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

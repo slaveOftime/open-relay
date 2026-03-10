@@ -9,7 +9,9 @@ use std::io::BufRead;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    protocol::{ListQuery, PushSubscriptionInput, RpcRequest, RpcResponse},
+    protocol::{
+        ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
+    },
     session::StartSpec,
 };
 
@@ -119,10 +121,10 @@ pub struct ListParams {
     pub status: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
-    /// Field to sort by: created_at | status | title
-    pub sort: Option<String>,
+    /// Field to sort by: created_at | status | title | id | command | cwd | pid
+    pub sort: Option<ListSortField>,
     /// asc | desc
-    pub order: Option<String>,
+    pub order: Option<SortOrder>,
     /// If set, proxy the list request to this connected secondary node.
     pub node: Option<String>,
 }
@@ -151,8 +153,8 @@ pub async fn list(
         until: None,
         limit: page_limit,
         offset: offset,
-        sort: params.sort.clone(),
-        order: params.order.clone(),
+        sort: params.sort.unwrap_or_default(),
+        order: params.order.unwrap_or_default(),
     };
 
     // If a node is specified, proxy the request to that secondary node.
@@ -354,8 +356,8 @@ pub async fn get_session(
                 until: None,
                 limit: 1,
                 offset: 0,
-                sort: None,
-                order: None,
+                sort: ListSortField::CreatedAt,
+                order: SortOrder::Desc,
             },
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {

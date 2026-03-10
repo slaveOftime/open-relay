@@ -4,6 +4,36 @@
 
 export type SessionStatus = 'created' | 'running' | 'stopping' | 'stopped' | 'failed'
 
+export const SessionSortField = {
+  Id: 'id',
+  Title: 'title',
+  Command: 'command',
+  Cwd: 'cwd',
+  Status: 'status',
+  Pid: 'pid',
+  CreatedAt: 'created_at',
+} as const
+
+export type SessionSortField = (typeof SessionSortField)[keyof typeof SessionSortField]
+
+export const SortOrder = {
+  Asc: 'asc',
+  Desc: 'desc',
+} as const
+
+export type SortOrder = (typeof SortOrder)[keyof typeof SortOrder]
+
+const sessionSortFields = new Set<string>(Object.values(SessionSortField))
+const sortOrders = new Set<string>(Object.values(SortOrder))
+
+export function isSessionSortField(value: unknown): value is SessionSortField {
+  return typeof value === 'string' && sessionSortFields.has(value)
+}
+
+export function isSortOrder(value: unknown): value is SortOrder {
+  return typeof value === 'string' && sortOrders.has(value)
+}
+
 export interface SessionSummary {
   id: string
   title: string | null

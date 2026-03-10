@@ -16,7 +16,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use crate::{
-    protocol::ListQuery,
+    protocol::{ListQuery, ListSortField, SortOrder},
     session::{SessionLiveSummary, SessionStore},
 };
 
@@ -112,8 +112,8 @@ pub async fn events_handler(
             until: None,
             limit: 200,
             offset: 0,
-            sort: None,
-            order: None,
+            sort: ListSortField::CreatedAt,
+            order: SortOrder::Desc,
         };
         store.list_summaries(&q).await.unwrap_or_default()
     };
