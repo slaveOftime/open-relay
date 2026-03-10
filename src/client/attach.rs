@@ -70,6 +70,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         while running {
             while event::poll(std::time::Duration::from_millis(0))? {
                 match event::read()? {
+                    Event::Paste(data) => send_input(config, id, data, node).await?,
                     Event::Resize(_, _) => send_resize(config, id, node).await?,
                     Event::Key(key) => {
                         if !matches!(key.kind, KeyEventKind::Press) {
@@ -97,21 +98,6 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
                             send_input(config, id, data, node).await?;
                         }
-                    }
-                    Event::Paste(data) => {
-                        // Normalise line endings to \r (PTY convention), handling
-                        // both \r\n (Windows clipboard) and bare \n.
-                        let normalised = data.replace("\r\n", "\r").replace('\n', "\r");
-                        // Mirror xterm.js: only wrap in bracketed-paste markers
-                        // when the child process has actually enabled the mode
-                        // (\x1b[?2004h). Sending markers to an app that hasn't
-                        // requested them would cause literal garbage output.
-                        let payload = if child_bracketed_paste {
-                            format!("\x1b[200~{normalised}\x1b[201~")
-                        } else {
-                            normalised
-                        };
-                        send_input(config, id, payload, node).await?;
                     }
                     _ => {}
                 }
