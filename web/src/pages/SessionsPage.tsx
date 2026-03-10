@@ -53,6 +53,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   ChevronUpIcon,
+  CopyIcon,
   Cross2Icon,
   FileTextIcon,
   Link2Icon,
@@ -355,21 +356,13 @@ function SessionRow({
             {isRunning && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="icon" onClick={() => openSession('attach')}>
+                  <Button variant="link" size="icon" onClick={() => openSession('attach')}>
                     <Link2Icon className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Attach</TooltipContent>
               </Tooltip>
             )}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
-                  <FileTextIcon className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Logs</TooltipContent>
-            </Tooltip>
             {isRunning && (
               <>
                 <Tooltip>
@@ -402,8 +395,16 @@ function SessionRow({
             )}
             <Tooltip>
               <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
+                  <FileTextIcon className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Logs</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={() => onRunAgain(session)}>
-                  <ReloadIcon className="h-4 w-4" />
+                  <CopyIcon className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Run Again</TooltipContent>
@@ -465,7 +466,7 @@ function SessionCard({
   return (
     <>
       <Card
-        className={`relative rounded-xl shadow-sm mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
+        className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
         <CardContent className="px-4 pt-3.5 pb-3 flex flex-col gap-2">
           {/* Row 1: id, status, pid, age */}
@@ -474,11 +475,6 @@ function SessionCard({
               {session.id.slice(0, 7)}
             </span>
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
-            {session.pid != null && (
-              <span className="text-xs text-[hsl(var(--muted-foreground))] font-mono">
-                PID:{session.pid}
-              </span>
-            )}
             <div className="flex-1" />
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
               {formatAge(session.created_at)}
@@ -519,16 +515,16 @@ function SessionCard({
           )}
 
           {/* Row 4: activity sparkline */}
-          <div
-            className={`pt-1 w-full ${session.status === 'running' ? 'opacity-90' : 'opacity-40'}`}
-          >
-            <SparklineSvg
-              series={series}
-              fullWidth
-              className="w-full"
-              enableAnimation={isRunning}
-            />
-          </div>
+          {session.status === 'running' && (
+            <div className="pt-1 w-full opacity-90">
+              <SparklineSvg
+                series={series}
+                fullWidth
+                className="w-full"
+                enableAnimation={isRunning}
+              />
+            </div>
+          )}
         </CardContent>
 
         <div className="border-t border-[hsl(var(--border))]" />
@@ -539,15 +535,16 @@ function SessionCard({
           onClick={(e) => e.stopPropagation()}
         >
           {isRunning && (
-            <Button variant="outline" size="sm" onClick={() => openSession('attach')}>
+            <Button
+              variant="outline"
+              className="border-[hsl(var(--primary))] text-[hsl(var(--primary))]"
+              size="sm"
+              onClick={() => openSession('attach')}
+            >
               <Link2Icon className="h-4 w-4" />
               Attach
             </Button>
           )}
-          <Button variant="outline" size="sm" onClick={() => openSession('logs')}>
-            <FileTextIcon className="h-4 w-4" />
-            Logs
-          </Button>
           {isRunning && (
             <>
               <Tooltip>
@@ -568,15 +565,19 @@ function SessionCard({
               </Tooltip>
             </>
           )}
+          <Button variant="ghost" size="sm" onClick={() => openSession('logs')}>
+            <FileTextIcon className="h-4 w-4" />
+            Logs
+          </Button>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
-                variant="outline"
+                variant="ghost"
                 size="icon"
                 className="ml-auto shrink-0"
                 onClick={() => onRunAgain(session)}
               >
-                <ReloadIcon className="h-4 w-4" />
+                <CopyIcon className="h-4 w-4" />
               </Button>
             </TooltipTrigger>
             <TooltipContent>Run Again</TooltipContent>
@@ -1274,7 +1275,7 @@ export default function SessionsPage() {
               )}
             </Button>
             <Button
-              variant={pushEnabled ? 'secondary' : 'ghost'}
+              variant={pushEnabled ? 'link' : 'ghost'}
               size="icon"
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
@@ -1464,7 +1465,7 @@ export default function SessionsPage() {
 
             <Button
               size="sm"
-              variant={pushEnabled ? 'secondary' : 'ghost'}
+              variant={pushEnabled ? 'link' : 'ghost'}
               onClick={() => void handleTogglePush()}
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
             >
