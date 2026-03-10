@@ -198,7 +198,8 @@ pub struct LogsArgs {
 pub struct InputArgs {
     /// Session ID to send input to.
     pub id: String,
-    /// Send key/control sequence (repeatable): named key or hex byte ('0x1b' or '\x1b' for ESC). Example: -k ctrl -k c -k '0x1b' -k '\x1b'
+    /// Send key/control sequence (repeatable): named keys enter/return/cr, lf/linefeed, tab, backspace/bs, esc/escape, up/down/left/right, home/end, pageup/pgup, pagedown/pgdn, delete/del, insert/ins; or hex bytes ('0x1b' / '\x1b'). Example: -k ctrl -k c -k '0x1b' -k '\x1b'
+    ///
     #[arg(long = "key", short = 'k', value_name = "KEY")]
     pub keys: Vec<String>,
     /// Send text input. -t "Hello, world!"
