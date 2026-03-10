@@ -60,7 +60,6 @@ import {
   MixerHorizontalIcon,
   PlayIcon,
   PlusIcon,
-  ReloadIcon,
   StopIcon,
 } from '@radix-ui/react-icons'
 import {
