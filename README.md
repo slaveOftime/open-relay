@@ -44,8 +44,8 @@ You can run one agent to supervise another. When the supervisor hits something i
 ## Install 📦
 
 ```sh
-brew tap slaveOftime/oly
-brew install oly
+brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
+brew install slaveOftime/open-relay/oly
 ```
 
 ### Pre-built Binaries
