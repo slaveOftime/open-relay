@@ -226,6 +226,12 @@ impl Default for TerminalModeTracker {
 /// chunk boundaries.
 ///
 /// Returns a list of response byte strings to write sequentially.
+///
+/// OSC 10/11 colour probes are detected so they can still be stripped from
+/// output, but we intentionally do NOT answer them here. In attached Linux
+/// terminals some interactive apps echo the colour response into the prompt,
+/// producing visible junk like `]10;rgb:ffff/ffff/ffff\`. CPR/DSR are the
+/// only queries that currently need a daemon-side answer for correctness.
 pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<Vec<u8>> {
     let text = String::from_utf8_lossy(data);
     let mut combined = std::mem::take(tail);
@@ -240,8 +246,15 @@ pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<
         else {
             break;
         };
-        let response = terminal_query_response(query, Some((1, 1)));
-        responses.push(response.into_bytes());
+        match query {
+            TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => {
+                let response = terminal_query_response(query, Some((1, 1)));
+                responses.push(response.into_bytes());
+            }
+            TerminalQuery::ForegroundColor | TerminalQuery::BackgroundColor => {
+                // Deliberately unanswered; see doc comment above.
+            }
+        }
         search_from = match_start + query_len;
     }
 

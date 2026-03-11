@@ -520,7 +520,10 @@ async fn respond_to_terminal_queries(
             std::io::stdout().flush()?;
         }
 
-        // The daemon is the sole responder for CPR/DSR/OSC terminal queries.
+        // The daemon is the sole responder for shared terminal queries
+        // (currently CPR/DSR). OSC colour probes are stripped locally but are
+        // not answered because some Linux apps echo those replies into the
+        // prompt as visible junk.
         // A session can have multiple attached viewers, and allowing each
         // client to answer independently causes conflicting cursor-position
         // reports and corrupts passive viewers.  We still strip the query from

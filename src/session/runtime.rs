@@ -411,8 +411,9 @@ pub fn spawn_session(
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
-                    // Always let the daemon answer terminal queries (CPR, DSR,
-                    // OSC 10/11).  Multiple attached clients cannot safely
+                    // Always let the daemon answer terminal queries that need
+                    // a shared, session-global answer (currently CPR/DSR).
+                    // Multiple attached clients cannot safely
                     // answer independently because each viewer may have a
                     // different local cursor position; the child PTY only has
                     // one shared terminal state.  Centralising replies here
