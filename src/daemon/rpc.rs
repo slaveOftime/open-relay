@@ -221,14 +221,13 @@ async fn handle_attach_subscribe(
         }
     };
 
-    // Build the replay text lines from raw chunks.
+    // Filter CPR/DSR responses from the replay bytes (same filter as the
+    // live stream) and send the raw filtered bytes directly to the client.
     let mut init_filter = EscapeFilter::new();
-    let raw_init: Vec<u8> = replay_chunks
+    let data: Vec<u8> = replay_chunks
         .iter()
         .flat_map(|(_, b)| init_filter.filter(b))
         .collect();
-    let text = String::from_utf8_lossy(&raw_init);
-    let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
 
     // Send init frame.
     let running = {
@@ -238,7 +237,7 @@ async fn handle_attach_subscribe(
     ipc::write_response_to_writer(
         &mut writer,
         RpcResponse::AttachStreamInit {
-            lines,
+            data,
             end_offset,
             running,
             bracketed_paste_mode,

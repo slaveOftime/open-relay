@@ -15,7 +15,6 @@ use crate::{
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    utils::{find_next_terminal_query, terminal_query_tail_len},
 };
 
 // ---------------------------------------------------------------------------
@@ -53,13 +52,13 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
     // Receive the init frame.
     let init = ipc::read_response_from_reader(&mut reader).await?;
-    let (initial_lines, mut running, mut child_app_cursor_keys) = match init {
+    let (initial_data, mut running, mut child_app_cursor_keys) = match init {
         RpcResponse::AttachStreamInit {
-            lines,
+            data,
             running,
             app_cursor_keys,
             ..
-        } => (lines, running, app_cursor_keys),
+        } => (data, running, app_cursor_keys),
         RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
@@ -67,7 +66,12 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     let mut detached = false;
     let mut stream_error: Option<AppError> = None;
     {
-        let _raw_mode = RawModeGuard::new()?;
+        let mut raw_mode = RawModeGuard::new()?;
+        // Use the terminal's alternate screen buffer so that TUI draw
+        // commands (cursor positioning, color etc.) never touch the main
+        // screen or scrollback.  The main screen and its history are fully
+        // restored when we leave the alternate screen on teardown.
+        raw_mode.enter_alternate_screen()?;
 
         // Initial resize + render.
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -81,17 +85,17 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         )
         .await?;
 
-        let mut query_tail = String::new();
-        let mut response_tail = String::new();
-        render_lines(
-            config,
-            id,
-            initial_lines,
-            &mut query_tail,
-            &mut response_tail,
-            None,
-        )
-        .await?;
+        // Write the initial replay bytes directly — the daemon has already
+        // stripped CPR/DSR responses via EscapeFilter, so no further
+        // processing is needed.  Writing raw bytes preserves all cursor-
+        // positioning, color, and alternate-screen sequences that TUIs emit,
+        // which is required for correct reattach rendering.
+        {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&initial_data)?;
+            stdout.flush()?;
+        }
 
         // `read_response_from_reader` uses `read_line`, which is not safe to
         // keep cancelling with timeouts. Read daemon frames in a dedicated task
@@ -188,17 +192,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     break;
                 }
                 Ok(Some(Ok(RpcResponse::AttachStreamChunk { data, .. }))) => {
-                    let text = String::from_utf8_lossy(&data);
-                    let chunk = String::from(&*text);
-                    respond_to_terminal_queries(
-                        config,
-                        id,
-                        &mut query_tail,
-                        &mut response_tail,
-                        &chunk,
-                        None,
-                    )
-                    .await?;
+                    // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
+                    use std::io::Write;
+                    std::io::stdout().write_all(&data)?;
                     std::io::stdout().flush()?;
                 }
                 Ok(Some(Ok(RpcResponse::AttachModeChanged {
@@ -216,21 +212,27 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             }
         }
 
+        if detached {
+            // Detach while raw mode is still active, then consume any queued
+            // key-release or terminal-response events so they do not leak into
+            // the parent shell after we restore the terminal.
+            let _ = ipc::write_request_to_writer(
+                &mut write_half,
+                RpcRequest::AttachDetach { id: id.to_string() },
+            )
+            .await;
+            let _ = drain_pending_terminal_events();
+        }
+
         reader_task.abort();
     }
 
     if detached {
-        // Send detach signal to daemon.
-        let _ = ipc::write_request_to_writer(
-            &mut write_half,
-            RpcRequest::AttachDetach { id: id.to_string() },
-        )
-        .await;
-        println!("\r\nDetached from session {id}");
+        println!("Detached from session {id}");
     } else if let Some(err) = stream_error {
-        eprintln!("\r\nAttach session {id} ended with error: {err}");
+        eprintln!("Attach session {id} ended with error: {err}");
     } else {
-        println!("\r\nSession {id} has ended.");
+        println!("Session {id} has ended.");
     }
 
     Ok(())
@@ -250,32 +252,29 @@ async fn run_attach_polled(config: &AppConfig, id: &str, node: Option<&str>) -> 
     )
     .await?;
 
-    let (initial_lines, mut running, child_app_cursor_keys) = match snapshot {
+    let (initial_data, mut running, child_app_cursor_keys) = match snapshot {
         RpcResponse::AttachStreamInit {
-            lines,
+            data,
             running,
             app_cursor_keys,
             ..
-        } => (lines, running, app_cursor_keys),
+        } => (data, running, app_cursor_keys),
         RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
 
     let mut detached = false;
+    let mut detach_error: Option<AppError> = None;
     {
-        let _raw_mode = RawModeGuard::new()?;
+        let mut raw_mode = RawModeGuard::new()?;
+        raw_mode.enter_alternate_screen()?;
         send_resize(config, id, node).await?;
-        let mut query_tail = String::new();
-        let mut response_tail = String::new();
-        render_lines(
-            config,
-            id,
-            initial_lines,
-            &mut query_tail,
-            &mut response_tail,
-            node,
-        )
-        .await?;
+        {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&initial_data)?;
+            stdout.flush()?;
+        }
         let mut saw_ctrl_bracket = false;
 
         while running {
@@ -337,16 +336,14 @@ async fn run_attach_polled(config: &AppConfig, id: &str, node: Option<&str>) -> 
                     running: next_running,
                     ..
                 } => {
-                    let new_lines: Vec<String> = lines;
-                    render_lines(
-                        config,
-                        id,
-                        new_lines,
-                        &mut query_tail,
-                        &mut response_tail,
-                        node,
-                    )
-                    .await?;
+                    // Polled fallback: lines are already text-cleaned by the
+                    // daemon; print them directly.
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout();
+                    for line in &lines {
+                        stdout.write_all(line.as_bytes())?;
+                    }
+                    stdout.flush()?;
                     running = next_running;
                 }
                 RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
@@ -355,13 +352,22 @@ async fn run_attach_polled(config: &AppConfig, id: &str, node: Option<&str>) -> 
 
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+
+        if detached {
+            if let Err(err) = send_detach(config, id, node).await {
+                detach_error = Some(err);
+            }
+            let _ = drain_pending_terminal_events();
+        }
     }
 
     if detached {
-        send_detach(config, id, node).await?;
-        println!("\r\nDetached from session {id}");
+        if let Some(err) = detach_error {
+            return Err(err);
+        }
+        println!("Detached from session {id}");
     } else {
-        println!("\r\nSession {id} has ended.");
+        println!("Session {id} has ended.");
     }
 
     Ok(())
@@ -418,24 +424,33 @@ impl RawModeGuard {
         }
 
         let mut stdout = std::io::stdout();
-        let execute_result = if self.alternate_screen {
-            execute!(
-                stdout,
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                terminal::LeaveAlternateScreen,
-                cursor::Show,
-                cursor::MoveToColumn(0)
-            )
-        } else {
-            execute!(
-                stdout,
-                DisableBracketedPaste,
-                cursor::Show,
-                cursor::MoveToColumn(0)
-            )
-        };
 
+        // Unconditional terminal normalisation.  The attached process may have
+        // entered its own alternate screen, changed cursor-key mode, enabled
+        // mouse tracking, etc.  We undo all of that:
+        //
+        //  \x1b[?1049l  - leave alternate screen (no-op if already on main)
+        //  \x1b[!p      - DECSTR soft terminal reset (resets DECCKM, DECOM,
+        //                 DECAWM, scroll region, etc. without clearing screen)
+        //  \x1b[0m      - SGR reset (colors / bold / etc.)
+        //  \x1b[?25h    - ensure cursor is visible
+        //  \x1b[?1000l .. \x1b[?2004l  - disable mouse and bracketed-paste
+        //                 modes the app may have enabled (belt-and-suspenders
+        //                 alongside crossterm's DisableBracketedPaste below)
+        //
+        // We deliberately do NOT reposition the cursor: after leaving altscreen
+        // the cursor is where the main-screen left it (correct), and if we
+        // were already on main screen the shell will handle its own prompt.
+        let normalize: &[u8] = b"\x1b[?1049l\x1b[!p\x1b[0m\x1b[?25h\
+            \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+        if let Err(err) = stdout.write_all(normalize) {
+            if first_error.is_none() {
+                first_error = Some(err.into());
+            }
+        }
+
+        // crossterm also tracks its own bracketed-paste / mouse state.
+        let execute_result = execute!(stdout, DisableBracketedPaste, DisableMouseCapture);
         if let Err(err) = execute_result {
             if first_error.is_none() {
                 first_error = Some(err.into());
@@ -478,190 +493,13 @@ fn attach_proxy(node: Option<&str>, req: RpcRequest) -> RpcRequest {
     }
 }
 
-async fn render_lines(
-    config: &AppConfig,
-    id: &str,
-    lines: Vec<String>,
-    query_tail: &mut String,
-    response_tail: &mut String,
-    node: Option<&str>,
-) -> Result<()> {
-    for line in lines {
-        respond_to_terminal_queries(config, id, query_tail, response_tail, &line, node).await?;
+fn drain_pending_terminal_events() -> Result<()> {
+    while event::poll(std::time::Duration::from_millis(0))? {
+        let _ = event::read()?;
     }
-    std::io::stdout().flush()?;
     Ok(())
 }
 
-/// Detects and responds to CPR / DSR terminal queries that the child process
-/// may emit (e.g. readline uses them to detect terminal capabilities).
-async fn respond_to_terminal_queries(
-    config: &AppConfig,
-    id: &str,
-    tail: &mut String,
-    response_tail: &mut String,
-    chunk: &str,
-    node: Option<&str>,
-) -> Result<()> {
-    let mut combined = String::with_capacity(tail.len() + chunk.len());
-    combined.push_str(tail);
-    combined.push_str(chunk);
-
-    let mut search_from = 0usize;
-    while search_from < combined.len() {
-        let Some((match_start, query_len, query)) =
-            find_next_terminal_query(&combined, search_from)
-        else {
-            break;
-        };
-
-        if match_start > search_from {
-            print_sanitized_output(response_tail, &combined[search_from..match_start]);
-            std::io::stdout().flush()?;
-        }
-
-        // The daemon is the sole responder for shared terminal queries
-        // (currently CPR/DSR). OSC colour probes are stripped locally but are
-        // not answered because some Linux apps echo those replies into the
-        // prompt as visible junk.
-        // A session can have multiple attached viewers, and allowing each
-        // client to answer independently causes conflicting cursor-position
-        // reports and corrupts passive viewers.  We still strip the query from
-        // display locally, but do not send any response from the client.
-        let _ = (config, id, query, node);
-
-        search_from = match_start + query_len;
-    }
-
-    let remainder = &combined[search_from..];
-    let keep = terminal_query_tail_len(remainder);
-
-    let printable_len = remainder.len().saturating_sub(keep);
-    if printable_len > 0 {
-        print_sanitized_output(response_tail, &remainder[..printable_len]);
-    }
-    *tail = remainder[printable_len..].to_string();
-
-    Ok(())
-}
-
-fn print_sanitized_output(response_tail: &mut String, chunk: &str) {
-    let sanitized = filter_terminal_response_chunk(response_tail, chunk);
-    if !sanitized.is_empty() {
-        print!("{sanitized}");
-    }
-}
-
-fn filter_terminal_response_chunk(pending: &mut String, chunk: &str) -> String {
-    use std::sync::OnceLock;
-
-    static PARTIAL_CPR_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let partial_cpr_re = PARTIAL_CPR_RE
-        .get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:\??\d*(?:;\d*)?)?)?$").unwrap());
-
-    static FULL_CPR_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let full_cpr_re = FULL_CPR_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
-
-    static BARE_CPR_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let bare_cpr_re = BARE_CPR_RE.get_or_init(|| regex::Regex::new(r"\[\??\d+;\d+R").unwrap());
-
-    static FULL_OSC_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let full_osc_re = FULL_OSC_RE.get_or_init(|| {
-        regex::Regex::new(
-            r"\x1b]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\x1b\\)",
-        )
-        .unwrap()
-    });
-
-    static BARE_OSC_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let bare_osc_re = BARE_OSC_RE.get_or_init(|| {
-        regex::Regex::new(r"]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\\)")
-            .unwrap()
-    });
-
-    let mut combined = std::mem::take(pending);
-    combined.push_str(chunk);
-
-    let cpr_pending_start = partial_cpr_re.find(&combined).map(|m| m.start());
-    let osc_pending_start = trailing_partial_osc_response_start(&combined);
-    if let Some(start) = [cpr_pending_start, osc_pending_start]
-        .into_iter()
-        .flatten()
-        .min()
-    {
-        *pending = combined[start..].to_string();
-        combined.truncate(start);
-    }
-
-    let combined = full_cpr_re.replace_all(&combined, "");
-    let combined = bare_cpr_re.replace_all(&combined, "");
-    let combined = full_osc_re.replace_all(&combined, "");
-    bare_osc_re.replace_all(&combined, "").into_owned()
-}
-
-fn trailing_partial_osc_response_start(text: &str) -> Option<usize> {
-    ["\x1b]10;rgb:", "\x1b]11;rgb:", "]10;rgb:", "]11;rgb:"]
-        .into_iter()
-        .filter_map(|prefix| text.rfind(prefix))
-        .filter(|start| is_partial_osc_color_response(&text[*start..]))
-        .min()
-}
-
-fn is_partial_osc_color_response(candidate: &str) -> bool {
-    let bytes = candidate.as_bytes();
-    let mut index = 0usize;
-
-    if bytes.first() == Some(&0x1b) {
-        index += 1;
-    }
-
-    if bytes.get(index) != Some(&b']') {
-        return false;
-    }
-    index += 1;
-
-    let rest = &candidate[index..];
-    let prefix_len = if rest.starts_with("10;rgb:") || rest.starts_with("11;rgb:") {
-        7
-    } else {
-        return false;
-    };
-    index += prefix_len;
-
-    let mut slash_count = 0usize;
-    let mut hex_in_component = 0usize;
-    let mut saw_hex = false;
-
-    while let Some(&byte) = bytes.get(index) {
-        if byte.is_ascii_hexdigit() {
-            if hex_in_component == 4 {
-                return false;
-            }
-            hex_in_component += 1;
-            saw_hex = true;
-            index += 1;
-            continue;
-        }
-
-        match byte {
-            b'/' => {
-                if !saw_hex || slash_count >= 2 {
-                    return false;
-                }
-                slash_count += 1;
-                hex_in_component = 0;
-                saw_hex = false;
-                index += 1;
-            }
-            0x07 => return slash_count == 2 && saw_hex,
-            0x1b => return index + 1 == bytes.len(),
-            b'\\' => return false,
-            _ => return false,
-        }
-    }
-
-    true
-}
 pub async fn send_input(
     config: &AppConfig,
     id: &str,

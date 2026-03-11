@@ -309,13 +309,22 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
             .unwrap()
     });
 
+    static GENERIC_OSC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let generic_osc_full_re = GENERIC_OSC_FULL_RE.get_or_init(|| {
+        regex::Regex::new(r"\x1b]\d{1,3}(?:;[^\x07\x1b]*)*(?:\x07|\x1b\\)").unwrap()
+    });
+
+    static GENERIC_OSC_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let generic_osc_bare_re = GENERIC_OSC_BARE_RE
+        .get_or_init(|| regex::Regex::new(r"]\d{1,3}(?:;[^\x07\\]*)*(?:\x07|\\)").unwrap());
+
     // 1. Prepend any fragment saved from the previous chunk.
     let mut combined = std::mem::take(pending);
     combined.push_str(chunk);
 
     // 2. Save any trailing incomplete CPR/OSC prefix for the next call.
     let cpr_pending_start = partial_re.find(&combined).map(|m| m.start());
-    let osc_pending_start = trailing_partial_osc_response_start(&combined);
+    let osc_pending_start = trailing_partial_osc_sequence_start(&combined);
     if let Some(start) = [cpr_pending_start, osc_pending_start]
         .into_iter()
         .flatten()
@@ -333,14 +342,24 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
 
     // 5. Strip OSC 10/11 color responses, ESC-prefixed or bare.
     let combined = osc_full_re.replace_all(&combined, "");
-    osc_bare_re.replace_all(&combined, "").into_owned()
+    let combined = osc_bare_re.replace_all(&combined, "");
+
+    // 6. Strip generic OSC control sequences such as OSC 7 shell cwd updates.
+    let combined = generic_osc_full_re.replace_all(&combined, "");
+    generic_osc_bare_re.replace_all(&combined, "").into_owned()
 }
 
-pub(crate) fn trailing_partial_osc_response_start(text: &str) -> Option<usize> {
+pub(crate) fn trailing_partial_osc_sequence_start(text: &str) -> Option<usize> {
     ["\x1b]10;rgb:", "\x1b]11;rgb:", "]10;rgb:", "]11;rgb:"]
         .into_iter()
         .filter_map(|prefix| text.rfind(prefix))
         .filter(|start| is_partial_osc_color_response(&text[*start..]))
+        .chain(
+            ["\x1b]", "]"]
+                .into_iter()
+                .filter_map(|prefix| text.rfind(prefix))
+                .filter(|start| is_partial_generic_osc_sequence(&text[*start..])),
+        )
         .min()
 }
 
@@ -388,12 +407,65 @@ pub(crate) fn is_partial_osc_color_response(candidate: &str) -> bool {
                 saw_hex = false;
                 index += 1;
             }
-            0x07 => return slash_count == 2 && saw_hex,
-            0x1b => return index + 1 == bytes.len(),
+            0x07 => return false,
+            0x1b => {
+                return if index + 1 == bytes.len() {
+                    slash_count == 2 && saw_hex
+                } else {
+                    bytes.get(index + 1) != Some(&b'\\')
+                };
+            }
             b'\\' => return false,
             _ => return false,
         }
     }
+    true
+}
+
+pub(crate) fn is_partial_generic_osc_sequence(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    let mut index = 0usize;
+
+    if bytes.first() == Some(&0x1b) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b']') {
+        return false;
+    }
+    index += 1;
+
+    let digits_start = index;
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    if index == digits_start || index - digits_start > 3 {
+        return false;
+    }
+    if bytes.get(index) != Some(&b';') {
+        return false;
+    }
+    index += 1;
+
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            0x07 => return false,
+            0x1b => {
+                return if index + 1 == bytes.len() {
+                    true
+                } else {
+                    bytes.get(index + 1) != Some(&b'\\')
+                };
+            }
+            b'\\' => return false,
+            _ => index += 1,
+        }
+    }
+
     true
 }
 
@@ -437,5 +509,24 @@ mod tests {
         assert_eq!(xterm_color_to_rgb(21), (0x00, 0x00, 0xff));
         assert_eq!(xterm_color_to_rgb(232), (0x08, 0x08, 0x08));
         assert_eq!(xterm_color_to_rgb(255), (0xee, 0xee, 0xee));
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_strips_generic_osc_sequences() {
+        let mut pending = String::new();
+        let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug\x07after";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_keeps_partial_generic_osc_sequence_pending() {
+        let mut pending = String::new();
+        let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "before");
+        assert_eq!(
+            pending,
+            "\x1b]7;file://host/home/binwen/open-relay/target/debug"
+        );
     }
 }

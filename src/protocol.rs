@@ -138,9 +138,10 @@ pub enum RpcResponse {
     Start {
         session_id: String,
     },
-    /// Sent once after AttachSubscribe: ring tail replay + terminal mode flags.
+    /// Sent once after AttachSubscribe: ring tail replay (raw filtered bytes) + terminal mode flags.
     AttachStreamInit {
-        lines: Vec<String>,
+        /// Raw PTY bytes (CPR/DSR responses stripped), ready to write directly to the terminal.
+        data: Vec<u8>,
         end_offset: u64,
         running: bool,
         bracketed_paste_mode: bool,
