@@ -310,8 +310,8 @@ pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<
 // filter_cpr_chunk — shared ESC-response filter (used by EscapeFilter)
 // ---------------------------------------------------------------------------
 
-/// Filters CPR (Cursor Position Report) and OSC 10/11 color responses out of
-/// a single PTY chunk.
+/// Filters CPR (Cursor Position Report), OSC 10/11 color responses, and
+/// terminal-query sequences out of a single PTY chunk.
 ///
 /// ConPTY on Windows echoes device/color responses into the master output
 /// stream.  The sequence is frequently split across PTY read boundaries at
@@ -323,12 +323,18 @@ pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<
 /// * ESC alone:               `…\x1b`  |  `[35;1R…`
 /// * Bare (no ESC from ConPTY): `…[35;1R…`
 /// * OSC 10/11 full or bare variants
+/// * Terminal queries that would cause the attach client's terminal to
+///   respond (DECRPM, XTVERSION, DA1/DA2, kitty keyboard, etc.)
 pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     use std::sync::OnceLock;
 
     static PARTIAL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let partial_re =
-        PARTIAL_RE.get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:\??\d*(?:;\d*)?)?)?$").unwrap());
+    let partial_re = PARTIAL_RE.get_or_init(|| {
+        // Matches a trailing incomplete CSI sequence that may continue in the
+        // next chunk.  Covers standard CSI, private-mode CSI (?), and CSI >
+        // prefixes with optional digits, semicolons, and intermediate bytes.
+        regex::Regex::new(r"\x1b(?:\[(?:[>?]?\d*(?:;\d*)*\$?)?)?$").unwrap()
+    });
 
     static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
     let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
@@ -345,6 +351,42 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     static DSR_QUERY_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
     let dsr_query_bare_re =
         DSR_QUERY_BARE_RE.get_or_init(|| regex::Regex::new(r"\[[56]n").unwrap());
+
+    // Private-mode DSR queries (\x1b[?<digits>n) — the `?` variant is NOT
+    // caught by DSR_QUERY_FULL_RE above.  Programs like opencode/bubbletea
+    // send \x1b[?996n (DEC Locator) which would otherwise leak.
+    static PRIVATE_DSR_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let private_dsr_query_re =
+        PRIVATE_DSR_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?\d+n").unwrap());
+
+    // DECRPM queries (\x1b[?<mode>$p) — opencode/bubbletea sends these to
+    // probe terminal modes.  If they leak to the attach client's terminal,
+    // the terminal responds with DECRPM replies that crossterm interprets as
+    // key events, sending garbage input back to the child.
+    static DECRPM_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let decrpm_query_re = DECRPM_QUERY_RE
+        .get_or_init(|| regex::Regex::new(r"\x1b\[\?\d+(?:;\d+)*\$p").unwrap());
+
+    // XTVERSION query (\x1b[>0q or variants) — terminal responds with a DCS
+    // string that crossterm doesn't recognise, causing character-level garbage.
+    static XTVERSION_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let xtversion_query_re =
+        XTVERSION_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[>\d*q").unwrap());
+
+    // DA1 / DA2 queries — \x1b[c and \x1b[>c.
+    static DA_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let da_query_re =
+        DA_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[>?c").unwrap());
+
+    // Kitty keyboard protocol query (\x1b[?u).
+    static KITTY_KB_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let kitty_kb_query_re =
+        KITTY_KB_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?u").unwrap());
+
+    // Window-size-in-pixels query (\x1b[14t, \x1b[16t, etc.).
+    static WINSIZE_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let winsize_query_re =
+        WINSIZE_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[1[4-9]t").unwrap());
 
     static OSC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
     let osc_full_re = OSC_FULL_RE.get_or_init(|| {
@@ -401,7 +443,16 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
 
     // 7. Strip generic OSC control sequences such as OSC 7 shell cwd updates.
     let combined = generic_osc_full_re.replace_all(&combined, "");
-    generic_osc_bare_re.replace_all(&combined, "").into_owned()
+    let combined = generic_osc_bare_re.replace_all(&combined, "");
+
+    // 8. Strip terminal-query sequences that would cause the attach client's
+    //    real terminal to respond, injecting garbage into crossterm's stdin.
+    let combined = private_dsr_query_re.replace_all(&combined, "");
+    let combined = decrpm_query_re.replace_all(&combined, "");
+    let combined = xtversion_query_re.replace_all(&combined, "");
+    let combined = da_query_re.replace_all(&combined, "");
+    let combined = kitty_kb_query_re.replace_all(&combined, "");
+    winsize_query_re.replace_all(&combined, "").into_owned()
 }
 
 pub(crate) fn trailing_partial_osc_sequence_start(text: &str) -> Option<usize> {
@@ -692,6 +743,111 @@ mod tests {
         assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
         // Second chunk completes the query with `n`
         let text2 = "nworld";
+        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+    }
+
+    // -----------------------------------------------------------------------
+    // Terminal query stripping (DECRPM, XTVERSION, DA, kitty keyboard, etc.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_strips_decrpm_queries() {
+        let mut pending = String::new();
+        let text = "before\x1b[?2004$pafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_multiple_decrpm_queries() {
+        let mut pending = String::new();
+        let text = "\x1b[?1016$p\x1b[?2027$p\x1b[?2004$pvisible";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "visible");
+    }
+
+    #[test]
+    fn test_filter_strips_xtversion_query() {
+        let mut pending = String::new();
+        let text = "before\x1b[>0qafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_da1_query() {
+        let mut pending = String::new();
+        let text = "before\x1b[cafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_da2_query() {
+        let mut pending = String::new();
+        let text = "before\x1b[>cafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_kitty_keyboard_query() {
+        let mut pending = String::new();
+        let text = "before\x1b[?uafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_private_dsr_query() {
+        let mut pending = String::new();
+        // \x1b[?996n is a private-mode DSR that the plain \x1b[\d+n regex misses.
+        let text = "before\x1b[?996nafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_winsize_query() {
+        let mut pending = String::new();
+        let text = "before\x1b[14tafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_preserves_restore_cursor_csi_u() {
+        let mut pending = String::new();
+        // \x1b[u is "restore cursor position" — must NOT be stripped.
+        // Only \x1b[?u (kitty keyboard query) should be stripped.
+        let text = "before\x1b[uafter";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "before\x1b[uafter");
+    }
+
+    #[test]
+    fn test_filter_strips_opencode_startup_queries() {
+        let mut pending = String::new();
+        // Simulates the query burst that opencode/bubbletea sends at startup.
+        let text = "\x1b[>0q\x1b[?25l\x1b[s\x1b[?1016$p\x1b[?2027$p\x1b[?2031$p\x1b[?1004$p\x1b[?2004$p\x1b[?2026$p\x1b[?u\x1b[H\x1b[?1049hTUI_CONTENT";
+        let result = filter_cpr_chunk(&mut pending, text);
+        // Queries stripped, mode-setting commands and content preserved.
+        assert!(
+            result.contains("\x1b[?25l"),
+            "hide cursor should be preserved"
+        );
+        assert!(
+            result.contains("\x1b[?1049h"),
+            "alt screen enter should be preserved"
+        );
+        assert!(result.contains("TUI_CONTENT"), "TUI content should be preserved");
+        assert!(
+            !result.contains("$p"),
+            "DECRPM queries should be stripped"
+        );
+        assert!(!result.contains(">0q"), "XTVERSION should be stripped");
+        assert!(!result.contains("\x1b[?u"), "kitty kb query should be stripped");
+    }
+
+    #[test]
+    fn test_filter_strips_split_decrpm_query() {
+        let mut pending = String::new();
+        // First chunk ends with partial DECRPM: \x1b[?2004$
+        let text1 = "hello\x1b[?2004$";
+        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
+        // Second chunk completes the query with `p`
+        let text2 = "pworld";
         assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
     }
 }
