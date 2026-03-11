@@ -6,10 +6,14 @@
 
 <p align="center"><a href="./assets/oly-full-demo.mp4">Download or open the full demo video</a></p>
 
+[![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 > Run any CLI like a managed service.
 
 `oly` turns long-running and interactive CLI workflows into persistent, supervised sessions for humans and AI agents. Close the terminal, keep the process alive, get notified when input is needed, and jump back in from anywhere.
+
+If this solves a real problem for you, give the repo a star so more people can find it.
 
 For a full repository architecture map, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 For the PTY/session internals specifically, see [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
@@ -32,6 +36,22 @@ You start an agent or interactive CLI task. It runs for 20 minutes. Halfway thro
 - Detects when input is likely needed and notifies you
 - Lets you inject input without attaching (`oly input <id> --key enter`)
 - Keeps auditable logs of everything
+
+### Who it's for
+
+- People running AI coding agents that stall on prompts, permissions, or long-running work
+- Anyone using interactive CLIs that should survive terminal closes, disconnects, or context switches
+- Teams that want auditable logs and remote intervention instead of fragile ad-hoc shell sessions
+
+### Why not just `tmux`, `screen`, or a remote shell?
+
+| Need | `tmux` / `screen` | `oly` |
+|---|---|---|
+| Session survives after you close your terminal | Yes | Yes |
+| Detects when human input is likely needed | No | Yes |
+| Send input without attaching | No | Yes |
+| Built for supervising AI agents and interactive CLIs | Not really | Yes |
+| Keeps auditable session logs as a first-class feature | Minimal | Yes |
 
 ### Agent-supervises-agent 🤖 👀 🤖
 
@@ -76,6 +96,8 @@ Download the latest release for your platform from the [Releases page](https://g
 
 The CLI is for both humans and AI agents.
 
+If you only try one workflow, make it this one: start the daemon, launch a session detached, inspect logs, then send input only when needed.
+
 ```sh
 # Start the daemon (once per boot, or add to your init)
 oly daemon start
@@ -113,6 +135,14 @@ Access and manage sessions from a browser, with push notification support. Inter
 ```
 
 Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logged. Your rules. 🔒
+
+---
+
+## Why star or watch this repo
+
+- You want a better way to supervise long-running agent or CLI sessions
+- You want release updates as packaging, remote supervision, and workflow support improve
+- You want to help shape an early tool in a fast-moving part of the developer tooling stack
 
 ---
 

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Support
+    url: https://github.com/slaveOftime/open-relay/blob/main/SUPPORT.md
+    about: Read the support guide before opening a workflow or install issue.
+  - name: Security policy
+    url: https://github.com/slaveOftime/open-relay/blob/main/SECURITY.md
+    about: Review the security reporting instructions before sharing sensitive details.
