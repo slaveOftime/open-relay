@@ -109,6 +109,9 @@ jobs:
           npm version "$VERSION" --no-git-tag-version
         working-directory: npm
 
+      - name: Copy README to npm package
+        run: cp README.md npm/README.md
+
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

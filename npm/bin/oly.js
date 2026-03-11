@@ -10,7 +10,7 @@ const binaryPath = path.join(__dirname, binaryName);
 
 if (!fs.existsSync(binaryPath)) {
   console.error(
-    "oly: binary not found. Try reinstalling: npm install -g oly"
+    "oly: binary not found. Try reinstalling: npm install -g @slaveoftime/oly"
   );
   process.exit(1);
 }
