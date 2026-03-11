@@ -336,6 +336,16 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     static BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
     let bare_re = BARE_RE.get_or_init(|| regex::Regex::new(r"\[\??\d+;\d+R").unwrap());
 
+    // DSR/CPR *query* patterns — strip these so attach clients' terminals
+    // don't respond with their own CPR, which would leak into the child's stdin.
+    static DSR_QUERY_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let dsr_query_full_re =
+        DSR_QUERY_FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\d+n").unwrap());
+
+    static DSR_QUERY_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let dsr_query_bare_re =
+        DSR_QUERY_BARE_RE.get_or_init(|| regex::Regex::new(r"\[[56]n").unwrap());
+
     static OSC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
     let osc_full_re = OSC_FULL_RE.get_or_init(|| {
         regex::Regex::new(
@@ -381,11 +391,15 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     // 4. Strip bare CPRs (ESC missing / dropped by ConPTY).
     let combined = bare_re.replace_all(&combined, "");
 
-    // 5. Strip OSC 10/11 color responses, ESC-prefixed or bare.
+    // 5. Strip DSR/CPR *query* sequences (e.g. \x1b[6n, \x1b[5n).
+    let combined = dsr_query_full_re.replace_all(&combined, "");
+    let combined = dsr_query_bare_re.replace_all(&combined, "");
+
+    // 6. Strip OSC 10/11 color responses, ESC-prefixed or bare.
     let combined = osc_full_re.replace_all(&combined, "");
     let combined = osc_bare_re.replace_all(&combined, "");
 
-    // 6. Strip generic OSC control sequences such as OSC 7 shell cwd updates.
+    // 7. Strip generic OSC control sequences such as OSC 7 shell cwd updates.
     let combined = generic_osc_full_re.replace_all(&combined, "");
     generic_osc_bare_re.replace_all(&combined, "").into_owned()
 }
@@ -659,5 +673,25 @@ mod tests {
             pending,
             "\x1b]7;file://host/home/binwen/open-relay/target/debug"
         );
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_strips_dsr_queries() {
+        let mut pending = String::new();
+        // CPR query \x1b[6n and DSR query \x1b[5n should be stripped.
+        let text = "hello\x1b[6nworld\x1b[5n!";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "helloworld!");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_strips_split_dsr_query() {
+        let mut pending = String::new();
+        // First chunk ends with partial sequence \x1b[6
+        let text1 = "hello\x1b[6";
+        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
+        // Second chunk completes the query with `n`
+        let text2 = "nworld";
+        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
     }
 }
