@@ -387,8 +387,13 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     let id2 = start_session(&tmp, shell);
 
     for id in [&id1, &id2] {
-        wait_for_log(&tmp, id, |log| !log.trim().is_empty(), Duration::from_secs(3))
-            .unwrap_or_else(|| panic!("session {id} produced no output within 3 s"));
+        wait_for_log(
+            &tmp,
+            id,
+            |log| !log.trim().is_empty(),
+            Duration::from_secs(3),
+        )
+        .unwrap_or_else(|| panic!("session {id} produced no output within 3 s"));
     }
 
     const MARKER_1: &str = "oly_e2e_session_alpha";
@@ -435,7 +440,11 @@ fn e2e_high_bandwidth_output_logs_intact() {
     #[cfg(target_os = "windows")]
     let cmd: &[&str] = &["cmd.exe", "/c", "for /L %i in (1,1,500) do @echo LINE_%i"];
     #[cfg(not(target_os = "windows"))]
-    let cmd: &[&str] = &["sh", "-c", "seq 1 500 | while read i; do echo LINE_$i; done"];
+    let cmd: &[&str] = &[
+        "sh",
+        "-c",
+        "seq 1 500 | while read i; do echo LINE_$i; done",
+    ];
 
     let id = start_session(&tmp, cmd);
 
@@ -494,7 +503,14 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
     );
 
     let colored = oly_cmd(&tmp)
-        .args(["logs", &id, "--tail", "200", "--no-truncate", "--keep-color"])
+        .args([
+            "logs",
+            &id,
+            "--tail",
+            "200",
+            "--no-truncate",
+            "--keep-color",
+        ])
         .output()
         .expect("`oly logs --keep-color` failed");
     let colored_text = String::from_utf8_lossy(&colored.stdout);

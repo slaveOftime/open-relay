@@ -22,7 +22,10 @@ fn oly_cmd(tmp_dir: &PathBuf) -> Command {
 
     // OLY_SOCKET_NAME prevents accidentally connecting to a real daemon
     // running on the default named pipe (Windows) or socket (Unix).
-    cmd.env("OLY_SOCKET_NAME", format!("oly-cli-test-{}", tmp_dir.display()));
+    cmd.env(
+        "OLY_SOCKET_NAME",
+        format!("oly-cli-test-{}", tmp_dir.display()),
+    );
 
     cmd
 }

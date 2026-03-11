@@ -218,7 +218,10 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let nodes_resp = reqwest::get(format!("http://127.0.0.1:{port}/api/nodes"))
             .await
             .expect("GET /api/nodes failed");
-        assert!(nodes_resp.status().is_success(), "GET /api/nodes was not 2xx");
+        assert!(
+            nodes_resp.status().is_success(),
+            "GET /api/nodes was not 2xx"
+        );
         let nodes_body = nodes_resp.text().await.expect("read /api/nodes body");
         let nodes_json: serde_json::Value =
             serde_json::from_str(&nodes_body).expect("parse /api/nodes");

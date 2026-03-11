@@ -17,7 +17,8 @@ use crate::{
 };
 
 use super::pty::{
-    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content,
+    CursorTracker, EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client,
+    has_visible_content,
 };
 
 use super::{
@@ -347,6 +348,7 @@ pub fn spawn_session(
         let mut buf = [0u8; 4096];
         let mut reader = reader;
         let mut query_tail = String::new();
+        let mut cursor_tracker = CursorTracker::new(rows, cols);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -359,9 +361,17 @@ pub fn spawn_session(
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
+                    // Update cursor position tracking before answering queries
+                    // so CPR responses reflect the actual cursor position.
+                    cursor_tracker.process(&data);
+
                     // Always let the daemon answer terminal queries that need
                     // a shared, session-global answer (currently CPR/DSR).
-                    for resp in extract_query_responses_no_client(&data, &mut query_tail) {
+                    for resp in extract_query_responses_no_client(
+                        &data,
+                        &mut query_tail,
+                        cursor_tracker.position(),
+                    ) {
                         let _ = writer_tx.send(resp);
                     }
 
