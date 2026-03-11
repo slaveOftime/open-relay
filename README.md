@@ -51,6 +51,10 @@ brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
 brew install slaveOftime/open-relay/oly
 ```
 
+```sh
+npm i @slaveoftime/oly -g
+```
+
 ### Pre-built Binaries
 
 Download the latest release for your platform from the [Releases page](https://github.com/Slaveoftime/open-relay/releases).
