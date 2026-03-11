@@ -3,7 +3,6 @@ use std::{path::PathBuf, process::Command};
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let web_dir = manifest_dir.join("web");
-    let icon_path = manifest_dir.join("assets").join("icon.ico");
 
     // Re-run this build script whenever web sources change.
     println!("cargo:rerun-if-changed=web/src");
@@ -15,6 +14,7 @@ fn main() {
 
     #[cfg(windows)]
     {
+        let icon_path = manifest_dir.join("assets").join("icon.ico");
         println!("cargo:rerun-if-changed={}", icon_path.display());
         let mut res = winres::WindowsResource::new();
         res.set_icon(icon_path.to_str().expect("invalid icon path"));

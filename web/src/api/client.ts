@@ -338,10 +338,23 @@ export function subscribeEvents(
 // WebSocket PTY attach
 // ---------------------------------------------------------------------------
 
+/** Decode a base64 string into a Uint8Array of raw bytes. */
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
 export interface AttachOptions {
-  onSnapshot: (lines: string[], cursor: number, running: boolean) => void
-  onOutput: (lines: string[], cursor: number) => void
-  onEnd: (exitCode: number | null) => void
+  /** Called with decoded raw PTY bytes from the initial ring-buffer replay. */
+  onInit: (data: Uint8Array, appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called with decoded raw PTY bytes for each incremental output chunk. */
+  onData: (data: Uint8Array) => void
+  /** Called when terminal modes change (DECCKM, bracketed paste). */
+  onModeChanged: (appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called when the session ends. */
+  onSessionEnded: (exitCode: number | null) => void
   onError: (message: string) => void
   onOpen: () => void
   onClose: (code: number, reason: string) => void
@@ -351,11 +364,20 @@ export class AttachSocket {
   private ws: WebSocket
   private closed = false
 
-  constructor(sessionId: string, opts: AttachOptions, node?: string) {
+  constructor(
+    sessionId: string,
+    opts: AttachOptions,
+    node?: string,
+    initialSize?: { rows: number; cols: number }
+  ) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = location.host
     const params = new URLSearchParams()
     if (node) params.set('node', node)
+    if (initialSize && initialSize.rows > 0 && initialSize.cols > 0) {
+      params.set('rows', String(initialSize.rows))
+      params.set('cols', String(initialSize.cols))
+    }
     const tok = getToken()
     if (tok) params.set('token', tok)
     const qs = params.toString()
@@ -372,17 +394,22 @@ export class AttachSocket {
       try {
         const msg = JSON.parse(e.data) as WsServerMessage
         switch (msg.type) {
-          case 'snapshot':
-            opts.onSnapshot(msg.lines, msg.cursor, msg.running)
+          case 'init':
+            opts.onInit(base64ToBytes(msg.data), msg.appCursorKeys, msg.bracketedPasteMode)
             break
-          case 'output':
-            opts.onOutput(msg.lines, msg.cursor)
+          case 'data':
+            opts.onData(base64ToBytes(msg.data))
             break
-          case 'end':
-            opts.onEnd(msg.exit_code)
+          case 'mode_changed':
+            opts.onModeChanged(msg.appCursorKeys, msg.bracketedPasteMode)
+            break
+          case 'session_ended':
+            opts.onSessionEnded(msg.exit_code)
             break
           case 'error':
             opts.onError(msg.message)
+            break
+          case 'pong':
             break
         }
       } catch {

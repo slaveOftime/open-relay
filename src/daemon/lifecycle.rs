@@ -31,6 +31,16 @@ pub struct DaemonGuard {
     config: AppConfig,
 }
 
+fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
+    if let Ok(filter) = std::env::var("RUST_LOG") {
+        return tracing_subscriber::EnvFilter::try_new(filter)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    }
+
+    tracing_subscriber::EnvFilter::try_new(config.log_level.clone())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = storage::remove_file_if_exists(&self.config.lock_file);
@@ -186,17 +196,16 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         .without_time()
         .with_target(false);
 
+    let env_filter = build_env_filter(&config);
+
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
+        .with(env_filter)
         .with(file_layer)
         .with(stderr_layer)
         .init();
 
     let pid = std::process::id();
-    info!(pid, "daemon started");
+    info!(pid, log_level = %config.log_level, "daemon started");
 
     let db = Arc::new(Database::open(&config.db_file, config.sessions_dir.clone()).await?);
     info!(db_file = ?config.db_file, "database opened");
@@ -206,8 +215,11 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
     for join in client::join::load_join_configs(&config) {
-        let (abort, stop_tx) =
-            client::spawn_join_connector(join.clone(), config.clone(), notification_tx.subscribe());
+        let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
+            join.clone(),
+            config.clone(),
+            notification_tx.subscribe(),
+        );
         join_handles
             .lock()
             .await

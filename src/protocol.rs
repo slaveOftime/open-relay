@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcEnvelope<T> {
@@ -27,12 +27,9 @@ pub enum RpcRequest {
         #[serde(default)]
         disable_notifications: bool,
     },
-    AttachSnapshot {
+    AttachSubscribe {
         id: String,
-    },
-    AttachPoll {
-        id: String,
-        cursor: usize,
+        from_byte_offset: Option<u64>,
     },
     AttachInput {
         id: String,
@@ -42,6 +39,9 @@ pub enum RpcRequest {
         id: String,
         rows: u16,
         cols: u16,
+    },
+    AttachDetach {
+        id: String,
     },
     Stop {
         id: String,
@@ -53,7 +53,7 @@ pub enum RpcRequest {
     },
     LogsPoll {
         id: String,
-        cursor: usize,
+        cursor: u64,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
     /// times out), then return a snapshot.  Response is `LogsSnapshot`.
@@ -102,10 +102,10 @@ impl RpcRequest {
             RpcRequest::DaemonStop => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
-            RpcRequest::AttachSnapshot { .. } => "attach_snapshot",
-            RpcRequest::AttachPoll { .. } => "attach_poll",
+            RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
             RpcRequest::AttachResize { .. } => "attach_resize",
+            RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::LogsSnapshot { .. } => "logs_snapshot",
             RpcRequest::LogsPoll { .. } => "logs_poll",
@@ -138,33 +138,42 @@ pub enum RpcResponse {
     Start {
         session_id: String,
     },
-    AttachSnapshot {
-        lines: Vec<String>,
-        cursor: usize,
+    /// Sent once after AttachSubscribe: ring tail replay (raw filtered bytes) + terminal mode flags.
+    AttachStreamInit {
+        /// Raw PTY bytes (CPR/DSR responses stripped), ready to write directly to the terminal.
+        data: Vec<u8>,
+        end_offset: u64,
         running: bool,
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
     },
-    AttachPoll {
-        lines: Vec<String>,
-        cursor: usize,
-        running: bool,
+    /// Stream chunk of new PTY output (filtered, ready to write to terminal).
+    AttachStreamChunk {
+        offset: u64,
+        data: Vec<u8>,
+    },
+    /// Terminal mode changed (bracketed-paste / app-cursor-keys) mid-stream.
+    AttachModeChanged {
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
+    },
+    /// Session ended; attach stream is done.
+    AttachStreamDone {
+        exit_code: Option<i32>,
     },
     Stop {
         stopped: bool,
     },
     LogsSnapshot {
         lines: Vec<String>,
-        cursor: usize,
+        cursor: u64,
         running: bool,
     },
     LogsPoll {
         lines: Vec<String>,
-        cursor: usize,
+        cursor: u64,
         running: bool,
     },
     Ack,
@@ -237,10 +246,18 @@ pub enum NodeWsMessage {
         id: String,
         request: serde_json::Value,
     },
-    /// Secondary → Primary: RPC response.
+    /// Secondary → Primary: single-shot RPC response (non-streaming).
     RpcResponse {
         id: String,
         response: serde_json::Value,
+    },
+    /// Secondary → Primary: one frame of a streaming RPC response.
+    /// Multiple frames share the same `id`.  `done` is true on the final frame.
+    RpcStreamFrame {
+        id: String,
+        response: serde_json::Value,
+        #[serde(default)]
+        done: bool,
     },
     /// Secondary -> Primary: notification event produced by the secondary daemon.
     Notification {

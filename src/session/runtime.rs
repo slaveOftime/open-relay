@@ -1,12 +1,14 @@
 use std::{
-    collections::VecDeque,
     io::{ErrorKind, Read, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use tokio::sync::{broadcast, mpsc};
+use tracing::{debug, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -14,41 +16,19 @@ use crate::{
     error::{AppError, Result},
 };
 
-use super::{
-    SessionMeta, SessionStatus,
-    persist::{append_event, append_output, append_resize_event},
+use super::pty::{
+    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content,
 };
 
-// ---------------------------------------------------------------------------
-// RuntimeChild
-// ---------------------------------------------------------------------------
+use super::{
+    SessionMeta, SessionStatus,
+    cursor_tracker::CursorTracker,
+    mode_tracker::{ModeSnapshot, ModeTracker},
+    persist::{append_event, append_output_raw, append_resize_event},
+    ring::RingBuffer,
+};
 
-pub enum RuntimeChild {
-    Pty(Box<dyn portable_pty::Child + Send + Sync>),
-}
-
-impl RuntimeChild {
-    pub fn process_id(&self) -> Option<u32> {
-        match self {
-            Self::Pty(child) => child.process_id(),
-        }
-    }
-
-    pub fn kill(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Pty(child) => child.kill(),
-        }
-    }
-
-    pub fn try_wait_code(&mut self) -> std::io::Result<Option<i32>> {
-        match self {
-            Self::Pty(child) => child
-                .try_wait()
-                .map(|opt| opt.map(|status| status.exit_code() as i32)),
-        }
-    }
-}
-
+#[allow(dead_code)]
 const ATTACH_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
@@ -57,177 +37,100 @@ const ATTACH_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct SessionRuntime {
     pub meta: SessionMeta,
+    /// Absolute path to the session's working directory (`sessions/<id>/`).
     pub dir: PathBuf,
-    /// Total number of lines ever pushed to this session's output.
-    /// Used as a cursor for incremental polling via `attach_poll` / `logs_poll`.
-    pub output_line_count: usize,
-    pub ring: VecDeque<String>,
-    pub ring_limit: usize,
-    pub writer: Box<dyn Write + Send>,
-    pub child: RuntimeChild,
+    /// Byte-limited ring buffer of raw PTY output.
+    pub ring: RingBuffer,
+    /// Sends raw PTY output chunks to all live attach subscribers.
+    pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
+    /// PTY ownership: master fd, writer channel, child process.
+    pub pty: PtyHandle,
     pub completed_at: Option<Instant>,
-    pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
-    /// Timestamp of the last output chunk received; used by the notification engine.
+    /// Timestamp of the last visible output chunk; drives the notification engine.
     pub last_output_at: Option<Instant>,
-    /// Timestamp of the last input bytes forwarded to the PTY; used to suppress
-    /// notifications while the user is actively typing (input arrived after output).
+    /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
-    /// Timestamp of the last activity from an attach client, i.e. any API call that
-    /// indicates the user is actively viewing/interacting with the session.
-    /// Used to suppress notifications while the user is actively attached.
+    /// Timestamp of the last subscribe/attach action; coarse presence signal.
+    pub last_attach_presence_at: Option<Instant>,
+    /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
     /// Timestamp of the last *successful* notification delivery for this session.
-    /// Useful for diagnostics/telemetry of notification behavior.
     pub last_notified_at: Option<Instant>,
-    /// The value of `last_output_at` at the time of the last *successful* notification.
-    /// Re-notification is suppressed until `last_output_at` advances past this epoch
-    /// (i.e. new visible output has arrived).
+    /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
-    /// Carries a trailing `\x1b` byte from the end of one PTY chunk to the start
-    /// of the next. ConPTY on Windows sometimes splits `\x1b[N;NR` across two
-    /// reads; by prepending the saved ESC we always see the complete sequence and
-    /// can strip it without touching bare `[` characters in normal output.
-    pub pending_cpr_prefix: String,
-    /// Whether the child process has enabled bracketed-paste mode
-    /// (`\x1b[?2004h`).  Updated by `push_output` scanning the PTY output
-    /// stream, mirroring what xterm.js does via `decPrivateModes.bracketedPasteMode`.
-    pub bracketed_paste_mode: bool,
-    /// Carries trailing bytes that may be a partial DSR/CPR query
-    /// (`\x1b[5n` / `\x1b[6n`) between PTY chunks for daemon-side fallback
-    /// handling when no client is attached.
-    pub pending_terminal_query_tail: String,
-    /// Whether the child process has enabled application cursor key mode
-    /// (DECCKM, `\x1b[?1h`). When active, arrow key sequences sent to the
-    /// child must use `\x1bO{A,B,C,D}` instead of `\x1b[{A,B,C,D}`.
-    pub app_cursor_keys: bool,
+    /// Byte-level state machine for DEC private mode tracking.
+    pub mode_tracker: ModeTracker,
+    /// Set once the PTY reader has reached EOF or a terminal read error.
+    pub output_closed: bool,
     pub notifications_enabled: bool,
+    /// Filters CPR/DSR/OSC responses from PTY output before writing to disk.
+    pub persist_filter: EscapeFilter,
 }
 
 impl SessionRuntime {
-    pub fn push_output(&mut self, chunk: String) {
-        let chunk = if self.has_active_attach_client() {
-            if self.pending_terminal_query_tail.is_empty() {
-                chunk
-            } else {
-                let mut merged = std::mem::take(&mut self.pending_terminal_query_tail);
-                merged.push_str(&chunk);
-                merged
-            }
-        } else {
-            self.respond_to_terminal_queries_without_attach(&chunk)
-        };
+    /// Current terminal mode snapshot (DECCKM, bracketed paste).
+    pub fn mode_snapshot(&self) -> ModeSnapshot {
+        self.mode_tracker.snapshot()
+    }
 
-        let chunk = filter_cpr_chunk(&mut self.pending_cpr_prefix, &chunk);
-        for line in chunk.split_inclusive('\n') {
-            let normalized = line.to_string();
-            self.output_line_count += 1;
-            self.ring.push_back(normalized.clone());
-            while self.ring.len() > self.ring_limit {
-                let _ = self.ring.pop_front();
-            }
-            let _ = append_output(&self.dir, &normalized);
+    /// Push a raw PTY chunk: persist to disk, store in ring, update mode state,
+    /// and advance the silence clock for visible content.
+    ///
+    /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
+    pub fn push_raw(&mut self, data: Bytes) -> Option<ModeSnapshot> {
+        // Track DEC private mode toggles via byte-level state machine.
+        let mode_change = self.mode_tracker.process(&data);
+        if let Some(ref snap) = mode_change {
+            debug!(
+                session_id = %self.meta.id,
+                app_cursor_keys = snap.app_cursor_keys,
+                bracketed_paste_mode = snap.bracketed_paste_mode,
+                "terminal mode changed"
+            );
         }
-        // Track whether the child has enabled/disabled bracketed-paste mode
-        // (`\x1b[?2004h` = enable, `\x1b[?2004l` = disable). Mirrors what
-        // xterm.js does so the attach client knows how to forward pastes.
-        if chunk.contains("\x1b[?2004h") {
-            self.bracketed_paste_mode = true;
-        } else if chunk.contains("\x1b[?2004l") {
-            self.bracketed_paste_mode = false;
-        }
-        // Track DECCKM (application cursor key mode, DEC private mode 1).
-        // `\x1b[?1h` = enable, `\x1b[?1l` = disable.
-        // When active, arrow keys must be sent as `\x1bO{A,B,C,D}` rather
-        // than the standard-mode `\x1b[{A,B,C,D}`.
-        if chunk.contains("\x1b[?1h") {
-            self.app_cursor_keys = true;
-        } else if chunk.contains("\x1b[?1l") {
-            self.app_cursor_keys = false;
-        }
-        // Only advance the silence clock when the chunk contains visible characters.
-        // Pure ANSI/control sequences (cursor moves, redraws) must NOT reset the
-        // silence timer — interactive CLIs emit these continuously while waiting.
-        if has_visible_content(&chunk) {
-            // println!("| {}", chunk.replace('\x1b', "\\x1b"));
+
+        // Advance the silence clock only for chunks with visible content.
+        let text_cow = String::from_utf8_lossy(&data);
+        if has_visible_content(&text_cow) {
             self.last_output_at = Some(Instant::now());
         }
+
+        // Persist filtered bytes to disk (strips CPR/DSR/OSC responses that
+        // get echoed by the PTY driver so `oly logs` output stays clean).
+        let filtered = self.persist_filter.filter(&data);
+        if !filtered.is_empty() {
+            let _ = append_output_raw(&self.dir, &filtered);
+        }
+
+        // Add to in-memory ring (evicts oldest if over capacity).
+        self.ring.push(data);
+
+        mode_change
+    }
+
+    pub fn mark_attach_presence(&mut self) {
+        trace!(session_id = %self.meta.id, "attach presence marked");
+        self.last_attach_presence_at = Some(Instant::now());
     }
 
     pub fn mark_attach_activity(&mut self) {
+        self.mark_attach_presence();
+        debug!(session_id = %self.meta.id, "interactive attach activity marked");
         self.last_attach_activity_at = Some(Instant::now());
     }
 
-    fn has_active_attach_client(&self) -> bool {
-        self.last_attach_activity_at
-            .map(|t| Instant::now().duration_since(t) <= ATTACH_ACTIVITY_TIMEOUT)
-            .unwrap_or(false)
+    pub fn clear_attach_state(&mut self) {
+        debug!(session_id = %self.meta.id, "attach presence/activity cleared");
+        self.last_attach_presence_at = None;
+        self.last_attach_activity_at = None;
     }
 
-    fn respond_to_terminal_queries_without_attach(&mut self, chunk: &str) -> String {
-        const CPR_QUERY: &str = "\x1b[6n";
-        const DSR_QUERY: &str = "\x1b[5n";
-
-        let mut combined = std::mem::take(&mut self.pending_terminal_query_tail);
-        combined.push_str(chunk);
-
-        let mut output = String::with_capacity(combined.len());
-        let mut search_from = 0usize;
-
-        while search_from < combined.len() {
-            let cpr_match = combined[search_from..]
-                .find(CPR_QUERY)
-                .map(|o| (o, CPR_QUERY));
-            let dsr_match = combined[search_from..]
-                .find(DSR_QUERY)
-                .map(|o| (o, DSR_QUERY));
-
-            let Some((offset, query)) = [cpr_match, dsr_match]
-                .into_iter()
-                .flatten()
-                .min_by_key(|(o, _)| *o)
-            else {
-                break;
-            };
-
-            let match_start = search_from + offset;
-            if match_start > search_from {
-                output.push_str(&combined[search_from..match_start]);
-            }
-
-            let response = match query {
-                CPR_QUERY => "\x1b[1;1R",
-                DSR_QUERY => "\x1b[0n",
-                _ => "",
-            };
-            if !response.is_empty() {
-                let _ = self.writer.write_all(response.as_bytes());
-                let _ = self.writer.flush();
-            }
-
-            search_from = match_start + query.len();
-        }
-
-        let remainder = &combined[search_from..];
-        let max_prefix = CPR_QUERY.len().max(DSR_QUERY.len()).saturating_sub(1);
-        let mut keep = 0usize;
-        for prefix_len in (1..=max_prefix).rev() {
-            if remainder.ends_with(&CPR_QUERY[..prefix_len])
-                || remainder.ends_with(&DSR_QUERY[..prefix_len])
-            {
-                keep = prefix_len;
-                break;
-            }
-        }
-
-        let printable_len = remainder.len().saturating_sub(keep);
-        if printable_len > 0 {
-            output.push_str(&remainder[..printable_len]);
-        }
-        self.pending_terminal_query_tail = remainder[printable_len..].to_string();
-
-        output
+    /// Returns `true` when at least one attach subscriber is currently live.
+    #[allow(dead_code)]
+    pub fn has_active_attach_client(&self) -> bool {
+        self.broadcast_tx.receiver_count() > 0
     }
 
     /// Checks child exit status and updates `meta.status`. Returns `true` if completed.
@@ -239,8 +142,9 @@ impl SessionRuntime {
             return true;
         }
 
-        match self.child.try_wait_code() {
+        match self.pty.try_wait() {
             Ok(Some(code)) => {
+                debug!(session_id = %self.meta.id, exit_code = code, "child process exited");
                 let status = if code == 0 {
                     SessionStatus::Stopped
                 } else {
@@ -256,6 +160,7 @@ impl SessionRuntime {
                 false
             }
             Err(_) => {
+                debug!(session_id = %self.meta.id, "failed to read child exit status; marking session failed");
                 self.mark_completed(SessionStatus::Failed, None);
                 true
             }
@@ -296,19 +201,12 @@ impl SessionRuntime {
 
     pub fn resize_pty(&mut self, rows: u16, cols: u16) -> bool {
         if rows == 0 || cols == 0 {
+            debug!(session_id = %self.meta.id, rows, cols, "ignoring invalid PTY resize request");
             return false;
         }
-        let Some(pty_master) = self._pty_master.as_mut() else {
-            return false;
-        };
-        pty_master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .is_ok()
+        let resized = self.pty.resize(rows, cols);
+        debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
+        resized
     }
 }
 
@@ -331,7 +229,7 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 // ---------------------------------------------------------------------------
 
 /// Spawns a PTY-backed child process and returns an `Arc<Mutex<SessionRuntime>>`.
-/// Reader threads are started automatically and share ownership via the same Arc.
+/// Reader and writer threads are started automatically and share ownership via the Arc.
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
 pub fn spawn_session(
@@ -399,51 +297,97 @@ pub fn spawn_session(
         .unwrap_or_else(|| "?".to_string());
     let _ = append_event(&full_dir, &format!("session started pid={started_pid}"));
 
+    // Broadcast channel: each live attach subscriber holds a Receiver.
+    let (broadcast_tx, _initial_rx) = broadcast::channel::<Arc<Bytes>>(256);
+
+    // Writer channel: the dedicated write thread owns the PTY writer so that
+    // sending input never blocks the tokio runtime.
+    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // PTY writer thread — drains writer_rx and forwards bytes to the child.
+    std::thread::spawn(move || {
+        let mut writer = writer;
+        while let Some(data) = writer_rx.blocking_recv() {
+            let _ = writer.write_all(&data).and_then(|_| writer.flush());
+        }
+    });
+
+    let pty_handle = PtyHandle {
+        child: runtime_child,
+        writer_tx: writer_tx.clone(),
+        pty_master: Some(master),
+    };
+
     let runtime = Arc::new(Mutex::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
-        output_line_count: 0,
-        ring: VecDeque::new(),
-        ring_limit: config.ring_buffer_lines,
-        writer,
-        child: runtime_child,
+        ring: RingBuffer::new(config.ring_buffer_bytes),
+        broadcast_tx: broadcast_tx.clone(),
+        pty: pty_handle,
         completed_at: None,
-        _pty_master: Some(master),
         persisted: false,
         last_output_at: None,
         last_input_at: None,
+        last_attach_presence_at: None,
         last_attach_activity_at: None,
         notified_output_epoch: None,
         last_notified_at: None,
-        pending_cpr_prefix: String::new(),
-        bracketed_paste_mode: false,
-        pending_terminal_query_tail: String::new(),
-        app_cursor_keys: false,
+        mode_tracker: ModeTracker::new(),
+        output_closed: false,
         notifications_enabled,
+        persist_filter: EscapeFilter::new(),
     }));
 
-    // Spawn reader thread that feeds PTY output into the runtime buffer.
+    // PTY reader thread: reads raw bytes, stores in ring, broadcasts to subscribers.
     let runtime_reader = runtime.clone();
+    let broadcast_tx_reader = broadcast_tx;
     std::thread::spawn(move || {
         if let Ok(rt) = runtime_reader.lock() {
             let _ = append_event(&rt.dir, "pty reader started");
         }
         let mut buf = [0u8; 4096];
         let mut reader = reader;
+        let mut query_tail = String::new();
+        let mut cursor_tracker = CursorTracker::new(rows, cols);
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    if let Ok(rt) = runtime_reader.lock() {
+                    if let Ok(mut rt) = runtime_reader.lock() {
+                        rt.output_closed = true;
                         let _ = append_event(&rt.dir, "pty reader reached EOF");
                     }
                     break;
                 }
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let data = Bytes::copy_from_slice(&buf[..n]);
+
+                    // Update cursor position tracking before answering queries
+                    // so CPR responses reflect the actual cursor position.
+                    cursor_tracker.process(&data);
+
+                    // Always let the daemon answer terminal queries that need
+                    // a shared, session-global answer (currently CPR/DSR).
+                    for resp in extract_query_responses_no_client(
+                        &data,
+                        &mut query_tail,
+                        cursor_tracker.position(),
+                    ) {
+                        let _ = writer_tx.send(resp);
+                    }
+
+                    // Update in-memory ring + disk + mode tracking (brief lock).
                     match runtime_reader.lock() {
-                        Ok(mut rt) => rt.push_output(chunk),
+                        Ok(mut rt) => {
+                            let _mode_change = rt.push_raw(data.clone());
+                            // Mode changes are picked up by attach subscribers
+                            // via the broadcast channel + periodic mode checks.
+                        }
                         Err(_) => break,
                     }
+
+                    // Broadcast to all live subscribers (non-blocking; lagged
+                    // receivers will re-sync from the ring on the next tick).
+                    let _ = broadcast_tx_reader.send(Arc::new(data));
                 }
                 Err(err)
                     if matches!(err.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
@@ -451,7 +395,8 @@ pub fn spawn_session(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    if let Ok(rt) = runtime_reader.lock() {
+                    if let Ok(mut rt) = runtime_reader.lock() {
+                        rt.output_closed = true;
                         let _ = append_event(&rt.dir, &format!("pty reader error: {err}"));
                     }
                     break;
@@ -472,117 +417,6 @@ fn format_command_for_display(command: &str, args: &[String]) -> String {
         return command.to_string();
     }
     format!("{} {}", command, args.join(" "))
-}
-
-/// Filters CPR (Cursor Position Report) sequences out of a single PTY chunk.
-///
-/// ConPTY on Windows echoes the CPR response (`\x1b[row;colR`) into the master
-/// output stream.  The sequence is frequently split across PTY read boundaries
-/// at *any* byte, so this function carries a `pending` prefix from one call to
-/// the next to ensure every fragment is reassembled before being examined.
-///
-/// Splitting points handled (all stripped):
-/// * Full sequence in one chunk: `\x1b[35;1R`
-/// * ESC alone:  `…\x1b`  |  `[35;1R…`
-/// * ESC+bracket: `…\x1b[`  |  `35;1R…`
-/// * Partial row: `…\x1b[35;`  |  `1R…`
-/// * All-but-R:  `…\x1b[35;1`  |  `R…`
-/// * Bare (no ESC at all): `…[35;1R…`  — ConPTY occasionally omits the ESC
-pub(crate) fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
-    use std::sync::OnceLock;
-
-    // Matches any trailing incomplete CPR prefix so it can be carried forward.
-    // A CPR looks like \x1b [ <?> digits ; digits R — every strict prefix of
-    // that sequence (that starts with \x1b) is matched here.
-    static PARTIAL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let partial_re =
-        PARTIAL_RE.get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:\??\d*(?:;\d*)?)?)?$").unwrap());
-
-    // Matches a complete ESC-prefixed CPR anywhere in the text.
-    static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
-
-    // Matches a bare CPR that ConPTY emitted without its leading ESC byte.
-    // `R` as CSI final byte is reserved exclusively for CPR (terminal→app),
-    // so this pattern cannot appear in normal program output.
-    static BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let bare_re = BARE_RE.get_or_init(|| regex::Regex::new(r"\[\??\d+;\d+R").unwrap());
-
-    // ------------------------------------------------------------------ //
-    // 1. Prepend any fragment saved from the previous chunk.              //
-    // ------------------------------------------------------------------ //
-    let mut combined = std::mem::take(pending);
-    combined.push_str(chunk);
-
-    // ------------------------------------------------------------------ //
-    // 2. Save any trailing incomplete CPR prefix for the next call.       //
-    // ------------------------------------------------------------------ //
-    if let Some(m) = partial_re.find(&combined) {
-        *pending = m.as_str().to_string();
-        combined.truncate(m.start());
-    }
-
-    // ------------------------------------------------------------------ //
-    // 3. Strip fully-formed ESC-prefixed CPRs.                            //
-    // ------------------------------------------------------------------ //
-    let combined = full_re.replace_all(&combined, "");
-
-    // ------------------------------------------------------------------ //
-    // 4. Strip bare CPRs (ESC missing / dropped by ConPTY).               //
-    // ------------------------------------------------------------------ //
-    bare_re.replace_all(&combined, "").into_owned()
-}
-
-/// Strips only ESC-prefixed CPR device responses (`\x1b[row;colR`) from a
-/// chunk. Bare CPR fragments without a leading ESC are intentionally preserved.
-#[cfg(test)]
-fn strip_device_responses(text: &str) -> String {
-    use std::sync::OnceLock;
-    static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
-    full_re.replace_all(text, "").into_owned()
-}
-
-/// Returns `true` when `text` contains at least one character that is
-/// visually rendered (i.e. not whitespace and not part of an ANSI/VT escape
-/// sequence). Used to avoid advancing the silence clock on chunks that
-/// contain only cursor-movement or redraw escape sequences.
-pub(crate) fn has_visible_content(text: &str) -> bool {
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip CSI/OSC/other escape sequences.
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for c in chars.by_ref() {
-                        if c == '\x07' {
-                            break;
-                        }
-                        if prev == '\x1b' && c == '\\' {
-                            break;
-                        }
-                        prev = c;
-                    }
-                }
-                _ => {
-                    chars.next();
-                }
-            }
-        } else if !ch.is_whitespace() && !ch.is_control() {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -628,224 +462,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // filter_cpr_chunk — helper
-    // -----------------------------------------------------------------------
-
-    /// Run several chunks through `filter_cpr_chunk` with shared pending state,
-    /// returning the concatenated filtered output.
-    fn feed(chunks: &[&str]) -> String {
-        let mut pending = String::new();
-        let mut out = String::new();
-        for chunk in chunks {
-            out.push_str(&filter_cpr_chunk(&mut pending, chunk));
-        }
-        // Flush whatever is still pending (no more chunks → can't be a valid CPR)
-        out.push_str(&pending);
-        out
-    }
-
-    // -----------------------------------------------------------------------
-    // filter_cpr_chunk — CPR stripping
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn cpr_full_sequence_stripped() {
-        assert_eq!(feed(&["\x1b[3;1R"]), "");
-        assert_eq!(feed(&["\x1b[12;1R"]), "");
-        assert_eq!(feed(&["\x1b[20;1R"]), "");
-        assert_eq!(feed(&["\x1b[35;1R"]), "");
-        assert_eq!(feed(&["\x1b[24;80R"]), "");
-        assert_eq!(feed(&["\x1b[?3;1R"]), ""); // DEC private variant
-    }
-
-    #[test]
-    fn cpr_split_after_esc() {
-        assert_eq!(feed(&["text\x1b", "[35;1R more"]), "text more");
-    }
-
-    #[test]
-    fn cpr_split_after_bracket() {
-        assert_eq!(feed(&["text\x1b[", "35;1R more"]), "text more");
-    }
-
-    #[test]
-    fn cpr_split_mid_row() {
-        assert_eq!(feed(&["text\x1b[35", ";1R more"]), "text more");
-    }
-
-    #[test]
-    fn cpr_split_after_semicolon() {
-        assert_eq!(feed(&["text\x1b[35;", "1R more"]), "text more");
-    }
-
-    #[test]
-    fn cpr_split_before_r() {
-        assert_eq!(feed(&["text\x1b[35;1", "R more"]), "text more");
-    }
-
-    #[test]
-    fn cpr_bare_no_esc_global() {
-        // ConPTY sometimes emits the CPR with no ESC at all.
-        assert_eq!(feed(&["[15;1R"]), "");
-        assert_eq!(feed(&["[35;1R"]), "");
-        assert_eq!(feed(&["before[35;1Rafter"]), "beforeafter");
-        assert_eq!(feed(&["> [12;1R"]), "> ");
-    }
-
-    #[test]
-    fn cpr_multiple_in_one_chunk() {
-        assert_eq!(feed(&["\x1b[3;1R\x1b[24;80R"]), "");
-        assert_eq!(feed(&["a\x1b[3;1Rb\x1b[24;80Rc"]), "abc");
-    }
-
-    // -----------------------------------------------------------------------
-    // filter_cpr_chunk — must NOT mangle normal output
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn normal_text_untouched() {
-        let plain = "hello world";
-        assert_eq!(feed(&[plain]), plain);
-    }
-
-    #[test]
-    fn fsi_let_binding_untouched() {
-        // The exact text that was being corrupted in the regression.
-        let line = "let x = 123;;";
-        assert_eq!(feed(&[line]), line);
-    }
-
-    #[test]
-    fn fsi_error_output_untouched() {
-        let err = "stdin(1,5): error FS1156: This is not a valid numeric literal.";
-        assert_eq!(feed(&[err]), err);
-        let caret = "  ----^^^^^";
-        assert_eq!(feed(&[caret]), caret);
-    }
-
-    #[test]
-    fn fsharp_list_output_untouched() {
-        // F# list display has `; ` (space after semicolon) — should not match.
-        let list = "val it: int list = [1; 2; 3]";
-        assert_eq!(feed(&[list]), list);
-    }
-
-    #[test]
-    fn ansi_sgr_untouched() {
-        let sgr = "\x1b[32mOK\x1b[0m";
-        assert_eq!(feed(&[sgr]), sgr);
-    }
-
-    #[test]
-    fn ansi_cursor_movement_untouched() {
-        // \x1b[1A = cursor up, \x1b[2K = erase line — neither ends in R.
-        let cur = "\x1b[1A\x1b[2K";
-        assert_eq!(feed(&[cur]), cur);
-    }
-
-    #[test]
-    fn cpr_inline_with_normal_output() {
-        // CPR injected in the middle of a normal fsi output line.
-        assert_eq!(
-            feed(&["> let x = \x1b[35;1R123;;\r\n"]),
-            "> let x = 123;;\r\n"
-        );
-    }
-
-    #[test]
-    fn cpr_split_across_fsi_output() {
-        // CPR split mid-sequence, flanked by genuine fsi output.
-        assert_eq!(
-            feed(&["> let x = \x1b[35;", "1R123;;\r\n"]),
-            "> let x = 123;;\r\n"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // strip_device_responses (lower-level, ESC-prefixed only)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_strip_cpr_simple() {
-        assert_eq!(strip_device_responses("\x1b[3;1R"), "");
-        assert_eq!(strip_device_responses("\x1b[24;80R"), "");
-    }
-
-    #[test]
-    fn test_strip_bare_cpr_not_touched() {
-        // Bare `[N;NR` (no ESC) is handled by filter_cpr_chunk, not here.
-        assert_eq!(strip_device_responses("[12;1R"), "[12;1R");
-    }
-
-    #[test]
-    fn test_strip_passthrough_normal_ansi() {
-        let sgr = "\x1b[32mOK\x1b[0m";
-        assert_eq!(strip_device_responses(sgr), sgr);
-    }
-
-    // -----------------------------------------------------------------------
-    // has_visible_content
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_has_visible_content_plain_text() {
-        assert!(has_visible_content("hello"));
-        assert!(has_visible_content("$ "));
-        assert!(has_visible_content("Do you want to continue?"));
-    }
-
-    #[test]
-    fn test_has_visible_content_empty_and_whitespace() {
-        assert!(!has_visible_content(""));
-        assert!(!has_visible_content("   "));
-        assert!(!has_visible_content("\t\n\r"));
-    }
-
-    #[test]
-    fn test_has_visible_content_pure_ansi_csi() {
-        // Cursor movement escape sequences — no visible characters.
-        assert!(!has_visible_content("\x1b[2J"));
-        assert!(!has_visible_content("\x1b[1A\x1b[1A\x1b[2K"));
-        assert!(!has_visible_content("\x1b[H\x1b[2J\x1b[?25l"));
-    }
-
-    #[test]
-    fn test_has_visible_content_ansi_with_text() {
-        // ANSI wrapping around visible text → true.
-        assert!(has_visible_content("\x1b[32mOK\x1b[0m"));
-        assert!(has_visible_content("\x1b[1;31mError\x1b[0m"));
-    }
-
-    #[test]
-    fn test_has_visible_content_osc_sequences() {
-        // OSC title sequence — no visible characters.
-        assert!(!has_visible_content("\x1b]0;my title\x07"));
-        assert!(!has_visible_content("\x1b]2;Terminal\x1b\\"));
-    }
-
-    // -----------------------------------------------------------------------
     // Helpers for SessionRuntime unit tests
     // -----------------------------------------------------------------------
-
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_writer() -> (
-        Box<dyn std::io::Write + Send>,
-        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    ) {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        (Box::new(CaptureWriter(buf.clone())), buf)
-    }
 
     fn make_test_child() -> RuntimeChild {
         #[cfg(target_os = "windows")]
@@ -867,9 +485,8 @@ mod tests {
         RuntimeChild::Pty(child)
     }
 
-    fn new_runtime(writer: Box<dyn std::io::Write + Send>) -> SessionRuntime {
+    fn new_runtime() -> SessionRuntime {
         use crate::session::{SessionMeta, SessionStatus};
-        use std::collections::VecDeque;
 
         let meta = SessionMeta {
             id: "rt_tst01".to_string(),
@@ -884,118 +501,107 @@ mod tests {
             pid: None,
             exit_code: None,
         };
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel(4);
+        let (writer_tx, _wrx) = tokio::sync::mpsc::unbounded_channel();
         SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
-            output_line_count: 0,
-            ring: VecDeque::new(),
-            ring_limit: 4, // small limit to test eviction
-            writer,
-            child: make_test_child(),
+            ring: RingBuffer::new(4096), // small capacity for tests
+            broadcast_tx,
+            pty: PtyHandle {
+                child: make_test_child(),
+                writer_tx,
+                pty_master: None,
+            },
             completed_at: None,
-            _pty_master: None,
             persisted: false,
             last_output_at: None,
             last_input_at: None,
+            last_attach_presence_at: None,
             last_attach_activity_at: None,
             last_notified_at: None,
             notified_output_epoch: None,
-            pending_cpr_prefix: String::new(),
-            bracketed_paste_mode: false,
-            pending_terminal_query_tail: String::new(),
-            app_cursor_keys: false,
+            mode_tracker: ModeTracker::new(),
+            output_closed: false,
             notifications_enabled: true,
+            persist_filter: EscapeFilter::new(),
         }
     }
 
-    // -----------------------------------------------------------------------
-    // push_output — mode tracking
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_push_output_enables_bracketed_paste() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        assert!(!rt.bracketed_paste_mode);
-        rt.push_output("text \x1b[?2004h more".to_string());
+    fn test_push_raw_enables_bracketed_paste() {
+        let mut rt = new_runtime();
+        assert!(!rt.mode_snapshot().bracketed_paste_mode);
+        rt.push_raw(bytes::Bytes::from("text \x1b[?2004h more"));
         assert!(
-            rt.bracketed_paste_mode,
+            rt.mode_snapshot().bracketed_paste_mode,
             "bracketed_paste_mode should be set after \\x1b[?2004h"
         );
     }
 
     #[test]
-    fn test_push_output_disables_bracketed_paste() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        rt.bracketed_paste_mode = true;
-        rt.push_output("\x1b[?2004l".to_string());
+    fn test_push_raw_disables_bracketed_paste() {
+        let mut rt = new_runtime();
+        rt.push_raw(bytes::Bytes::from("\x1b[?2004h"));
+        assert!(rt.mode_snapshot().bracketed_paste_mode);
+        rt.push_raw(bytes::Bytes::from("\x1b[?2004l"));
         assert!(
-            !rt.bracketed_paste_mode,
+            !rt.mode_snapshot().bracketed_paste_mode,
             "bracketed_paste_mode should be cleared after \\x1b[?2004l"
         );
     }
 
     #[test]
-    fn test_push_output_enables_app_cursor_keys() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        assert!(!rt.app_cursor_keys);
-        rt.push_output("\x1b[?1h".to_string());
+    fn test_push_raw_enables_app_cursor_keys() {
+        let mut rt = new_runtime();
+        assert!(!rt.mode_snapshot().app_cursor_keys);
+        rt.push_raw(bytes::Bytes::from("\x1b[?1h"));
         assert!(
-            rt.app_cursor_keys,
+            rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be set after DECCKM enable"
         );
     }
 
     #[test]
-    fn test_push_output_disables_app_cursor_keys() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        rt.app_cursor_keys = true;
-        rt.push_output("\x1b[?1l".to_string());
+    fn test_push_raw_disables_app_cursor_keys() {
+        let mut rt = new_runtime();
+        rt.push_raw(bytes::Bytes::from("\x1b[?1h"));
+        assert!(rt.mode_snapshot().app_cursor_keys);
+        rt.push_raw(bytes::Bytes::from("\x1b[?1l"));
         assert!(
-            !rt.app_cursor_keys,
+            !rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be cleared after DECCKM disable"
         );
     }
 
     // -----------------------------------------------------------------------
-    // push_output — ring buffer eviction
+    // push_raw — ring buffer eviction
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_push_output_ring_evicts_oldest_when_full() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        // ring_limit is 4; push 5 lines.
-        for i in 0..5usize {
-            rt.push_output(format!("line{i}\n"));
-        }
-        assert_eq!(rt.ring.len(), 4, "ring should not exceed ring_limit");
-        // The oldest line ("line0") should be evicted; ring starts at "line1".
-        assert_eq!(rt.ring.front().map(String::as_str), Some("line1\n"));
-        assert_eq!(rt.ring.back().map(String::as_str), Some("line4\n"));
-    }
-
-    #[test]
-    fn test_push_output_line_count_tracks_total_lines() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        for i in 0..10usize {
-            rt.push_output(format!("line{i}\n"));
-        }
-        assert_eq!(
-            rt.output_line_count, 10,
-            "output_line_count tracks total lines pushed"
+    fn test_push_raw_ring_evicts_oldest_when_over_capacity() {
+        let mut rt = new_runtime(); // capacity = 4096 bytes
+        // Push chunks that together exceed 4096 bytes so oldest are evicted.
+        let chunk = bytes::Bytes::from(vec![b'x'; 1500]);
+        rt.push_raw(chunk.clone());
+        rt.push_raw(chunk.clone());
+        rt.push_raw(chunk.clone()); // total so far: 4500 — first evicted
+        // start_offset must have advanced past 0
+        assert!(
+            rt.ring.start_offset() > 0,
+            "oldest chunks should be evicted once capacity is exceeded"
         );
-        // ring_limit is 4, so ring only holds last 4 lines
-        assert_eq!(rt.ring.len(), 4, "ring is bounded by ring_limit");
     }
 
     // -----------------------------------------------------------------------
-    // push_output — last_output_at tracking
+    // push_raw — last_output_at tracking
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_push_output_visible_content_advances_last_output_at() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
+    fn test_push_raw_visible_content_advances_last_output_at() {
+        let mut rt = new_runtime();
         assert!(rt.last_output_at.is_none());
-        rt.push_output("hello world\n".to_string());
+        rt.push_raw(bytes::Bytes::from("hello world\n"));
         assert!(
             rt.last_output_at.is_some(),
             "visible output should set last_output_at"
@@ -1003,10 +609,9 @@ mod tests {
     }
 
     #[test]
-    fn test_push_output_pure_ansi_does_not_advance_last_output_at() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        // Cursor movement + erase sequences — no visible characters.
-        rt.push_output("\x1b[1A\x1b[2K\x1b[H".to_string());
+    fn test_push_raw_pure_ansi_does_not_advance_last_output_at() {
+        let mut rt = new_runtime();
+        rt.push_raw(bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"));
         assert!(
             rt.last_output_at.is_none(),
             "pure ANSI sequences should not advance last_output_at"
@@ -1014,86 +619,25 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // mark_attach_activity / has_active_attach_client
+    // has_active_attach_client
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_has_active_attach_client_false_initially() {
-        let rt = new_runtime(Box::new(std::io::sink()));
+    fn test_has_active_attach_client_false_with_no_receivers() {
+        let rt = new_runtime();
         assert!(
             !rt.has_active_attach_client(),
-            "no activity recorded yet → should report no active client"
+            "no receiver subscribed → should report no active client"
         );
     }
 
     #[test]
-    fn test_has_active_attach_client_true_after_mark() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        rt.mark_attach_activity();
+    fn test_has_active_attach_client_true_with_receiver() {
+        let rt = new_runtime();
+        let _rx = rt.broadcast_tx.subscribe();
         assert!(
             rt.has_active_attach_client(),
-            "should report active client immediately after mark_attach_activity"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // respond_to_terminal_queries_without_attach
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_respond_cpr_query_sends_reply_and_strips_from_output() {
-        let (writer, buf) = capture_writer();
-        let mut rt = new_runtime(writer);
-
-        // CPR query embedded in a chunk with surrounding text.
-        let out = rt.respond_to_terminal_queries_without_attach("before\x1b[6nafter");
-
-        // The sequence itself should be stripped from the returned output.
-        assert!(
-            !out.contains("\x1b[6n"),
-            "CPR query should be stripped from returned output"
-        );
-        // A CPR response should have been written to the PTY (position 1;1).
-        let written = buf.lock().unwrap().clone();
-        assert!(
-            written.windows(b"\x1b[".len()).any(|w| w == b"\x1b["),
-            "a CPR response should be written to the writer"
-        );
-        assert!(
-            std::str::from_utf8(&written)
-                .unwrap_or("")
-                .contains("\x1b[1;1R"),
-            "CPR response should be \\x1b[1;1R"
-        );
-    }
-
-    #[test]
-    fn test_respond_dsr_query_sends_reply_and_strips_from_output() {
-        let (writer, buf) = capture_writer();
-        let mut rt = new_runtime(writer);
-
-        let out = rt.respond_to_terminal_queries_without_attach("text\x1b[5nmore");
-
-        assert!(
-            !out.contains("\x1b[5n"),
-            "DSR query should be stripped from returned output"
-        );
-        let written = buf.lock().unwrap().clone();
-        assert_eq!(
-            std::str::from_utf8(&written).unwrap_or(""),
-            "\x1b[0n",
-            "DSR response should be \\x1b[0n"
-        );
-    }
-
-    #[test]
-    fn test_respond_no_query_passes_through_unchanged() {
-        let mut rt = new_runtime(Box::new(std::io::sink()));
-        let input = "normal output with no queries";
-        let out = rt.respond_to_terminal_queries_without_attach(input);
-        assert_eq!(
-            out, input,
-            "chunk without queries should pass through unchanged"
+            "one receiver subscribed → should report active client"
         );
     }
 
@@ -1103,7 +647,7 @@ mod tests {
 
     #[test]
     fn test_is_completed_running_returns_false() {
-        let rt = new_runtime(Box::new(std::io::sink()));
+        let rt = new_runtime();
         assert!(
             !rt.is_completed(),
             "running session should not be completed"
@@ -1113,7 +657,7 @@ mod tests {
     #[test]
     fn test_mark_completed_stopped() {
         use crate::session::SessionStatus;
-        let mut rt = new_runtime(Box::new(std::io::sink()));
+        let mut rt = new_runtime();
         rt.mark_completed(SessionStatus::Stopped, Some(0));
         assert!(rt.is_completed());
         assert_eq!(rt.meta.exit_code, Some(0));
@@ -1124,7 +668,7 @@ mod tests {
     #[test]
     fn test_mark_completed_failed_with_nonzero_exit() {
         use crate::session::SessionStatus;
-        let mut rt = new_runtime(Box::new(std::io::sink()));
+        let mut rt = new_runtime();
         rt.mark_completed(SessionStatus::Failed, Some(1));
         assert!(rt.is_completed());
         assert_eq!(rt.meta.exit_code, Some(1));
@@ -1133,7 +677,7 @@ mod tests {
     #[test]
     fn test_mark_completed_is_idempotent() {
         use crate::session::SessionStatus;
-        let mut rt = new_runtime(Box::new(std::io::sink()));
+        let mut rt = new_runtime();
         rt.mark_completed(SessionStatus::Stopped, Some(0));
         let first_ended_at = rt.meta.ended_at;
         // Second call should not overwrite ended_at.

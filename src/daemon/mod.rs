@@ -1,6 +1,8 @@
 mod auth;
 mod lifecycle;
 mod rpc;
+mod rpc_attach;
+mod rpc_nodes;
 
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, watch};

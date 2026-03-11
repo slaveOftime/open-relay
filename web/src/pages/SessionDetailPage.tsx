@@ -164,7 +164,7 @@ export default function SessionDetailPage() {
   const reconnectTimerRef = useRef<number | null>(null)
   const pendingReconnectRef = useRef(false)
   const connectAttemptStartedAtRef = useRef(0)
-  const outputBufferRef = useRef<string[]>([])
+  const outputBufferRef = useRef<Uint8Array[]>([])
   const outputFlushRafRef = useRef<number | null>(null)
   const pendingResetRef = useRef(false)
   const resizeDebounceRef = useRef<number | null>(null)
@@ -186,14 +186,20 @@ export default function SessionDetailPage() {
       pendingResetRef.current = false
     }
     if (outputBufferRef.current.length > 0) {
-      term.write(outputBufferRef.current.join(''))
+      const chunks = outputBufferRef.current
       outputBufferRef.current = []
+      let total = 0
+      for (const c of chunks) total += c.length
+      const merged = new Uint8Array(total)
+      let off = 0
+      for (const c of chunks) { merged.set(c, off); off += c.length }
+      term.write(merged)
     }
     term.scrollToBottom()
   }, [])
 
   const enqueueTerminalOutput = useCallback(
-    (chunks: string[], opts?: { reset?: boolean }) => {
+    (chunks: Uint8Array[], opts?: { reset?: boolean }) => {
       if (!isMounted.current) return
       if (opts?.reset) {
         pendingResetRef.current = true
@@ -448,6 +454,9 @@ export default function SessionDetailPage() {
     }
 
     connectAttemptStartedAtRef.current = Date.now()
+    // Force a synchronous fit so we send the real terminal dimensions (not the
+    // default 80×24 before FitAddon's deferred RAF has fired).
+    const initialSize = termRef.current?.fit() ?? undefined
     const sock = new AttachSocket(
       id,
       {
@@ -457,6 +466,7 @@ export default function SessionDetailPage() {
           pendingReconnectRef.current = false
           connectAttemptStartedAtRef.current = 0
           lastSentResizeRef.current = null
+          pendingResizeRef.current = null
           lastWsFrameAtRef.current = Date.now()
           setWsError(null)
           setWsConnecting(false)
@@ -466,34 +476,30 @@ export default function SessionDetailPage() {
             reconnectTimerRef.current = null
           }
           if (isMounted.current) setWsConnected(true)
-
-          setTimeout(() => {
-            console.info(
-              'Forcing terminal resize after 1s to work around potential initial size issues'
-            )
-            const size = termRef.current?.getSize()
-            if (size) {
-              handleTermResize(size.cols, size.rows)
-            }
-          }, 1000)
         },
-        onSnapshot: (lines) => {
+        onInit: (data, _appCursorKeys, _bracketedPasteMode) => {
           if (!gotSnapshot) {
-            pushConnectTrace(`snapshot received (${lines.length} chunks)`)
+            pushConnectTrace(`init received (${data.length} bytes)`)
             gotSnapshot = true
           }
           lastWsFrameAtRef.current = Date.now()
-          enqueueTerminalOutput(lines, { reset: true })
+          enqueueTerminalOutput([data], { reset: true })
         },
-        onOutput: (lines) => {
+        onData: (data) => {
           lastWsFrameAtRef.current = Date.now()
-          enqueueTerminalOutput(lines)
+          enqueueTerminalOutput([data])
         },
-        onEnd: (code) => {
+        onModeChanged: (_appCursorKeys, _bracketedPasteMode) => {
+          lastWsFrameAtRef.current = Date.now()
+          // Mode changes are tracked server-side; client doesn't need to act.
+        },
+        onSessionEnded: (code) => {
           ended = true
           lastWsFrameAtRef.current = Date.now()
           pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
           if (!isMounted.current) return
+          const exitMsg = code != null ? ` (exit code: ${code})` : ''
+          termRef.current?.writeln(`\r\n\x1b[2m[Session ended${exitMsg}]\x1b[0m`)
           setExitCode(code)
           setWsConnected(false)
           setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
@@ -522,7 +528,8 @@ export default function SessionDetailPage() {
           }
         },
       },
-      node ?? undefined
+      node ?? undefined,
+      initialSize ?? undefined
     )
     pushConnectTrace('websocket created')
     socketRef.current = sock
@@ -780,7 +787,9 @@ export default function SessionDetailPage() {
       const last = lastSentResizeRef.current
       if (last && last.cols === next.cols && last.rows === next.rows) return
       socketRef.current?.sendResize(next.rows, next.cols)
-      lastSentResizeRef.current = next
+      if (wsConnectedRef.current) {
+        lastSentResizeRef.current = next
+      }
     }, 120)
   }
 

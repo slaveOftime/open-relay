@@ -8,6 +8,7 @@ use crossterm::{
     },
     execute, terminal,
 };
+use tokio::{io::BufReader, sync::mpsc};
 
 use crate::{
     config::AppConfig,
@@ -29,122 +30,206 @@ pub async fn run_attach_node(config: &AppConfig, id: &str, node: Option<String>)
 }
 
 async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    let snapshot = ipc::send_request(
-        config,
-        attach_proxy(node, RpcRequest::AttachSnapshot { id: id.to_string() }),
+    let stream = ipc::connect(config).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+
+    // Send AttachSubscribe (wrapped in NodeProxy if targeting a remote node).
+    ipc::write_request_to_writer(
+        &mut write_half,
+        attach_proxy(
+            node,
+            RpcRequest::AttachSubscribe {
+                id: id.to_string(),
+                from_byte_offset: None,
+            },
+        ),
     )
     .await?;
 
-    let (
-        initial_lines,
-        mut cursor,
-        mut running,
-        mut _child_bracketed_paste,
-        mut child_app_cursor_keys,
-    ) = match snapshot {
-        RpcResponse::AttachSnapshot {
-            lines,
-            cursor,
+    // Receive the init frame.
+    let init = ipc::read_response_from_reader(&mut reader).await?;
+    let (initial_data, mut running, mut child_app_cursor_keys) = match init {
+        RpcResponse::AttachStreamInit {
+            data,
             running,
-            bracketed_paste_mode,
             app_cursor_keys,
-        } => (
-            lines,
-            cursor,
-            running,
-            bracketed_paste_mode,
-            app_cursor_keys,
-        ),
+            ..
+        } => (data, running, app_cursor_keys),
         RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
 
     let mut detached = false;
+    let mut stream_error: Option<AppError> = None;
     {
-        let _raw_mode = RawModeGuard::new()?;
-        send_resize(config, id, node).await?;
-        let mut query_tail = String::new();
-        render_lines(config, id, initial_lines, &mut query_tail, node).await?;
-        let mut saw_ctrl_bracket = false;
+        let mut raw_mode = RawModeGuard::new()?;
+        // Use the terminal's alternate screen buffer so that TUI draw
+        // commands (cursor positioning, color etc.) never touch the main
+        // screen or scrollback.  The main screen and its history are fully
+        // restored when we leave the alternate screen on teardown.
+        raw_mode.enter_alternate_screen()?;
+
+        // Initial resize + render.
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        ipc::write_request_to_writer(
+            &mut write_half,
+            RpcRequest::AttachResize {
+                id: id.to_string(),
+                rows,
+                cols,
+            },
+        )
+        .await?;
+
+        // Write the initial replay bytes directly — the daemon has already
+        // stripped CPR/DSR responses via EscapeFilter, so no further
+        // processing is needed.  Writing raw bytes preserves all cursor-
+        // positioning, color, and alternate-screen sequences that TUIs emit,
+        // which is required for correct reattach rendering.
+        {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&initial_data)?;
+            stdout.flush()?;
+        }
+
+        // `read_response_from_reader` uses `read_line`, which is not safe to
+        // keep cancelling with timeouts. Read daemon frames in a dedicated task
+        // and receive them over a channel instead.
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        let reader_task = tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                let frame = ipc::read_response_from_reader(&mut reader).await;
+                let done = frame.is_err();
+                if frame_tx.send(frame).is_err() {
+                    break;
+                }
+                if done {
+                    break;
+                }
+            }
+        });
 
         while running {
-            while event::poll(std::time::Duration::from_millis(0))? {
+            // Drain all pending keyboard/resize events first.
+            loop {
+                match event::poll(std::time::Duration::from_millis(0)) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(err) => {
+                        stream_error = Some(err.into());
+                        running = false;
+                        break;
+                    }
+                }
                 match event::read()? {
-                    Event::Paste(data) => send_input(config, id, data, node).await?,
-                    Event::Resize(_, _) => send_resize(config, id, node).await?,
+                    Event::Paste(data) => {
+                        ipc::write_request_to_writer(
+                            &mut write_half,
+                            RpcRequest::AttachInput {
+                                id: id.to_string(),
+                                data,
+                            },
+                        )
+                        .await?
+                    }
+                    Event::Resize(cols, rows) => {
+                        ipc::write_request_to_writer(
+                            &mut write_half,
+                            RpcRequest::AttachResize {
+                                id: id.to_string(),
+                                rows,
+                                cols,
+                            },
+                        )
+                        .await?
+                    }
                     Event::Key(key) => {
                         if !matches!(key.kind, KeyEventKind::Press) {
                             continue;
                         }
-                        if is_ctrl_bracket(key) {
-                            saw_ctrl_bracket = true;
-                            continue;
-                        }
-                        if is_ctrl_d(key)
-                            || (saw_ctrl_bracket
-                                && matches!(
-                                    key.code,
-                                    KeyCode::Char('c')
-                                        | KeyCode::Char('C')
-                                        | KeyCode::Char('d')
-                                        | KeyCode::Char('D')
-                                ))
-                        {
+                        if is_ctrl_d(key) {
                             detached = true;
                             running = false;
                             break;
                         }
-                        saw_ctrl_bracket = false;
                         if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
-                            send_input(config, id, data, node).await?;
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id.to_string(),
+                                    data,
+                                },
+                            )
+                            .await?;
                         }
                     }
                     _ => {}
                 }
             }
-
             if !running {
                 break;
             }
 
-            let response = ipc::send_request(
-                config,
-                attach_proxy(
-                    node,
-                    RpcRequest::AttachPoll {
-                        id: id.to_string(),
-                        cursor,
-                    },
-                ),
-            )
-            .await?;
-
-            match response {
-                RpcResponse::AttachPoll {
-                    lines,
-                    cursor: next_cursor,
-                    running: next_running,
-                    bracketed_paste_mode,
-                    app_cursor_keys,
-                } => {
-                    render_lines(config, id, lines, &mut query_tail, node).await?;
-                    cursor = next_cursor;
-                    running = next_running;
-                    _child_bracketed_paste = bracketed_paste_mode;
+            // Wait for next server frame (with a timeout so we keep draining input).
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_millis(60), frame_rx.recv()).await;
+            match frame {
+                Err(_timeout) => continue,
+                Ok(None) => {
+                    stream_error = Some(AppError::Protocol(
+                        "daemon closed the connection".to_string(),
+                    ));
+                    break;
+                }
+                Ok(Some(Err(err))) => {
+                    stream_error = Some(err);
+                    break;
+                }
+                Ok(Some(Ok(RpcResponse::AttachStreamChunk { data, .. }))) => {
+                    // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
+                    use std::io::Write;
+                    std::io::stdout().write_all(&data)?;
+                    std::io::stdout().flush()?;
+                }
+                Ok(Some(Ok(RpcResponse::AttachModeChanged {
+                    app_cursor_keys, ..
+                }))) => {
                     child_app_cursor_keys = app_cursor_keys;
                 }
-                RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
-                _ => return Err(AppError::Protocol("unexpected response type".to_string())),
+                Ok(Some(Ok(RpcResponse::AttachStreamDone { .. }))) => {
+                    running = false;
+                }
+                Ok(Some(Ok(RpcResponse::Error { message }))) => {
+                    return Err(AppError::DaemonUnavailable(message));
+                }
+                Ok(Some(Ok(_))) => {}
             }
-
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
+
+        if detached {
+            // Detach while raw mode is still active, then consume any queued
+            // key-release or terminal-response events so they do not leak into
+            // the parent shell after we restore the terminal.
+            let _ = ipc::write_request_to_writer(
+                &mut write_half,
+                RpcRequest::AttachDetach { id: id.to_string() },
+            )
+            .await;
+            let _ = drain_pending_terminal_events();
+        }
+
+        reader_task.abort();
     }
 
     if detached {
-        println!("\r\nDetached from session {id}");
+        println!("Detached from session {id}");
+    } else if let Some(err) = stream_error {
+        eprintln!("Attach session {id} ended with error: {err}");
     } else {
-        println!("\r\nSession {id} has ended.");
+        println!("Session {id} has ended.");
     }
 
     Ok(())
@@ -181,7 +266,6 @@ impl RawModeGuard {
         execute!(
             stdout,
             terminal::EnterAlternateScreen,
-            cursor::Hide,
             cursor::MoveTo(0, 0),
             terminal::Clear(terminal::ClearType::All)
         )?;
@@ -201,24 +285,33 @@ impl RawModeGuard {
         }
 
         let mut stdout = std::io::stdout();
-        let execute_result = if self.alternate_screen {
-            execute!(
-                stdout,
-                DisableBracketedPaste,
-                DisableMouseCapture,
-                terminal::LeaveAlternateScreen,
-                cursor::Show,
-                cursor::MoveToColumn(0)
-            )
-        } else {
-            execute!(
-                stdout,
-                DisableBracketedPaste,
-                cursor::Show,
-                cursor::MoveToColumn(0)
-            )
-        };
 
+        // Unconditional terminal normalisation.  The attached process may have
+        // entered its own alternate screen, changed cursor-key mode, enabled
+        // mouse tracking, etc.  We undo all of that:
+        //
+        //  \x1b[?1049l  - leave alternate screen (no-op if already on main)
+        //  \x1b[!p      - DECSTR soft terminal reset (resets DECCKM, DECOM,
+        //                 DECAWM, scroll region, etc. without clearing screen)
+        //  \x1b[0m      - SGR reset (colors / bold / etc.)
+        //  \x1b[?25h    - ensure cursor is visible
+        //  \x1b[?1000l .. \x1b[?2004l  - disable mouse and bracketed-paste
+        //                 modes the app may have enabled (belt-and-suspenders
+        //                 alongside crossterm's DisableBracketedPaste below)
+        //
+        // We deliberately do NOT reposition the cursor: after leaving altscreen
+        // the cursor is where the main-screen left it (correct), and if we
+        // were already on main screen the shell will handle its own prompt.
+        let normalize: &[u8] = b"\x1b[?1049l\x1b[!p\x1b[0m\x1b[?25h\
+            \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+        if let Err(err) = stdout.write_all(normalize) {
+            if first_error.is_none() {
+                first_error = Some(err.into());
+            }
+        }
+
+        // crossterm also tracks its own bracketed-paste / mouse state.
+        let execute_result = execute!(stdout, DisableBracketedPaste, DisableMouseCapture);
         if let Err(err) = execute_result {
             if first_error.is_none() {
                 first_error = Some(err.into());
@@ -261,136 +354,11 @@ fn attach_proxy(node: Option<&str>, req: RpcRequest) -> RpcRequest {
     }
 }
 
-async fn render_lines(
-    config: &AppConfig,
-    id: &str,
-    lines: Vec<String>,
-    query_tail: &mut String,
-    node: Option<&str>,
-) -> Result<()> {
-    for line in lines {
-        respond_to_terminal_queries(config, id, query_tail, &line, node).await?;
+fn drain_pending_terminal_events() -> Result<()> {
+    while event::poll(std::time::Duration::from_millis(0))? {
+        let _ = event::read()?;
     }
-    std::io::stdout().flush()?;
     Ok(())
-}
-
-/// Detects and responds to CPR / DSR terminal queries that the child process
-/// may emit (e.g. readline uses them to detect terminal capabilities).
-async fn respond_to_terminal_queries(
-    config: &AppConfig,
-    id: &str,
-    tail: &mut String,
-    chunk: &str,
-    node: Option<&str>,
-) -> Result<()> {
-    const CPR: &str = "\x1b[6n"; // Cursor Position Report request
-    const DSR: &str = "\x1b[5n"; // Device Status Report request
-
-    let mut combined = String::with_capacity(tail.len() + chunk.len());
-    combined.push_str(tail);
-    combined.push_str(chunk);
-
-    let mut search_from = 0usize;
-    while search_from < combined.len() {
-        let cpr_match = combined[search_from..].find(CPR).map(|o| (o, CPR));
-        let dsr_match = combined[search_from..].find(DSR).map(|o| (o, DSR));
-
-        let Some((offset, query)) = [cpr_match, dsr_match]
-            .into_iter()
-            .flatten()
-            .min_by_key(|(o, _)| *o)
-        else {
-            break;
-        };
-
-        let match_start = search_from + offset;
-        if match_start > search_from {
-            print!("{}", &combined[search_from..match_start]);
-            std::io::stdout().flush()?;
-        }
-
-        match query {
-            CPR => send_cursor_position_report(config, id, node).await?,
-            DSR => send_input(config, id, "\x1b[0n".to_string(), node).await?,
-            _ => {}
-        }
-
-        search_from = match_start + query.len();
-    }
-
-    let remainder = &combined[search_from..];
-    let max_prefix = CPR.len().max(DSR.len()).saturating_sub(1);
-    let mut keep = 0usize;
-    for prefix_len in (1..=max_prefix).rev() {
-        if remainder.ends_with(&CPR[..prefix_len]) || remainder.ends_with(&DSR[..prefix_len]) {
-            keep = prefix_len;
-            break;
-        }
-    }
-
-    let printable_len = remainder.len().saturating_sub(keep);
-    if printable_len > 0 {
-        print!("{}", &remainder[..printable_len]);
-    }
-    *tail = remainder[printable_len..].to_string();
-
-    Ok(())
-}
-
-async fn send_cursor_position_report(
-    config: &AppConfig,
-    id: &str,
-    node: Option<&str>,
-) -> Result<()> {
-    let (col, row) = cursor::position().unwrap_or((0, 0));
-    let report = format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1));
-    send_input(config, id, report, node).await
-}
-
-pub async fn send_input(
-    config: &AppConfig,
-    id: &str,
-    data: String,
-    node: Option<&str>,
-) -> Result<()> {
-    match ipc::send_request(
-        config,
-        attach_proxy(
-            node,
-            RpcRequest::AttachInput {
-                id: id.to_string(),
-                data,
-            },
-        ),
-    )
-    .await?
-    {
-        RpcResponse::Ack => Ok(()),
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-        _ => Err(AppError::Protocol("unexpected response type".to_string())),
-    }
-}
-
-async fn send_resize(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    match ipc::send_request(
-        config,
-        attach_proxy(
-            node,
-            RpcRequest::AttachResize {
-                id: id.to_string(),
-                rows,
-                cols,
-            },
-        ),
-    )
-    .await?
-    {
-        RpcResponse::Ack => Ok(()),
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-        _ => Err(AppError::Protocol("unexpected response type".to_string())),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -430,11 +398,6 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn is_ctrl_bracket(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
 }
 
 fn is_ctrl_d(key: KeyEvent) -> bool {
@@ -662,21 +625,6 @@ mod tests {
         // Ctrl-Z → ASCII 26 (SUB / suspend).
         let result = map_key_to_input(ctrl_press(KeyCode::Char('z')), false).unwrap();
         assert_eq!(result.as_bytes(), &[26]);
-    }
-
-    // -----------------------------------------------------------------------
-    // is_ctrl_bracket
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_is_ctrl_bracket_true_for_right_bracket() {
-        assert!(is_ctrl_bracket(ctrl_press(KeyCode::Char(']'))));
-    }
-
-    #[test]
-    fn test_is_ctrl_bracket_false_for_plain_char() {
-        assert!(!is_ctrl_bracket(press(KeyCode::Char(']'))));
-        assert!(!is_ctrl_bracket(ctrl_press(KeyCode::Char('c'))));
     }
 
     // -----------------------------------------------------------------------

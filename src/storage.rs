@@ -8,6 +8,11 @@ use std::{
 use crate::error::{AppError, Result};
 
 pub fn resolve_state_dir() -> PathBuf {
+    // Direct override — used by tests to guarantee full isolation.
+    if let Some(dir) = env::var_os("OLY_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+
     #[cfg(target_os = "windows")]
     {
         if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {

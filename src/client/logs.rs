@@ -1,7 +1,5 @@
 use crossterm::terminal;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::Write;
 
 use crate::{
     config::AppConfig,
@@ -9,13 +7,8 @@ use crate::{
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
+    session::logs::{read_tail_bytes, render_rows},
 };
-
-/// Generous per-line byte budget that accounts for ANSI escape sequences.
-const BYTES_PER_LINE_ESTIMATE: u64 = 256;
-
-/// Wide parser column count — prevents any line wrapping inside the vt100 grid.
-const PARSER_COLS: u16 = 2000;
 
 pub async fn run_logs(
     config: &AppConfig,
@@ -107,68 +100,6 @@ async fn run_logs_local(
     let rows = render_rows(&bytes, tail, term_cols, keep_color);
 
     print_rows(&rows, keep_color)
-}
-
-/// Seek near the end of the log file and read enough bytes to cover `tail * 2`
-/// lines (using a generous per-line estimate), returning the raw bytes.
-fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<Vec<u8>> {
-    let mut file = File::open(log_path)?;
-    let file_size = file.seek(SeekFrom::End(0))?;
-
-    let margin = (tail as u64) * 2 * BYTES_PER_LINE_ESTIMATE;
-    let start = file_size.saturating_sub(margin);
-
-    file.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::with_capacity((file_size - start) as usize);
-    file.read_to_end(&mut buf)?;
-
-    // If we didn't start at byte 0, we likely started in the middle of a line.
-    // Drop the first partial line to avoid feeding truncated ANSI escape
-    // sequences into the parser, which can corrupt subsequent color state.
-    if start > 0 {
-        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            buf.drain(..=pos);
-        }
-    }
-
-    Ok(buf)
-}
-
-/// Parse `bytes` through a vt100 terminal of `tail` rows and collect the last
-/// `tail` visible ANSI-formatted row byte vectors, each trimmed to `term_cols`.
-///
-/// The cursor row is used as the upper bound of real content so that trailing
-/// blank rows (present when the log has fewer lines than `tail`) are excluded
-/// before taking the final `tail` rows.
-fn render_rows(bytes: &[u8], tail: usize, term_cols: u16, keep_color: bool) -> Vec<Vec<u8>> {
-    let mut parser = vt100::Parser::new(tail as u16, PARSER_COLS, 0);
-    parser.process(bytes);
-
-    let screen = parser.screen();
-
-    // cursor_position() returns (row, col); the cursor row is the last row
-    // that received output.  Rows beyond it are blank and should not count.
-    let cursor_row = screen.cursor_position().0 as usize;
-
-    // rows_formatted(start_col, width) emits ANSI-formatted bytes for every
-    // visible row restricted to the column range [0, term_cols).
-    let content_rows: Vec<Vec<u8>> = if keep_color {
-        screen
-            .rows_formatted(0, term_cols)
-            .take(cursor_row + 1)
-            .collect()
-    } else {
-        // If not keeping color, filter out ANSI escape codes from each row.
-        screen
-            .rows(0, term_cols)
-            .take(cursor_row + 1)
-            .map(|s| s.into_bytes())
-            .collect()
-    };
-
-    // Take the last `tail` rows from the content region.
-    let skip = content_rows.len().saturating_sub(tail);
-    content_rows.into_iter().skip(skip).collect()
 }
 
 /// Write all rows to stdout, skipping any leading blank rows.

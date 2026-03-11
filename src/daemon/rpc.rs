@@ -1,6 +1,6 @@
 use interprocess::local_socket::tokio::Stream;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::{io::BufReader, sync::mpsc};
 use tracing::info;
 
 use crate::{
@@ -16,10 +16,18 @@ use crate::{
 };
 
 use super::{JoinHandles, NotificationTx, SessionStoreHandle};
+use super::{
+    rpc_attach::{
+        handle_attach_detach, handle_attach_input, handle_attach_resize, handle_attach_subscribe,
+    },
+    rpc_nodes::{
+        handle_node_list, handle_node_proxy, handle_node_proxy_streaming, spawn_join_connector,
+    },
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client(
-    mut stream: Stream,
+    stream: Stream,
     config: &AppConfig,
     session_store: SessionStoreHandle,
     shutdown_tx: mpsc::UnboundedSender<()>,
@@ -28,7 +36,35 @@ pub(super) async fn handle_client(
     join_handles: JoinHandles,
     notification_tx: NotificationTx,
 ) -> Result<()> {
-    let request = ipc::read_request(&mut stream).await?;
+    // Peek at the request without consuming the stream so we can decide whether
+    // it needs the bidirectional streaming path or the simple req/resp path.
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let request = ipc::read_request_from_reader(&mut reader).await?;
+
+    if let RpcRequest::AttachSubscribe {
+        id,
+        from_byte_offset,
+    } = request
+    {
+        return handle_attach_subscribe(id, from_byte_offset, reader, write_half, &session_store)
+            .await;
+    }
+
+    // Node-proxied streaming attach: unwrap the proxy envelope and relay
+    // streaming frames from the secondary node back to the CLI.
+    if matches!(
+        &request,
+        RpcRequest::NodeProxy { inner, .. }
+            if matches!(inner.as_ref(), RpcRequest::AttachSubscribe { .. })
+    ) {
+        if let RpcRequest::NodeProxy { node, inner } = request {
+            return handle_node_proxy_streaming(node, *inner, reader, write_half, &node_registry)
+                .await;
+        }
+    }
+
+    // Non-streaming path: dispatch and write single response.
     let response = dispatch_request(
         request,
         config,
@@ -40,7 +76,7 @@ pub(super) async fn handle_client(
         &notification_tx,
     )
     .await?;
-    ipc::write_response(&mut stream, response).await
+    ipc::write_response_to_writer(&mut write_half, response).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -82,14 +118,17 @@ async fn dispatch_request(
             )
             .await
         }
-        RpcRequest::AttachSnapshot { id } => handle_attach_snapshot(id, session_store).await,
-        RpcRequest::AttachPoll { id, cursor } => {
-            handle_attach_poll(id, cursor, session_store).await
+        RpcRequest::AttachSubscribe { .. } => {
+            // Handled before dispatch in handle_client; should not reach here.
+            RpcResponse::Error {
+                message: "AttachSubscribe must be handled on the streaming path".into(),
+            }
         }
         RpcRequest::AttachInput { id, data } => handle_attach_input(id, data, session_store).await,
         RpcRequest::AttachResize { id, rows, cols } => {
             handle_attach_resize(id, rows, cols, session_store).await
         }
+        RpcRequest::AttachDetach { id } => handle_attach_detach(id, session_store).await,
         RpcRequest::Stop { id, grace_seconds } => {
             handle_stop(id, grace_seconds, session_store).await
         }
@@ -179,75 +218,6 @@ async fn handle_start(
     }
 }
 
-async fn handle_attach_snapshot(id: String, session_store: &SessionStoreHandle) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_snapshot(&id).await {
-        Ok((lines, cursor, running, bracketed_paste_mode, app_cursor_keys)) => {
-            RpcResponse::AttachSnapshot {
-                lines,
-                cursor,
-                running,
-                bracketed_paste_mode,
-                app_cursor_keys,
-            }
-        }
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
-    }
-}
-
-async fn handle_attach_poll(
-    id: String,
-    cursor: usize,
-    session_store: &SessionStoreHandle,
-) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_poll(&id, cursor).await {
-        Ok((lines, cursor, running, bracketed_paste_mode, app_cursor_keys)) => {
-            RpcResponse::AttachPoll {
-                lines,
-                cursor,
-                running,
-                bracketed_paste_mode,
-                app_cursor_keys,
-            }
-        }
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
-    }
-}
-
-async fn handle_attach_input(
-    id: String,
-    data: String,
-    session_store: &SessionStoreHandle,
-) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_input(&id, &data).await {
-        Ok(()) => RpcResponse::Ack,
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
-    }
-}
-
-async fn handle_attach_resize(
-    id: String,
-    rows: u16,
-    cols: u16,
-    session_store: &SessionStoreHandle,
-) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_resize(&id, rows, cols).await {
-        Ok(()) => RpcResponse::Ack,
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
-    }
-}
-
 async fn handle_stop(
     id: String,
     grace_seconds: u64,
@@ -284,7 +254,7 @@ async fn handle_logs_snapshot(
 
 async fn handle_logs_poll(
     id: String,
-    cursor: usize,
+    cursor: u64,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     let mut store = session_store.lock().await;
@@ -396,19 +366,6 @@ async fn handle_logs_wait(
     }
 }
 
-async fn handle_node_proxy(
-    node: String,
-    inner: crate::protocol::RpcRequest,
-    node_registry: &Arc<NodeRegistry>,
-) -> RpcResponse {
-    match node_registry.proxy_rpc(&node, &inner).await {
-        Ok(r) => r,
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
 async fn handle_api_key_add(name: String, db: &Arc<Database>) -> RpcResponse {
     use rand::RngCore;
     let mut key_bytes = [0u8; 32];
@@ -476,8 +433,7 @@ async fn handle_join_start(
         api_key: key,
     };
     client::join::save_join_config(config, &join)?;
-    let (abort, stop_tx) =
-        client::spawn_join_connector(join, config.clone(), notification_tx.subscribe());
+    let (abort, stop_tx) = spawn_join_connector(join, config.clone(), notification_tx.subscribe());
     join_handles.lock().await.insert(name, (abort, stop_tx));
     Ok(RpcResponse::Ack)
 }
@@ -498,9 +454,4 @@ async fn handle_join_stop(
 fn handle_join_list(config: &AppConfig) -> RpcResponse {
     let joins = client::join::list_join_summaries(config);
     RpcResponse::JoinList { joins }
-}
-
-async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcResponse {
-    let nodes = node_registry.connected_names().await;
-    RpcResponse::NodeList { nodes }
 }

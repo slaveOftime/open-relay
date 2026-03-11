@@ -16,15 +16,16 @@ fn oly_bin() -> PathBuf {
 fn oly_cmd(tmp_dir: &PathBuf) -> Command {
     let mut cmd = Command::new(oly_bin());
 
-    // Point the platform-specific state resolver at our temp dir.
-    // storage::resolve_state_dir() picks up LOCALAPPDATA on Windows,
-    // XDG_STATE_HOME on Linux, and HOME on macOS.
-    #[cfg(target_os = "windows")]
-    cmd.env("LOCALAPPDATA", tmp_dir);
-    #[cfg(target_os = "linux")]
-    cmd.env("XDG_STATE_HOME", tmp_dir);
-    #[cfg(target_os = "macos")]
-    cmd.env("HOME", tmp_dir);
+    // OLY_STATE_DIR directly overrides resolve_state_dir() — no
+    // platform-specific env hacks needed.
+    cmd.env("OLY_STATE_DIR", tmp_dir.join("oly"));
+
+    // OLY_SOCKET_NAME prevents accidentally connecting to a real daemon
+    // running on the default named pipe (Windows) or socket (Unix).
+    cmd.env(
+        "OLY_SOCKET_NAME",
+        format!("oly-cli-test-{}", tmp_dir.display()),
+    );
 
     cmd
 }
@@ -47,7 +48,7 @@ fn list_without_daemon_succeeds_gracefully() {
         .output()
         .expect("failed to run oly ls");
 
-    // oly list reads persisted session metadata from disk and must not require
+    // oly ls reads persisted session metadata from disk and must not require
     // a live daemon – it should always exit 0 even with an empty state dir.
     assert!(
         output.status.success(),

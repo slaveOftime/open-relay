@@ -57,7 +57,7 @@ function getTerminalTheme(): ITheme {
 }
 
 export interface XTermHandle {
-  write(data: string): void
+  write(data: string | Uint8Array): void
   writeln(data: string): void
   clear(): void
   reset(): void
@@ -65,6 +65,8 @@ export interface XTermHandle {
   scrollToTop(): void
   scrollLines(amount: number): void
   getSize(): { cols: number; rows: number } | null
+  /** Force FitAddon to compute the correct size immediately and return it. */
+  fit(): { cols: number; rows: number } | null
 }
 
 interface Props {
@@ -92,7 +94,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
   }, [onResize])
 
   useImperativeHandle(ref, () => ({
-    write(data: string) {
+    write(data: string | Uint8Array) {
       termRef.current?.write(data)
     },
     writeln(data: string) {
@@ -115,6 +117,15 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
     },
     getSize() {
       if (!termRef.current) return null
+      return { cols: termRef.current.cols, rows: termRef.current.rows }
+    },
+    fit() {
+      if (!termRef.current || !fitRef.current) return null
+      try {
+        fitRef.current.fit()
+      } catch {
+        return null
+      }
       return { cols: termRef.current.cols, rows: termRef.current.rows }
     },
   }))

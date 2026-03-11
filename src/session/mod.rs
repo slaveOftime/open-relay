@@ -1,4 +1,9 @@
+pub(crate) mod cursor_tracker;
+pub mod logs;
+pub(crate) mod mode_tracker;
 pub(crate) mod persist;
+pub mod pty;
+pub(crate) mod ring;
 mod runtime;
 mod store;
 
