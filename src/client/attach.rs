@@ -266,7 +266,6 @@ impl RawModeGuard {
         execute!(
             stdout,
             terminal::EnterAlternateScreen,
-            cursor::Hide,
             cursor::MoveTo(0, 0),
             terminal::Clear(terminal::ClearType::All)
         )?;
