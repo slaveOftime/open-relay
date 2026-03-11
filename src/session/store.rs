@@ -227,8 +227,8 @@ impl SessionStore {
             return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
-        let lines = rt.ring.iter().cloned().collect();
-        let cursor = rt.output_line_count;
+        rt.mark_attach_activity();
+        let (lines, cursor) = rt.snapshot_output();
         let running = rt.meta.status.as_str() == "running";
         let bracketed_paste_mode = rt.bracketed_paste_mode;
         let app_cursor_keys = rt.app_cursor_keys;
@@ -251,18 +251,10 @@ impl SessionStore {
             return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
-        let total = rt.output_line_count;
-        let ring_len = rt.ring.len();
-        // The ring holds the last `ring_len` lines; compute where it starts in
-        // the global line number space so cursor-based indexing still works.
-        let ring_start = total.saturating_sub(ring_len);
-        let lines: Vec<String> = if cursor >= total {
-            Vec::new()
-        } else {
-            let offset = cursor.saturating_sub(ring_start);
-            rt.ring.iter().skip(offset).cloned().collect()
-        };
-        let next_cursor = total;
+        // Unlike attach_snapshot, attach_poll does not reset the attach activity timer, 
+        // so that silent-notification candidates are not suppressed just because a client is polling for new output.
+        // rt.mark_attach_activity();
+        let (lines, next_cursor) = rt.replay_output_from(cursor);
         let running = rt.meta.status.as_str() == "running";
         let bracketed_paste_mode = rt.bracketed_paste_mode;
         let app_cursor_keys = rt.app_cursor_keys;
@@ -599,12 +591,13 @@ mod tests {
         if !excerpt.is_empty() {
             ring.push_back(excerpt.to_string());
         }
+        let output_line_count = ring.len();
 
         let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            output_line_count: 0,
+            output_line_count,
             ring,
             ring_limit: 100,
             // We only need a writer stub; use a Vec sink.
@@ -1189,7 +1182,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // attach_snapshot — returns ring + cursor (does not mark attach activity)
+    // attach_snapshot — returns ring + cursor and marks view activity
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -1205,8 +1198,8 @@ mod tests {
 
         let locked = rt_clone.lock().unwrap();
         assert!(
-            locked.last_attach_activity_at.is_none(),
-            "attach_snapshot should not mark attach activity"
+            locked.last_attach_activity_at.is_some(),
+            "attach_snapshot should mark attach activity"
         );
     }
 
@@ -1221,7 +1214,7 @@ mod tests {
             .expect("snapshot should succeed");
 
         assert_eq!(lines, vec!["output line".to_string()]);
-        assert_eq!(cursor, 0, "cursor should equal output_line_count");
+        assert_eq!(cursor, 1, "cursor should equal output_line_count");
         assert!(running, "session should be reported as running");
     }
 
@@ -1233,11 +1226,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // attach_poll — returns lines from cursor (does not mark attach activity)
+    // attach_poll — returns lines from cursor and marks view activity
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_attach_poll_marks_attach_activity() {
+    async fn test_attach_poll_should_not_marks_attach_activity() {
         let rt = make_runtime_with_lines(
             "poll001",
             vec!["line1\n".to_string(), "line2\n".to_string()],
@@ -1253,7 +1246,7 @@ mod tests {
         let locked = rt_clone.lock().unwrap();
         assert!(
             locked.last_attach_activity_at.is_none(),
-            "attach_poll should not mark attach activity"
+            "attach_poll should mark attach activity"
         );
     }
 
@@ -1299,6 +1292,42 @@ mod tests {
 
         assert!(lines.is_empty(), "no new lines when cursor is at end");
         assert_eq!(next_cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn test_attach_poll_resyncs_to_retained_ring_tail_when_cursor_is_stale() {
+        let rt = make_runtime_with_lines(
+            "poll004",
+            vec![
+                "line6\n".to_string(),
+                "line7\n".to_string(),
+                "line8\n".to_string(),
+                "line9\n".to_string(),
+            ],
+        );
+        {
+            let mut locked = rt.lock().unwrap();
+            locked.output_line_count = 10;
+        }
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        let (lines, next_cursor, running, _, _) = store
+            .attach_poll("poll004", 3)
+            .await
+            .expect("poll should succeed");
+
+        assert_eq!(
+            lines,
+            vec![
+                "line6\n".to_string(),
+                "line7\n".to_string(),
+                "line8\n".to_string(),
+                "line9\n".to_string(),
+            ],
+            "stale cursor should resync to the retained ring tail"
+        );
+        assert_eq!(next_cursor, 10);
+        assert!(running);
     }
 
     #[tokio::test]

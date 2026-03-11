@@ -14,6 +14,9 @@ use crate::{
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
+    utils::{
+        TerminalQuery, find_next_terminal_query, terminal_query_response, terminal_query_tail_len,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -284,50 +287,29 @@ async fn respond_to_terminal_queries(
     chunk: &str,
     node: Option<&str>,
 ) -> Result<()> {
-    const CPR: &str = "\x1b[6n"; // Cursor Position Report request
-    const DSR: &str = "\x1b[5n"; // Device Status Report request
-
     let mut combined = String::with_capacity(tail.len() + chunk.len());
     combined.push_str(tail);
     combined.push_str(chunk);
 
     let mut search_from = 0usize;
     while search_from < combined.len() {
-        let cpr_match = combined[search_from..].find(CPR).map(|o| (o, CPR));
-        let dsr_match = combined[search_from..].find(DSR).map(|o| (o, DSR));
-
-        let Some((offset, query)) = [cpr_match, dsr_match]
-            .into_iter()
-            .flatten()
-            .min_by_key(|(o, _)| *o)
+        let Some((match_start, query_len, query)) = find_next_terminal_query(&combined, search_from)
         else {
             break;
         };
 
-        let match_start = search_from + offset;
         if match_start > search_from {
             print!("{}", &combined[search_from..match_start]);
             std::io::stdout().flush()?;
         }
 
-        match query {
-            CPR => send_cursor_position_report(config, id, node).await?,
-            DSR => send_input(config, id, "\x1b[0n".to_string(), node).await?,
-            _ => {}
-        }
+        respond_to_terminal_query(config, id, query, node).await?;
 
-        search_from = match_start + query.len();
+        search_from = match_start + query_len;
     }
 
     let remainder = &combined[search_from..];
-    let max_prefix = CPR.len().max(DSR.len()).saturating_sub(1);
-    let mut keep = 0usize;
-    for prefix_len in (1..=max_prefix).rev() {
-        if remainder.ends_with(&CPR[..prefix_len]) || remainder.ends_with(&DSR[..prefix_len]) {
-            keep = prefix_len;
-            break;
-        }
-    }
+    let keep = terminal_query_tail_len(remainder);
 
     let printable_len = remainder.len().saturating_sub(keep);
     if printable_len > 0 {
@@ -338,14 +320,24 @@ async fn respond_to_terminal_queries(
     Ok(())
 }
 
-async fn send_cursor_position_report(
+async fn respond_to_terminal_query(
     config: &AppConfig,
     id: &str,
+    query: TerminalQuery,
     node: Option<&str>,
 ) -> Result<()> {
-    let (col, row) = cursor::position().unwrap_or((0, 0));
-    let report = format!("\x1b[{};{}R", row.saturating_add(1), col.saturating_add(1));
-    send_input(config, id, report, node).await
+    let response = match query {
+        TerminalQuery::CursorPositionReport => {
+            let (col, row) = cursor::position().unwrap_or((0, 0));
+            terminal_query_response(
+                TerminalQuery::CursorPositionReport,
+                Some((row.saturating_add(1), col.saturating_add(1))),
+            )
+        }
+        _ => terminal_query_response(query, None),
+    };
+
+    send_input(config, id, response, node).await
 }
 
 pub async fn send_input(

@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     error::{AppError, Result},
+    utils::{find_next_terminal_query, terminal_query_response, terminal_query_tail_len},
 };
 
 use super::{
@@ -106,6 +107,39 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
+    pub fn output_ring_start(&self) -> usize {
+        self.output_line_count.saturating_sub(self.ring.len())
+    }
+
+    pub fn snapshot_output(&self) -> (Vec<String>, usize) {
+        (self.ring.iter().cloned().collect(), self.output_line_count)
+    }
+
+    pub fn replay_output_from(&mut self, cursor: usize) -> (Vec<String>, usize) {
+        let total = self.output_line_count;
+        let ring_start = self.output_ring_start();
+
+        let lines = if cursor >= total {
+            Vec::new()
+        } else {
+            let offset = if cursor < ring_start {
+                let _ = append_event(
+                    &self.dir,
+                    &format!(
+                        "viewer replay resync cursor={} ring_start={} total={}",
+                        cursor, ring_start, total
+                    ),
+                );
+                0
+            } else {
+                cursor - ring_start
+            };
+            self.ring.iter().skip(offset).cloned().collect()
+        };
+
+        (lines, total)
+    }
+
     pub fn push_output(&mut self, chunk: String) {
         let chunk = if self.has_active_attach_client() {
             if self.pending_terminal_query_tail.is_empty() {
@@ -166,9 +200,6 @@ impl SessionRuntime {
     }
 
     fn respond_to_terminal_queries_without_attach(&mut self, chunk: &str) -> String {
-        const CPR_QUERY: &str = "\x1b[6n";
-        const DSR_QUERY: &str = "\x1b[5n";
-
         let mut combined = std::mem::take(&mut self.pending_terminal_query_tail);
         combined.push_str(chunk);
 
@@ -176,50 +207,25 @@ impl SessionRuntime {
         let mut search_from = 0usize;
 
         while search_from < combined.len() {
-            let cpr_match = combined[search_from..]
-                .find(CPR_QUERY)
-                .map(|o| (o, CPR_QUERY));
-            let dsr_match = combined[search_from..]
-                .find(DSR_QUERY)
-                .map(|o| (o, DSR_QUERY));
-
-            let Some((offset, query)) = [cpr_match, dsr_match]
-                .into_iter()
-                .flatten()
-                .min_by_key(|(o, _)| *o)
+            let Some((match_start, query_len, query)) =
+                find_next_terminal_query(&combined, search_from)
             else {
                 break;
             };
 
-            let match_start = search_from + offset;
             if match_start > search_from {
                 output.push_str(&combined[search_from..match_start]);
             }
 
-            let response = match query {
-                CPR_QUERY => "\x1b[1;1R",
-                DSR_QUERY => "\x1b[0n",
-                _ => "",
-            };
-            if !response.is_empty() {
-                let _ = self.writer.write_all(response.as_bytes());
-                let _ = self.writer.flush();
-            }
+            let response = terminal_query_response(query, Some((1, 1)));
+            let _ = self.writer.write_all(response.as_bytes());
+            let _ = self.writer.flush();
 
-            search_from = match_start + query.len();
+            search_from = match_start + query_len;
         }
 
         let remainder = &combined[search_from..];
-        let max_prefix = CPR_QUERY.len().max(DSR_QUERY.len()).saturating_sub(1);
-        let mut keep = 0usize;
-        for prefix_len in (1..=max_prefix).rev() {
-            if remainder.ends_with(&CPR_QUERY[..prefix_len])
-                || remainder.ends_with(&DSR_QUERY[..prefix_len])
-            {
-                keep = prefix_len;
-                break;
-            }
-        }
+        let keep = terminal_query_tail_len(remainder);
 
         let printable_len = remainder.len().saturating_sub(keep);
         if printable_len > 0 {
@@ -987,6 +993,51 @@ mod tests {
         assert_eq!(rt.ring.len(), 4, "ring is bounded by ring_limit");
     }
 
+    #[test]
+    fn test_output_ring_start_tracks_retained_window() {
+        let mut rt = new_runtime(Box::new(std::io::sink()));
+        for i in 0..5usize {
+            rt.push_output(format!("line{i}\n"));
+        }
+        assert_eq!(rt.output_line_count, 5);
+        assert_eq!(rt.ring.len(), 4);
+        assert_eq!(rt.output_ring_start(), 1);
+    }
+
+    #[test]
+    fn test_replay_output_from_cursor_inside_ring() {
+        let mut rt = new_runtime(Box::new(std::io::sink()));
+        for i in 0..5usize {
+            rt.push_output(format!("line{i}\n"));
+        }
+
+        let (lines, next_cursor) = rt.replay_output_from(3);
+
+        assert_eq!(lines, vec!["line3\n".to_string(), "line4\n".to_string()]);
+        assert_eq!(next_cursor, 5);
+    }
+
+    #[test]
+    fn test_replay_output_from_cursor_before_ring_start_resyncs_to_tail() {
+        let mut rt = new_runtime(Box::new(std::io::sink()));
+        for i in 0..5usize {
+            rt.push_output(format!("line{i}\n"));
+        }
+
+        let (lines, next_cursor) = rt.replay_output_from(0);
+
+        assert_eq!(
+            lines,
+            vec![
+                "line1\n".to_string(),
+                "line2\n".to_string(),
+                "line3\n".to_string(),
+                "line4\n".to_string()
+            ]
+        );
+        assert_eq!(next_cursor, 5);
+    }
+
     // -----------------------------------------------------------------------
     // push_output — last_output_at tracking
     // -----------------------------------------------------------------------
@@ -1083,6 +1134,50 @@ mod tests {
             std::str::from_utf8(&written).unwrap_or(""),
             "\x1b[0n",
             "DSR response should be \\x1b[0n"
+        );
+    }
+
+    #[test]
+    fn test_respond_osc_foreground_query_sends_reply_and_strips_from_output() {
+        let (writer, buf) = capture_writer();
+        let mut rt = new_runtime(writer);
+
+        let out = rt.respond_to_terminal_queries_without_attach("text\x1b]10;?\x07more");
+
+        assert!(
+            !out.contains("\x1b]10;?"),
+            "OSC foreground query should be stripped from returned output"
+        );
+        let written = std::str::from_utf8(&buf.lock().unwrap()).unwrap_or("").to_string();
+        assert!(
+            written.starts_with("\x1b]10;rgb:"),
+            "OSC foreground response should report an rgb color"
+        );
+        assert!(
+            written.ends_with("\x1b\\"),
+            "OSC foreground response should be ST-terminated"
+        );
+    }
+
+    #[test]
+    fn test_respond_osc_background_query_sends_reply_and_strips_from_output() {
+        let (writer, buf) = capture_writer();
+        let mut rt = new_runtime(writer);
+
+        let out = rt.respond_to_terminal_queries_without_attach("text\x1b]11;?\x1b\\more");
+
+        assert!(
+            !out.contains("\x1b]11;?"),
+            "OSC background query should be stripped from returned output"
+        );
+        let written = std::str::from_utf8(&buf.lock().unwrap()).unwrap_or("").to_string();
+        assert!(
+            written.starts_with("\x1b]11;rgb:"),
+            "OSC background response should report an rgb color"
+        );
+        assert!(
+            written.ends_with("\x1b\\"),
+            "OSC background response should be ST-terminated"
         );
     }
 

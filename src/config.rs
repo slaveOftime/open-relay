@@ -113,7 +113,7 @@ impl AppConfig {
             .and_then(normalize_optional_string);
 
         Ok(Self {
-            ring_buffer_lines: 5_000,
+            ring_buffer_lines: 10_000,
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds,
