@@ -411,15 +411,14 @@ pub fn spawn_session(
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
 
-                    // When no subscribers are attached, let the daemon respond
-                    // to terminal queries (CPR, DSR, OSC 10/11) so the child
-                    // process does not stall waiting for an answer.
-                    if broadcast_tx_reader.receiver_count() == 0 {
-                        for resp in extract_query_responses_no_client(&data, &mut query_tail) {
-                            let _ = writer_tx.send(resp);
-                        }
-                    } else {
-                        query_tail.clear();
+                    // Always let the daemon answer terminal queries (CPR, DSR,
+                    // OSC 10/11).  Multiple attached clients cannot safely
+                    // answer independently because each viewer may have a
+                    // different local cursor position; the child PTY only has
+                    // one shared terminal state.  Centralising replies here
+                    // prevents passive viewers from sending conflicting CPRs.
+                    for resp in extract_query_responses_no_client(&data, &mut query_tail) {
+                        let _ = writer_tx.send(resp);
                     }
 
                     // Update in-memory ring + disk (brief lock, no I/O inside).

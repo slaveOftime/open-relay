@@ -8,16 +8,14 @@ use crossterm::{
     },
     execute, terminal,
 };
-use tokio::io::BufReader;
+use tokio::{io::BufReader, sync::mpsc};
 
 use crate::{
     config::AppConfig,
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    utils::{
-        TerminalQuery, find_next_terminal_query, terminal_query_response, terminal_query_tail_len,
-    },
+    utils::{find_next_terminal_query, terminal_query_tail_len},
 };
 
 // ---------------------------------------------------------------------------
@@ -95,6 +93,24 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         )
         .await?;
 
+        // `read_response_from_reader` uses `read_line`, which is not safe to
+        // keep cancelling with timeouts. Read daemon frames in a dedicated task
+        // and receive them over a channel instead.
+        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        let reader_task = tokio::spawn(async move {
+            let mut reader = reader;
+            loop {
+                let frame = ipc::read_response_from_reader(&mut reader).await;
+                let done = frame.is_err();
+                if frame_tx.send(frame).is_err() {
+                    break;
+                }
+                if done {
+                    break;
+                }
+            }
+        });
+
         while running {
             // Drain all pending keyboard/resize events first.
             loop {
@@ -157,18 +173,21 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             }
 
             // Wait for next server frame (with a timeout so we keep draining input).
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_millis(60),
-                ipc::read_response_from_reader(&mut reader),
-            )
-            .await;
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_millis(60), frame_rx.recv()).await;
             match frame {
                 Err(_timeout) => continue,
-                Ok(Err(err)) => {
+                Ok(None) => {
+                    stream_error = Some(AppError::Protocol(
+                        "daemon closed the connection".to_string(),
+                    ));
+                    break;
+                }
+                Ok(Some(Err(err))) => {
                     stream_error = Some(err);
                     break;
                 }
-                Ok(Ok(RpcResponse::AttachStreamChunk { data, .. })) => {
+                Ok(Some(Ok(RpcResponse::AttachStreamChunk { data, .. }))) => {
                     let text = String::from_utf8_lossy(&data);
                     let chunk = String::from(&*text);
                     respond_to_terminal_queries(
@@ -182,20 +201,22 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     .await?;
                     std::io::stdout().flush()?;
                 }
-                Ok(Ok(RpcResponse::AttachModeChanged {
+                Ok(Some(Ok(RpcResponse::AttachModeChanged {
                     app_cursor_keys, ..
-                })) => {
+                }))) => {
                     child_app_cursor_keys = app_cursor_keys;
                 }
-                Ok(Ok(RpcResponse::AttachStreamDone { .. })) => {
+                Ok(Some(Ok(RpcResponse::AttachStreamDone { .. }))) => {
                     running = false;
                 }
-                Ok(Ok(RpcResponse::Error { message })) => {
+                Ok(Some(Ok(RpcResponse::Error { message }))) => {
                     return Err(AppError::DaemonUnavailable(message));
                 }
-                Ok(Ok(_)) => {}
+                Ok(Some(Ok(_))) => {}
             }
         }
+
+        reader_task.abort();
     }
 
     if detached {
@@ -499,7 +520,12 @@ async fn respond_to_terminal_queries(
             std::io::stdout().flush()?;
         }
 
-        respond_to_terminal_query(config, id, query, node).await?;
+        // The daemon is the sole responder for CPR/DSR/OSC terminal queries.
+        // A session can have multiple attached viewers, and allowing each
+        // client to answer independently causes conflicting cursor-position
+        // reports and corrupts passive viewers.  We still strip the query from
+        // display locally, but do not send any response from the client.
+        let _ = (config, id, query, node);
 
         search_from = match_start + query_len;
     }
@@ -633,27 +659,6 @@ fn is_partial_osc_color_response(candidate: &str) -> bool {
 
     true
 }
-
-async fn respond_to_terminal_query(
-    config: &AppConfig,
-    id: &str,
-    query: TerminalQuery,
-    node: Option<&str>,
-) -> Result<()> {
-    let response = match query {
-        TerminalQuery::CursorPositionReport => {
-            let (col, row) = cursor::position().unwrap_or((0, 0));
-            terminal_query_response(
-                TerminalQuery::CursorPositionReport,
-                Some((row.saturating_add(1), col.saturating_add(1))),
-            )
-        }
-        _ => terminal_query_response(query, None),
-    };
-
-    send_input(config, id, response, node).await
-}
-
 pub async fn send_input(
     config: &AppConfig,
     id: &str,

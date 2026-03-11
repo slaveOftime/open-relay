@@ -40,14 +40,8 @@ pub(super) async fn handle_client(
         from_byte_offset,
     } = request
     {
-        return handle_attach_subscribe(
-            id,
-            from_byte_offset,
-            &mut reader,
-            &mut write_half,
-            &session_store,
-        )
-        .await;
+        return handle_attach_subscribe(id, from_byte_offset, reader, write_half, &session_store)
+            .await;
     }
 
     // Non-streaming path: dispatch and write single response.
@@ -207,8 +201,8 @@ async fn handle_start(
 async fn handle_attach_subscribe(
     id: String,
     from_byte_offset: Option<u64>,
-    reader: &mut BufReader<tokio::io::ReadHalf<Stream>>,
-    writer: &mut tokio::io::WriteHalf<Stream>,
+    mut reader: BufReader<tokio::io::ReadHalf<Stream>>,
+    mut writer: tokio::io::WriteHalf<Stream>,
     session_store: &SessionStoreHandle,
 ) -> Result<()> {
     use tokio::sync::broadcast::error::RecvError;
@@ -222,7 +216,7 @@ async fn handle_attach_subscribe(
                 let resp = RpcResponse::Error {
                     message: err.message(&id),
                 };
-                return ipc::write_response_to_writer(writer, resp).await;
+                return ipc::write_response_to_writer(&mut writer, resp).await;
             }
         }
     };
@@ -242,7 +236,7 @@ async fn handle_attach_subscribe(
         store.is_running(&id)
     };
     ipc::write_response_to_writer(
-        writer,
+        &mut writer,
         RpcResponse::AttachStreamInit {
             lines,
             end_offset,
@@ -258,6 +252,23 @@ async fn handle_attach_subscribe(
         let mut store = session_store.lock().await;
         let _ = store.mark_attach_presence(&id).await;
     }
+
+    // `read_request_from_reader` uses `read_line`, which is not safe to keep
+    // cancelling inside `tokio::select!`. Read client messages in a dedicated
+    // task so each frame is consumed to completion.
+    let (client_msg_tx, mut client_msg_rx) = mpsc::unbounded_channel();
+    let client_reader_task = tokio::spawn(async move {
+        loop {
+            let msg = ipc::read_request_from_reader(&mut reader).await;
+            let done = msg.is_err();
+            if client_msg_tx.send(msg).is_err() {
+                break;
+            }
+            if done {
+                break;
+            }
+        }
+    });
 
     let mut chunk_filter = EscapeFilter::new();
     let mut current_offset = end_offset;
@@ -294,7 +305,7 @@ async fn handle_attach_subscribe(
                             .collect();
                         if !raw.is_empty() {
                             ipc::write_response_to_writer(
-                                writer,
+                                &mut writer,
                                 RpcResponse::AttachStreamChunk {
                                     offset: current_offset,
                                     data: raw,
@@ -305,7 +316,7 @@ async fn handle_attach_subscribe(
                     }
 
                     let _ = ipc::write_response_to_writer(
-                        writer,
+                        &mut writer,
                         RpcResponse::AttachStreamDone { exit_code },
                     )
                     .await;
@@ -314,23 +325,24 @@ async fn handle_attach_subscribe(
             }
 
             // Incoming client message (input / resize / detach).
-            client_msg = ipc::read_request_from_reader(reader) => {
+            client_msg = client_msg_rx.recv() => {
                 match client_msg {
-                    Err(_) => break, // client disconnected
-                    Ok(RpcRequest::AttachInput { id: req_id, data }) if req_id == id => {
+                    None => break,
+                    Some(Err(_)) => break, // client disconnected
+                    Some(Ok(RpcRequest::AttachInput { id: req_id, data })) if req_id == id => {
                         let mut store = session_store.lock().await;
                         if store.attach_input(&req_id, &data).await.is_err() {
                             break;
                         }
                     }
-                    Ok(RpcRequest::AttachResize { id: req_id, rows, cols }) if req_id == id => {
+                    Some(Ok(RpcRequest::AttachResize { id: req_id, rows, cols })) if req_id == id => {
                         let mut store = session_store.lock().await;
                         let _ = store.attach_resize(&req_id, rows, cols).await;
                     }
-                    Ok(RpcRequest::AttachDetach { id: req_id }) if req_id == id => {
+                    Some(Ok(RpcRequest::AttachDetach { id: req_id })) if req_id == id => {
                         break;
                     }
-                    Ok(_) => {} // ignore unrecognised messages
+                    Some(Ok(_)) => {} // ignore unrecognised messages
                 }
             }
 
@@ -341,7 +353,7 @@ async fn handle_attach_subscribe(
                         let filtered = chunk_filter.filter(&raw_arc);
                         if !filtered.is_empty() {
                             ipc::write_response_to_writer(
-                                writer,
+                                &mut writer,
                                 RpcResponse::AttachStreamChunk {
                                     offset: current_offset,
                                     data: filtered,
@@ -370,7 +382,7 @@ async fn handle_attach_subscribe(
                             .collect();
                         if !raw.is_empty() {
                             ipc::write_response_to_writer(
-                                writer,
+                                &mut writer,
                                 RpcResponse::AttachStreamChunk {
                                     offset: current_offset,
                                     data: raw,
@@ -387,7 +399,7 @@ async fn handle_attach_subscribe(
                             store.get_exit_code(&id)
                         };
                         let _ = ipc::write_response_to_writer(
-                            writer,
+                            &mut writer,
                             RpcResponse::AttachStreamDone { exit_code },
                         )
                         .await;
@@ -399,6 +411,7 @@ async fn handle_attach_subscribe(
     }
 
     // Clean up attach presence on exit.
+    client_reader_task.abort();
     let mut store = session_store.lock().await;
     let _ = store.attach_detach(&id).await;
     Ok(())
