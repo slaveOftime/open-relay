@@ -17,12 +17,12 @@ use crate::{
 };
 
 use super::pty::{
-    CursorTracker, EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client,
-    has_visible_content,
+    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content,
 };
 
 use super::{
     SessionMeta, SessionStatus,
+    cursor_tracker::CursorTracker,
     mode_tracker::{ModeSnapshot, ModeTracker},
     persist::{append_event, append_output_raw, append_resize_event},
     ring::RingBuffer,
