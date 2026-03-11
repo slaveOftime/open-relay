@@ -164,7 +164,7 @@ export default function SessionDetailPage() {
   const reconnectTimerRef = useRef<number | null>(null)
   const pendingReconnectRef = useRef(false)
   const connectAttemptStartedAtRef = useRef(0)
-  const outputBufferRef = useRef<string[]>([])
+  const outputBufferRef = useRef<Uint8Array[]>([])
   const outputFlushRafRef = useRef<number | null>(null)
   const pendingResetRef = useRef(false)
   const resizeDebounceRef = useRef<number | null>(null)
@@ -186,14 +186,20 @@ export default function SessionDetailPage() {
       pendingResetRef.current = false
     }
     if (outputBufferRef.current.length > 0) {
-      term.write(outputBufferRef.current.join(''))
+      const chunks = outputBufferRef.current
       outputBufferRef.current = []
+      let total = 0
+      for (const c of chunks) total += c.length
+      const merged = new Uint8Array(total)
+      let off = 0
+      for (const c of chunks) { merged.set(c, off); off += c.length }
+      term.write(merged)
     }
     term.scrollToBottom()
   }, [])
 
   const enqueueTerminalOutput = useCallback(
-    (chunks: string[], opts?: { reset?: boolean }) => {
+    (chunks: Uint8Array[], opts?: { reset?: boolean }) => {
       if (!isMounted.current) return
       if (opts?.reset) {
         pendingResetRef.current = true

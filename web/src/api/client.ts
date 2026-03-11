@@ -338,11 +338,19 @@ export function subscribeEvents(
 // WebSocket PTY attach
 // ---------------------------------------------------------------------------
 
+/** Decode a base64 string into a Uint8Array of raw bytes. */
+function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64)
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
 export interface AttachOptions {
   /** Called with decoded raw PTY bytes from the initial ring-buffer replay. */
-  onInit: (data: string, appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  onInit: (data: Uint8Array, appCursorKeys: boolean, bracketedPasteMode: boolean) => void
   /** Called with decoded raw PTY bytes for each incremental output chunk. */
-  onData: (data: string) => void
+  onData: (data: Uint8Array) => void
   /** Called when terminal modes change (DECCKM, bracketed paste). */
   onModeChanged: (appCursorKeys: boolean, bracketedPasteMode: boolean) => void
   /** Called when the session ends. */
@@ -387,10 +395,10 @@ export class AttachSocket {
         const msg = JSON.parse(e.data) as WsServerMessage
         switch (msg.type) {
           case 'init':
-            opts.onInit(atob(msg.data), msg.appCursorKeys, msg.bracketedPasteMode)
+            opts.onInit(base64ToBytes(msg.data), msg.appCursorKeys, msg.bracketedPasteMode)
             break
           case 'data':
-            opts.onData(atob(msg.data))
+            opts.onData(base64ToBytes(msg.data))
             break
           case 'mode_changed':
             opts.onModeChanged(msg.appCursorKeys, msg.bracketedPasteMode)

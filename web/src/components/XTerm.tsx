@@ -57,7 +57,7 @@ function getTerminalTheme(): ITheme {
 }
 
 export interface XTermHandle {
-  write(data: string): void
+  write(data: string | Uint8Array): void
   writeln(data: string): void
   clear(): void
   reset(): void
@@ -94,7 +94,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
   }, [onResize])
 
   useImperativeHandle(ref, () => ({
-    write(data: string) {
+    write(data: string | Uint8Array) {
       termRef.current?.write(data)
     },
     writeln(data: string) {
