@@ -20,7 +20,9 @@ use super::{
     rpc_attach::{
         handle_attach_detach, handle_attach_input, handle_attach_resize, handle_attach_subscribe,
     },
-    rpc_nodes::{handle_node_list, handle_node_proxy, handle_node_proxy_streaming},
+    rpc_nodes::{
+        handle_node_list, handle_node_proxy, handle_node_proxy_streaming, spawn_join_connector,
+    },
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -431,8 +433,7 @@ async fn handle_join_start(
         api_key: key,
     };
     client::join::save_join_config(config, &join)?;
-    let (abort, stop_tx) =
-        client::spawn_join_connector(join, config.clone(), notification_tx.subscribe());
+    let (abort, stop_tx) = spawn_join_connector(join, config.clone(), notification_tx.subscribe());
     join_handles.lock().await.insert(name, (abort, stop_tx));
     Ok(RpcResponse::Ack)
 }

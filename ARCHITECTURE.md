@@ -87,15 +87,18 @@ Primary references:
 - **CLI + command dispatch**
   - `src/main.rs` - command routing, daemon spawn/check, CLI behavior.
   - `src/cli.rs` - clap command model and options.
+  - `src/client/attach.rs`, `input.rs`, `list.rs`, `logs.rs` - human/agent-facing CLI command implementations.
+  - `src/client/join.rs` - persisted join config management and CLI join/start-stop flows.
 - **Daemon lifecycle + IPC handling**
   - `src/daemon/lifecycle.rs` - daemon startup/shutdown, lock/pid handling, foreground runtime orchestration.
   - `src/daemon/rpc.rs` - IPC request entrypoint and top-level dispatch.
-  - `src/daemon/rpc_handlers.rs` - request handlers grouped by domain (sessions/logs/federation/api keys/joins).
-  - `src/daemon/notifications.rs` - notification monitor and notifier channel wiring.
+  - `src/daemon/rpc_attach.rs` - streaming attach/input/resize/detach handlers.
+  - `src/daemon/rpc_nodes.rs` - node proxy handlers plus secondary-node connector runtime.
   - `src/daemon/auth.rs` - password prompt and no-auth safety confirmation helpers.
   - `src/ipc.rs` - envelope protocol and transport framing.
 - **Session subsystem**
   - `src/session/pty.rs` - PTY ownership (PtyHandle), escape filtering, terminal query handling.
+  - `src/session/cursor_tracker.rs` - cursor position approximation for CPR responses.
   - `src/session/mode_tracker.rs` - byte-level DEC private mode state machine.
   - `src/session/runtime.rs` - SessionRuntime: ring + broadcast + pty + meta + spawn.
   - `src/session/store.rs` - in-memory registry, attach/detach, input, resize, stop.
@@ -114,8 +117,9 @@ Primary references:
   - `src/http/auth.rs` - auth/login/status/API key middleware endpoints.
   - `src/http/nodes.rs` - node/federation HTTP surfaces.
 - **Federation (multi-node)**
-  - `src/node/registry.rs` - node tracking and state.
-  - `src/client/join.rs` - join/connect loop for secondary nodes.
+  - `src/node/registry.rs` - connected node tracking, request proxying, and streaming fan-out.
+  - `src/daemon/rpc_nodes.rs` - node proxy RPC handlers and outbound join connector runtime.
+  - `src/client/join.rs` - join config persistence + CLI join commands.
 - **Notifications**
   - `src/notification/*` - dispatcher and delivery channels.
 
@@ -138,6 +142,7 @@ Primary references:
 - Rust integration/e2e:
   - `tests/cli_errors.rs`
   - `tests/e2e_daemon.rs`
+  - `tests/e2e_pty.rs`
 - Web unit/e2e:
   - `web/src/utils/keyInput.test.ts`
   - `web/e2e/sessions.spec.ts`
@@ -625,7 +630,7 @@ Both are reset when the sequence is completed or proven not to be an escape sequ
 **Requirements**:
 - Session must survive CLI process exit and terminal disconnect.
 - Session must be addressable by name or UUID.
-- `oly list` must show the session as running.
+- `oly ls` must show the session as running.
 
 ### F2 — Reattach to Running Session
 
@@ -655,7 +660,7 @@ Both are reset when the sequence is completed or proven not to be an escape sequ
 **Requirements**:
 - Machine B runs `oly` configured as a secondary node, joined to Machine A's primary.
 - Authentication uses an API key.
-- `oly list` on Machine B shows sessions from Machine A.
+- `oly ls` on Machine B shows sessions from Machine A.
 - `oly attach` on Machine B proxies input/output through the node WebSocket connection.
 - Latency is added by the WS hop but correctness (mode tracking, resize, bracketed paste) is preserved.
 

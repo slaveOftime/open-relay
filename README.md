@@ -12,6 +12,7 @@
 `oly` is a session-persistent PTY daemon for long-running CLI agents (Claude Code, Gemini CLI, OpenCode, normal CLI etc.). It keeps your agent alive after you close the terminal, notifies you when something needs a human, and lets you intervene from anywhere.
 
 For a full repository architecture map, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+For the PTY/session internals specifically, see [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
 
 ---
 
@@ -34,6 +35,12 @@ You start an agent task. It runs for 20 minutes. Halfway through it hits a `y/n`
 ### Agent-supervises-agent 🤖 👀 🤖
 
 You can run one agent to supervise another. When the supervisor hits something it's unsure about — or something that needs elevated permission — it escalates to you. You decide whether to approve, modify, or abort. You're still in the loop, just not watching.
+
+### Code layout at a glance
+
+- `src/daemon/rpc.rs` keeps the top-level IPC dispatch, with attach handlers in `src/daemon/rpc_attach.rs` and federation/node runtime in `src/daemon/rpc_nodes.rs`.
+- `src/session/pty.rs` owns PTY resources and escape filtering, while `src/session/cursor_tracker.rs` and `src/session/mode_tracker.rs` track terminal state.
+- `src/client/join.rs` now focuses on join config persistence and CLI join commands; the secondary-node connector runs daemon-side.
 
 ---
 

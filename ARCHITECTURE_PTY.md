@@ -125,6 +125,8 @@ src/session/
 │   ├── TerminalQuery   Query pattern matching & response generation
 │   ├── has_visible_content()
 │   └── extract_query_responses_no_client()
+├── cursor_tracker.rs   Approximate cursor position tracker for CPR replies
+│   └── CursorTracker   CSI/printable-text based cursor model
 ├── mode_tracker.rs     Byte-level DEC private mode state machine
 │   ├── ModeTracker     Parser state machine
 │   └── ModeSnapshot    Current mode values
@@ -613,7 +615,7 @@ Node Registry  proxy_rpc_stream()              (local store)
                     │                              │
 Inter-node WS  RpcStreamFrame { id, resp, done }
                     │                              │
-Join connector     nodes.rs relay loop        join.rs relay_streaming_rpc()
+Join connector     rpc_nodes.rs relay loop    rpc_nodes.rs relay_streaming_rpc()
 ```
 
 ### Frame Relay

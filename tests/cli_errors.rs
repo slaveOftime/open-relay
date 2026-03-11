@@ -48,7 +48,7 @@ fn list_without_daemon_succeeds_gracefully() {
         .output()
         .expect("failed to run oly ls");
 
-    // oly list reads persisted session metadata from disk and must not require
+    // oly ls reads persisted session metadata from disk and must not require
     // a live daemon – it should always exit 0 even with an empty state dir.
     assert!(
         output.status.success(),

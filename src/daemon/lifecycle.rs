@@ -215,8 +215,11 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
     for join in client::join::load_join_configs(&config) {
-        let (abort, stop_tx) =
-            client::spawn_join_connector(join.clone(), config.clone(), notification_tx.subscribe());
+        let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
+            join.clone(),
+            config.clone(),
+            notification_tx.subscribe(),
+        );
         join_handles
             .lock()
             .await
