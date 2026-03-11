@@ -227,11 +227,11 @@ impl Default for TerminalModeTracker {
 ///
 /// Returns a list of response byte strings to write sequentially.
 ///
-/// OSC 10/11 colour probes are detected so they can still be stripped from
-/// output, but we intentionally do NOT answer them here. In attached Linux
-/// terminals some interactive apps echo the colour response into the prompt,
-/// producing visible junk like `]10;rgb:ffff/ffff/ffff\`. CPR/DSR are the
-/// only queries that currently need a daemon-side answer for correctness.
+/// OSC 10/11 colour probes are answered with a static best-guess response
+/// (white foreground, black background, or the `COLORFGBG` env var if set).
+/// Any echoed colour response that the child app writes back to its own stdout
+/// is stripped by the `EscapeFilter` (via `GENERIC_OSC_FULL_RE`) before being
+/// forwarded to attach clients, so there is no visible junk.
 pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<Vec<u8>> {
     let text = String::from_utf8_lossy(data);
     let mut combined = std::mem::take(tail);
@@ -252,7 +252,11 @@ pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<
                 responses.push(response.into_bytes());
             }
             TerminalQuery::ForegroundColor | TerminalQuery::BackgroundColor => {
-                // Deliberately unanswered; see doc comment above.
+                // Answer with a static colour response so that apps that query
+                // the terminal colour during startup (e.g. to pick a light/dark
+                // theme) are not left blocking on an unanswered OSC query.
+                let response = terminal_query_response(query, None);
+                responses.push(response.into_bytes());
             }
         }
         search_from = match_start + query_len;
