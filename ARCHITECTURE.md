@@ -59,32 +59,25 @@ Primary references:
 |   oly CLI        +------------------->|       Oly Daemon           |<----------------->|  Secondary node    |
 | (start/list/... )|  (Unix/Named Sock) |  - request router          |                   |   on other pc      |
 +---------+--------+                    |  - auth + config           |                   |                    |
-          |                             |  - notifications           |                   |                    |
-          |                             +------+---------------------+                   +--------------------+
-          |                                    |
-          |                                    | manages
-          |                                    v
-          |                           +--------+---------------------+
-          |                           | Session Store + Runtime      |
-          |                           | - PTY child process          |
-          |                           | - ring buffer / polling      |
-          |                           | - resize/input/stop          |
-          |                           +--------+---------------------+
-          |                                    |
-          |                                    | persists metadata/logs
-          |                                    v
-          |                           +--------+---------------------+
-          |                           | SQLite + log files           |
-          |                           | - sessions/api_keys/push     |
-          |                           | - output.log/events.log      |
-          |                           +------------------------------+
-          |
-          | optional federation proxy/join
-          v
-+--------------------+
-| Other Oly Node     |
-| (primary/secondary)|
-+--------------------+
+                                        |  - notifications           |                   |                    |
+                                        +------+---------------------+                   +--------------------+
+                                               |
+                                               | manages
+                                               v
+                                      +--------+---------------------+
+                                      | Session Store + Runtime      |
+                                      | - PTY child process          |
+                                      | - ring buffer / polling      |
+                                      | - resize/input/stop          |
+                                      +--------+---------------------+
+                                               |
+                                               | persists metadata/logs
+                                               v
+                                      +--------+---------------------+
+                                      | SQLite + log files           |
+                                      | - sessions/api_keys/push     |
+                                      | - output.log/events.log      |
+                                      +------------------------------+
 ```
 
 ## 3) Repository Structure and Responsibilities
