@@ -16,7 +16,9 @@ use crate::{
     error::{AppError, Result},
 };
 
-use super::pty::{PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content};
+use super::pty::{
+    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content,
+};
 
 use super::{
     SessionMeta, SessionStatus,
@@ -62,6 +64,8 @@ pub struct SessionRuntime {
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
     pub notifications_enabled: bool,
+    /// Filters CPR/DSR/OSC responses from PTY output before writing to disk.
+    pub persist_filter: EscapeFilter,
 }
 
 impl SessionRuntime {
@@ -92,8 +96,12 @@ impl SessionRuntime {
             self.last_output_at = Some(Instant::now());
         }
 
-        // Persist raw bytes to disk.
-        let _ = append_output_raw(&self.dir, &data);
+        // Persist filtered bytes to disk (strips CPR/DSR/OSC responses that
+        // get echoed by the PTY driver so `oly logs` output stays clean).
+        let filtered = self.persist_filter.filter(&data);
+        if !filtered.is_empty() {
+            let _ = append_output_raw(&self.dir, &filtered);
+        }
 
         // Add to in-memory ring (evicts oldest if over capacity).
         self.ring.push(data);
@@ -326,6 +334,7 @@ pub fn spawn_session(
         mode_tracker: ModeTracker::new(),
         output_closed: false,
         notifications_enabled,
+        persist_filter: EscapeFilter::new(),
     }));
 
     // PTY reader thread: reads raw bytes, stores in ring, broadcasts to subscribers.
@@ -505,12 +514,9 @@ mod tests {
             mode_tracker: ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
+            persist_filter: EscapeFilter::new(),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // push_raw — mode tracking
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_push_raw_enables_bracketed_paste() {

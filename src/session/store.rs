@@ -705,6 +705,7 @@ mod tests {
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
+            persist_filter: super::super::pty::EscapeFilter::new(),
         }))
     }
 
@@ -1042,6 +1043,7 @@ mod tests {
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
+            persist_filter: super::super::pty::EscapeFilter::new(),
         }));
         (rt, writer_rx)
     }
