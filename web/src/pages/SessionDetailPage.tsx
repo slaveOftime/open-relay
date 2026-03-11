@@ -471,24 +471,23 @@ export default function SessionDetailPage() {
           }
           if (isMounted.current) setWsConnected(true)
         },
-        onSnapshot: (lines, _cursor, running) => {
+        onInit: (data, _appCursorKeys, _bracketedPasteMode) => {
           if (!gotSnapshot) {
-            pushConnectTrace(`snapshot received (${lines.length} chunks)`)
+            pushConnectTrace(`init received (${data.length} bytes)`)
             gotSnapshot = true
           }
           lastWsFrameAtRef.current = Date.now()
-          enqueueTerminalOutput(lines, { reset: true })
-          if (!running) {
-            // Session was already stopped; the server sends End immediately after,
-            // but mark ended now so onClose doesn't schedule a spurious reconnect.
-            ended = true
-          }
+          enqueueTerminalOutput([data], { reset: true })
         },
-        onOutput: (lines) => {
+        onData: (data) => {
           lastWsFrameAtRef.current = Date.now()
-          enqueueTerminalOutput(lines)
+          enqueueTerminalOutput([data])
         },
-        onEnd: (code) => {
+        onModeChanged: (_appCursorKeys, _bracketedPasteMode) => {
+          lastWsFrameAtRef.current = Date.now()
+          // Mode changes are tracked server-side; client doesn't need to act.
+        },
+        onSessionEnded: (code) => {
           ended = true
           lastWsFrameAtRef.current = Date.now()
           pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)

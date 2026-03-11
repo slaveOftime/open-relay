@@ -95,8 +95,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
     // ── Step 4: set up RPC relay channel and register node ───────────────
     let (send_tx, mut send_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
-    let pending: Arc<Mutex<HashMap<String, PendingRpc>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending: Arc<Mutex<HashMap<String, PendingRpc>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_recv = Arc::clone(&pending);
     let notifier = build_notifier(state.db.clone(), &state.config);
 
@@ -250,8 +249,12 @@ async fn handle_join(socket: WebSocket, state: AppState) {
         let err = || crate::error::AppError::NodeNotConnected(name.clone());
         for (_, sender) in pm.drain() {
             match sender {
-                PendingRpc::OneShot(tx) => { let _ = tx.send(Err(err())); }
-                PendingRpc::Stream(tx) => { let _ = tx.send(Err(err())); }
+                PendingRpc::OneShot(tx) => {
+                    let _ = tx.send(Err(err()));
+                }
+                PendingRpc::Stream(tx) => {
+                    let _ = tx.send(Err(err()));
+                }
             }
         }
     }

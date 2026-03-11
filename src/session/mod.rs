@@ -1,3 +1,4 @@
+pub mod logs;
 pub(crate) mod mode_tracker;
 pub(crate) mod persist;
 pub mod pty;

@@ -5,14 +5,13 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
-use std::io::BufRead;
 use tracing::{debug, error, info, warn};
 
 use crate::{
     protocol::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
-    session::StartSpec,
+    session::{StartSpec, logs::read_persisted_log_page},
 };
 
 use super::{AppState, SessionEvent};
@@ -621,34 +620,6 @@ pub struct LogsParams {
     pub limit: Option<usize>,
     /// If set, proxy the logs request to this connected secondary node.
     pub node: Option<String>,
-}
-
-fn read_persisted_log_page(
-    session_dir: &std::path::Path,
-    offset: usize,
-    limit: usize,
-) -> Option<(Vec<String>, usize)> {
-    let file = std::fs::File::open(session_dir.join("output.log")).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-
-    let end = offset.saturating_add(limit);
-    let mut total = 0usize;
-    let mut lines = Vec::with_capacity(limit);
-
-    loop {
-        let mut buf = String::new();
-        let bytes_read = reader.read_line(&mut buf).ok()?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        if total >= offset && total < end {
-            lines.push(buf);
-        }
-        total += 1;
-    }
-
-    Some((lines, total))
 }
 
 pub async fn get_logs(

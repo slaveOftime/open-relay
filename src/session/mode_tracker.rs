@@ -59,11 +59,7 @@ impl ModeTracker {
                     } else {
                         // Not a CSI introducer — could be another ESC or
                         // a different escape type; restart.
-                        self.state = if b == 0x1b {
-                            State::Esc
-                        } else {
-                            State::Normal
-                        };
+                        self.state = if b == 0x1b { State::Esc } else { State::Normal };
                     }
                 }
                 State::Csi => {
@@ -72,28 +68,26 @@ impl ModeTracker {
                         self.param = 0;
                     } else {
                         // Not a DEC private sequence — skip.
-                        self.state = if b == 0x1b {
-                            State::Esc
-                        } else {
-                            State::Normal
-                        };
+                        self.state = if b == 0x1b { State::Esc } else { State::Normal };
                     }
                 }
                 State::CsiPrivate => {
                     if b.is_ascii_digit() {
-                        self.param = self.param.saturating_mul(10).saturating_add((b - b'0') as u32);
+                        self.param = self
+                            .param
+                            .saturating_mul(10)
+                            .saturating_add((b - b'0') as u32);
                         self.state = State::CsiParam;
                     } else {
-                        self.state = if b == 0x1b {
-                            State::Esc
-                        } else {
-                            State::Normal
-                        };
+                        self.state = if b == 0x1b { State::Esc } else { State::Normal };
                     }
                 }
                 State::CsiParam => {
                     if b.is_ascii_digit() {
-                        self.param = self.param.saturating_mul(10).saturating_add((b - b'0') as u32);
+                        self.param = self
+                            .param
+                            .saturating_mul(10)
+                            .saturating_add((b - b'0') as u32);
                     } else if b == b'h' {
                         self.apply(true);
                         self.state = State::Normal;
@@ -102,22 +96,14 @@ impl ModeTracker {
                         self.state = State::Normal;
                     } else {
                         // Unexpected byte — reset.
-                        self.state = if b == 0x1b {
-                            State::Esc
-                        } else {
-                            State::Normal
-                        };
+                        self.state = if b == 0x1b { State::Esc } else { State::Normal };
                     }
                 }
             }
         }
 
         let after = self.snapshot();
-        if after != before {
-            Some(after)
-        } else {
-            None
-        }
+        if after != before { Some(after) } else { None }
     }
 
     fn apply(&mut self, enable: bool) {

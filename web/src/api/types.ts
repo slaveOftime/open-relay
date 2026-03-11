@@ -67,14 +67,6 @@ export interface NodeSummary {
   connected: boolean
 }
 
-export interface AttachSnapshotResponse {
-  lines: string[]
-  cursor: number
-  running: boolean
-  bracketed_paste_mode: boolean
-  app_cursor_keys: boolean
-}
-
 export interface LogsResponse {
   lines: string[]
   offset: number
@@ -128,10 +120,12 @@ export type SessionEvent =
 // ---------------------------------------------------------------------------
 
 export type WsServerMessage =
-  | { type: 'snapshot'; lines: string[]; cursor: number; running: boolean }
-  | { type: 'output'; lines: string[]; cursor: number }
-  | { type: 'end'; exit_code: number | null }
+  | { type: 'init'; data: string; appCursorKeys: boolean; bracketedPasteMode: boolean }
+  | { type: 'data'; data: string }
+  | { type: 'mode_changed'; appCursorKeys: boolean; bracketedPasteMode: boolean }
+  | { type: 'session_ended'; exit_code: number | null }
   | { type: 'error'; message: string }
+  | { type: 'pong' }
 
 export type WsClientMessage =
   | { type: 'input'; data: string }

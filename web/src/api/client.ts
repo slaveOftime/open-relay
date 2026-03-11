@@ -339,9 +339,14 @@ export function subscribeEvents(
 // ---------------------------------------------------------------------------
 
 export interface AttachOptions {
-  onSnapshot: (lines: string[], cursor: number, running: boolean) => void
-  onOutput: (lines: string[], cursor: number) => void
-  onEnd: (exitCode: number | null) => void
+  /** Called with decoded raw PTY bytes from the initial ring-buffer replay. */
+  onInit: (data: string, appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called with decoded raw PTY bytes for each incremental output chunk. */
+  onData: (data: string) => void
+  /** Called when terminal modes change (DECCKM, bracketed paste). */
+  onModeChanged: (appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called when the session ends. */
+  onSessionEnded: (exitCode: number | null) => void
   onError: (message: string) => void
   onOpen: () => void
   onClose: (code: number, reason: string) => void
@@ -381,17 +386,22 @@ export class AttachSocket {
       try {
         const msg = JSON.parse(e.data) as WsServerMessage
         switch (msg.type) {
-          case 'snapshot':
-            opts.onSnapshot(msg.lines, msg.cursor, msg.running)
+          case 'init':
+            opts.onInit(atob(msg.data), msg.appCursorKeys, msg.bracketedPasteMode)
             break
-          case 'output':
-            opts.onOutput(msg.lines, msg.cursor)
+          case 'data':
+            opts.onData(atob(msg.data))
             break
-          case 'end':
-            opts.onEnd(msg.exit_code)
+          case 'mode_changed':
+            opts.onModeChanged(msg.appCursorKeys, msg.bracketedPasteMode)
+            break
+          case 'session_ended':
+            opts.onSessionEnded(msg.exit_code)
             break
           case 'error':
             opts.onError(msg.message)
+            break
+          case 'pong':
             break
         }
       } catch {

@@ -51,14 +51,8 @@ pub(super) async fn handle_client(
             if matches!(inner.as_ref(), RpcRequest::AttachSubscribe { .. })
     ) {
         if let RpcRequest::NodeProxy { node, inner } = request {
-            return handle_node_proxy_streaming(
-                node,
-                *inner,
-                reader,
-                write_half,
-                &node_registry,
-            )
-            .await;
+            return handle_node_proxy_streaming(node, *inner, reader, write_half, &node_registry)
+                .await;
         }
     }
 
@@ -781,8 +775,7 @@ async fn handle_node_proxy_streaming(
     };
 
     // Spawn a task to read client messages (input/resize/detach) from IPC.
-    let (client_msg_tx, mut client_msg_rx) =
-        mpsc::unbounded_channel::<Result<RpcRequest>>();
+    let (client_msg_tx, mut client_msg_rx) = mpsc::unbounded_channel::<Result<RpcRequest>>();
     let client_reader_task = tokio::spawn(async move {
         let mut reader = reader;
         loop {
@@ -867,12 +860,7 @@ async fn handle_node_proxy_streaming(
     client_reader_task.abort();
     // Send detach to clean up attach presence on the secondary node.
     let _ = node_registry
-        .proxy_rpc(
-            &node,
-            &RpcRequest::AttachDetach {
-                id: session_id,
-            },
-        )
+        .proxy_rpc(&node, &RpcRequest::AttachDetach { id: session_id })
         .await;
 
     Ok(())
