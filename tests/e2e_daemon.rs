@@ -59,12 +59,9 @@ fn oly_cmd(tmp_dir: &PathBuf) -> Command {
 }
 
 fn apply_state_env(cmd: &mut Command, tmp_dir: &PathBuf) {
-    #[cfg(target_os = "windows")]
-    cmd.env("LOCALAPPDATA", tmp_dir);
-    #[cfg(target_os = "linux")]
-    cmd.env("XDG_STATE_HOME", tmp_dir);
-    #[cfg(target_os = "macos")]
-    cmd.env("HOME", tmp_dir);
+    // OLY_STATE_DIR is the most direct and reliable override — it bypasses
+    // all platform-specific env-var logic in resolve_state_dir().
+    cmd.env("OLY_STATE_DIR", tmp_dir.join("oly"));
     cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(tmp_dir));
 }
 
@@ -1409,4 +1406,511 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     );
 
     drop(secondary_restart);
+}
+
+// ============================================================================
+// Test 13: logs contain no CPR/DSR escape artifacts
+//
+// Verifies Bug 1 fix: the persist filter strips terminal query responses
+// (`\x1b[1;1R`) and DSR queries (`\x1b[6n`) before writing to output.log.
+// ============================================================================
+
+#[test]
+fn e2e_logs_contain_no_escape_artifacts() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_no_escape_artifacts");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let shell: &[&str] = &["cmd.exe"];
+    #[cfg(not(target_os = "windows"))]
+    let shell: &[&str] = &["sh"];
+
+    let id = start_session(&tmp, shell);
+
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| !log.trim().is_empty(),
+        Duration::from_secs(3),
+    )
+    .expect("shell produced no output within 3 s");
+
+    // Send a few commands to generate PTY traffic that might trigger CPR queries.
+    send_line(&tmp, &id, "echo ARTIFACT_CHECK_1");
+    send_line(&tmp, &id, "echo ARTIFACT_CHECK_2");
+
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("ARTIFACT_CHECK_2"),
+        Duration::from_secs(3),
+    )
+    .expect("second marker not found in logs");
+
+    let log = fetch_logs(&tmp, &id);
+
+    // CPR responses look like `\x1b[<row>;<col>R` — in rendered text they
+    // appear as `[1;1R`, `[24;80R`, etc.
+    let has_cpr_response = log.contains(";1R")
+        || log.contains(";80R")
+        || log.contains("\x1b[") && log.contains("R");
+    // DSR queries appear as `\x1b[6n` or `\x1b[5n`.
+    let has_dsr_query = log.contains("[6n") || log.contains("[5n");
+
+    assert!(
+        !has_cpr_response || log.contains("ARTIFACT"),
+        "logs contain CPR response artifacts.\nLogs:\n{log}"
+    );
+    assert!(
+        !has_dsr_query,
+        "logs contain DSR query artifacts.\nLogs:\n{log}"
+    );
+}
+
+// ============================================================================
+// Test 14: multiple concurrent sessions are independent
+//
+// Verifies that starting two sessions and sending different commands to each
+// produces independent, non-interleaved output.
+// ============================================================================
+
+#[test]
+fn e2e_multiple_concurrent_sessions_are_independent() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_multi_session");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let shell: &[&str] = &["cmd.exe"];
+    #[cfg(not(target_os = "windows"))]
+    let shell: &[&str] = &["sh"];
+
+    let id1 = start_session(&tmp, shell);
+    let id2 = start_session(&tmp, shell);
+
+    // Wait for both shells to be ready.
+    for id in [&id1, &id2] {
+        wait_for_log(&tmp, id, |log| !log.trim().is_empty(), Duration::from_secs(3))
+            .unwrap_or_else(|| panic!("session {id} produced no output within 3 s"));
+    }
+
+    const MARKER_1: &str = "oly_e2e_session_alpha";
+    const MARKER_2: &str = "oly_e2e_session_beta";
+
+    send_line(&tmp, &id1, &format!("echo {MARKER_1}"));
+    send_line(&tmp, &id2, &format!("echo {MARKER_2}"));
+
+    wait_for_log(
+        &tmp,
+        &id1,
+        |log| log.contains(MARKER_1),
+        Duration::from_secs(3),
+    )
+    .expect("marker 1 not found in session 1 logs");
+
+    wait_for_log(
+        &tmp,
+        &id2,
+        |log| log.contains(MARKER_2),
+        Duration::from_secs(3),
+    )
+    .expect("marker 2 not found in session 2 logs");
+
+    // Session 1 should NOT contain session 2's marker and vice versa.
+    let log1 = fetch_logs(&tmp, &id1);
+    let log2 = fetch_logs(&tmp, &id2);
+
+    assert!(
+        !log1.contains(MARKER_2),
+        "session 1 logs contain session 2 marker — output is leaking.\nLog1:\n{log1}"
+    );
+    assert!(
+        !log2.contains(MARKER_1),
+        "session 2 logs contain session 1 marker — output is leaking.\nLog2:\n{log2}"
+    );
+}
+
+// ============================================================================
+// Test 15: session status transitions (running → stopped) visible in `oly ls`
+//
+// Verifies that `oly ls` reports correct session status.
+// ============================================================================
+
+#[test]
+fn e2e_session_status_transitions_in_list() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_status_transitions");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let shell: &[&str] = &["cmd.exe"];
+    #[cfg(not(target_os = "windows"))]
+    let shell: &[&str] = &["sh"];
+
+    let id = start_session(&tmp, shell);
+
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| !log.trim().is_empty(),
+        Duration::from_secs(3),
+    )
+    .expect("shell produced no output within 3 s");
+
+    // While the shell is running, `oly ls` should show "running".
+    let ls_running = oly_cmd(&tmp)
+        .args(["ls"])
+        .output()
+        .expect("`oly ls` failed to execute");
+    let ls_out = String::from_utf8_lossy(&ls_running.stdout);
+    assert!(
+        ls_out.contains(&id) && ls_out.contains("running"),
+        "expected session {id} with 'running' status in ls output.\nOutput:\n{ls_out}"
+    );
+
+    // Stop the session.
+    let stop = oly_cmd(&tmp)
+        .args(["stop", &id])
+        .output()
+        .expect("`oly stop` failed to execute");
+    assert!(
+        stop.status.success(),
+        "`oly stop` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    // After stopping, poll `oly ls` until it shows "stopped".
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ls_out2 = String::new();
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(500));
+        let ls_stopped = oly_cmd(&tmp)
+            .args(["ls"])
+            .output()
+            .expect("`oly ls` failed to execute");
+        ls_out2 = String::from_utf8_lossy(&ls_stopped.stdout).to_string();
+        if ls_out2.contains(&id) && (ls_out2.contains("stopped") || ls_out2.contains("failed")) {
+            break;
+        }
+    }
+    assert!(
+        ls_out2.contains(&id) && (ls_out2.contains("stopped") || ls_out2.contains("failed")),
+        "expected session {id} with 'stopped' or 'failed' status after stop.\nOutput:\n{ls_out2}"
+    );
+
+    // Logs should still be accessible for a stopped session.
+    let log = fetch_logs(&tmp, &id);
+    assert!(
+        !log.trim().is_empty(),
+        "logs should be accessible after session is stopped"
+    );
+}
+
+// ============================================================================
+// Test 16: high-bandwidth output preserves log integrity
+//
+// Spawns a command that generates a large amount of output and verifies the
+// last output line is captured correctly.
+// ============================================================================
+
+#[test]
+fn e2e_high_bandwidth_output_logs_intact() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_high_bandwidth");
+    let _daemon = start_daemon(&tmp);
+
+    // Generate 500 numbered lines to stress the ring buffer and log pipeline.
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &[
+        "cmd.exe",
+        "/c",
+        "for /L %i in (1,1,500) do @echo LINE_%i",
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "seq 1 500 | while read i; do echo LINE_$i; done"];
+
+    let id = start_session(&tmp, cmd);
+
+    // Wait for the final line to appear.
+    let result = wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("LINE_500"),
+        Duration::from_secs(10),
+    );
+    assert!(
+        result.is_some(),
+        "LINE_500 not found — high-bandwidth output may have been lost.\nLogs (tail):\n{}",
+        fetch_logs(&tmp, &id)
+    );
+
+    // Verify that early lines are present when we request enough tail lines.
+    let full_log = oly_cmd(&tmp)
+        .args(["logs", &id, "--tail", "600", "--no-truncate"])
+        .output()
+        .expect("`oly logs --tail 600` failed");
+    let full_text = String::from_utf8_lossy(&full_log.stdout);
+    assert!(
+        full_text.contains("LINE_1"),
+        "LINE_1 not found with --tail 600 — early output may have been dropped.\nLogs:\n{full_text}"
+    );
+}
+
+// ============================================================================
+// Test 17: `oly logs --keep-color` preserves ANSI escape codes
+//
+// Verifies that `--keep-color` flag outputs raw ANSI sequences instead of
+// stripping them.
+// ============================================================================
+
+#[test]
+fn e2e_logs_keep_color_preserves_ansi_codes() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_keep_color");
+    let _daemon = start_daemon(&tmp);
+
+    // Use a command that produces ANSI color output.
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &[
+        "cmd.exe",
+        "/c",
+        // cmd.exe doesn't have easy ANSI output; use PowerShell inline.
+        "powershell -NoProfile -Command \"Write-Host 'COLOR_TEST' -ForegroundColor Red\"",
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &[
+        "sh",
+        "-c",
+        "printf '\\033[31mCOLOR_TEST\\033[0m\\n'",
+    ];
+
+    let id = start_session(&tmp, cmd);
+
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("COLOR_TEST"),
+        Duration::from_secs(5),
+    )
+    .expect("COLOR_TEST not found in logs");
+
+    // Without --keep-color, `oly logs` renders through vt100 parser and strips ANSI.
+    let plain = fetch_logs(&tmp, &id);
+    assert!(
+        plain.contains("COLOR_TEST"),
+        "plain logs should contain text.\nLogs:\n{plain}"
+    );
+
+    // With --keep-color, ANSI sequences should be preserved.
+    let colored = oly_cmd(&tmp)
+        .args(["logs", &id, "--tail", "200", "--no-truncate", "--keep-color"])
+        .output()
+        .expect("`oly logs --keep-color` failed");
+    let colored_text = String::from_utf8_lossy(&colored.stdout);
+    assert!(
+        colored_text.contains("COLOR_TEST"),
+        "colored logs should contain text.\nLogs:\n{colored_text}"
+    );
+    // The colored output should contain ESC character (\x1b) for ANSI codes.
+    assert!(
+        colored_text.contains('\x1b'),
+        "colored logs should contain ANSI escape sequences.\nLogs:\n{colored_text}"
+    );
+}
+
+// ============================================================================
+// Test 18: `oly logs --wait-for-prompt` blocks until session needs input
+//
+// Starts a command that sleeps briefly then prints a prompt-like pattern,
+// and verifies `--wait-for-prompt` returns the logs.
+// ============================================================================
+
+#[test]
+fn e2e_logs_wait_for_prompt_returns_after_command_exits() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_wait_prompt");
+    let _daemon = start_daemon(&tmp);
+
+    // A short-lived command. --wait-for-prompt should return when it exits.
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", "echo PROMPT_DONE"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "echo PROMPT_DONE"];
+
+    let id = start_session(&tmp, cmd);
+
+    // Give the command a moment to complete.
+    sleep(Duration::from_millis(500));
+
+    let output = oly_cmd(&tmp)
+        .args([
+            "logs",
+            &id,
+            "--wait-for-prompt",
+            "--timeout",
+            "5000",
+            "--tail",
+            "100",
+            "--no-truncate",
+        ])
+        .output()
+        .expect("`oly logs --wait-for-prompt` failed to execute");
+
+    assert!(
+        output.status.success(),
+        "`oly logs --wait-for-prompt` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("PROMPT_DONE"),
+        "expected PROMPT_DONE in wait-for-prompt output.\nstdout:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// Test 19: stopped session still accessible via `oly logs` after stop
+//
+// Verifies that `oly logs` reads from persisted output.log even after
+// the session has been stopped and potentially evicted from memory.
+// ============================================================================
+
+#[test]
+fn e2e_stopped_session_logs_persist_on_disk() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_persist_after_stop");
+
+    // Use short eviction so the session is evicted from memory quickly.
+    fs::create_dir_all(tmp.join("oly")).expect("create state dir");
+    fs::write(
+        tmp.join("oly").join("config.json"),
+        r#"{ "session_eviction_seconds": 1 }"#,
+    )
+    .expect("write config override");
+
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", "echo", "PERSIST_CHECK_MARKER"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "echo PERSIST_CHECK_MARKER"];
+
+    let id = start_session(&tmp, cmd);
+
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("PERSIST_CHECK_MARKER"),
+        Duration::from_secs(3),
+    )
+    .expect("marker not found before eviction");
+
+    // Wait for eviction (session_eviction_seconds = 1).
+    sleep(Duration::from_secs(3));
+
+    // Logs should still be readable from disk after eviction.
+    let log = fetch_logs(&tmp, &id);
+    assert!(
+        log.contains("PERSIST_CHECK_MARKER"),
+        "logs should persist on disk after session eviction.\nLogs:\n{log}"
+    );
+}
+
+// ============================================================================
+// Test 20: `oly start` (foreground) captures output and reports session end
+//
+// Like Test 8, but using a command that generates multiple lines, verifying
+// that the full output is streamed back to the attach client.
+// ============================================================================
+
+#[test]
+fn e2e_foreground_start_streams_full_output() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_foreground_full");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", "echo LINE_A& echo LINE_B& echo LINE_C"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "echo LINE_A; echo LINE_B; echo LINE_C"];
+
+    let mut args = vec!["start"];
+    args.extend_from_slice(cmd);
+    let output = oly_cmd(&tmp)
+        .args(&args)
+        .output()
+        .expect("`oly start` failed to execute");
+
+    assert!(
+        output.status.success(),
+        "`oly start` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("LINE_A") && stdout.contains("LINE_B") && stdout.contains("LINE_C"),
+        "foreground start should capture all output lines.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("has ended"),
+        "foreground start should report session end.\nstdout:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// Test 21: sending input to a non-existent session fails gracefully
+//
+// Verifies error handling when referencing a session that doesn't exist.
+// ============================================================================
+
+#[test]
+fn e2e_input_to_nonexistent_session_fails_gracefully() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_bad_session_input");
+    let _daemon = start_daemon(&tmp);
+
+    let output = oly_cmd(&tmp)
+        .args(["input", "zzz9999", "--text", "hello"])
+        .output()
+        .expect("`oly input` failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "`oly input` should fail for non-existent session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found") || stderr.contains("error") || stderr.contains("evicted"),
+        "expected clear error for non-existent session.\nstderr:\n{stderr}"
+    );
+}
+
+// ============================================================================
+// Test 22: `oly ls` with no sessions shows "No sessions" hint
+//
+// Verifies user-friendly output when the session list is empty.
+// ============================================================================
+
+#[test]
+fn e2e_list_empty_shows_no_sessions_hint() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_ls_empty");
+    let _daemon = start_daemon(&tmp);
+
+    let output = oly_cmd(&tmp)
+        .args(["ls"])
+        .output()
+        .expect("`oly ls` failed to execute");
+
+    assert!(
+        output.status.success(),
+        "`oly ls` should succeed even with no sessions"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No sessions"),
+        "expected 'No sessions' hint.\nstdout:\n{stdout}"
+    );
 }

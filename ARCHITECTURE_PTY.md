@@ -330,12 +330,23 @@ before forwarding to clients.
 Patterns stripped:
 - **Full CPR**: `\x1b[<row>;<col>R` (with or without `?`)
 - **Bare CPR**: `[<row>;<col>R` (ESC dropped by ConPTY)
+- **DSR/CPR queries**: `\x1b[6n`, `\x1b[5n` (stripped to prevent client
+  terminals from generating their own CPR responses, which would corrupt
+  the child process's stdin via the attach input path)
+- **Bare DSR queries**: `[5n`, `[6n` (ESC dropped by ConPTY)
 - **OSC 10/11 color responses**: `\x1b]10;rgb:xxxx/xxxx/xxxx\x07`
 - **Generic OSC**: `\x1b]<num>;<payload>\x07` (e.g., shell CWD updates)
 
 Cross-chunk handling: `pending` field carries incomplete sequences across
 `filter()` calls.  This handles ConPTY splitting ESC sequences at arbitrary
 byte boundaries.
+
+### Persist Filter
+
+The `SessionRuntime` also runs its own `EscapeFilter` (the "persist filter")
+on all PTY output before writing to `output.log`.  This ensures that
+`oly logs` reads clean data from disk, free of CPR/DSR artifacts that would
+otherwise appear as garbage characters in the log output.
 
 ### Query Response Generation
 
@@ -487,7 +498,8 @@ for intermediate sizes.  Mitigation: clients should debounce resize events
 
 | Issue | Impact | Mitigation |
 |---|---|---|
-| Echo of device responses | CPR/DSR/OSC responses appear in master output | `EscapeFilter` strips them |
+| Echo of device responses | CPR/DSR/OSC responses appear in master output | `EscapeFilter` strips them (both per-client and persist filter) |
+| DSR query forwarding | Queries like `\x1b[6n` forwarded to attach clients cause CPR response feedback loop | `EscapeFilter` strips DSR queries before sending to clients |
 | ESC split across reads | Sequences split at arbitrary byte boundaries | `pending` field in `EscapeFilter` carries fragments |
 | No SIGWINCH | ConPTY uses `ResizePseudoConsole()` internally | `portable_pty` abstracts this |
 | No SIGCHLD | Child exit detected via `WaitForSingleObject` | `try_wait()` polls periodically |
