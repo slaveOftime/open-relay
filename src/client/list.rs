@@ -42,7 +42,7 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
             Ok(RpcResponse::List { sessions, .. }) => sessions,
             Ok(RpcResponse::Error { message }) => return Err(AppError::DaemonUnavailable(message)),
             Ok(_) => return Err(AppError::Protocol("unexpected response type".to_string())),
-            Err(AppError::DaemonUnavailable(_)) => {
+            Err(AppError::DaemonUnavailable(_)) | Err(AppError::Protocol(_)) => {
                 println!(
                     "⚠️ Daemon unavailable; falling back to direct DB access (data may be stale)"
                 );

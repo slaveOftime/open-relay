@@ -97,9 +97,7 @@ fn format_osc_color_response(ps: u8, color: &str) -> String {
 }
 
 fn format_osc_rgb((red, green, blue): (u8, u8, u8)) -> String {
-    format!(
-        "rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}"
-    )
+    format!("rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}")
 }
 
 fn xterm_color_to_rgb(index: u8) -> (u8, u8, u8) {
@@ -139,6 +137,253 @@ fn xterm_color_to_rgb(index: u8) -> (u8, u8, u8) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EscapeFilter — stateful per-attach ESC sequence stripper
+// ---------------------------------------------------------------------------
+
+/// Strips CPR/DSR terminal device responses and OSC 10/11 color responses
+/// from PTY output before display.  Carries incomplete sequences across chunk
+/// boundaries so ConPTY split-ESC cases are handled correctly.
+///
+/// All regex state is static (shared); only the cross-chunk `pending` prefix
+/// is per-instance.
+pub struct EscapeFilter {
+    pending: String,
+}
+
+impl EscapeFilter {
+    pub fn new() -> Self {
+        Self {
+            pending: String::new(),
+        }
+    }
+
+    /// Filter a raw PTY byte slice and return the cleaned bytes.
+    pub fn filter(&mut self, data: &[u8]) -> Vec<u8> {
+        let chunk = String::from_utf8_lossy(data);
+        filter_cpr_chunk(&mut self.pending, &chunk).into_bytes()
+    }
+}
+
+impl Default for EscapeFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TerminalModeTracker — tracks bracketed paste and DECCKM from raw bytes
+// ---------------------------------------------------------------------------
+
+/// Tracks DEC private mode toggles emitted by the child PTY process.
+/// Feed each raw output chunk through `process()` to keep state current.
+#[allow(dead_code)]
+pub struct TerminalModeTracker {
+    pub bracketed_paste_mode: bool,
+    pub app_cursor_keys: bool,
+}
+
+#[allow(dead_code)]
+impl TerminalModeTracker {
+    pub fn new() -> Self {
+        Self {
+            bracketed_paste_mode: false,
+            app_cursor_keys: false,
+        }
+    }
+
+    /// Process a raw PTY output chunk and update tracked modes.
+    pub fn process(&mut self, data: &[u8]) {
+        let chunk = String::from_utf8_lossy(data);
+        if chunk.contains("\x1b[?2004h") {
+            self.bracketed_paste_mode = true;
+        } else if chunk.contains("\x1b[?2004l") {
+            self.bracketed_paste_mode = false;
+        }
+        if chunk.contains("\x1b[?1h") {
+            self.app_cursor_keys = true;
+        } else if chunk.contains("\x1b[?1l") {
+            self.app_cursor_keys = false;
+        }
+    }
+}
+
+impl Default for TerminalModeTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-side fallback query responder (no attach client)
+// ---------------------------------------------------------------------------
+
+/// Scan `data` for DSR/CPR/OSC colour queries and generate response bytes.
+///
+/// Responses are for the daemon to write back to the PTY stdin when no attach
+/// client is connected.  CPR always uses row 1 col 1 (the best the daemon can
+/// do without a real terminal).  `tail` carries partial query sequences across
+/// chunk boundaries.
+///
+/// Returns a list of response byte strings to write sequentially.
+pub fn extract_query_responses_no_client(data: &[u8], tail: &mut String) -> Vec<Vec<u8>> {
+    let text = String::from_utf8_lossy(data);
+    let mut combined = std::mem::take(tail);
+    combined.push_str(&text);
+
+    let mut responses = Vec::new();
+    let mut search_from = 0usize;
+
+    while search_from < combined.len() {
+        let Some((match_start, query_len, query)) =
+            find_next_terminal_query(&combined, search_from)
+        else {
+            break;
+        };
+        let response = terminal_query_response(query, Some((1, 1)));
+        responses.push(response.into_bytes());
+        search_from = match_start + query_len;
+    }
+
+    let remainder = &combined[search_from..];
+    let keep = terminal_query_tail_len(remainder);
+    *tail = remainder[remainder.len().saturating_sub(keep)..].to_string();
+
+    responses
+}
+
+// ---------------------------------------------------------------------------
+// filter_cpr_chunk — shared ESC-response filter (used by EscapeFilter)
+// ---------------------------------------------------------------------------
+
+/// Filters CPR (Cursor Position Report) and OSC 10/11 color responses out of
+/// a single PTY chunk.
+///
+/// ConPTY on Windows echoes device/color responses into the master output
+/// stream.  The sequence is frequently split across PTY read boundaries at
+/// *any* byte, so `pending` carries a trailing prefix from one call to the
+/// next to ensure every fragment is reassembled before being examined.
+///
+/// Splitting points handled (all stripped):
+/// * Full CPR in one chunk:   `\x1b[35;1R`
+/// * ESC alone:               `…\x1b`  |  `[35;1R…`
+/// * Bare (no ESC from ConPTY): `…[35;1R…`
+/// * OSC 10/11 full or bare variants
+pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
+    use std::sync::OnceLock;
+
+    static PARTIAL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let partial_re =
+        PARTIAL_RE.get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:\??\d*(?:;\d*)?)?)?$").unwrap());
+
+    static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
+
+    static BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let bare_re = BARE_RE.get_or_init(|| regex::Regex::new(r"\[\??\d+;\d+R").unwrap());
+
+    static OSC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let osc_full_re = OSC_FULL_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\x1b]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\x1b\\)",
+        )
+        .unwrap()
+    });
+
+    static OSC_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let osc_bare_re = OSC_BARE_RE.get_or_init(|| {
+        regex::Regex::new(r"]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\\)")
+            .unwrap()
+    });
+
+    // 1. Prepend any fragment saved from the previous chunk.
+    let mut combined = std::mem::take(pending);
+    combined.push_str(chunk);
+
+    // 2. Save any trailing incomplete CPR/OSC prefix for the next call.
+    let cpr_pending_start = partial_re.find(&combined).map(|m| m.start());
+    let osc_pending_start = trailing_partial_osc_response_start(&combined);
+    if let Some(start) = [cpr_pending_start, osc_pending_start]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        *pending = combined[start..].to_string();
+        combined.truncate(start);
+    }
+
+    // 3. Strip fully-formed ESC-prefixed CPRs.
+    let combined = full_re.replace_all(&combined, "");
+
+    // 4. Strip bare CPRs (ESC missing / dropped by ConPTY).
+    let combined = bare_re.replace_all(&combined, "");
+
+    // 5. Strip OSC 10/11 color responses, ESC-prefixed or bare.
+    let combined = osc_full_re.replace_all(&combined, "");
+    osc_bare_re.replace_all(&combined, "").into_owned()
+}
+
+pub(crate) fn trailing_partial_osc_response_start(text: &str) -> Option<usize> {
+    ["\x1b]10;rgb:", "\x1b]11;rgb:", "]10;rgb:", "]11;rgb:"]
+        .into_iter()
+        .filter_map(|prefix| text.rfind(prefix))
+        .filter(|start| is_partial_osc_color_response(&text[*start..]))
+        .min()
+}
+
+pub(crate) fn is_partial_osc_color_response(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    let mut index = 0usize;
+
+    if bytes.first() == Some(&0x1b) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b']') {
+        return false;
+    }
+    index += 1;
+
+    let rest = &candidate[index..];
+    let prefix_len = if rest.starts_with("10;rgb:") || rest.starts_with("11;rgb:") {
+        7
+    } else {
+        return false;
+    };
+    index += prefix_len;
+
+    let mut slash_count = 0usize;
+    let mut hex_in_component = 0usize;
+    let mut saw_hex = false;
+
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_hexdigit() {
+            if hex_in_component == 4 {
+                return false;
+            }
+            hex_in_component += 1;
+            saw_hex = true;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'/' => {
+                if !saw_hex || slash_count >= 2 {
+                    return false;
+                }
+                slash_count += 1;
+                hex_in_component = 0;
+                saw_hex = false;
+                index += 1;
+            }
+            0x07 => return slash_count == 2 && saw_hex,
+            0x1b => return index + 1 == bytes.len(),
+            b'\\' => return false,
+            _ => return false,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +400,10 @@ mod tests {
 
     #[test]
     fn test_terminal_query_tail_len_keeps_partial_osc_sequence() {
-        assert_eq!(terminal_query_tail_len("text\x1b]10;?\x1b"), "\x1b]10;?\x1b".len());
+        assert_eq!(
+            terminal_query_tail_len("text\x1b]10;?\x1b"),
+            "\x1b]10;?\x1b".len()
+        );
     }
 
     #[test]

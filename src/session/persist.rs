@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 
 use crate::error::Result;
 
+#[allow(dead_code)]
 pub fn append_output(dir: &Path, chunk: &str) -> Result<()> {
     let path = dir.join("output.log");
     let mut file = fs::OpenOptions::new()
@@ -11,6 +12,19 @@ pub fn append_output(dir: &Path, chunk: &str) -> Result<()> {
         .create(true)
         .open(path)?;
     file.write_all(chunk.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Write raw PTY bytes directly to `output.log` without any UTF-8 conversion.
+/// This is the preferred path for the new byte-oriented ring/log design.
+pub fn append_output_raw(dir: &Path, data: &[u8]) -> Result<()> {
+    let path = dir.join("output.log");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    file.write_all(data)?;
     file.flush()?;
     Ok(())
 }

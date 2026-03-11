@@ -448,6 +448,9 @@ export default function SessionDetailPage() {
     }
 
     connectAttemptStartedAtRef.current = Date.now()
+    // Force a synchronous fit so we send the real terminal dimensions (not the
+    // default 80×24 before FitAddon's deferred RAF has fired).
+    const initialSize = termRef.current?.fit() ?? undefined
     const sock = new AttachSocket(
       id,
       {
@@ -457,6 +460,7 @@ export default function SessionDetailPage() {
           pendingReconnectRef.current = false
           connectAttemptStartedAtRef.current = 0
           lastSentResizeRef.current = null
+          pendingResizeRef.current = null
           lastWsFrameAtRef.current = Date.now()
           setWsError(null)
           setWsConnecting(false)
@@ -466,24 +470,19 @@ export default function SessionDetailPage() {
             reconnectTimerRef.current = null
           }
           if (isMounted.current) setWsConnected(true)
-
-          setTimeout(() => {
-            console.info(
-              'Forcing terminal resize after 1s to work around potential initial size issues'
-            )
-            const size = termRef.current?.getSize()
-            if (size) {
-              handleTermResize(size.cols, size.rows)
-            }
-          }, 1000)
         },
-        onSnapshot: (lines) => {
+        onSnapshot: (lines, _cursor, running) => {
           if (!gotSnapshot) {
             pushConnectTrace(`snapshot received (${lines.length} chunks)`)
             gotSnapshot = true
           }
           lastWsFrameAtRef.current = Date.now()
           enqueueTerminalOutput(lines, { reset: true })
+          if (!running) {
+            // Session was already stopped; the server sends End immediately after,
+            // but mark ended now so onClose doesn't schedule a spurious reconnect.
+            ended = true
+          }
         },
         onOutput: (lines) => {
           lastWsFrameAtRef.current = Date.now()
@@ -494,6 +493,8 @@ export default function SessionDetailPage() {
           lastWsFrameAtRef.current = Date.now()
           pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
           if (!isMounted.current) return
+          const exitMsg = code != null ? ` (exit code: ${code})` : ''
+          termRef.current?.writeln(`\r\n\x1b[2m[Session ended${exitMsg}]\x1b[0m`)
           setExitCode(code)
           setWsConnected(false)
           setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
@@ -522,7 +523,8 @@ export default function SessionDetailPage() {
           }
         },
       },
-      node ?? undefined
+      node ?? undefined,
+      initialSize ?? undefined
     )
     pushConnectTrace('websocket created')
     socketRef.current = sock
@@ -780,7 +782,9 @@ export default function SessionDetailPage() {
       const last = lastSentResizeRef.current
       if (last && last.cols === next.cols && last.rows === next.rows) return
       socketRef.current?.sendResize(next.rows, next.cols)
-      lastSentResizeRef.current = next
+      if (wsConnectedRef.current) {
+        lastSentResizeRef.current = next
+      }
     }, 120)
   }
 

@@ -45,7 +45,8 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub http_port: u16,
-    pub ring_buffer_lines: usize,
+    pub log_level: String,
+    pub ring_buffer_bytes: usize,
     pub stop_grace_seconds: u64,
     pub prompt_patterns: Vec<String>,
     pub web_push_subject: Option<String>,
@@ -68,6 +69,7 @@ pub struct AppConfig {
 #[derive(Debug, Default, Deserialize)]
 struct AppConfigOverrides {
     http_port: Option<u16>,
+    log_level: Option<String>,
     prompt_patterns: Option<Vec<String>>,
     web_push_subject: Option<String>,
     web_push_vapid_public_key: Option<String>,
@@ -87,6 +89,10 @@ impl AppConfig {
         let overrides = load_overrides(&state_dir);
         let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
         let http_port = overrides.http_port.unwrap_or(15443);
+        let log_level = overrides
+            .log_level
+            .and_then(normalize_optional_string)
+            .unwrap_or_else(|| "info".to_string());
         let prompt_patterns = overrides.prompt_patterns.unwrap_or_else(|| {
             DEFAULT_PROMPT_PATTERNS
                 .iter()
@@ -113,7 +119,8 @@ impl AppConfig {
             .and_then(normalize_optional_string);
 
         Ok(Self {
-            ring_buffer_lines: 10_000,
+            log_level,
+            ring_buffer_bytes: 4_194_304,
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds,

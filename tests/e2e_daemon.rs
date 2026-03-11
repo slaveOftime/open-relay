@@ -787,7 +787,54 @@ fn e2e_logs_available_after_session_exits() {
 }
 
 // ============================================================================
-// Test 8: spawn failure is surfaced as a clear non-zero CLI error
+// Test 8: local streaming attach reports child termination to the terminal
+//
+// Verifies: `oly start <cmd>` attaches immediately, renders child output, and
+// prints `Session <id> has ended.` when the child exits shortly afterwards.
+// ============================================================================
+
+#[test]
+fn e2e_local_attach_reports_session_end_on_child_exit() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_attach_stream_done");
+    let _daemon = start_daemon(&tmp);
+
+    const MARKER: &str = "oly_e2e_attach_stream_done_marker";
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &[
+        "cmd.exe",
+        "/c",
+        &format!("ping 127.0.0.1 -n 2 >nul & echo {MARKER}"),
+    ];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", &format!("sleep 1; echo {MARKER}")];
+
+    let output = oly_cmd(&tmp)
+        .args(["start", cmd[0], cmd[1], cmd[2]])
+        .output()
+        .expect("`oly start` failed to execute");
+
+    assert!(
+        output.status.success(),
+        "`oly start` exited non-zero.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(MARKER),
+        "attached output did not contain child marker '{MARKER}'.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Session ") && stdout.contains(" has ended."),
+        "attached output did not report child termination.\nstdout:\n{stdout}"
+    );
+}
+
+// ============================================================================
+// Test 9: spawn failure is surfaced as a clear non-zero CLI error
 //
 // Verifies: when the daemon cannot spawn the requested command, `oly start`
 // exits non-zero and returns an actionable error message.
@@ -859,7 +906,7 @@ fn e2e_start_respects_explicit_cwd() {
 }
 
 // ============================================================================
-// Test 9: interactive ops fail gracefully after session is evicted from memory
+// Test 10: interactive ops fail gracefully after session is evicted from memory
 //
 // Verifies: with short eviction TTL, completed sessions are evicted and
 // `oly input` returns a clear non-zero error rather than hanging/crashing.
@@ -931,7 +978,7 @@ fn e2e_evicted_session_input_fails_gracefully() {
 }
 
 // ============================================================================
-// Test 10: federation API key + join handshake behavior on primary
+// Test 11: federation API key + join handshake behavior on primary
 //
 // Verifies:
 //   1) `oly api-key add` prints a 64-hex key.

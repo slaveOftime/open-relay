@@ -1,12 +1,13 @@
 use std::{
     collections::HashMap,
-    io::Write,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use chrono::Utc;
-use tracing::warn;
+use tokio::sync::broadcast;
+use tracing::{debug, trace, warn};
 
 use crate::{
     config::AppConfig,
@@ -218,53 +219,129 @@ impl SessionStore {
         rt.meta.exit_code
     }
 
-    pub async fn attach_snapshot(
+    /// Returns the current ring write-position for the session without
+    /// requiring a mutable borrow.  Used by the WS handler to capture a
+    /// snapshot point just before a PTY resize so that only the post-resize
+    /// (post-SIGWINCH) bytes are included in the initial attach snapshot.
+    pub fn get_ring_end_offset(&self, id: &str) -> u64 {
+        self.sessions
+            .get(id)
+            .and_then(|rt| rt.lock().ok())
+            .map(|rt| rt.ring.end_offset())
+            .unwrap_or(0)
+    }
+
+    /// Returns raw PTY bytes (CPR/OSC filtered) since `from_offset` as a
+    /// **single** un-split `String` element so that `\r` in `\r\n` sequences
+    /// is preserved.  `logs_snapshot` splits on `\n` via `.lines()` which
+    /// strips every `\r`, breaking TUI cursor-movement.  This method avoids
+    /// that by never splitting on newlines.
+    pub async fn raw_bytes_since_snapshot(
         &mut self,
         id: &str,
-    ) -> std::result::Result<(Vec<String>, usize, bool, bool, bool), SessionLookupError> {
+        from_offset: u64,
+    ) -> Option<(Vec<String>, u64, bool)> {
+        self.prune_evicted_sessions().await;
+        let runtime = self.sessions.get(id)?;
+        let mut rt = runtime.lock().ok()?;
+        rt.refresh_status();
+        let (chunks, end_offset) = rt.ring.read_from(from_offset);
+        let mut filter = crate::utils::EscapeFilter::new();
+        let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let running = rt.meta.status.as_str() == "running";
+        // Single element: xterm receives the full string verbatim (reset: true
+        // clears the screen first) and processes all escape sequences.
+        let lines = if text.is_empty() { vec![] } else { vec![text] };
+        Some((lines, end_offset, running))
+    }
+
+    pub fn is_running(&self, id: &str) -> bool {
+        let Some(runtime) = self.sessions.get(id) else {
+            return false;
+        };
+        let Ok(rt) = runtime.lock() else {
+            return false;
+        };
+        matches!(rt.meta.status, super::SessionStatus::Running)
+    }
+
+    pub async fn attach_stream_status(
+        &mut self,
+        id: &str,
+    ) -> std::result::Result<(bool, bool, Option<i32>), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
         rt.refresh_status();
-        rt.mark_attach_activity();
-        let (lines, cursor) = rt.snapshot_output();
-        let running = rt.meta.status.as_str() == "running";
+        Ok((
+            matches!(rt.meta.status, super::SessionStatus::Running),
+            rt.output_closed,
+            rt.meta.exit_code,
+        ))
+    }
+
+    pub async fn mark_attach_presence(&mut self, id: &str) {
+        if let Some(runtime) = self.sessions.get(id) {
+            if let Ok(mut rt) = runtime.lock() {
+                rt.mark_attach_presence();
+            }
+        }
+    }
+
+    /// Initialise an attach subscription: return the ring content since
+    /// `from_byte_offset` (or all content if `None`), the current end offset,
+    /// a live broadcast receiver, and the current terminal mode flags.
+    pub async fn attach_subscribe_init(
+        &mut self,
+        id: &str,
+        from_byte_offset: Option<u64>,
+    ) -> std::result::Result<
+        (
+            Vec<(u64, Bytes)>,
+            u64,
+            broadcast::Receiver<Arc<Bytes>>,
+            bool,
+            bool,
+        ),
+        SessionLookupError,
+    > {
+        let runtime = self.lookup_runtime(id).await?;
+        let Ok(mut rt) = runtime.lock() else {
+            return Err(SessionLookupError::Evicted);
+        };
+        rt.refresh_status();
+        let offset = from_byte_offset.unwrap_or(0);
+        let (chunks, end_offset) = rt.ring.read_from(offset);
+        let rx = rt.broadcast_tx.subscribe();
         let bracketed_paste_mode = rt.bracketed_paste_mode;
         let app_cursor_keys = rt.app_cursor_keys;
+        debug!(
+            session_id = id,
+            chunks = chunks.len(),
+            end_offset,
+            bracketed_paste_mode,
+            app_cursor_keys,
+            "attach subscribe init"
+        );
         Ok((
-            lines,
-            cursor,
-            running,
+            chunks,
+            end_offset,
+            rx,
             bracketed_paste_mode,
             app_cursor_keys,
         ))
     }
 
-    pub async fn attach_poll(
-        &mut self,
-        id: &str,
-        cursor: usize,
-    ) -> std::result::Result<(Vec<String>, usize, bool, bool, bool), SessionLookupError> {
+    pub async fn attach_detach(&mut self, id: &str) -> std::result::Result<(), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
-        rt.refresh_status();
-        // Unlike attach_snapshot, attach_poll does not reset the attach activity timer, 
-        // so that silent-notification candidates are not suppressed just because a client is polling for new output.
-        // rt.mark_attach_activity();
-        let (lines, next_cursor) = rt.replay_output_from(cursor);
-        let running = rt.meta.status.as_str() == "running";
-        let bracketed_paste_mode = rt.bracketed_paste_mode;
-        let app_cursor_keys = rt.app_cursor_keys;
-        Ok((
-            lines,
-            next_cursor,
-            running,
-            bracketed_paste_mode,
-            app_cursor_keys,
-        ))
+        rt.clear_attach_state();
+        debug!(session_id = id, "attach detach acknowledged");
+        Ok(())
     }
 
     pub async fn attach_input(
@@ -287,12 +364,12 @@ impl SessionStore {
         // `oly attach` and `oly input` always work, regardless of whether the
         // caller tracks DECCKM state itself.
         let cooked;
-        let bytes = if rt.app_cursor_keys
+        let transformed = rt.app_cursor_keys
             && (data.contains("\x1b[A")
                 || data.contains("\x1b[B")
                 || data.contains("\x1b[C")
-                || data.contains("\x1b[D"))
-        {
+                || data.contains("\x1b[D"));
+        let bytes = if transformed {
             cooked = data
                 .replace("\x1b[A", "\x1bOA")
                 .replace("\x1b[B", "\x1bOB")
@@ -302,11 +379,23 @@ impl SessionStore {
         } else {
             data.as_bytes()
         };
-        if rt.writer.write_all(bytes).is_ok() && rt.writer.flush().is_ok() {
+        if rt.writer_tx.send(bytes.to_vec()).is_ok() {
             rt.mark_attach_activity();
             rt.last_input_at = Some(Instant::now());
+            debug!(
+                session_id = id,
+                bytes = bytes.len(),
+                transformed,
+                app_cursor_keys = rt.app_cursor_keys,
+                "attach input forwarded"
+            );
             Ok(())
         } else {
+            debug!(
+                session_id = id,
+                bytes = bytes.len(),
+                "attach input failed while writing to PTY"
+            );
             Err(SessionLookupError::Evicted)
         }
     }
@@ -322,7 +411,12 @@ impl SessionStore {
             return Err(SessionLookupError::Evicted);
         };
         rt.mark_attach_activity();
-        if rt.resize_pty(rows, cols) {
+        let resized = rt.resize_pty(rows, cols);
+        debug!(
+            session_id = id,
+            rows, cols, resized, "attach resize requested"
+        );
+        if resized {
             let offset = current_output_offset(&rt.dir);
             let _ = append_resize_event(&rt.dir, offset, rows, cols);
             Ok(())
@@ -344,8 +438,7 @@ impl SessionStore {
                 return false;
             };
             rt.meta.status = SessionStatus::Stopping;
-            let _ = rt.writer.write_all(&[0x03]);
-            let _ = rt.writer.flush();
+            let _ = rt.writer_tx.send(vec![0x03]);
         }
 
         let deadline = Instant::now() + Duration::from_secs(grace_seconds);
@@ -388,29 +481,40 @@ impl SessionStore {
         &mut self,
         id: &str,
         tail: usize,
-    ) -> Option<(Vec<String>, usize, bool)> {
+    ) -> Option<(Vec<String>, u64, bool)> {
         self.prune_evicted_sessions().await;
 
         let runtime = self.sessions.get(id)?;
         let mut rt = runtime.lock().ok()?;
         rt.refresh_status();
-        let len = rt.output_line_count;
-        let ring_len = rt.ring.len();
-        let skip = ring_len.saturating_sub(tail);
-        let lines: Vec<String> = rt.ring.iter().skip(skip).cloned().collect();
+        let mut filter = crate::utils::EscapeFilter::new();
+        let all_bytes: Vec<u8> = rt
+            .ring
+            .all_chunks()
+            .flat_map(|b| filter.filter(b))
+            .collect();
+        let text = String::from_utf8_lossy(&all_bytes);
+        let all_lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
+        let skip = all_lines.len().saturating_sub(tail);
+        let lines: Vec<String> = all_lines.into_iter().skip(skip).collect();
+        let cursor = rt.ring.end_offset();
         let running = rt.meta.status.as_str() == "running";
-        Some((lines, len, running))
+        Some((lines, cursor, running))
     }
 
-    pub async fn logs_poll(
-        &mut self,
-        id: &str,
-        cursor: usize,
-    ) -> Option<(Vec<String>, usize, bool)> {
-        self.attach_poll(id, cursor)
-            .await
-            .ok()
-            .map(|(lines, cur, running, _, _)| (lines, cur, running))
+    pub async fn logs_poll(&mut self, id: &str, cursor: u64) -> Option<(Vec<String>, u64, bool)> {
+        self.prune_evicted_sessions().await;
+
+        let runtime = self.sessions.get(id)?;
+        let mut rt = runtime.lock().ok()?;
+        rt.refresh_status();
+        let (chunks, end_offset) = rt.ring.read_from(cursor);
+        let mut filter = crate::utils::EscapeFilter::new();
+        let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
+        let text = String::from_utf8_lossy(&raw);
+        let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
+        let running = rt.meta.status.as_str() == "running";
+        Some((lines, end_offset, running))
     }
 
     async fn lookup_runtime(
@@ -420,13 +524,22 @@ impl SessionStore {
         self.prune_evicted_sessions().await;
 
         if let Some(runtime) = self.sessions.get(id) {
+            trace!(
+                session_id = id,
+                "session runtime lookup hit in-memory runtime"
+            );
             return Ok(runtime.clone());
         }
 
         if self.evicted_sessions.contains_key(id) {
+            debug!(
+                session_id = id,
+                "session runtime lookup hit evicted tombstone"
+            );
             return Err(SessionLookupError::Evicted);
         }
 
+        debug!(session_id = id, "session runtime lookup missed");
         Err(SessionLookupError::NotRunning)
     }
 
@@ -464,12 +577,14 @@ impl SessionStore {
 
         // Persist completed sessions outside the borrow of `self.sessions`.
         for meta in to_persist {
+            debug!(session_id = %meta.id, status = meta.status.as_str(), "persisting completed session metadata");
             if let Err(err) = self.db.update_session(&meta).await {
                 tracing::error!(%err, session_id = meta.id, "failed to persist completed session");
             }
         }
 
         for id in evicted_ids {
+            debug!(session_id = %id, "session evicted from in-memory store");
             self.evicted_sessions.insert(id, now);
         }
 
@@ -523,11 +638,11 @@ impl SessionStore {
                     return None;
                 }
 
-                let n = rt.ring.len();
-                let limit = 20;
+                let limit = 20u16;
                 let mut parser = vt100::Parser::new(limit, 2000, 0);
-                for ring in rt.ring.iter().skip(n.saturating_sub(limit as usize)) {
-                    parser.process(ring.as_bytes());
+                let chunks: Vec<_> = rt.ring.all_chunks().collect();
+                for chunk in chunks.iter().rev().take(limit as usize).rev() {
+                    parser.process(chunk);
                 }
                 let excerpt = parser.screen().contents();
 
@@ -566,9 +681,10 @@ mod tests {
         excerpt: &str,
         last_output_ago: Option<Duration>,
     ) -> Arc<Mutex<super::super::runtime::SessionRuntime>> {
-        use std::collections::VecDeque;
+        use crate::session::ring::RingBuffer;
+        use bytes::Bytes;
+        use tokio::sync::{broadcast, mpsc};
 
-        // Use a dummy path for dir (tests don't write to disk through this path)
         let dir = std::env::temp_dir().join(format!("oly_store_test_{id}"));
 
         let meta = SessionMeta {
@@ -587,34 +703,33 @@ mod tests {
 
         let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
 
-        let mut ring = VecDeque::new();
+        let mut ring = RingBuffer::new(4096);
         if !excerpt.is_empty() {
-            ring.push_back(excerpt.to_string());
+            ring.push(Bytes::from(excerpt.to_string()));
         }
-        let output_line_count = ring.len();
 
+        let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (writer_tx, _writer_rx) = mpsc::unbounded_channel();
         let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            output_line_count,
             ring,
-            ring_limit: 100,
-            // We only need a writer stub; use a Vec sink.
-            writer: Box::new(std::io::sink()),
+            broadcast_tx,
+            writer_tx,
             child,
             completed_at: None,
             _pty_master: Some(pty_master),
             persisted: false,
             last_output_at,
             last_input_at: None,
+            last_attach_presence_at: None,
             last_attach_activity_at: None,
             last_notified_at: None,
             notified_output_epoch: None,
-            pending_cpr_prefix: String::new(),
             bracketed_paste_mode: false,
-            pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            output_closed: false,
             notifications_enabled: true,
         }))
     }
@@ -902,27 +1017,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Capturing writer helper for attach_input tests
+    // attach_input — data forwarding and last_input_at tracking
     // -----------------------------------------------------------------------
-
-    struct CaptureWriter(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
 
     fn make_runtime_writable(
         id: &str,
         status: SessionStatus,
-        buf: std::sync::Arc<Mutex<Vec<u8>>>,
-    ) -> Arc<Mutex<super::super::runtime::SessionRuntime>> {
-        use std::collections::VecDeque;
+    ) -> (
+        Arc<Mutex<super::super::runtime::SessionRuntime>>,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        use crate::session::ring::RingBuffer;
+        use tokio::sync::{broadcast, mpsc};
 
         let dir = std::env::temp_dir().join(format!("oly_store_writable_{id}"));
         let meta = SessionMeta {
@@ -938,88 +1044,42 @@ mod tests {
             pid: None,
             exit_code: None,
         };
+        let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
         let (child, pty_master) = make_dummy_child();
-        Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
+        let rt = Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            output_line_count: 0,
-            ring: VecDeque::new(),
-            ring_limit: 100,
-            writer: Box::new(CaptureWriter(buf)),
+            ring: RingBuffer::new(4096),
+            broadcast_tx,
+            writer_tx,
             child,
             completed_at: None,
             _pty_master: Some(pty_master),
             persisted: false,
             last_output_at: None,
             last_input_at: None,
+            last_attach_presence_at: None,
             last_attach_activity_at: None,
             last_notified_at: None,
             notified_output_epoch: None,
-            pending_cpr_prefix: String::new(),
             bracketed_paste_mode: false,
-            pending_terminal_query_tail: String::new(),
             app_cursor_keys: false,
+            output_closed: false,
             notifications_enabled: true,
-        }))
-    }
-
-    fn make_runtime_with_lines(
-        id: &str,
-        lines: Vec<String>,
-    ) -> Arc<Mutex<super::super::runtime::SessionRuntime>> {
-        use std::collections::VecDeque;
-
-        let dir = std::env::temp_dir().join(format!("oly_store_lines_{id}"));
-        let meta = SessionMeta {
-            id: id.to_string(),
-            title: None,
-            command: "sh".to_string(),
-            args: vec![],
-            cwd: None,
-            created_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            ended_at: None,
-            status: SessionStatus::Running,
-            pid: None,
-            exit_code: None,
-        };
-        let mut ring = VecDeque::new();
-        for line in &lines {
-            ring.push_back(line.clone());
-        }
-        let (child, pty_master) = make_dummy_child();
-        Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
-            meta,
-            dir,
-            output_line_count: lines.len(),
-            ring,
-            ring_limit: 100,
-            writer: Box::new(std::io::sink()),
-            child,
-            completed_at: None,
-            _pty_master: Some(pty_master),
-            persisted: false,
-            last_output_at: None,
-            last_input_at: None,
-            last_attach_activity_at: None,
-            last_notified_at: None,
-            notified_output_epoch: None,
-            pending_cpr_prefix: String::new(),
-            bracketed_paste_mode: false,
-            pending_terminal_query_tail: String::new(),
-            app_cursor_keys: false,
-            notifications_enabled: true,
-        }))
+        }));
+        (rt, writer_rx)
     }
 
     fn make_test_config(max_running_sessions: usize) -> AppConfig {
         use std::path::PathBuf;
         AppConfig {
-            ring_buffer_lines: 10_000,
+            ring_buffer_bytes: 4_194_304,
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds: 15,
             http_port: 0,
+            log_level: "info".into(),
             prompt_patterns: vec![],
             web_push_vapid_public_key: None,
             web_push_vapid_private_key: None,
@@ -1071,8 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_input_writes_data_to_writer() {
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let rt = make_runtime_writable("inp0001", SessionStatus::Running, buf.clone());
+        let (rt, mut writer_rx) = make_runtime_writable("inp0001", SessionStatus::Running);
         let mut store = store_with(vec![rt], make_test_db().await);
 
         store
@@ -1080,17 +1139,16 @@ mod tests {
             .await
             .expect("attach_input should succeed");
 
-        let written = buf.lock().unwrap().clone();
+        let written = writer_rx.recv().await.expect("should receive bytes");
         assert_eq!(
             written, b"hello\r",
-            "expected exact bytes written to PTY writer"
+            "expected exact bytes sent via writer_tx"
         );
     }
 
     #[tokio::test]
     async fn test_attach_input_sets_last_input_at() {
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let rt = make_runtime_writable("inp0002", SessionStatus::Running, buf.clone());
+        let (rt, _writer_rx) = make_runtime_writable("inp0002", SessionStatus::Running);
         let rt_clone = rt.clone();
         let mut store = store_with(vec![rt], make_test_db().await);
 
@@ -1109,8 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn test_attach_input_decckm_transforms_arrow_up() {
         // When app_cursor_keys = true, \x1b[A → \x1bOA (DECCKM mode).
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let rt = make_runtime_writable("inp0003", SessionStatus::Running, buf.clone());
+        let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
             locked.app_cursor_keys = true;
@@ -1122,7 +1179,7 @@ mod tests {
             .await
             .expect("attach_input should succeed");
 
-        let written = buf.lock().unwrap().clone();
+        let written = writer_rx.recv().await.expect("should receive bytes");
         assert_eq!(
             written, b"\x1bOA",
             "arrow up should be translated to app-cursor-key form"
@@ -1131,8 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_input_decckm_transforms_all_arrows() {
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let rt = make_runtime_writable("inp0004", SessionStatus::Running, buf.clone());
+        let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
             locked.app_cursor_keys = true;
@@ -1145,7 +1201,7 @@ mod tests {
             .await
             .expect("attach_input should succeed");
 
-        let written = buf.lock().unwrap().clone();
+        let written = writer_rx.recv().await.expect("should receive bytes");
         assert_eq!(
             written, b"\x1bOA\x1bOB\x1bOC\x1bOD",
             "all arrow sequences should be translated in DECCKM mode"
@@ -1154,8 +1210,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_input_no_transform_when_decckm_off() {
-        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let rt = make_runtime_writable("inp0005", SessionStatus::Running, buf.clone());
+        let (rt, mut writer_rx) = make_runtime_writable("inp0005", SessionStatus::Running);
         // app_cursor_keys is false by default.
         let mut store = store_with(vec![rt], make_test_db().await);
 
@@ -1164,7 +1219,7 @@ mod tests {
             .await
             .expect("attach_input should succeed");
 
-        let written = buf.lock().unwrap().clone();
+        let written = writer_rx.recv().await.expect("should receive bytes");
         assert_eq!(
             written, b"\x1b[A\x1b[B",
             "arrow sequences should pass through unchanged when DECCKM is off"
@@ -1182,158 +1237,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // attach_snapshot — returns ring + cursor and marks view activity
+    // attach_detach
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_attach_snapshot_marks_attach_activity() {
-        let rt = make_runtime("snap001", SessionStatus::Running, "$ prompt", None);
+    async fn test_attach_detach_clears_presence_and_activity() {
+        let rt = make_runtime("detach001", SessionStatus::Running, "$ prompt", None);
         let rt_clone = rt.clone();
         let mut store = store_with(vec![rt], make_test_db().await);
 
+        {
+            let mut locked = rt_clone.lock().unwrap();
+            locked.mark_attach_activity();
+        }
+
         store
-            .attach_snapshot("snap001")
+            .attach_detach("detach001")
             .await
-            .expect("snapshot should succeed");
+            .expect("detach should succeed");
 
         let locked = rt_clone.lock().unwrap();
         assert!(
-            locked.last_attach_activity_at.is_some(),
-            "attach_snapshot should mark attach activity"
+            locked.last_attach_presence_at.is_none(),
+            "detach should clear attach presence"
         );
-    }
-
-    #[tokio::test]
-    async fn test_attach_snapshot_returns_ring_contents() {
-        let rt = make_runtime("snap002", SessionStatus::Running, "output line", None);
-        let mut store = store_with(vec![rt], make_test_db().await);
-
-        let (lines, cursor, running, _, _) = store
-            .attach_snapshot("snap002")
-            .await
-            .expect("snapshot should succeed");
-
-        assert_eq!(lines, vec!["output line".to_string()]);
-        assert_eq!(cursor, 1, "cursor should equal output_line_count");
-        assert!(running, "session should be reported as running");
-    }
-
-    #[tokio::test]
-    async fn test_attach_snapshot_not_found_for_unknown_session() {
-        let mut store = SessionStore::new(900, make_test_db().await);
-        let result = store.attach_snapshot("no_such_id").await;
-        assert!(result.is_err(), "snapshot of unknown session should fail");
-    }
-
-    // -----------------------------------------------------------------------
-    // attach_poll — returns lines from cursor and marks view activity
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_attach_poll_should_not_marks_attach_activity() {
-        let rt = make_runtime_with_lines(
-            "poll001",
-            vec!["line1\n".to_string(), "line2\n".to_string()],
-        );
-        let rt_clone = rt.clone();
-        let mut store = store_with(vec![rt], make_test_db().await);
-
-        store
-            .attach_poll("poll001", 0)
-            .await
-            .expect("poll should succeed");
-
-        let locked = rt_clone.lock().unwrap();
         assert!(
             locked.last_attach_activity_at.is_none(),
-            "attach_poll should mark attach activity"
+            "detach should clear attach activity"
         );
-    }
-
-    #[tokio::test]
-    async fn test_attach_poll_returns_lines_from_cursor() {
-        let rt = make_runtime_with_lines(
-            "poll002",
-            vec![
-                "line0\n".to_string(),
-                "line1\n".to_string(),
-                "line2\n".to_string(),
-                "line3\n".to_string(),
-            ],
-        );
-        let mut store = store_with(vec![rt], make_test_db().await);
-
-        let (lines, next_cursor, running, _, _) = store
-            .attach_poll("poll002", 2)
-            .await
-            .expect("poll should succeed");
-
-        assert_eq!(
-            lines,
-            vec!["line2\n".to_string(), "line3\n".to_string()],
-            "poll from cursor=2 should return lines[2..]"
-        );
-        assert_eq!(next_cursor, 4, "next_cursor should be output_line_count");
-        assert!(running);
-    }
-
-    #[tokio::test]
-    async fn test_attach_poll_at_end_returns_empty() {
-        let rt = make_runtime_with_lines(
-            "poll003",
-            vec!["line0\n".to_string(), "line1\n".to_string()],
-        );
-        let mut store = store_with(vec![rt], make_test_db().await);
-
-        let (lines, next_cursor, _, _, _) = store
-            .attach_poll("poll003", 2)
-            .await
-            .expect("poll should succeed");
-
-        assert!(lines.is_empty(), "no new lines when cursor is at end");
-        assert_eq!(next_cursor, 2);
-    }
-
-    #[tokio::test]
-    async fn test_attach_poll_resyncs_to_retained_ring_tail_when_cursor_is_stale() {
-        let rt = make_runtime_with_lines(
-            "poll004",
-            vec![
-                "line6\n".to_string(),
-                "line7\n".to_string(),
-                "line8\n".to_string(),
-                "line9\n".to_string(),
-            ],
-        );
-        {
-            let mut locked = rt.lock().unwrap();
-            locked.output_line_count = 10;
-        }
-        let mut store = store_with(vec![rt], make_test_db().await);
-
-        let (lines, next_cursor, running, _, _) = store
-            .attach_poll("poll004", 3)
-            .await
-            .expect("poll should succeed");
-
-        assert_eq!(
-            lines,
-            vec![
-                "line6\n".to_string(),
-                "line7\n".to_string(),
-                "line8\n".to_string(),
-                "line9\n".to_string(),
-            ],
-            "stale cursor should resync to the retained ring tail"
-        );
-        assert_eq!(next_cursor, 10);
-        assert!(running);
-    }
-
-    #[tokio::test]
-    async fn test_attach_poll_not_found_for_unknown_session() {
-        let mut store = SessionStore::new(900, make_test_db().await);
-        let result = store.attach_poll("no_such_id", 0).await;
-        assert!(result.is_err(), "poll of unknown session should fail");
     }
 }

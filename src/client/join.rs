@@ -299,8 +299,7 @@ async fn connect_and_relay(
                                     RpcRequest::Health { .. }
                                     | RpcRequest::List { .. }
                                     | RpcRequest::Start { .. }
-                                    | RpcRequest::AttachSnapshot { .. }
-                                    | RpcRequest::AttachPoll { .. }
+                                    | RpcRequest::AttachSubscribe { .. }
                                     | RpcRequest::AttachInput { .. }
                                     | RpcRequest::AttachResize { .. }
                                     | RpcRequest::Stop { .. }

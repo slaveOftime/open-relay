@@ -351,11 +351,20 @@ export class AttachSocket {
   private ws: WebSocket
   private closed = false
 
-  constructor(sessionId: string, opts: AttachOptions, node?: string) {
+  constructor(
+    sessionId: string,
+    opts: AttachOptions,
+    node?: string,
+    initialSize?: { rows: number; cols: number }
+  ) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = location.host
     const params = new URLSearchParams()
     if (node) params.set('node', node)
+    if (initialSize && initialSize.rows > 0 && initialSize.cols > 0) {
+      params.set('rows', String(initialSize.rows))
+      params.set('cols', String(initialSize.cols))
+    }
     const tok = getToken()
     if (tok) params.set('token', tok)
     const qs = params.toString()

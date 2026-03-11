@@ -1,4 +1,5 @@
 pub(crate) mod persist;
+pub(crate) mod ring;
 mod runtime;
 mod store;
 

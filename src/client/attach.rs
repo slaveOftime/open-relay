@@ -8,6 +8,7 @@ use crossterm::{
     },
     execute, terminal,
 };
+use tokio::io::BufReader;
 
 use crate::{
     config::AppConfig,
@@ -32,32 +33,209 @@ pub async fn run_attach_node(config: &AppConfig, id: &str, node: Option<String>)
 }
 
 async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    let snapshot = ipc::send_request(
-        config,
-        attach_proxy(node, RpcRequest::AttachSnapshot { id: id.to_string() }),
+    // For node-proxied attaches we fall back to the old polling model since
+    // the streaming protocol goes over the direct local socket only.
+    if node.is_some() {
+        return run_attach_polled(config, id, node).await;
+    }
+
+    let stream = ipc::connect(config).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+
+    // Send AttachSubscribe.
+    ipc::write_request_to_writer(
+        &mut write_half,
+        RpcRequest::AttachSubscribe {
+            id: id.to_string(),
+            from_byte_offset: None,
+        },
     )
     .await?;
 
-    let (
-        initial_lines,
-        mut cursor,
-        mut running,
-        mut _child_bracketed_paste,
-        mut child_app_cursor_keys,
-    ) = match snapshot {
-        RpcResponse::AttachSnapshot {
+    // Receive the init frame.
+    let init = ipc::read_response_from_reader(&mut reader).await?;
+    let (initial_lines, mut running, mut child_app_cursor_keys) = match init {
+        RpcResponse::AttachStreamInit {
             lines,
-            cursor,
             running,
-            bracketed_paste_mode,
             app_cursor_keys,
-        } => (
-            lines,
-            cursor,
-            running,
-            bracketed_paste_mode,
-            app_cursor_keys,
+            ..
+        } => (lines, running, app_cursor_keys),
+        RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
+        _ => return Err(AppError::Protocol("unexpected response type".to_string())),
+    };
+
+    let mut detached = false;
+    let mut stream_error: Option<AppError> = None;
+    {
+        let _raw_mode = RawModeGuard::new()?;
+
+        // Initial resize + render.
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        ipc::write_request_to_writer(
+            &mut write_half,
+            RpcRequest::AttachResize {
+                id: id.to_string(),
+                rows,
+                cols,
+            },
+        )
+        .await?;
+
+        let mut query_tail = String::new();
+        let mut response_tail = String::new();
+        render_lines(
+            config,
+            id,
+            initial_lines,
+            &mut query_tail,
+            &mut response_tail,
+            None,
+        )
+        .await?;
+
+        while running {
+            // Drain all pending keyboard/resize events first.
+            loop {
+                match event::poll(std::time::Duration::from_millis(0)) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(err) => {
+                        stream_error = Some(err.into());
+                        running = false;
+                        break;
+                    }
+                }
+                match event::read()? {
+                    Event::Paste(data) => {
+                        ipc::write_request_to_writer(
+                            &mut write_half,
+                            RpcRequest::AttachInput {
+                                id: id.to_string(),
+                                data,
+                            },
+                        )
+                        .await?
+                    }
+                    Event::Resize(cols, rows) => {
+                        ipc::write_request_to_writer(
+                            &mut write_half,
+                            RpcRequest::AttachResize {
+                                id: id.to_string(),
+                                rows,
+                                cols,
+                            },
+                        )
+                        .await?
+                    }
+                    Event::Key(key) => {
+                        if !matches!(key.kind, KeyEventKind::Press) {
+                            continue;
+                        }
+                        if is_ctrl_d(key) {
+                            detached = true;
+                            running = false;
+                            break;
+                        }
+                        if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id.to_string(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !running {
+                break;
+            }
+
+            // Wait for next server frame (with a timeout so we keep draining input).
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_millis(60),
+                ipc::read_response_from_reader(&mut reader),
+            )
+            .await;
+            match frame {
+                Err(_timeout) => continue,
+                Ok(Err(err)) => {
+                    stream_error = Some(err);
+                    break;
+                }
+                Ok(Ok(RpcResponse::AttachStreamChunk { data, .. })) => {
+                    let text = String::from_utf8_lossy(&data);
+                    let chunk = String::from(&*text);
+                    respond_to_terminal_queries(
+                        config,
+                        id,
+                        &mut query_tail,
+                        &mut response_tail,
+                        &chunk,
+                        None,
+                    )
+                    .await?;
+                    std::io::stdout().flush()?;
+                }
+                Ok(Ok(RpcResponse::AttachModeChanged {
+                    app_cursor_keys, ..
+                })) => {
+                    child_app_cursor_keys = app_cursor_keys;
+                }
+                Ok(Ok(RpcResponse::AttachStreamDone { .. })) => {
+                    running = false;
+                }
+                Ok(Ok(RpcResponse::Error { message })) => {
+                    return Err(AppError::DaemonUnavailable(message));
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
+    }
+
+    if detached {
+        // Send detach signal to daemon.
+        let _ = ipc::write_request_to_writer(
+            &mut write_half,
+            RpcRequest::AttachDetach { id: id.to_string() },
+        )
+        .await;
+        println!("\r\nDetached from session {id}");
+    } else if let Some(err) = stream_error {
+        eprintln!("\r\nAttach session {id} ended with error: {err}");
+    } else {
+        println!("\r\nSession {id} has ended.");
+    }
+
+    Ok(())
+}
+
+/// Fallback polling-based attach used when routing through a node proxy.
+async fn run_attach_polled(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
+    let snapshot = ipc::send_request(
+        config,
+        attach_proxy(
+            node,
+            RpcRequest::AttachSubscribe {
+                id: id.to_string(),
+                from_byte_offset: None,
+            },
         ),
+    )
+    .await?;
+
+    let (initial_lines, mut running, child_app_cursor_keys) = match snapshot {
+        RpcResponse::AttachStreamInit {
+            lines,
+            running,
+            app_cursor_keys,
+            ..
+        } => (lines, running, app_cursor_keys),
         RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
@@ -67,7 +245,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         let _raw_mode = RawModeGuard::new()?;
         send_resize(config, id, node).await?;
         let mut query_tail = String::new();
-        render_lines(config, id, initial_lines, &mut query_tail, node).await?;
+        let mut response_tail = String::new();
+        render_lines(
+            config,
+            id,
+            initial_lines,
+            &mut query_tail,
+            &mut response_tail,
+            node,
+        )
+        .await?;
         let mut saw_ctrl_bracket = false;
 
         while running {
@@ -110,41 +297,47 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 break;
             }
 
+            // Node-proxied quick poll using logs_snapshot.
             let response = ipc::send_request(
                 config,
                 attach_proxy(
                     node,
-                    RpcRequest::AttachPoll {
+                    RpcRequest::LogsSnapshot {
                         id: id.to_string(),
-                        cursor,
+                        tail: 50,
                     },
                 ),
             )
             .await?;
 
             match response {
-                RpcResponse::AttachPoll {
+                RpcResponse::LogsSnapshot {
                     lines,
-                    cursor: next_cursor,
                     running: next_running,
-                    bracketed_paste_mode,
-                    app_cursor_keys,
+                    ..
                 } => {
-                    render_lines(config, id, lines, &mut query_tail, node).await?;
-                    cursor = next_cursor;
+                    let new_lines: Vec<String> = lines;
+                    render_lines(
+                        config,
+                        id,
+                        new_lines,
+                        &mut query_tail,
+                        &mut response_tail,
+                        node,
+                    )
+                    .await?;
                     running = next_running;
-                    _child_bracketed_paste = bracketed_paste_mode;
-                    child_app_cursor_keys = app_cursor_keys;
                 }
                 RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
                 _ => return Err(AppError::Protocol("unexpected response type".to_string())),
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 
     if detached {
+        send_detach(config, id, node).await?;
         println!("\r\nDetached from session {id}");
     } else {
         println!("\r\nSession {id} has ended.");
@@ -269,10 +462,11 @@ async fn render_lines(
     id: &str,
     lines: Vec<String>,
     query_tail: &mut String,
+    response_tail: &mut String,
     node: Option<&str>,
 ) -> Result<()> {
     for line in lines {
-        respond_to_terminal_queries(config, id, query_tail, &line, node).await?;
+        respond_to_terminal_queries(config, id, query_tail, response_tail, &line, node).await?;
     }
     std::io::stdout().flush()?;
     Ok(())
@@ -284,6 +478,7 @@ async fn respond_to_terminal_queries(
     config: &AppConfig,
     id: &str,
     tail: &mut String,
+    response_tail: &mut String,
     chunk: &str,
     node: Option<&str>,
 ) -> Result<()> {
@@ -293,13 +488,14 @@ async fn respond_to_terminal_queries(
 
     let mut search_from = 0usize;
     while search_from < combined.len() {
-        let Some((match_start, query_len, query)) = find_next_terminal_query(&combined, search_from)
+        let Some((match_start, query_len, query)) =
+            find_next_terminal_query(&combined, search_from)
         else {
             break;
         };
 
         if match_start > search_from {
-            print!("{}", &combined[search_from..match_start]);
+            print_sanitized_output(response_tail, &combined[search_from..match_start]);
             std::io::stdout().flush()?;
         }
 
@@ -313,11 +509,129 @@ async fn respond_to_terminal_queries(
 
     let printable_len = remainder.len().saturating_sub(keep);
     if printable_len > 0 {
-        print!("{}", &remainder[..printable_len]);
+        print_sanitized_output(response_tail, &remainder[..printable_len]);
     }
     *tail = remainder[printable_len..].to_string();
 
     Ok(())
+}
+
+fn print_sanitized_output(response_tail: &mut String, chunk: &str) {
+    let sanitized = filter_terminal_response_chunk(response_tail, chunk);
+    if !sanitized.is_empty() {
+        print!("{sanitized}");
+    }
+}
+
+fn filter_terminal_response_chunk(pending: &mut String, chunk: &str) -> String {
+    use std::sync::OnceLock;
+
+    static PARTIAL_CPR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let partial_cpr_re = PARTIAL_CPR_RE
+        .get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:\??\d*(?:;\d*)?)?)?$").unwrap());
+
+    static FULL_CPR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let full_cpr_re = FULL_CPR_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
+
+    static BARE_CPR_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let bare_cpr_re = BARE_CPR_RE.get_or_init(|| regex::Regex::new(r"\[\??\d+;\d+R").unwrap());
+
+    static FULL_OSC_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let full_osc_re = FULL_OSC_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\x1b]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\x1b\\)",
+        )
+        .unwrap()
+    });
+
+    static BARE_OSC_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let bare_osc_re = BARE_OSC_RE.get_or_init(|| {
+        regex::Regex::new(r"]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\\)")
+            .unwrap()
+    });
+
+    let mut combined = std::mem::take(pending);
+    combined.push_str(chunk);
+
+    let cpr_pending_start = partial_cpr_re.find(&combined).map(|m| m.start());
+    let osc_pending_start = trailing_partial_osc_response_start(&combined);
+    if let Some(start) = [cpr_pending_start, osc_pending_start]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        *pending = combined[start..].to_string();
+        combined.truncate(start);
+    }
+
+    let combined = full_cpr_re.replace_all(&combined, "");
+    let combined = bare_cpr_re.replace_all(&combined, "");
+    let combined = full_osc_re.replace_all(&combined, "");
+    bare_osc_re.replace_all(&combined, "").into_owned()
+}
+
+fn trailing_partial_osc_response_start(text: &str) -> Option<usize> {
+    ["\x1b]10;rgb:", "\x1b]11;rgb:", "]10;rgb:", "]11;rgb:"]
+        .into_iter()
+        .filter_map(|prefix| text.rfind(prefix))
+        .filter(|start| is_partial_osc_color_response(&text[*start..]))
+        .min()
+}
+
+fn is_partial_osc_color_response(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    let mut index = 0usize;
+
+    if bytes.first() == Some(&0x1b) {
+        index += 1;
+    }
+
+    if bytes.get(index) != Some(&b']') {
+        return false;
+    }
+    index += 1;
+
+    let rest = &candidate[index..];
+    let prefix_len = if rest.starts_with("10;rgb:") || rest.starts_with("11;rgb:") {
+        7
+    } else {
+        return false;
+    };
+    index += prefix_len;
+
+    let mut slash_count = 0usize;
+    let mut hex_in_component = 0usize;
+    let mut saw_hex = false;
+
+    while let Some(&byte) = bytes.get(index) {
+        if byte.is_ascii_hexdigit() {
+            if hex_in_component == 4 {
+                return false;
+            }
+            hex_in_component += 1;
+            saw_hex = true;
+            index += 1;
+            continue;
+        }
+
+        match byte {
+            b'/' => {
+                if !saw_hex || slash_count >= 2 {
+                    return false;
+                }
+                slash_count += 1;
+                hex_in_component = 0;
+                saw_hex = false;
+                index += 1;
+            }
+            0x07 => return slash_count == 2 && saw_hex,
+            0x1b => return index + 1 == bytes.len(),
+            b'\\' => return false,
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 async fn respond_to_terminal_query(
@@ -376,6 +690,19 @@ async fn send_resize(config: &AppConfig, id: &str, node: Option<&str>) -> Result
                 cols,
             },
         ),
+    )
+    .await?
+    {
+        RpcResponse::Ack => Ok(()),
+        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
+        _ => Err(AppError::Protocol("unexpected response type".to_string())),
+    }
+}
+
+async fn send_detach(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
+    match ipc::send_request(
+        config,
+        attach_proxy(node, RpcRequest::AttachDetach { id: id.to_string() }),
     )
     .await?
     {

@@ -1,6 +1,6 @@
 use interprocess::local_socket::tokio::Stream;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::{io::BufReader, sync::mpsc};
 use tracing::info;
 
 use crate::{
@@ -13,13 +13,14 @@ use crate::{
     node::NodeRegistry,
     protocol::{ApiKeySummary, ListQuery, RpcRequest, RpcResponse},
     session::StartSpec,
+    utils::EscapeFilter,
 };
 
 use super::{JoinHandles, NotificationTx, SessionStoreHandle};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client(
-    mut stream: Stream,
+    stream: Stream,
     config: &AppConfig,
     session_store: SessionStoreHandle,
     shutdown_tx: mpsc::UnboundedSender<()>,
@@ -28,7 +29,28 @@ pub(super) async fn handle_client(
     join_handles: JoinHandles,
     notification_tx: NotificationTx,
 ) -> Result<()> {
-    let request = ipc::read_request(&mut stream).await?;
+    // Peek at the request without consuming the stream so we can decide whether
+    // it needs the bidirectional streaming path or the simple req/resp path.
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let request = ipc::read_request_from_reader(&mut reader).await?;
+
+    if let RpcRequest::AttachSubscribe {
+        id,
+        from_byte_offset,
+    } = request
+    {
+        return handle_attach_subscribe(
+            id,
+            from_byte_offset,
+            &mut reader,
+            &mut write_half,
+            &session_store,
+        )
+        .await;
+    }
+
+    // Non-streaming path: dispatch and write single response.
     let response = dispatch_request(
         request,
         config,
@@ -40,7 +62,7 @@ pub(super) async fn handle_client(
         &notification_tx,
     )
     .await?;
-    ipc::write_response(&mut stream, response).await
+    ipc::write_response_to_writer(&mut write_half, response).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -82,14 +104,17 @@ async fn dispatch_request(
             )
             .await
         }
-        RpcRequest::AttachSnapshot { id } => handle_attach_snapshot(id, session_store).await,
-        RpcRequest::AttachPoll { id, cursor } => {
-            handle_attach_poll(id, cursor, session_store).await
+        RpcRequest::AttachSubscribe { .. } => {
+            // Handled before dispatch in handle_client; should not reach here.
+            RpcResponse::Error {
+                message: "AttachSubscribe must be handled on the streaming path".into(),
+            }
         }
         RpcRequest::AttachInput { id, data } => handle_attach_input(id, data, session_store).await,
         RpcRequest::AttachResize { id, rows, cols } => {
             handle_attach_resize(id, rows, cols, session_store).await
         }
+        RpcRequest::AttachDetach { id } => handle_attach_detach(id, session_store).await,
         RpcRequest::Stop { id, grace_seconds } => {
             handle_stop(id, grace_seconds, session_store).await
         }
@@ -179,44 +204,204 @@ async fn handle_start(
     }
 }
 
-async fn handle_attach_snapshot(id: String, session_store: &SessionStoreHandle) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_snapshot(&id).await {
-        Ok((lines, cursor, running, bracketed_paste_mode, app_cursor_keys)) => {
-            RpcResponse::AttachSnapshot {
-                lines,
-                cursor,
-                running,
-                bracketed_paste_mode,
-                app_cursor_keys,
-            }
-        }
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
-    }
-}
-
-async fn handle_attach_poll(
+async fn handle_attach_subscribe(
     id: String,
-    cursor: usize,
+    from_byte_offset: Option<u64>,
+    reader: &mut BufReader<tokio::io::ReadHalf<Stream>>,
+    writer: &mut tokio::io::WriteHalf<Stream>,
     session_store: &SessionStoreHandle,
-) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_poll(&id, cursor).await {
-        Ok((lines, cursor, running, bracketed_paste_mode, app_cursor_keys)) => {
-            RpcResponse::AttachPoll {
-                lines,
-                cursor,
-                running,
-                bracketed_paste_mode,
-                app_cursor_keys,
+) -> Result<()> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    // Acquire snapshot + subscribe to broadcast.
+    let (replay_chunks, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) = {
+        let mut store = session_store.lock().await;
+        match store.attach_subscribe_init(&id, from_byte_offset).await {
+            Ok(t) => t,
+            Err(err) => {
+                let resp = RpcResponse::Error {
+                    message: err.message(&id),
+                };
+                return ipc::write_response_to_writer(writer, resp).await;
             }
         }
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
+    };
+
+    // Build the replay text lines from raw chunks.
+    let mut init_filter = EscapeFilter::new();
+    let raw_init: Vec<u8> = replay_chunks
+        .iter()
+        .flat_map(|(_, b)| init_filter.filter(b))
+        .collect();
+    let text = String::from_utf8_lossy(&raw_init);
+    let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
+
+    // Send init frame.
+    let running = {
+        let store = session_store.lock().await;
+        store.is_running(&id)
+    };
+    ipc::write_response_to_writer(
+        writer,
+        RpcResponse::AttachStreamInit {
+            lines,
+            end_offset,
+            running,
+            bracketed_paste_mode,
+            app_cursor_keys,
         },
+    )
+    .await?;
+
+    // Mark attach presence.
+    {
+        let mut store = session_store.lock().await;
+        let _ = store.mark_attach_presence(&id).await;
     }
+
+    let mut chunk_filter = EscapeFilter::new();
+    let mut current_offset = end_offset;
+    let mut completion_check = tokio::time::interval(std::time::Duration::from_millis(100));
+    completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = completion_check.tick() => {
+                let (running, _output_closed, exit_code) = {
+                    let mut store = session_store.lock().await;
+                    match store.attach_stream_status(&id).await {
+                        Ok(state) => state,
+                        Err(_) => break,
+                    }
+                };
+
+                if !running {
+                    let chunks = {
+                        let mut store = session_store.lock().await;
+                        match store.attach_subscribe_init(&id, Some(current_offset)).await {
+                            Ok((chunks, _end, _rx, _bpm, _ack)) => chunks,
+                            Err(_) => Vec::new(),
+                        }
+                    };
+
+                    if !chunks.is_empty() {
+                        let mut resync_filter = EscapeFilter::new();
+                        let raw: Vec<u8> = chunks
+                            .iter()
+                            .flat_map(|(_, b)| resync_filter.filter(b))
+                            .collect();
+                        if !raw.is_empty() {
+                            ipc::write_response_to_writer(
+                                writer,
+                                RpcResponse::AttachStreamChunk {
+                                    offset: current_offset,
+                                    data: raw,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+
+                    let _ = ipc::write_response_to_writer(
+                        writer,
+                        RpcResponse::AttachStreamDone { exit_code },
+                    )
+                    .await;
+                    break;
+                }
+            }
+
+            // Incoming client message (input / resize / detach).
+            client_msg = ipc::read_request_from_reader(reader) => {
+                match client_msg {
+                    Err(_) => break, // client disconnected
+                    Ok(RpcRequest::AttachInput { id: req_id, data }) if req_id == id => {
+                        let mut store = session_store.lock().await;
+                        if store.attach_input(&req_id, &data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(RpcRequest::AttachResize { id: req_id, rows, cols }) if req_id == id => {
+                        let mut store = session_store.lock().await;
+                        let _ = store.attach_resize(&req_id, rows, cols).await;
+                    }
+                    Ok(RpcRequest::AttachDetach { id: req_id }) if req_id == id => {
+                        break;
+                    }
+                    Ok(_) => {} // ignore unrecognised messages
+                }
+            }
+
+            // Outgoing chunk from the PTY broadcast.
+            chunk = broadcast_rx.recv() => {
+                match chunk {
+                    Ok(raw_arc) => {
+                        let filtered = chunk_filter.filter(&raw_arc);
+                        if !filtered.is_empty() {
+                            ipc::write_response_to_writer(
+                                writer,
+                                RpcResponse::AttachStreamChunk {
+                                    offset: current_offset,
+                                    data: filtered,
+                                },
+                            )
+                            .await?;
+                            current_offset += raw_arc.len() as u64;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {
+                        // Re-sync from ring from current_offset.
+                        let (chunks, new_end) = {
+                            let mut store = session_store.lock().await;
+                            match store.attach_subscribe_init(&id, Some(current_offset)).await {
+                                Ok((c, e, rx, _bpm, _ack)) => {
+                                    broadcast_rx = rx;
+                                    (c, e)
+                                }
+                                Err(_) => break,
+                            }
+                        };
+                        let mut resync_filter = EscapeFilter::new();
+                        let raw: Vec<u8> = chunks
+                            .iter()
+                            .flat_map(|(_, b)| resync_filter.filter(b))
+                            .collect();
+                        if !raw.is_empty() {
+                            ipc::write_response_to_writer(
+                                writer,
+                                RpcResponse::AttachStreamChunk {
+                                    offset: current_offset,
+                                    data: raw,
+                                },
+                            )
+                            .await?;
+                        }
+                        current_offset = new_end;
+                    }
+                    Err(RecvError::Closed) => {
+                        // Session ended.
+                        let exit_code = {
+                            let store = session_store.lock().await;
+                            store.get_exit_code(&id)
+                        };
+                        let _ = ipc::write_response_to_writer(
+                            writer,
+                            RpcResponse::AttachStreamDone { exit_code },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up attach presence on exit.
+    let mut store = session_store.lock().await;
+    let _ = store.attach_detach(&id).await;
+    Ok(())
 }
 
 async fn handle_attach_input(
@@ -241,6 +426,16 @@ async fn handle_attach_resize(
 ) -> RpcResponse {
     let mut store = session_store.lock().await;
     match store.attach_resize(&id, rows, cols).await {
+        Ok(()) => RpcResponse::Ack,
+        Err(err) => RpcResponse::Error {
+            message: err.message(&id),
+        },
+    }
+}
+
+async fn handle_attach_detach(id: String, session_store: &SessionStoreHandle) -> RpcResponse {
+    let mut store = session_store.lock().await;
+    match store.attach_detach(&id).await {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),
@@ -284,7 +479,7 @@ async fn handle_logs_snapshot(
 
 async fn handle_logs_poll(
     id: String,
-    cursor: usize,
+    cursor: u64,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     let mut store = session_store.lock().await;
