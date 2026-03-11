@@ -1,3 +1,3 @@
 pub mod registry;
 
-pub use registry::{NodeHandle, NodeRegistry};
+pub use registry::{NodeHandle, NodeRegistry, PendingRpc};

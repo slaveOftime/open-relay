@@ -7,14 +7,13 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::{
     db::Database,
-    error::Result,
     http::AppState,
-    node::NodeHandle,
+    node::{NodeHandle, PendingRpc},
     notification::{
         channel::{LocalOsNotificationChannel, NotificationChannel, WebPushChannel},
         dispatcher::Notifier,
@@ -96,7 +95,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
     // ── Step 4: set up RPC relay channel and register node ───────────────
     let (send_tx, mut send_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
-    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Result<RpcResponse>>>>> =
+    let pending: Arc<Mutex<HashMap<String, PendingRpc>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_recv = Arc::clone(&pending);
     let notifier = build_notifier(state.db.clone(), &state.config);
@@ -140,8 +139,46 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                             Ok(NodeWsMessage::RpcResponse { id, response }) => {
                                 if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
                                     let mut pm = pending_recv.lock().await;
-                                    if let Some(tx) = pm.remove(&id) {
-                                        let _ = tx.send(Ok(rpc_resp));
+                                    if let Some(sender) = pm.remove(&id) {
+                                        match sender {
+                                            PendingRpc::OneShot(tx) => {
+                                                let _ = tx.send(Ok(rpc_resp));
+                                            }
+                                            PendingRpc::Stream(tx) => {
+                                                let _ = tx.send(Ok(rpc_resp));
+                                                // One-shot response on a stream channel — done.
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(NodeWsMessage::RpcStreamFrame { id, response, done }) => {
+                                if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
+                                    let mut pm = pending_recv.lock().await;
+                                    if done {
+                                        // Final frame — remove and send.
+                                        if let Some(sender) = pm.remove(&id) {
+                                            match sender {
+                                                PendingRpc::Stream(tx) => {
+                                                    let _ = tx.send(Ok(rpc_resp));
+                                                }
+                                                PendingRpc::OneShot(tx) => {
+                                                    let _ = tx.send(Ok(rpc_resp));
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // Intermediate frame — send but keep channel.
+                                        if let Some(sender) = pm.get(&id) {
+                                            match sender {
+                                                PendingRpc::Stream(tx) => {
+                                                    let _ = tx.send(Ok(rpc_resp));
+                                                }
+                                                PendingRpc::OneShot(_) => {
+                                                    // Shouldn't happen; ignore.
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -210,8 +247,12 @@ async fn handle_join(socket: WebSocket, state: AppState) {
     // Drain pending waiters with an error so callers don't hang.
     {
         let mut pm = pending_recv.lock().await;
-        for (_, tx) in pm.drain() {
-            let _ = tx.send(Err(crate::error::AppError::NodeNotConnected(name.clone())));
+        let err = || crate::error::AppError::NodeNotConnected(name.clone());
+        for (_, sender) in pm.drain() {
+            match sender {
+                PendingRpc::OneShot(tx) => { let _ = tx.send(Err(err())); }
+                PendingRpc::Stream(tx) => { let _ = tx.send(Err(err())); }
+            }
         }
     }
 

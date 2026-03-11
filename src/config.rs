@@ -92,7 +92,7 @@ impl AppConfig {
         let log_level = overrides
             .log_level
             .and_then(normalize_optional_string)
-            .unwrap_or_else(|| "info".to_string());
+            .unwrap_or_else(|| "debug".to_string());
         let prompt_patterns = overrides.prompt_patterns.unwrap_or_else(|| {
             DEFAULT_PROMPT_PATTERNS
                 .iter()

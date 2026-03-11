@@ -219,43 +219,6 @@ impl SessionStore {
         rt.meta.exit_code
     }
 
-    /// Returns the current ring write-position for the session without
-    /// requiring a mutable borrow.  Used by the WS handler to capture a
-    /// snapshot point just before a PTY resize so that only the post-resize
-    /// (post-SIGWINCH) bytes are included in the initial attach snapshot.
-    pub fn get_ring_end_offset(&self, id: &str) -> u64 {
-        self.sessions
-            .get(id)
-            .and_then(|rt| rt.lock().ok())
-            .map(|rt| rt.ring.end_offset())
-            .unwrap_or(0)
-    }
-
-    /// Returns raw PTY bytes (CPR/OSC filtered) since `from_offset` as a
-    /// **single** un-split `String` element so that `\r` in `\r\n` sequences
-    /// is preserved.  `logs_snapshot` splits on `\n` via `.lines()` which
-    /// strips every `\r`, breaking TUI cursor-movement.  This method avoids
-    /// that by never splitting on newlines.
-    pub async fn raw_bytes_since_snapshot(
-        &mut self,
-        id: &str,
-        from_offset: u64,
-    ) -> Option<(Vec<String>, u64, bool)> {
-        self.prune_evicted_sessions().await;
-        let runtime = self.sessions.get(id)?;
-        let mut rt = runtime.lock().ok()?;
-        rt.refresh_status();
-        let (chunks, end_offset) = rt.ring.read_from(from_offset);
-        let mut filter = crate::utils::EscapeFilter::new();
-        let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
-        let text = String::from_utf8_lossy(&raw).into_owned();
-        let running = rt.meta.status.as_str() == "running";
-        // Single element: xterm receives the full string verbatim (reset: true
-        // clears the screen first) and processes all escape sequences.
-        let lines = if text.is_empty() { vec![] } else { vec![text] };
-        Some((lines, end_offset, running))
-    }
-
     pub fn is_running(&self, id: &str) -> bool {
         let Some(runtime) = self.sessions.get(id) else {
             return false;
@@ -264,6 +227,16 @@ impl SessionStore {
             return false;
         };
         matches!(rt.meta.status, super::SessionStatus::Running)
+    }
+
+    /// Returns the current terminal mode snapshot for the session, if available.
+    pub fn get_mode_snapshot(
+        &self,
+        id: &str,
+    ) -> Option<crate::session::mode_tracker::ModeSnapshot> {
+        let runtime = self.sessions.get(id)?;
+        let rt = runtime.lock().ok()?;
+        Some(rt.mode_snapshot())
     }
 
     pub async fn attach_stream_status(
@@ -315,22 +288,21 @@ impl SessionStore {
         let offset = from_byte_offset.unwrap_or(0);
         let (chunks, end_offset) = rt.ring.read_from(offset);
         let rx = rt.broadcast_tx.subscribe();
-        let bracketed_paste_mode = rt.bracketed_paste_mode;
-        let app_cursor_keys = rt.app_cursor_keys;
+        let modes = rt.mode_snapshot();
         debug!(
             session_id = id,
             chunks = chunks.len(),
             end_offset,
-            bracketed_paste_mode,
-            app_cursor_keys,
+            bracketed_paste_mode = modes.bracketed_paste_mode,
+            app_cursor_keys = modes.app_cursor_keys,
             "attach subscribe init"
         );
         Ok((
             chunks,
             end_offset,
             rx,
-            bracketed_paste_mode,
-            app_cursor_keys,
+            modes.bracketed_paste_mode,
+            modes.app_cursor_keys,
         ))
     }
 
@@ -363,8 +335,9 @@ impl SessionStore {
         // instead of `\x1b[`.  Transform transparently here so both
         // `oly attach` and `oly input` always work, regardless of whether the
         // caller tracks DECCKM state itself.
+        let modes = rt.mode_snapshot();
         let cooked;
-        let transformed = rt.app_cursor_keys
+        let transformed = modes.app_cursor_keys
             && (data.contains("\x1b[A")
                 || data.contains("\x1b[B")
                 || data.contains("\x1b[C")
@@ -379,14 +352,14 @@ impl SessionStore {
         } else {
             data.as_bytes()
         };
-        if rt.writer_tx.send(bytes.to_vec()).is_ok() {
+        if rt.pty.write_input(bytes.to_vec()) {
             rt.mark_attach_activity();
             rt.last_input_at = Some(Instant::now());
             debug!(
                 session_id = id,
                 bytes = bytes.len(),
                 transformed,
-                app_cursor_keys = rt.app_cursor_keys,
+                app_cursor_keys = modes.app_cursor_keys,
                 "attach input forwarded"
             );
             Ok(())
@@ -438,7 +411,7 @@ impl SessionStore {
                 return false;
             };
             rt.meta.status = SessionStatus::Stopping;
-            let _ = rt.writer_tx.send(vec![0x03]);
+            let _ = rt.pty.write_input(vec![0x03]);
         }
 
         let deadline = Instant::now() + Duration::from_secs(grace_seconds);
@@ -457,7 +430,7 @@ impl SessionStore {
         let Ok(mut rt) = runtime.lock() else {
             return false;
         };
-        if rt.child.kill().is_ok() {
+        if rt.pty.kill().is_ok() {
             let _ = rt.refresh_status();
             true
         } else {
@@ -487,7 +460,7 @@ impl SessionStore {
         let runtime = self.sessions.get(id)?;
         let mut rt = runtime.lock().ok()?;
         rt.refresh_status();
-        let mut filter = crate::utils::EscapeFilter::new();
+        let mut filter = crate::session::pty::EscapeFilter::new();
         let all_bytes: Vec<u8> = rt
             .ring
             .all_chunks()
@@ -509,7 +482,7 @@ impl SessionStore {
         let mut rt = runtime.lock().ok()?;
         rt.refresh_status();
         let (chunks, end_offset) = rt.ring.read_from(cursor);
-        let mut filter = crate::utils::EscapeFilter::new();
+        let mut filter = crate::session::pty::EscapeFilter::new();
         let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
         let text = String::from_utf8_lossy(&raw);
         let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
@@ -716,10 +689,12 @@ mod tests {
             dir,
             ring,
             broadcast_tx,
-            writer_tx,
-            child,
+            pty: super::super::pty::PtyHandle {
+                child,
+                writer_tx,
+                pty_master: Some(pty_master),
+            },
             completed_at: None,
-            _pty_master: Some(pty_master),
             persisted: false,
             last_output_at,
             last_input_at: None,
@@ -727,15 +702,14 @@ mod tests {
             last_attach_activity_at: None,
             last_notified_at: None,
             notified_output_epoch: None,
-            bracketed_paste_mode: false,
-            app_cursor_keys: false,
+            mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
         }))
     }
 
     fn make_dummy_child() -> (
-        super::super::runtime::RuntimeChild,
+        super::super::pty::RuntimeChild,
         Box<dyn portable_pty::MasterPty + Send>,
     ) {
         // Spawn a long-running process so refresh_status() sees it still alive.
@@ -759,7 +733,7 @@ mod tests {
             })
             .expect("openpty in test");
         let child = pty.slave.spawn_command(cmd).expect("spawn in test");
-        (super::super::runtime::RuntimeChild::Pty(child), pty.master)
+        (super::super::pty::RuntimeChild::Pty(child), pty.master)
     }
 
     async fn make_test_db() -> Arc<Database> {
@@ -1052,10 +1026,12 @@ mod tests {
             dir,
             ring: RingBuffer::new(4096),
             broadcast_tx,
-            writer_tx,
-            child,
+            pty: super::super::pty::PtyHandle {
+                child,
+                writer_tx,
+                pty_master: Some(pty_master),
+            },
             completed_at: None,
-            _pty_master: Some(pty_master),
             persisted: false,
             last_output_at: None,
             last_input_at: None,
@@ -1063,8 +1039,7 @@ mod tests {
             last_attach_activity_at: None,
             last_notified_at: None,
             notified_output_epoch: None,
-            bracketed_paste_mode: false,
-            app_cursor_keys: false,
+            mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
         }));
@@ -1170,7 +1145,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
-            locked.app_cursor_keys = true;
+            locked.mode_tracker.process(b"\x1b[?1h");
         }
         let mut store = store_with(vec![rt], make_test_db().await);
 
@@ -1191,7 +1166,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
-            locked.app_cursor_keys = true;
+            locked.mode_tracker.process(b"\x1b[?1h");
         }
         let mut store = store_with(vec![rt], make_test_db().await);
 

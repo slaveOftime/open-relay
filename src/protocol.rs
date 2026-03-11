@@ -246,10 +246,18 @@ pub enum NodeWsMessage {
         id: String,
         request: serde_json::Value,
     },
-    /// Secondary → Primary: RPC response.
+    /// Secondary → Primary: single-shot RPC response (non-streaming).
     RpcResponse {
         id: String,
         response: serde_json::Value,
+    },
+    /// Secondary → Primary: one frame of a streaming RPC response.
+    /// Multiple frames share the same `id`.  `done` is true on the final frame.
+    RpcStreamFrame {
+        id: String,
+        response: serde_json::Value,
+        #[serde(default)]
+        done: bool,
     },
     /// Secondary -> Primary: notification event produced by the secondary daemon.
     Notification {

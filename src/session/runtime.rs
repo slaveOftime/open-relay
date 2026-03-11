@@ -14,44 +14,16 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     error::{AppError, Result},
-    utils::extract_query_responses_no_client,
 };
+
+use super::pty::{PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content};
 
 use super::{
     SessionMeta, SessionStatus,
+    mode_tracker::{ModeSnapshot, ModeTracker},
     persist::{append_event, append_output_raw, append_resize_event},
     ring::RingBuffer,
 };
-
-// ---------------------------------------------------------------------------
-// RuntimeChild
-// ---------------------------------------------------------------------------
-
-pub enum RuntimeChild {
-    Pty(Box<dyn portable_pty::Child + Send + Sync>),
-}
-
-impl RuntimeChild {
-    pub fn process_id(&self) -> Option<u32> {
-        match self {
-            Self::Pty(child) => child.process_id(),
-        }
-    }
-
-    pub fn kill(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::Pty(child) => child.kill(),
-        }
-    }
-
-    pub fn try_wait_code(&mut self) -> std::io::Result<Option<i32>> {
-        match self {
-            Self::Pty(child) => child
-                .try_wait()
-                .map(|opt| opt.map(|status| status.exit_code() as i32)),
-        }
-    }
-}
 
 #[allow(dead_code)]
 const ATTACH_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -67,80 +39,55 @@ pub struct SessionRuntime {
     /// Byte-limited ring buffer of raw PTY output.
     pub ring: RingBuffer,
     /// Sends raw PTY output chunks to all live attach subscribers.
-    /// `receiver_count()` reflects how many clients are currently attached and
-    /// governs whether the daemon-side terminal-query fallback responder fires.
     pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
-    /// Channel to the dedicated PTY writer thread.  Send `Vec<u8>` to write
-    /// bytes to the child's stdin without blocking the caller.
-    pub writer_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub child: RuntimeChild,
+    /// PTY ownership: master fd, writer channel, child process.
+    pub pty: PtyHandle,
     pub completed_at: Option<Instant>,
-    pub _pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
     /// Timestamp of the last visible output chunk; drives the notification engine.
     pub last_output_at: Option<Instant>,
-    /// Timestamp of the last input bytes forwarded to the PTY; used to suppress
-    /// notifications while the user is actively typing.
+    /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last subscribe/attach action; coarse presence signal.
     pub last_attach_presence_at: Option<Instant>,
-    /// Timestamp of the last interactive attach action (input/resize) that
-    /// should suppress notifications for a short window.
+    /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
     /// Timestamp of the last *successful* notification delivery for this session.
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
-    /// Re-notification is suppressed until output advances past this epoch.
     pub notified_output_epoch: Option<Instant>,
-    /// Whether the child has enabled bracketed-paste mode (`\x1b[?2004h`).
-    /// Updated by `push_raw` scanning the raw PTY output stream.
-    pub bracketed_paste_mode: bool,
-    /// Whether the child has enabled DECCKM application cursor key mode
-    /// (`\x1b[?1h`).  When active, arrow keys must be `\x1bO{A,B,C,D}`.
-    pub app_cursor_keys: bool,
+    /// Byte-level state machine for DEC private mode tracking.
+    pub mode_tracker: ModeTracker,
     /// Set once the PTY reader has reached EOF or a terminal read error.
-    /// After this no further PTY output can arrive for streaming attaches.
     pub output_closed: bool,
     pub notifications_enabled: bool,
 }
 
 impl SessionRuntime {
+    /// Current terminal mode snapshot (DECCKM, bracketed paste).
+    pub fn mode_snapshot(&self) -> ModeSnapshot {
+        self.mode_tracker.snapshot()
+    }
+
     /// Push a raw PTY chunk: persist to disk, store in ring, update mode state,
     /// and advance the silence clock for visible content.
     ///
-    /// No ESC filtering is done here — raw bytes are stored as-is so that
-    /// output.log is a faithful record.  Filtering happens per-subscriber at
-    /// delivery time via `EscapeFilter`.
-    pub fn push_raw(&mut self, data: Bytes) {
-        let text_cow = String::from_utf8_lossy(&data);
-
-        // Track DEC private mode toggles in the raw stream.
-        if text_cow.contains("\x1b[?2004h") {
-            if !self.bracketed_paste_mode {
-                debug!(session_id = %self.meta.id, "child enabled bracketed paste mode");
-            }
-            self.bracketed_paste_mode = true;
-        } else if text_cow.contains("\x1b[?2004l") {
-            if self.bracketed_paste_mode {
-                debug!(session_id = %self.meta.id, "child disabled bracketed paste mode");
-            }
-            self.bracketed_paste_mode = false;
-        }
-        if text_cow.contains("\x1b[?1h") {
-            if !self.app_cursor_keys {
-                debug!(session_id = %self.meta.id, "child enabled application cursor keys");
-            }
-            self.app_cursor_keys = true;
-        } else if text_cow.contains("\x1b[?1l") {
-            if self.app_cursor_keys {
-                debug!(session_id = %self.meta.id, "child disabled application cursor keys");
-            }
-            self.app_cursor_keys = false;
+    /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
+    pub fn push_raw(&mut self, data: Bytes) -> Option<ModeSnapshot> {
+        // Track DEC private mode toggles via byte-level state machine.
+        let mode_change = self.mode_tracker.process(&data);
+        if let Some(ref snap) = mode_change {
+            debug!(
+                session_id = %self.meta.id,
+                app_cursor_keys = snap.app_cursor_keys,
+                bracketed_paste_mode = snap.bracketed_paste_mode,
+                "terminal mode changed"
+            );
         }
 
         // Advance the silence clock only for chunks with visible content.
-        // Pure ANSI cursor/redraw sequences must NOT reset the timer.
+        let text_cow = String::from_utf8_lossy(&data);
         if has_visible_content(&text_cow) {
             self.last_output_at = Some(Instant::now());
         }
@@ -150,6 +97,8 @@ impl SessionRuntime {
 
         // Add to in-memory ring (evicts oldest if over capacity).
         self.ring.push(data);
+
+        mode_change
     }
 
     pub fn mark_attach_presence(&mut self) {
@@ -184,7 +133,7 @@ impl SessionRuntime {
             return true;
         }
 
-        match self.child.try_wait_code() {
+        match self.pty.try_wait() {
             Ok(Some(code)) => {
                 debug!(session_id = %self.meta.id, exit_code = code, "child process exited");
                 let status = if code == 0 {
@@ -246,18 +195,7 @@ impl SessionRuntime {
             debug!(session_id = %self.meta.id, rows, cols, "ignoring invalid PTY resize request");
             return false;
         }
-        let Some(pty_master) = self._pty_master.as_mut() else {
-            debug!(session_id = %self.meta.id, rows, cols, "PTY resize requested after master was released");
-            return false;
-        };
-        let resized = pty_master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .is_ok();
+        let resized = self.pty.resize(rows, cols);
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         resized
     }
@@ -351,8 +289,6 @@ pub fn spawn_session(
     let _ = append_event(&full_dir, &format!("session started pid={started_pid}"));
 
     // Broadcast channel: each live attach subscriber holds a Receiver.
-    // `receiver_count()` is used in the reader thread to decide whether the
-    // daemon-side terminal-query fallback should fire.
     let (broadcast_tx, _initial_rx) = broadcast::channel::<Arc<Bytes>>(256);
 
     // Writer channel: the dedicated write thread owns the PTY writer so that
@@ -367,15 +303,19 @@ pub fn spawn_session(
         }
     });
 
+    let pty_handle = PtyHandle {
+        child: runtime_child,
+        writer_tx: writer_tx.clone(),
+        pty_master: Some(master),
+    };
+
     let runtime = Arc::new(Mutex::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
         ring: RingBuffer::new(config.ring_buffer_bytes),
         broadcast_tx: broadcast_tx.clone(),
-        writer_tx: writer_tx.clone(),
-        child: runtime_child,
+        pty: pty_handle,
         completed_at: None,
-        _pty_master: Some(master),
         persisted: false,
         last_output_at: None,
         last_input_at: None,
@@ -383,8 +323,7 @@ pub fn spawn_session(
         last_attach_activity_at: None,
         notified_output_epoch: None,
         last_notified_at: None,
-        bracketed_paste_mode: false,
-        app_cursor_keys: false,
+        mode_tracker: ModeTracker::new(),
         output_closed: false,
         notifications_enabled,
     }));
@@ -413,18 +352,17 @@ pub fn spawn_session(
 
                     // Always let the daemon answer terminal queries that need
                     // a shared, session-global answer (currently CPR/DSR).
-                    // Multiple attached clients cannot safely
-                    // answer independently because each viewer may have a
-                    // different local cursor position; the child PTY only has
-                    // one shared terminal state.  Centralising replies here
-                    // prevents passive viewers from sending conflicting CPRs.
                     for resp in extract_query_responses_no_client(&data, &mut query_tail) {
                         let _ = writer_tx.send(resp);
                     }
 
-                    // Update in-memory ring + disk (brief lock, no I/O inside).
+                    // Update in-memory ring + disk + mode tracking (brief lock).
                     match runtime_reader.lock() {
-                        Ok(mut rt) => rt.push_raw(data.clone()),
+                        Ok(mut rt) => {
+                            let _mode_change = rt.push_raw(data.clone());
+                            // Mode changes are picked up by attach subscribers
+                            // via the broadcast channel + periodic mode checks.
+                        }
                         Err(_) => break,
                     }
 
@@ -460,48 +398,6 @@ fn format_command_for_display(command: &str, args: &[String]) -> String {
         return command.to_string();
     }
     format!("{} {}", command, args.join(" "))
-}
-
-/// Returns `true` when `text` contains at least one character that is
-/// visually rendered (i.e. not whitespace and not part of an ANSI/VT escape
-/// sequence). Used to avoid advancing the silence clock on chunks that
-/// contain only cursor-movement or redraw escape sequences.
-pub(crate) fn has_visible_content(text: &str) -> bool {
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip CSI/OSC/other escape sequences.
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for c in chars.by_ref() {
-                        if c == '\x07' {
-                            break;
-                        }
-                        if prev == '\x1b' && c == '\\' {
-                            break;
-                        }
-                        prev = c;
-                    }
-                }
-                _ => {
-                    chars.next();
-                }
-            }
-        } else if !ch.is_whitespace() && !ch.is_control() {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -593,10 +489,12 @@ mod tests {
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             ring: RingBuffer::new(4096), // small capacity for tests
             broadcast_tx,
-            writer_tx,
-            child: make_test_child(),
+            pty: PtyHandle {
+                child: make_test_child(),
+                writer_tx,
+                pty_master: None,
+            },
             completed_at: None,
-            _pty_master: None,
             persisted: false,
             last_output_at: None,
             last_input_at: None,
@@ -604,8 +502,7 @@ mod tests {
             last_attach_activity_at: None,
             last_notified_at: None,
             notified_output_epoch: None,
-            bracketed_paste_mode: false,
-            app_cursor_keys: false,
+            mode_tracker: ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
         }
@@ -618,10 +515,10 @@ mod tests {
     #[test]
     fn test_push_raw_enables_bracketed_paste() {
         let mut rt = new_runtime();
-        assert!(!rt.bracketed_paste_mode);
+        assert!(!rt.mode_snapshot().bracketed_paste_mode);
         rt.push_raw(bytes::Bytes::from("text \x1b[?2004h more"));
         assert!(
-            rt.bracketed_paste_mode,
+            rt.mode_snapshot().bracketed_paste_mode,
             "bracketed_paste_mode should be set after \\x1b[?2004h"
         );
     }
@@ -629,10 +526,11 @@ mod tests {
     #[test]
     fn test_push_raw_disables_bracketed_paste() {
         let mut rt = new_runtime();
-        rt.bracketed_paste_mode = true;
+        rt.push_raw(bytes::Bytes::from("\x1b[?2004h"));
+        assert!(rt.mode_snapshot().bracketed_paste_mode);
         rt.push_raw(bytes::Bytes::from("\x1b[?2004l"));
         assert!(
-            !rt.bracketed_paste_mode,
+            !rt.mode_snapshot().bracketed_paste_mode,
             "bracketed_paste_mode should be cleared after \\x1b[?2004l"
         );
     }
@@ -640,10 +538,10 @@ mod tests {
     #[test]
     fn test_push_raw_enables_app_cursor_keys() {
         let mut rt = new_runtime();
-        assert!(!rt.app_cursor_keys);
+        assert!(!rt.mode_snapshot().app_cursor_keys);
         rt.push_raw(bytes::Bytes::from("\x1b[?1h"));
         assert!(
-            rt.app_cursor_keys,
+            rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be set after DECCKM enable"
         );
     }
@@ -651,10 +549,11 @@ mod tests {
     #[test]
     fn test_push_raw_disables_app_cursor_keys() {
         let mut rt = new_runtime();
-        rt.app_cursor_keys = true;
+        rt.push_raw(bytes::Bytes::from("\x1b[?1h"));
+        assert!(rt.mode_snapshot().app_cursor_keys);
         rt.push_raw(bytes::Bytes::from("\x1b[?1l"));
         assert!(
-            !rt.app_cursor_keys,
+            !rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be cleared after DECCKM disable"
         );
     }
@@ -724,47 +623,6 @@ mod tests {
             rt.has_active_attach_client(),
             "one receiver subscribed → should report active client"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // -----------------------------------------------------------------------
-    // has_visible_content
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_has_visible_content_plain_text() {
-        assert!(has_visible_content("hello"));
-        assert!(has_visible_content("$ "));
-        assert!(has_visible_content("Do you want to continue?"));
-    }
-
-    #[test]
-    fn test_has_visible_content_empty_and_whitespace() {
-        assert!(!has_visible_content(""));
-        assert!(!has_visible_content("   "));
-        assert!(!has_visible_content("\t\n\r"));
-    }
-
-    #[test]
-    fn test_has_visible_content_pure_ansi_csi() {
-        // Cursor movement escape sequences — no visible characters.
-        assert!(!has_visible_content("\x1b[2J"));
-        assert!(!has_visible_content("\x1b[1A\x1b[1A\x1b[2K"));
-        assert!(!has_visible_content("\x1b[H\x1b[2J\x1b[?25l"));
-    }
-
-    #[test]
-    fn test_has_visible_content_ansi_with_text() {
-        // ANSI wrapping around visible text → true.
-        assert!(has_visible_content("\x1b[32mOK\x1b[0m"));
-        assert!(has_visible_content("\x1b[1;31mError\x1b[0m"));
-    }
-
-    #[test]
-    fn test_has_visible_content_osc_sequences() {
-        // OSC title sequence — no visible characters.
-        assert!(!has_visible_content("\x1b]0;my title\x07"));
-        assert!(!has_visible_content("\x1b]2;Terminal\x1b\\"));
     }
 
     // -----------------------------------------------------------------------

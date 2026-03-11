@@ -12,8 +12,7 @@ use crate::{
     ipc,
     node::NodeRegistry,
     protocol::{ApiKeySummary, ListQuery, RpcRequest, RpcResponse},
-    session::StartSpec,
-    utils::EscapeFilter,
+    session::{StartSpec, pty::EscapeFilter},
 };
 
 use super::{JoinHandles, NotificationTx, SessionStoreHandle};
@@ -42,6 +41,25 @@ pub(super) async fn handle_client(
     {
         return handle_attach_subscribe(id, from_byte_offset, reader, write_half, &session_store)
             .await;
+    }
+
+    // Node-proxied streaming attach: unwrap the proxy envelope and relay
+    // streaming frames from the secondary node back to the CLI.
+    if matches!(
+        &request,
+        RpcRequest::NodeProxy { inner, .. }
+            if matches!(inner.as_ref(), RpcRequest::AttachSubscribe { .. })
+    ) {
+        if let RpcRequest::NodeProxy { node, inner } = request {
+            return handle_node_proxy_streaming(
+                node,
+                *inner,
+                reader,
+                write_half,
+                &node_registry,
+            )
+            .await;
+        }
     }
 
     // Non-streaming path: dispatch and write single response.
@@ -274,6 +292,12 @@ async fn handle_attach_subscribe(
     let mut completion_check = tokio::time::interval(std::time::Duration::from_millis(100));
     completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Track mode state for change detection.
+    let mut last_modes = crate::session::mode_tracker::ModeSnapshot {
+        app_cursor_keys,
+        bracketed_paste_mode,
+    };
+
     loop {
         tokio::select! {
             biased;
@@ -360,6 +384,25 @@ async fn handle_attach_subscribe(
                             )
                             .await?;
                             current_offset += raw_arc.len() as u64;
+                        }
+
+                        // Check for terminal mode changes after each chunk.
+                        let current_modes = {
+                            let store = session_store.lock().await;
+                            store.get_mode_snapshot(&id)
+                        };
+                        if let Some(modes) = current_modes {
+                            if modes != last_modes {
+                                ipc::write_response_to_writer(
+                                    &mut writer,
+                                    RpcResponse::AttachModeChanged {
+                                        app_cursor_keys: modes.app_cursor_keys,
+                                        bracketed_paste_mode: modes.bracketed_paste_mode,
+                                    },
+                                )
+                                .await?;
+                                last_modes = modes;
+                            }
                         }
                     }
                     Err(RecvError::Lagged(_)) => {
@@ -710,4 +753,127 @@ fn handle_join_list(config: &AppConfig) -> RpcResponse {
 async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcResponse {
     let nodes = node_registry.connected_names().await;
     RpcResponse::NodeList { nodes }
+}
+
+/// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the
+/// secondary node and relay all streaming frames back to the CLI via IPC.
+/// Also reads client messages (input/resize/detach) from the IPC reader and
+/// proxies them to the secondary node as one-shot RPCs.
+async fn handle_node_proxy_streaming(
+    node: String,
+    inner: RpcRequest,
+    reader: BufReader<tokio::io::ReadHalf<Stream>>,
+    mut writer: tokio::io::WriteHalf<Stream>,
+    node_registry: &Arc<NodeRegistry>,
+) -> Result<()> {
+    let mut stream_rx = match node_registry.proxy_rpc_stream(&node, &inner).await {
+        Ok(rx) => rx,
+        Err(e) => {
+            ipc::write_response_to_writer(
+                &mut writer,
+                RpcResponse::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Spawn a task to read client messages (input/resize/detach) from IPC.
+    let (client_msg_tx, mut client_msg_rx) =
+        mpsc::unbounded_channel::<Result<RpcRequest>>();
+    let client_reader_task = tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            match ipc::read_request_from_reader(&mut reader).await {
+                Ok(req) => {
+                    if client_msg_tx.send(Ok(req)).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = client_msg_tx.send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+
+    // Extract session ID from the inner request for proxying client messages.
+    let session_id = match &inner {
+        RpcRequest::AttachSubscribe { id, .. } => id.clone(),
+        _ => String::new(),
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+
+            // Streaming frames from the secondary node.
+            frame = stream_rx.recv() => {
+                match frame {
+                    Some(Ok(resp)) => {
+                        let is_done = matches!(
+                            resp,
+                            RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
+                        );
+                        if ipc::write_response_to_writer(&mut writer, resp).await.is_err() {
+                            break;
+                        }
+                        if is_done {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        let _ = ipc::write_response_to_writer(
+                            &mut writer,
+                            RpcResponse::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                        break;
+                    }
+                    None => {
+                        // Stream ended without a done frame.
+                        let _ = ipc::write_response_to_writer(
+                            &mut writer,
+                            RpcResponse::AttachStreamDone { exit_code: None },
+                        )
+                        .await;
+                        break;
+                    }
+                }
+            }
+
+            // Client messages (input/resize/detach) from CLI via IPC.
+            client_msg = client_msg_rx.recv() => {
+                match client_msg {
+                    Some(Ok(req)) => {
+                        let is_detach = matches!(req, RpcRequest::AttachDetach { .. });
+                        // Proxy to secondary node as one-shot RPC.
+                        let _ = node_registry.proxy_rpc(&node, &req).await;
+                        if is_detach {
+                            break;
+                        }
+                    }
+                    _ => break, // client disconnected
+                }
+            }
+        }
+    }
+
+    client_reader_task.abort();
+    // Send detach to clean up attach presence on the secondary node.
+    let _ = node_registry
+        .proxy_rpc(
+            &node,
+            &RpcRequest::AttachDetach {
+                id: session_id,
+            },
+        )
+        .await;
+
+    Ok(())
 }

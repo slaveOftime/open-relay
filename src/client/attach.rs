@@ -30,23 +30,20 @@ pub async fn run_attach_node(config: &AppConfig, id: &str, node: Option<String>)
 }
 
 async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    // For node-proxied attaches we fall back to the old polling model since
-    // the streaming protocol goes over the direct local socket only.
-    if node.is_some() {
-        return run_attach_polled(config, id, node).await;
-    }
-
     let stream = ipc::connect(config).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
-    // Send AttachSubscribe.
+    // Send AttachSubscribe (wrapped in NodeProxy if targeting a remote node).
     ipc::write_request_to_writer(
         &mut write_half,
-        RpcRequest::AttachSubscribe {
-            id: id.to_string(),
-            from_byte_offset: None,
-        },
+        attach_proxy(
+            node,
+            RpcRequest::AttachSubscribe {
+                id: id.to_string(),
+                from_byte_offset: None,
+            },
+        ),
     )
     .await?;
 
@@ -238,141 +235,6 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     Ok(())
 }
 
-/// Fallback polling-based attach used when routing through a node proxy.
-async fn run_attach_polled(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    let snapshot = ipc::send_request(
-        config,
-        attach_proxy(
-            node,
-            RpcRequest::AttachSubscribe {
-                id: id.to_string(),
-                from_byte_offset: None,
-            },
-        ),
-    )
-    .await?;
-
-    let (initial_data, mut running, child_app_cursor_keys) = match snapshot {
-        RpcResponse::AttachStreamInit {
-            data,
-            running,
-            app_cursor_keys,
-            ..
-        } => (data, running, app_cursor_keys),
-        RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
-        _ => return Err(AppError::Protocol("unexpected response type".to_string())),
-    };
-
-    let mut detached = false;
-    let mut detach_error: Option<AppError> = None;
-    {
-        let mut raw_mode = RawModeGuard::new()?;
-        raw_mode.enter_alternate_screen()?;
-        send_resize(config, id, node).await?;
-        {
-            use std::io::Write;
-            let mut stdout = std::io::stdout();
-            stdout.write_all(&initial_data)?;
-            stdout.flush()?;
-        }
-        let mut saw_ctrl_bracket = false;
-
-        while running {
-            while event::poll(std::time::Duration::from_millis(0))? {
-                match event::read()? {
-                    Event::Paste(data) => send_input(config, id, data, node).await?,
-                    Event::Resize(_, _) => send_resize(config, id, node).await?,
-                    Event::Key(key) => {
-                        if !matches!(key.kind, KeyEventKind::Press) {
-                            continue;
-                        }
-                        if is_ctrl_bracket(key) {
-                            saw_ctrl_bracket = true;
-                            continue;
-                        }
-                        if is_ctrl_d(key)
-                            || (saw_ctrl_bracket
-                                && matches!(
-                                    key.code,
-                                    KeyCode::Char('c')
-                                        | KeyCode::Char('C')
-                                        | KeyCode::Char('d')
-                                        | KeyCode::Char('D')
-                                ))
-                        {
-                            detached = true;
-                            running = false;
-                            break;
-                        }
-                        saw_ctrl_bracket = false;
-                        if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
-                            send_input(config, id, data, node).await?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if !running {
-                break;
-            }
-
-            // Node-proxied quick poll using logs_snapshot.
-            let response = ipc::send_request(
-                config,
-                attach_proxy(
-                    node,
-                    RpcRequest::LogsSnapshot {
-                        id: id.to_string(),
-                        tail: 50,
-                    },
-                ),
-            )
-            .await?;
-
-            match response {
-                RpcResponse::LogsSnapshot {
-                    lines,
-                    running: next_running,
-                    ..
-                } => {
-                    // Polled fallback: lines are already text-cleaned by the
-                    // daemon; print them directly.
-                    use std::io::Write;
-                    let mut stdout = std::io::stdout();
-                    for line in &lines {
-                        stdout.write_all(line.as_bytes())?;
-                    }
-                    stdout.flush()?;
-                    running = next_running;
-                }
-                RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
-                _ => return Err(AppError::Protocol("unexpected response type".to_string())),
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        if detached {
-            if let Err(err) = send_detach(config, id, node).await {
-                detach_error = Some(err);
-            }
-            let _ = drain_pending_terminal_events();
-        }
-    }
-
-    if detached {
-        if let Some(err) = detach_error {
-            return Err(err);
-        }
-        println!("Detached from session {id}");
-    } else {
-        println!("Session {id} has ended.");
-    }
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // RawModeGuard - RAII for terminal raw mode + optional alternate screen
 // ---------------------------------------------------------------------------
@@ -500,64 +362,6 @@ fn drain_pending_terminal_events() -> Result<()> {
     Ok(())
 }
 
-pub async fn send_input(
-    config: &AppConfig,
-    id: &str,
-    data: String,
-    node: Option<&str>,
-) -> Result<()> {
-    match ipc::send_request(
-        config,
-        attach_proxy(
-            node,
-            RpcRequest::AttachInput {
-                id: id.to_string(),
-                data,
-            },
-        ),
-    )
-    .await?
-    {
-        RpcResponse::Ack => Ok(()),
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-        _ => Err(AppError::Protocol("unexpected response type".to_string())),
-    }
-}
-
-async fn send_resize(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    let (cols, rows) = terminal::size().unwrap_or((80, 24));
-    match ipc::send_request(
-        config,
-        attach_proxy(
-            node,
-            RpcRequest::AttachResize {
-                id: id.to_string(),
-                rows,
-                cols,
-            },
-        ),
-    )
-    .await?
-    {
-        RpcResponse::Ack => Ok(()),
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-        _ => Err(AppError::Protocol("unexpected response type".to_string())),
-    }
-}
-
-async fn send_detach(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
-    match ipc::send_request(
-        config,
-        attach_proxy(node, RpcRequest::AttachDetach { id: id.to_string() }),
-    )
-    .await?
-    {
-        RpcResponse::Ack => Ok(()),
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-        _ => Err(AppError::Protocol("unexpected response type".to_string())),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Key input mapping
 // ---------------------------------------------------------------------------
@@ -595,11 +399,6 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
         }
         _ => None,
     }
-}
-
-fn is_ctrl_bracket(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5'))
 }
 
 fn is_ctrl_d(key: KeyEvent) -> bool {
@@ -827,21 +626,6 @@ mod tests {
         // Ctrl-Z → ASCII 26 (SUB / suspend).
         let result = map_key_to_input(ctrl_press(KeyCode::Char('z')), false).unwrap();
         assert_eq!(result.as_bytes(), &[26]);
-    }
-
-    // -----------------------------------------------------------------------
-    // is_ctrl_bracket
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_is_ctrl_bracket_true_for_right_bracket() {
-        assert!(is_ctrl_bracket(ctrl_press(KeyCode::Char(']'))));
-    }
-
-    #[test]
-    fn test_is_ctrl_bracket_false_for_plain_char() {
-        assert!(!is_ctrl_bracket(press(KeyCode::Char(']'))));
-        assert!(!is_ctrl_bracket(ctrl_press(KeyCode::Char('c'))));
     }
 
     // -----------------------------------------------------------------------

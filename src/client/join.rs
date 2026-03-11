@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{info, warn};
 
@@ -269,12 +269,35 @@ async fn connect_and_relay(
     }
 
     // ── Relay loop ───────────────────────────────────────────────────────────
+    // Channel for spawned streaming tasks to send frames back to the WS writer.
+    let (stream_frame_tx, mut stream_frame_rx) =
+        mpsc::unbounded_channel::<(String, RpcResponse, bool)>();
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
                 if *stop_rx.borrow() {
                     let _ = ws_tx.send(WsMessage::Close(None)).await;
                     return Ok(true);
+                }
+            }
+            // Outgoing stream frames from spawned streaming tasks.
+            frame = stream_frame_rx.recv() => {
+                let Some((id, response, done)) = frame else { break };
+                let response_json = match serde_json::to_value(&response) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let reply = NodeWsMessage::RpcStreamFrame {
+                    id,
+                    response: response_json,
+                    done,
+                };
+                let reply_text = match serde_json::to_string(&reply) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if ws_tx.send(WsMessage::Text(reply_text.into())).await.is_err() {
+                    break;
                 }
             }
             incoming = ws_rx.next() => {
@@ -317,6 +340,24 @@ async fn connect_and_relay(
                                 continue;
                             }
                         };
+
+                        // Streaming: open a persistent IPC connection and relay
+                        // all frames back to the primary as RpcStreamFrame.
+                        if matches!(req, RpcRequest::AttachSubscribe { .. }) {
+                            let local_cfg = local_config.clone();
+                            let rpc_id = id.clone();
+                            let frame_tx = stream_frame_tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = relay_streaming_rpc(
+                                    &local_cfg, req, &rpc_id, &frame_tx,
+                                ).await {
+                                    warn!(%err, id = %rpc_id, "streaming relay failed");
+                                    let resp = RpcResponse::Error { message: err.to_string() };
+                                    let _ = frame_tx.send((rpc_id, resp, true));
+                                }
+                            });
+                            continue;
+                        }
 
                         let response = match ipc::send_request(local_config, req).await {
                             Ok(r) => r,
@@ -383,4 +424,56 @@ async fn connect_and_relay(
     }
 
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming RPC relay (secondary → primary)
+// ---------------------------------------------------------------------------
+
+/// Open a streaming IPC connection to the local daemon, send `request`, and
+/// relay all response frames back through `frame_tx` as `(id, response, done)`.
+async fn relay_streaming_rpc(
+    config: &AppConfig,
+    request: RpcRequest,
+    rpc_id: &str,
+    frame_tx: &mpsc::UnboundedSender<(String, RpcResponse, bool)>,
+) -> Result<()> {
+    use tokio::io::BufReader;
+
+    let stream = ipc::connect(config).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+
+    // Send the request.
+    ipc::write_request_to_writer(&mut write_half, request).await?;
+
+    // Read streaming frames until the stream ends.
+    loop {
+        let response = ipc::read_response_from_reader(&mut reader).await;
+        match response {
+            Ok(resp) => {
+                let is_done = matches!(
+                    resp,
+                    RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
+                );
+                if frame_tx.send((rpc_id.to_string(), resp, is_done)).is_err() {
+                    break;
+                }
+                if is_done {
+                    break;
+                }
+            }
+            Err(_) => {
+                // IPC connection closed — send done frame.
+                let _ = frame_tx.send((
+                    rpc_id.to_string(),
+                    RpcResponse::AttachStreamDone { exit_code: None },
+                    true,
+                ));
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
