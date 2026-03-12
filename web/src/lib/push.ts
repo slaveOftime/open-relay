@@ -4,9 +4,32 @@ import type { PushSubscriptionInput } from '@/api/types'
 export type PushSetupState = 'unsupported' | 'unconfigured' | 'denied' | 'idle' | 'subscribed'
 
 const PUSH_SW_SCOPE = '/__push__/'
+const PUSH_DISABLED_KEY = 'open-relay.web.push.disabled.v1'
 
 let passiveSyncInFlight: Promise<PushSetupState> | null = null
 let passiveSyncCachedState: PushSetupState | null = null
+
+function isPushExplicitlyDisabled(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return window.localStorage.getItem(PUSH_DISABLED_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+function setPushExplicitlyDisabled(disabled: boolean) {
+  if (typeof window === 'undefined') return
+  try {
+    if (disabled) {
+      window.localStorage.setItem(PUSH_DISABLED_KEY, 'true')
+      return
+    }
+    window.localStorage.removeItem(PUSH_DISABLED_KEY)
+  } catch {
+    // Ignore storage write failures; push state still follows browser capabilities.
+  }
+}
 
 function urlBase64ToArrayBuffer(base64String: string): ArrayBuffer {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
@@ -36,7 +59,8 @@ function toPushSubscriptionInput(sub: PushSubscription): PushSubscriptionInput |
 }
 
 export async function syncPushSubscription(requestPermission: boolean): Promise<PushSetupState> {
-  if (!requestPermission && passiveSyncCachedState) {
+  const explicitlyDisabled = isPushExplicitlyDisabled()
+  if (!requestPermission && passiveSyncCachedState && !explicitlyDisabled) {
     return passiveSyncCachedState
   }
   if (passiveSyncInFlight) {
@@ -74,6 +98,7 @@ export async function syncPushSubscription(requestPermission: boolean): Promise<
       return 'denied'
     }
     if (permission !== 'granted') return 'idle'
+    if (!requestPermission && explicitlyDisabled) return 'idle'
 
     let subscription = await registration.pushManager.getSubscription()
     if (!subscription) {
@@ -87,6 +112,7 @@ export async function syncPushSubscription(requestPermission: boolean): Promise<
     if (!payload) return 'idle'
 
     await upsertPushSubscription(payload)
+    setPushExplicitlyDisabled(false)
     return 'subscribed'
   })()
 
@@ -101,15 +127,26 @@ export async function syncPushSubscription(requestPermission: boolean): Promise<
   return run
 }
 
-export async function disablePushNotifications(): Promise<void> {
-  passiveSyncCachedState = Notification.permission === 'denied' ? 'denied' : 'idle'
-  if (!('serviceWorker' in navigator)) return
+export async function disablePushNotifications(): Promise<PushSetupState> {
+  const nextState = Notification.permission === 'denied' ? 'denied' : 'idle'
+  if (!('serviceWorker' in navigator)) {
+    passiveSyncCachedState = nextState
+    setPushExplicitlyDisabled(true)
+    return nextState
+  }
   const registration = await navigator.serviceWorker.getRegistration(PUSH_SW_SCOPE)
   const subscription = await registration?.pushManager.getSubscription()
-  if (!subscription) return
+  if (!subscription) {
+    passiveSyncCachedState = nextState
+    setPushExplicitlyDisabled(true)
+    return nextState
+  }
 
   await deletePushSubscription(subscription.endpoint)
   await subscription.unsubscribe()
+  passiveSyncCachedState = nextState
+  setPushExplicitlyDisabled(true)
+  return nextState
 }
 
 export async function showSessionNotification(
