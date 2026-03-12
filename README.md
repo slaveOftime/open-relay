@@ -2,9 +2,9 @@
 
 <p align="center"><img src="./assets/icon-demo.svg" width="160" /></p>
 
-[![Watch the video](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.png)](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.mp4)
-
-<p align="center"><a href="./assets/oly-full-demo.mp4">Download or open the full demo video</a></p>
+<div align="center">
+  <video src="https://youtu.be/qg7uX6Rxdn8" width="600" controls></video>
+</div>
 
 [![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
