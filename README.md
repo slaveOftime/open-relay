@@ -6,10 +6,14 @@
 
 <p align="center"><a href="./assets/oly-full-demo.mp4">Download or open the full demo video</a></p>
 
+[![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-> Run agents. Walk away. Intervene when it matters.
+> Run any CLI like a managed service.
 
-`oly` is a session-persistent PTY daemon for long-running CLI agents (Claude Code, Gemini CLI, OpenCode, normal CLI etc.). It keeps your agent alive after you close the terminal, notifies you when something needs a human, and lets you intervene from anywhere.
+`oly` turns long-running and interactive CLI workflows into persistent, supervised sessions for humans and AI agents. Close the terminal, keep the process alive, get notified when input is needed, and jump back in from anywhere.
+
+If this solves a real problem for you, give the repo a star so more people can find it.
 
 For a full repository architecture map, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 For the PTY/session internals specifically, see [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
@@ -18,7 +22,7 @@ For the PTY/session internals specifically, see [ARCHITECTURE_PTY.md](./ARCHITEC
 
 ## The problem 😤
 
-You start an agent task. It runs for 20 minutes. Halfway through it hits a `y/n` prompt and just... sits there. You had to keep a terminal open, stay at your desk, babysit it.
+You start an agent or interactive CLI task. It runs for 20 minutes. Halfway through it hits a `y/n` prompt and just... sits there. You had to keep a terminal open, stay at your desk, babysit it.
 
 **That's over.**
 
@@ -26,25 +30,48 @@ You start an agent task. It runs for 20 minutes. Halfway through it hits a `y/n`
 
 ## What oly does ⚡
 
+- Turns interactive CLIs into managed, auditable sessions
 - Owns agent sessions in a background daemon — closing your terminal changes nothing
 - Replays buffered output when you reattach (no lost context)
 - Detects when input is likely needed and notifies you
 - Lets you inject input without attaching (`oly input <id> --key enter`)
 - Keeps auditable logs of everything
 
+### Who it's for
+
+- People running AI coding agents that stall on prompts, permissions, or long-running work
+- Anyone using interactive CLIs that should survive terminal closes, disconnects, or context switches
+- Teams that want auditable logs and remote intervention instead of fragile ad-hoc shell sessions
+
+### Why not just `tmux`, `screen`, or a remote shell?
+
+| Need | `tmux` / `screen` | `oly` |
+|---|---|---|
+| Session survives after you close your terminal | Yes | Yes |
+| Detects when human input is likely needed | No | Yes |
+| Send input without attaching | No | Yes |
+| Built for supervising AI agents and interactive CLIs | Not really | Yes |
+| Keeps auditable session logs as a first-class feature | Minimal | Yes |
+
 ### Agent-supervises-agent 🤖 👀 🤖
 
 You can run one agent to supervise another. When the supervisor hits something it's unsure about — or something that needs elevated permission — it escalates to you. You decide whether to approve, modify, or abort. You're still in the loop, just not watching.
 
-### Code layout at a glance
-
-- `src/daemon/rpc.rs` keeps the top-level IPC dispatch, with attach handlers in `src/daemon/rpc_attach.rs` and federation/node runtime in `src/daemon/rpc_nodes.rs`.
-- `src/session/pty.rs` owns PTY resources and escape filtering, while `src/session/cursor_tracker.rs` and `src/session/mode_tracker.rs` track terminal state.
-- `src/client/join.rs` now focuses on join config persistence and CLI join commands; the secondary-node connector runs daemon-side.
-
 ---
 
 ## Install 📦
+
+```sh
+npm i @slaveoftime/oly -g
+```
+
+Global install is required because `oly` is a CLI. On first run, the npm package downloads the matching release binary for your platform.
+
+Currently supported via npm:
+
+- **macOS**: Apple Silicon (`arm64`)
+- **Linux**: x86_64 / AMD64
+- **Windows**: x86_64 / AMD64
 
 ```sh
 brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
@@ -52,10 +79,10 @@ brew install slaveOftime/open-relay/oly
 ```
 
 ```sh
-npm i @slaveoftime/oly -g
+cargo install --path .
 ```
 
-### Pre-built Binaries
+### Pre-built binaries
 
 Download the latest release for your platform from the [Releases page](https://github.com/Slaveoftime/open-relay/releases).
 
@@ -63,17 +90,13 @@ Download the latest release for your platform from the [Releases page](https://g
 - **Linux**: Download `oly-linux-amd64.zip`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
 - **Windows**: Download `oly-windows-amd64.zip`, unzip, and add to your PATH.
 
-### From Source
-
-```sh
-cargo install --path .
-```
-
 ---
 
 ## Quick start 🚀
 
-The cli is both for human and AI agent.
+The CLI is for both humans and AI agents.
+
+If you only try one workflow, make it this one: start the daemon, launch a session detached, inspect logs, then send input only when needed.
 
 ```sh
 # Start the daemon (once per boot, or add to your init)
@@ -103,7 +126,7 @@ oly stop <id>
 
 ## Remote supervision 🌐
 
-Access and manage sessions from browser, with push notification support. Intervene from anywhere.
+Access and manage sessions from a browser, with push notification support. Intervene from anywhere.
 
 `oly` has no built-in network listener — deliberately. Expose it the way you control:
 
@@ -112,6 +135,14 @@ Access and manage sessions from browser, with push notification support. Interve
 ```
 
 Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logged. Your rules. 🔒
+
+---
+
+## Why star or watch this repo
+
+- You want a better way to supervise long-running agent or CLI sessions
+- You want release updates as packaging, remote supervision, and workflow support improve
+- You want to help shape an early tool in a fast-moving part of the developer tooling stack
 
 ---
 
@@ -142,3 +173,11 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 All session commands support `--node <name>` to target a connected secondary.
 
 Detach from an attached session: `Ctrl-]` then `d`.
+
+---
+
+## Code layout at a glance
+
+- `src/daemon/rpc.rs` keeps the top-level IPC dispatch, with attach handlers in `src/daemon/rpc_attach.rs` and federation/node runtime in `src/daemon/rpc_nodes.rs`.
+- `src/session/pty.rs` owns PTY resources and escape filtering, while `src/session/cursor_tracker.rs` and `src/session/mode_tracker.rs` track terminal state.
+- `src/client/join.rs` now focuses on join config persistence and CLI join commands; the secondary-node connector runs daemon-side.
