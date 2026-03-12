@@ -26,7 +26,7 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<SessionStore>>,
-    pub config: AppConfig,
+    pub config: Arc<AppConfig>,
     pub db: Arc<Database>,
     pub event_tx: broadcast::Sender<SessionEvent>,
     /// None when `--no-auth` was specified; Some when password auth is active.

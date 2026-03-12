@@ -56,7 +56,7 @@ async fn run() -> Result<()> {
     match cli.command {
         Commands::Daemon(args) => match args.command {
             DaemonCommand::Start(start_args) => {
-                let http_port = start_args.port.unwrap_or(config.http_port.clone());
+                let http_port = start_args.port.unwrap_or(config.http_port);
                 daemon::start(
                     AppConfig {
                         http_port,

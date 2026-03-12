@@ -42,7 +42,7 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
     r"(?i)press (?:enter|return|any key)",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AppConfig {
     pub http_port: u16,
     pub log_level: String,
