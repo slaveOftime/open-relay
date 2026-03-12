@@ -399,6 +399,20 @@ impl SessionStore {
     }
 
     pub async fn stop_session(&mut self, id: &str, grace_seconds: u64) -> bool {
+        self.terminate_session(id, grace_seconds, SessionStatus::Stopped)
+            .await
+    }
+
+    pub async fn kill_session(&mut self, id: &str) -> bool {
+        self.terminate_session(id, 0, SessionStatus::Killed).await
+    }
+
+    async fn terminate_session(
+        &mut self,
+        id: &str,
+        grace_seconds: u64,
+        requested_final_status: SessionStatus,
+    ) -> bool {
         self.prune_evicted_sessions().await;
 
         let Some(runtime) = self.sessions.get(id).cloned() else {
@@ -410,8 +424,14 @@ impl SessionStore {
             let Ok(mut rt) = runtime.lock() else {
                 return false;
             };
+            if rt.refresh_status() {
+                return true;
+            }
+            rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
-            let _ = rt.pty.write_input(vec![0x03]);
+            if matches!(requested_final_status, SessionStatus::Stopped) {
+                let _ = rt.pty.write_input(vec![0x03]);
+            }
         }
 
         let deadline = Instant::now() + Duration::from_secs(grace_seconds);
@@ -430,6 +450,9 @@ impl SessionStore {
         let Ok(mut rt) = runtime.lock() else {
             return false;
         };
+        if rt.refresh_status() {
+            return true;
+        }
         if rt.pty.kill().is_ok() {
             let _ = rt.refresh_status();
             true
@@ -696,6 +719,7 @@ mod tests {
             },
             completed_at: None,
             persisted: false,
+            requested_final_status: None,
             last_output_at,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -740,13 +764,7 @@ mod tests {
     async fn make_test_db() -> Arc<Database> {
         // Use a unique per-test file-based DB in the temp directory so
         // concurrent tests don't interfere with each other.
-        let path = std::env::temp_dir().join(format!(
-            "oly_test_{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
+        let path = std::env::temp_dir().join(format!("oly_test_{}.db", uuid::Uuid::new_v4()));
         Arc::new(
             Database::open(&path, std::env::temp_dir())
                 .await
@@ -1034,6 +1052,7 @@ mod tests {
             },
             completed_at: None,
             persisted: false,
+            requested_final_status: None,
             last_output_at: None,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -1210,6 +1229,58 @@ mod tests {
         assert!(
             result.is_err(),
             "attach_input to unknown session should return an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_session_preserves_completed_failure() {
+        let (rt, mut writer_rx) = make_runtime_writable("stp0001", SessionStatus::Failed);
+        let rt_clone = rt.clone();
+        {
+            let mut locked = rt.lock().unwrap();
+            locked.meta.exit_code = Some(42);
+            locked.meta.ended_at = Some(Utc::now());
+            locked.completed_at = Some(Instant::now());
+        }
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        assert!(
+            store.stop_session("stp0001", 0).await,
+            "completed session should still be treated as found"
+        );
+
+        let locked = rt_clone.lock().unwrap();
+        assert!(matches!(locked.meta.status, SessionStatus::Failed));
+        assert_eq!(locked.meta.exit_code, Some(42));
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "completed sessions should not receive a synthetic Ctrl-C"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kill_session_preserves_completed_failure() {
+        let (rt, mut writer_rx) = make_runtime_writable("kil0001", SessionStatus::Failed);
+        let rt_clone = rt.clone();
+        {
+            let mut locked = rt.lock().unwrap();
+            locked.meta.exit_code = Some(99);
+            locked.meta.ended_at = Some(Utc::now());
+            locked.completed_at = Some(Instant::now());
+        }
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        assert!(
+            store.kill_session("kil0001").await,
+            "completed session should still be treated as found"
+        );
+
+        let locked = rt_clone.lock().unwrap();
+        assert!(matches!(locked.meta.status, SessionStatus::Failed));
+        assert_eq!(locked.meta.exit_code, Some(99));
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "completed sessions should not receive synthetic input during kill"
         );
     }
 

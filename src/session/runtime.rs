@@ -48,6 +48,7 @@ pub struct SessionRuntime {
     pub completed_at: Option<Instant>,
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
+    pub requested_final_status: Option<SessionStatus>,
     /// Timestamp of the last visible output chunk; drives the notification engine.
     pub last_output_at: Option<Instant>,
     /// Timestamp of the last input bytes forwarded to the PTY.
@@ -145,11 +146,13 @@ impl SessionRuntime {
         match self.pty.try_wait() {
             Ok(Some(code)) => {
                 debug!(session_id = %self.meta.id, exit_code = code, "child process exited");
-                let status = if code == 0 {
-                    SessionStatus::Stopped
-                } else {
-                    SessionStatus::Failed
-                };
+                let status = self.requested_final_status.unwrap_or_else(|| {
+                    if code == 0 {
+                        SessionStatus::Stopped
+                    } else {
+                        SessionStatus::Failed
+                    }
+                });
                 self.mark_completed(status, Some(code));
                 true
             }
@@ -172,6 +175,7 @@ impl SessionRuntime {
             self.meta.ended_at = Some(chrono::Utc::now());
         }
         self.meta.status = status;
+        self.requested_final_status = None;
         if let Some(code) = exit_code {
             self.meta.exit_code = Some(code);
         }
@@ -182,6 +186,10 @@ impl SessionRuntime {
             SessionStatus::Stopped => format!(
                 "session stopped exit_code={}",
                 self.meta.exit_code.unwrap_or(0)
+            ),
+            SessionStatus::Killed => format!(
+                "session killed exit_code={}",
+                self.meta.exit_code.unwrap_or(-1)
             ),
             SessionStatus::Failed => format!(
                 "session failed exit_code={}",
@@ -195,7 +203,7 @@ impl SessionRuntime {
     pub fn is_completed(&self) -> bool {
         matches!(
             self.meta.status,
-            SessionStatus::Stopped | SessionStatus::Failed
+            SessionStatus::Stopped | SessionStatus::Killed | SessionStatus::Failed
         )
     }
 
@@ -326,6 +334,7 @@ pub fn spawn_session(
         pty: pty_handle,
         completed_at: None,
         persisted: false,
+        requested_final_status: None,
         last_output_at: None,
         last_input_at: None,
         last_attach_presence_at: None,
@@ -465,13 +474,24 @@ mod tests {
     // Helpers for SessionRuntime unit tests
     // -----------------------------------------------------------------------
 
-    fn make_test_child() -> RuntimeChild {
+    fn make_test_child_with_exit_code(exit_code: i32) -> RuntimeChild {
         #[cfg(target_os = "windows")]
         let mut cmd = portable_pty::CommandBuilder::new("cmd.exe");
         #[cfg(target_os = "windows")]
-        cmd.args(["/c", "exit", "0"]);
+        {
+            let exit_arg = exit_code.to_string();
+            cmd.arg("/c");
+            cmd.arg("exit");
+            cmd.arg(exit_arg);
+        }
         #[cfg(not(target_os = "windows"))]
-        let mut cmd = portable_pty::CommandBuilder::new("true");
+        let mut cmd = portable_pty::CommandBuilder::new("sh");
+        #[cfg(not(target_os = "windows"))]
+        {
+            let command = format!("exit {exit_code}");
+            cmd.arg("-c");
+            cmd.arg(command);
+        }
 
         let pty = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
@@ -485,9 +505,8 @@ mod tests {
         RuntimeChild::Pty(child)
     }
 
-    fn new_runtime() -> SessionRuntime {
-        use crate::session::{SessionMeta, SessionStatus};
-
+    fn new_runtime_with(status: SessionStatus, exit_code: i32) -> SessionRuntime {
+        use crate::session::SessionMeta;
         let meta = SessionMeta {
             id: "rt_tst01".to_string(),
             title: None,
@@ -497,7 +516,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
             ended_at: None,
-            status: SessionStatus::Running,
+            status,
             pid: None,
             exit_code: None,
         };
@@ -509,12 +528,13 @@ mod tests {
             ring: RingBuffer::new(4096), // small capacity for tests
             broadcast_tx,
             pty: PtyHandle {
-                child: make_test_child(),
+                child: make_test_child_with_exit_code(exit_code),
                 writer_tx,
                 pty_master: None,
             },
             completed_at: None,
             persisted: false,
+            requested_final_status: None,
             last_output_at: None,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -526,6 +546,20 @@ mod tests {
             notifications_enabled: true,
             persist_filter: EscapeFilter::new(),
         }
+    }
+
+    fn new_runtime() -> SessionRuntime {
+        new_runtime_with(SessionStatus::Running, 0)
+    }
+
+    fn refresh_until_completed(rt: &mut SessionRuntime) {
+        for _ in 0..100 {
+            if rt.refresh_status() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("session did not complete within the expected refresh window");
     }
 
     #[test]
@@ -672,6 +706,32 @@ mod tests {
         rt.mark_completed(SessionStatus::Failed, Some(1));
         assert!(rt.is_completed());
         assert_eq!(rt.meta.exit_code, Some(1));
+    }
+
+    #[test]
+    fn test_refresh_status_marks_nonzero_exit_failed_without_stop_request() {
+        let mut rt = new_runtime_with(SessionStatus::Running, 1);
+        refresh_until_completed(&mut rt);
+        assert!(matches!(rt.meta.status, SessionStatus::Failed));
+        assert!(matches!(rt.meta.exit_code, Some(code) if code != 0));
+    }
+
+    #[test]
+    fn test_refresh_status_marks_nonzero_exit_stopped_during_stop_request() {
+        let mut rt = new_runtime_with(SessionStatus::Stopping, 1);
+        rt.requested_final_status = Some(SessionStatus::Stopped);
+        refresh_until_completed(&mut rt);
+        assert!(matches!(rt.meta.status, SessionStatus::Stopped));
+        assert!(matches!(rt.meta.exit_code, Some(code) if code != 0));
+    }
+
+    #[test]
+    fn test_refresh_status_marks_nonzero_exit_killed_during_kill_request() {
+        let mut rt = new_runtime_with(SessionStatus::Stopping, 1);
+        rt.requested_final_status = Some(SessionStatus::Killed);
+        refresh_until_completed(&mut rt);
+        assert!(matches!(rt.meta.status, SessionStatus::Killed));
+        assert!(matches!(rt.meta.exit_code, Some(code) if code != 0));
     }
 
     #[test]

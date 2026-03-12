@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcEnvelope<T> {
@@ -46,6 +46,9 @@ pub enum RpcRequest {
     Stop {
         id: String,
         grace_seconds: u64,
+    },
+    Kill {
+        id: String,
     },
     LogsSnapshot {
         id: String,
@@ -107,6 +110,7 @@ impl RpcRequest {
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
+            RpcRequest::Kill { .. } => "kill",
             RpcRequest::LogsSnapshot { .. } => "logs_snapshot",
             RpcRequest::LogsPoll { .. } => "logs_poll",
             RpcRequest::LogsWait { .. } => "logs_wait",
@@ -165,6 +169,9 @@ pub enum RpcResponse {
     },
     Stop {
         stopped: bool,
+    },
+    Kill {
+        killed: bool,
     },
     LogsSnapshot {
         lines: Vec<String>,

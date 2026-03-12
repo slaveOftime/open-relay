@@ -15,13 +15,14 @@ use crate::protocol::SessionSummary;
 pub use store::SessionStore;
 pub use store::SilentCandidate;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Created,
     Running,
     Stopping,
     Stopped,
+    Killed,
     Failed,
 }
 
@@ -32,6 +33,7 @@ impl SessionStatus {
             Self::Running => "running",
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
+            Self::Killed => "killed",
             Self::Failed => "failed",
         }
     }
