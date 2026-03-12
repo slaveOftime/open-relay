@@ -1191,14 +1191,16 @@ export default function SessionsPage() {
           : 'Enable Push'
 
   async function handleEnablePush() {
-    const next = await syncPushSubscription(true).catch(() => 'idle' as PushSetupState)
+    const next = await syncPushSubscription(true).catch(() => null)
+    if (!next) return
     setPushState(next)
   }
 
   async function handleTogglePush() {
     if (pushEnabled) {
-      await disablePushNotifications().catch(() => {})
-      setPushState(Notification.permission === 'denied' ? 'denied' : 'idle')
+      const next = await disablePushNotifications().catch(() => null)
+      if (!next) return
+      setPushState(next)
       return
     }
     await handleEnablePush()
