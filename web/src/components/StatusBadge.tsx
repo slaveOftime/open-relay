@@ -17,6 +17,8 @@ function statusVariant(status: SessionStatus, inputNeeded: boolean): BadgeVarian
       return 'running'
     case 'stopping':
       return 'stopping'
+    case 'killed':
+      return 'killed'
     case 'failed':
       return 'failed'
     case 'created':
@@ -33,6 +35,8 @@ function dotColor(status: SessionStatus, inputNeeded: boolean): string {
       return 'bg-green-400'
     case 'stopping':
       return 'bg-yellow-400'
+    case 'killed':
+      return 'bg-orange-500'
     case 'failed':
       return 'bg-red-400'
     default:

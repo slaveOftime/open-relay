@@ -561,6 +561,14 @@ necessary because:
 2. Wait up to `stop_grace_seconds` (configurable, default 5s)
 3. If still running, send SIGKILL
 4. Record exit code
+5. Finalize the session as `stopped` for user-requested stops even when the OS
+   reports a non-zero signal/termination code; reserve `failed` for unrequested
+   non-zero exits or runtime errors
+
+`SessionStore::kill_session()`:
+1. Mark the runtime as stopping with a requested final state of `killed`
+2. Skip the Ctrl-C grace path and terminate the child immediately
+3. Finalize the session as `killed` once the process exit is observed
 
 ### Daemon Shutdown
 

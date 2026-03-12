@@ -116,7 +116,7 @@ pub async fn unsubscribe_push(
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     pub search: Option<String>,
-    /// Comma-separated status values: running,stopped,failed,created,stopping
+    /// Comma-separated status values: running,stopped,killed,failed,created,stopping
     pub status: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
@@ -496,13 +496,10 @@ pub async fn kill_session(
     Query(params): Query<NodeParams>,
 ) -> impl IntoResponse {
     if let Some(ref node) = params.node {
-        let rpc = RpcRequest::Stop {
-            id: id.clone(),
-            grace_seconds: 0,
-        };
+        let rpc = RpcRequest::Kill { id: id.clone() };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::Stop { stopped }) => {
-                if stopped {
+            Ok(RpcResponse::Kill { killed }) => {
+                if killed {
                     Json(serde_json::json!({ "killed": true })).into_response()
                 } else {
                     (
@@ -530,14 +527,14 @@ pub async fn kill_session(
         };
     }
 
-    let (stopped, summary) = {
+    let (killed, summary) = {
         let mut store = state.store.lock().await;
-        let stopped = store.stop_session(&id, 0).await;
+        let killed = store.kill_session(&id).await;
         let summary = store.get_summary(&id);
-        (stopped, summary)
+        (killed, summary)
     };
 
-    if stopped {
+    if killed {
         info!(session_id = %id, "kill requested");
         if let Some(s) = summary {
             let _ = state.event_tx.send(SessionEvent::SessionUpdated(s));

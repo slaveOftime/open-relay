@@ -33,6 +33,8 @@ export function statusDotClass(status: SessionStatus): string {
       return 'dot-running'
     case 'stopping':
       return 'dot-stopping'
+    case 'killed':
+      return 'dot-failed'
     case 'failed':
       return 'dot-failed'
     default:
@@ -47,6 +49,8 @@ export function statusBadgeClass(status: SessionStatus, inputNeeded: boolean): s
       return 'badge-running'
     case 'stopping':
       return 'badge-stopping'
+    case 'killed':
+      return 'badge-failed'
     case 'failed':
       return 'badge-failed'
     default:
@@ -63,6 +67,8 @@ export function statusLabel(status: SessionStatus, inputNeeded: boolean): string
       return 'Stopping'
     case 'stopped':
       return 'Stopped'
+    case 'killed':
+      return 'Killed'
     case 'failed':
       return 'Failed'
     case 'created':

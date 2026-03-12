@@ -81,6 +81,8 @@ pub enum ListStatus {
     Stopping,
     /// Exited cleanly.
     Stopped,
+    /// Terminated immediately via hard stop.
+    Killed,
     /// Exited with an error.
     Failed,
     /// Status could not be determined.
@@ -94,6 +96,7 @@ impl ListStatus {
             Self::Running => "running",
             Self::Stopping => "stopping",
             Self::Stopped => "stopped",
+            Self::Killed => "killed",
             Self::Failed => "failed",
             Self::Unknown => "unknown",
         }

@@ -368,6 +368,7 @@ fn parse_status(s: &str) -> SessionStatus {
         "running" => SessionStatus::Running,
         "stopping" => SessionStatus::Stopping,
         "stopped" => SessionStatus::Stopped,
+        "killed" => SessionStatus::Killed,
         _ => SessionStatus::Failed,
     }
 }

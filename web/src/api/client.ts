@@ -1,5 +1,6 @@
 import type {
   SessionSummary,
+  SessionStatus,
   ListPage,
   CreateSessionSpec,
   LogsResponse,
@@ -113,7 +114,7 @@ export async function logout(): Promise<void> {
 
 export interface ListParams {
   search?: string
-  status?: string
+  status?: SessionStatus
   limit?: number
   offset?: number
   sort?: SessionSortField

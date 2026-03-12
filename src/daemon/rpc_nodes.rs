@@ -183,6 +183,7 @@ async fn connect_and_relay(
                                     | RpcRequest::AttachInput { .. }
                                     | RpcRequest::AttachResize { .. }
                                     | RpcRequest::Stop { .. }
+                                    | RpcRequest::Kill { .. }
                                     | RpcRequest::LogsPoll { .. }
                                     | RpcRequest::LogsSnapshot { .. }
                                     | RpcRequest::LogsWait { .. } => r,

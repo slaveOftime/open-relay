@@ -610,19 +610,91 @@ fn e2e_session_status_transitions_in_list() {
             .output()
             .expect("`oly ls` failed to execute");
         ls_out2 = String::from_utf8_lossy(&ls_stopped.stdout).to_string();
-        if ls_out2.contains(&id) && (ls_out2.contains("stopped") || ls_out2.contains("failed")) {
+        if ls_out2.contains(&id) && ls_out2.contains("stopped") {
             break;
         }
     }
     assert!(
-        ls_out2.contains(&id) && (ls_out2.contains("stopped") || ls_out2.contains("failed")),
-        "expected session {id} with 'stopped' or 'failed' status after stop.\nOutput:\n{ls_out2}"
+        ls_out2.contains(&id) && ls_out2.contains("stopped"),
+        "expected session {id} with 'stopped' status after stop.\nOutput:\n{ls_out2}"
     );
 
     let log = fetch_logs(&tmp, &id);
     assert!(
         !log.trim().is_empty(),
         "logs should be accessible after session is stopped"
+    );
+}
+
+#[tokio::test]
+async fn e2e_kill_session_status_transitions_to_killed() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_kill_status_transitions");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http(&tmp, port);
+
+    #[cfg(target_os = "windows")]
+    let shell: &[&str] = &["cmd.exe"];
+    #[cfg(not(target_os = "windows"))]
+    let shell: &[&str] = &["sh"];
+
+    let id = start_session(&tmp, shell);
+
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| !log.trim().is_empty(),
+        Duration::from_secs(3),
+    )
+    .expect("shell produced no output within 3 s");
+
+    let client = reqwest::Client::new();
+    let kill = client
+        .post(format!("http://127.0.0.1:{port}/api/sessions/{id}/kill"))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("POST /api/sessions/{id}/kill failed");
+    assert!(
+        kill.status().is_success(),
+        "expected kill request to succeed, got HTTP {}",
+        kill.status()
+    );
+    let kill_body = kill.text().await.expect("read kill response body");
+    let kill_body: serde_json::Value =
+        serde_json::from_str(&kill_body).expect("parse kill response");
+    assert_eq!(
+        kill_body.get("killed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut ls_killed_out = String::new();
+    while Instant::now() < deadline {
+        sleep(Duration::from_millis(500));
+        let ls_killed = oly_cmd(&tmp)
+            .args(["ls", "--status", "killed"])
+            .output()
+            .expect("`oly ls --status killed` failed to execute");
+        ls_killed_out = String::from_utf8_lossy(&ls_killed.stdout).to_string();
+        if ls_killed_out.contains(&id) && ls_killed_out.contains("killed") {
+            break;
+        }
+    }
+    assert!(
+        ls_killed_out.contains(&id) && ls_killed_out.contains("killed"),
+        "expected session {id} with 'killed' status after kill.\nOutput:\n{ls_killed_out}"
+    );
+
+    let ls_stopped = oly_cmd(&tmp)
+        .args(["ls", "--status", "stopped"])
+        .output()
+        .expect("`oly ls --status stopped` failed to execute");
+    let ls_stopped_out = String::from_utf8_lossy(&ls_stopped.stdout);
+    assert!(
+        !ls_stopped_out.contains(&id),
+        "killed session {id} should not appear under the stopped filter.\nOutput:\n{ls_stopped_out}"
     );
 }
 

@@ -132,6 +132,7 @@ async fn dispatch_request(
         RpcRequest::Stop { id, grace_seconds } => {
             handle_stop(id, grace_seconds, session_store).await
         }
+        RpcRequest::Kill { id } => handle_kill(id, session_store).await,
         RpcRequest::LogsSnapshot { id, tail } => {
             handle_logs_snapshot(id, tail, session_store).await
         }
@@ -230,6 +231,18 @@ async fn handle_stop(
     } else {
         RpcResponse::Error {
             message: format!("session not found or failed to stop: {id}"),
+        }
+    }
+}
+
+async fn handle_kill(id: String, session_store: &SessionStoreHandle) -> RpcResponse {
+    let mut store = session_store.lock().await;
+    if store.kill_session(&id).await {
+        info!(session_id = id, "session killed");
+        RpcResponse::Kill { killed: true }
+    } else {
+        RpcResponse::Error {
+            message: format!("session not found or failed to kill: {id}"),
         }
     }
 }

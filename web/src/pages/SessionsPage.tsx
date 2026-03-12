@@ -4,9 +4,11 @@ import type { ListParams } from '@/api/client'
 import {
   SessionSortField,
   SortOrder,
+  isSessionStatusFilter,
   isSessionSortField,
   isSortOrder,
   type SessionSummary,
+  type SessionStatusFilter,
   type NodeSummary,
 } from '@/api/types'
 import {
@@ -87,11 +89,19 @@ type GroupBy = 'none' | 'cwd' | 'command'
 
 type SessionPrefs = {
   search: string
-  statusFilter: string
+  statusFilter: SessionStatusFilter
   groupBy: GroupBy
   node: string | null
   sortField: SessionSortField
   sortOrder: SortOrder
+}
+
+function normalizeStatusFilter(value: unknown): SessionStatusFilter {
+  return isSessionStatusFilter(value) ? value : 'all'
+}
+
+function isTerminalStatus(status: SessionSummary['status']): boolean {
+  return status === 'stopped' || status === 'killed' || status === 'failed'
 }
 
 const SORT_OPTIONS: Array<{ label: string; value: SessionSortField }> = [
@@ -125,10 +135,7 @@ function loadSessionPrefs(): SessionPrefs {
     const sortOrder = parsed.sortOrder
     return {
       search: typeof parsed.search === 'string' ? parsed.search : defaults.search,
-      statusFilter:
-        typeof parsed.statusFilter === 'string'
-          ? parsed.statusFilter || 'all'
-          : defaults.statusFilter,
+      statusFilter: normalizeStatusFilter(parsed.statusFilter),
       groupBy:
         groupBy === 'none' || groupBy === 'cwd' || groupBy === 'command'
           ? groupBy
@@ -261,7 +268,7 @@ function SessionRow({
       ? '[box-shadow:inset_2px_0_0_0_rgb(22_163_74/0.5)]'
       : ''
 
-  const rowOpacity = session.status === 'stopped' || session.status === 'failed' ? 'opacity-60' : ''
+  const rowOpacity = isTerminalStatus(session.status) ? 'opacity-60' : ''
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
 
   function openSession(mode: 'attach' | 'logs') {
@@ -440,9 +447,7 @@ function SessionCard({
     session.status === 'running' || session.status === 'stopping' || session.status === 'created'
 
   const titleTone =
-    session.status === 'stopped' || session.status === 'failed'
-      ? 'text-[hsl(var(--foreground))]/70'
-      : 'text-[hsl(var(--foreground))]'
+    isTerminalStatus(session.status) ? 'text-[hsl(var(--foreground))]/70' : 'text-[hsl(var(--foreground))]'
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
 
   function openSession(mode: 'attach' | 'logs') {
@@ -854,7 +859,7 @@ export default function SessionsPage() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [search, setSearch] = useState(initialPrefs.search)
-  const [statusFilter, setStatusFilter] = useState(initialPrefs.statusFilter)
+  const [statusFilter, setStatusFilter] = useState<SessionStatusFilter>(initialPrefs.statusFilter)
   const [groupBy, setGroupBy] = useState<GroupBy>(initialPrefs.groupBy)
   const [sortField, setSortField] = useState<SessionSortField>(initialPrefs.sortField)
   const [sortOrder, setSortOrder] = useState<SortOrder>(initialPrefs.sortOrder)
@@ -1171,10 +1176,11 @@ export default function SessionsPage() {
     sortField !== SessionSortField.CreatedAt ||
     sortOrder !== SortOrder.Desc
 
-  const statusChips: { label: string; value: string }[] = [
+  const statusChips: { label: string; value: SessionStatusFilter }[] = [
     { label: 'All', value: 'all' },
     { label: 'Running', value: 'running' },
     { label: 'Stopped', value: 'stopped' },
+    { label: 'Killed', value: 'killed' },
     { label: 'Failed', value: 'failed' },
     { label: 'Stopping', value: 'stopping' },
   ]
@@ -1286,19 +1292,21 @@ export default function SessionsPage() {
                 <Select
                   value={statusFilter}
                   onValueChange={(v) => {
-                    setStatusFilter(v)
-                    setPage(0)
+                    if (isSessionStatusFilter(v)) {
+                      setStatusFilter(v)
+                      setPage(0)
+                    }
                   }}
                 >
                   <SelectTrigger className="flex-1 h-8 text-xs">
                     <SelectValue placeholder="All statuses" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">All statuses</SelectItem>
-                    <SelectItem value="running">Running</SelectItem>
-                    <SelectItem value="stopped">Stopped</SelectItem>
-                    <SelectItem value="failed">Failed</SelectItem>
-                    <SelectItem value="stopping">Stopping</SelectItem>
+                    {statusChips.map((chip) => (
+                      <SelectItem key={chip.value} value={chip.value}>
+                        {chip.label}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
               </div>
@@ -1399,8 +1407,10 @@ export default function SessionsPage() {
             <Select
               value={statusFilter}
               onValueChange={(v) => {
-                setStatusFilter(v)
-                setPage(0)
+                if (isSessionStatusFilter(v)) {
+                  setStatusFilter(v)
+                  setPage(0)
+                }
               }}
             >
               <SelectTrigger className="h-8 w-36 text-sm xl:hidden">
@@ -1420,7 +1430,7 @@ export default function SessionsPage() {
                 type="single"
                 value={statusFilter}
                 onValueChange={(v) => {
-                  if (v) {
+                  if (isSessionStatusFilter(v)) {
                     setStatusFilter(v)
                     setPage(0)
                   }
@@ -1588,7 +1598,7 @@ export default function SessionsPage() {
                     )}
                     {items.map((s) => (
                       <SessionRow
-                        key={s.id}
+                        key={`${s.id}:${s.status}:${s.input_needed ? 'input' : 'normal'}`}
                         session={s}
                         series={seriesMap.get(s.id) ?? []}
                         animateIn={enteringIds.has(s.id)}
