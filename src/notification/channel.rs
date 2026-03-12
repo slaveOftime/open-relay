@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use base64::Engine as _;
+use std::time::Duration;
 use tracing::info;
 
 use crate::{
@@ -103,8 +104,7 @@ impl LocalOsNotificationChannel {
 
         match result {
             Ok(mut child) => {
-                // Reap in a background thread so we never block the async runtime.
-                std::thread::spawn(move || {
+                tokio::task::spawn_blocking(move || {
                     let _ = child.wait();
                 });
             }
@@ -188,12 +188,18 @@ impl WebPushChannel {
 
         validate_vapid_subject(vapid_subject)?;
 
+        let http = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .pool_idle_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| AppError::Protocol(format!("web push HTTP client init failed: {e}")))?;
+
         Ok(Self {
             vapid_private_key_bytes: key_bytes,
             vapid_public_key: b64url(derived_pub.as_bytes()),
             vapid_subject: vapid_subject.to_string(),
             db,
-            http: reqwest::Client::new(),
+            http,
         })
     }
 
