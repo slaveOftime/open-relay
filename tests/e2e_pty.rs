@@ -231,13 +231,14 @@ fn e2e_special_keys_reach_pty_without_error() {
     .expect("sh produced no output within 3 s");
 
     for key in &["shift+tab", "up", "down", "left", "right", "home", "end"] {
+        let key_chunk = format!("key:{key}");
         let output = oly_cmd(&tmp)
-            .args(["input", &id, "--key", key])
+            .args(["send", &id, &key_chunk])
             .output()
-            .expect("oly input failed to execute");
+            .expect("oly send failed to execute");
         assert!(
             output.status.success(),
-            "`oly input --key {key}` returned non-zero.\nstderr: {}",
+            "`oly send key:{key}` returned non-zero.\nstderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
@@ -644,13 +645,13 @@ fn e2e_input_to_nonexistent_session_fails_gracefully() {
     let _daemon = start_daemon(&tmp);
 
     let output = oly_cmd(&tmp)
-        .args(["input", "zzz9999", "--text", "hello"])
+        .args(["send", "zzz9999", "hello"])
         .output()
-        .expect("`oly input` failed to execute");
+        .expect("`oly send` failed to execute");
 
     assert!(
         !output.status.success(),
-        "`oly input` should fail for non-existent session"
+        "`oly send` should fail for non-existent session"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

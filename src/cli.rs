@@ -26,8 +26,8 @@ pub enum Commands {
     Attach(AttachArgs),
     /// Show session logs.
     Logs(LogsArgs),
-    /// Send text or keys to a session.
-    Input(InputArgs),
+    /// Send text or keys to a session. Example: `oly send <id> "hello" key:enter`.
+    Send(SendArgs),
     /// Manage API keys on this (primary) daemon.
     ApiKey(ApiKeyArgs),
     /// Manage this daemon's outbound connections to a primary daemon.
@@ -195,16 +195,19 @@ pub struct LogsArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct InputArgs {
+pub struct SendArgs {
     /// Session ID to send input to.
     pub id: String,
-    /// Send key/control sequence (repeatable): named keys enter/return/cr, lf/linefeed, tab, backspace/bs, esc/escape, up/down/left/right, home/end, pageup/pgup, pagedown/pgdn, delete/del, insert/ins; or hex bytes ('0x1b' / '\x1b'). Example: -k ctrl -k c -k '0x1b' -k '\x1b'
-    ///
-    #[arg(long = "key", short = 'k', value_name = "KEY")]
-    pub keys: Vec<String>,
-    /// Send text input. -t "Hello, world!"
-    #[arg(long, short = 't', value_name = "TEXT")]
-    pub text: Vec<String>,
+    /// Input chunks, processed left to right. Plain text is sent literally.
+    /// Prefix with key: for special keys, e.g. key:enter, key:ctrl+c, key:up.
+    /// Supported keys: enter, tab, esc, backspace, up/down/left/right, home/end,
+    /// pgup/pgdn, del/ins, ctrl+<char>, alt+<char|key>, shift+tab, hex:<bytes>.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "CHUNK"
+    )]
+    pub chunks: Vec<String>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,

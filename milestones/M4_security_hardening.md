@@ -23,8 +23,8 @@
 
 ### Input injection audit trail
 
-- [ ] Log every `oly input` invocation (caller identity, session id, byte count, key specs) to `events.log`.
-- [ ] Implement guarded-mode policy for `oly input`:
+- [ ] Log every `oly send` invocation (caller identity, session id, byte count, key specs) to `events.log`.
+- [ ] Implement guarded-mode policy for `oly send`:
   - Default: allow literal bytes + known key specs.
   - Optional `--strict` flag: reject high-risk shell metacharacter payloads unless explicitly overridden.
 

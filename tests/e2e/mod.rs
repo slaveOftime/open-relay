@@ -209,12 +209,12 @@ pub fn start_session(tmp: &PathBuf, cmd_and_args: &[&str]) -> String {
 
 pub fn send_line(tmp: &PathBuf, id: &str, text: &str) {
     let output = oly_cmd(tmp)
-        .args(["input", id, "--text", text, "--key", "enter"])
+        .args(["send", id, text, "key:enter"])
         .output()
-        .expect("`oly input` failed to execute");
+        .expect("`oly send` failed to execute");
     assert!(
         output.status.success(),
-        "`oly input --text …` exited non-zero.\nstdout: {}\nstderr: {}",
+        "`oly send` exited non-zero.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -222,24 +222,25 @@ pub fn send_line(tmp: &PathBuf, id: &str, text: &str) {
 
 pub fn send_text_only(tmp: &PathBuf, id: &str, text: &str) {
     let output = oly_cmd(tmp)
-        .args(["input", id, "--text", text])
+        .args(["send", id, text])
         .output()
-        .expect("`oly input --text` failed to execute");
+        .expect("`oly send` failed to execute");
     assert!(
         output.status.success(),
-        "`oly input --text` (no enter) exited non-zero.\nstderr: {}",
+        "`oly send` (text only) exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
 pub fn send_key(tmp: &PathBuf, id: &str, key: &str) {
+    let key_chunk = format!("key:{key}");
     let output = oly_cmd(tmp)
-        .args(["input", id, "--key", key])
+        .args(["send", id, &key_chunk])
         .output()
-        .expect("`oly input --key` failed to execute");
+        .expect("`oly send` failed to execute");
     assert!(
         output.status.success(),
-        "`oly input --key {key}` exited non-zero.\nstderr: {}",
+        "`oly send key:{key}` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 }

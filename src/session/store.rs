@@ -333,7 +333,7 @@ impl SessionStore {
         // When the child process has enabled DECCKM (application cursor key
         // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
         // instead of `\x1b[`.  Transform transparently here so both
-        // `oly attach` and `oly input` always work, regardless of whether the
+        // `oly attach` and `oly send` always work, regardless of whether the
         // caller tracks DECCKM state itself.
         let modes = rt.mode_snapshot();
         let cooked;
