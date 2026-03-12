@@ -43,6 +43,18 @@ impl PtyHandle {
             .is_ok()
     }
 
+    /// Release PTY-owned handles once the session is completed.
+    ///
+    /// This closes the stored master handle and replaces the public writer
+    /// sender with a permanently closed channel so future writes fail fast.
+    pub fn release_resources(&mut self) {
+        self.pty_master.take();
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+        drop(closed_rx);
+        let previous_tx = std::mem::replace(&mut self.writer_tx, closed_tx);
+        drop(previous_tx);
+    }
+
     /// Send SIGKILL / close ConPTY.
     pub fn kill(&mut self) -> std::io::Result<()> {
         self.child.kill()

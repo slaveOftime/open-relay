@@ -120,7 +120,7 @@ impl AppConfig {
 
         Ok(Self {
             log_level,
-            ring_buffer_bytes: 4_194_304,
+            ring_buffer_bytes: 1_048_576,
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds,

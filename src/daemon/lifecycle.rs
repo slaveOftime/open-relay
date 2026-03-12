@@ -1,4 +1,4 @@
-use std::{fs::File, process::Stdio, sync::Arc};
+use std::{fs::File, process::Stdio, sync::Arc, time::Duration};
 
 use interprocess::local_socket::traits::tokio::Listener as _;
 use tokio::sync::{Mutex, mpsc};
@@ -307,6 +307,9 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         });
     }
 
+    let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
+    session_maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -316,6 +319,10 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             _ = shutdown_rx.recv() => {
                 info!("daemon received stop request, shutting down");
                 break;
+            }
+            _ = session_maintenance_tick.tick() => {
+                let mut store = session_store.lock().await;
+                store.run_maintenance().await;
             }
             incoming = listener.accept() => {
                 match incoming {
