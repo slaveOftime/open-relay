@@ -34,7 +34,7 @@ You start an agent or interactive CLI task. It runs for 20 minutes. Halfway thro
 - Owns agent sessions in a background daemon — closing your terminal changes nothing
 - Replays buffered output when you reattach (no lost context)
 - Detects when input is likely needed and notifies you
-- Lets you inject input without attaching (`oly input <id> --key enter`)
+- Lets you inject input without attaching (`oly send <id> key:enter`)
 - Keeps auditable logs of everything
 
 ### Who it's for
@@ -112,7 +112,7 @@ oly ls
 oly logs <id>
 
 # Something needs your input — send it without a terminal
-oly input <id> --text "yes" --key enter
+oly send <id> "yes" key:enter
 
 # Actually attach and drive it yourself
 # Ctrl+D to detach anytime
@@ -155,7 +155,7 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 | `oly ls` | Show sessions (supports search/status/time filters) |
 | `oly attach <id>` | Reattach (replays buffer first) |
 | `oly logs <id> [--tail N] [--wait-for-prompt]` | Read logs without attaching |
-| `oly input <id> [--text TEXT] [--key k]` | Send input without attaching |
+| `oly send <id> [CHUNK]...` | Send input without attaching |
 | `oly stop <id>` | Graceful stop |
 
 ### Federation commands

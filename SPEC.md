@@ -41,7 +41,7 @@
    - `oly stop <id> [--grace <seconds>] [--node <name>]`
    - `oly ls [--search <text>] [--status <status>]... [--since <RFC3339>] [--until <RFC3339>] [--limit <n>] [--node <name>]`
    - `oly attach <id> [--node <name>]`
-   - `oly input <id> [--key <key>]... [--text <text>]... [--node <name>]`
+   - `oly send <id> [CHUNK]... [--node <name>]`
    - `oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <ms>] [--node <name>]`
 3. PTY-backed child process execution with detach/reattach.
 4. Rolling in-memory output buffer (default 10,000 lines) plus on-disk log persistence.
@@ -114,7 +114,7 @@ src/
   client/
     mod.rs             – Re-exports for all client-side commands.
     attach.rs          – run_attach, RawModeGuard, terminal query responses.
-    input.rs           – run_input, key-spec parsing.
+    input.rs           – run_send, key-spec parsing.
     list.rs            – run_list, query building, display formatting.
     logs.rs            – run_logs, VT100 frame building, replay viewer.
     join.rs            – JoinConfig, run_join, run_join_stop, connector task.
@@ -194,14 +194,13 @@ Each session has:
 
 ### 5.6 Send input without attach
 
-`oly input <id> [--key <key> --key <key>]... [--text <text>]... [--node <name>]`
+`oly send <id> [CHUNK]... [--node <name>]`
 
 - Sends input bytes to the target session PTY without opening `attach`.
 - Supports automation flow driven by `oly logs <id>` output with agent analysis.
-- Accepts piped stdin (example: `cmd xxx | oly input <id>`).
-- When both `--text` and piped stdin are present, sends `--text` first, then stdin stream.
-- Repeated `--text` values are joined by single spaces, sent literally, and do not append an implicit newline.
-- `--key` sends terminal key/control sequences (repeatable), including named keys (`enter`, `tab`, `esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, `backspace`), modifier forms (`ctrl+<char>`, `alt+<char|named-key>`, `meta+<char|named-key>`, `shift+tab`, `shift+<char>`, `capslock+<char>`), and aliases (`ctrl-`, `alt-`, `meta-`, `shift-`, `caps-`).
+- Accepts piped stdin (example: `cmd xxx | oly send <id>`); cannot be combined with positional chunks.
+- Positional chunks are processed left to right. Plain text is sent literally. Prefix with `key:` for special keys.
+- `key:<spec>` sends terminal key/control sequences, including named keys (`enter`, `tab`, `esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, `backspace`), modifier forms (`ctrl+<char>`, `alt+<char|named-key>`, `meta+<char|named-key>`, `shift+tab`), and raw bytes (`hex:<bytes>`).
 
 ## 6. PTY + Buffer Requirements
 
@@ -323,7 +322,7 @@ Known platform caveats are allowed if documented in release notes.
 ## 11. Security Requirements (MVP)
 
 1. IPC caller identity verification is mandatory (section 3.2).
-2. `oly input` must support a guarded mode for automation/supervisor channels:
+2. `oly send` must support a guarded mode for automation/supervisor channels:
 	- default allows literal bytes + known key specs,
 	- optional strict policy rejects high-risk shell metacharacter payloads unless explicitly overridden,
 	- all injected input events are audit-logged.

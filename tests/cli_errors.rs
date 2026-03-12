@@ -137,20 +137,20 @@ fn start_without_daemon_exits_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
-// oly input – daemon unavailable
+// oly send – daemon unavailable
 // ---------------------------------------------------------------------------
 
 #[test]
 fn input_without_daemon_exits_nonzero() {
     let tmp = make_tmp_dir("input_no_daemon");
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "hello"])
+        .args(["send", "abc1234", "hello"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
     assert!(
         !output.status.success(),
-        "`oly input` should exit non-zero when daemon is not running"
+        "`oly send` should exit non-zero when daemon is not running"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -186,24 +186,24 @@ fn logs_session_not_found_exits_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
-// oly input – key validation errors (no daemon required)
+// oly send – key validation errors (no daemon required)
 //
-// Key spec errors are caught in parse_key_inputs() BEFORE any IPC attempt.
-// These tests verify that invalid --key values produce clear, non-zero exits.
+// Key spec errors are caught before any IPC attempt.
+// These tests verify that invalid key: chunks produce clear, non-zero exits.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn input_unsupported_key_spec_exits_nonzero_with_message() {
     let tmp = make_tmp_dir("input_bad_key");
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "--key", "foobar"])
+        .args(["send", "abc1234", "key:foobar"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
     // "foobar" is not a recognised key name → parse error before IPC.
     assert!(
         !output.status.success(),
-        "`oly input --key foobar` should exit non-zero (unsupported key)"
+        "`oly send key:foobar` should exit non-zero (unsupported key)"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -216,14 +216,14 @@ fn input_unsupported_key_spec_exits_nonzero_with_message() {
 fn input_modifier_only_key_exits_nonzero_with_message() {
     let tmp = make_tmp_dir("input_modifier_only");
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "--key", "ctrl"])
+        .args(["send", "abc1234", "key:ctrl"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
-    // Lone modifier → error: "modifier --key `ctrl` must be followed by a key value".
+    // Lone modifier → error.
     assert!(
         !output.status.success(),
-        "`oly input --key ctrl` (modifier alone) should exit non-zero"
+        "`oly send key:ctrl` (modifier alone) should exit non-zero"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -237,13 +237,13 @@ fn input_ctrl_multichar_key_exits_nonzero() {
     let tmp = make_tmp_dir("input_ctrl_multichar");
     // "ctrl+ab" – ctrl sequences require exactly one character.
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "--key", "ctrl+ab"])
+        .args(["send", "abc1234", "key:ctrl+ab"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
     assert!(
         !output.status.success(),
-        "`oly input --key ctrl+ab` should exit non-zero (multi-char ctrl)"
+        "`oly send key:ctrl+ab` should exit non-zero (multi-char ctrl)"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -253,38 +253,16 @@ fn input_ctrl_multichar_key_exits_nonzero() {
 }
 
 #[test]
-fn input_two_consecutive_modifiers_exits_nonzero() {
-    let tmp = make_tmp_dir("input_double_modifier");
-    // --key ctrl --key alt → second modifier before a key value for the first.
-    let output = oly_cmd(&tmp)
-        .args([
-            "input", "abc1234", "--key", "ctrl", "--key", "alt", "--key", "c",
-        ])
-        .output()
-        .expect("failed to run oly input");
-
-    assert!(
-        !output.status.success(),
-        "two consecutive modifiers should exit non-zero"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("modifier") || stderr.contains("error"),
-        "expected modifier-ordering error, got: {stderr}"
-    );
-}
-
-#[test]
 fn input_empty_key_value_exits_nonzero() {
     let tmp = make_tmp_dir("input_empty_key");
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "--key", ""])
+        .args(["send", "abc1234", "key:"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
     assert!(
         !output.status.success(),
-        "`oly input --key ''` should exit non-zero (empty key)"
+        "`oly send key:` should exit non-zero (empty key)"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -294,7 +272,7 @@ fn input_empty_key_value_exits_nonzero() {
 }
 
 // ---------------------------------------------------------------------------
-// oly input – valid key specs exit non-zero only because daemon unavailable
+// oly send – valid key specs exit non-zero only because daemon unavailable
 // (verifies that valid specs are accepted by the parser and reach IPC stage)
 // ---------------------------------------------------------------------------
 
@@ -302,19 +280,18 @@ fn input_empty_key_value_exits_nonzero() {
 fn input_valid_ctrl_c_reaches_daemon_check() {
     let tmp = make_tmp_dir("input_valid_ctrl");
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "--key", "ctrl+c"])
+        .args(["send", "abc1234", "key:ctrl+c"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
     // Key is valid → gets past parser → fails at daemon connection.
-    // The error must mention "daemon" or "connection", NOT "unsupported" or "modifier".
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
         "should exit non-zero when daemon is unavailable"
     );
     assert!(
-        !stderr.contains("unsupported --key") && !stderr.contains("modifier-only"),
+        !stderr.contains("unsupported") && !stderr.contains("modifier"),
         "error should be about daemon, not key parsing; got: {stderr}"
     );
 }
@@ -323,14 +300,14 @@ fn input_valid_ctrl_c_reaches_daemon_check() {
 fn input_valid_shift_tab_reaches_daemon_check() {
     let tmp = make_tmp_dir("input_valid_shift_tab");
     let output = oly_cmd(&tmp)
-        .args(["input", "abc1234", "--key", "shift+tab"])
+        .args(["send", "abc1234", "key:shift+tab"])
         .output()
-        .expect("failed to run oly input");
+        .expect("failed to run oly send");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        !stderr.contains("unsupported --key"),
+        !stderr.contains("unsupported"),
         "shift+tab should be a valid key spec; got: {stderr}"
     );
 }
@@ -339,18 +316,19 @@ fn input_valid_shift_tab_reaches_daemon_check() {
 fn input_valid_arrow_keys_reach_daemon_check() {
     for key in &["up", "down", "left", "right"] {
         let tmp = make_tmp_dir(&format!("input_arrow_{key}"));
+        let key_chunk = format!("key:{key}");
         let output = oly_cmd(&tmp)
-            .args(["input", "abc1234", "--key", key])
+            .args(["send", "abc1234", &key_chunk])
             .output()
-            .expect("failed to run oly input");
+            .expect("failed to run oly send");
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
-            "`oly input --key {key}` should fail (no daemon), not from key parse error"
+            "`oly send key:{key}` should fail (no daemon), not from key parse error"
         );
         assert!(
-            !stderr.contains("unsupported --key"),
+            !stderr.contains("unsupported"),
             "arrow key '{key}' should be a valid key spec; got: {stderr}"
         );
     }

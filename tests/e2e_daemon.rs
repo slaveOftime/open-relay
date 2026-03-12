@@ -115,9 +115,9 @@ fn e2e_evicted_session_input_fails_gracefully() {
 
     while Instant::now() < deadline {
         let output = oly_cmd(&tmp)
-            .args(["input", &id, "--text", "still_there?"])
+            .args(["send", &id, "still_there?"])
             .output()
-            .expect("`oly input` failed to execute");
+            .expect("`oly send` failed to execute");
 
         last_stderr = String::from_utf8_lossy(&output.stderr).to_string();
         if !output.status.success() {
@@ -130,7 +130,7 @@ fn e2e_evicted_session_input_fails_gracefully() {
 
     assert!(
         saw_failure,
-        "`oly input` remained successful past eviction timeout; last stderr: {last_stderr}"
+        "`oly send` remained successful past eviction timeout; last stderr: {last_stderr}"
     );
     assert!(
         last_stderr.contains("evicted")
@@ -463,20 +463,18 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     const REMOTE_MARKER: &str = "oly_federation_remote_marker";
     let input = oly_cmd(&primary_tmp)
         .args([
-            "input",
+            "send",
             &session_id,
             "--node",
             "worker1",
-            "--text",
             &format!("echo {REMOTE_MARKER}"),
-            "--key",
-            "enter",
+            "key:enter",
         ])
         .output()
-        .expect("`oly input --node` failed to execute");
+        .expect("`oly send --node` failed to execute");
     assert!(
         input.status.success(),
-        "`oly input --node` exited non-zero.\nstderr: {}",
+        "`oly send --node` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&input.stderr)
     );
 

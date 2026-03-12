@@ -171,9 +171,9 @@ async fn run() -> Result<()> {
             .await
         }
 
-        Commands::Input(input_args) => {
-            let node = input_args.node.clone();
-            client::run_input(&config, input_args, node).await
+        Commands::Send(send_args) => {
+            let node = send_args.node.clone();
+            client::run_send(&config, send_args, node).await
         }
 
         // ── API key management (primary side) ────────────────────────────────

@@ -37,9 +37,9 @@
 - [x] Implement `oly stop <id> [--grace <seconds>]` (graceful SIGTERM/TerminateProcess then force-kill fallback).
 - [x] Implement `oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <ms>]` from persisted logs.
 - [x] Default `--tail` to 40 lines.
-- [x] Implement `oly input <id> [--text <text>]...` for non-attach PTY input.
-- [x] Support piped stdin for input automation (`cmd xxx | oly input <id>`).
-- [x] Add repeatable `--key <key>` with named keys, modifier forms (`ctrl/alt/meta/shift/capslock`), and dash-style aliases.
+- [x] Implement `oly send <id> [CHUNK]...` for non-attach PTY input.
+- [x] Support piped stdin for input automation (`cmd xxx | oly send <id>`).
+- [x] Support `key:<spec>` chunks with named keys and modifier forms (`ctrl/alt/meta/shift+tab`).
 
 ### Verification
 

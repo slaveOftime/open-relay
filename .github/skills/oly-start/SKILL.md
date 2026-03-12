@@ -37,26 +37,27 @@ Notes:
 
 ## Send input
 
-Send normal text:
+Send text followed by enter:
 
 ```bash
-oly input <id> --text "yes" --key enter
+oly send <id> "yes" key:enter
 ```
 
-Send multiple keys:
+Send special keys:
 
 ```bash
-oly input <id> --key shift --key tab
-oly input <id> --key ctrl+c
+oly send <id> key:shift+tab
+oly send <id> key:ctrl+c
 ```
 
 Key syntax notes:
 
-- `-k` is the short form of `--key`.
-- You can split modifier sequences across repeated flags, for example `--key ctrl --key c`.
-- Supported named keys are: `enter`, `return`, `cr`, `lf`, `linefeed`, `tab`, `backspace`, `bs`, `esc`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pgup`, `pagedown`, `pgdn`, `delete`, `del`, `insert`, `ins`.
-- Supported modifier forms include: `ctrl+<char>`, `alt+<char|named-key>`, `meta+<char|named-key>`, `shift+<char|tab>`, `capslock+<letter>`.
-- Hex byte input is also supported, for example `0x1b` or `\x1b`.
+- Prefix special keys with `key:`, e.g. `key:enter`, `key:ctrl+c`, `key:alt+x`.
+- Plain arguments are sent as literal text.
+- Chunks are processed left to right, so `oly send <id> "hello" key:enter` types "hello" then presses enter.
+- Supported named keys: `enter`, `return`, `cr`, `lf`, `linefeed`, `tab`, `backspace`, `bs`, `esc`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pgup`, `pagedown`, `pgdn`, `delete`, `del`, `insert`, `ins`.
+- Supported modifier forms: `ctrl+<char>`, `alt+<char|named-key>`, `meta+<char|named-key>`, `shift+tab`.
+- Raw hex bytes: `key:hex:1b` or `key:hex:1b5b41`.
 
 After sending input, you can wait again:
 
@@ -99,5 +100,5 @@ Useful `oly ls` filters:
 1. Start the command with `oly start --detach`.
 2. Watch with `oly logs <id> --no-truncate  --wait-for-prompt`.
 3. Decide whether to answer the prompt yourself or escalate to the user.
-4. Send input with `oly input <id> ...` if the context is clear.
+4. Send input with `oly send <id> ...` if the context is clear.
 5. Repeat until the task finishes, then stop or leave the session running as appropriate.
