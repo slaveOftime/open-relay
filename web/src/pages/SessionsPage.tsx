@@ -1598,7 +1598,7 @@ export default function SessionsPage() {
                     )}
                     {items.map((s) => (
                       <SessionRow
-                        key={s.id}
+                        key={`${s.id}:${s.status}:${s.input_needed ? 'input' : 'normal'}`}
                         session={s}
                         series={seriesMap.get(s.id) ?? []}
                         animateIn={enteringIds.has(s.id)}
