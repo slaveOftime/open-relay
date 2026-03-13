@@ -137,15 +137,17 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                         match serde_json::from_str::<NodeWsMessage>(&text) {
                             Ok(NodeWsMessage::RpcResponse { id, response }) => {
                                 if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
-                                    let mut pm = pending_recv.lock().await;
-                                    if let Some(sender) = pm.remove(&id) {
+                                    let sender = {
+                                        let mut pm = pending_recv.lock().await;
+                                        pm.remove(&id)
+                                    };
+                                    if let Some(sender) = sender {
                                         match sender {
                                             PendingRpc::OneShot(tx) => {
                                                 let _ = tx.send(Ok(rpc_resp));
                                             }
                                             PendingRpc::Stream(tx) => {
-                                                let _ = tx.send(Ok(rpc_resp));
-                                                // One-shot response on a stream channel — done.
+                                                let _ = tx.send(Ok(rpc_resp)).await;
                                             }
                                         }
                                     }
@@ -153,13 +155,16 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                             }
                             Ok(NodeWsMessage::RpcStreamFrame { id, response, done }) => {
                                 if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
-                                    let mut pm = pending_recv.lock().await;
                                     if done {
-                                        // Final frame — remove and send.
-                                        if let Some(sender) = pm.remove(&id) {
+                                        // Final frame — remove sender from pending and send.
+                                        let sender = {
+                                            let mut pm = pending_recv.lock().await;
+                                            pm.remove(&id)
+                                        };
+                                        if let Some(sender) = sender {
                                             match sender {
                                                 PendingRpc::Stream(tx) => {
-                                                    let _ = tx.send(Ok(rpc_resp));
+                                                    let _ = tx.send(Ok(rpc_resp)).await;
                                                 }
                                                 PendingRpc::OneShot(tx) => {
                                                     let _ = tx.send(Ok(rpc_resp));
@@ -167,18 +172,22 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                             }
                                         }
                                     } else {
-                                        // Intermediate frame — send but keep channel.
-                                        // If the receiver was dropped, remove the entry.
-                                        let should_remove = if let Some(sender) = pm.get(&id) {
-                                            match sender {
-                                                PendingRpc::Stream(tx) => tx.send(Ok(rpc_resp)).is_err(),
-                                                PendingRpc::OneShot(_) => false,
+                                        // Intermediate frame — clone sender (under lock), drop
+                                        // lock, then send with backpressure.
+                                        let tx_clone = {
+                                            let pm = pending_recv.lock().await;
+                                            if let Some(PendingRpc::Stream(tx)) = pm.get(&id) {
+                                                Some(tx.clone())
+                                            } else {
+                                                None
                                             }
-                                        } else {
-                                            false
                                         };
-                                        if should_remove {
-                                            pm.remove(&id);
+                                        if let Some(tx) = tx_clone {
+                                            if tx.send(Ok(rpc_resp)).await.is_err() {
+                                                // Receiver dropped; clean up pending entry.
+                                                let mut pm = pending_recv.lock().await;
+                                                pm.remove(&id);
+                                            }
                                         }
                                     }
                                 }

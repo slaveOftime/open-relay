@@ -12,8 +12,8 @@ use crate::{
 pub enum PendingRpc {
     /// Single request/response — resolved once.
     OneShot(oneshot::Sender<Result<RpcResponse>>),
-    /// Streaming — multiple frames delivered until stream ends.
-    Stream(mpsc::UnboundedSender<Result<RpcResponse>>),
+    /// Streaming — multiple frames delivered until stream ends (bounded).
+    Stream(mpsc::Sender<Result<RpcResponse>>),
 }
 
 /// A live connection to a secondary node.
@@ -87,7 +87,7 @@ impl NodeRegistry {
         &self,
         node: &str,
         request: &crate::protocol::RpcRequest,
-    ) -> Result<(String, mpsc::UnboundedReceiver<Result<RpcResponse>>)> {
+    ) -> Result<(String, mpsc::Receiver<Result<RpcResponse>>)> {
         let (send_tx, pending) = {
             let nodes = self.nodes.lock().await;
             let handle = nodes
@@ -97,7 +97,7 @@ impl NodeRegistry {
         };
 
         let id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(256);
 
         {
             let mut pending_map = pending.lock().await;
