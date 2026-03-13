@@ -56,24 +56,24 @@ const popularKeys = [
   { key: 'alt', label: 'alt', instant: false },
   { key: 'meta', label: 'meta', instant: false },
   { key: 'tab', label: 'tab', instant: false },
+  { key: 'shift+tab', label: 'shift+tab', instant: true },
   { key: 'esc', label: 'esc', instant: true },
   { key: 'enter', label: 'enter', instant: true },
-  { key: 'shift+tab', label: 'shift+tab', instant: true },
-  { key: 'ctrl+c', label: '^C', instant: true },
   { key: 'ctrl+d', label: '^D', instant: true },
   { key: 'ctrl+l', label: '^L', instant: true },
   { key: 'ctrl+z', label: '^Z', instant: true },
+  { key: 'ctrl+c', label: '^C', instant: true },
+  { key: 'del', label: 'del', instant: true },
+  { key: 'backspace', label: '⌫', instant: true },
+  { key: 'home', label: 'home', instant: true },
+  { key: 'end', label: 'end', instant: true },
   { key: 'left', label: '←', instant: true },
   { key: 'up', label: '↑', instant: true },
   { key: 'down', label: '↓', instant: true },
   { key: 'right', label: '→', instant: true },
-  { key: 'backspace', label: '⌫', instant: true },
-  { key: 'home', label: 'home', instant: true },
-  { key: 'end', label: 'end', instant: true },
   { key: 'pgup', label: 'pgup', instant: true },
   { key: 'pgdn', label: 'pgdn', instant: true },
   { key: 'ins', label: 'ins', instant: true },
-  { key: 'del', label: 'del', instant: true },
 ]
 
 export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProps) {
@@ -194,9 +194,9 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                   <TooltipTrigger asChild>
                     <Button
                       type="button"
-                      variant={instant ? 'default' : 'secondary'}
+                      variant="secondary"
                       size="sm"
-                      className="font-mono text-xs"
+                      className={`font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700' : key === 'esc' || key === 'enter' ? 'bg-amber-700' : instant ? 'bg-[hsl(var(--primary))]/30' : ''}`}
                       onClick={() => {
                         if (instant) {
                           if (customKeys.trim()) {

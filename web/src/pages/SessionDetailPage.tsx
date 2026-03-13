@@ -192,7 +192,10 @@ export default function SessionDetailPage() {
       for (const c of chunks) total += c.length
       const merged = new Uint8Array(total)
       let off = 0
-      for (const c of chunks) { merged.set(c, off); off += c.length }
+      for (const c of chunks) {
+        merged.set(c, off)
+        off += c.length
+      }
       term.write(merged)
     }
     term.scrollToBottom()
@@ -386,7 +389,7 @@ export default function SessionDetailPage() {
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
     return () => {
       isMounted.current = false
     }
@@ -507,7 +510,7 @@ export default function SessionDetailPage() {
             .then((s) => {
               if (isMounted.current) setSession(s)
             })
-            .catch(() => { })
+            .catch(() => {})
         },
         onError: (msg) => {
           lastWsFrameAtRef.current = Date.now()
@@ -653,9 +656,9 @@ export default function SessionDetailPage() {
           .then((s) => {
             if (isMounted.current) setSession(s)
           })
-          .catch(() => { })
+          .catch(() => {})
       })
-      .catch(() => { })
+      .catch(() => {})
 
     return () => {
       cancelled = true
@@ -755,21 +758,21 @@ export default function SessionDetailPage() {
 
   async function handleStop() {
     if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => { })
+    await stopSession(id, undefined, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
   async function handleKill() {
     if (!id) return
-    await killSession(id, node ?? undefined).catch(() => { })
+    await killSession(id, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -805,18 +808,18 @@ export default function SessionDetailPage() {
   // Unused var suppression
   void logLines
 
-  const attachedState =
-    <div className='flex items-center gap-2 opacity-60 text-xs'>
+  const attachedState = (
+    <div className="flex items-center gap-2 opacity-60 text-xs">
       {mode === 'attach' &&
         (wsConnected ? (
           <>
             <Link1Icon className="h-4 w-4" />
             <span>Attached</span>
-            </>
+          </>
         ) : wsConnecting ? (
           <>
             <TrackNextIcon className="h-4 w-4" />
-              {wsEverConnected ? 'Reconnecting' : 'Connecting'}
+            {wsEverConnected ? 'Reconnecting' : 'Connecting'}
           </>
         ) : (
           <>
@@ -824,8 +827,8 @@ export default function SessionDetailPage() {
             Disconnected
           </>
         ))}
-    </div>;
-
+    </div>
+  )
 
   return (
     <TooltipProvider>
@@ -848,9 +851,7 @@ export default function SessionDetailPage() {
                 {node}
               </Badge>
             )}
-            <div className='hidden sm:inline-block'>
-              {attachedState}
-            </div>
+            <div className="hidden sm:inline-block">{attachedState}</div>
             {mode === 'attach' && !isOnline && (
               <Badge className="inline-flex font-light border-amber-400/40 bg-amber-400/10 text-amber-600 dark:text-amber-300">
                 <TrackNextIcon className="h-4 w-4" />
@@ -1127,9 +1128,7 @@ export default function SessionDetailPage() {
               <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none">
                 <AttachPanel sendInput={sendInput} showKeyError={showKeyError} />
               </div>
-              <div className='sm:hidden flex items-center justify-center h-8'>
-                {attachedState}
-              </div>
+              <div className="sm:hidden flex items-center justify-center h-8">{attachedState}</div>
             </>
           )}
         </div>

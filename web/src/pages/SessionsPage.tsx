@@ -96,6 +96,11 @@ type SessionPrefs = {
   sortOrder: SortOrder
 }
 
+type LoadErrorState = {
+  title: string
+  message: string
+}
+
 function normalizeStatusFilter(value: unknown): SessionStatusFilter {
   return isSessionStatusFilter(value) ? value : 'all'
 }
@@ -162,6 +167,14 @@ function normalizeStoredNode(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
   return trimmed === '' ? null : trimmed
+}
+
+function getErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error) {
+    const message = error.message.trim()
+    return message === '' ? fallback : message
+  }
+  return fallback
 }
 
 function getSessionListRequestKey(params: ListParams): string {
@@ -288,7 +301,7 @@ function SessionRow({
           className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
           onClick={(e) => {
             e.stopPropagation()
-            navigator.clipboard.writeText(session.id).catch(() => { })
+            navigator.clipboard.writeText(session.id).catch(() => {})
           }}
         >
           <Tooltip>
@@ -337,7 +350,10 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg series={series} enableAnimation={(isRunning && (node === null || node === "__local__"))} />
+          <SparklineSvg
+            series={series}
+            enableAnimation={isRunning && (node == null || node === '__local__')}
+          />
         </TableCell>
 
         {/* PID */}
@@ -446,8 +462,9 @@ function SessionCard({
   const isRunning =
     session.status === 'running' || session.status === 'stopping' || session.status === 'created'
 
-  const titleTone =
-    isTerminalStatus(session.status) ? 'text-[hsl(var(--foreground))]/70' : 'text-[hsl(var(--foreground))]'
+  const titleTone = isTerminalStatus(session.status)
+    ? 'text-[hsl(var(--foreground))]/70'
+    : 'text-[hsl(var(--foreground))]'
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
 
   function openSession(mode: 'attach' | 'logs') {
@@ -508,7 +525,7 @@ function SessionCard({
           )}
 
           {/* Row 4: activity sparkline */}
-          {session.status === 'running' && (node === null || node === "__local__") && (
+          {session.status === 'running' && (node == null || node === '__local__') && (
             <div className="pt-1 w-full opacity-90">
               <SparklineSvg
                 series={series}
@@ -832,11 +849,19 @@ function SortIcon({
 
 // ── Empty state ────────────────────────────────────────────────────────────
 
-function EmptyState({ onNewSession }: { onNewSession: () => void }) {
+function EmptyState({
+  onNewSession,
+  selectedNode,
+}: {
+  onNewSession: () => void
+  selectedNode: string | null
+}) {
   return (
     <div className="flex flex-col items-center justify-center py-24 text-[hsl(var(--muted-foreground))] gap-3">
       <Logo size={80} />
-      <p className="text-sm text-[hsl(var(--muted-foreground))]">No sessions yet.</p>
+      <p className="text-sm text-[hsl(var(--muted-foreground))]">
+        No sessions yet{selectedNode ? ` on ${selectedNode}` : ''}.
+      </p>
       <Button size="sm" onClick={onNewSession}>
         <PlusIcon className="w-4 h-4" />
         New Session
@@ -873,6 +898,7 @@ export default function SessionsPage() {
   const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set())
   const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
+  const [loadError, setLoadError] = useState<LoadErrorState | null>(null)
 
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isMounted = useRef(true)
@@ -913,8 +939,13 @@ export default function SessionsPage() {
         hasLoadedRef.current = true
         applySessionItems(res.items)
         setRemoteTotal(res.total)
-      } catch {
-        /* ignore */
+      } catch (error) {
+        if (isMounted.current && !opts?.background) {
+          setLoadError({
+            title: 'Unable to load sessions',
+            message: getErrorMessage(error, 'Failed to load local sessions.'),
+          })
+        }
       } finally {
         if (isMounted.current) {
           if (shouldShowSkeleton) setLoading(false)
@@ -949,8 +980,13 @@ export default function SessionsPage() {
         hasLoadedRef.current = true
         applySessionItems(res.items)
         setRemoteTotal(res.total)
-      } catch {
-        /* ignore */
+      } catch (error) {
+        if (isMounted.current && !opts?.background) {
+          setLoadError({
+            title: 'Unable to load sessions',
+            message: getErrorMessage(error, 'Failed to load remote sessions.'),
+          })
+        }
       } finally {
         if (isMounted.current) {
           if (shouldShowSkeleton) setLoading(false)
@@ -963,7 +999,18 @@ export default function SessionsPage() {
 
   const reloadSessions = useCallback(
     async (opts?: { background?: boolean }) => {
-      fetchNodes().catch(() => { })
+      void fetchNodes()
+        .then((nextNodes) => {
+          if (isMounted.current) setNodes(nextNodes)
+        })
+        .catch((error) => {
+          if (isMounted.current && !opts?.background) {
+            setLoadError({
+              title: 'Unable to load nodes',
+              message: getErrorMessage(error, 'Failed to refresh connected nodes.'),
+            })
+          }
+        })
       if (selectedNode) {
         await loadRemote(opts)
         return
@@ -991,7 +1038,7 @@ export default function SessionsPage() {
   useEffect(() => {
     fetchNodes()
       .then(setNodes)
-      .catch(() => { })
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -1137,11 +1184,11 @@ export default function SessionsPage() {
   }
 
   async function handleStop(id: string) {
-    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => { })
+    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
   }
   async function handleKill(id: string) {
-    await killSession(id, selectedNode ?? undefined).catch(() => { })
+    await killSession(id, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
   }
 
@@ -1216,6 +1263,27 @@ export default function SessionsPage() {
   return (
     <TooltipProvider>
       <div className="flex flex-col h-full bg-[hsl(var(--background))] text-[hsl(var(--foreground))]">
+        <Dialog
+          open={loadError !== null}
+          onOpenChange={(open) => {
+            if (!open) setLoadError(null)
+          }}
+        >
+          <DialogContent className="max-w-sm">
+            <DialogHeader>
+              <DialogTitle>{loadError?.title ?? 'Error'}</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-[hsl(var(--muted-foreground))]">
+              {loadError?.message ?? 'Something went wrong.'}
+            </p>
+            <div className="flex justify-end pt-1">
+              <Button size="sm" onClick={() => setLoadError(null)}>
+                Close
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
         {/* ── Header ── */}
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
@@ -1482,7 +1550,7 @@ export default function SessionsPage() {
             sessions.length === 0 &&
             Array.from({ length: 5 }).map((_, i) => <SkeletonCard key={i} />)}
           {!loading && sessions.length === 0 && (
-            <EmptyState onNewSession={() => setShowNewSession(true)} />
+            <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
           )}
           {!loading && sessions.length > 0 && (
             <div className="pb-4">
@@ -1523,7 +1591,7 @@ export default function SessionsPage() {
             </Table>
           )}
           {!loading && sessions.length === 0 && (
-            <EmptyState onNewSession={() => setShowNewSession(true)} />
+            <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
           )}
           {!loading && sessions.length > 0 && (
             <Table className="w-full border-collapse table-fixed">
@@ -1563,10 +1631,11 @@ export default function SessionsPage() {
                   ).map((col) => (
                     <TableHead
                       key={col.key}
-                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${col.sortField
+                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
+                        col.sortField
                           ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
                           : 'text-[hsl(var(--muted-foreground))]'
-                        } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
+                      } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
                       onClick={col.sortField ? () => handleSort(col.sortField!) : undefined}
                     >
                       <span className="inline-flex items-center gap-1">
@@ -1661,13 +1730,13 @@ export default function SessionsPage() {
           initialValues={
             rerunSession
               ? {
-                cmd: rerunSession.command,
-                args: rerunSession.args
-                  .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
-                  .join(' '),
-                title: rerunSession.title ?? '',
-                cwd: rerunSession.cwd ?? '',
-              }
+                  cmd: rerunSession.command,
+                  args: rerunSession.args
+                    .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+                    .join(' '),
+                  title: rerunSession.title ?? '',
+                  cwd: rerunSession.cwd ?? '',
+                }
               : undefined
           }
           node={selectedNode ?? undefined}
