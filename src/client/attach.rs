@@ -376,7 +376,15 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
             }
         }
         KeyCode::BackTab => Some("\x1b[Z".to_string()),
-        KeyCode::Backspace => Some("\x7f".to_string()),
+        KeyCode::Backspace => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                // Ctrl+Backspace → ASCII BS (0x08) for better compatibility with apps that do not handle DEL.
+                Some("\x08".to_string())
+            } else {
+                // Backspace → ASCII DEL (0x7f) by default, which is what most terminals send and what most apps expect for the Backspace key.
+                Some("\x7f".to_string())
+            }
+        }
         KeyCode::Esc => Some("\x1b".to_string()),
         KeyCode::Up => Some(if app_cursor_keys { "\x1bOA" } else { "\x1b[A" }.to_string()),
         KeyCode::Down => Some(if app_cursor_keys { "\x1bOB" } else { "\x1b[B" }.to_string()),
