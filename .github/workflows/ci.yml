@@ -5,6 +5,7 @@ on:
     branches:
       - main
     paths:
+      - .github/workflows/**
       - src/**
       - web/**
 
@@ -13,8 +14,15 @@ permissions:
 
 jobs:
   build-test:
-    name: build-test
-    runs-on: windows-latest
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
 
     steps:
       - name: Checkout code
@@ -22,8 +30,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -31,7 +37,7 @@ jobs:
           node-version: 22
 
       - name: Test
-        run: cargo test --target x86_64-pc-windows-msvc
+        run: cargo test
 
       - name: Build Release
-        run: cargo build --target x86_64-pc-windows-msvc --release
+        run: cargo build --release

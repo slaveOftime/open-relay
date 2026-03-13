@@ -2,6 +2,7 @@
 // PTY-related types and terminal query/escape handling
 // ---------------------------------------------------------------------------
 
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
@@ -105,12 +106,17 @@ impl RuntimeChild {
 // Terminal query types and helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalQuery {
     CursorPositionReport,
     DeviceStatusReport,
     ForegroundColor,
     BackgroundColor,
+    PrimaryDeviceAttributes,
+    SecondaryDeviceAttributes,
+    XtVersion,
+    DecPrivateModeReport(String),
+    KittyKeyboard,
 }
 
 const TERMINAL_QUERY_PATTERNS: [(&str, TerminalQuery); 6] = [
@@ -122,49 +128,168 @@ const TERMINAL_QUERY_PATTERNS: [(&str, TerminalQuery); 6] = [
     ("\x1b]11;?\x1b\\", TerminalQuery::BackgroundColor),
 ];
 
+fn partial_csi_sequence_re() -> &'static regex::Regex {
+    static PARTIAL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    PARTIAL_RE.get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:[>?]?\d*(?:;\d*)*\$?)?)?$").unwrap())
+}
+
+fn private_dsr_query_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?\d+n").unwrap())
+}
+
+fn decrpm_query_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?(\d+(?:;\d+)*)\$p").unwrap())
+}
+
+fn xtversion_query_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\x1b\[>\d*q").unwrap())
+}
+
+fn da1_query_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\d*c").unwrap())
+}
+
+fn da2_query_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\x1b\[>\d*c").unwrap())
+}
+
+fn kitty_keyboard_query_re() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?u").unwrap())
+}
+
 pub fn find_next_terminal_query(
     text: &str,
     search_from: usize,
 ) -> Option<(usize, usize, TerminalQuery)> {
-    TERMINAL_QUERY_PATTERNS
+    let fixed_match = TERMINAL_QUERY_PATTERNS
         .iter()
         .filter_map(|(pattern, query)| {
             text[search_from..]
                 .find(pattern)
-                .map(|offset| (search_from + offset, pattern.len(), *query))
+                .map(|offset| (search_from + offset, pattern.len(), query.clone()))
         })
-        .min_by_key(|(start, _, _)| *start)
+        .min_by_key(|(start, _, _)| *start);
+
+    let decrpm_match = decrpm_query_re()
+        .captures_at(text, search_from)
+        .and_then(|caps| {
+            let whole = caps.get(0)?;
+            let modes = caps.get(1)?.as_str().to_string();
+            Some((
+                whole.start(),
+                whole.as_str().len(),
+                TerminalQuery::DecPrivateModeReport(modes),
+            ))
+        });
+
+    let xtversion_match = xtversion_query_re()
+        .find_at(text, search_from)
+        .map(|m| (m.start(), m.as_str().len(), TerminalQuery::XtVersion));
+
+    let da1_match = da1_query_re().find_at(text, search_from).map(|m| {
+        (
+            m.start(),
+            m.as_str().len(),
+            TerminalQuery::PrimaryDeviceAttributes,
+        )
+    });
+
+    let da2_match = da2_query_re().find_at(text, search_from).map(|m| {
+        (
+            m.start(),
+            m.as_str().len(),
+            TerminalQuery::SecondaryDeviceAttributes,
+        )
+    });
+
+    let kitty_match = kitty_keyboard_query_re()
+        .find_at(text, search_from)
+        .map(|m| (m.start(), m.as_str().len(), TerminalQuery::KittyKeyboard));
+
+    [
+        fixed_match,
+        decrpm_match,
+        xtversion_match,
+        da1_match,
+        da2_match,
+        kitty_match,
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|(start, _, _)| *start)
 }
 
 pub fn terminal_query_tail_len(remainder: &str) -> usize {
-    let mut keep = 0usize;
-    for (pattern, _) in TERMINAL_QUERY_PATTERNS {
-        let max_prefix = pattern.len().saturating_sub(1).min(remainder.len());
-        for prefix_len in (1..=max_prefix).rev() {
-            if remainder.ends_with(&pattern[..prefix_len]) {
-                keep = keep.max(prefix_len);
-                break;
-            }
-        }
-    }
-    keep
+    let csi_tail = partial_csi_sequence_re()
+        .find(remainder)
+        .filter(|m| m.end() == remainder.len())
+        .map(|m| remainder.len().saturating_sub(m.start()))
+        .unwrap_or(0);
+
+    let osc_tail = [
+        "\x1b]10;?\x1b",
+        "\x1b]11;?\x1b",
+        "\x1b]10;?",
+        "\x1b]11;?",
+        "\x1b]10;",
+        "\x1b]11;",
+        "\x1b]",
+    ]
+    .into_iter()
+    .filter_map(|prefix| remainder.rfind(prefix).map(|start| (prefix, start)))
+    .filter(|(_, start)| {
+        let suffix = &remainder[*start..];
+        !suffix.contains('\x07') && !suffix.contains("\x1b\\")
+    })
+    .map(|(_, start)| remainder.len().saturating_sub(start))
+    .max()
+    .unwrap_or(0);
+
+    csi_tail.max(osc_tail)
 }
 
-pub fn terminal_query_response(query: TerminalQuery, cursor: Option<(u16, u16)>) -> String {
+fn xtversion_response() -> String {
+    format!(
+        "\x1bP>|{} {}\x1b\\",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn decrpm_responses(modes: &str) -> Vec<String> {
+    modes
+        .split(';')
+        .filter(|mode| !mode.is_empty())
+        .map(|mode| format!("\x1b[?{mode};2$y"))
+        .collect()
+}
+
+pub fn terminal_query_response(query: TerminalQuery, cursor: Option<(u16, u16)>) -> Vec<String> {
     match query {
         TerminalQuery::CursorPositionReport => {
             let (row, col) = cursor.unwrap_or((1, 1));
-            format!("\x1b[{row};{col}R")
+            vec![format!("\x1b[{row};{col}R")]
         }
-        TerminalQuery::DeviceStatusReport => "\x1b[0n".to_string(),
+        TerminalQuery::DeviceStatusReport => vec!["\x1b[0n".to_string()],
         TerminalQuery::ForegroundColor => {
             let (foreground, _) = terminal_report_colors();
-            format_osc_color_response(10, &foreground)
+            vec![format_osc_color_response(10, &foreground)]
         }
         TerminalQuery::BackgroundColor => {
             let (_, background) = terminal_report_colors();
-            format_osc_color_response(11, &background)
+            vec![format_osc_color_response(11, &background)]
         }
+        TerminalQuery::PrimaryDeviceAttributes => vec!["\x1b[?62;c".to_string()],
+        TerminalQuery::SecondaryDeviceAttributes => vec!["\x1b[>1;0;0c".to_string()],
+        TerminalQuery::XtVersion => vec![xtversion_response()],
+        TerminalQuery::DecPrivateModeReport(modes) => decrpm_responses(&modes),
+        TerminalQuery::KittyKeyboard => vec!["\x1b[?0u".to_string()],
     }
 }
 
@@ -270,7 +395,7 @@ impl Default for EscapeFilter {
 // Daemon-side fallback query responder (no attach client)
 // ---------------------------------------------------------------------------
 
-/// Scan `data` for DSR/CPR/OSC colour queries and generate response bytes.
+/// Scan `data` for terminal capability queries and generate response bytes.
 ///
 /// Responses are for the daemon to write back to the PTY stdin when no attach
 /// client is connected.  CPR always uses row 1 col 1 (the best the daemon can
@@ -281,9 +406,9 @@ impl Default for EscapeFilter {
 ///
 /// OSC 10/11 colour probes are answered with a static best-guess response
 /// (white foreground, black background, or the `COLORFGBG` env var if set).
-/// Any echoed colour response that the child app writes back to its own stdout
-/// is stripped by the `EscapeFilter` (via `GENERIC_OSC_FULL_RE`) before being
-/// forwarded to attach clients, so there is no visible junk.
+/// DA1/DA2/XTVERSION and DECRPM/kitty-keyboard probes get conservative,
+/// well-formed replies so detached apps do not block waiting for a real
+/// terminal to answer them.
 pub fn extract_query_responses_no_client(
     data: &[u8],
     tail: &mut String,
@@ -302,15 +427,12 @@ pub fn extract_query_responses_no_client(
         else {
             break;
         };
-        match query {
-            TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => {
-                let response = terminal_query_response(query, Some(cursor));
-                responses.push(response.into_bytes());
-            }
-            TerminalQuery::ForegroundColor | TerminalQuery::BackgroundColor => {
-                let response = terminal_query_response(query, None);
-                responses.push(response.into_bytes());
-            }
+        let response_cursor = match query {
+            TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => Some(cursor),
+            _ => None,
+        };
+        for response in terminal_query_response(query, response_cursor) {
+            responses.push(response.into_bytes());
         }
         search_from = match_start + query_len;
     }
@@ -342,16 +464,6 @@ pub fn extract_query_responses_no_client(
 /// * Terminal queries that would cause the attach client's terminal to
 ///   respond (DECRPM, XTVERSION, DA1/DA2, kitty keyboard, etc.)
 pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
-    use std::sync::OnceLock;
-
-    static PARTIAL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let partial_re = PARTIAL_RE.get_or_init(|| {
-        // Matches a trailing incomplete CSI sequence that may continue in the
-        // next chunk.  Covers standard CSI, private-mode CSI (?), and CSI >
-        // prefixes with optional digits, semicolons, and intermediate bytes.
-        regex::Regex::new(r"\x1b(?:\[(?:[>?]?\d*(?:;\d*)*\$?)?)?$").unwrap()
-    });
-
     static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
     let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
 
@@ -371,33 +483,10 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     // Private-mode DSR queries (\x1b[?<digits>n) — the `?` variant is NOT
     // caught by DSR_QUERY_FULL_RE above.  Programs like opencode/bubbletea
     // send \x1b[?996n (DEC Locator) which would otherwise leak.
-    static PRIVATE_DSR_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let private_dsr_query_re =
-        PRIVATE_DSR_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?\d+n").unwrap());
-
     // DECRPM queries (\x1b[?<mode>$p) — opencode/bubbletea sends these to
     // probe terminal modes.  If they leak to the attach client's terminal,
     // the terminal responds with DECRPM replies that crossterm interprets as
     // key events, sending garbage input back to the child.
-    static DECRPM_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let decrpm_query_re =
-        DECRPM_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?\d+(?:;\d+)*\$p").unwrap());
-
-    // XTVERSION query (\x1b[>0q or variants) — terminal responds with a DCS
-    // string that crossterm doesn't recognise, causing character-level garbage.
-    static XTVERSION_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let xtversion_query_re =
-        XTVERSION_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[>\d*q").unwrap());
-
-    // DA1 / DA2 queries — \x1b[c and \x1b[>c.
-    static DA_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let da_query_re = DA_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[>?c").unwrap());
-
-    // Kitty keyboard protocol query (\x1b[?u).
-    static KITTY_KB_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let kitty_kb_query_re =
-        KITTY_KB_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?u").unwrap());
-
     // Window-size-in-pixels query (\x1b[14t, \x1b[16t, etc.).
     static WINSIZE_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
     let winsize_query_re =
@@ -431,7 +520,7 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     combined.push_str(chunk);
 
     // 2. Save any trailing incomplete CPR/OSC prefix for the next call.
-    let cpr_pending_start = partial_re.find(&combined).map(|m| m.start());
+    let cpr_pending_start = partial_csi_sequence_re().find(&combined).map(|m| m.start());
     let osc_pending_start = trailing_partial_osc_sequence_start(&combined);
     if let Some(start) = [cpr_pending_start, osc_pending_start]
         .into_iter()
@@ -462,11 +551,12 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
 
     // 8. Strip terminal-query sequences that would cause the attach client's
     //    real terminal to respond, injecting garbage into crossterm's stdin.
-    let combined = private_dsr_query_re.replace_all(&combined, "");
-    let combined = decrpm_query_re.replace_all(&combined, "");
-    let combined = xtversion_query_re.replace_all(&combined, "");
-    let combined = da_query_re.replace_all(&combined, "");
-    let combined = kitty_kb_query_re.replace_all(&combined, "");
+    let combined = private_dsr_query_re().replace_all(&combined, "");
+    let combined = decrpm_query_re().replace_all(&combined, "");
+    let combined = xtversion_query_re().replace_all(&combined, "");
+    let combined = da1_query_re().replace_all(&combined, "");
+    let combined = da2_query_re().replace_all(&combined, "");
+    let combined = kitty_keyboard_query_re().replace_all(&combined, "");
     winsize_query_re.replace_all(&combined, "").into_owned()
 }
 
@@ -703,6 +793,14 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_query_tail_len_keeps_partial_decrpm_sequence() {
+        assert_eq!(
+            terminal_query_tail_len("text\x1b[?2004$"),
+            "\x1b[?2004$".len()
+        );
+    }
+
+    #[test]
     fn test_terminal_query_response_formats_osc_colors() {
         assert_eq!(
             format_osc_color_response(10, "rgb:ffff/ffff/ffff"),
@@ -711,6 +809,37 @@ mod tests {
         assert_eq!(
             format_osc_color_response(11, "rgb:0000/0000/0000"),
             "\x1b]11;rgb:0000/0000/0000\x1b\\"
+        );
+    }
+
+    #[test]
+    fn test_terminal_query_response_formats_capability_defaults() {
+        assert_eq!(
+            terminal_query_response(TerminalQuery::PrimaryDeviceAttributes, None),
+            vec!["\x1b[?62;c".to_string()]
+        );
+        assert_eq!(
+            terminal_query_response(TerminalQuery::SecondaryDeviceAttributes, None),
+            vec!["\x1b[>1;0;0c".to_string()]
+        );
+        assert_eq!(
+            terminal_query_response(TerminalQuery::KittyKeyboard, None),
+            vec!["\x1b[?0u".to_string()]
+        );
+        assert_eq!(
+            terminal_query_response(
+                TerminalQuery::DecPrivateModeReport("2004".to_string()),
+                None
+            ),
+            vec!["\x1b[?2004;2$y".to_string()]
+        );
+        assert_eq!(
+            terminal_query_response(TerminalQuery::XtVersion, None),
+            vec![format!(
+                "\x1bP>|{} {}\x1b\\",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )]
         );
     }
 
@@ -876,5 +1005,47 @@ mod tests {
         let responses = extract_query_responses_no_client(data, &mut tail, (7, 3));
         assert_eq!(responses.len(), 1);
         assert_eq!(responses[0], b"\x1b[7;3R");
+    }
+
+    #[test]
+    fn test_extract_query_answers_device_attributes_and_xtversion() {
+        let mut tail = String::new();
+        let data = b"\x1b[c\x1b[>c\x1b[>0q";
+        let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0], b"\x1b[?62;c");
+        assert_eq!(responses[1], b"\x1b[>1;0;0c");
+        assert_eq!(
+            responses[2],
+            format!(
+                "\x1bP>|{} {}\x1b\\",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )
+            .into_bytes()
+        );
+    }
+
+    #[test]
+    fn test_extract_query_answers_split_da2_query() {
+        let mut tail = String::new();
+        let responses1 = extract_query_responses_no_client(b"hello\x1b[>", &mut tail, (1, 1));
+        assert!(responses1.is_empty());
+        assert_eq!(tail, "\x1b[>");
+
+        let responses2 = extract_query_responses_no_client(b"cworld", &mut tail, (1, 1));
+        assert_eq!(responses2, vec![b"\x1b[>1;0;0c".to_vec()]);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn test_extract_query_answers_decrpm_and_kitty_keyboard_queries() {
+        let mut tail = String::new();
+        let data = b"\x1b[?2004$p\x1b[?u";
+        let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
+        assert_eq!(
+            responses,
+            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?0u".to_vec()]
+        );
     }
 }
