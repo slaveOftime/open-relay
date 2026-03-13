@@ -60,6 +60,7 @@ rpassword = "7"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 mimalloc = "0.1.48"
 bytes = "1"
+arc-swap = "1"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

@@ -12,7 +12,7 @@ use crate::{
     ipc,
     node::NodeRegistry,
     protocol::{ApiKeySummary, ListQuery, RpcRequest, RpcResponse},
-    session::StartSpec,
+    session::{SessionStore, StartSpec},
 };
 
 use super::{JoinHandles, NotificationTx, SessionStoreHandle};
@@ -166,8 +166,7 @@ async fn handle_daemon_stop(
     session_store: &SessionStoreHandle,
     shutdown_tx: &mpsc::UnboundedSender<()>,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    let stopped = store.stop_all_sessions(grace_seconds).await;
+    let stopped = session_store.stop_all_sessions(grace_seconds).await;
     let _ = shutdown_tx.send(());
     RpcResponse::DaemonStop { stopped }
 }
@@ -178,8 +177,7 @@ async fn handle_list(
     db: &Arc<Database>,
 ) -> Result<RpcResponse> {
     let total = db.count_summaries(&query).await?;
-    let mut store = session_store.lock().await;
-    let sessions = store.list_summaries(&query).await?;
+    let sessions = session_store.list_summaries(&query).await?;
     Ok(RpcResponse::List { total, sessions })
 }
 
@@ -195,21 +193,20 @@ async fn handle_start(
     cols: Option<u16>,
     disable_notifications: bool,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store
-        .start_session(
-            config,
-            StartSpec {
-                title: title.clone(),
-                cmd: cmd.clone(),
-                args: args.clone(),
-                cwd: cwd.clone(),
-                rows,
-                cols,
-                notifications_enabled: !disable_notifications,
-            },
-        )
-        .await
+    match SessionStore::start_session_via_handle(
+        session_store,
+        config,
+        StartSpec {
+            title: title.clone(),
+            cmd: cmd.clone(),
+            args: args.clone(),
+            cwd: cwd.clone(),
+            rows,
+            cols,
+            notifications_enabled: !disable_notifications,
+        },
+    )
+    .await
     {
         Ok(session_id) => {
             info!(session_id, cmd, "session started");
@@ -226,8 +223,7 @@ async fn handle_stop(
     grace_seconds: u64,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    if store.stop_session(&id, grace_seconds).await {
+    if session_store.stop_session(&id, grace_seconds).await {
         info!(session_id = id, "session stopped");
         RpcResponse::Stop { stopped: true }
     } else {
@@ -238,8 +234,7 @@ async fn handle_stop(
 }
 
 async fn handle_kill(id: String, session_store: &SessionStoreHandle) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    if store.kill_session(&id).await {
+    if session_store.kill_session(&id).await {
         info!(session_id = id, "session killed");
         RpcResponse::Kill { killed: true }
     } else {
@@ -254,8 +249,7 @@ async fn handle_logs_snapshot(
     tail: usize,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.logs_snapshot(&id, tail).await {
+    match session_store.logs_snapshot(&id, tail).await {
         Some((lines, cursor, running)) => RpcResponse::LogsSnapshot {
             lines,
             cursor,
@@ -272,8 +266,7 @@ async fn handle_logs_poll(
     cursor: u64,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.logs_poll(&id, cursor).await {
+    match session_store.logs_poll(&id, cursor).await {
         Some((lines, cursor, running)) => RpcResponse::LogsPoll {
             lines,
             cursor,
@@ -295,10 +288,7 @@ async fn handle_logs_wait(
     use crate::notification::event::NotificationKind;
 
     let mut notify_rx = notification_tx.subscribe();
-    let initial = {
-        let mut store = session_store.lock().await;
-        store.logs_snapshot(&id, tail).await
-    };
+    let initial = session_store.logs_snapshot(&id, tail).await;
 
     match initial {
         None => RpcResponse::Error {
@@ -342,10 +332,7 @@ async fn handle_logs_wait(
                         }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        let updated = {
-                            let mut store = session_store.lock().await;
-                            store.logs_snapshot(&id, tail).await
-                        };
+                        let updated = session_store.logs_snapshot(&id, tail).await;
                         if let Some((l, c, r)) = updated {
                             lines = l;
                             cursor = c;
@@ -363,10 +350,7 @@ async fn handle_logs_wait(
                 }
             }
 
-            if let Some((l, c, r)) = {
-                let mut store = session_store.lock().await;
-                store.logs_snapshot(&id, tail).await
-            } {
+            if let Some((l, c, r)) = session_store.logs_snapshot(&id, tail).await {
                 lines = l;
                 cursor = c;
                 running = r;

@@ -143,6 +143,15 @@ impl Database {
         Ok(())
     }
 
+    pub async fn delete_session(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM sessions WHERE id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
     /// Returns `<sessions_dir>/<id>` if the session exists in the database, else `None`.
     pub async fn get_session_dir(&self, id: &str) -> Result<Option<PathBuf>> {
         if self.session_exists(id).await {

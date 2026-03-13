@@ -126,10 +126,7 @@ async fn handle_ws_streaming(
     use tokio::sync::broadcast::error::RecvError;
 
     // Subscribe to broadcast + get ring replay, all under one lock.
-    let subscribe_result = {
-        let mut store = state.store.lock().await;
-        store.attach_subscribe_init(&id, None).await
-    };
+    let subscribe_result = { state.store.attach_subscribe_init(&id, None).await };
 
     let (replay_chunks, _end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
         match subscribe_result {
@@ -159,22 +156,17 @@ async fn handle_ws_streaming(
         bracketed_paste_mode,
     };
     if !send_json(&mut socket, &init_msg).await {
-        let mut store = state.store.lock().await;
-        let _ = store.attach_detach(&id).await;
+        let _ = state.store.attach_detach(&id).await;
         return;
     }
 
     // Mark attach presence.
-    {
-        let mut store = state.store.lock().await;
-        let _ = store.mark_attach_presence(&id).await;
-    }
+    let _ = state.store.mark_attach_presence(&id).await;
 
     // Resize PTY to browser dimensions AFTER init is sent.
     if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
         if rows > 0 && cols > 0 {
-            let mut store = state.store.lock().await;
-            let _ = store.attach_resize(&id, rows, cols).await;
+            let _ = state.store.attach_resize(&id, rows, cols).await;
             debug!(session_id = %id, rows, cols, "PTY resized after WS init");
         }
     }
@@ -195,17 +187,13 @@ async fn handle_ws_streaming(
 
             // Check session completion periodically.
             _ = completion_check.tick() => {
-                let status = {
-                    let mut store = state.store.lock().await;
-                    store.attach_stream_status(&id).await
-                };
+                let status = state.store.attach_stream_status(&id).await;
                 match status {
                     Ok((running, _output_closed, exit_code)) => {
                         if !running {
                             info!(session_id = %id, ?exit_code, "WS session ended");
                             let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
-                            let mut store = state.store.lock().await;
-                            let _ = store.attach_detach(&id).await;
+                            let _ = state.store.attach_detach(&id).await;
                             return;
                         }
                     }
@@ -226,18 +214,13 @@ async fn handle_ws_streaming(
                                 data: B64.encode(&filtered),
                             };
                             if !send_json(&mut socket, &msg).await {
-                                let mut store = state.store.lock().await;
-                                let _ = store.attach_detach(&id).await;
+                                let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
                         }
 
                         // Check for mode changes.
-                        let current_modes = {
-                            let store = state.store.lock().await;
-                            // Borrow the runtime to read mode snapshot.
-                            store.get_mode_snapshot(&id)
-                        };
+                        let current_modes = state.store.get_mode_snapshot(&id);
                         if let Some(modes) = current_modes {
                             if modes != last_modes {
                                 let _ = send_json(&mut socket, &ServerMessage::ModeChanged {
@@ -250,10 +233,7 @@ async fn handle_ws_streaming(
                     }
                     Err(RecvError::Lagged(_)) => {
                         // Re-sync from ring.
-                        let resync = {
-                            let mut store = state.store.lock().await;
-                            store.attach_subscribe_init(&id, None).await
-                        };
+                        let resync = state.store.attach_subscribe_init(&id, None).await;
                         match resync {
                             Ok((chunks, _, rx, bpm, ack)) => {
                                 broadcast_rx = rx;
@@ -267,8 +247,7 @@ async fn handle_ws_streaming(
                                         data: B64.encode(&raw),
                                     };
                                     if !send_json(&mut socket, &msg).await {
-                                        let mut store = state.store.lock().await;
-                                        let _ = store.attach_detach(&id).await;
+                                        let _ = state.store.attach_detach(&id).await;
                                         return;
                                     }
                                 }
@@ -284,10 +263,9 @@ async fn handle_ws_streaming(
                         }
                     }
                     Err(RecvError::Closed) => {
-                        let exit_code = state.store.lock().await.get_exit_code(&id);
+                        let exit_code = state.store.get_exit_code(&id);
                         let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
-                        let mut store = state.store.lock().await;
-                        let _ = store.attach_detach(&id).await;
+                        let _ = state.store.attach_detach(&id).await;
                         return;
                     }
                 }
@@ -300,18 +278,15 @@ async fn handle_ws_streaming(
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Input { data }) => {
                                 debug!(session_id = %id, bytes = data.len(), "WS input received");
-                                let mut store = state.store.lock().await;
-                                let _ = store.attach_input(&id, &data).await;
+                                let _ = state.store.attach_input(&id, &data).await;
                             }
                             Ok(ClientMessage::Resize { rows, cols }) => {
                                 debug!(session_id = %id, rows, cols, "WS resize received");
-                                let mut store = state.store.lock().await;
-                                let _ = store.attach_resize(&id, rows, cols).await;
+                                let _ = state.store.attach_resize(&id, rows, cols).await;
                             }
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, "WS client detached");
-                                let mut store = state.store.lock().await;
-                                let _ = store.attach_detach(&id).await;
+                                let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
                             Ok(ClientMessage::Ping) => {
@@ -322,8 +297,7 @@ async fn handle_ws_streaming(
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         debug!(session_id = %id, "WS client disconnected");
-                        let mut store = state.store.lock().await;
-                        let _ = store.attach_detach(&id).await;
+                        let _ = state.store.attach_detach(&id).await;
                         return;
                     }
                     _ => {}

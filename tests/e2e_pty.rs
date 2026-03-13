@@ -327,6 +327,56 @@ fn e2e_local_attach_reports_session_end_on_child_exit() {
 }
 
 #[test]
+fn e2e_attach_completed_session_succeeds_with_piped_stdio_cross_platform() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_attach_completed_piped");
+    let _daemon = start_daemon(&tmp);
+
+    const MARKER: &str = "oly_e2e_attach_completed_marker";
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", &format!("echo {MARKER}")];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", &format!("echo {MARKER}")];
+
+    let id = start_session(&tmp, cmd);
+
+    let logged = wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains(MARKER),
+        Duration::from_secs(3),
+    );
+    assert!(
+        logged.is_some(),
+        "completed session marker '{MARKER}' not found in logs.\nLogs:\n{}",
+        fetch_logs(&tmp, &id)
+    );
+
+    let output = oly_cmd(&tmp)
+        .args(["attach", &id])
+        .output()
+        .expect("`oly attach` failed to execute");
+
+    assert!(
+        output.status.success(),
+        "`oly attach` exited non-zero.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(MARKER),
+        "completed-session attach did not replay marker '{MARKER}'.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Session ") && stdout.contains(" has ended."),
+        "completed-session attach did not report child termination.\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn e2e_logs_contain_no_escape_artifacts() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_no_escape_artifacts");

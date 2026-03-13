@@ -4,7 +4,6 @@ pub mod event;
 pub mod prompt;
 
 use std::{sync::Arc, time::Instant};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -25,7 +24,7 @@ use crate::{
 /// trigger a notification. Prompt patterns are used to pick a better body
 /// line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
-    session_store: Arc<Mutex<SessionStore>>,
+    session_store: Arc<SessionStore>,
     config: Arc<AppConfig>,
     db: Arc<Database>,
     event_tx: tokio::sync::broadcast::Sender<http::SessionEvent>,
@@ -47,10 +46,8 @@ pub(super) async fn run_notification_monitor(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
-        let candidates: Vec<SilentCandidate> = {
-            let store = session_store.lock().await;
-            store.silent_candidates(suppression_window, min_notification_interval)
-        };
+        let candidates: Vec<SilentCandidate> =
+            session_store.silent_candidates(suppression_window, min_notification_interval);
 
         if !candidates.is_empty() {
             debug!(count = candidates.len(), "notification candidates detected");
@@ -141,10 +138,7 @@ pub(super) async fn run_notification_monitor(
             };
 
             if dispatched {
-                {
-                    let mut store = session_store.lock().await;
-                    store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
-                }
+                session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
 
                 let _ = notification_tx.send(event.clone());
                 let _ = event_tx.send(http::SessionEvent::SessionNotification {

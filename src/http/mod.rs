@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
@@ -25,7 +25,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<Mutex<SessionStore>>,
+    pub store: Arc<SessionStore>,
     pub config: Arc<AppConfig>,
     pub db: Arc<Database>,
     pub event_tx: broadcast::Sender<SessionEvent>,

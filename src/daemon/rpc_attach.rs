@@ -20,8 +20,10 @@ pub(super) async fn handle_attach_subscribe(
     use tokio::sync::broadcast::error::RecvError;
 
     let (replay_chunks, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) = {
-        let mut store = session_store.lock().await;
-        match store.attach_subscribe_init(&id, from_byte_offset).await {
+        match session_store
+            .attach_subscribe_init(&id, from_byte_offset)
+            .await
+        {
             Ok(t) => t,
             Err(err) => {
                 let resp = RpcResponse::Error {
@@ -38,10 +40,7 @@ pub(super) async fn handle_attach_subscribe(
         .flat_map(|(_, b)| init_filter.filter(b))
         .collect();
 
-    let running = {
-        let store = session_store.lock().await;
-        store.is_running(&id)
-    };
+    let running = session_store.is_running(&id);
     ipc::write_response_to_writer(
         &mut writer,
         RpcResponse::AttachStreamInit {
@@ -54,10 +53,7 @@ pub(super) async fn handle_attach_subscribe(
     )
     .await?;
 
-    {
-        let mut store = session_store.lock().await;
-        let _ = store.mark_attach_presence(&id).await;
-    }
+    let _ = session_store.mark_attach_presence(&id).await;
 
     let (client_msg_tx, mut client_msg_rx) = mpsc::unbounded_channel();
     let client_reader_task = tokio::spawn(async move {
@@ -89,8 +85,7 @@ pub(super) async fn handle_attach_subscribe(
 
             _ = completion_check.tick() => {
                 let (running, _output_closed, exit_code) = {
-                    let mut store = session_store.lock().await;
-                    match store.attach_stream_status(&id).await {
+                    match session_store.attach_stream_status(&id).await {
                         Ok(state) => state,
                         Err(_) => break,
                     }
@@ -98,8 +93,7 @@ pub(super) async fn handle_attach_subscribe(
 
                 if !running {
                     let chunks = {
-                        let mut store = session_store.lock().await;
-                        match store.attach_subscribe_init(&id, Some(current_offset)).await {
+                        match session_store.attach_subscribe_init(&id, Some(current_offset)).await {
                             Ok((chunks, _end, _rx, _bpm, _ack)) => chunks,
                             Err(_) => Vec::new(),
                         }
@@ -137,14 +131,12 @@ pub(super) async fn handle_attach_subscribe(
                     None => break,
                     Some(Err(_)) => break,
                     Some(Ok(RpcRequest::AttachInput { id: req_id, data })) if req_id == id => {
-                        let mut store = session_store.lock().await;
-                        if store.attach_input(&req_id, &data).await.is_err() {
+                        if session_store.attach_input(&req_id, &data).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(RpcRequest::AttachResize { id: req_id, rows, cols })) if req_id == id => {
-                        let mut store = session_store.lock().await;
-                        let _ = store.attach_resize(&req_id, rows, cols).await;
+                        let _ = session_store.attach_resize(&req_id, rows, cols).await;
                     }
                     Some(Ok(RpcRequest::AttachDetach { id: req_id })) if req_id == id => {
                         break;
@@ -170,8 +162,7 @@ pub(super) async fn handle_attach_subscribe(
                         }
 
                         let current_modes = {
-                            let store = session_store.lock().await;
-                            store.get_mode_snapshot(&id)
+                            session_store.get_mode_snapshot(&id)
                         };
                         if let Some(modes) = current_modes {
                             if modes != last_modes {
@@ -189,8 +180,7 @@ pub(super) async fn handle_attach_subscribe(
                     }
                     Err(RecvError::Lagged(_)) => {
                         let (chunks, new_end) = {
-                            let mut store = session_store.lock().await;
-                            match store.attach_subscribe_init(&id, Some(current_offset)).await {
+                            match session_store.attach_subscribe_init(&id, Some(current_offset)).await {
                                 Ok((c, e, rx, _bpm, _ack)) => {
                                     broadcast_rx = rx;
                                     (c, e)
@@ -216,10 +206,7 @@ pub(super) async fn handle_attach_subscribe(
                         current_offset = new_end;
                     }
                     Err(RecvError::Closed) => {
-                        let exit_code = {
-                            let store = session_store.lock().await;
-                            store.get_exit_code(&id)
-                        };
+                        let exit_code = session_store.get_exit_code(&id);
                         let _ = ipc::write_response_to_writer(
                             &mut writer,
                             RpcResponse::AttachStreamDone { exit_code },
@@ -233,8 +220,7 @@ pub(super) async fn handle_attach_subscribe(
     }
 
     client_reader_task.abort();
-    let mut store = session_store.lock().await;
-    let _ = store.attach_detach(&id).await;
+    let _ = session_store.attach_detach(&id).await;
     Ok(())
 }
 
@@ -243,8 +229,7 @@ pub(super) async fn handle_attach_input(
     data: String,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_input(&id, &data).await {
+    match session_store.attach_input(&id, &data).await {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),
@@ -258,8 +243,7 @@ pub(super) async fn handle_attach_resize(
     cols: u16,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_resize(&id, rows, cols).await {
+    match session_store.attach_resize(&id, rows, cols).await {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),
@@ -271,8 +255,7 @@ pub(super) async fn handle_attach_detach(
     id: String,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let mut store = session_store.lock().await;
-    match store.attach_detach(&id).await {
+    match session_store.attach_detach(&id).await {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),
