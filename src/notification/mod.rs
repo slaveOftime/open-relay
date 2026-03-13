@@ -4,7 +4,7 @@ pub mod event;
 pub mod prompt;
 
 use std::{sync::Arc, time::Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     config::AppConfig,
@@ -56,11 +56,13 @@ pub(super) async fn run_notification_monitor(
             let session_id = candidate.session_id;
             let excerpt = candidate.raw_excerpt;
             let output_epoch = candidate.output_epoch;
-            debug!(
+
+            debug!(session_id, "evaluating notification triggers for candidate");
+            trace!(
                 session_id,
                 excerpt = excerpt.as_str(),
                 output_epoch = ?output_epoch,
-                "evaluating notification triggers for candidate"
+                "evaluating notification triggers for candidate in detail"
             );
 
             let clean = strip_ansi_for_body(&excerpt);

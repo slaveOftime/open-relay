@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::session::mode_tracker::ModeSnapshot;
@@ -93,6 +93,14 @@ async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
     }
 }
 
+fn collect_filtered_chunks(chunks: &[(u64, bytes::Bytes)], filter: &mut EscapeFilter) -> Vec<u8> {
+    let mut filtered = Vec::with_capacity(chunks.iter().map(|(_, chunk)| chunk.len()).sum());
+    for (_, chunk) in chunks {
+        filtered.extend(filter.filter(chunk));
+    }
+    filtered
+}
+
 async fn handle_ws(
     socket: WebSocket,
     state: AppState,
@@ -128,10 +136,11 @@ async fn handle_ws_streaming(
     // Subscribe to broadcast + get ring replay, all under one lock.
     let subscribe_result = { state.store.attach_subscribe_init(&id, None).await };
 
-    let (replay_chunks, _end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
+    let (replay_chunks, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
         match subscribe_result {
             Ok(t) => t,
             Err(err) => {
+                warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
                 let _ = send_json(
                     &mut socket,
                     &ServerMessage::Error {
@@ -145,10 +154,7 @@ async fn handle_ws_streaming(
 
     // Filter CPR/DSR from replay and send as init frame.
     let mut init_filter = EscapeFilter::new();
-    let replay_bytes: Vec<u8> = replay_chunks
-        .iter()
-        .flat_map(|(_, b)| init_filter.filter(b))
-        .collect();
+    let replay_bytes = collect_filtered_chunks(&replay_chunks, &mut init_filter);
 
     let init_msg = ServerMessage::Init {
         data: B64.encode(&replay_bytes),
@@ -156,18 +162,30 @@ async fn handle_ws_streaming(
         bracketed_paste_mode,
     };
     if !send_json(&mut socket, &init_msg).await {
-        let _ = state.store.attach_detach(&id).await;
+        debug!(session_id = %id, "local WebSocket closed before init frame could be sent");
         return;
     }
 
-    // Mark attach presence.
-    let _ = state.store.mark_attach_presence(&id).await;
+    state.store.register_attach_client(&id).await;
+    debug!(
+        session_id = %id,
+        replay_chunks = replay_chunks.len(),
+        replay_bytes = replay_bytes.len(),
+        end_offset,
+        app_cursor_keys,
+        bracketed_paste_mode,
+        "local WebSocket stream initialized"
+    );
 
     // Resize PTY to browser dimensions AFTER init is sent.
     if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
         if rows > 0 && cols > 0 {
-            let _ = state.store.attach_resize(&id, rows, cols).await;
-            debug!(session_id = %id, rows, cols, "PTY resized after WS init");
+            match state.store.attach_resize(&id, rows, cols).await {
+                Ok(()) => debug!(session_id = %id, rows, cols, "PTY resized after WS init"),
+                Err(err) => {
+                    warn!(session_id = %id, rows, cols, error = err.message(&id), "PTY resize after WS init failed")
+                }
+            }
         }
     }
 
@@ -178,6 +196,7 @@ async fn handle_ws_streaming(
     };
 
     let mut chunk_filter = EscapeFilter::new();
+    let mut current_offset = end_offset;
     let mut completion_check = tokio::time::interval(Duration::from_millis(200));
     completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -191,6 +210,27 @@ async fn handle_ws_streaming(
                 match status {
                     Ok((running, _output_closed, exit_code)) => {
                         if !running {
+                            let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
+                            if let Ok((chunks, _new_end, _rx, _bpm, _ack)) = resync {
+                                let mut resync_filter = EscapeFilter::new();
+                                let raw = collect_filtered_chunks(&chunks, &mut resync_filter);
+                                if !raw.is_empty() {
+                                    debug!(
+                                        session_id = %id,
+                                        resync_chunks = chunks.len(),
+                                        resync_bytes = raw.len(),
+                                        current_offset,
+                                        "sending final buffered output before local WebSocket shutdown"
+                                    );
+                                    let msg = ServerMessage::Data {
+                                        data: B64.encode(&raw),
+                                    };
+                                    if !send_json(&mut socket, &msg).await {
+                                        let _ = state.store.attach_detach(&id).await;
+                                        return;
+                                    }
+                                }
+                            }
                             info!(session_id = %id, ?exit_code, "WS session ended");
                             let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                             let _ = state.store.attach_detach(&id).await;
@@ -198,7 +238,9 @@ async fn handle_ws_streaming(
                         }
                     }
                     Err(_) => {
+                        warn!(session_id = %id, "local WebSocket stream status lookup failed");
                         let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = state.store.attach_detach(&id).await;
                         return;
                     }
                 }
@@ -218,31 +260,59 @@ async fn handle_ws_streaming(
                                 return;
                             }
                         }
+                        current_offset += raw_arc.len() as u64;
+                        trace!(
+                            session_id = %id,
+                            raw_bytes = raw_arc.len(),
+                            filtered_bytes = filtered.len(),
+                            current_offset,
+                            "forwarded live PTY output over local WebSocket"
+                        );
 
                         // Check for mode changes.
                         let current_modes = state.store.get_mode_snapshot(&id);
                         if let Some(modes) = current_modes {
                             if modes != last_modes {
-                                let _ = send_json(&mut socket, &ServerMessage::ModeChanged {
+                                debug!(
+                                    session_id = %id,
+                                    app_cursor_keys = modes.app_cursor_keys,
+                                    bracketed_paste_mode = modes.bracketed_paste_mode,
+                                    "local WebSocket terminal mode changed"
+                                );
+                                if !send_json(&mut socket, &ServerMessage::ModeChanged {
                                     app_cursor_keys: modes.app_cursor_keys,
                                     bracketed_paste_mode: modes.bracketed_paste_mode,
-                                }).await;
+                                }).await {
+                                    let _ = state.store.attach_detach(&id).await;
+                                    return;
+                                }
                                 last_modes = modes;
                             }
                         }
                     }
-                    Err(RecvError::Lagged(_)) => {
+                    Err(RecvError::Lagged(skipped)) => {
+                        warn!(
+                            session_id = %id,
+                            skipped,
+                            current_offset,
+                            "local WebSocket lagged behind broadcast output; replaying from ring"
+                        );
                         // Re-sync from ring.
-                        let resync = state.store.attach_subscribe_init(&id, None).await;
+                        let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
                         match resync {
-                            Ok((chunks, _, rx, bpm, ack)) => {
+                            Ok((chunks, new_end, rx, bpm, ack)) => {
                                 broadcast_rx = rx;
                                 let mut resync_filter = EscapeFilter::new();
-                                let raw: Vec<u8> = chunks
-                                    .iter()
-                                    .flat_map(|(_, b)| resync_filter.filter(b))
-                                    .collect();
+                                let raw = collect_filtered_chunks(&chunks, &mut resync_filter);
                                 if !raw.is_empty() {
+                                    debug!(
+                                        session_id = %id,
+                                        resync_chunks = chunks.len(),
+                                        resync_bytes = raw.len(),
+                                        from_offset = current_offset,
+                                        to_offset = new_end,
+                                        "replayed buffered PTY output for local WebSocket resync"
+                                    );
                                     let msg = ServerMessage::Data {
                                         data: B64.encode(&raw),
                                     };
@@ -251,19 +321,23 @@ async fn handle_ws_streaming(
                                         return;
                                     }
                                 }
+                                current_offset = new_end;
                                 last_modes = ModeSnapshot {
                                     app_cursor_keys: ack,
                                     bracketed_paste_mode: bpm,
                                 };
                             }
                             Err(_) => {
+                                warn!(session_id = %id, "local WebSocket resync failed");
                                 let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                                let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
                         }
                     }
                     Err(RecvError::Closed) => {
                         let exit_code = state.store.get_exit_code(&id);
+                        info!(session_id = %id, ?exit_code, "local WebSocket broadcast channel closed");
                         let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
@@ -278,11 +352,23 @@ async fn handle_ws_streaming(
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Input { data }) => {
                                 debug!(session_id = %id, bytes = data.len(), "WS input received");
-                                let _ = state.store.attach_input(&id, &data).await;
+                                if let Err(err) = state.store.attach_input(&id, &data).await {
+                                    let _ = send_json(&mut socket, &ServerMessage::Error {
+                                        message: err.message(&id),
+                                    }).await;
+                                    let _ = state.store.attach_detach(&id).await;
+                                    return;
+                                }
                             }
                             Ok(ClientMessage::Resize { rows, cols }) => {
                                 debug!(session_id = %id, rows, cols, "WS resize received");
-                                let _ = state.store.attach_resize(&id, rows, cols).await;
+                                if let Err(err) = state.store.attach_resize(&id, rows, cols).await {
+                                    let _ = send_json(&mut socket, &ServerMessage::Error {
+                                        message: err.message(&id),
+                                    }).await;
+                                    let _ = state.store.attach_detach(&id).await;
+                                    return;
+                                }
                             }
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, "WS client detached");
@@ -290,9 +376,12 @@ async fn handle_ws_streaming(
                                 return;
                             }
                             Ok(ClientMessage::Ping) => {
+                                trace!(session_id = %id, "local WebSocket ping received");
                                 let _ = send_json(&mut socket, &ServerMessage::Pong).await;
                             }
-                            Err(_) => {}
+                            Err(err) => {
+                                warn!(session_id = %id, %err, "failed to parse local WebSocket client message");
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
@@ -321,6 +410,8 @@ async fn handle_ws_proxied_streaming(
 ) {
     use base64::{Engine, engine::general_purpose::STANDARD as B64};
 
+    info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
+
     // Resize PTY via node proxy before subscribing.
     if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
         if rows > 0 && cols > 0 {
@@ -329,8 +420,11 @@ async fn handle_ws_proxied_streaming(
                 rows,
                 cols,
             };
-            let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
-            debug!(session_id = %id, rows, cols, "PTY pre-resized via node proxy");
+            if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                warn!(session_id = %id, node = %node, rows, cols, %err, "proxied WebSocket pre-resize failed");
+            } else {
+                debug!(session_id = %id, node = %node, rows, cols, "PTY pre-resized via node proxy");
+            }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
@@ -340,20 +434,24 @@ async fn handle_ws_proxied_streaming(
         id: id.to_string(),
         from_byte_offset: None,
     };
-    let (stream_rpc_id, mut stream_rx) =
-        match state.node_registry.proxy_rpc_stream(&node, &rpc).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                let _ = send_json(
-                    &mut socket,
-                    &ServerMessage::Error {
-                        message: format!("failed to open proxy stream: {err}"),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
+    let (stream_rpc_id, mut stream_rx) = match state
+        .node_registry
+        .proxy_rpc_stream(&node, &rpc)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            warn!(session_id = %id, node = %node, %err, "failed to open proxied WebSocket stream");
+            let _ = send_json(
+                &mut socket,
+                &ServerMessage::Error {
+                    message: format!("failed to open proxy stream: {err}"),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
     let mut init_sent = false;
 
@@ -380,10 +478,19 @@ async fn handle_ws_proxied_streaming(
                                 if !send_json(&mut socket, &msg).await {
                                     break;
                                 }
+                                debug!(
+                                    session_id = %id,
+                                    node = %node,
+                                    replay_bytes = data.len(),
+                                    app_cursor_keys,
+                                    bracketed_paste_mode,
+                                    "proxied WebSocket init frame received"
+                                );
                                 init_sent = true;
                             }
                             RpcResponse::AttachStreamChunk { data, .. } => {
                                 if !data.is_empty() {
+                                    trace!(session_id = %id, node = %node, bytes = data.len(), "forwarding proxied PTY output");
                                     let msg = ServerMessage::Data {
                                         data: B64.encode(&data),
                                     };
@@ -396,16 +503,25 @@ async fn handle_ws_proxied_streaming(
                                 app_cursor_keys,
                                 bracketed_paste_mode,
                             } => {
+                                debug!(
+                                    session_id = %id,
+                                    node = %node,
+                                    app_cursor_keys,
+                                    bracketed_paste_mode,
+                                    "proxied WebSocket terminal mode changed"
+                                );
                                 let _ = send_json(&mut socket, &ServerMessage::ModeChanged {
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                 }).await;
                             }
                             RpcResponse::AttachStreamDone { exit_code } => {
+                                info!(session_id = %id, node = %node, ?exit_code, "proxied WebSocket stream ended");
                                 let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                                 break;
                             }
                             RpcResponse::Error { message } => {
+                                warn!(session_id = %id, node = %node, %message, "proxied WebSocket stream returned an error");
                                 let _ = send_json(&mut socket, &ServerMessage::Error { message }).await;
                                 break;
                             }
@@ -431,34 +547,49 @@ async fn handle_ws_proxied_streaming(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Input { data }) => {
+                                debug!(session_id = %id, node = %node, bytes = data.len(), "proxied WebSocket input received");
                                 let rpc = RpcRequest::AttachInput {
                                     id: id.to_string(),
                                     data,
                                 };
-                                let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
+                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket input");
+                                }
                             }
                             Ok(ClientMessage::Resize { rows, cols }) => {
+                                debug!(session_id = %id, node = %node, rows, cols, "proxied WebSocket resize received");
                                 let rpc = RpcRequest::AttachResize {
                                     id: id.to_string(),
                                     rows,
                                     cols,
                                 };
-                                let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
+                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                    warn!(session_id = %id, node = %node, rows, cols, %err, "failed to proxy WebSocket resize");
+                                }
                             }
                             Ok(ClientMessage::Detach) => {
+                                debug!(session_id = %id, node = %node, "proxied WebSocket detach requested");
                                 let rpc = RpcRequest::AttachDetach { id: id.to_string() };
-                                let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
+                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket detach");
+                                }
                                 break;
                             }
                             Ok(ClientMessage::Ping) => {
+                                trace!(session_id = %id, node = %node, "proxied WebSocket ping received");
                                 let _ = send_json(&mut socket, &ServerMessage::Pong).await;
                             }
-                            Err(_) => {}
+                            Err(err) => {
+                                warn!(session_id = %id, node = %node, %err, "failed to parse proxied WebSocket client message");
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
+                        debug!(session_id = %id, node = %node, "proxied WebSocket client disconnected");
                         let rpc = RpcRequest::AttachDetach { id: id.to_string() };
-                        let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
+                        if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                            warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket disconnect cleanup");
+                        }
                         break;
                     }
                     _ => {}
@@ -473,4 +604,5 @@ async fn handle_ws_proxied_streaming(
         .node_registry
         .remove_pending(&node, &stream_rpc_id)
         .await;
+    debug!(session_id = %id, node = %node, "proxied WebSocket stream cleanup complete");
 }

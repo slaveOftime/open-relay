@@ -9,6 +9,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::future::join_all;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, info, trace, warn};
 
@@ -78,7 +79,7 @@ impl SessionRuntimeSnapshot {
             last_attach_activity_at: rt.last_attach_activity_at,
             last_notified_at: rt.last_notified_at,
             notified_output_epoch: rt.notified_output_epoch,
-            running: matches!(rt.meta.status, SessionStatus::Running),
+            running: !rt.is_completed(),
             exit_code: rt.meta.exit_code,
         }
     }
@@ -384,11 +385,11 @@ impl SessionStore {
         Ok((snapshot.running, snapshot.output_closed, snapshot.exit_code))
     }
 
-    pub async fn mark_attach_presence(&self, id: &str) {
+    pub async fn register_attach_client(&self, id: &str) {
         let sessions = self.sessions.load();
         if let Some(handle) = sessions.get(id).cloned() {
             if let Ok(mut rt) = handle.runtime.lock() {
-                rt.mark_attach_presence();
+                rt.register_attach_client();
                 handle.refresh_snapshot(&rt);
             }
         }
@@ -441,7 +442,7 @@ impl SessionStore {
         let Ok(mut rt) = runtime.runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
-        rt.clear_attach_state();
+        rt.detach_attach_client();
         runtime.refresh_snapshot(&rt);
         debug!(session_id = id, "attach detach acknowledged");
         Ok(())
@@ -479,29 +480,41 @@ impl SessionStore {
                 .replace("\x1b[B", "\x1bOB")
                 .replace("\x1b[C", "\x1bOC")
                 .replace("\x1b[D", "\x1bOD");
-            cooked.as_bytes()
+            cooked.into_bytes()
         } else {
-            data.as_bytes()
+            data.as_bytes().to_vec()
         };
-        if rt.pty.write_input(bytes.to_vec()) {
-            rt.mark_attach_activity();
-            rt.last_input_at = Some(Instant::now());
-            runtime.refresh_snapshot(&rt);
-            debug!(
-                session_id = id,
-                bytes = bytes.len(),
-                transformed,
-                app_cursor_keys = modes.app_cursor_keys,
-                "attach input forwarded"
-            );
-            Ok(())
-        } else {
-            debug!(
-                session_id = id,
-                bytes = bytes.len(),
-                "attach input failed while writing to PTY"
-            );
-            Err(SessionLookupError::Evicted)
+        let byte_len = bytes.len();
+        match rt.pty.try_write_input(bytes) {
+            Ok(()) => {
+                rt.mark_attach_activity();
+                rt.last_input_at = Some(Instant::now());
+                runtime.refresh_snapshot(&rt);
+                debug!(
+                    session_id = id,
+                    bytes = byte_len,
+                    transformed,
+                    app_cursor_keys = modes.app_cursor_keys,
+                    "attach input forwarded"
+                );
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                debug!(
+                    session_id = id,
+                    bytes = byte_len,
+                    "attach input backpressured by full PTY writer queue"
+                );
+                Err(SessionLookupError::Busy)
+            }
+            Err(TrySendError::Closed(_)) => {
+                debug!(
+                    session_id = id,
+                    bytes = byte_len,
+                    "attach input failed while writing to PTY"
+                );
+                Err(SessionLookupError::Evicted)
+            }
         }
     }
 
@@ -607,14 +620,35 @@ impl SessionStore {
             rt.meta.status = SessionStatus::Stopping;
             runtime.refresh_snapshot(&rt);
             if let Some((_, input)) = soft_stop_schedule.first() {
-                let _ = rt.pty.write_input((*input).to_vec());
-                debug!(
-                    session_id = %session_id,
-                    stage = 1,
-                    total_stages = soft_stop_schedule.len(),
-                    bytes = input.len(),
-                    "sent soft-stop input"
-                );
+                match rt.pty.try_write_input((*input).to_vec()) {
+                    Ok(()) => {
+                        debug!(
+                            session_id = %session_id,
+                            stage = 1,
+                            total_stages = soft_stop_schedule.len(),
+                            bytes = input.len(),
+                            "sent soft-stop input"
+                        );
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        warn!(
+                            session_id = %session_id,
+                            stage = 1,
+                            total_stages = soft_stop_schedule.len(),
+                            bytes = input.len(),
+                            "soft-stop input dropped because PTY writer queue is full"
+                        );
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        warn!(
+                            session_id = %session_id,
+                            stage = 1,
+                            total_stages = soft_stop_schedule.len(),
+                            bytes = input.len(),
+                            "soft-stop input failed because PTY writer is closed"
+                        );
+                    }
+                }
                 next_soft_stop_index = 1;
             }
         }
@@ -643,15 +677,38 @@ impl SessionStore {
                     if Instant::now() < soft_stop_schedule[next_soft_stop_index].0 {
                         break;
                     }
-                    let _ = rt.pty.write_input((*input).to_vec());
-                    debug!(
-                        session_id = %session_id,
-                        stage = next_soft_stop_index + 1,
-                        total_stages = soft_stop_schedule.len(),
-                        bytes = input.len(),
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "sent staged soft-stop input"
-                    );
+                    match rt.pty.try_write_input((*input).to_vec()) {
+                        Ok(()) => {
+                            debug!(
+                                session_id = %session_id,
+                                stage = next_soft_stop_index + 1,
+                                total_stages = soft_stop_schedule.len(),
+                                bytes = input.len(),
+                                elapsed_ms = start.elapsed().as_millis(),
+                                "sent staged soft-stop input"
+                            );
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            warn!(
+                                session_id = %session_id,
+                                stage = next_soft_stop_index + 1,
+                                total_stages = soft_stop_schedule.len(),
+                                bytes = input.len(),
+                                elapsed_ms = start.elapsed().as_millis(),
+                                "staged soft-stop input dropped because PTY writer queue is full"
+                            );
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            warn!(
+                                session_id = %session_id,
+                                stage = next_soft_stop_index + 1,
+                                total_stages = soft_stop_schedule.len(),
+                                bytes = input.len(),
+                                elapsed_ms = start.elapsed().as_millis(),
+                                "staged soft-stop input failed because PTY writer is closed"
+                            );
+                        }
+                    }
                     next_soft_stop_index += 1;
                 }
                 runtime.refresh_snapshot(&rt);
@@ -1007,7 +1064,7 @@ mod tests {
         }
 
         let (broadcast_tx, _rx) = broadcast::channel(4);
-        let (writer_tx, _writer_rx) = mpsc::unbounded_channel();
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
         let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
@@ -1026,12 +1083,12 @@ mod tests {
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
+            attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
-            persist_filter: super::super::pty::EscapeFilter::new(),
         }))
     }
 
@@ -1367,7 +1424,18 @@ mod tests {
         status: SessionStatus,
     ) -> (
         Arc<Mutex<super::super::runtime::SessionRuntime>>,
-        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        make_runtime_writable_with_capacity(id, status, 8)
+    }
+
+    fn make_runtime_writable_with_capacity(
+        id: &str,
+        status: SessionStatus,
+        capacity: usize,
+    ) -> (
+        Arc<Mutex<super::super::runtime::SessionRuntime>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         use crate::session::ring::RingBuffer;
         use tokio::sync::{broadcast, mpsc};
@@ -1387,7 +1455,7 @@ mod tests {
             exit_code: None,
         };
         let (broadcast_tx, _rx) = broadcast::channel(4);
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+        let (writer_tx, writer_rx) = mpsc::channel(capacity.max(1));
         let (child, pty_master) = make_dummy_child();
         let rt = Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
@@ -1406,12 +1474,12 @@ mod tests {
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
+            attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
-            persist_filter: super::super::pty::EscapeFilter::new(),
         }));
         (rt, writer_rx)
     }
@@ -1646,6 +1714,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_attach_input_returns_busy_when_writer_queue_is_full() {
+        let (rt, _writer_rx) =
+            make_runtime_writable_with_capacity("inpbusy1", SessionStatus::Running, 1);
+        {
+            let locked = rt.lock().unwrap();
+            locked
+                .pty
+                .try_write_input(b"first".to_vec())
+                .expect("first write should fit in the bounded queue");
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let result = store.attach_input("inpbusy1", "second").await;
+        assert!(
+            matches!(result, Err(SessionLookupError::Busy)),
+            "expected bounded writer queue saturation to surface SessionLookupError::Busy"
+        );
+    }
+
+    #[tokio::test]
     async fn test_stop_session_preserves_completed_failure() {
         let (rt, mut writer_rx) = make_runtime_writable("stp0001", SessionStatus::Failed);
         let rt_clone = rt.clone();
@@ -1744,6 +1832,7 @@ mod tests {
         let rt_clone = rt.clone();
         let store = store_with(vec![rt], make_test_db().await);
 
+        store.register_attach_client("detach001").await;
         {
             let mut locked = rt_clone.lock().unwrap();
             locked.mark_attach_activity();
@@ -1763,5 +1852,77 @@ mod tests {
             locked.last_attach_activity_at.is_none(),
             "detach should clear attach activity"
         );
+    }
+
+    #[tokio::test]
+    async fn test_attach_detach_only_clears_after_final_client_disconnects() {
+        let rt = make_runtime("detach002", SessionStatus::Running, "$ prompt", None);
+        let rt_clone = rt.clone();
+        let store = store_with(vec![rt], make_test_db().await);
+
+        store.register_attach_client("detach002").await;
+        store.register_attach_client("detach002").await;
+        {
+            let mut locked = rt_clone.lock().unwrap();
+            locked.mark_attach_activity();
+        }
+
+        store
+            .attach_detach("detach002")
+            .await
+            .expect("first detach should succeed");
+
+        {
+            let locked = rt_clone.lock().unwrap();
+            assert_eq!(
+                locked.attach_count, 1,
+                "one client should still remain registered"
+            );
+            assert!(
+                locked.last_attach_presence_at.is_some(),
+                "presence should remain while one client is still connected"
+            );
+            assert!(
+                locked.last_attach_activity_at.is_some(),
+                "activity timestamp should remain until the last client disconnects"
+            );
+        }
+
+        store
+            .attach_detach("detach002")
+            .await
+            .expect("second detach should succeed");
+
+        let locked = rt_clone.lock().unwrap();
+        assert_eq!(locked.attach_count, 0, "all clients should be disconnected");
+        assert!(
+            locked.last_attach_presence_at.is_none(),
+            "final detach should clear attach presence"
+        );
+        assert!(
+            locked.last_attach_activity_at.is_none(),
+            "final detach should clear attach activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_stream_status_keeps_stopping_session_live() {
+        let rt = make_runtime("stoplive", SessionStatus::Stopping, "", None);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let (running, output_closed, exit_code) = store
+            .attach_stream_status("stoplive")
+            .await
+            .expect("status lookup should succeed");
+
+        assert!(
+            running,
+            "stopping sessions should remain streamable until exit"
+        );
+        assert!(
+            !output_closed,
+            "fresh test runtime should still have open output"
+        );
+        assert_eq!(exit_code, None);
     }
 }

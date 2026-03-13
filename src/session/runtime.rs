@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, trace};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -54,6 +54,8 @@ pub struct SessionRuntime {
     pub last_attach_presence_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
+    /// Number of currently connected local clients for this session.
+    pub attach_count: usize,
     /// Timestamp of the last *successful* notification delivery for this session.
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
@@ -63,9 +65,9 @@ pub struct SessionRuntime {
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
     pub notifications_enabled: bool,
-    /// Filters CPR/DSR/OSC responses from PTY output before writing to disk.
-    pub persist_filter: EscapeFilter,
 }
+
+const PTY_WRITER_QUEUE_CAPACITY: usize = 256;
 
 impl SessionRuntime {
     /// Current terminal mode snapshot (DECCKM, bracketed paste).
@@ -77,7 +79,7 @@ impl SessionRuntime {
     /// and advance the silence clock for visible content.
     ///
     /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
-    pub fn push_raw(&mut self, data: Bytes) -> Option<ModeSnapshot> {
+    pub fn push_raw(&mut self, data: Bytes, has_visible_output: bool) -> Option<ModeSnapshot> {
         // Track DEC private mode toggles via byte-level state machine.
         let mode_change = self.mode_tracker.process(&data);
         if let Some(ref snap) = mode_change {
@@ -90,16 +92,8 @@ impl SessionRuntime {
         }
 
         // Advance the silence clock only for chunks with visible content.
-        let text_cow = String::from_utf8_lossy(&data);
-        if has_visible_content(&text_cow) {
+        if has_visible_output {
             self.last_output_at = Some(Instant::now());
-        }
-
-        // Persist filtered bytes to disk (strips CPR/DSR/OSC responses that
-        // get echoed by the PTY driver so `oly logs` output stays clean).
-        let filtered = self.persist_filter.filter(&data);
-        if !filtered.is_empty() {
-            let _ = append_output_raw(&self.dir, &filtered);
         }
 
         // Add to in-memory ring (evicts oldest if over capacity).
@@ -108,19 +102,41 @@ impl SessionRuntime {
         mode_change
     }
 
-    pub fn mark_attach_presence(&mut self) {
-        trace!(session_id = %self.meta.id, "attach presence marked");
+    pub fn register_attach_client(&mut self) {
+        self.attach_count = self.attach_count.saturating_add(1);
+        trace!(
+            session_id = %self.meta.id,
+            attach_count = self.attach_count,
+            "attach client registered"
+        );
         self.last_attach_presence_at = Some(Instant::now());
     }
 
     pub fn mark_attach_activity(&mut self) {
-        self.mark_attach_presence();
-        debug!(session_id = %self.meta.id, "interactive attach activity marked");
+        self.last_attach_presence_at = Some(Instant::now());
+        debug!(
+            session_id = %self.meta.id,
+            attach_count = self.attach_count,
+            "interactive attach activity marked"
+        );
         self.last_attach_activity_at = Some(Instant::now());
+    }
+
+    pub fn detach_attach_client(&mut self) {
+        self.attach_count = self.attach_count.saturating_sub(1);
+        debug!(
+            session_id = %self.meta.id,
+            attach_count = self.attach_count,
+            "attach client detached"
+        );
+        if self.attach_count == 0 {
+            self.clear_attach_state();
+        }
     }
 
     pub fn clear_attach_state(&mut self) {
         debug!(session_id = %self.meta.id, "attach presence/activity cleared");
+        self.attach_count = 0;
         self.last_attach_presence_at = None;
         self.last_attach_activity_at = None;
     }
@@ -134,7 +150,7 @@ impl SessionRuntime {
     /// Returns `true` when at least one attach subscriber is currently live.
     #[allow(dead_code)]
     pub fn has_active_attach_client(&self) -> bool {
-        self.broadcast_tx.receiver_count() > 0
+        self.attach_count > 0
     }
 
     /// Checks child exit status and updates `meta.status`. Returns `true` if completed.
@@ -185,6 +201,12 @@ impl SessionRuntime {
         if self.completed_at.is_none() {
             self.completed_at = Some(Instant::now());
         }
+        info!(
+            session_id = %self.meta.id,
+            status = status.as_str(),
+            exit_code = ?exit_code,
+            "marking PTY session as completed"
+        );
         self.pty.release_resources();
         let event = match &self.meta.status {
             SessionStatus::Stopped => format!(
@@ -201,7 +223,9 @@ impl SessionRuntime {
             ),
             other => format!("session ended status={}", other.as_str()),
         };
-        let _ = append_event(&self.dir, &event);
+        if let Err(err) = append_event(&self.dir, &event) {
+            warn!(session_id = %self.meta.id, %err, "failed to persist PTY session completion event");
+        }
     }
 
     pub fn is_completed(&self) -> bool {
@@ -253,6 +277,17 @@ pub fn spawn_session(
     notifications_enabled: bool,
 ) -> Result<Arc<Mutex<SessionRuntime>>> {
     let full_dir = session_dir;
+    let reader_dir = full_dir.clone();
+    info!(
+        session_id = %meta.id,
+        command = %meta.command,
+        args = ?meta.args,
+        cwd = ?meta.cwd,
+        rows,
+        cols,
+        notifications_enabled,
+        "spawning PTY session runtime"
+    );
     std::fs::create_dir_all(&full_dir)?;
 
     let Ok(cmd) = which::which(&meta.command) else {
@@ -314,14 +349,21 @@ pub fn spawn_session(
 
     // Writer channel: the dedicated write thread owns the PTY writer so that
     // sending input never blocks the tokio runtime.
-    let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(PTY_WRITER_QUEUE_CAPACITY);
 
     // PTY writer thread — drains writer_rx and forwards bytes to the child.
+    let writer_session_id = meta.id.clone();
     std::thread::spawn(move || {
+        debug!(session_id = %writer_session_id, "PTY writer thread started");
         let mut writer = writer;
         while let Some(data) = writer_rx.blocking_recv() {
-            let _ = writer.write_all(&data).and_then(|_| writer.flush());
+            trace!(session_id = %writer_session_id, bytes = data.len(), "forwarding PTY stdin bytes");
+            if let Err(err) = writer.write_all(&data).and_then(|_| writer.flush()) {
+                warn!(session_id = %writer_session_id, %err, "PTY writer thread failed");
+                break;
+            }
         }
+        debug!(session_id = %writer_session_id, "PTY writer thread stopped");
     });
 
     let pty_handle = PtyHandle {
@@ -343,36 +385,43 @@ pub fn spawn_session(
         last_input_at: None,
         last_attach_presence_at: None,
         last_attach_activity_at: None,
+        attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
         mode_tracker: ModeTracker::new(),
         output_closed: false,
         notifications_enabled,
-        persist_filter: EscapeFilter::new(),
     }));
 
     // PTY reader thread: reads raw bytes, stores in ring, broadcasts to subscribers.
     let runtime_reader = runtime.clone();
     let broadcast_tx_reader = broadcast_tx;
+    let reader_session_id = meta.id.clone();
     std::thread::spawn(move || {
-        if let Ok(rt) = runtime_reader.lock() {
-            let _ = append_event(&rt.dir, "pty reader started");
+        debug!(session_id = %reader_session_id, "PTY reader thread started");
+        if let Err(err) = append_event(&reader_dir, "pty reader started") {
+            warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader start event");
         }
         let mut buf = [0u8; 4096];
         let mut reader = reader;
         let mut query_tail = String::new();
         let mut cursor_tracker = CursorTracker::new(rows, cols);
+        let mut persist_filter = EscapeFilter::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
                     if let Ok(mut rt) = runtime_reader.lock() {
                         rt.output_closed = true;
-                        let _ = append_event(&rt.dir, "pty reader reached EOF");
+                    }
+                    debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
+                    if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
+                        warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
                     }
                     break;
                 }
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
+                    trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
                     // Update cursor position tracking before answering queries
                     // so CPR responses reflect the actual cursor position.
@@ -385,39 +434,82 @@ pub fn spawn_session(
                         &mut query_tail,
                         cursor_tracker.position(),
                     ) {
-                        let _ = writer_tx.send(resp);
+                        trace!(
+                            session_id = %reader_session_id,
+                            bytes = resp.len(),
+                            "responding to detached terminal capability query"
+                        );
+                        if writer_tx.blocking_send(resp).is_err() {
+                            warn!(
+                                session_id = %reader_session_id,
+                                "failed to queue detached terminal query response because PTY writer closed"
+                            );
+                            break;
+                        }
                     }
 
-                    // Update in-memory ring + disk + mode tracking (brief lock).
+                    let has_visible_output = has_visible_content(&String::from_utf8_lossy(&data));
+                    let filtered_for_persist = persist_filter.filter(&data);
+
+                    // Update in-memory ring + mode tracking (brief lock).
                     match runtime_reader.lock() {
                         Ok(mut rt) => {
-                            let _mode_change = rt.push_raw(data.clone());
+                            let _mode_change = rt.push_raw(data.clone(), has_visible_output);
                             // Mode changes are picked up by attach subscribers
                             // via the broadcast channel + periodic mode checks.
                         }
-                        Err(_) => break,
+                        Err(_) => {
+                            warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
+                            break;
+                        }
+                    }
+
+                    if !filtered_for_persist.is_empty() {
+                        if let Err(err) = append_output_raw(&reader_dir, &filtered_for_persist) {
+                            warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
+                        }
                     }
 
                     // Broadcast to all live subscribers (non-blocking; lagged
                     // receivers will re-sync from the ring on the next tick).
-                    let _ = broadcast_tx_reader.send(Arc::new(data));
+                    if let Ok(receiver_count) = broadcast_tx_reader.send(Arc::new(data)) {
+                        trace!(
+                            session_id = %reader_session_id,
+                            receiver_count,
+                            "broadcast PTY output chunk to live subscribers"
+                        );
+                    }
                 }
                 Err(err)
                     if matches!(err.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
                 {
+                    trace!(session_id = %reader_session_id, kind = ?err.kind(), "PTY reader retrying after transient read condition");
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
                     if let Ok(mut rt) = runtime_reader.lock() {
                         rt.output_closed = true;
-                        let _ = append_event(&rt.dir, &format!("pty reader error: {err}"));
+                    }
+                    warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
+                    if let Err(append_err) =
+                        append_event(&reader_dir, &format!("pty reader error: {err}"))
+                    {
+                        warn!(session_id = %reader_session_id, %append_err, "failed to persist PTY reader error event");
                     }
                     break;
                 }
             }
         }
+        debug!(session_id = %reader_session_id, "PTY reader thread stopped");
     });
 
+    info!(
+        session_id = %meta.id,
+        pid = ?meta.pid,
+        ring_buffer_bytes = config.ring_buffer_bytes,
+        writer_queue_capacity = PTY_WRITER_QUEUE_CAPACITY,
+        "PTY session runtime spawned"
+    );
     Ok(runtime)
 }
 
@@ -525,7 +617,7 @@ mod tests {
             exit_code: None,
         };
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel(4);
-        let (writer_tx, _wrx) = tokio::sync::mpsc::unbounded_channel();
+        let (writer_tx, _wrx) = tokio::sync::mpsc::channel(8);
         SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
@@ -543,12 +635,12 @@ mod tests {
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
+            attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
-            persist_filter: EscapeFilter::new(),
         }
     }
 
@@ -570,7 +662,7 @@ mod tests {
     fn test_push_raw_enables_bracketed_paste() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_raw(bytes::Bytes::from("text \x1b[?2004h more"));
+        rt.push_raw(bytes::Bytes::from("text \x1b[?2004h more"), true);
         assert!(
             rt.mode_snapshot().bracketed_paste_mode,
             "bracketed_paste_mode should be set after \\x1b[?2004h"
@@ -580,9 +672,9 @@ mod tests {
     #[test]
     fn test_push_raw_disables_bracketed_paste() {
         let mut rt = new_runtime();
-        rt.push_raw(bytes::Bytes::from("\x1b[?2004h"));
+        rt.push_raw(bytes::Bytes::from("\x1b[?2004h"), false);
         assert!(rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_raw(bytes::Bytes::from("\x1b[?2004l"));
+        rt.push_raw(bytes::Bytes::from("\x1b[?2004l"), false);
         assert!(
             !rt.mode_snapshot().bracketed_paste_mode,
             "bracketed_paste_mode should be cleared after \\x1b[?2004l"
@@ -593,7 +685,7 @@ mod tests {
     fn test_push_raw_enables_app_cursor_keys() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().app_cursor_keys);
-        rt.push_raw(bytes::Bytes::from("\x1b[?1h"));
+        rt.push_raw(bytes::Bytes::from("\x1b[?1h"), false);
         assert!(
             rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be set after DECCKM enable"
@@ -603,9 +695,9 @@ mod tests {
     #[test]
     fn test_push_raw_disables_app_cursor_keys() {
         let mut rt = new_runtime();
-        rt.push_raw(bytes::Bytes::from("\x1b[?1h"));
+        rt.push_raw(bytes::Bytes::from("\x1b[?1h"), false);
         assert!(rt.mode_snapshot().app_cursor_keys);
-        rt.push_raw(bytes::Bytes::from("\x1b[?1l"));
+        rt.push_raw(bytes::Bytes::from("\x1b[?1l"), false);
         assert!(
             !rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be cleared after DECCKM disable"
@@ -621,9 +713,9 @@ mod tests {
         let mut rt = new_runtime(); // capacity = 4096 bytes
         // Push chunks that together exceed 4096 bytes so oldest are evicted.
         let chunk = bytes::Bytes::from(vec![b'x'; 1500]);
-        rt.push_raw(chunk.clone());
-        rt.push_raw(chunk.clone());
-        rt.push_raw(chunk.clone()); // total so far: 4500 — first evicted
+        rt.push_raw(chunk.clone(), true);
+        rt.push_raw(chunk.clone(), true);
+        rt.push_raw(chunk.clone(), true); // total so far: 4500 — first evicted
         // start_offset must have advanced past 0
         assert!(
             rt.ring.start_offset() > 0,
@@ -639,7 +731,7 @@ mod tests {
     fn test_push_raw_visible_content_advances_last_output_at() {
         let mut rt = new_runtime();
         assert!(rt.last_output_at.is_none());
-        rt.push_raw(bytes::Bytes::from("hello world\n"));
+        rt.push_raw(bytes::Bytes::from("hello world\n"), true);
         assert!(
             rt.last_output_at.is_some(),
             "visible output should set last_output_at"
@@ -649,7 +741,7 @@ mod tests {
     #[test]
     fn test_push_raw_pure_ansi_does_not_advance_last_output_at() {
         let mut rt = new_runtime();
-        rt.push_raw(bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"));
+        rt.push_raw(bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"), false);
         assert!(
             rt.last_output_at.is_none(),
             "pure ANSI sequences should not advance last_output_at"
@@ -665,17 +757,17 @@ mod tests {
         let rt = new_runtime();
         assert!(
             !rt.has_active_attach_client(),
-            "no receiver subscribed → should report no active client"
+            "no registered client → should report no active client"
         );
     }
 
     #[test]
-    fn test_has_active_attach_client_true_with_receiver() {
-        let rt = new_runtime();
-        let _rx = rt.broadcast_tx.subscribe();
+    fn test_has_active_attach_client_true_with_registered_client() {
+        let mut rt = new_runtime();
+        rt.register_attach_client();
         assert!(
             rt.has_active_attach_client(),
-            "one receiver subscribed → should report active client"
+            "one registered client → should report active client"
         );
     }
 
@@ -731,7 +823,7 @@ mod tests {
             exit_code: None,
         };
         let (broadcast_tx, _rx) = broadcast::channel(4);
-        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel();
+        let (writer_tx, mut writer_rx) = mpsc::channel(4);
         let mut rt = SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
@@ -749,15 +841,15 @@ mod tests {
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
+            attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: ModeTracker::new(),
             output_closed: false,
             notifications_enabled: true,
-            persist_filter: EscapeFilter::new(),
         };
 
-        assert!(rt.pty.write_input(b"before".to_vec()));
+        assert!(rt.pty.try_write_input(b"before".to_vec()).is_ok());
         assert_eq!(
             writer_rx
                 .try_recv()
@@ -768,7 +860,7 @@ mod tests {
         rt.mark_completed(SessionStatus::Stopped, Some(0));
 
         assert!(
-            !rt.pty.write_input(b"after".to_vec()),
+            rt.pty.try_write_input(b"after".to_vec()).is_err(),
             "completed sessions should reject further writes"
         );
     }

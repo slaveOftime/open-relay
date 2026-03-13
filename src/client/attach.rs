@@ -52,16 +52,18 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
     // Receive the init frame.
     let init = ipc::read_response_from_reader(&mut reader).await?;
-    let (initial_data, mut running, mut child_app_cursor_keys) = match init {
-        RpcResponse::AttachStreamInit {
-            data,
-            running,
-            app_cursor_keys,
-            ..
-        } => (data, running, app_cursor_keys),
-        RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
-        _ => return Err(AppError::Protocol("unexpected response type".to_string())),
-    };
+    let (initial_data, mut running, mut child_bracketed_paste_mode, mut child_app_cursor_keys) =
+        match init {
+            RpcResponse::AttachStreamInit {
+                data,
+                running,
+                bracketed_paste_mode,
+                app_cursor_keys,
+                ..
+            } => (data, running, bracketed_paste_mode, app_cursor_keys),
+            RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
+            _ => return Err(AppError::Protocol("unexpected response type".to_string())),
+        };
 
     // When stdio is piped, interactive terminal control fails across platforms,
     // so fall back to a plain stream replay instead of raw-mode attach.
@@ -153,7 +155,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             &mut write_half,
                             RpcRequest::AttachInput {
                                 id: id_owned.clone(),
-                                data,
+                                data: wrap_paste_input(data, child_bracketed_paste_mode),
                             },
                         )
                         .await?
@@ -216,9 +218,11 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     write_bytes_to_stdout(&data)?;
                 }
                 Ok(Some(Ok(RpcResponse::AttachModeChanged {
-                    app_cursor_keys, ..
+                    app_cursor_keys,
+                    bracketed_paste_mode,
                 }))) => {
                     child_app_cursor_keys = app_cursor_keys;
+                    child_bracketed_paste_mode = bracketed_paste_mode;
                 }
                 Ok(Some(Ok(RpcResponse::AttachStreamDone { .. }))) => {
                     running = false;
@@ -395,6 +399,14 @@ fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
+    if bracketed_paste_mode {
+        format!("\x1b[200~{data}\x1b[201~")
+    } else {
+        data
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key input mapping
 // ---------------------------------------------------------------------------
@@ -516,6 +528,22 @@ mod tests {
         assert_eq!(
             map_key_to_input(press(KeyCode::Esc), false),
             Some("\x1b".to_string())
+        );
+    }
+
+    #[test]
+    fn test_wrap_paste_input_passthrough_when_bracketed_paste_is_disabled() {
+        assert_eq!(
+            wrap_paste_input("hello\nworld".to_string(), false),
+            "hello\nworld"
+        );
+    }
+
+    #[test]
+    fn test_wrap_paste_input_wraps_when_bracketed_paste_is_enabled() {
+        assert_eq!(
+            wrap_paste_input("hello\nworld".to_string(), true),
+            "\x1b[200~hello\nworld\x1b[201~"
         );
     }
 

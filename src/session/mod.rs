@@ -68,6 +68,7 @@ pub struct StartSpec {
 pub enum SessionLookupError {
     Evicted,
     NotRunning,
+    Busy,
 }
 
 impl SessionLookupError {
@@ -75,6 +76,7 @@ impl SessionLookupError {
         match self {
             Self::Evicted => format!("session evicted from memory: {id}"),
             Self::NotRunning => format!("session not running: {id}"),
+            Self::Busy => format!("session input queue is full: {id}"),
         }
     }
 }
