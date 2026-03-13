@@ -4,6 +4,8 @@
 
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tracing::{debug, trace, warn};
 
 // ---------------------------------------------------------------------------
 // PtyHandle — owns the PTY file descriptors, reader/writer threads, and child
@@ -15,30 +17,43 @@ use tokio::sync::mpsc;
 pub struct PtyHandle {
     pub(crate) child: RuntimeChild,
     /// Channel to the dedicated PTY writer thread.
-    pub(crate) writer_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub(crate) writer_tx: mpsc::Sender<Vec<u8>>,
     /// Kept alive so the master fd stays open; resize goes through this.
     pub(crate) pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
 }
 
 impl PtyHandle {
     /// Send raw bytes to the child's stdin via the writer thread.
-    pub fn write_input(&self, data: Vec<u8>) -> bool {
-        self.writer_tx.send(data).is_ok()
+    pub fn try_write_input(&self, data: Vec<u8>) -> std::result::Result<(), TrySendError<Vec<u8>>> {
+        let len = data.len();
+        let result = self.writer_tx.try_send(data);
+        match &result {
+            Ok(()) => trace!(bytes = len, "queued PTY stdin write"),
+            Err(TrySendError::Full(_)) => debug!(bytes = len, "PTY stdin queue is full"),
+            Err(TrySendError::Closed(_)) => debug!(bytes = len, "PTY stdin queue is closed"),
+        }
+        result
     }
 
     /// Resize the PTY. Returns `true` on success.
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
         let Some(master) = self.pty_master.as_mut() else {
+            debug!(
+                rows,
+                cols, "PTY resize skipped because master handle is unavailable"
+            );
             return false;
         };
-        master
+        let result = master
             .resize(portable_pty::PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .is_ok()
+            .is_ok();
+        debug!(rows, cols, resized = result, "PTY resize completed");
+        result
     }
 
     /// Release PTY-owned handles once the session is completed.
@@ -46,8 +61,9 @@ impl PtyHandle {
     /// This closes the stored master handle and replaces the public writer
     /// sender with a permanently closed channel so future writes fail fast.
     pub fn release_resources(&mut self) {
+        debug!("releasing PTY resources");
         self.pty_master.take();
-        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+        let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let previous_tx = std::mem::replace(&mut self.writer_tx, closed_tx);
         drop(previous_tx);
@@ -55,12 +71,23 @@ impl PtyHandle {
 
     /// Send SIGKILL / close ConPTY.
     pub fn kill(&mut self) -> std::io::Result<()> {
-        self.child.kill()
+        let result = self.child.kill();
+        match &result {
+            Ok(()) => debug!("PTY child kill requested"),
+            Err(err) => warn!(%err, "failed to kill PTY child"),
+        }
+        result
     }
 
     /// Non-blocking check for child exit. Returns `Some(exit_code)` if exited.
     pub fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.child.try_wait_code()
+        let result = self.child.try_wait_code();
+        match &result {
+            Ok(Some(code)) => debug!(exit_code = code, "PTY child exit observed"),
+            Ok(None) => {}
+            Err(err) => warn!(%err, "failed to poll PTY child status"),
+        }
+        result
     }
 
     #[allow(dead_code)]
@@ -377,13 +404,24 @@ impl EscapeFilter {
 
     /// Filter a raw PTY byte slice and return the cleaned bytes.
     pub fn filter(&mut self, data: &[u8]) -> Vec<u8> {
+        let pending_before = self.pending.len();
         // Fast path: avoid a heap allocation when the data is already valid
         // UTF-8 (the overwhelmingly common case for terminal output).
         let chunk: std::borrow::Cow<'_, str> = match std::str::from_utf8(data) {
             Ok(s) => std::borrow::Cow::Borrowed(s),
             Err(_) => String::from_utf8_lossy(data),
         };
-        filter_cpr_chunk(&mut self.pending, &chunk).into_bytes()
+        let filtered = filter_cpr_chunk(&mut self.pending, &chunk).into_bytes();
+        if filtered.len() != data.len() || self.pending.len() != pending_before {
+            trace!(
+                input_bytes = data.len(),
+                output_bytes = filtered.len(),
+                pending_before,
+                pending_after = self.pending.len(),
+                "filtered terminal escape responses from PTY output"
+            );
+        }
+        filtered
     }
 }
 
@@ -443,6 +481,17 @@ pub fn extract_query_responses_no_client(
     let keep = terminal_query_tail_len(remainder);
     *tail = remainder[remainder.len().saturating_sub(keep)..].to_string();
 
+    if !responses.is_empty() || keep > 0 {
+        debug!(
+            input_bytes = data.len(),
+            response_count = responses.len(),
+            tail_len = keep,
+            cursor_row = cursor.0,
+            cursor_col = cursor.1,
+            "processed terminal capability queries without a live client"
+        );
+    }
+
     responses
 }
 
@@ -466,6 +515,7 @@ pub fn extract_query_responses_no_client(
 /// * Terminal queries that would cause the attach client's terminal to
 ///   respond (DECRPM, XTVERSION, DA1/DA2, kitty keyboard, etc.)
 pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
+    let pending_before = pending.len();
     static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
     let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
 
@@ -559,7 +609,17 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     let combined = da1_query_re().replace_all(&combined, "");
     let combined = da2_query_re().replace_all(&combined, "");
     let combined = kitty_keyboard_query_re().replace_all(&combined, "");
-    winsize_query_re.replace_all(&combined, "").into_owned()
+    let filtered = winsize_query_re.replace_all(&combined, "").into_owned();
+    if filtered.len() != chunk.len() + pending_before || pending.len() != pending_before {
+        trace!(
+            pending_before,
+            pending_after = pending.len(),
+            combined_len = chunk.len() + pending_before,
+            filtered_len = filtered.len(),
+            "stripped device-response escape sequences from PTY chunk"
+        );
+    }
+    filtered
 }
 
 pub(crate) fn trailing_partial_osc_sequence_start(text: &str) -> Option<usize> {
