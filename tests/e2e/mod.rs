@@ -76,6 +76,70 @@ pub struct DaemonGuard {
     tmp_dir: PathBuf,
 }
 
+fn daemon_ready_timeout(no_http: bool) -> Duration {
+    if cfg!(target_os = "windows") {
+        if no_http {
+            Duration::from_secs(8)
+        } else {
+            Duration::from_secs(10)
+        }
+    } else if no_http {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(4)
+    }
+}
+
+fn wait_for_daemon_ready(
+    mut child: std::process::Child,
+    tmp: &PathBuf,
+    log_path: &PathBuf,
+    timeout: Duration,
+) -> DaemonGuard {
+    let deadline = Instant::now() + timeout;
+    loop {
+        sleep(Duration::from_millis(250));
+
+        if let Some(status) = child
+            .try_wait()
+            .expect("failed to check daemon child status")
+        {
+            let daemon_log = fs::read_to_string(log_path).unwrap_or_default();
+            panic!(
+                "daemon exited before becoming ready: {status}\n--- daemon stderr ({}) ---\n{}",
+                log_path.display(),
+                daemon_log,
+            );
+        }
+
+        let probe = oly_cmd(tmp)
+            .args(["stop", "zzz9999"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("readiness probe (`oly stop`) failed to execute");
+        let probe_stderr = String::from_utf8_lossy(&probe.stderr).to_string();
+        if probe_stderr.contains("zzz9999") {
+            return DaemonGuard {
+                child,
+                tmp_dir: tmp.clone(),
+            };
+        }
+
+        if Instant::now() >= deadline {
+            let daemon_log = fs::read_to_string(log_path).unwrap_or_default();
+            panic!(
+                "daemon did not become ready within {} s\n--- daemon stderr ({}) ---\n{}\n--- last probe stderr ---\n{}",
+                timeout.as_secs(),
+                log_path.display(),
+                daemon_log,
+                probe_stderr,
+            );
+        }
+    }
+}
+
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
         let _ = oly_cmd(&self.tmp_dir)
@@ -108,33 +172,7 @@ pub fn start_daemon(tmp: &PathBuf) -> DaemonGuard {
         .spawn()
         .expect("failed to spawn daemon process");
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        sleep(Duration::from_millis(250));
-        let probe = oly_cmd(tmp)
-            .args(["stop", "zzz9999"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("readiness probe (`oly stop`) failed to execute");
-        let probe_stderr = String::from_utf8_lossy(&probe.stderr).to_string();
-        if probe_stderr.contains("zzz9999") {
-            return DaemonGuard {
-                child,
-                tmp_dir: tmp.clone(),
-            };
-        }
-        if Instant::now() >= deadline {
-            let daemon_log = fs::read_to_string(&log_path).unwrap_or_default();
-            panic!(
-                "daemon did not become ready within 3 s\n--- daemon stderr ({}) ---\n{}\n--- last probe stderr ---\n{}",
-                log_path.display(),
-                daemon_log,
-                probe_stderr,
-            );
-        }
-    }
+    wait_for_daemon_ready(child, tmp, &log_path, daemon_ready_timeout(true))
 }
 
 pub fn pick_free_port() -> u16 {
@@ -161,33 +199,7 @@ pub fn start_daemon_http(tmp: &PathBuf, port: u16) -> DaemonGuard {
         .spawn()
         .expect("failed to spawn daemon process");
 
-    let deadline = Instant::now() + Duration::from_secs(4);
-    loop {
-        sleep(Duration::from_millis(250));
-        let probe = oly_cmd(tmp)
-            .args(["stop", "zzz9999"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .expect("readiness probe (`oly stop`) failed to execute");
-        let probe_stderr = String::from_utf8_lossy(&probe.stderr).to_string();
-        if probe_stderr.contains("zzz9999") {
-            return DaemonGuard {
-                child,
-                tmp_dir: tmp.clone(),
-            };
-        }
-        if Instant::now() >= deadline {
-            let daemon_log = fs::read_to_string(&log_path).unwrap_or_default();
-            panic!(
-                "daemon did not become ready within 4 s\n--- daemon stderr ({}) ---\n{}\n--- last probe stderr ---\n{}",
-                log_path.display(),
-                daemon_log,
-                probe_stderr,
-            );
-        }
-    }
+    wait_for_daemon_ready(child, tmp, &log_path, daemon_ready_timeout(false))
 }
 
 pub fn start_session(tmp: &PathBuf, cmd_and_args: &[&str]) -> String {
