@@ -109,7 +109,7 @@ We deliberately **do not** adopt:
 | Spawned | Running | Immediately after spawn (reader thread starts) |
 | Running | Exited | Child process exits (`try_wait()` returns `Some`) |
 | Running | Exited | `kill()` called (stop command) |
-| Exited | Cleaned Up | Eviction timer / daemon shutdown |
+| Exited | Cleaned Up | Periodic daemon maintenance tick after eviction TTL / daemon shutdown |
 
 ---
 
@@ -218,7 +218,7 @@ DECCKM arrow-key transformation before sending to the writer channel.
 ## 6) Ring Buffer & Replay
 
 The ring buffer (`src/session/ring.rs`) is a fixed-capacity circular byte
-buffer (default 512 KB) that stores the most recent PTY output.
+buffer (default 1 MiB) that stores the most recent PTY output.
 
 ### Replay on Attach
 
@@ -547,8 +547,9 @@ for intermediate sizes.  Mitigation: clients should debounce resize events
 └──────────────────────────────────────────┘
 ```
 
-Both IPC and WebSocket handlers run a periodic completion check.  This is
-necessary because:
+Both IPC and WebSocket handlers run a periodic completion check, and the daemon
+also runs a periodic maintenance tick to persist/evict completed sessions even
+while idle. This is necessary because:
 - `broadcast::Receiver::Closed` only fires when the sender is dropped
 - The sender is dropped when the reader thread exits
 - The reader thread exits when `read()` returns 0 (master fd closed)

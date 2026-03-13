@@ -21,7 +21,7 @@ use crate::{
 
 pub(super) fn spawn_join_connector(
     join: JoinConfig,
-    local_config: AppConfig,
+    local_config: Arc<AppConfig>,
     notification_rx: broadcast::Receiver<NotificationEvent>,
 ) -> (tokio::task::AbortHandle, watch::Sender<bool>) {
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -33,7 +33,7 @@ pub(super) fn spawn_join_connector(
 
 async fn run_join_connector(
     join: JoinConfig,
-    local_config: AppConfig,
+    local_config: Arc<AppConfig>,
     mut notification_rx: broadcast::Receiver<NotificationEvent>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
@@ -74,7 +74,7 @@ async fn run_join_connector(
 
 async fn connect_and_relay(
     join: &JoinConfig,
-    local_config: &AppConfig,
+    local_config: &Arc<AppConfig>,
     notification_rx: &mut broadcast::Receiver<NotificationEvent>,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<bool> {
@@ -200,7 +200,7 @@ async fn connect_and_relay(
                         };
 
                         if matches!(req, RpcRequest::AttachSubscribe { .. }) {
-                            let local_cfg = local_config.clone();
+                            let local_cfg = Arc::clone(&local_config);
                             let rpc_id = id.clone();
                             let frame_tx = stream_frame_tx.clone();
                             tokio::spawn(async move {

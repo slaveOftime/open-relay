@@ -48,6 +48,12 @@ impl SessionStore {
         }
     }
 
+    /// Persist and evict completed sessions that have aged past the in-memory
+    /// retention window.
+    pub async fn run_maintenance(&mut self) {
+        self.prune_evicted_sessions().await;
+    }
+
     /// Load session history from the SQLite database on daemon startup.
     ///
     /// Any stale `running` / `stopping` sessions are reconciled to `failed`,
@@ -564,6 +570,11 @@ impl SessionStore {
                 return true;
             };
             if now.duration_since(completed_at) >= self.eviction_ttl {
+                tracing::info!(
+                    session_id = id,
+                    age_seconds = now.duration_since(completed_at).as_secs(),
+                    "evicting completed session from memory after eviction TTL"
+                );
                 let _ = append_event(&rt.dir, "session evicted from memory");
                 evicted_ids.push(id.clone());
                 return false;
@@ -955,6 +966,32 @@ mod tests {
         // Should not panic.
         let now = Instant::now();
         store.mark_notified("does_not_exist", now, now);
+    }
+
+    #[tokio::test]
+    async fn test_run_maintenance_evicts_completed_session_after_ttl() {
+        let rt = make_runtime("evict001", SessionStatus::Stopped, "", None);
+        {
+            let mut locked = rt.lock().unwrap();
+            locked.meta.exit_code = Some(0);
+            locked.meta.ended_at = Some(Utc::now());
+            locked.completed_at = Some(Instant::now() - Duration::from_secs(2));
+        }
+
+        let db = make_test_db().await;
+        let mut store = SessionStore::new(1, db);
+        store.sessions.insert("evict001".to_string(), rt);
+
+        store.run_maintenance().await;
+
+        assert!(
+            !store.sessions.contains_key("evict001"),
+            "completed sessions older than the eviction TTL should be removed from memory"
+        );
+        assert!(
+            store.evicted_sessions.contains_key("evict001"),
+            "evicted sessions should leave a tombstone for follow-up lookups"
+        );
     }
 
     #[tokio::test]

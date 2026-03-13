@@ -28,7 +28,7 @@ use super::{
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client(
     stream: Stream,
-    config: &AppConfig,
+    config: Arc<AppConfig>,
     session_store: SessionStoreHandle,
     shutdown_tx: mpsc::UnboundedSender<()>,
     node_registry: Arc<NodeRegistry>,
@@ -67,7 +67,7 @@ pub(super) async fn handle_client(
     // Non-streaming path: dispatch and write single response.
     let response = dispatch_request(
         request,
-        config,
+        &config,
         &session_store,
         &shutdown_tx,
         &node_registry,
@@ -82,7 +82,7 @@ pub(super) async fn handle_client(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_request(
     request: RpcRequest,
-    config: &AppConfig,
+    config: &Arc<AppConfig>,
     session_store: &SessionStoreHandle,
     shutdown_tx: &mpsc::UnboundedSender<()>,
     node_registry: &Arc<NodeRegistry>,
@@ -433,7 +433,7 @@ async fn handle_api_key_remove(name: String, db: &Arc<Database>) -> RpcResponse 
 }
 
 async fn handle_join_start(
-    config: &AppConfig,
+    config: &Arc<AppConfig>,
     join_handles: &JoinHandles,
     notification_tx: &NotificationTx,
     url: String,
@@ -446,7 +446,8 @@ async fn handle_join_start(
         api_key: key,
     };
     client::join::save_join_config(config, &join)?;
-    let (abort, stop_tx) = spawn_join_connector(join, config.clone(), notification_tx.subscribe());
+    let (abort, stop_tx) =
+        spawn_join_connector(join, Arc::clone(config), notification_tx.subscribe());
     join_handles.lock().await.insert(name, (abort, stop_tx));
     Ok(RpcResponse::Ack)
 }

@@ -182,6 +182,7 @@ impl SessionRuntime {
         if self.completed_at.is_none() {
             self.completed_at = Some(Instant::now());
         }
+        self.pty.release_resources();
         let event = match &self.meta.status {
             SessionStatus::Stopped => format!(
                 "session stopped exit_code={}",
@@ -706,6 +707,67 @@ mod tests {
         rt.mark_completed(SessionStatus::Failed, Some(1));
         assert!(rt.is_completed());
         assert_eq!(rt.meta.exit_code, Some(1));
+    }
+
+    #[test]
+    fn test_mark_completed_releases_writer_handle() {
+        use crate::session::SessionMeta;
+        use tokio::sync::{broadcast, mpsc};
+
+        let meta = SessionMeta {
+            id: "rt_release".to_string(),
+            title: None,
+            command: "sh".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            ended_at: None,
+            status: SessionStatus::Running,
+            pid: None,
+            exit_code: None,
+        };
+        let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel();
+        let mut rt = SessionRuntime {
+            meta,
+            dir: std::env::temp_dir().join("oly_runtime_release_test"),
+            ring: RingBuffer::new(4096),
+            broadcast_tx,
+            pty: PtyHandle {
+                child: make_test_child_with_exit_code(0),
+                writer_tx,
+                pty_master: None,
+            },
+            completed_at: None,
+            persisted: false,
+            requested_final_status: None,
+            last_output_at: None,
+            last_input_at: None,
+            last_attach_presence_at: None,
+            last_attach_activity_at: None,
+            last_notified_at: None,
+            notified_output_epoch: None,
+            mode_tracker: ModeTracker::new(),
+            output_closed: false,
+            notifications_enabled: true,
+            persist_filter: EscapeFilter::new(),
+        };
+
+        assert!(rt.pty.write_input(b"before".to_vec()));
+        assert_eq!(
+            writer_rx
+                .try_recv()
+                .expect("writer should receive pre-close bytes"),
+            b"before".to_vec()
+        );
+
+        rt.mark_completed(SessionStatus::Stopped, Some(0));
+
+        assert!(
+            !rt.pty.write_input(b"after".to_vec()),
+            "completed sessions should reject further writes"
+        );
     }
 
     #[test]

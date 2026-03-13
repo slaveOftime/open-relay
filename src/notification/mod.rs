@@ -26,7 +26,7 @@ use crate::{
 /// line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
     session_store: Arc<Mutex<SessionStore>>,
-    config: AppConfig,
+    config: Arc<AppConfig>,
     db: Arc<Database>,
     event_tx: tokio::sync::broadcast::Sender<http::SessionEvent>,
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,

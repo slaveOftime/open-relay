@@ -1,4 +1,4 @@
-use std::{fs::File, process::Stdio, sync::Arc};
+use std::{fs::File, process::Stdio, sync::Arc, time::Duration};
 
 use interprocess::local_socket::traits::tokio::Listener as _;
 use tokio::sync::{Mutex, mpsc};
@@ -28,7 +28,7 @@ use super::{
 
 pub struct DaemonGuard {
     _lock: File,
-    config: AppConfig,
+    config: Arc<AppConfig>,
 }
 
 fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
@@ -37,7 +37,7 @@ fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     }
 
-    tracing_subscriber::EnvFilter::try_new(config.log_level.clone())
+    tracing_subscriber::EnvFilter::try_new(config.log_level.as_str())
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
 }
 
@@ -150,6 +150,8 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u
 }
 
 async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: bool) -> Result<()> {
+    let config = Arc::new(config);
+
     info!(
         no_http,
         auth_enabled = auth_hash.is_some(),
@@ -179,7 +181,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     let _guard = DaemonGuard {
         _lock: lock,
-        config: config.clone(),
+        config: Arc::clone(&config),
     };
 
     let file_appender =
@@ -217,7 +219,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     for join in client::join::load_join_configs(&config) {
         let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
             join.clone(),
-            config.clone(),
+            Arc::clone(&config),
             notification_tx.subscribe(),
         );
         join_handles
@@ -246,7 +248,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     if !no_http {
         let http_state = http::AppState {
             store: session_store.clone(),
-            config: config.clone(),
+            config: Arc::clone(&config),
             db: db.clone(),
             event_tx: event_tx.clone(),
             auth: auth_state,
@@ -259,7 +261,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     }
 
     let notify_store = session_store.clone();
-    let notify_config = config.clone();
+    let notify_config = Arc::clone(&config);
     let notify_db = db.clone();
     let notify_event_tx = event_tx.clone();
     let notify_notification_tx = notification_tx.clone();
@@ -307,6 +309,9 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         });
     }
 
+    let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
+    session_maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -317,10 +322,14 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 info!("daemon received stop request, shutting down");
                 break;
             }
+            _ = session_maintenance_tick.tick() => {
+                let mut store = session_store.lock().await;
+                store.run_maintenance().await;
+            }
             incoming = listener.accept() => {
                 match incoming {
                     Ok(stream) => {
-                        let config_clone = config.clone();
+                        let config_clone = Arc::clone(&config);
                         let store_clone = session_store.clone();
                         let shutdown_tx_clone = shutdown_tx.clone();
                         let registry_clone = node_registry.clone();
@@ -330,7 +339,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                         tokio::spawn(async move {
                             if let Err(err) = handle_client(
                                 stream,
-                                &config_clone,
+                                config_clone,
                                 store_clone,
                                 shutdown_tx_clone,
                                 registry_clone,
