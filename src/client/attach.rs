@@ -376,7 +376,7 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
             }
         }
         KeyCode::BackTab => Some("\x1b[Z".to_string()),
-        KeyCode::Backspace => Some("\x08".to_string()),
+        KeyCode::Backspace => Some("\x7f".to_string()),
         KeyCode::Esc => Some("\x1b".to_string()),
         KeyCode::Up => Some(if app_cursor_keys { "\x1bOA" } else { "\x1b[A" }.to_string()),
         KeyCode::Down => Some(if app_cursor_keys { "\x1bOB" } else { "\x1b[B" }.to_string()),
@@ -465,7 +465,7 @@ mod tests {
     fn test_map_key_backspace() {
         assert_eq!(
             map_key_to_input(press(KeyCode::Backspace), false),
-            Some("\x08".to_string())
+            Some("\x7f".to_string())
         );
     }
 
