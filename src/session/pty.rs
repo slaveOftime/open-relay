@@ -28,9 +28,6 @@ impl PtyHandle {
 
     /// Resize the PTY. Returns `true` on success.
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
-        if rows == 0 || cols == 0 {
-            return false;
-        }
         let Some(master) = self.pty_master.as_mut() else {
             return false;
         };

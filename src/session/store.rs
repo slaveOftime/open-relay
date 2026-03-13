@@ -733,32 +733,38 @@ impl SessionStore {
     pub async fn logs_snapshot(&self, id: &str, tail: usize) -> Option<(Vec<String>, u64, bool)> {
         let sessions = self.sessions.load();
         let runtime = sessions.get(id)?.clone();
-        let rt = runtime.runtime.lock().ok()?;
+        // Extract ring data under the lock, then release before heavy processing
+        // to avoid blocking the PTY reader thread.
+        let (chunks, cursor) = {
+            let rt = runtime.runtime.lock().ok()?;
+            let chunks: Vec<Bytes> = rt.ring.all_chunks().cloned().collect();
+            let cursor = rt.ring.end_offset();
+            (chunks, cursor)
+        };
+        let running = runtime.snapshot().running;
         let mut filter = crate::session::pty::EscapeFilter::new();
-        let all_bytes: Vec<u8> = rt
-            .ring
-            .all_chunks()
-            .flat_map(|b| filter.filter(b))
-            .collect();
+        let all_bytes: Vec<u8> = chunks.iter().flat_map(|b| filter.filter(b)).collect();
         let text = String::from_utf8_lossy(&all_bytes);
         let all_lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
         let skip = all_lines.len().saturating_sub(tail);
         let lines: Vec<String> = all_lines.into_iter().skip(skip).collect();
-        let cursor = rt.ring.end_offset();
-        let running = runtime.snapshot().running;
         Some((lines, cursor, running))
     }
 
     pub async fn logs_poll(&self, id: &str, cursor: u64) -> Option<(Vec<String>, u64, bool)> {
         let sessions = self.sessions.load();
         let runtime = sessions.get(id)?.clone();
-        let rt = runtime.runtime.lock().ok()?;
-        let (chunks, end_offset) = rt.ring.read_from(cursor);
+        // Extract ring data under the lock, then release before filtering
+        // to avoid blocking the PTY reader thread.
+        let (chunks, end_offset) = {
+            let rt = runtime.runtime.lock().ok()?;
+            rt.ring.read_from(cursor)
+        };
+        let running = runtime.snapshot().running;
         let mut filter = crate::session::pty::EscapeFilter::new();
         let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
         let text = String::from_utf8_lossy(&raw);
         let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
-        let running = runtime.snapshot().running;
         Some((lines, end_offset, running))
     }
 
@@ -878,7 +884,7 @@ impl SessionStore {
                     return None;
                 }
 
-                // Suppress notification untill output advances
+                // Suppress notification until output advances
                 // if there was attach activity in recent supression window.
                 // Because normally every input may cause some output, which should not be notified in short time.
                 if let Some(last_attach_activity) = snapshot.last_attach_activity_at {
