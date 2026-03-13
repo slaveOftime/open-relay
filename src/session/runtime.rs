@@ -28,9 +28,6 @@ use super::{
     ring::RingBuffer,
 };
 
-#[allow(dead_code)]
-const ATTACH_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(2);
-
 // ---------------------------------------------------------------------------
 // SessionRuntime
 // ---------------------------------------------------------------------------
