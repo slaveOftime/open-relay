@@ -24,9 +24,9 @@ use crate::{
 /// trigger a notification. Prompt patterns are used to pick a better body
 /// line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
+    notifier: Arc<Notifier>,
     session_store: Arc<SessionStore>,
     config: Arc<AppConfig>,
-    db: Arc<Database>,
     event_tx: tokio::sync::broadcast::Sender<http::SessionEvent>,
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
 ) {
@@ -34,7 +34,6 @@ pub(super) async fn run_notification_monitor(
     let suppression_window = std::time::Duration::from_secs(3);
     let min_notification_interval = std::time::Duration::from_secs(5);
     let patterns = compile_prompt_patterns(&config.prompt_patterns);
-    let notifier = build_notifier(db, &config);
 
     info!(
         silence_seconds = config.silence_seconds,

@@ -343,6 +343,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(100);
+    let notifier = Arc::new(crate::notification::build_notifier(db.clone(), &config));
 
     let auth_state = auth_hash.map(AuthState::new);
     if !no_http {
@@ -350,6 +351,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             store: session_store.clone(),
             config: Arc::clone(&config),
             db: db.clone(),
+            notifier: notifier.clone(),
             event_tx: event_tx.clone(),
             auth: auth_state,
             node_registry: node_registry.clone(),
@@ -362,14 +364,14 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     let notify_store = session_store.clone();
     let notify_config = Arc::clone(&config);
-    let notify_db = db.clone();
     let notify_event_tx = event_tx.clone();
     let notify_notification_tx = notification_tx.clone();
+    let notify_notifier = notifier.clone();
     tokio::spawn(async move {
         crate::notification::run_notification_monitor(
+            notify_notifier,
             notify_store,
             notify_config,
-            notify_db,
             notify_event_tx,
             notify_notification_tx,
         )
@@ -378,7 +380,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     info!("notification monitor task spawned");
 
     if !startup_failed_sessions.is_empty() {
-        let notifier = crate::notification::build_notifier(db.clone(), &config);
+        let notifier = notifier.clone();
         let event = NotificationEvent::startup_recovery(&startup_failed_sessions);
         let outcome = notifier.dispatch(&event).await;
 

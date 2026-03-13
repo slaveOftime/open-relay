@@ -128,8 +128,7 @@ async fn connect_and_relay(
         }
     }
 
-    let (stream_frame_tx, mut stream_frame_rx) =
-        mpsc::unbounded_channel::<(String, RpcResponse, bool)>();
+    let (stream_frame_tx, mut stream_frame_rx) = mpsc::channel::<(String, RpcResponse, bool)>(256);
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
@@ -211,7 +210,7 @@ async fn connect_and_relay(
                                     let resp = RpcResponse::Error {
                                         message: err.to_string(),
                                     };
-                                    let _ = frame_tx.send((rpc_id, resp, true));
+                                    let _ = frame_tx.send((rpc_id, resp, true)).await;
                                 }
                             });
                             continue;
@@ -284,7 +283,7 @@ async fn relay_streaming_rpc(
     config: &AppConfig,
     request: RpcRequest,
     rpc_id: &str,
-    frame_tx: &mpsc::UnboundedSender<(String, RpcResponse, bool)>,
+    frame_tx: &mpsc::Sender<(String, RpcResponse, bool)>,
 ) -> Result<()> {
     let stream = ipc::connect(config).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -300,7 +299,11 @@ async fn relay_streaming_rpc(
                     resp,
                     RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
                 );
-                if frame_tx.send((rpc_id.to_string(), resp, is_done)).is_err() {
+                if frame_tx
+                    .send((rpc_id.to_string(), resp, is_done))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
                 if is_done {
@@ -308,11 +311,13 @@ async fn relay_streaming_rpc(
                 }
             }
             Err(_) => {
-                let _ = frame_tx.send((
-                    rpc_id.to_string(),
-                    RpcResponse::AttachStreamDone { exit_code: None },
-                    true,
-                ));
+                let _ = frame_tx
+                    .send((
+                        rpc_id.to_string(),
+                        RpcResponse::AttachStreamDone { exit_code: None },
+                        true,
+                    ))
+                    .await;
                 break;
             }
         }
@@ -350,8 +355,8 @@ pub(super) async fn handle_node_proxy_streaming(
     mut writer: tokio::io::WriteHalf<Stream>,
     node_registry: &Arc<NodeRegistry>,
 ) -> Result<()> {
-    let mut stream_rx = match node_registry.proxy_rpc_stream(&node, &inner).await {
-        Ok(rx) => rx,
+    let (stream_rpc_id, mut stream_rx) = match node_registry.proxy_rpc_stream(&node, &inner).await {
+        Ok(pair) => pair,
         Err(e) => {
             ipc::write_response_to_writer(
                 &mut writer,
@@ -364,18 +369,18 @@ pub(super) async fn handle_node_proxy_streaming(
         }
     };
 
-    let (client_msg_tx, mut client_msg_rx) = mpsc::unbounded_channel::<Result<RpcRequest>>();
+    let (client_msg_tx, mut client_msg_rx) = mpsc::channel::<Result<RpcRequest>>(64);
     let client_reader_task = tokio::spawn(async move {
         let mut reader = reader;
         loop {
             match ipc::read_request_from_reader(&mut reader).await {
                 Ok(req) => {
-                    if client_msg_tx.send(Ok(req)).is_err() {
+                    if client_msg_tx.send(Ok(req)).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => {
-                    let _ = client_msg_tx.send(Err(e));
+                    let _ = client_msg_tx.send(Err(e)).await;
                     break;
                 }
             }
@@ -442,6 +447,9 @@ pub(super) async fn handle_node_proxy_streaming(
     }
 
     client_reader_task.abort();
+    // Clean up the pending entry so it doesn't linger if the secondary
+    // hasn't sent a done frame yet.
+    node_registry.remove_pending(&node, &stream_rpc_id).await;
     let _ = node_registry
         .proxy_rpc(&node, &RpcRequest::AttachDetach { id: session_id })
         .await;

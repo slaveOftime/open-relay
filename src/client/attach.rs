@@ -34,13 +34,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
 
+    // Pre-allocate once — avoids 7+ repeated heap allocations of the same id.
+    let id_owned = id.to_string();
+
     // Send AttachSubscribe (wrapped in NodeProxy if targeting a remote node).
     ipc::write_request_to_writer(
         &mut write_half,
         attach_proxy(
             node,
             RpcRequest::AttachSubscribe {
-                id: id.to_string(),
+                id: id_owned.clone(),
                 from_byte_offset: None,
             },
         ),
@@ -64,6 +67,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     // so fall back to a plain stream replay instead of raw-mode attach.
     if !can_use_interactive_terminal() {
         write_bytes_to_stdout(&initial_data)?;
+        drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         while running {
             match ipc::read_response_from_reader(&mut reader).await? {
@@ -98,7 +102,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         ipc::write_request_to_writer(
             &mut write_half,
             RpcRequest::AttachResize {
-                id: id.to_string(),
+                id: id_owned.clone(),
                 rows,
                 cols,
             },
@@ -111,6 +115,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         // positioning, color, and alternate-screen sequences that TUIs emit,
         // which is required for correct reattach rendering.
         write_bytes_to_stdout(&initial_data)?;
+        drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         // `read_response_from_reader` uses `read_line`, which is not safe to
         // keep cancelling with timeouts. Read daemon frames in a dedicated task
@@ -147,7 +152,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         ipc::write_request_to_writer(
                             &mut write_half,
                             RpcRequest::AttachInput {
-                                id: id.to_string(),
+                                id: id_owned.clone(),
                                 data,
                             },
                         )
@@ -157,7 +162,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         ipc::write_request_to_writer(
                             &mut write_half,
                             RpcRequest::AttachResize {
-                                id: id.to_string(),
+                                id: id_owned.clone(),
                                 rows,
                                 cols,
                             },
@@ -177,7 +182,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             ipc::write_request_to_writer(
                                 &mut write_half,
                                 RpcRequest::AttachInput {
-                                    id: id.to_string(),
+                                    id: id_owned.clone(),
                                     data,
                                 },
                             )
@@ -231,7 +236,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             // the parent shell after we restore the terminal.
             let _ = ipc::write_request_to_writer(
                 &mut write_half,
-                RpcRequest::AttachDetach { id: id.to_string() },
+                RpcRequest::AttachDetach {
+                    id: id_owned.clone(),
+                },
             )
             .await;
             let _ = drain_pending_terminal_events();
