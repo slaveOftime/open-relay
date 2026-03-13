@@ -19,8 +19,8 @@ use tracing::{error, info};
 pub use auth::AuthState;
 
 use crate::{
-    config::AppConfig, db::Database, node::NodeRegistry, protocol::SessionSummary,
-    session::SessionStore,
+    config::AppConfig, db::Database, node::NodeRegistry, notification::dispatcher::Notifier,
+    protocol::SessionSummary, session::SessionStore,
 };
 
 #[derive(Clone)]
@@ -28,6 +28,7 @@ pub struct AppState {
     pub store: Arc<SessionStore>,
     pub config: Arc<AppConfig>,
     pub db: Arc<Database>,
+    pub notifier: Arc<Notifier>,
     pub event_tx: broadcast::Sender<SessionEvent>,
     /// None when `--no-auth` was specified; Some when password auth is active.
     pub auth: Option<Arc<AuthState>>,

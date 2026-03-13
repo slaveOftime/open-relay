@@ -11,14 +11,9 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::{
-    db::Database,
     http::AppState,
     node::{NodeHandle, PendingRpc},
-    notification::{
-        channel::{LocalOsNotificationChannel, NotificationChannel, WebPushChannel},
-        dispatcher::Notifier,
-        event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
-    },
+    notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
     protocol::{NodeSummary, NodeWsMessage, RpcResponse},
 };
 
@@ -97,7 +92,6 @@ async fn handle_join(socket: WebSocket, state: AppState) {
     let (send_tx, mut send_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
     let pending: Arc<Mutex<HashMap<String, PendingRpc>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_recv = Arc::clone(&pending);
-    let notifier = build_notifier(state.db.clone(), &state.config);
 
     let handle = NodeHandle { send_tx, pending };
     state.node_registry.connect(name.clone(), handle).await;
@@ -221,7 +215,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                         trigger_rule: trigger_rule_enum,
                                         trigger_detail: trigger_detail.clone(),
                                     };
-                                    let outcome = notifier.dispatch(&event).await;
+                                    let outcome = state.notifier.dispatch(&event).await;
                                     if !outcome.any_delivered() {
                                         warn!(
                                             node = %name,
@@ -273,27 +267,6 @@ async fn handle_join(socket: WebSocket, state: AppState) {
     state.node_registry.disconnect(&name).await;
     warn!(node = %name, "secondary node disconnected");
 }
-
-fn build_notifier(db: std::sync::Arc<Database>, config: &crate::config::AppConfig) -> Notifier {
-    let mut channels: Vec<Box<dyn NotificationChannel + Send + Sync>> =
-        vec![Box::new(LocalOsNotificationChannel {
-            hook: config.notification_hook.clone(),
-        })];
-
-    if let (Some(vapid_public_key), Some(vapid_private_key), Some(vapid_subject)) = (
-        config.web_push_vapid_public_key.clone(),
-        config.web_push_vapid_private_key.clone(),
-        config.web_push_subject.clone(),
-    ) {
-        match WebPushChannel::new(&vapid_private_key, &vapid_public_key, &vapid_subject, db) {
-            Ok(channel) => channels.push(Box::new(channel)),
-            Err(err) => warn!(%err, "web push channel init failed on primary node relay"),
-        }
-    }
-
-    Notifier::with_channels(channels)
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
