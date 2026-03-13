@@ -1,7 +1,34 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
+
+/// Serde helper: transparently encode `Vec<u8>` as a base64 string in JSON.
+/// This reduces wire size from ~4× (JSON integer arrays) to ~1.37× (base64).
+mod base64_bytes {
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &Vec<u8>, ser: S) -> Result<S::Ok, S::Error> {
+        B64.encode(data).serialize(ser)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
+        let s = StringOrSeq::deserialize(de)?;
+        match s {
+            StringOrSeq::Str(s) => B64.decode(&s).map_err(serde::de::Error::custom),
+            StringOrSeq::Seq(v) => Ok(v),
+        }
+    }
+
+    /// Accept either a base64 string (v4+) or a JSON integer array (v3 compat).
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        Str(String),
+        Seq(Vec<u8>),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcEnvelope<T> {
@@ -147,6 +174,7 @@ pub enum RpcResponse {
     /// Sent once after AttachSubscribe: ring tail replay (raw filtered bytes) + terminal mode flags.
     AttachStreamInit {
         /// Raw PTY bytes (CPR/DSR responses stripped), ready to write directly to the terminal.
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         end_offset: u64,
         running: bool,
@@ -157,6 +185,7 @@ pub enum RpcResponse {
     /// Stream chunk of new PTY output (filtered, ready to write to terminal).
     AttachStreamChunk {
         offset: u64,
+        #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
     /// Terminal mode changed (bracketed-paste / app-cursor-keys) mid-stream.

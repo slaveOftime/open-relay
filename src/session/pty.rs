@@ -377,7 +377,12 @@ impl EscapeFilter {
 
     /// Filter a raw PTY byte slice and return the cleaned bytes.
     pub fn filter(&mut self, data: &[u8]) -> Vec<u8> {
-        let chunk = String::from_utf8_lossy(data);
+        // Fast path: avoid a heap allocation when the data is already valid
+        // UTF-8 (the overwhelmingly common case for terminal output).
+        let chunk: std::borrow::Cow<'_, str> = match std::str::from_utf8(data) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => String::from_utf8_lossy(data),
+        };
         filter_cpr_chunk(&mut self.pending, &chunk).into_bytes()
     }
 }

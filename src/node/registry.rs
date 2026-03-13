@@ -81,12 +81,13 @@ impl NodeRegistry {
     }
 
     /// Forward `request` to the named secondary and return a stream receiver
-    /// for multi-frame responses.
+    /// for multi-frame responses.  Also returns the `rpc_id` so callers can
+    /// explicitly clean up the pending entry on early exit.
     pub async fn proxy_rpc_stream(
         &self,
         node: &str,
         request: &crate::protocol::RpcRequest,
-    ) -> Result<mpsc::UnboundedReceiver<Result<RpcResponse>>> {
+    ) -> Result<(String, mpsc::UnboundedReceiver<Result<RpcResponse>>)> {
         let (send_tx, pending) = {
             let nodes = self.nodes.lock().await;
             let handle = nodes
@@ -109,7 +110,7 @@ impl NodeRegistry {
             .await
             .map_err(|_| AppError::NodeNotConnected(node.to_string()))?;
 
-        Ok(rx)
+        Ok((id, rx))
     }
 
     /// Returns `true` if `name` is currently connected.
@@ -122,5 +123,16 @@ impl NodeRegistry {
     pub async fn connected_names(&self) -> Vec<String> {
         let nodes = self.nodes.lock().await;
         nodes.keys().cloned().collect()
+    }
+
+    /// Remove a pending RPC entry for the named node.  Called when the caller
+    /// drops its stream receiver early (e.g. client disconnect) so the entry
+    /// does not linger in the pending map.
+    pub async fn remove_pending(&self, node: &str, rpc_id: &str) {
+        let nodes = self.nodes.lock().await;
+        if let Some(handle) = nodes.get(node) {
+            let mut pm = handle.pending.lock().await;
+            pm.remove(rpc_id);
+        }
     }
 }

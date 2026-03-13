@@ -55,12 +55,12 @@ pub(super) async fn handle_attach_subscribe(
 
     let _ = session_store.mark_attach_presence(&id).await;
 
-    let (client_msg_tx, mut client_msg_rx) = mpsc::unbounded_channel();
+    let (client_msg_tx, mut client_msg_rx) = mpsc::channel(64);
     let client_reader_task = tokio::spawn(async move {
         loop {
             let msg = ipc::read_request_from_reader(&mut reader).await;
             let done = msg.is_err();
-            if client_msg_tx.send(msg).is_err() {
+            if client_msg_tx.send(msg).await.is_err() {
                 break;
             }
             if done {

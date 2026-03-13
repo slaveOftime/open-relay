@@ -340,19 +340,20 @@ async fn handle_ws_proxied_streaming(
         id: id.to_string(),
         from_byte_offset: None,
     };
-    let mut stream_rx = match state.node_registry.proxy_rpc_stream(&node, &rpc).await {
-        Ok(rx) => rx,
-        Err(err) => {
-            let _ = send_json(
-                &mut socket,
-                &ServerMessage::Error {
-                    message: format!("failed to open proxy stream: {err}"),
-                },
-            )
-            .await;
-            return;
-        }
-    };
+    let (stream_rpc_id, mut stream_rx) =
+        match state.node_registry.proxy_rpc_stream(&node, &rpc).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                let _ = send_json(
+                    &mut socket,
+                    &ServerMessage::Error {
+                        message: format!("failed to open proxy stream: {err}"),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
 
     let mut init_sent = false;
 
@@ -377,7 +378,7 @@ async fn handle_ws_proxied_streaming(
                                     bracketed_paste_mode,
                                 };
                                 if !send_json(&mut socket, &msg).await {
-                                    return;
+                                    break;
                                 }
                                 init_sent = true;
                             }
@@ -387,7 +388,7 @@ async fn handle_ws_proxied_streaming(
                                         data: B64.encode(&data),
                                     };
                                     if !send_json(&mut socket, &msg).await {
-                                        return;
+                                        break;
                                     }
                                 }
                             }
@@ -402,11 +403,11 @@ async fn handle_ws_proxied_streaming(
                             }
                             RpcResponse::AttachStreamDone { exit_code } => {
                                 let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
-                                return;
+                                break;
                             }
                             RpcResponse::Error { message } => {
                                 let _ = send_json(&mut socket, &ServerMessage::Error { message }).await;
-                                return;
+                                break;
                             }
                             _ => {}
                         }
@@ -414,12 +415,12 @@ async fn handle_ws_proxied_streaming(
                     Some(Err(err)) => {
                         warn!(session_id = %id, %err, "proxy stream error");
                         let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
-                        return;
+                        break;
                     }
                     None => {
                         // Stream channel closed.
                         let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
-                        return;
+                        break;
                     }
                 }
             }
@@ -447,7 +448,7 @@ async fn handle_ws_proxied_streaming(
                             Ok(ClientMessage::Detach) => {
                                 let rpc = RpcRequest::AttachDetach { id: id.to_string() };
                                 let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
-                                return;
+                                break;
                             }
                             Ok(ClientMessage::Ping) => {
                                 let _ = send_json(&mut socket, &ServerMessage::Pong).await;
@@ -458,11 +459,18 @@ async fn handle_ws_proxied_streaming(
                     Some(Ok(Message::Close(_))) | None => {
                         let rpc = RpcRequest::AttachDetach { id: id.to_string() };
                         let _ = state.node_registry.proxy_rpc(&node, &rpc).await;
-                        return;
+                        break;
                     }
                     _ => {}
                 }
             }
         }
     }
+
+    // Clean up the pending entry so it doesn't linger if the secondary
+    // hasn't sent a done frame yet.
+    state
+        .node_registry
+        .remove_pending(&node, &stream_rpc_id)
+        .await;
 }

@@ -168,15 +168,17 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                         }
                                     } else {
                                         // Intermediate frame — send but keep channel.
-                                        if let Some(sender) = pm.get(&id) {
+                                        // If the receiver was dropped, remove the entry.
+                                        let should_remove = if let Some(sender) = pm.get(&id) {
                                             match sender {
-                                                PendingRpc::Stream(tx) => {
-                                                    let _ = tx.send(Ok(rpc_resp));
-                                                }
-                                                PendingRpc::OneShot(_) => {
-                                                    // Shouldn't happen; ignore.
-                                                }
+                                                PendingRpc::Stream(tx) => tx.send(Ok(rpc_resp)).is_err(),
+                                                PendingRpc::OneShot(_) => false,
                                             }
+                                        } else {
+                                            false
+                                        };
+                                        if should_remove {
+                                            pm.remove(&id);
                                         }
                                     }
                                 }
