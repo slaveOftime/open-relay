@@ -288,7 +288,7 @@ function SessionRow({
           className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
           onClick={(e) => {
             e.stopPropagation()
-            navigator.clipboard.writeText(session.id).catch(() => {})
+            navigator.clipboard.writeText(session.id).catch(() => { })
           }}
         >
           <Tooltip>
@@ -337,7 +337,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg series={series} enableAnimation={isRunning} />
+          <SparklineSvg series={series} enableAnimation={(isRunning && (node === null || node === "__local__"))} />
         </TableCell>
 
         {/* PID */}
@@ -508,7 +508,7 @@ function SessionCard({
           )}
 
           {/* Row 4: activity sparkline */}
-          {session.status === 'running' && (
+          {session.status === 'running' && (node === null || node === "__local__") && (
             <div className="pt-1 w-full opacity-90">
               <SparklineSvg
                 series={series}
@@ -963,6 +963,7 @@ export default function SessionsPage() {
 
   const reloadSessions = useCallback(
     async (opts?: { background?: boolean }) => {
+      fetchNodes().catch(() => { })
       if (selectedNode) {
         await loadRemote(opts)
         return
@@ -990,7 +991,7 @@ export default function SessionsPage() {
   useEffect(() => {
     fetchNodes()
       .then(setNodes)
-      .catch(() => {})
+      .catch(() => { })
   }, [])
 
   useEffect(() => {
@@ -1136,11 +1137,11 @@ export default function SessionsPage() {
   }
 
   async function handleStop(id: string) {
-    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
+    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => { })
     if (selectedNode) void loadRemote()
   }
   async function handleKill(id: string) {
-    await killSession(id, selectedNode ?? undefined).catch(() => {})
+    await killSession(id, selectedNode ?? undefined).catch(() => { })
     if (selectedNode) void loadRemote()
   }
 
@@ -1562,11 +1563,10 @@ export default function SessionsPage() {
                   ).map((col) => (
                     <TableHead
                       key={col.key}
-                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
-                        col.sortField
+                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${col.sortField
                           ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
                           : 'text-[hsl(var(--muted-foreground))]'
-                      } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
+                        } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
                       onClick={col.sortField ? () => handleSort(col.sortField!) : undefined}
                     >
                       <span className="inline-flex items-center gap-1">
@@ -1661,13 +1661,13 @@ export default function SessionsPage() {
           initialValues={
             rerunSession
               ? {
-                  cmd: rerunSession.command,
-                  args: rerunSession.args
-                    .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
-                    .join(' '),
-                  title: rerunSession.title ?? '',
-                  cwd: rerunSession.cwd ?? '',
-                }
+                cmd: rerunSession.command,
+                args: rerunSession.args
+                  .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
+                  .join(' '),
+                title: rerunSession.title ?? '',
+                cwd: rerunSession.cwd ?? '',
+              }
               : undefined
           }
           node={selectedNode ?? undefined}

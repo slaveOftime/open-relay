@@ -11,7 +11,7 @@ use crate::{
     http::auth,
     ipc,
     node::NodeRegistry,
-    protocol::{ApiKeySummary, ListQuery, RpcRequest, RpcResponse},
+    protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{SessionStore, StartSpec},
 };
 
@@ -154,7 +154,7 @@ async fn dispatch_request(
             handle_join_start(config, join_handles, notification_tx, url, name, key).await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
-        RpcRequest::JoinList => handle_join_list(config),
+        RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
         RpcRequest::NodeList => handle_node_list(node_registry).await,
     };
 
@@ -451,7 +451,25 @@ async fn handle_join_stop(
     RpcResponse::Ack
 }
 
-fn handle_join_list(config: &AppConfig) -> RpcResponse {
-    let joins = client::join::list_join_summaries(config);
+async fn handle_join_list(
+    config: &AppConfig,
+    node_registry: &NodeRegistry,
+    primary: bool,
+) -> RpcResponse {
+    let joins = if primary {
+        node_registry
+            .connected_names()
+            .await
+            .iter()
+            .map(|n| JoinSummary {
+                name: n.clone(),
+                primary_url: "".into(),
+                connected: true,
+            })
+            .collect()
+    } else {
+        client::join::list_join_summaries(config)
+    };
+
     RpcResponse::JoinList { joins }
 }

@@ -314,22 +314,35 @@ async fn run() -> Result<()> {
                 client::run_join(&config, args.url, args.name, args.key).await
             }
             JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
-            JoinCommand::List => match ipc::send_request(&config, RpcRequest::JoinList).await? {
-                RpcResponse::JoinList { joins } => {
-                    if joins.is_empty() {
-                        println!("No active joins.");
-                    } else {
-                        println!("{:<24} {:<12} {}", "NAME", "STATUS", "PRIMARY URL");
-                        for j in joins {
-                            let status = if j.connected { "connected" } else { "saved" };
-                            println!("{:<24} {:<12} {}", j.name, status, j.primary_url);
+            JoinCommand::List(args) => {
+                match ipc::send_request(
+                    &config,
+                    RpcRequest::JoinList {
+                        primary: args.primary,
+                    },
+                )
+                .await?
+                {
+                    RpcResponse::JoinList { joins } => {
+                        if joins.is_empty() {
+                            println!("No active joins.");
+                        } else if args.primary {
+                            for j in joins {
+                                println!("{:<24}", j.name);
+                            }
+                        } else {
+                            println!("{:<24} {:<12} {}", "NAME", "STATUS", "PRIMARY URL");
+                            for j in joins {
+                                let status = if j.connected { "connected" } else { "saved" };
+                                println!("{:<24} {:<12} {}", j.name, status, j.primary_url);
+                            }
                         }
+                        Ok(())
                     }
-                    Ok(())
+                    RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
+                    _ => Err(AppError::Protocol("unexpected response".into())),
                 }
-                RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-                _ => Err(AppError::Protocol("unexpected response".into())),
-            },
+            }
         },
     }
 }

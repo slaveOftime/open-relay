@@ -122,7 +122,9 @@ pub enum RpcRequest {
         name: String,
     },
     /// List active join connectors on this (secondary) daemon.
-    JoinList,
+    JoinList {
+        primary: bool,
+    },
     /// List all secondary nodes currently connected to this (primary) daemon.
     NodeList,
 }
@@ -149,7 +151,7 @@ impl RpcRequest {
             RpcRequest::ApiKeyRemove { .. } => "api_key_remove",
             RpcRequest::JoinStart { .. } => "join_start",
             RpcRequest::JoinStop { .. } => "join_stop",
-            RpcRequest::JoinList => "join_list",
+            RpcRequest::JoinList { .. } => "join_list",
             RpcRequest::NodeList => "node_list",
         }
     }

@@ -274,7 +274,7 @@ pub enum JoinCommand {
     Stop(JoinStopArgs),
     /// List all active join configs on this (secondary) daemon.
     #[command(name = "ls")]
-    List,
+    List(JoinListArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -311,4 +311,11 @@ pub struct JoinStopArgs {
     /// Name of the join config to stop and remove.
     #[arg(long, short = 'n')]
     pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct JoinListArgs {
+    /// For list all the nodes joined to the current daemon (primary)
+    #[arg(long, short = 'p')]
+    pub primary: bool,
 }
