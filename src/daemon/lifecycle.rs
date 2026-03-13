@@ -26,6 +26,9 @@ use super::{
     rpc::handle_client,
 };
 
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(120);
+const LOCK_STARTUP_GRACE: Duration = Duration::from_secs(3);
+
 pub struct DaemonGuard {
     _lock: File,
     config: Arc<AppConfig>,
@@ -48,6 +51,90 @@ impl Drop for DaemonGuard {
     }
 }
 
+async fn daemon_is_healthy(config: &AppConfig) -> bool {
+    matches!(
+        ipc::send_request(config, RpcRequest::Health).await,
+        Ok(RpcResponse::Health { .. })
+    )
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    type Handle = *mut core::ffi::c_void;
+
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+
+        let mut exit_code = 0;
+        let ok = GetExitCodeProcess(process, &mut exit_code);
+        let _ = CloseHandle(process);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const EPERM: i32 = 1;
+
+    unsafe {
+        if kill(pid as i32, 0) == 0 {
+            return true;
+        }
+
+        std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    false
+}
+
+async fn acquire_daemon_start_lock(config: &AppConfig) -> Result<File> {
+    let deadline = std::time::Instant::now() + LOCK_STARTUP_GRACE;
+
+    loop {
+        match storage::try_acquire_daemon_lock(&config.lock_file) {
+            Ok(file) => return Ok(file),
+            Err(AppError::DaemonAlreadyRunning) => {
+                if daemon_is_healthy(config).await {
+                    return Err(AppError::DaemonAlreadyRunning);
+                }
+
+                if let Some(pid) = storage::read_pid(&config.lock_file)? {
+                    if process_is_running(pid) {
+                        return Err(AppError::DaemonAlreadyRunning);
+                    }
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    storage::remove_file_if_exists(&config.lock_file)?;
+                    return storage::try_acquire_daemon_lock(&config.lock_file);
+                }
+
+                tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub async fn start(
     config: AppConfig,
     detach: bool,
@@ -56,10 +143,7 @@ pub async fn start(
     no_http: bool,
     auth_hash_internal: Option<String>,
 ) -> Result<()> {
-    if matches!(
-        ipc::send_request(&config, RpcRequest::Health).await,
-        Ok(RpcResponse::Health { .. })
-    ) {
+    if daemon_is_healthy(&config).await {
         return Err(AppError::DaemonAlreadyRunning);
     }
 
@@ -107,10 +191,7 @@ pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
 async fn wait_for_daemon_ready(config: &AppConfig, timeout: std::time::Duration) -> Result<()> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if matches!(
-            ipc::send_request(config, RpcRequest::Health).await,
-            Ok(RpcResponse::Health { .. })
-        ) {
+        if daemon_is_healthy(config).await {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -169,20 +250,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     storage::ensure_state_dirs(&config.state_dir, &config.sessions_dir)?;
 
-    let lock = match storage::try_acquire_daemon_lock(&config.lock_file) {
-        Ok(file) => file,
-        Err(AppError::DaemonAlreadyRunning) => {
-            if matches!(
-                ipc::send_request(&config, RpcRequest::Health).await,
-                Ok(RpcResponse::Health { .. })
-            ) {
-                return Err(AppError::DaemonAlreadyRunning);
-            }
-            storage::remove_file_if_exists(&config.lock_file)?;
-            storage::try_acquire_daemon_lock(&config.lock_file)?
-        }
-        Err(err) => return Err(err),
-    };
+    let lock = acquire_daemon_start_lock(&config).await?;
 
     storage::write_pid(&config.lock_file, std::process::id())?;
 
