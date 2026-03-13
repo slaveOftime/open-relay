@@ -23,6 +23,14 @@ use super::{
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 
+#[cfg(target_os = "windows")]
+const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']];
+
+#[cfg(not(target_os = "windows"))]
+const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
+
+const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 pub struct SessionStore {
     sessions: HashMap<String, Arc<Mutex<SessionRuntime>>>,
     evicted_sessions: HashMap<String, Instant>,
@@ -425,7 +433,14 @@ impl SessionStore {
             return false;
         };
 
-        // Send Ctrl-C and mark as stopping.
+        let grace = Duration::from_secs(grace_seconds);
+        let start = Instant::now();
+        let deadline = start + grace;
+        let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
+        let mut next_soft_stop_index = 0usize;
+
+        // Begin a soft-stop sequence and let the child exit on its own before
+        // escalating to a forced kill when the grace window expires.
         {
             let Ok(mut rt) = runtime.lock() else {
                 return false;
@@ -435,12 +450,12 @@ impl SessionStore {
             }
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
-            if matches!(requested_final_status, SessionStatus::Stopped) {
-                let _ = rt.pty.write_input(vec![0x03]);
+            if let Some((_, input)) = soft_stop_schedule.first() {
+                let _ = rt.pty.write_input((*input).to_vec());
+                next_soft_stop_index = 1;
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(grace_seconds);
         while Instant::now() < deadline {
             {
                 let Ok(mut rt) = runtime.lock() else {
@@ -449,8 +464,15 @@ impl SessionStore {
                 if rt.refresh_status() {
                     return true;
                 }
+                while let Some((_, input)) = soft_stop_schedule.get(next_soft_stop_index) {
+                    if Instant::now() < soft_stop_schedule[next_soft_stop_index].0 {
+                        break;
+                    }
+                    let _ = rt.pty.write_input((*input).to_vec());
+                    next_soft_stop_index += 1;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
         let Ok(mut rt) = runtime.lock() else {
@@ -673,6 +695,30 @@ impl SessionStore {
             }
         }
     }
+}
+
+fn build_soft_stop_schedule(
+    start: Instant,
+    grace: Duration,
+    requested_final_status: SessionStatus,
+) -> Vec<(Instant, &'static [u8])> {
+    if !matches!(requested_final_status, SessionStatus::Stopped) {
+        return Vec::new();
+    }
+
+    let stage_count = SOFT_STOP_INPUTS.len();
+    SOFT_STOP_INPUTS
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let offset_millis = if index == 0 || grace.is_zero() {
+                0
+            } else {
+                ((grace.as_millis() * index as u128) / stage_count as u128) as u64
+            };
+            (start + Duration::from_millis(offset_millis), *input)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1128,6 +1174,16 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+        vec![vec![0x03], vec![0x03], vec![0x1a, b'\r']]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+        vec![vec![0x03], vec![0x03], vec![0x04]]
+    }
+
     #[tokio::test]
     async fn test_start_session_enforces_limit() {
         let config = make_test_config(1);
@@ -1319,6 +1375,24 @@ mod tests {
             writer_rx.try_recv().is_err(),
             "completed sessions should not receive synthetic input during kill"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stop_session_uses_staged_soft_shutdown_inputs() {
+        let (rt, mut writer_rx) = make_runtime_writable("stp0002", SessionStatus::Running);
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        assert!(
+            store.stop_session("stp0002", 1).await,
+            "running session should be stoppable"
+        );
+
+        let mut writes = Vec::new();
+        while let Ok(bytes) = writer_rx.try_recv() {
+            writes.push(bytes);
+        }
+
+        assert_eq!(writes, expected_soft_stop_inputs());
     }
 
     // -----------------------------------------------------------------------
