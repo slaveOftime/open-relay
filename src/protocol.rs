@@ -13,7 +13,9 @@ pub struct RpcEnvelope<T> {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
     Health,
-    DaemonStop,
+    DaemonStop {
+        grace_seconds: u64,
+    },
     List {
         query: ListQuery,
     },
@@ -102,7 +104,7 @@ impl RpcRequest {
     pub fn name(&self) -> &'static str {
         match self {
             RpcRequest::Health => "health",
-            RpcRequest::DaemonStop => "daemon_stop",
+            RpcRequest::DaemonStop { .. } => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",

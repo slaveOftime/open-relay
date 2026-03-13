@@ -6,8 +6,9 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
+use futures_util::future::join_all;
 use tokio::sync::broadcast;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     config::AppConfig,
@@ -430,28 +431,72 @@ impl SessionStore {
         self.prune_evicted_sessions().await;
 
         let Some(runtime) = self.sessions.get(id).cloned() else {
+            debug!(
+                session_id = id,
+                requested_final_status = requested_final_status.as_str(),
+                "terminate session lookup missed"
+            );
             return false;
         };
 
+        Self::terminate_runtime(
+            id.to_string(),
+            runtime,
+            grace_seconds,
+            requested_final_status,
+        )
+        .await
+    }
+
+    async fn terminate_runtime(
+        session_id: String,
+        runtime: Arc<Mutex<SessionRuntime>>,
+        grace_seconds: u64,
+        requested_final_status: SessionStatus,
+    ) -> bool {
         let grace = Duration::from_secs(grace_seconds);
         let start = Instant::now();
         let deadline = start + grace;
         let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
         let mut next_soft_stop_index = 0usize;
+        debug!(
+            session_id = %session_id,
+            requested_final_status = requested_final_status.as_str(),
+            grace_seconds,
+            soft_stop_attempts = soft_stop_schedule.len(),
+            "session termination requested"
+        );
 
         // Begin a soft-stop sequence and let the child exit on its own before
         // escalating to a forced kill when the grace window expires.
         {
             let Ok(mut rt) = runtime.lock() else {
+                warn!(
+                    session_id = %session_id,
+                    "failed to lock session runtime before termination"
+                );
                 return false;
             };
             if rt.refresh_status() {
+                debug!(
+                    session_id = %session_id,
+                    status = rt.meta.status.as_str(),
+                    exit_code = ?rt.meta.exit_code,
+                    "session already completed before termination started"
+                );
                 return true;
             }
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
             if let Some((_, input)) = soft_stop_schedule.first() {
                 let _ = rt.pty.write_input((*input).to_vec());
+                debug!(
+                    session_id = %session_id,
+                    stage = 1,
+                    total_stages = soft_stop_schedule.len(),
+                    bytes = input.len(),
+                    "sent soft-stop input"
+                );
                 next_soft_stop_index = 1;
             }
         }
@@ -459,9 +504,20 @@ impl SessionStore {
         while Instant::now() < deadline {
             {
                 let Ok(mut rt) = runtime.lock() else {
+                    warn!(
+                        session_id = %session_id,
+                        "failed to lock session runtime while waiting for termination"
+                    );
                     return true;
                 };
                 if rt.refresh_status() {
+                    debug!(
+                        session_id = %session_id,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        status = rt.meta.status.as_str(),
+                        exit_code = ?rt.meta.exit_code,
+                        "session exited during grace window"
+                    );
                     return true;
                 }
                 while let Some((_, input)) = soft_stop_schedule.get(next_soft_stop_index) {
@@ -469,6 +525,14 @@ impl SessionStore {
                         break;
                     }
                     let _ = rt.pty.write_input((*input).to_vec());
+                    debug!(
+                        session_id = %session_id,
+                        stage = next_soft_stop_index + 1,
+                        total_stages = soft_stop_schedule.len(),
+                        bytes = input.len(),
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "sent staged soft-stop input"
+                    );
                     next_soft_stop_index += 1;
                 }
             }
@@ -476,29 +540,74 @@ impl SessionStore {
         }
 
         let Ok(mut rt) = runtime.lock() else {
+            warn!(
+                session_id = %session_id,
+                "failed to lock session runtime before forced termination"
+            );
             return false;
         };
         if rt.refresh_status() {
+            info!(
+                session_id = %session_id,
+                elapsed_ms = start.elapsed().as_millis(),
+                status = rt.meta.status.as_str(),
+                exit_code = ?rt.meta.exit_code,
+                "session exited at grace deadline"
+            );
             return true;
         }
+        debug!(
+            session_id = %session_id,
+            requested_final_status = requested_final_status.as_str(),
+            grace_seconds,
+            "session did not stop within grace window; forcing termination"
+        );
         if rt.pty.kill().is_ok() {
             let _ = rt.refresh_status();
+            info!(
+                session_id = %session_id,
+                status = rt.meta.status.as_str(),
+                exit_code = ?rt.meta.exit_code,
+                "forced termination completed"
+            );
             true
         } else {
+            warn!(
+                session_id = %session_id,
+                "failed to force terminate session process"
+            );
             false
         }
     }
 
     pub async fn stop_all_sessions(&mut self, grace_seconds: u64) -> bool {
         self.prune_evicted_sessions().await;
-        let ids: Vec<String> = self.sessions.keys().cloned().collect();
-        let mut all_stopped = true;
-        for id in ids {
-            if !self.stop_session(&id, grace_seconds).await {
-                all_stopped = false;
-            }
-        }
-        all_stopped
+
+        let runtimes: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|(id, runtime)| (id.clone(), runtime.clone()))
+            .collect();
+
+        info!(
+            session_count = runtimes.len(),
+            grace_seconds, "stopping all sessions"
+        );
+
+        let results = join_all(runtimes.into_iter().map(|(session_id, runtime)| {
+            Self::terminate_runtime(session_id, runtime, grace_seconds, SessionStatus::Stopped)
+        }))
+        .await;
+
+        let stopped_count = results.iter().filter(|stopped| **stopped).count();
+
+        info!(
+            stopped_count,
+            total_sessions = results.len(),
+            grace_seconds,
+            "completed stop-all session termination pass"
+        );
+        results.into_iter().all(|stopped| stopped)
     }
 
     pub async fn logs_snapshot(
@@ -1393,6 +1502,25 @@ mod tests {
         }
 
         assert_eq!(writes, expected_soft_stop_inputs());
+    }
+
+    #[tokio::test]
+    async fn test_stop_all_sessions_runs_in_parallel() {
+        let (rt1, _writer_rx1) = make_runtime_writable("stp1001", SessionStatus::Running);
+        let (rt2, _writer_rx2) = make_runtime_writable("stp1002", SessionStatus::Running);
+        let (rt3, _writer_rx3) = make_runtime_writable("stp1003", SessionStatus::Running);
+        let mut store = store_with(vec![rt1, rt2, rt3], make_test_db().await);
+
+        let started = Instant::now();
+        assert!(
+            store.stop_all_sessions(1).await,
+            "all running sessions should be stoppable"
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(2_500),
+            "stop_all_sessions should stop multiple sessions concurrently"
+        );
     }
 
     // -----------------------------------------------------------------------

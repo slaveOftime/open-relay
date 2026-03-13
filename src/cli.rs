@@ -47,7 +47,7 @@ pub enum DaemonCommand {
     /// Launch the daemon. Runs in the foreground unless `--detach` is given.
     Start(DaemonStartArgs),
     /// Gracefully shut down the running daemon.
-    Stop,
+    Stop(DaemonStopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -69,6 +69,13 @@ pub struct DaemonStartArgs {
     /// Argon2 PHC hash passed from the parent process to the detached child; never set manually.
     #[arg(long, hide = true)]
     pub auth_hash_internal: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonStopArgs {
+    /// Seconds to wait for sessions to exit cleanly before forcing termination.
+    #[arg(long, default_value_t = 15)]
+    pub grace: u64,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

@@ -94,7 +94,9 @@ async fn dispatch_request(
         RpcRequest::Health => RpcResponse::Health {
             daemon_pid: std::process::id(),
         },
-        RpcRequest::DaemonStop => handle_daemon_stop(config, session_store, shutdown_tx).await,
+        RpcRequest::DaemonStop { grace_seconds } => {
+            handle_daemon_stop(grace_seconds, session_store, shutdown_tx).await
+        }
         RpcRequest::List { query } => handle_list(query, session_store, db).await?,
         RpcRequest::Start {
             title,
@@ -160,12 +162,12 @@ async fn dispatch_request(
 }
 
 async fn handle_daemon_stop(
-    config: &AppConfig,
+    grace_seconds: u64,
     session_store: &SessionStoreHandle,
     shutdown_tx: &mpsc::UnboundedSender<()>,
 ) -> RpcResponse {
     let mut store = session_store.lock().await;
-    let stopped = store.stop_all_sessions(config.stop_grace_seconds).await;
+    let stopped = store.stop_all_sessions(grace_seconds).await;
     let _ = shutdown_tx.send(());
     RpcResponse::DaemonStop { stopped }
 }
