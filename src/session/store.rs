@@ -1,13 +1,15 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use chrono::Utc;
 use futures_util::future::join_all;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
@@ -15,7 +17,7 @@ use crate::{
     db::Database,
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
-    session::SessionLiveSummary,
+    session::{SessionLiveSummary, mode_tracker::ModeSnapshot},
 };
 
 use super::{
@@ -32,9 +34,86 @@ const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
 const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub struct SessionStore {
-    sessions: HashMap<String, Arc<Mutex<SessionRuntime>>>,
+type SessionMap = HashMap<String, Arc<SessionHandle>>;
+
+struct StoreMutableState {
+    starting_sessions: HashSet<String>,
     evicted_sessions: HashMap<String, Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRuntimeSnapshot {
+    summary: SessionSummary,
+    last_output_at: Option<Instant>,
+    mode_snapshot: ModeSnapshot,
+    output_closed: bool,
+    notifications_enabled: bool,
+    last_attach_activity_at: Option<Instant>,
+    last_notified_at: Option<Instant>,
+    notified_output_epoch: Option<Instant>,
+    running: bool,
+    exit_code: Option<i32>,
+}
+
+impl SessionRuntimeSnapshot {
+    fn from_runtime(rt: &SessionRuntime) -> Self {
+        let input_needed = rt.input_needed();
+        Self {
+            summary: SessionSummary {
+                id: rt.meta.id.clone(),
+                title: rt.meta.title.clone(),
+                command: rt.meta.command.clone(),
+                args: rt.meta.args.clone(),
+                pid: rt.meta.pid,
+                status: rt.meta.status.as_str().to_string(),
+                age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
+                created_at: rt.meta.created_at,
+                cwd: rt.meta.cwd.clone(),
+                input_needed,
+            },
+            last_output_at: rt.last_output_at,
+            mode_snapshot: rt.mode_snapshot(),
+            output_closed: rt.output_closed,
+            notifications_enabled: rt.notifications_enabled,
+            last_attach_activity_at: rt.last_attach_activity_at,
+            last_notified_at: rt.last_notified_at,
+            notified_output_epoch: rt.notified_output_epoch,
+            running: matches!(rt.meta.status, SessionStatus::Running),
+            exit_code: rt.meta.exit_code,
+        }
+    }
+}
+
+struct SessionHandle {
+    runtime: Arc<Mutex<SessionRuntime>>,
+    snapshot: ArcSwap<SessionRuntimeSnapshot>,
+}
+
+impl SessionHandle {
+    fn new(runtime: Arc<Mutex<SessionRuntime>>) -> Self {
+        let initial = runtime
+            .lock()
+            .map(|rt| SessionRuntimeSnapshot::from_runtime(&rt))
+            .unwrap_or_else(|poisoned| SessionRuntimeSnapshot::from_runtime(poisoned.get_ref()));
+        Self {
+            runtime,
+            snapshot: ArcSwap::from_pointee(initial),
+        }
+    }
+
+    fn snapshot(&self) -> Arc<SessionRuntimeSnapshot> {
+        self.snapshot.load_full()
+    }
+
+    fn refresh_snapshot(&self, rt: &SessionRuntime) {
+        self.snapshot
+            .store(Arc::new(SessionRuntimeSnapshot::from_runtime(rt)));
+    }
+}
+
+pub struct SessionStore {
+    sessions: ArcSwap<SessionMap>,
+    mutable: TokioMutex<StoreMutableState>,
     eviction_ttl: Duration,
     db: Arc<Database>,
 }
@@ -47,11 +126,23 @@ pub struct SilentCandidate {
     pub notifications_enabled: bool,
 }
 
+#[derive(Debug)]
+struct PreparedStart {
+    meta: SessionMeta,
+    session_dir: PathBuf,
+    rows: u16,
+    cols: u16,
+    notifications_enabled: bool,
+}
+
 impl SessionStore {
     pub fn new(eviction_seconds: u64, db: Arc<Database>) -> Self {
         Self {
-            sessions: HashMap::new(),
-            evicted_sessions: HashMap::new(),
+            sessions: ArcSwap::from_pointee(HashMap::new()),
+            mutable: TokioMutex::new(StoreMutableState {
+                starting_sessions: HashSet::new(),
+                evicted_sessions: HashMap::new(),
+            }),
             eviction_ttl: Duration::from_secs(eviction_seconds.max(1)),
             db,
         }
@@ -59,7 +150,7 @@ impl SessionStore {
 
     /// Persist and evict completed sessions that have aged past the in-memory
     /// retention window.
-    pub async fn run_maintenance(&mut self) {
+    pub async fn run_maintenance(&self) {
         self.prune_evicted_sessions().await;
     }
 
@@ -68,7 +159,7 @@ impl SessionStore {
     /// Any stale `running` / `stopping` sessions are reconciled to `failed`,
     /// persisted back to SQLite, and returned so callers can emit user-facing
     /// startup notifications.
-    pub async fn load_running_stopping_sessions(&mut self) -> Vec<SessionMeta> {
+    pub async fn load_running_stopping_sessions(&self) -> Vec<SessionMeta> {
         let db = self.db.clone();
 
         let mut startup_failed = Vec::new();
@@ -99,28 +190,75 @@ impl SessionStore {
         startup_failed
     }
 
-    pub async fn start_session(&mut self, config: &AppConfig, spec: StartSpec) -> Result<String> {
-        let running_count = self
-            .sessions
+    pub async fn start_session_via_handle(
+        store_handle: &Arc<Self>,
+        config: &AppConfig,
+        spec: StartSpec,
+    ) -> Result<String> {
+        let prepared = store_handle.prepare_start_session(config, spec).await?;
+
+        let PreparedStart {
+            mut meta,
+            session_dir,
+            rows,
+            cols,
+            notifications_enabled,
+        } = prepared;
+        let session_id = meta.id.clone();
+        let runtime = match spawn_session(
+            config,
+            &mut meta,
+            session_dir,
+            rows,
+            cols,
+            notifications_enabled,
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = store_handle.abort_started_session(&session_id).await;
+                return Err(err);
+            }
+        };
+        let cleanup_runtime = Arc::clone(&runtime);
+
+        let result = store_handle.commit_started_session(meta, runtime).await;
+
+        if result.is_err() {
+            if let Ok(mut rt) = cleanup_runtime.lock() {
+                let _ = rt.pty.kill();
+                rt.mark_completed(SessionStatus::Failed, None);
+            }
+            let _ = store_handle.abort_started_session(&session_id).await;
+        }
+
+        result
+    }
+
+    async fn prepare_start_session(
+        &self,
+        config: &AppConfig,
+        spec: StartSpec,
+    ) -> Result<PreparedStart> {
+        let sessions = self.sessions.load();
+        let running_count = sessions
             .values()
-            .filter(|s| {
-                s.lock()
-                    .map(|rt| matches!(rt.meta.status, SessionStatus::Running))
-                    .unwrap_or(false)
-            })
+            .filter(|handle| handle.snapshot().running)
             .count();
 
-        if running_count >= config.max_running_sessions {
+        let mut state = self.mutable.lock().await;
+        if running_count + state.starting_sessions.len() >= config.max_running_sessions {
             return Err(AppError::MaxSessionsReached(config.max_running_sessions));
         }
 
-        let id = generate_session_id(|candidate| self.sessions.contains_key(candidate));
+        let id = generate_session_id(|candidate| {
+            sessions.contains_key(candidate) || state.starting_sessions.contains(candidate)
+        });
 
         let rows = spec.rows.unwrap_or(24).max(1);
         let cols = spec.cols.unwrap_or(80).max(1);
         let created_at = Utc::now();
 
-        let mut meta = SessionMeta {
+        let meta = SessionMeta {
             id: id.clone(),
             title: spec.title,
             command: spec.cmd,
@@ -134,114 +272,96 @@ impl SessionStore {
             exit_code: None,
         };
 
-        self.db.insert_session(&meta).await?;
+        state.starting_sessions.insert(id.clone());
+        drop(state);
 
-        let session_dir = config.sessions_dir.join(&id);
-        let runtime = spawn_session(
-            config,
-            &mut meta,
-            session_dir,
+        if let Err(err) = self.db.insert_session(&meta).await {
+            self.mutable.lock().await.starting_sessions.remove(&id);
+            return Err(err);
+        }
+
+        Ok(PreparedStart {
+            meta,
+            session_dir: config.sessions_dir.join(&id),
             rows,
             cols,
-            spec.notifications_enabled,
-        )?;
+            notifications_enabled: spec.notifications_enabled,
+        })
+    }
 
-        self.db.update_session(&meta).await?;
-
-        self.sessions.insert(id.clone(), runtime);
-
+    async fn commit_started_session(
+        &self,
+        meta: SessionMeta,
+        runtime: Arc<Mutex<SessionRuntime>>,
+    ) -> Result<String> {
+        let id = meta.id.clone();
+        let update_result = self.db.update_session(&meta).await;
+        self.mutable.lock().await.starting_sessions.remove(&id);
+        update_result?;
+        let handle = Arc::new(SessionHandle::new(runtime));
+        self.sessions.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(id.clone(), handle.clone());
+            next
+        });
         Ok(id)
     }
 
-    pub async fn list_summaries(&mut self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
+    async fn abort_started_session(&self, id: &str) -> Result<()> {
+        self.mutable.lock().await.starting_sessions.remove(id);
+        self.db.delete_session(id).await
+    }
+
+    pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
         let mut sessions = self.db.list_summaries(query).await?;
 
-        self.prune_evicted_sessions().await;
-        for runtime in self.sessions.values() {
-            if let Ok(mut rt) = runtime.lock() {
-                if let Some(session) = sessions.iter_mut().find(|s| s.id == rt.meta.id) {
-                    rt.refresh_status();
-
-                    session.input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
-                        && rt.notified_output_epoch.is_some()
-                        && rt.notified_output_epoch == rt.last_output_at;
-                }
-            } else {
-                warn!("failed to lock session runtime for summary refresh");
+        let live_sessions = self.sessions.load();
+        for session in &mut sessions {
+            if let Some(handle) = live_sessions.get(&session.id) {
+                *session = handle.snapshot().summary.clone();
             }
         }
 
         Ok(sessions)
     }
 
-    pub fn get_summary(&mut self, id: &str) -> Option<SessionSummary> {
-        let runtime = self.sessions.get(id)?;
-        let mut rt = runtime.lock().ok()?;
-        rt.refresh_status();
-        let input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
-            && rt.notified_output_epoch.is_some()
-            && rt.notified_output_epoch == rt.last_output_at;
-        Some(SessionSummary {
-            id: rt.meta.id.clone(),
-            title: rt.meta.title.clone(),
-            command: rt.meta.command.clone(),
-            args: rt.meta.args.clone(),
-            pid: rt.meta.pid,
-            status: rt.meta.status.as_str().to_string(),
-            age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
-            created_at: rt.meta.created_at,
-            cwd: rt.meta.cwd.clone(),
-            input_needed,
-        })
+    pub fn get_summary(&self, id: &str) -> Option<SessionSummary> {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| handle.snapshot().summary.clone())
     }
 
     /// Returns summaries for all sessions that are currently held in memory
     /// (live or recently evicted), without touching the database.
     /// Used by the SSE session poller to avoid a DB query every 500 ms.
-    pub fn list_live_summaries(&mut self) -> Vec<SessionLiveSummary> {
-        let mut out = Vec::with_capacity(self.sessions.len());
-        for runtime in self.sessions.values() {
-            if let Ok(mut rt) = runtime.lock() {
-                rt.refresh_status();
-                let input_needed = matches!(rt.meta.status, super::SessionStatus::Running)
-                    && rt.notified_output_epoch.is_some()
-                    && rt.notified_output_epoch == rt.last_output_at;
-                out.push(SessionLiveSummary {
-                    last_output_at: rt.last_output_at,
-                    summary: SessionSummary {
-                        id: rt.meta.id.clone(),
-                        title: rt.meta.title.clone(),
-                        command: rt.meta.command.clone(),
-                        args: rt.meta.args.clone(),
-                        pid: rt.meta.pid,
-                        status: rt.meta.status.as_str().to_string(),
-                        age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
-                        created_at: rt.meta.created_at,
-                        cwd: rt.meta.cwd.clone(),
-                        input_needed,
-                    },
-                });
-            } else {
-                tracing::warn!("failed to lock session runtime in list_live_summaries");
-            }
-        }
-        out
+    pub fn list_live_summaries(&self) -> Vec<SessionLiveSummary> {
+        let sessions = self.sessions.load();
+        sessions
+            .values()
+            .map(|handle| {
+                let snapshot = handle.snapshot();
+                SessionLiveSummary {
+                    last_output_at: snapshot.last_output_at,
+                    summary: snapshot.summary.clone(),
+                }
+            })
+            .collect()
     }
 
     pub fn get_exit_code(&self, id: &str) -> Option<i32> {
-        let runtime = self.sessions.get(id)?;
-        let rt = runtime.lock().ok()?;
-        rt.meta.exit_code
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .and_then(|handle| handle.snapshot().exit_code)
     }
 
     pub fn is_running(&self, id: &str) -> bool {
-        let Some(runtime) = self.sessions.get(id) else {
-            return false;
-        };
-        let Ok(rt) = runtime.lock() else {
-            return false;
-        };
-        matches!(rt.meta.status, super::SessionStatus::Running)
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| handle.snapshot().running)
+            .unwrap_or(false)
     }
 
     /// Returns the current terminal mode snapshot for the session, if available.
@@ -249,31 +369,27 @@ impl SessionStore {
         &self,
         id: &str,
     ) -> Option<crate::session::mode_tracker::ModeSnapshot> {
-        let runtime = self.sessions.get(id)?;
-        let rt = runtime.lock().ok()?;
-        Some(rt.mode_snapshot())
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| handle.snapshot().mode_snapshot)
     }
 
     pub async fn attach_stream_status(
-        &mut self,
+        &self,
         id: &str,
     ) -> std::result::Result<(bool, bool, Option<i32>), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.lock() else {
-            return Err(SessionLookupError::Evicted);
-        };
-        rt.refresh_status();
-        Ok((
-            matches!(rt.meta.status, super::SessionStatus::Running),
-            rt.output_closed,
-            rt.meta.exit_code,
-        ))
+        let snapshot = runtime.snapshot();
+        Ok((snapshot.running, snapshot.output_closed, snapshot.exit_code))
     }
 
-    pub async fn mark_attach_presence(&mut self, id: &str) {
-        if let Some(runtime) = self.sessions.get(id) {
-            if let Ok(mut rt) = runtime.lock() {
+    pub async fn mark_attach_presence(&self, id: &str) {
+        let sessions = self.sessions.load();
+        if let Some(handle) = sessions.get(id).cloned() {
+            if let Ok(mut rt) = handle.runtime.lock() {
                 rt.mark_attach_presence();
+                handle.refresh_snapshot(&rt);
             }
         }
     }
@@ -282,7 +398,7 @@ impl SessionStore {
     /// `from_byte_offset` (or all content if `None`), the current end offset,
     /// a live broadcast receiver, and the current terminal mode flags.
     pub async fn attach_subscribe_init(
-        &mut self,
+        &self,
         id: &str,
         from_byte_offset: Option<u64>,
     ) -> std::result::Result<
@@ -296,10 +412,9 @@ impl SessionStore {
         SessionLookupError,
     > {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.lock() else {
+        let Ok(rt) = runtime.runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
-        rt.refresh_status();
         let offset = from_byte_offset.unwrap_or(0);
         let (chunks, end_offset) = rt.ring.read_from(offset);
         let rx = rt.broadcast_tx.subscribe();
@@ -321,18 +436,19 @@ impl SessionStore {
         ))
     }
 
-    pub async fn attach_detach(&mut self, id: &str) -> std::result::Result<(), SessionLookupError> {
+    pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.lock() else {
+        let Ok(mut rt) = runtime.runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
         rt.clear_attach_state();
+        runtime.refresh_snapshot(&rt);
         debug!(session_id = id, "attach detach acknowledged");
         Ok(())
     }
 
     pub async fn attach_input(
-        &mut self,
+        &self,
         id: &str,
         data: &str,
     ) -> std::result::Result<(), SessionLookupError> {
@@ -342,7 +458,7 @@ impl SessionStore {
         }
 
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.lock() else {
+        let Ok(mut rt) = runtime.runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
         // When the child process has enabled DECCKM (application cursor key
@@ -370,6 +486,7 @@ impl SessionStore {
         if rt.pty.write_input(bytes.to_vec()) {
             rt.mark_attach_activity();
             rt.last_input_at = Some(Instant::now());
+            runtime.refresh_snapshot(&rt);
             debug!(
                 session_id = id,
                 bytes = bytes.len(),
@@ -389,17 +506,18 @@ impl SessionStore {
     }
 
     pub async fn attach_resize(
-        &mut self,
+        &self,
         id: &str,
         rows: u16,
         cols: u16,
     ) -> std::result::Result<(), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.lock() else {
+        let Ok(mut rt) = runtime.runtime.lock() else {
             return Err(SessionLookupError::Evicted);
         };
         rt.mark_attach_activity();
         let resized = rt.resize_pty(rows, cols);
+        runtime.refresh_snapshot(&rt);
         debug!(
             session_id = id,
             rows, cols, resized, "attach resize requested"
@@ -413,24 +531,22 @@ impl SessionStore {
         }
     }
 
-    pub async fn stop_session(&mut self, id: &str, grace_seconds: u64) -> bool {
+    pub async fn stop_session(&self, id: &str, grace_seconds: u64) -> bool {
         self.terminate_session(id, grace_seconds, SessionStatus::Stopped)
             .await
     }
 
-    pub async fn kill_session(&mut self, id: &str) -> bool {
+    pub async fn kill_session(&self, id: &str) -> bool {
         self.terminate_session(id, 0, SessionStatus::Killed).await
     }
 
     async fn terminate_session(
-        &mut self,
+        &self,
         id: &str,
         grace_seconds: u64,
         requested_final_status: SessionStatus,
     ) -> bool {
-        self.prune_evicted_sessions().await;
-
-        let Some(runtime) = self.sessions.get(id).cloned() else {
+        let Ok(runtime) = self.lookup_runtime(id).await else {
             debug!(
                 session_id = id,
                 requested_final_status = requested_final_status.as_str(),
@@ -450,7 +566,7 @@ impl SessionStore {
 
     async fn terminate_runtime(
         session_id: String,
-        runtime: Arc<Mutex<SessionRuntime>>,
+        runtime: Arc<SessionHandle>,
         grace_seconds: u64,
         requested_final_status: SessionStatus,
     ) -> bool {
@@ -470,7 +586,7 @@ impl SessionStore {
         // Begin a soft-stop sequence and let the child exit on its own before
         // escalating to a forced kill when the grace window expires.
         {
-            let Ok(mut rt) = runtime.lock() else {
+            let Ok(mut rt) = runtime.runtime.lock() else {
                 warn!(
                     session_id = %session_id,
                     "failed to lock session runtime before termination"
@@ -478,6 +594,7 @@ impl SessionStore {
                 return false;
             };
             if rt.refresh_status() {
+                runtime.refresh_snapshot(&rt);
                 debug!(
                     session_id = %session_id,
                     status = rt.meta.status.as_str(),
@@ -488,6 +605,7 @@ impl SessionStore {
             }
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
+            runtime.refresh_snapshot(&rt);
             if let Some((_, input)) = soft_stop_schedule.first() {
                 let _ = rt.pty.write_input((*input).to_vec());
                 debug!(
@@ -503,7 +621,7 @@ impl SessionStore {
 
         while Instant::now() < deadline {
             {
-                let Ok(mut rt) = runtime.lock() else {
+                let Ok(mut rt) = runtime.runtime.lock() else {
                     warn!(
                         session_id = %session_id,
                         "failed to lock session runtime while waiting for termination"
@@ -511,6 +629,7 @@ impl SessionStore {
                     return true;
                 };
                 if rt.refresh_status() {
+                    runtime.refresh_snapshot(&rt);
                     debug!(
                         session_id = %session_id,
                         elapsed_ms = start.elapsed().as_millis(),
@@ -535,11 +654,12 @@ impl SessionStore {
                     );
                     next_soft_stop_index += 1;
                 }
+                runtime.refresh_snapshot(&rt);
             }
             tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
-        let Ok(mut rt) = runtime.lock() else {
+        let Ok(mut rt) = runtime.runtime.lock() else {
             warn!(
                 session_id = %session_id,
                 "failed to lock session runtime before forced termination"
@@ -547,6 +667,7 @@ impl SessionStore {
             return false;
         };
         if rt.refresh_status() {
+            runtime.refresh_snapshot(&rt);
             info!(
                 session_id = %session_id,
                 elapsed_ms = start.elapsed().as_millis(),
@@ -564,6 +685,7 @@ impl SessionStore {
         );
         if rt.pty.kill().is_ok() {
             let _ = rt.refresh_status();
+            runtime.refresh_snapshot(&rt);
             info!(
                 session_id = %session_id,
                 status = rt.meta.status.as_str(),
@@ -580,11 +702,9 @@ impl SessionStore {
         }
     }
 
-    pub async fn stop_all_sessions(&mut self, grace_seconds: u64) -> bool {
-        self.prune_evicted_sessions().await;
-
-        let runtimes: Vec<_> = self
-            .sessions
+    pub async fn stop_all_sessions(&self, grace_seconds: u64) -> bool {
+        let sessions = self.sessions.load();
+        let runtimes: Vec<_> = sessions
             .iter()
             .map(|(id, runtime)| (id.clone(), runtime.clone()))
             .collect();
@@ -610,16 +730,10 @@ impl SessionStore {
         results.into_iter().all(|stopped| stopped)
     }
 
-    pub async fn logs_snapshot(
-        &mut self,
-        id: &str,
-        tail: usize,
-    ) -> Option<(Vec<String>, u64, bool)> {
-        self.prune_evicted_sessions().await;
-
-        let runtime = self.sessions.get(id)?;
-        let mut rt = runtime.lock().ok()?;
-        rt.refresh_status();
+    pub async fn logs_snapshot(&self, id: &str, tail: usize) -> Option<(Vec<String>, u64, bool)> {
+        let sessions = self.sessions.load();
+        let runtime = sessions.get(id)?.clone();
+        let rt = runtime.runtime.lock().ok()?;
         let mut filter = crate::session::pty::EscapeFilter::new();
         let all_bytes: Vec<u8> = rt
             .ring
@@ -631,32 +745,29 @@ impl SessionStore {
         let skip = all_lines.len().saturating_sub(tail);
         let lines: Vec<String> = all_lines.into_iter().skip(skip).collect();
         let cursor = rt.ring.end_offset();
-        let running = rt.meta.status.as_str() == "running";
+        let running = runtime.snapshot().running;
         Some((lines, cursor, running))
     }
 
-    pub async fn logs_poll(&mut self, id: &str, cursor: u64) -> Option<(Vec<String>, u64, bool)> {
-        self.prune_evicted_sessions().await;
-
-        let runtime = self.sessions.get(id)?;
-        let mut rt = runtime.lock().ok()?;
-        rt.refresh_status();
+    pub async fn logs_poll(&self, id: &str, cursor: u64) -> Option<(Vec<String>, u64, bool)> {
+        let sessions = self.sessions.load();
+        let runtime = sessions.get(id)?.clone();
+        let rt = runtime.runtime.lock().ok()?;
         let (chunks, end_offset) = rt.ring.read_from(cursor);
         let mut filter = crate::session::pty::EscapeFilter::new();
         let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
         let text = String::from_utf8_lossy(&raw);
         let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
-        let running = rt.meta.status.as_str() == "running";
+        let running = runtime.snapshot().running;
         Some((lines, end_offset, running))
     }
 
     async fn lookup_runtime(
-        &mut self,
+        &self,
         id: &str,
-    ) -> std::result::Result<Arc<Mutex<SessionRuntime>>, SessionLookupError> {
-        self.prune_evicted_sessions().await;
-
-        if let Some(runtime) = self.sessions.get(id) {
+    ) -> std::result::Result<Arc<SessionHandle>, SessionLookupError> {
+        let sessions = self.sessions.load();
+        if let Some(runtime) = sessions.get(id) {
             trace!(
                 session_id = id,
                 "session runtime lookup hit in-memory runtime"
@@ -664,7 +775,7 @@ impl SessionStore {
             return Ok(runtime.clone());
         }
 
-        if self.evicted_sessions.contains_key(id) {
+        if self.mutable.lock().await.evicted_sessions.contains_key(id) {
             debug!(
                 session_id = id,
                 "session runtime lookup hit evicted tombstone"
@@ -676,42 +787,42 @@ impl SessionStore {
         Err(SessionLookupError::NotRunning)
     }
 
-    async fn prune_evicted_sessions(&mut self) {
+    async fn prune_evicted_sessions(&self) {
         let now = Instant::now();
         let mut to_persist: Vec<SessionMeta> = Vec::new();
         let mut evicted_ids: Vec<String> = Vec::new();
+        let sessions = self.sessions.load_full();
 
-        self.sessions.retain(|id, runtime| {
-            let Ok(mut rt) = runtime.lock() else {
-                return true;
+        for (id, runtime) in sessions.iter() {
+            let Ok(mut rt) = runtime.runtime.lock() else {
+                continue;
             };
             rt.refresh_status();
 
-            // Write completed-but-not-yet-persisted sessions to the DB.
             if rt.is_completed() && !rt.persisted {
                 to_persist.push(rt.meta.clone());
                 rt.persisted = true;
             }
 
-            if !rt.is_completed() {
-                return true;
+            if rt.is_completed() {
+                let Some(completed_at) = rt.completed_at else {
+                    rt.completed_at = Some(now);
+                    runtime.refresh_snapshot(&rt);
+                    continue;
+                };
+                if now.duration_since(completed_at) >= self.eviction_ttl {
+                    tracing::info!(
+                        session_id = id,
+                        age_seconds = now.duration_since(completed_at).as_secs(),
+                        "evicting completed session from memory after eviction TTL"
+                    );
+                    let _ = append_event(&rt.dir, "session evicted from memory");
+                    evicted_ids.push(id.clone());
+                }
             }
-            let Some(completed_at) = rt.completed_at else {
-                rt.completed_at = Some(now);
-                return true;
-            };
-            if now.duration_since(completed_at) >= self.eviction_ttl {
-                tracing::info!(
-                    session_id = id,
-                    age_seconds = now.duration_since(completed_at).as_secs(),
-                    "evicting completed session from memory after eviction TTL"
-                );
-                let _ = append_event(&rt.dir, "session evicted from memory");
-                evicted_ids.push(id.clone());
-                return false;
-            }
-            true
-        });
+
+            runtime.refresh_snapshot(&rt);
+        }
 
         // Persist completed sessions outside the borrow of `self.sessions`.
         for meta in to_persist {
@@ -721,17 +832,33 @@ impl SessionStore {
             }
         }
 
-        for id in evicted_ids {
-            debug!(session_id = %id, "session evicted from in-memory store");
-            self.evicted_sessions.insert(id, now);
+        if !evicted_ids.is_empty() {
+            let evicted_set: HashSet<_> = evicted_ids.iter().cloned().collect();
+            self.sessions.rcu(|current| {
+                let mut next = (**current).clone();
+                next.retain(|id, _| !evicted_set.contains(id));
+                next
+            });
+
+            let mut state = self.mutable.lock().await;
+            for id in evicted_ids {
+                debug!(session_id = %id, "session evicted from in-memory store");
+                state.evicted_sessions.insert(id, now);
+            }
+            Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl);
+            return;
         }
 
-        self.evict_old_tombstones(now);
+        let mut state = self.mutable.lock().await;
+        Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl);
     }
 
-    fn evict_old_tombstones(&mut self, now: Instant) {
-        self.evicted_sessions
-            .retain(|_, evicted_at| now.duration_since(*evicted_at) < self.eviction_ttl);
+    fn evict_old_tombstones(
+        evicted_sessions: &mut HashMap<String, Instant>,
+        now: Instant,
+        eviction_ttl: Duration,
+    ) {
+        evicted_sessions.retain(|_, evicted_at| now.duration_since(*evicted_at) < eviction_ttl);
     }
 
     /// Returns silent-notification candidates with session id, raw excerpt,
@@ -742,40 +869,41 @@ impl SessionStore {
         min_notification_interval: Duration,
     ) -> Vec<SilentCandidate> {
         let now = Instant::now();
-        self.sessions
+        let sessions = self.sessions.load();
+        sessions
             .values()
             .filter_map(|runtime| {
-                let mut rt = runtime.lock().ok()?;
-                if !matches!(rt.meta.status, super::SessionStatus::Running) {
+                let snapshot = runtime.snapshot();
+                if !snapshot.running {
                     return None;
                 }
 
                 // Suppress notification untill output advances
                 // if there was attach activity in recent supression window.
                 // Because normally every input may cause some output, which should not be notified in short time.
-                if let Some(last_attach_activity) = rt.last_attach_activity_at {
+                if let Some(last_attach_activity) = snapshot.last_attach_activity_at {
                     if now.duration_since(last_attach_activity) < suppression_window {
-                        rt.last_output_at = None;
                         return None;
                     }
                 }
 
                 // Silence condition: no visible output for `silence` duration.
-                let last_output = rt.last_output_at?;
+                let last_output = snapshot.last_output_at?;
 
                 // Drop short-age candidates to prevent repeated alerts in a
                 // short interval even when monitor ticks every second.
-                if let Some(last_notified_at) = rt.last_notified_at {
+                if let Some(last_notified_at) = snapshot.last_notified_at {
                     if now.duration_since(last_notified_at) < min_notification_interval {
                         return None;
                     }
                 }
                 // Already notified for this exact output epoch.
                 // Suppress until new visible output advances the epoch.
-                if rt.notified_output_epoch == Some(last_output) {
+                if snapshot.notified_output_epoch == Some(last_output) {
                     return None;
                 }
 
+                let rt = runtime.runtime.lock().ok()?;
                 let limit = 20u16;
                 let mut parser = vt100::Parser::new(limit, 2000, 0);
                 let chunks: Vec<_> = rt.ring.all_chunks().collect();
@@ -785,10 +913,10 @@ impl SessionStore {
                 let excerpt = parser.screen().contents();
 
                 Some(SilentCandidate {
-                    session_id: rt.meta.id.clone(),
+                    session_id: snapshot.summary.id.clone(),
                     raw_excerpt: excerpt,
                     output_epoch: last_output,
-                    notifications_enabled: rt.notifications_enabled,
+                    notifications_enabled: snapshot.notifications_enabled,
                 })
             })
             .collect()
@@ -796,11 +924,13 @@ impl SessionStore {
 
     /// Records a successful notification for `session_id` at `output_epoch`.
     /// Re-notification is suppressed until output advances to a new epoch.
-    pub fn mark_notified(&mut self, session_id: &str, output_epoch: Instant, notified_at: Instant) {
-        if let Some(runtime) = self.sessions.get(session_id) {
-            if let Ok(mut rt) = runtime.lock() {
+    pub fn mark_notified(&self, session_id: &str, output_epoch: Instant, notified_at: Instant) {
+        let sessions = self.sessions.load();
+        if let Some(runtime) = sessions.get(session_id) {
+            if let Ok(mut rt) = runtime.runtime.lock() {
                 rt.notified_output_epoch = Some(output_epoch);
                 rt.last_notified_at = Some(notified_at);
+                runtime.refresh_snapshot(&rt);
             }
         }
     }
@@ -942,10 +1072,15 @@ mod tests {
         runtimes: Vec<Arc<Mutex<super::super::runtime::SessionRuntime>>>,
         db: Arc<Database>,
     ) -> SessionStore {
-        let mut store = SessionStore::new(900, db);
+        let store = SessionStore::new(900, db);
         for rt in runtimes {
             let id = rt.lock().unwrap().meta.id.clone();
-            store.sessions.insert(id, rt);
+            let handle = Arc::new(SessionHandle::new(rt));
+            store.sessions.rcu(|current| {
+                let mut next = (**current).clone();
+                next.insert(id.clone(), handle.clone());
+                next
+            });
         }
         store
     }
@@ -1027,7 +1162,7 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         // First call returns a candidate with an output epoch.
         let first = store.silent_candidates(silence, min_interval);
@@ -1056,7 +1191,7 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
@@ -1066,12 +1201,14 @@ mod tests {
 
         // Simulate new output by advancing last_output_at on the runtime.
         {
-            let runtime = store.sessions.get("abc1234").unwrap();
-            let mut rt = runtime.lock().unwrap();
+            let sessions = store.sessions.load();
+            let runtime = sessions.get("abc1234").unwrap();
+            let mut rt = runtime.runtime.lock().unwrap();
             // A new epoch strictly later than the notified one.
             rt.last_output_at = Some(Instant::now());
             // Move notification timestamp into the past so cooldown no longer blocks.
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(30));
+            runtime.refresh_snapshot(&rt);
         }
 
         // New output epoch + expired notification cooldown should re-qualify.
@@ -1089,7 +1226,7 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         let first = store.silent_candidates(silence, min_interval);
         assert_eq!(first.len(), 1);
@@ -1103,9 +1240,11 @@ mod tests {
 
         // Simulate time passing without any new output.
         {
-            let runtime = store.sessions.get("abc1234").unwrap();
-            let mut rt = runtime.lock().unwrap();
+            let sessions = store.sessions.load();
+            let runtime = sessions.get("abc1234").unwrap();
+            let mut rt = runtime.runtime.lock().unwrap();
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(31));
+            runtime.refresh_snapshot(&rt);
         }
 
         let still_suppressed = store.silent_candidates(silence, min_interval);
@@ -1117,7 +1256,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_notified_on_unknown_id_is_noop() {
-        let mut store = SessionStore::new(900, make_test_db().await);
+        let store = SessionStore::new(900, make_test_db().await);
         // Should not panic.
         let now = Instant::now();
         store.mark_notified("does_not_exist", now, now);
@@ -1134,17 +1273,28 @@ mod tests {
         }
 
         let db = make_test_db().await;
-        let mut store = SessionStore::new(1, db);
-        store.sessions.insert("evict001".to_string(), rt);
+        let store = SessionStore::new(1, db);
+        let handle = Arc::new(SessionHandle::new(rt));
+        store.sessions.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert("evict001".to_string(), handle.clone());
+            next
+        });
 
         store.run_maintenance().await;
 
+        let sessions = store.sessions.load();
         assert!(
-            !store.sessions.contains_key("evict001"),
+            !sessions.contains_key("evict001"),
             "completed sessions older than the eviction TTL should be removed from memory"
         );
         assert!(
-            store.evicted_sessions.contains_key("evict001"),
+            store
+                .mutable
+                .lock()
+                .await
+                .evicted_sessions
+                .contains_key("evict001"),
             "evicted sessions should leave a tombstone for follow-up lookups"
         );
     }
@@ -1159,7 +1309,7 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)), // output 5s ago (past silence)
         );
-        // Recent attach activity should suppress notifications and clear output epoch.
+        // Recent attach activity should suppress notifications without mutating runtime state.
         {
             let mut locked = rt.lock().unwrap();
             locked.last_attach_activity_at = Some(Instant::now());
@@ -1171,11 +1321,12 @@ mod tests {
             "should suppress notification while attach activity is inside suppression window"
         );
 
-        let runtime = store.sessions.get("abc1234").unwrap();
-        let locked = runtime.lock().unwrap();
+        let sessions = store.sessions.load();
+        let runtime = sessions.get("abc1234").unwrap();
+        let locked = runtime.runtime.lock().unwrap();
         assert!(
-            locked.last_output_at.is_none(),
-            "suppression path should clear output epoch until a new output arrives"
+            locked.last_output_at.is_some(),
+            "suppression path should no longer mutate output epoch during reads"
         );
     }
 
@@ -1298,7 +1449,7 @@ mod tests {
         let config = make_test_config(1);
         // Create 1 running session
         let rt = make_runtime("s1", SessionStatus::Running, "", None);
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         // Try to start a 2nd session
         let spec = StartSpec {
@@ -1311,7 +1462,7 @@ mod tests {
             notifications_enabled: true,
         };
 
-        let result = store.start_session(&config, spec).await;
+        let result = store.prepare_start_session(&config, spec).await;
 
         // Assert it fails with MaxSessionsReached
         assert!(result.is_err());
@@ -1323,6 +1474,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_prepare_start_session_reserves_capacity_until_abort() {
+        let config = make_test_config(1);
+        let db = make_test_db().await;
+        let store = SessionStore::new(900, db.clone());
+        let spec = StartSpec {
+            title: None,
+            cmd: "echo".into(),
+            args: vec![],
+            cwd: None,
+            rows: None,
+            cols: None,
+            notifications_enabled: true,
+        };
+
+        let prepared = store
+            .prepare_start_session(&config, spec)
+            .await
+            .expect("first reservation should succeed");
+        assert!(
+            db.session_exists(&prepared.meta.id).await,
+            "reservation should persist a placeholder session row"
+        );
+
+        let result = store
+            .prepare_start_session(
+                &config,
+                StartSpec {
+                    title: None,
+                    cmd: "echo".into(),
+                    args: vec![],
+                    cwd: None,
+                    rows: None,
+                    cols: None,
+                    notifications_enabled: true,
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::error::AppError::MaxSessionsReached(1))
+        ));
+
+        store
+            .abort_started_session(&prepared.meta.id)
+            .await
+            .expect("aborting reservation should succeed");
+        assert!(
+            !db.session_exists(&prepared.meta.id).await,
+            "aborting reservation should clean up the placeholder session row"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // attach_input — data forwarding and last_input_at tracking
     // -----------------------------------------------------------------------
@@ -1330,7 +1535,7 @@ mod tests {
     #[tokio::test]
     async fn test_attach_input_writes_data_to_writer() {
         let (rt, mut writer_rx) = make_runtime_writable("inp0001", SessionStatus::Running);
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0001", "hello\r")
@@ -1348,7 +1553,7 @@ mod tests {
     async fn test_attach_input_sets_last_input_at() {
         let (rt, _writer_rx) = make_runtime_writable("inp0002", SessionStatus::Running);
         let rt_clone = rt.clone();
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0002", "x")
@@ -1370,7 +1575,7 @@ mod tests {
             let mut locked = rt.lock().unwrap();
             locked.mode_tracker.process(b"\x1b[?1h");
         }
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0003", "\x1b[A")
@@ -1391,7 +1596,7 @@ mod tests {
             let mut locked = rt.lock().unwrap();
             locked.mode_tracker.process(b"\x1b[?1h");
         }
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         // Send all four arrow sequences at once.
         store
@@ -1410,7 +1615,7 @@ mod tests {
     async fn test_attach_input_no_transform_when_decckm_off() {
         let (rt, mut writer_rx) = make_runtime_writable("inp0005", SessionStatus::Running);
         // app_cursor_keys is false by default.
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         store
             .attach_input("inp0005", "\x1b[A\x1b[B")
@@ -1426,7 +1631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_input_not_found_for_unknown_session() {
-        let mut store = SessionStore::new(900, make_test_db().await);
+        let store = SessionStore::new(900, make_test_db().await);
         let result = store.attach_input("no_such_id", "data").await;
         assert!(
             result.is_err(),
@@ -1444,7 +1649,7 @@ mod tests {
             locked.meta.ended_at = Some(Utc::now());
             locked.completed_at = Some(Instant::now());
         }
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         assert!(
             store.stop_session("stp0001", 0).await,
@@ -1470,7 +1675,7 @@ mod tests {
             locked.meta.ended_at = Some(Utc::now());
             locked.completed_at = Some(Instant::now());
         }
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         assert!(
             store.kill_session("kil0001").await,
@@ -1489,7 +1694,7 @@ mod tests {
     #[tokio::test]
     async fn test_stop_session_uses_staged_soft_shutdown_inputs() {
         let (rt, mut writer_rx) = make_runtime_writable("stp0002", SessionStatus::Running);
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         assert!(
             store.stop_session("stp0002", 1).await,
@@ -1509,7 +1714,7 @@ mod tests {
         let (rt1, _writer_rx1) = make_runtime_writable("stp1001", SessionStatus::Running);
         let (rt2, _writer_rx2) = make_runtime_writable("stp1002", SessionStatus::Running);
         let (rt3, _writer_rx3) = make_runtime_writable("stp1003", SessionStatus::Running);
-        let mut store = store_with(vec![rt1, rt2, rt3], make_test_db().await);
+        let store = store_with(vec![rt1, rt2, rt3], make_test_db().await);
 
         let started = Instant::now();
         assert!(
@@ -1531,7 +1736,7 @@ mod tests {
     async fn test_attach_detach_clears_presence_and_activity() {
         let rt = make_runtime("detach001", SessionStatus::Running, "$ prompt", None);
         let rt_clone = rt.clone();
-        let mut store = store_with(vec![rt], make_test_db().await);
+        let store = store_with(vec![rt], make_test_db().await);
 
         {
             let mut locked = rt_clone.lock().unwrap();

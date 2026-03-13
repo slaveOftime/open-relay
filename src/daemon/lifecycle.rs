@@ -235,11 +235,11 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let listener = ipc::bind(&config)?;
     info!(socket_file = ?config.socket_file, "ipc listener bound");
     let (store, startup_failed_sessions) = {
-        let mut store = SessionStore::new(config.session_eviction_seconds, db.clone());
+        let store = SessionStore::new(config.session_eviction_seconds, db.clone());
         let startup_failed_sessions = store.load_running_stopping_sessions().await;
         (store, startup_failed_sessions)
     };
-    let session_store = Arc::new(Mutex::new(store));
+    let session_store = Arc::new(store);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(100);
@@ -323,8 +323,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 break;
             }
             _ = session_maintenance_tick.tick() => {
-                let mut store = session_store.lock().await;
-                store.run_maintenance().await;
+                session_store.run_maintenance().await;
             }
             incoming = listener.accept() => {
                 match incoming {

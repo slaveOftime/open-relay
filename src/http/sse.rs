@@ -10,7 +10,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::{Stream, StreamExt};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 
 use tracing::{debug, info, warn};
@@ -47,7 +47,7 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
 /// `SessionEvent::SessionUpdated` only when a session's fingerprint changes.
 /// This avoids a database round-trip on every tick.
 pub(super) async fn run_session_poller(
-    store: Arc<Mutex<SessionStore>>,
+    store: Arc<SessionStore>,
     event_tx: broadcast::Sender<SessionEvent>,
 ) {
     info!("session poller started");
@@ -57,10 +57,7 @@ pub(super) async fn run_session_poller(
 
     loop {
         interval.tick().await;
-        let sessions = {
-            let mut store = store.lock().await;
-            store.list_live_summaries()
-        };
+        let sessions = store.list_live_summaries();
 
         let mut seen_ids = std::collections::HashSet::with_capacity(last_sent.len());
 
@@ -104,7 +101,6 @@ pub async fn events_handler(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Snapshot of all current sessions sent as the first event
     let initial = {
-        let mut store = state.store.lock().await;
         let q = ListQuery {
             search: None,
             statuses: vec![],
@@ -115,7 +111,7 @@ pub async fn events_handler(
             sort: ListSortField::CreatedAt,
             order: SortOrder::Desc,
         };
-        store.list_summaries(&q).await.unwrap_or_default()
+        state.store.list_summaries(&q).await.unwrap_or_default()
     };
 
     debug!(snapshot_count = initial.len(), "SSE client connected");

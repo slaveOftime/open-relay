@@ -128,6 +128,12 @@ impl SessionRuntime {
         self.last_attach_activity_at = None;
     }
 
+    pub fn input_needed(&self) -> bool {
+        matches!(self.meta.status, SessionStatus::Running)
+            && self.notified_output_epoch.is_some()
+            && self.notified_output_epoch == self.last_output_at
+    }
+
     /// Returns `true` when at least one attach subscriber is currently live.
     #[allow(dead_code)]
     pub fn has_active_attach_client(&self) -> bool {

@@ -11,7 +11,7 @@ use crate::{
     protocol::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
-    session::{StartSpec, logs::read_persisted_log_page},
+    session::{SessionStore, StartSpec, logs::read_persisted_log_page},
 };
 
 use super::{AppState, SessionEvent};
@@ -199,8 +199,7 @@ pub async fn list(
         }
     };
 
-    let mut store = state.store.lock().await;
-    let sessions = match store.list_summaries(&query).await {
+    let sessions = match state.store.list_summaries(&query).await {
         Ok(sessions) => sessions,
         Err(err) => {
             error!(%err, "failed to list sessions from store");
@@ -211,8 +210,6 @@ pub async fn list(
                 .into_response();
         }
     };
-    drop(store);
-
     Json(serde_json::json!({
         "items": sessions,
         "total": total,
@@ -297,16 +294,14 @@ pub async fn create(
         notifications_enabled: !body.disable_notifications,
     };
 
-    let result = {
-        let mut store = state.store.lock().await;
-        store
-            .start_session(&state.config, spec)
-            .await
-            .and_then(|id| {
-                let summary = store.get_summary(&id);
+    let result =
+        match SessionStore::start_session_via_handle(&state.store, &state.config, spec).await {
+            Ok(id) => {
+                let summary = state.store.get_summary(&id);
                 Ok((id, summary))
-            })
-    };
+            }
+            Err(err) => Err(err),
+        };
 
     match result {
         Ok((session_id, summary)) => {
@@ -468,9 +463,8 @@ pub async fn stop_session(
     }
 
     let (stopped, summary) = {
-        let mut store = state.store.lock().await;
-        let stopped = store.stop_session(&id, grace).await;
-        let summary = store.get_summary(&id);
+        let stopped = state.store.stop_session(&id, grace).await;
+        let summary = state.store.get_summary(&id);
         (stopped, summary)
     };
 
@@ -528,9 +522,8 @@ pub async fn kill_session(
     }
 
     let (killed, summary) = {
-        let mut store = state.store.lock().await;
-        let killed = store.kill_session(&id).await;
-        let summary = store.get_summary(&id);
+        let killed = state.store.kill_session(&id).await;
+        let summary = state.store.get_summary(&id);
         (killed, summary)
     };
 
@@ -590,8 +583,7 @@ pub async fn send_input(
         };
     }
 
-    let mut store = state.store.lock().await;
-    match store.attach_input(&id, &body.data).await {
+    match state.store.attach_input(&id, &body.data).await {
         Ok(()) => {
             debug!(session_id = %id, bytes = body.data.len(), "input forwarded");
             Json(serde_json::json!({ "ok": true })).into_response()
