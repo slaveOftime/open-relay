@@ -386,7 +386,7 @@ export default function SessionDetailPage() {
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => {})
+      .catch(() => { })
     return () => {
       isMounted.current = false
     }
@@ -507,7 +507,7 @@ export default function SessionDetailPage() {
             .then((s) => {
               if (isMounted.current) setSession(s)
             })
-            .catch(() => {})
+            .catch(() => { })
         },
         onError: (msg) => {
           lastWsFrameAtRef.current = Date.now()
@@ -653,9 +653,9 @@ export default function SessionDetailPage() {
           .then((s) => {
             if (isMounted.current) setSession(s)
           })
-          .catch(() => {})
+          .catch(() => { })
       })
-      .catch(() => {})
+      .catch(() => { })
 
     return () => {
       cancelled = true
@@ -755,21 +755,21 @@ export default function SessionDetailPage() {
 
   async function handleStop() {
     if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => {})
+    await stopSession(id, undefined, node ?? undefined).catch(() => { })
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => {})
+      .catch(() => { })
   }
   async function handleKill() {
     if (!id) return
-    await killSession(id, node ?? undefined).catch(() => {})
+    await killSession(id, node ?? undefined).catch(() => { })
     fetchSession(id, node ?? undefined)
       .then((s) => {
         if (isMounted.current) setSession(s)
       })
-      .catch(() => {})
+      .catch(() => { })
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -805,6 +805,28 @@ export default function SessionDetailPage() {
   // Unused var suppression
   void logLines
 
+  const attachedState =
+    <div className='flex items-center gap-2 opacity-60 text-xs'>
+      {mode === 'attach' &&
+        (wsConnected ? (
+          <>
+            <Link1Icon className="h-4 w-4" />
+            <span>Attached</span>
+            </>
+        ) : wsConnecting ? (
+          <>
+            <TrackNextIcon className="h-4 w-4" />
+              {wsEverConnected ? 'Reconnecting' : 'Connecting'}
+          </>
+        ) : (
+          <>
+            <CrossCircledIcon className="h-4 w-4" />
+            Disconnected
+          </>
+        ))}
+    </div>;
+
+
   return (
     <TooltipProvider>
       <div className="flex flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] h-full">
@@ -816,7 +838,7 @@ export default function SessionDetailPage() {
               <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
-          <div className="flex items-center gap-2 min-w-0 flex-1">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
             <span className="font-mono text-sm text-[hsl(var(--muted-foreground))] font-semibold truncate">
               {session?.id}
             </span>
@@ -826,25 +848,9 @@ export default function SessionDetailPage() {
                 {node}
               </Badge>
             )}
-            {mode === 'attach' &&
-              (wsConnected ? (
-                <Badge variant="attached" className="inline-flex font-light">
-                  <Link1Icon className="h-4 w-4" />
-                  <span className="hidden sm:inline">Attached</span>
-                </Badge>
-              ) : wsConnecting ? (
-                <Badge className="inline-flex font-light border-amber-400/40 bg-amber-400/10 text-amber-600 dark:text-amber-300 animate-pulse">
-                  <TrackNextIcon className="h-4 w-4" />
-                  <span className="hidden sm:inline">
-                    {wsEverConnected ? 'Reconnecting' : 'Connecting'}
-                  </span>
-                </Badge>
-              ) : (
-                <Badge className="inline-flex font-light border-red-400/40 bg-red-400/10 text-red-600 dark:text-red-300">
-                  <CrossCircledIcon className="h-4 w-4" />
-                  <span className="hidden sm:inline">Disconnected</span>
-                </Badge>
-              ))}
+            <div className='hidden sm:inline-block'>
+              {attachedState}
+            </div>
             {mode === 'attach' && !isOnline && (
               <Badge className="inline-flex font-light border-amber-400/40 bg-amber-400/10 text-amber-600 dark:text-amber-300">
                 <TrackNextIcon className="h-4 w-4" />
@@ -1009,7 +1015,7 @@ export default function SessionDetailPage() {
 
           {/* Terminal area */}
           <div
-            className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-40px)] sm:h-full'}`}
+            className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
           >
             <div
               ref={termContainerRef}
@@ -1117,9 +1123,14 @@ export default function SessionDetailPage() {
           </div>
 
           {mode === 'attach' && (
-            <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none">
-              <AttachPanel sendInput={sendInput} showKeyError={showKeyError} />
-            </div>
+            <>
+              <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none">
+                <AttachPanel sendInput={sendInput} showKeyError={showKeyError} />
+              </div>
+              <div className='sm:hidden flex items-center justify-center h-8'>
+                {attachedState}
+              </div>
+            </>
           )}
         </div>
 

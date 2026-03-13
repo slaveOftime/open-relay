@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { SendIcon } from 'lucide-react'
+import { ArrowLeftIcon, ArrowRightIcon, SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
 import {
   ArrowDownIcon,
@@ -252,6 +252,14 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
         <Button
           variant={'ghost'}
           className="text-[hsl(var(--primary))]"
+          onClick={() => handleSendKeySpec('left')}
+          aria-label="Left"
+        >
+          <ArrowLeftIcon className="w-6 h-6" />
+        </Button>
+        <Button
+          variant={'ghost'}
+          className="text-[hsl(var(--primary))]"
           onClick={() => handleSendKeySpec('up')}
           aria-label="Up"
         >
@@ -264,6 +272,14 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
           aria-label="Down"
         >
           <ArrowDownIcon className="w-6 h-6" />
+        </Button>
+        <Button
+          variant={'ghost'}
+          className="text-[hsl(var(--primary))]"
+          onClick={() => handleSendKeySpec('right')}
+          aria-label="Right"
+        >
+          <ArrowRightIcon className="w-6 h-6" />
         </Button>
         <Button
           variant={'ghost'}
