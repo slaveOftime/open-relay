@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use crossterm::{
     cursor,
@@ -60,6 +60,29 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
 
+    // When stdio is piped, interactive terminal control fails across platforms,
+    // so fall back to a plain stream replay instead of raw-mode attach.
+    if !can_use_interactive_terminal() {
+        write_bytes_to_stdout(&initial_data)?;
+
+        while running {
+            match ipc::read_response_from_reader(&mut reader).await? {
+                RpcResponse::AttachStreamChunk { data, .. } => write_bytes_to_stdout(&data)?,
+                RpcResponse::AttachModeChanged { .. } => {}
+                RpcResponse::AttachStreamDone { .. } => {
+                    running = false;
+                }
+                RpcResponse::Error { message } => {
+                    return Err(AppError::DaemonUnavailable(message));
+                }
+                _ => {}
+            }
+        }
+
+        println!("Session {id} has ended.");
+        return Ok(());
+    }
+
     let mut detached = false;
     let mut stream_error: Option<AppError> = None;
     {
@@ -87,12 +110,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         // processing is needed.  Writing raw bytes preserves all cursor-
         // positioning, color, and alternate-screen sequences that TUIs emit,
         // which is required for correct reattach rendering.
-        {
-            use std::io::Write;
-            let mut stdout = std::io::stdout();
-            stdout.write_all(&initial_data)?;
-            stdout.flush()?;
-        }
+        write_bytes_to_stdout(&initial_data)?;
 
         // `read_response_from_reader` uses `read_line`, which is not safe to
         // keep cancelling with timeouts. Read daemon frames in a dedicated task
@@ -190,9 +208,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 }
                 Ok(Some(Ok(RpcResponse::AttachStreamChunk { data, .. }))) => {
                     // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
-                    use std::io::Write;
-                    std::io::stdout().write_all(&data)?;
-                    std::io::stdout().flush()?;
+                    write_bytes_to_stdout(&data)?;
                 }
                 Ok(Some(Ok(RpcResponse::AttachModeChanged {
                     app_cursor_keys, ..
@@ -358,6 +374,17 @@ fn drain_pending_terminal_events() -> Result<()> {
     while event::poll(std::time::Duration::from_millis(0))? {
         let _ = event::read()?;
     }
+    Ok(())
+}
+
+fn can_use_interactive_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout();
+    stdout.write_all(data)?;
+    stdout.flush()?;
     Ok(())
 }
 
