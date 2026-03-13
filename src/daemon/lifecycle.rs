@@ -233,6 +233,23 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u
         // CREATE_NEW_PROCESS_GROUP (0x00000200): own signal group, won't receive Ctrl+C/Break from parent
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
+    // On Unix the child must start a new session so it is not killed by SIGHUP
+    // when the launching terminal closes.  This mirrors the Windows
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP flags above.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Safety: setsid() is async-signal-safe (POSIX.1-2008).
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                unsafe { setsid() };
+                Ok(())
+            });
+        }
+    }
     cmd.spawn()?;
     Ok(())
 }
@@ -306,6 +323,14 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         let count = join_handles.lock().await.len();
         info!(count, "join connectors initialized");
     }
+
+    // Remove any stale socket file left by a crashed daemon.  On macOS (and
+    // other platforms without abstract-namespace sockets) the file-based Unix
+    // domain socket persists on disk after an unclean exit.  Binding to an
+    // existing socket file fails with EADDRINUSE, which silently prevents the
+    // daemon from starting and makes the parent `wait_for_daemon_ready` loop
+    // appear to hang.
+    storage::remove_file_if_exists(&config.socket_file)?;
 
     let listener = ipc::bind(&config)?;
     info!(socket_file = ?config.socket_file, "ipc listener bound");
