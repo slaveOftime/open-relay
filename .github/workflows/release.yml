@@ -42,6 +42,23 @@ jobs:
         with:
           node-version: 22
 
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $version = $env:VERSION -replace '^v', ''
+          $cargoToml = 'Cargo.toml'
+          $content = Get-Content $cargoToml -Raw
+          $updated = [regex]::Replace($content, '(?m)^version = "[^"]+"', "version = `"$version`"", 1)
+
+          if ($updated -eq $content) {
+            throw "Failed to update Cargo.toml version from tag $version"
+          }
+
+          Set-Content $cargoToml $updated -NoNewline
+
       # - name: Test
       #   run: cargo test --target ${{ matrix.target }}
         
