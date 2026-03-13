@@ -11,7 +11,9 @@ use crate::{
 pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<String>) -> Result<()> {
     use std::io::IsTerminal;
 
-    let id = send_args.id;
+    let id = send_args
+        .id
+        .expect("session ID must be resolved before run_send");
     let has_chunks = !send_args.chunks.is_empty();
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
