@@ -56,6 +56,13 @@ pub async fn start(
     no_http: bool,
     auth_hash_internal: Option<String>,
 ) -> Result<()> {
+    if matches!(
+        ipc::send_request(&config, RpcRequest::Health).await,
+        Ok(RpcResponse::Health { .. })
+    ) {
+        return Err(AppError::DaemonAlreadyRunning);
+    }
+
     let auth_hash: Option<String> = if foreground_internal {
         auth_hash_internal
     } else if !no_http {
