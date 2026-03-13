@@ -82,8 +82,8 @@ pub async fn start(
     run_foreground(config, auth_hash, no_http).await
 }
 
-pub async fn stop(config: AppConfig) -> Result<()> {
-    match ipc::send_request(&config, RpcRequest::DaemonStop).await? {
+pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
+    match ipc::send_request(&config, RpcRequest::DaemonStop { grace_seconds }).await? {
         RpcResponse::DaemonStop { stopped } => {
             if !stopped {
                 eprintln!(

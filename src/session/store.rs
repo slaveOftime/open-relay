@@ -6,8 +6,9 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
+use futures_util::future::join_all;
 use tokio::sync::broadcast;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     config::AppConfig,
@@ -22,6 +23,14 @@ use super::{
     persist::{append_event, append_resize_event, current_output_offset, format_age},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
+
+#[cfg(target_os = "windows")]
+const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']];
+
+#[cfg(not(target_os = "windows"))]
+const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
+
+const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct SessionStore {
     sessions: HashMap<String, Arc<Mutex<SessionRuntime>>>,
@@ -422,61 +431,183 @@ impl SessionStore {
         self.prune_evicted_sessions().await;
 
         let Some(runtime) = self.sessions.get(id).cloned() else {
+            debug!(
+                session_id = id,
+                requested_final_status = requested_final_status.as_str(),
+                "terminate session lookup missed"
+            );
             return false;
         };
 
-        // Send Ctrl-C and mark as stopping.
+        Self::terminate_runtime(
+            id.to_string(),
+            runtime,
+            grace_seconds,
+            requested_final_status,
+        )
+        .await
+    }
+
+    async fn terminate_runtime(
+        session_id: String,
+        runtime: Arc<Mutex<SessionRuntime>>,
+        grace_seconds: u64,
+        requested_final_status: SessionStatus,
+    ) -> bool {
+        let grace = Duration::from_secs(grace_seconds);
+        let start = Instant::now();
+        let deadline = start + grace;
+        let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
+        let mut next_soft_stop_index = 0usize;
+        debug!(
+            session_id = %session_id,
+            requested_final_status = requested_final_status.as_str(),
+            grace_seconds,
+            soft_stop_attempts = soft_stop_schedule.len(),
+            "session termination requested"
+        );
+
+        // Begin a soft-stop sequence and let the child exit on its own before
+        // escalating to a forced kill when the grace window expires.
         {
             let Ok(mut rt) = runtime.lock() else {
+                warn!(
+                    session_id = %session_id,
+                    "failed to lock session runtime before termination"
+                );
                 return false;
             };
             if rt.refresh_status() {
+                debug!(
+                    session_id = %session_id,
+                    status = rt.meta.status.as_str(),
+                    exit_code = ?rt.meta.exit_code,
+                    "session already completed before termination started"
+                );
                 return true;
             }
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
-            if matches!(requested_final_status, SessionStatus::Stopped) {
-                let _ = rt.pty.write_input(vec![0x03]);
+            if let Some((_, input)) = soft_stop_schedule.first() {
+                let _ = rt.pty.write_input((*input).to_vec());
+                debug!(
+                    session_id = %session_id,
+                    stage = 1,
+                    total_stages = soft_stop_schedule.len(),
+                    bytes = input.len(),
+                    "sent soft-stop input"
+                );
+                next_soft_stop_index = 1;
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(grace_seconds);
         while Instant::now() < deadline {
             {
                 let Ok(mut rt) = runtime.lock() else {
+                    warn!(
+                        session_id = %session_id,
+                        "failed to lock session runtime while waiting for termination"
+                    );
                     return true;
                 };
                 if rt.refresh_status() {
+                    debug!(
+                        session_id = %session_id,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        status = rt.meta.status.as_str(),
+                        exit_code = ?rt.meta.exit_code,
+                        "session exited during grace window"
+                    );
                     return true;
                 }
+                while let Some((_, input)) = soft_stop_schedule.get(next_soft_stop_index) {
+                    if Instant::now() < soft_stop_schedule[next_soft_stop_index].0 {
+                        break;
+                    }
+                    let _ = rt.pty.write_input((*input).to_vec());
+                    debug!(
+                        session_id = %session_id,
+                        stage = next_soft_stop_index + 1,
+                        total_stages = soft_stop_schedule.len(),
+                        bytes = input.len(),
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "sent staged soft-stop input"
+                    );
+                    next_soft_stop_index += 1;
+                }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
         let Ok(mut rt) = runtime.lock() else {
+            warn!(
+                session_id = %session_id,
+                "failed to lock session runtime before forced termination"
+            );
             return false;
         };
         if rt.refresh_status() {
+            info!(
+                session_id = %session_id,
+                elapsed_ms = start.elapsed().as_millis(),
+                status = rt.meta.status.as_str(),
+                exit_code = ?rt.meta.exit_code,
+                "session exited at grace deadline"
+            );
             return true;
         }
+        debug!(
+            session_id = %session_id,
+            requested_final_status = requested_final_status.as_str(),
+            grace_seconds,
+            "session did not stop within grace window; forcing termination"
+        );
         if rt.pty.kill().is_ok() {
             let _ = rt.refresh_status();
+            info!(
+                session_id = %session_id,
+                status = rt.meta.status.as_str(),
+                exit_code = ?rt.meta.exit_code,
+                "forced termination completed"
+            );
             true
         } else {
+            warn!(
+                session_id = %session_id,
+                "failed to force terminate session process"
+            );
             false
         }
     }
 
     pub async fn stop_all_sessions(&mut self, grace_seconds: u64) -> bool {
         self.prune_evicted_sessions().await;
-        let ids: Vec<String> = self.sessions.keys().cloned().collect();
-        let mut all_stopped = true;
-        for id in ids {
-            if !self.stop_session(&id, grace_seconds).await {
-                all_stopped = false;
-            }
-        }
-        all_stopped
+
+        let runtimes: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|(id, runtime)| (id.clone(), runtime.clone()))
+            .collect();
+
+        info!(
+            session_count = runtimes.len(),
+            grace_seconds, "stopping all sessions"
+        );
+
+        let results = join_all(runtimes.into_iter().map(|(session_id, runtime)| {
+            Self::terminate_runtime(session_id, runtime, grace_seconds, SessionStatus::Stopped)
+        }))
+        .await;
+
+        let stopped_count = results.iter().filter(|stopped| **stopped).count();
+
+        info!(
+            stopped_count,
+            total_sessions = results.len(),
+            grace_seconds,
+            "completed stop-all session termination pass"
+        );
+        results.into_iter().all(|stopped| stopped)
     }
 
     pub async fn logs_snapshot(
@@ -673,6 +804,30 @@ impl SessionStore {
             }
         }
     }
+}
+
+fn build_soft_stop_schedule(
+    start: Instant,
+    grace: Duration,
+    requested_final_status: SessionStatus,
+) -> Vec<(Instant, &'static [u8])> {
+    if !matches!(requested_final_status, SessionStatus::Stopped) {
+        return Vec::new();
+    }
+
+    let stage_count = SOFT_STOP_INPUTS.len();
+    SOFT_STOP_INPUTS
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            let offset_millis = if index == 0 || grace.is_zero() {
+                0
+            } else {
+                ((grace.as_millis() * index as u128) / stage_count as u128) as u64
+            };
+            (start + Duration::from_millis(offset_millis), *input)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1128,6 +1283,16 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+        vec![vec![0x03], vec![0x03], vec![0x1a, b'\r']]
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+        vec![vec![0x03], vec![0x03], vec![0x04]]
+    }
+
     #[tokio::test]
     async fn test_start_session_enforces_limit() {
         let config = make_test_config(1);
@@ -1318,6 +1483,43 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "completed sessions should not receive synthetic input during kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stop_session_uses_staged_soft_shutdown_inputs() {
+        let (rt, mut writer_rx) = make_runtime_writable("stp0002", SessionStatus::Running);
+        let mut store = store_with(vec![rt], make_test_db().await);
+
+        assert!(
+            store.stop_session("stp0002", 1).await,
+            "running session should be stoppable"
+        );
+
+        let mut writes = Vec::new();
+        while let Ok(bytes) = writer_rx.try_recv() {
+            writes.push(bytes);
+        }
+
+        assert_eq!(writes, expected_soft_stop_inputs());
+    }
+
+    #[tokio::test]
+    async fn test_stop_all_sessions_runs_in_parallel() {
+        let (rt1, _writer_rx1) = make_runtime_writable("stp1001", SessionStatus::Running);
+        let (rt2, _writer_rx2) = make_runtime_writable("stp1002", SessionStatus::Running);
+        let (rt3, _writer_rx3) = make_runtime_writable("stp1003", SessionStatus::Running);
+        let mut store = store_with(vec![rt1, rt2, rt3], make_test_db().await);
+
+        let started = Instant::now();
+        assert!(
+            store.stop_all_sessions(1).await,
+            "all running sessions should be stoppable"
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_millis(2_500),
+            "stop_all_sessions should stop multiple sessions concurrently"
         );
     }
 
