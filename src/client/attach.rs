@@ -155,7 +155,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             &mut write_half,
                             RpcRequest::AttachInput {
                                 id: id_owned.clone(),
-                                data: wrap_paste_input(&data, child_bracketed_paste_mode),
+                                data: wrap_paste_input(data, child_bracketed_paste_mode),
                             },
                         )
                         .await?
@@ -399,11 +399,11 @@ fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn wrap_paste_input(data: &str, bracketed_paste_mode: bool) -> String {
+fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
     if bracketed_paste_mode {
         format!("\x1b[200~{data}\x1b[201~")
     } else {
-        data.to_string()
+        data
     }
 }
 
@@ -533,13 +533,16 @@ mod tests {
 
     #[test]
     fn test_wrap_paste_input_passthrough_when_bracketed_paste_is_disabled() {
-        assert_eq!(wrap_paste_input("hello\nworld", false), "hello\nworld");
+        assert_eq!(
+            wrap_paste_input("hello\nworld".to_string(), false),
+            "hello\nworld"
+        );
     }
 
     #[test]
     fn test_wrap_paste_input_wraps_when_bracketed_paste_is_enabled() {
         assert_eq!(
-            wrap_paste_input("hello\nworld", true),
+            wrap_paste_input("hello\nworld".to_string(), true),
             "\x1b[200~hello\nworld\x1b[201~"
         );
     }
