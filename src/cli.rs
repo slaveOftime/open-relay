@@ -161,8 +161,8 @@ pub struct StartArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
-    /// Session ID to stop.
-    pub id: String,
+    /// Session ID to stop. If omitted, uses the most recently created session.
+    pub id: Option<String>,
     /// Seconds to wait for clean exit before forcibly killing.
     #[arg(long, default_value_t = 5)]
     pub grace: u64,
@@ -173,8 +173,8 @@ pub struct StopArgs {
 
 #[derive(Debug, Args)]
 pub struct AttachArgs {
-    /// Session ID to attach to.
-    pub id: String,
+    /// Session ID to attach to. If omitted, uses the most recently created session.
+    pub id: Option<String>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
@@ -182,8 +182,8 @@ pub struct AttachArgs {
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    /// Session ID to show logs for.
-    pub id: String,
+    /// Session ID to show logs for. If omitted, uses the most recently created session.
+    pub id: Option<String>,
     /// Number of recent lines to display.
     #[arg(long, default_value_t = 40)]
     pub tail: usize,
@@ -206,8 +206,8 @@ pub struct LogsArgs {
 
 #[derive(Debug, Args)]
 pub struct SendArgs {
-    /// Session ID to send input to.
-    pub id: String,
+    /// Session ID to send input to. If omitted, uses the most recently created session.
+    pub id: Option<String>,
     /// Input chunks, processed left to right. Plain text is sent literally.
     /// Prefix with key: for special keys, e.g. key:enter, key:ctrl+c, key:up.
     /// Supported keys: enter, tab, esc, backspace, up/down/left/right, home/end,

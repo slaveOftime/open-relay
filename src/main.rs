@@ -17,7 +17,7 @@ use clap::Parser;
 use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand};
 use crossterm::terminal;
 use error::{AppError, Result};
-use protocol::{RpcRequest, RpcResponse};
+use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
 
 use crate::config::AppConfig;
 
@@ -46,6 +46,50 @@ fn node_wrap(node: Option<String>, req: RpcRequest) -> RpcRequest {
             node: name,
             inner: Box::new(req),
         },
+    }
+}
+
+/// Resolve a session ID: return the given ID or fetch the most recently created session.
+async fn resolve_session_id(
+    config: &AppConfig,
+    id: Option<String>,
+    node: Option<&String>,
+) -> Result<String> {
+    if let Some(id) = id {
+        return Ok(id);
+    }
+
+    let query = ListQuery {
+        search: None,
+        statuses: vec![],
+        since: None,
+        until: None,
+        limit: 1,
+        offset: 0,
+        sort: ListSortField::CreatedAt,
+        order: SortOrder::Desc,
+    };
+    let inner = RpcRequest::List { query };
+    let request = match node {
+        Some(name) => RpcRequest::NodeProxy {
+            node: name.clone(),
+            inner: Box::new(inner),
+        },
+        None => inner,
+    };
+
+    match ipc::send_request(config, request).await? {
+        RpcResponse::List { sessions, .. } => {
+            if let Some(session) = sessions.into_iter().next() {
+                Ok(session.id)
+            } else {
+                Err(AppError::Protocol(
+                    "no sessions found; start one with: oly start --detach <cmd>".to_string(),
+                ))
+            }
+        }
+        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
+        _ => Err(AppError::Protocol("unexpected response type".to_string())),
     }
 }
 
@@ -132,7 +176,8 @@ async fn run() -> Result<()> {
         }
 
         Commands::Stop(stop_args) => {
-            let id = stop_args.id.clone();
+            let id =
+                resolve_session_id(&config, stop_args.id.clone(), stop_args.node.as_ref()).await?;
             let inner = RpcRequest::Stop {
                 id: id.clone(),
                 grace_seconds: stop_args.grace,
@@ -148,19 +193,22 @@ async fn run() -> Result<()> {
         }
 
         Commands::Attach(attach_args) => {
+            let id = resolve_session_id(&config, attach_args.id.clone(), attach_args.node.as_ref())
+                .await?;
             if attach_args.node.is_some() {
-                // Remote attach: proxy the snapshot/poll/input/resize RPCs.
-                client::run_attach_node(&config, &attach_args.id, attach_args.node).await
+                client::run_attach_node(&config, &id, attach_args.node).await
             } else {
-                client::run_attach(&config, &attach_args.id).await
+                client::run_attach(&config, &id).await
             }
         }
 
         Commands::Logs(logs_args) => {
+            let id =
+                resolve_session_id(&config, logs_args.id.clone(), logs_args.node.as_ref()).await?;
             let node = logs_args.node.clone();
             client::run_logs(
                 &config,
-                &logs_args.id,
+                &id,
                 logs_args.tail,
                 logs_args.keep_color,
                 logs_args.no_truncate,
@@ -172,7 +220,13 @@ async fn run() -> Result<()> {
         }
 
         Commands::Send(send_args) => {
+            let id =
+                resolve_session_id(&config, send_args.id.clone(), send_args.node.as_ref()).await?;
             let node = send_args.node.clone();
+            let send_args = cli::SendArgs {
+                id: Some(id),
+                ..send_args
+            };
             client::run_send(&config, send_args, node).await
         }
 
