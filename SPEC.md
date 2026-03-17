@@ -16,7 +16,7 @@
 
 - Traditional multiplexers (`tmux`, `zellij`) provide persistence/windowing but are terminal-state blind for agent runtime intent.
 - Agent IDE hooks can react to events, but typically lack a cross-platform, durable daemon process that standardizes long-running supervision.
-- `oly` targets the gap: persistent PTY execution + explicit intervention channels (`attach`, `input`, notification) with auditable lifecycle state.
+- `oly` targets the gap: persistent PTY execution + explicit intervention channels (`attach`, `send`, notification) with auditable lifecycle state.
 
 ### 1.2 Target User
 

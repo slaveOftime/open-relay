@@ -11,7 +11,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::session::mode_tracker::ModeSnapshot;
-use crate::session::pty::EscapeFilter;
+use crate::session::pty::{EscapeFilter, collect_filtered_chunks};
+use crate::session::resize::ResizeSubscriber;
 
 use super::AppState;
 
@@ -49,6 +50,11 @@ enum ServerMessage {
         app_cursor_keys: bool,
         #[serde(rename = "bracketedPasteMode")]
         bracketed_paste_mode: bool,
+    },
+    /// Another attached client resized the PTY.
+    Resized {
+        rows: u16,
+        cols: u16,
     },
     /// Session ended.
     SessionEnded {
@@ -91,14 +97,6 @@ async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
             false
         }
     }
-}
-
-fn collect_filtered_chunks(chunks: &[(u64, bytes::Bytes)], filter: &mut EscapeFilter) -> Vec<u8> {
-    let mut filtered = Vec::with_capacity(chunks.iter().map(|(_, chunk)| chunk.len()).sum());
-    for (_, chunk) in chunks {
-        filtered.extend(filter.filter(chunk));
-    }
-    filtered
 }
 
 async fn handle_ws(
@@ -167,6 +165,11 @@ async fn handle_ws_streaming(
     }
 
     state.store.register_attach_client(&id).await;
+
+    // Subscribe to resize broadcasts so we can notify this client when
+    // another attached client changes the PTY size.
+    let mut resize_sub = ResizeSubscriber::new(state.store.subscribe_resize(&id), id.clone());
+
     debug!(
         session_id = %id,
         replay_chunks = replay_chunks.len(),
@@ -180,6 +183,7 @@ async fn handle_ws_streaming(
     // Resize PTY to browser dimensions AFTER init is sent.
     if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
         if rows > 0 && cols > 0 {
+            resize_sub.mark_sent(rows, cols);
             match state.store.attach_resize(&id, rows, cols).await {
                 Ok(()) => debug!(session_id = %id, rows, cols, "PTY resized after WS init"),
                 Err(err) => {
@@ -362,6 +366,7 @@ async fn handle_ws_streaming(
                             }
                             Ok(ClientMessage::Resize { rows, cols }) => {
                                 debug!(session_id = %id, rows, cols, "WS resize received");
+                                resize_sub.mark_sent(rows, cols);
                                 if let Err(err) = state.store.attach_resize(&id, rows, cols).await {
                                     let _ = send_json(&mut socket, &ServerMessage::Error {
                                         message: err.message(&id),
@@ -390,6 +395,19 @@ async fn handle_ws_streaming(
                         return;
                     }
                     _ => {}
+                }
+            }
+
+            // Resize notifications from other attached clients.
+            Some((rows, cols)) = resize_sub.recv_foreign() => {
+                debug!(
+                    session_id = %id,
+                    rows, cols,
+                    "forwarding resize notification to local WebSocket client"
+                );
+                if !send_json(&mut socket, &ServerMessage::Resized { rows, cols }).await {
+                    let _ = state.store.attach_detach(&id).await;
+                    return;
                 }
             }
         }
@@ -513,6 +531,18 @@ async fn handle_ws_proxied_streaming(
                                 let _ = send_json(&mut socket, &ServerMessage::ModeChanged {
                                     app_cursor_keys,
                                     bracketed_paste_mode,
+                                }).await;
+                            }
+                            RpcResponse::AttachResized { rows, cols } => {
+                                debug!(
+                                    session_id = %id,
+                                    node = %node,
+                                    rows, cols,
+                                    "proxied WebSocket resize notification received"
+                                );
+                                let _ = send_json(&mut socket, &ServerMessage::Resized {
+                                    rows,
+                                    cols,
                                 }).await;
                             }
                             RpcResponse::AttachStreamDone { exit_code } => {

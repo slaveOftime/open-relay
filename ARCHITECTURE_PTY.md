@@ -30,10 +30,10 @@
 
 ## 1) Design Philosophy
 
-Open Relay manages PTY sessions as a **daemon-side resource** (inspired by
-tmux's server model) but differs in a key way: we are a **CLI proxy**, not a
-terminal multiplexer.  The client is a regular terminal emulator — we never
-render cells, track cursor position, or maintain a screen buffer.
+Open Relay manages PTY sessions as a **daemon-side resource**.  The client is
+a regular terminal emulator — we never render cells or maintain a screen
+buffer.  We only keep lightweight byte-level mode state and enough
+cursor-position state to answer shared terminal queries.
 
 Design principles:
 
@@ -46,25 +46,19 @@ Design principles:
 | **Cross-chunk correctness** | All parsers carry state across read boundaries |
 | **Blocking I/O for PTY** | Dedicated OS threads avoid Tokio executor starvation |
 
-### tmux Influence
+### Architectural Choices
 
-We adopt several patterns from tmux's server-side session management:
-
-- **Event-driven I/O**: tmux uses libevent for non-blocking PTY I/O; we use
-  `std::thread` + `tokio::sync::broadcast` for the same decoupling.
-- **Reference counting**: tmux uses `session_add_ref/remove_ref`; we track
-  attach presence in `SessionStore` and defer cleanup.
-- **Deferred destruction**: tmux marks panes as exited but delays cleanup
-  (remain-on-exit); we keep the ring buffer available after child exit.
-- **Smallest-client-size rule**: tmux resizes to the smallest attached client;
-  we document this as the recommended multi-client resize strategy (§11).
-- **Signal discipline**: tmux blocks signals during fork with `sigprocmask`;
-  `portable_pty` handles this internally.
-
-We deliberately **do not** adopt:
-- Screen buffer / cell grid (we stream raw bytes)
-- Window/pane layout management (single session per PTY)
-- Client-side terminal rendering (the user's terminal handles it)
+- **Event-driven I/O**: PTY reads and writes are decoupled from attach clients
+  using dedicated OS threads plus Tokio broadcast channels.
+- **Attach tracking**: `SessionStore` tracks live attach presence separately
+  from PTY lifetime so clients can disconnect and reconnect without killing the
+  session.
+- **Deferred cleanup**: completed sessions keep their ring buffer and persisted
+  output available until eviction.
+- **Single shared PTY size**: the PTY adopts the most recent successful resize
+  request; per-client size aggregation remains future work.
+- **Platform-safe child startup**: `portable_pty` handles the platform-specific
+  PTY setup and child-spawn details for us.
 
 ---
 
@@ -130,9 +124,13 @@ src/session/
 ├── mode_tracker.rs     Byte-level DEC private mode state machine
 │   ├── ModeTracker     Parser state machine
 │   └── ModeSnapshot    Current mode values
+├── resize.rs           Resize broadcast helper for attach handlers
+│   └── ResizeSubscriber  Self-echo suppression for resize notifications
 ├── runtime.rs          SessionRuntime (ring + broadcast + pty + meta)
 │   ├── spawn_session() PTY spawn + thread creation
-│   └── push_raw()      Ring write + mode tracking + persistence
+│   ├── push_raw()      Ring write + mode tracking + persistence
+│   ├── resize_tx       Broadcast channel for resize notifications
+│   └── pty_size        Current PTY dimensions for dedupe + CPR sync
 ├── store.rs            SessionStore (session registry, attach/detach/resize)
 ├── ring.rs             Fixed-capacity byte ring buffer
 └── persist.rs          Disk persistence (append-only log)
@@ -157,8 +155,8 @@ pub struct PtyHandle {
 
 | Method | Behaviour | Failure mode |
 |---|---|---|
-| `write_input(data)` | Non-blocking channel send to writer thread | Returns `false` if channel closed |
-| `resize(rows, cols)` | `pty_master.resize()` → SIGWINCH / ConPTY resize | Returns `false` if master dropped |
+| `try_write_input(data)` | Non-blocking channel send to writer thread | `TrySendError::Full` / `TrySendError::Closed` |
+| `resize(rows, cols)` | `pty_master.resize()` → SIGWINCH / ConPTY resize | Returns `false` if master is unavailable or resize fails |
 | `kill()` | SIGKILL (POSIX) / TerminateProcess (Windows) | `io::Error` |
 | `try_wait()` | Non-blocking `waitpid(WNOHANG)` / `WaitForSingleObject(0)` | `io::Error` |
 | `process_id()` | Child PID (if available) | `None` on some platforms |
@@ -182,8 +180,8 @@ std::thread::spawn("pty-reader-{id}") {
         let n = master_reader.read(&mut buf[..4096]);
         if n == 0 || n == Err(_) → break;
 
-        // 1. Answer terminal queries when no client is attached
-        for resp in extract_query_responses_no_client(&buf, &mut tail) {
+        // 1. Answer shared terminal queries before fan-out
+        for resp in extract_query_responses_no_client(&buf, &mut tail, cursor_tracker.position()) {
             writer_tx.send(resp);  // Write response back to PTY stdin
         }
 
@@ -212,6 +210,11 @@ std::thread::spawn("pty-writer-{id}") {
 Input sources: IPC `AttachInput`, HTTP `POST /sessions/:id/input`, WebSocket
 `input` message.  All go through `SessionStore::attach_input()` which applies
 DECCKM arrow-key transformation before sending to the writer channel.
+
+The reader answers terminal capability probes centrally before bytes are fanned
+out to attach clients.  This keeps detached sessions progressing, and it avoids
+leaking probes such as CPR/DSR/DA/DECRPM to the real terminal attached to an
+IPC or WebSocket client.
 
 ---
 
@@ -298,9 +301,11 @@ PTY master fd
     │
     ▼
 ┌─────────────────────────────┐
-│ extract_query_responses()   │  Answers CPR/DSR/OSC queries
+│ extract_query_responses_    │  Answers shared terminal queries
+│ no_client()                 │  (CPR/DSR/OSC/DA/XTVERSION/etc.)
 │                             │  Writes responses back to PTY stdin
-│ (only when no client)       │  Prevents child apps from blocking
+│                             │  Prevents detached apps from blocking and
+│                             │  keeps attach clients from answering locally
 └─────────────┬───────────────┘
               │
               ▼
@@ -336,6 +341,9 @@ Patterns stripped:
   terminals from generating their own CPR responses, which would corrupt
   the child process's stdin via the attach input path)
 - **Bare DSR queries**: `[5n`, `[6n` (ESC dropped by ConPTY)
+- **Private-mode probes**: `\x1b[?<mode>n`, `\x1b[?<mode>$p`
+- **Version / attribute probes**: DA1, DA2, XTVERSION, kitty keyboard queries
+- **Window-size probes**: `\x1b[14t` ... `\x1b[19t`
 - **OSC 10/11 color responses**: `\x1b]10;rgb:xxxx/xxxx/xxxx\x07`
 - **Generic OSC**: `\x1b]<num>;<payload>\x07` (e.g., shell CWD updates)
 
@@ -352,18 +360,27 @@ otherwise appear as garbage characters in the log output.
 
 ### Query Response Generation
 
-When no client is attached, terminal query sequences in the PTY output must
-still be answered.  `extract_query_responses_no_client()` scans output for:
+Before PTY bytes are fanned out to attach clients, the daemon scans the stream
+for terminal capability probes and answers the ones that need a shared,
+session-global reply.  This keeps detached applications moving forward and
+prevents attached clients from delegating those probes to the user's real
+terminal.  `extract_query_responses_no_client()` currently handles:
 
 | Query | Sequence | Response |
 |---|---|---|
-| Cursor Position Report | `\x1b[6n` | `\x1b[1;1R` |
+| Cursor Position Report | `\x1b[6n` | `\x1b[<row>;<col>R` from `CursorTracker` |
 | Device Status Report | `\x1b[5n` | `\x1b[0n` |
 | Foreground color | `\x1b]10;?\x07` | `\x1b]10;rgb:xxxx/xxxx/xxxx\x1b\\` |
 | Background color | `\x1b]11;?\x07` | `\x1b]11;rgb:xxxx/xxxx/xxxx\x1b\\` |
+| Primary device attributes | `\x1b[c` / `\x1b[0c` | `\x1b[?62;c` |
+| Secondary device attributes | `\x1b[>c` / `\x1b[>0c` | `\x1b[>1;0;0c` |
+| XTVERSION | `\x1b[>0q` | `\x1bP>|oly <version>\x1b\\` |
+| DECRPM | `\x1b[?<mode>$p` | `\x1b[?<mode>;2$y` |
+| Kitty keyboard query | `\x1b[?u` | `\x1b[?0u` |
 
 Color responses use `COLORFGBG` env var if set, otherwise default to
-white-on-black.
+white-on-black.  Window-size-in-pixels probes are filtered out on the attach
+path but are not answered by the daemon today.
 
 ---
 
@@ -379,6 +396,7 @@ protocol.  This was unified from separate polling/streaming implementations.
 | `AttachStreamInit` | Server → Client | Ring buffer replay + initial mode state |
 | `AttachStreamChunk` | Server → Client | Incremental PTY output (filtered) |
 | `AttachModeChanged` | Server → Client | Terminal mode transition notification |
+| `AttachResized` | Server → Client | PTY resized by another attached client |
 | `AttachStreamDone` | Server → Client | Session ended (with exit code) |
 | `AttachInput` | Client → Server | Keyboard/paste input |
 | `AttachResize` | Client → Server | Terminal size change |
@@ -398,6 +416,7 @@ CLI                              Daemon
  │──AttachInput────────────────────►│  (keyboard input)
  │──AttachResize───────────────────►│  (terminal resize)
  │◄──AttachModeChanged─────────────│  (DECCKM toggled)
+ │◄──AttachResized─────────────────│  (another client resized the PTY)
  │◄──AttachStreamChunk─────────────│
  │                                  │  child exits
  │◄──AttachStreamDone──────────────│  (exit code)
@@ -412,6 +431,7 @@ WebSocket uses JSON messages with a `type` field:
 {"type": "init", "data": "<base64>", "appCursorKeys": false, "bracketedPasteMode": false}
 {"type": "data", "data": "<base64>"}
 {"type": "mode_changed", "appCursorKeys": true, "bracketedPasteMode": false}
+{"type": "resized", "rows": 24, "cols": 80}
 {"type": "session_ended", "exit_code": 0}
 
 // Client → Server
@@ -431,13 +451,27 @@ achieved through the `broadcast::channel`:
 broadcast_tx ──► broadcast_rx_1 (IPC client 1)
               ├► broadcast_rx_2 (WebSocket client)
               └► broadcast_rx_3 (node-proxied client)
+
+resize_tx   ──► resize_rx_1 (IPC client 1)
+              ├► resize_rx_2 (WebSocket client)
+              └► resize_rx_3 (node-proxied client)
 ```
 
 ### Shared Input
 
 All attached clients write to the same PTY stdin.  Input is **not** isolated —
-keystrokes from any client are interleaved.  This is intentional (same as tmux
-shared sessions).
+keystrokes from any client are interleaved.  This is intentional: attached
+clients share a single PTY input stream.
+
+### Resize Broadcast
+
+When any attached client resizes the PTY, the new dimensions are broadcast to
+all *other* attached clients via a dedicated `resize_tx` broadcast channel.
+Each attach handler wraps that receiver in `ResizeSubscriber`, which tracks the
+last resize it sent (`last_self_resize`) and suppresses the matching echo so
+the originating client never receives its own resize back.  Redundant resizes
+(same rows × cols as the current PTY size) are skipped at the
+`SessionRuntime` level.
 
 ### Broadcast Lag Recovery
 
@@ -451,9 +485,9 @@ returned.  The handler re-syncs by:
 
 `SessionStore` tracks whether any client is currently attached.  This is used
 for:
-- Query response routing (daemon answers queries when no client is attached)
+- Attach accounting / idle tracking
+- Distinguishing detached automation from live interactive viewing
 - Notification suppression (no "session ended" push if client is watching)
-- Idle detection
 
 ---
 
@@ -461,36 +495,50 @@ for:
 
 ### Ordering Constraint
 
-Resize must happen **after** the initial ring-buffer replay has been sent to
-the client.  Otherwise:
+Attach-driven resize is sequenced **after** the init frame is produced:
 
-1. Client attaches, receives ring replay (old terminal size)
-2. Resize sent immediately → child redraws at new size
-3. Client processes replay, then sees the full redraw → flicker/blank
+1. `attach_subscribe_init()` snapshots replay bytes + live receivers
+2. Server sends `AttachStreamInit`
+3. Server registers attach presence and subscribes to resize broadcasts
+4. The attach path applies its initial size, if it has one
 
-Correct order:
-1. `attach_subscribe_init()` → send `AttachStreamInit` with replay
-2. Client renders replay
-3. Send `AttachResize` → child redraws at correct size
+Current attach paths differ slightly:
+
+- **WebSocket**: browser dimensions are supplied up front, so the daemon sends
+  `init`, registers the client, creates `ResizeSubscriber`, and then applies
+  the initial resize on the server side.
+- **IPC / CLI**: the daemon sends `AttachStreamInit` first, then the interactive
+  CLI immediately follows with `AttachResize` using the local terminal size.
+  The daemon does not auto-resize IPC attaches by itself.
 
 ### Multi-Client Resize Strategy
 
-When multiple clients are attached with different terminal sizes, the
-recommended strategy is **smallest-client-size wins** (following tmux):
+The effective strategy is **last successful resize wins**.  Newly attached
+interactive clients usually become the current winner because they send an
+initial `AttachResize` immediately after `AttachStreamInit`, and later resize
+events from any client overwrite the PTY size again.  Every successful resize
+emits an `AttachResized` notification to the other attached clients.
 
-- Track each client's reported size
-- Resize PTY to `min(rows)` × `min(cols)` across all attached clients
-- Larger clients see blank padding; smaller clients render correctly
+The PTY tracks its current dimensions in `SessionRuntime::pty_size`.  Resize
+requests that match the current size are no-ops — neither the PTY nor other
+clients are notified.
 
-Currently, the last resize wins (no size aggregation).  This is documented
-as a known limitation.
+### CursorTracker Synchronization
+
+The PTY reader thread maintains a `CursorTracker` for generating CPR responses.
+After each read is pushed into the runtime, the reader briefly locks
+`SessionRuntime` and syncs the tracker's dimensions from
+`SessionRuntime::pty_size` via `set_size()`.  That keeps subsequent CPR
+responses aligned with the latest successful PTY resize, including resizes that
+originated from another attached client.
 
 ### Race Condition: Rapid Resize
 
 If a client sends multiple resize events in quick succession (e.g., during
 window drag), each triggers a `SIGWINCH`.  The child may emit partial redraws
-for intermediate sizes.  Mitigation: clients should debounce resize events
-(the web UI does this with a 100ms delay).
+for intermediate sizes.  Mitigation: the web UI debounces resize sends by
+120ms, and the CLI attach path ignores stale resize events for the first 500ms
+after entering the alternate screen before re-reading the actual terminal size.
 
 ---
 
@@ -512,12 +560,12 @@ for intermediate sizes.  Mitigation: clients should debounce resize events
 
 | Issue | Impact | Mitigation |
 |---|---|---|
-| File descriptor leaks | Child inherits daemon's fds | `portable_pty` handles `CLOEXEC`; tmux uses `closefrom(STDERR+1)` |
+| File descriptor leaks | Child inherits daemon's fds | `portable_pty` sets up PTY handles with `CLOEXEC` semantics |
 | Zombie processes | Parent must `waitpid()` after SIGCHLD | `try_wait()` polled in completion check loop |
 | Signal during fork | SIGCHLD between fork/exec can confuse child | `portable_pty` blocks signals during fork |
 | PTY master close race | Close master while child is writing → SIGPIPE | Reader thread detects `read() == 0` and breaks cleanly |
 | macOS PTY buffer size | Smaller than Linux (4KB vs 16KB) | No special handling needed; affects throughput only |
-| EMFILE/ENFILE in accept | FD exhaustion prevents new connections | Backoff with exponential delay (tmux pattern) |
+| EMFILE/ENFILE in accept | FD exhaustion prevents new connections | Back off and retry with exponential delay |
 
 ### Encoding Assumptions
 
@@ -665,8 +713,11 @@ CLI ──AttachInput──► Primary ──proxy_rpc()──► Secondary
 
 ### Current Constraints
 
-1. **Single PTY per session**: No window/pane splitting (not a multiplexer)
-2. **Last-resize-wins**: No multi-client size aggregation yet
+1. **Single PTY per session**: No window/pane splitting or layout management
+2. **Last successful resize wins**: Newly attached interactive clients usually
+   send an immediate resize, so the most recently attached or resized client's
+   dimensions are applied; other clients receive a resize notification but
+   their local terminal size is not forcefully changed
 3. **No scrollback beyond ring**: Ring is fixed-size; disk persistence is
    append-only but not queryable for replay
 4. **Blocking PTY I/O**: 2 threads per session limits to ~hundreds of sessions

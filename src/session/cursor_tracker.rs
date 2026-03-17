@@ -18,6 +18,8 @@ pub struct CursorTracker {
     col: u16,
     rows: u16,
     cols: u16,
+    saved_row: u16,
+    saved_col: u16,
     state: CtState,
     params: [u16; 4],
     param_idx: usize,
@@ -40,6 +42,8 @@ impl CursorTracker {
             col: 1,
             rows: rows.max(1),
             cols: cols.max(1),
+            saved_row: 1,
+            saved_col: 1,
             state: CtState::Normal,
             params: [0; 4],
             param_idx: 0,
@@ -54,12 +58,13 @@ impl CursorTracker {
     }
 
     /// Update terminal dimensions (e.g. after a resize).
-    #[allow(dead_code)]
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         self.rows = rows.max(1);
         self.cols = cols.max(1);
         self.row = self.row.min(self.rows);
         self.col = self.col.min(self.cols);
+        self.saved_row = self.saved_row.min(self.rows);
+        self.saved_col = self.saved_col.min(self.cols);
     }
 
     /// Process a chunk of PTY output bytes and update cursor position.
@@ -83,6 +88,9 @@ impl CursorTracker {
                 }
             }
             b'\r' => self.col = 1,
+            0x08 => {
+                self.col = self.col.saturating_sub(1).max(1);
+            }
             b'\t' => {
                 let next_tab = ((self.col - 1) / 8 + 1) * 8 + 1;
                 self.col = next_tab.min(self.cols);
@@ -121,6 +129,16 @@ impl CursorTracker {
                 self.private_marker = false;
             }
             b']' => self.state = CtState::Osc,
+            b'7' => {
+                self.saved_row = self.row;
+                self.saved_col = self.col;
+                self.state = CtState::Normal;
+            }
+            b'8' => {
+                self.row = self.saved_row.min(self.rows);
+                self.col = self.saved_col.min(self.cols);
+                self.state = CtState::Normal;
+            }
             0x1b => {}
             _ => self.state = CtState::Normal,
         }
@@ -208,6 +226,14 @@ impl CursorTracker {
             b'd' => {
                 let r = if p0 == 0 { 1 } else { p0 };
                 self.row = r.min(self.rows);
+            }
+            b's' => {
+                self.saved_row = self.row;
+                self.saved_col = self.col;
+            }
+            b'u' => {
+                self.row = self.saved_row.min(self.rows);
+                self.col = self.saved_col.min(self.cols);
             }
             b'J' => {
                 if p0 == 2 || p0 == 3 {
@@ -334,5 +360,26 @@ mod tests {
         let mut ct = CursorTracker::new(24, 80);
         ct.process(b"\x1b]0;my title\x07hello");
         assert_eq!(ct.position(), (1, 6));
+    }
+
+    #[test]
+    fn test_cursor_tracker_csi_save_restore_cursor() {
+        let mut ct = CursorTracker::new(24, 80);
+        ct.process(b"\x1b[10;20H\x1b[s\x1b[22;70H\x1b[u");
+        assert_eq!(ct.position(), (10, 20));
+    }
+
+    #[test]
+    fn test_cursor_tracker_dec_save_restore_cursor() {
+        let mut ct = CursorTracker::new(24, 80);
+        ct.process(b"\x1b[6;9H\x1b7\x1b[23;40H\x1b8");
+        assert_eq!(ct.position(), (6, 9));
+    }
+
+    #[test]
+    fn test_cursor_tracker_backspace() {
+        let mut ct = CursorTracker::new(24, 80);
+        ct.process(b"hello\x08\x08");
+        assert_eq!(ct.position(), (1, 4));
     }
 }

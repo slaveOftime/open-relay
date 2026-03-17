@@ -354,6 +354,8 @@ export interface AttachOptions {
   onData: (data: Uint8Array) => void
   /** Called when terminal modes change (DECCKM, bracketed paste). */
   onModeChanged: (appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called when the PTY was resized by another attached client. */
+  onResized?: (rows: number, cols: number) => void
   /** Called when the session ends. */
   onSessionEnded: (exitCode: number | null) => void
   onError: (message: string) => void
@@ -403,6 +405,9 @@ export class AttachSocket {
             break
           case 'mode_changed':
             opts.onModeChanged(msg.appCursorKeys, msg.bracketedPasteMode)
+            break
+          case 'resized':
+            opts.onResized?.(msg.rows, msg.cols)
             break
           case 'session_ended':
             opts.onSessionEnded(msg.exit_code)

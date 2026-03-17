@@ -437,6 +437,18 @@ impl SessionStore {
         ))
     }
 
+    /// Subscribe to resize notifications for a session.
+    /// Returns a broadcast receiver for (rows, cols) events and the current PTY size.
+    pub fn subscribe_resize(
+        &self,
+        id: &str,
+    ) -> Option<(broadcast::Receiver<(u16, u16)>, Option<(u16, u16)>)> {
+        let sessions = self.sessions.load();
+        let handle = sessions.get(id)?;
+        let rt = handle.runtime.lock().ok()?;
+        Some((rt.resize_tx.subscribe(), rt.pty_size))
+    }
+
     pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionLookupError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.runtime.lock() else {
@@ -1064,6 +1076,7 @@ mod tests {
         }
 
         let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (resize_tx, _resize_rx) = broadcast::channel(4);
         let (writer_tx, _writer_rx) = mpsc::channel(8);
         let (child, pty_master) = make_dummy_child();
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
@@ -1071,11 +1084,13 @@ mod tests {
             dir,
             ring,
             broadcast_tx,
+            resize_tx,
             pty: super::super::pty::PtyHandle {
                 child,
                 writer_tx,
                 pty_master: Some(pty_master),
             },
+            pty_size: None,
             completed_at: None,
             persisted: false,
             requested_final_status: None,
@@ -1455,6 +1470,7 @@ mod tests {
             exit_code: None,
         };
         let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (resize_tx, _resize_rx) = broadcast::channel(4);
         let (writer_tx, writer_rx) = mpsc::channel(capacity.max(1));
         let (child, pty_master) = make_dummy_child();
         let rt = Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
@@ -1462,11 +1478,13 @@ mod tests {
             dir,
             ring: RingBuffer::new(4096),
             broadcast_tx,
+            resize_tx,
             pty: super::super::pty::PtyHandle {
                 child,
                 writer_tx,
                 pty_master: Some(pty_master),
             },
+            pty_size: None,
             completed_at: None,
             persisted: false,
             requested_final_status: None,

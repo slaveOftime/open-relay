@@ -136,6 +136,7 @@ export default function SessionDetailPage() {
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
+  const isPointerDraggingRef = useRef(false)
   const [replaySpeed, setReplaySpeed] = useState(1)
   const [totalLines, setTotalLines] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
@@ -385,18 +386,31 @@ export default function SessionDetailPage() {
   useEffect(() => {
     if (!id) return
     isMounted.current = true
-    fetchSession(id, node ?? undefined)
-      .then((s) => {
-        if (isMounted.current) setSession(s)
-      })
-      .catch(() => {})
+    let cancelled = false
+    // Defer to avoid StrictMode double-fetch
+    const raf = requestAnimationFrame(() => {
+      if (cancelled) return
+      fetchSession(id, node ?? undefined)
+        .then((s) => {
+          if (!cancelled && isMounted.current) setSession(s)
+        })
+        .catch(() => {})
+    })
     return () => {
+      cancelled = true
+      cancelAnimationFrame(raf)
       isMounted.current = false
     }
   }, [id, node, reloadTick])
 
+  // Only connect after session metadata is loaded so the info bar has
+  // rendered and the terminal container has its final dimensions.  This
+  // prevents a post-connect resize that would cause the PTY program (e.g.
+  // Python REPL) to redraw its prompt, producing a duplicate cursor line.
+  const sessionReady = session !== null
+
   useEffect(() => {
-    if (mode !== 'attach' || !id) return
+    if (mode !== 'attach' || !id || !sessionReady) return
 
     // ── WebSocket attach (local + remote node) ─────────────────────────────
     pushConnectTrace('mode entered realtime connect view')
@@ -457,88 +471,108 @@ export default function SessionDetailPage() {
     }
 
     connectAttemptStartedAtRef.current = Date.now()
-    // Force a synchronous fit so we send the real terminal dimensions (not the
-    // default 80×24 before FitAddon's deferred RAF has fired).
-    const initialSize = termRef.current?.fit() ?? undefined
-    const sock = new AttachSocket(
-      id,
-      {
-        onOpen: () => {
-          pushConnectTrace('websocket open')
-          reconnectAttemptRef.current = 0
-          pendingReconnectRef.current = false
-          connectAttemptStartedAtRef.current = 0
-          lastSentResizeRef.current = null
-          pendingResizeRef.current = null
-          lastWsFrameAtRef.current = Date.now()
-          setWsError(null)
-          setWsConnecting(false)
-          setWsEverConnected(true)
-          if (reconnectTimerRef.current !== null) {
-            clearTimeout(reconnectTimerRef.current)
-            reconnectTimerRef.current = null
-          }
-          if (isMounted.current) setWsConnected(true)
+    // Defer WebSocket creation to requestAnimationFrame so that:
+    // 1) StrictMode's synchronous mount→unmount→mount sets `discarded = true`
+    //    before the socket is created, preventing duplicate connections.
+    // 2) XTerm's own initial rAF (which calls fitAddon.fit()) runs first
+    //    (child effects queue before parent effects), ensuring the terminal
+    //    is properly sized before we read dimensions and receive the init snapshot.
+    const connectRaf = requestAnimationFrame(() => {
+      if (discarded) return
+      // Force a synchronous fit so we send the real terminal dimensions (not the
+      // default 80×24 before FitAddon's deferred RAF has fired).
+      const initialSize = termRef.current?.fit() ?? undefined
+      const sock = new AttachSocket(
+        id,
+        {
+          onOpen: () => {
+            pushConnectTrace('websocket open')
+            reconnectAttemptRef.current = 0
+            pendingReconnectRef.current = false
+            connectAttemptStartedAtRef.current = 0
+            lastSentResizeRef.current = null
+            pendingResizeRef.current = null
+            lastWsFrameAtRef.current = Date.now()
+            setWsError(null)
+            setWsConnecting(false)
+            setWsEverConnected(true)
+            if (reconnectTimerRef.current !== null) {
+              clearTimeout(reconnectTimerRef.current)
+              reconnectTimerRef.current = null
+            }
+            if (isMounted.current) setWsConnected(true)
+          },
+          onInit: (data, _appCursorKeys, _bracketedPasteMode) => {
+            if (!gotSnapshot) {
+              pushConnectTrace(`init received (${data.length} bytes)`)
+              gotSnapshot = true
+            }
+            lastWsFrameAtRef.current = Date.now()
+            enqueueTerminalOutput([data], { reset: true })
+          },
+          onData: (data) => {
+            lastWsFrameAtRef.current = Date.now()
+            enqueueTerminalOutput([data])
+          },
+          onModeChanged: (_appCursorKeys, _bracketedPasteMode) => {
+            lastWsFrameAtRef.current = Date.now()
+            // Mode changes are tracked server-side; client doesn't need to act.
+          },
+          onResized: (rows, cols) => {
+            lastWsFrameAtRef.current = Date.now()
+            // If the PTY was resized to dimensions that don't match our
+            // viewport (e.g. a CLI client resized), push our actual size
+            // back so the PTY adapts to the web client.
+            const size = termRef.current?.getSize()
+            if (size && (size.cols !== cols || size.rows !== rows)) {
+              sock.sendResize(size.rows, size.cols)
+            }
+          },
+          onSessionEnded: (code) => {
+            ended = true
+            lastWsFrameAtRef.current = Date.now()
+            pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
+            if (!isMounted.current) return
+            const exitMsg = code != null ? ` (exit code: ${code})` : ''
+            termRef.current?.writeln(`\r\n\x1b[2m[Session ended${exitMsg}]\x1b[0m`)
+            setExitCode(code)
+            setWsConnected(false)
+            setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
+            fetchSession(id!, node ?? undefined)
+              .then((s) => {
+                if (isMounted.current) setSession(s)
+              })
+              .catch(() => {})
+          },
+          onError: (msg) => {
+            lastWsFrameAtRef.current = Date.now()
+            pushConnectTrace(`server error frame: ${msg}`)
+            if (!isMounted.current) return
+            termRef.current?.writeln(`\r\n\x1b[31mError: ${msg}\x1b[0m`)
+            setWsError(`Server error: ${msg}`)
+          },
+          onClose: (code, reason) => {
+            pushConnectTrace(`websocket close (code=${code}${reason ? ` reason=${reason}` : ''})`)
+            if (isMounted.current) setWsConnected(false)
+            // iOS PWA kills WebSocket connections when the app goes to background.
+            // Reconnect automatically for unexpected drops (not when the session
+            // ended normally or this effect is being cleaned up).
+            if (!ended && !discarded) {
+              setWsConnecting(true)
+              scheduleReconnect(code, reason)
+            }
+          },
         },
-        onInit: (data, _appCursorKeys, _bracketedPasteMode) => {
-          if (!gotSnapshot) {
-            pushConnectTrace(`init received (${data.length} bytes)`)
-            gotSnapshot = true
-          }
-          lastWsFrameAtRef.current = Date.now()
-          enqueueTerminalOutput([data], { reset: true })
-        },
-        onData: (data) => {
-          lastWsFrameAtRef.current = Date.now()
-          enqueueTerminalOutput([data])
-        },
-        onModeChanged: (_appCursorKeys, _bracketedPasteMode) => {
-          lastWsFrameAtRef.current = Date.now()
-          // Mode changes are tracked server-side; client doesn't need to act.
-        },
-        onSessionEnded: (code) => {
-          ended = true
-          lastWsFrameAtRef.current = Date.now()
-          pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
-          if (!isMounted.current) return
-          const exitMsg = code != null ? ` (exit code: ${code})` : ''
-          termRef.current?.writeln(`\r\n\x1b[2m[Session ended${exitMsg}]\x1b[0m`)
-          setExitCode(code)
-          setWsConnected(false)
-          setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
-          fetchSession(id!, node ?? undefined)
-            .then((s) => {
-              if (isMounted.current) setSession(s)
-            })
-            .catch(() => {})
-        },
-        onError: (msg) => {
-          lastWsFrameAtRef.current = Date.now()
-          pushConnectTrace(`server error frame: ${msg}`)
-          if (!isMounted.current) return
-          termRef.current?.writeln(`\r\n\x1b[31mError: ${msg}\x1b[0m`)
-          setWsError(`Server error: ${msg}`)
-        },
-        onClose: (code, reason) => {
-          pushConnectTrace(`websocket close (code=${code}${reason ? ` reason=${reason}` : ''})`)
-          if (isMounted.current) setWsConnected(false)
-          // iOS PWA kills WebSocket connections when the app goes to background.
-          // Reconnect automatically for unexpected drops (not when the session
-          // ended normally or this effect is being cleaned up).
-          if (!ended && !discarded) {
-            setWsConnecting(true)
-            scheduleReconnect(code, reason)
-          }
-        },
-      },
-      node ?? undefined,
-      initialSize ?? undefined
-    )
-    pushConnectTrace('websocket created')
-    socketRef.current = sock
+        node ?? undefined,
+        initialSize ?? undefined
+      )
+      pushConnectTrace('websocket created')
+      socketRef.current = sock
+    })
 
     return () => {
       discarded = true
+      cancelAnimationFrame(connectRaf)
       if (reconnectTimerRef.current !== null) {
         clearTimeout(reconnectTimerRef.current)
         reconnectTimerRef.current = null
@@ -550,12 +584,12 @@ export default function SessionDetailPage() {
       outputBufferRef.current = []
       pendingResetRef.current = false
       pushConnectTrace('teardown current websocket')
-      sock.close()
+      socketRef.current?.close()
       socketRef.current = null
       setWsConnected(false)
       setWsConnecting(false)
     }
-  }, [mode, id, node, pushConnectTrace, setSearchParams, wsReconnectKey, enqueueTerminalOutput])
+  }, [mode, id, node, sessionReady, pushConnectTrace, setSearchParams, wsReconnectKey, enqueueTerminalOutput])
 
   useEffect(() => {
     if (mode !== 'attach') setWsConnecting(false)
@@ -1034,7 +1068,21 @@ export default function SessionDetailPage() {
               </div>
               <div
                 className="absolute sm:hidden right-0 top-0 bottom-0 w-10 bg-transparent"
+                style={{ touchAction: 'none' }}
+                onPointerDown={(e) => {
+                  isPointerDraggingRef.current = true;
+                  (e.target as HTMLElement).setPointerCapture(e.pointerId)
+                }}
+                onPointerUp={(e) => {
+                  isPointerDraggingRef.current = false;
+                  (e.target as HTMLElement).releasePointerCapture(e.pointerId)
+                }}
+                onPointerCancel={(e) => {
+                  isPointerDraggingRef.current = false;
+                  (e.target as HTMLElement).releasePointerCapture(e.pointerId)
+                }}
                 onPointerMove={(e) => {
+                  if (!isPointerDraggingRef.current) return;
                   if (mode === 'logs') {
                     handleScrubRef.current?.(Math.max(0, replayIdxRef.current + e.movementY * 2))
                   } else {

@@ -40,8 +40,12 @@ pub struct SessionRuntime {
     pub ring: RingBuffer,
     /// Sends raw PTY output chunks to all live attach subscribers.
     pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
+    /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
+    pub resize_tx: broadcast::Sender<(u16, u16)>,
     /// PTY ownership: master fd, writer channel, child process.
     pub pty: PtyHandle,
+    /// Current PTY dimensions, updated on every successful resize.
+    pub pty_size: Option<(u16, u16)>,
     pub completed_at: Option<Instant>,
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
@@ -240,8 +244,18 @@ impl SessionRuntime {
             debug!(session_id = %self.meta.id, rows, cols, "ignoring invalid PTY resize request");
             return false;
         }
+        // Skip resize if the PTY is already at the requested size.
+        if self.pty_size == Some((rows, cols)) {
+            debug!(session_id = %self.meta.id, rows, cols, "PTY already at requested size, skipping resize");
+            return true;
+        }
         let resized = self.pty.resize(rows, cols);
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
+        if resized {
+            self.pty_size = Some((rows, cols));
+            // Notify all attached clients about the new size.
+            let _ = self.resize_tx.send((rows, cols));
+        }
         resized
     }
 }
@@ -347,6 +361,9 @@ pub fn spawn_session(
     // Broadcast channel: each live attach subscriber holds a Receiver.
     let (broadcast_tx, _initial_rx) = broadcast::channel::<Arc<Bytes>>(256);
 
+    // Resize broadcast channel: notifies all attached clients of PTY resize.
+    let (resize_tx, _initial_resize_rx) = broadcast::channel::<(u16, u16)>(16);
+
     // Writer channel: the dedicated write thread owns the PTY writer so that
     // sending input never blocks the tokio runtime.
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(PTY_WRITER_QUEUE_CAPACITY);
@@ -377,7 +394,9 @@ pub fn spawn_session(
         dir: full_dir,
         ring: RingBuffer::new(config.ring_buffer_bytes),
         broadcast_tx: broadcast_tx.clone(),
+        resize_tx,
         pty: pty_handle,
+        pty_size: Some((rows, cols)),
         completed_at: None,
         persisted: false,
         requested_final_status: None,
@@ -455,8 +474,11 @@ pub fn spawn_session(
                     match runtime_reader.lock() {
                         Ok(mut rt) => {
                             let _mode_change = rt.push_raw(data.clone(), has_visible_output);
-                            // Mode changes are picked up by attach subscribers
-                            // via the broadcast channel + periodic mode checks.
+                            // Sync cursor tracker to current PTY dimensions
+                            // so CPR responses reflect the correct size.
+                            if let Some((r, c)) = rt.pty_size {
+                                cursor_tracker.set_size(r, c);
+                            }
                         }
                         Err(_) => {
                             warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
@@ -617,17 +639,20 @@ mod tests {
             exit_code: None,
         };
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel(4);
+        let (resize_tx, _resize_rx) = tokio::sync::broadcast::channel(4);
         let (writer_tx, _wrx) = tokio::sync::mpsc::channel(8);
         SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             ring: RingBuffer::new(4096), // small capacity for tests
             broadcast_tx,
+            resize_tx,
             pty: PtyHandle {
                 child: make_test_child_with_exit_code(exit_code),
                 writer_tx,
                 pty_master: None,
             },
+            pty_size: None,
             completed_at: None,
             persisted: false,
             requested_final_status: None,
@@ -823,17 +848,20 @@ mod tests {
             exit_code: None,
         };
         let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (resize_tx, _resize_rx) = broadcast::channel(4);
         let (writer_tx, mut writer_rx) = mpsc::channel(4);
         let mut rt = SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
             ring: RingBuffer::new(4096),
             broadcast_tx,
+            resize_tx,
             pty: PtyHandle {
                 child: make_test_child_with_exit_code(0),
                 writer_tx,
                 pty_master: None,
             },
+            pty_size: None,
             completed_at: None,
             persisted: false,
             requested_final_status: None,

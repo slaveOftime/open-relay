@@ -101,6 +101,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
         // Initial resize + render.
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let mut last_sent_size = (cols, rows);
         ipc::write_request_to_writer(
             &mut write_half,
             RpcRequest::AttachResize {
@@ -118,6 +119,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         // which is required for correct reattach rendering.
         write_bytes_to_stdout(&initial_data)?;
         drop(initial_data); // Release up to 1 MB of replay data immediately.
+
+        // Drain any stale resize events queued by entering the alternate
+        // screen buffer and writing replay data before the main event loop.
+        let _ = drain_pending_terminal_events();
+
+        // Grace period: ignore Event::Resize within this window to avoid
+        // stale resize events from the alternate screen switch or replay
+        // data (e.g. cursor positioning sequences that transiently affect
+        // the ConPTY buffer size on Windows).
+        let attach_started_at = std::time::Instant::now();
 
         // `read_response_from_reader` uses `read_line`, which is not safe to
         // keep cancelling with timeouts. Read daemon frames in a dedicated task
@@ -161,15 +172,28 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         .await?
                     }
                     Event::Resize(cols, rows) => {
-                        ipc::write_request_to_writer(
-                            &mut write_half,
-                            RpcRequest::AttachResize {
-                                id: id_owned.clone(),
-                                rows,
-                                cols,
-                            },
-                        )
-                        .await?
+                        // Skip resize events that arrive shortly after
+                        // attach — these are artifacts from entering the
+                        // alternate screen buffer and writing replay data.
+                        if attach_started_at.elapsed() < std::time::Duration::from_millis(500) {
+                            continue;
+                        }
+                        // Re-read the actual terminal size — the event may
+                        // carry stale dimensions (e.g. after entering the
+                        // alternate screen buffer on Windows/ConPTY).
+                        let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
+                        if (actual_cols, actual_rows) != last_sent_size {
+                            last_sent_size = (actual_cols, actual_rows);
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachResize {
+                                    id: id_owned.clone(),
+                                    rows: actual_rows,
+                                    cols: actual_cols,
+                                },
+                            )
+                            .await?
+                        }
                     }
                     Event::Key(key) => {
                         if !matches!(key.kind, KeyEventKind::Press) {
@@ -223,6 +247,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 }))) => {
                     child_app_cursor_keys = app_cursor_keys;
                     child_bracketed_paste_mode = bracketed_paste_mode;
+                }
+                Ok(Some(Ok(RpcResponse::AttachResized { rows: _, cols: _ }))) => {
+                    // Another client resized the PTY.  We cannot
+                    // programmatically resize the terminal window (only the
+                    // screen buffer on Windows, which corrupts the display).
+                    // Instead, update last_sent_size to the actual terminal
+                    // size so that the dedup guard in Event::Resize prevents
+                    // echoing our unchanged dimensions back to the server.
+                    let (actual_cols, actual_rows) = terminal::size().unwrap_or((80, 24));
+                    last_sent_size = (actual_cols, actual_rows);
                 }
                 Ok(Some(Ok(RpcResponse::AttachStreamDone { .. }))) => {
                     running = false;

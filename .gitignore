@@ -1,6 +1,7 @@
 obj
 bin
 node_modules
+/tmp
 /target
 /target-test
 /web/dist
