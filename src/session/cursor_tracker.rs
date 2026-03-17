@@ -54,7 +54,6 @@ impl CursorTracker {
     }
 
     /// Update terminal dimensions (e.g. after a resize).
-    #[allow(dead_code)]
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         self.rows = rows.max(1);
         self.cols = cols.max(1);

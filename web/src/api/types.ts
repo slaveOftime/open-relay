@@ -146,6 +146,7 @@ export type WsServerMessage =
   | { type: 'init'; data: string; appCursorKeys: boolean; bracketedPasteMode: boolean }
   | { type: 'data'; data: string }
   | { type: 'mode_changed'; appCursorKeys: boolean; bracketedPasteMode: boolean }
+  | { type: 'resized'; rows: number; cols: number }
   | { type: 'session_ended'; exit_code: number | null }
   | { type: 'error'; message: string }
   | { type: 'pong' }

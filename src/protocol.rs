@@ -196,6 +196,11 @@ pub enum RpcResponse {
         #[serde(default)]
         app_cursor_keys: bool,
     },
+    /// Another attached client resized the PTY; receivers should adapt.
+    AttachResized {
+        rows: u16,
+        cols: u16,
+    },
     /// Session ended; attach stream is done.
     AttachStreamDone {
         exit_code: Option<i32>,

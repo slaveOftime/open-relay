@@ -6,18 +6,11 @@ use crate::{
     error::Result,
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    session::pty::EscapeFilter,
+    session::pty::{EscapeFilter, collect_filtered_chunks},
+    session::resize::ResizeSubscriber,
 };
 
 use super::SessionStoreHandle;
-
-fn collect_filtered_chunks(chunks: &[(u64, bytes::Bytes)], filter: &mut EscapeFilter) -> Vec<u8> {
-    let mut filtered = Vec::with_capacity(chunks.iter().map(|(_, chunk)| chunk.len()).sum());
-    for (_, chunk) in chunks {
-        filtered.extend(filter.filter(chunk));
-    }
-    filtered
-}
 
 pub(super) async fn handle_attach_subscribe(
     id: String,
@@ -78,6 +71,10 @@ pub(super) async fn handle_attach_subscribe(
 
     session_store.register_attach_client(&id).await;
     debug!(session_id = %id, "IPC stream client registered");
+
+    // Subscribe to resize broadcasts so we can notify this client when
+    // another attached client changes the PTY size.
+    let mut resize_sub = ResizeSubscriber::new(session_store.subscribe_resize(&id), id.clone());
 
     let (client_msg_tx, mut client_msg_rx) = mpsc::channel(64);
     let client_reader_task = tokio::spawn(async move {
@@ -180,6 +177,7 @@ pub(super) async fn handle_attach_subscribe(
                         }
                         Some(Ok(RpcRequest::AttachResize { id: req_id, rows, cols })) if req_id == id => {
                             debug!(session_id = %id, rows, cols, "IPC client resize received");
+                            resize_sub.mark_sent(rows, cols);
                             if session_store.attach_resize(&req_id, rows, cols).await.is_err() {
                                 warn!(session_id = %id, rows, cols, "IPC client resize forwarding failed");
                                 break;
@@ -291,6 +289,20 @@ pub(super) async fn handle_attach_subscribe(
                             break;
                         }
                     }
+                }
+
+                // Resize notifications from other attached clients.
+                Some((rows, cols)) = resize_sub.recv_foreign() => {
+                    debug!(
+                        session_id = %id,
+                        rows, cols,
+                        "forwarding resize notification to IPC client"
+                    );
+                    ipc::write_response_to_writer(
+                        &mut writer,
+                        RpcResponse::AttachResized { rows, cols },
+                    )
+                    .await?;
                 }
             }
         }

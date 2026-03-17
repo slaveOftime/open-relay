@@ -196,7 +196,7 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                       type="button"
                       variant="secondary"
                       size="sm"
-                      className={`font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700' : key === 'esc' || key === 'enter' ? 'bg-amber-700' : instant ? 'bg-[hsl(var(--primary))]/30' : ''}`}
+                      className={`font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
                       onClick={() => {
                         if (instant) {
                           if (customKeys.trim()) {

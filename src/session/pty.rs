@@ -788,6 +788,19 @@ pub(crate) fn has_visible_content(text: &str) -> bool {
     false
 }
 
+/// Filter CPR/DSR escape sequences from replay chunks and concatenate into
+/// a single buffer.  Used by both the IPC and WebSocket attach handlers.
+pub fn collect_filtered_chunks(
+    chunks: &[(u64, bytes::Bytes)],
+    filter: &mut EscapeFilter,
+) -> Vec<u8> {
+    let mut filtered = Vec::with_capacity(chunks.iter().map(|(_, chunk)| chunk.len()).sum());
+    for (_, chunk) in chunks {
+        filtered.extend(filter.filter(chunk));
+    }
+    filtered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
