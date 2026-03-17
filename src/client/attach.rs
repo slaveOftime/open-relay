@@ -4,7 +4,7 @@ use crossterm::{
     cursor,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers,
+        KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute, terminal,
 };
@@ -214,6 +214,17 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             )
                             .await?;
                         }
+                    }
+                    Event::Mouse(mouse) => {
+                        let data = map_mouse_to_sgr_input(mouse);
+                        ipc::write_request_to_writer(
+                            &mut write_half,
+                            RpcRequest::AttachInput {
+                                id: id_owned.clone(),
+                                data,
+                            },
+                        )
+                        .await?;
                     }
                     _ => {}
                 }
@@ -488,6 +499,43 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
     }
 }
 
+fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
+    let mut cb: u16 = match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Up(MouseButton::Left) => 0,
+        MouseEventKind::Up(MouseButton::Middle) => 1,
+        MouseEventKind::Up(MouseButton::Right) => 2,
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        MouseEventKind::Drag(MouseButton::Middle) => 33,
+        MouseEventKind::Drag(MouseButton::Right) => 34,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        cb += 4;
+    }
+    if mouse.modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+    // SGR uses 1-based coordinates.
+    let cx = mouse.column + 1;
+    let cy = mouse.row + 1;
+    let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+        'm'
+    } else {
+        'M'
+    };
+    format!("\x1b[<{cb};{cx};{cy}{suffix}")
+}
+
 fn is_ctrl_d(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
@@ -749,5 +797,90 @@ mod tests {
     #[test]
     fn test_is_ctrl_d_false_for_other_ctrl() {
         assert!(!is_ctrl_d(ctrl_press(KeyCode::Char('c'))));
+    }
+
+    // -----------------------------------------------------------------------
+    // map_mouse_to_sgr_input
+    // -----------------------------------------------------------------------
+
+    fn mouse_event(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn mouse_event_with_mods(
+        kind: MouseEventKind,
+        col: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn test_mouse_left_press() {
+        let ev = mouse_event(MouseEventKind::Down(MouseButton::Left), 9, 4);
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<0;10;5M");
+    }
+
+    #[test]
+    fn test_mouse_right_release() {
+        let ev = mouse_event(MouseEventKind::Up(MouseButton::Right), 0, 0);
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<2;1;1m");
+    }
+
+    #[test]
+    fn test_mouse_middle_drag() {
+        let ev = mouse_event(MouseEventKind::Drag(MouseButton::Middle), 5, 10);
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<33;6;11M");
+    }
+
+    #[test]
+    fn test_mouse_scroll_up() {
+        let ev = mouse_event(MouseEventKind::ScrollUp, 20, 15);
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<64;21;16M");
+    }
+
+    #[test]
+    fn test_mouse_scroll_down() {
+        let ev = mouse_event(MouseEventKind::ScrollDown, 20, 15);
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<65;21;16M");
+    }
+
+    #[test]
+    fn test_mouse_moved() {
+        let ev = mouse_event(MouseEventKind::Moved, 3, 7);
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<35;4;8M");
+    }
+
+    #[test]
+    fn test_mouse_with_shift_modifier() {
+        let ev = mouse_event_with_mods(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<4;1;1M");
+    }
+
+    #[test]
+    fn test_mouse_with_ctrl_alt_modifiers() {
+        let ev = mouse_event_with_mods(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<24;1;1M");
     }
 }
