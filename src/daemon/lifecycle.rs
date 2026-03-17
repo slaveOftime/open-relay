@@ -125,6 +125,7 @@ async fn acquire_daemon_start_lock(config: &AppConfig) -> Result<File> {
 
                 if std::time::Instant::now() >= deadline {
                     storage::remove_file_if_exists(&config.lock_file)?;
+                    storage::remove_file_if_exists(&config.socket_file)?;
                     return storage::try_acquire_daemon_lock(&config.lock_file);
                 }
 
@@ -194,6 +195,17 @@ async fn wait_for_daemon_ready(config: &AppConfig, timeout: std::time::Duration)
         if daemon_is_healthy(config).await {
             return Ok(());
         }
+
+        // If the child already exited, stop waiting and surface a helpful message.
+        if let Some(pid) = storage::read_pid(&config.lock_file)? {
+            if !process_is_running(pid) {
+                return Err(AppError::DaemonUnavailable(format!(
+                    "daemon process exited before becoming ready. Check logs under {}",
+                    config.state_dir.display()
+                )));
+            }
+        }
+
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
 
