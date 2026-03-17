@@ -58,7 +58,8 @@ base64 = "0.22"
 argon2 = "0.5"
 rpassword = "7"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
-mimalloc = "0.1.48"
+mimalloc = { version = "0.1.48", features = ["v3"] }
+libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
 bytes = "1"
 arc-swap = "1"
 

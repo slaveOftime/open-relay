@@ -21,6 +21,7 @@ use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
 
 use crate::config::AppConfig;
 
+use libmimalloc_sys::{mi_option_set_default, mi_option_set_enabled_default};
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -28,6 +29,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    configure_mimalloc_defaults();
+
     let code = match run().await {
         Ok(()) => 0,
         Err(err) => {
@@ -36,6 +39,22 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+fn configure_mimalloc_defaults() {
+    // libmimalloc-sys does not expose the newer v3 purge constants as stable
+    // Rust constants, so use the documented enum values from mimalloc.h.
+    const MI_OPTION_PURGE_DECOMMITS: i32 = 5;
+    const MI_OPTION_ABANDONED_PAGE_PURGE: i32 = 12;
+    const MI_OPTION_PURGE_DELAY: i32 = 15;
+
+    unsafe {
+        // Set defaults instead of forcing values so users can still override
+        // behavior through mimalloc environment variables when needed.
+        mi_option_set_enabled_default(MI_OPTION_PURGE_DECOMMITS, true);
+        mi_option_set_enabled_default(MI_OPTION_ABANDONED_PAGE_PURGE, true);
+        mi_option_set_default(MI_OPTION_PURGE_DELAY, 0);
+    }
 }
 
 /// Wrap `req` in a `NodeProxy` envelope when `node` is `Some`.
