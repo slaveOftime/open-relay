@@ -43,16 +43,6 @@ You start an agent or interactive CLI task. It runs for 20 minutes. Halfway thro
 - Anyone using interactive CLIs that should survive terminal closes, disconnects, or context switches
 - Teams that want auditable logs and remote intervention instead of fragile ad-hoc shell sessions
 
-### Why not just `tmux`, `screen`, or a remote shell?
-
-| Need | `tmux` / `screen` | `oly` |
-|---|---|---|
-| Session survives after you close your terminal | Yes | Yes |
-| Detects when human input is likely needed | No | Yes |
-| Send input without attaching | No | Yes |
-| Built for supervising AI agents and interactive CLIs | Not really | Yes |
-| Keeps auditable session logs as a first-class feature | Minimal | Yes |
-
 ### Agent-supervises-agent 🤖 👀 🤖
 
 You can run one agent to supervise another. When the supervisor hits something it's unsure about — or something that needs elevated permission — it escalates to you. You decide whether to approve, modify, or abort. You're still in the loop, just not watching.
@@ -65,22 +55,20 @@ You can run one agent to supervise another. When the supervisor hits something i
 npm i @slaveoftime/oly -g
 ```
 
-Global install is required because `oly` is a CLI. On first run, the npm package downloads the matching release binary for your platform.
-
-Currently supported via npm:
-
-- **macOS**: Apple Silicon (`arm64`)
-- **Linux**: x86_64 / AMD64
-- **Windows**: x86_64 / AMD64
+```sh
+cargo install oly
+```
 
 ```sh
 brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
 brew install slaveOftime/open-relay/oly
 ```
 
-```sh
-cargo install --path .
-```
+> Supported platform
+> - **macOS**: Apple Silicon (`arm64`)
+> - **Linux**: x86_64 / AMD64
+> - **Windows**: x86_64 / AMD64
+
 
 ### Pre-built binaries
 
@@ -138,14 +126,6 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 
 ---
 
-## Why star or watch this repo
-
-- You want a better way to supervise long-running agent or CLI sessions
-- You want release updates as packaging, remote supervision, and workflow support improve
-- You want to help shape an early tool in a fast-moving part of the developer tooling stack
-
----
-
 ## Commands 📋
 
 | Command | What it does |
@@ -173,11 +153,3 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 All session commands support `--node <name>` to target a connected secondary.
 
 Detach from an attached session: `Ctrl-]` then `d`.
-
----
-
-## Code layout at a glance
-
-- `src/daemon/rpc.rs` keeps the top-level IPC dispatch, with attach handlers in `src/daemon/rpc_attach.rs` and federation/node runtime in `src/daemon/rpc_nodes.rs`.
-- `src/session/pty.rs` owns PTY resources and escape filtering, while `src/session/cursor_tracker.rs` and `src/session/mode_tracker.rs` track terminal state.
-- `src/client/join.rs` now focuses on join config persistence and CLI join commands; the secondary-node connector runs daemon-side.
