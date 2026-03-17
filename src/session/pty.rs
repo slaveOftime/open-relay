@@ -567,14 +567,25 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     let generic_osc_bare_re = GENERIC_OSC_BARE_RE
         .get_or_init(|| regex::Regex::new(r"]\d{1,3}(?:;[^\x07\\]*)*(?:\x07|\\)").unwrap());
 
+    // APC sequences (\x1b_...\x1b\\) — e.g. Kitty graphics protocol.
+    static APC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let apc_full_re =
+        APC_FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b_[^\x1b]*\x1b\\").unwrap());
+
+    // DCS sequences (\x1bP...\x1b\\) — e.g. DECRQSS, sixel, XTVERSION.
+    static DCS_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let dcs_full_re =
+        DCS_FULL_RE.get_or_init(|| regex::Regex::new(r"\x1bP[^\x1b]*\x1b\\").unwrap());
+
     // 1. Prepend any fragment saved from the previous chunk.
     let mut combined = std::mem::take(pending);
     combined.push_str(chunk);
 
-    // 2. Save any trailing incomplete CPR/OSC prefix for the next call.
+    // 2. Save any trailing incomplete CPR/OSC/APC/DCS prefix for the next call.
     let cpr_pending_start = partial_csi_sequence_re().find(&combined).map(|m| m.start());
     let osc_pending_start = trailing_partial_osc_sequence_start(&combined);
-    if let Some(start) = [cpr_pending_start, osc_pending_start]
+    let apc_dcs_pending_start = trailing_partial_apc_dcs_start(&combined);
+    if let Some(start) = [cpr_pending_start, osc_pending_start, apc_dcs_pending_start]
         .into_iter()
         .flatten()
         .min()
@@ -609,7 +620,13 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     let combined = da1_query_re().replace_all(&combined, "");
     let combined = da2_query_re().replace_all(&combined, "");
     let combined = kitty_keyboard_query_re().replace_all(&combined, "");
-    let filtered = winsize_query_re.replace_all(&combined, "").into_owned();
+    let combined = winsize_query_re.replace_all(&combined, "");
+
+    // 9. Strip APC sequences (e.g. Kitty graphics protocol queries/responses).
+    let combined = apc_full_re.replace_all(&combined, "");
+
+    // 10. Strip DCS sequences (e.g. DECRQSS responses, sixel data).
+    let filtered = dcs_full_re.replace_all(&combined, "").into_owned();
     if filtered.len() != chunk.len() + pending_before || pending.len() != pending_before {
         trace!(
             pending_before,
@@ -620,6 +637,19 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
         );
     }
     filtered
+}
+
+/// Detect a trailing partial APC (`\x1b_`) or DCS (`\x1bP`) sequence that
+/// has not yet been terminated by ST (`\x1b\\`).
+pub(crate) fn trailing_partial_apc_dcs_start(text: &str) -> Option<usize> {
+    ["\x1b_", "\x1bP"]
+        .into_iter()
+        .filter_map(|prefix| text.rfind(prefix))
+        .filter(|&start| {
+            // Only keep if there is no complete ST after this prefix.
+            !text[start + 2..].contains("\x1b\\")
+        })
+        .min()
 }
 
 pub(crate) fn trailing_partial_osc_sequence_start(text: &str) -> Option<usize> {
@@ -764,7 +794,9 @@ pub(crate) fn has_visible_content(text: &str) -> bool {
                         }
                     }
                 }
-                Some(']') => {
+                // OSC (\x1b]), APC (\x1b_), DCS (\x1bP), PM (\x1b^)
+                // All terminated by ST (\x1b\\) or BEL (\x07).
+                Some(']') | Some('_') | Some('P') | Some('^') => {
                     chars.next();
                     let mut prev = '\0';
                     for c in chars.by_ref() {
@@ -1122,5 +1154,77 @@ mod tests {
             responses,
             vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?0u".to_vec()]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // APC / DCS / Kitty graphics filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_strips_kitty_graphics_apc_response() {
+        let mut pending = String::new();
+        let text = "before\x1b_Gi=31337;OK\x1b\\after";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_kitty_graphics_apc_query() {
+        let mut pending = String::new();
+        let text = "before\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\after";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_dcs_sequence() {
+        let mut pending = String::new();
+        let text = "before\x1bP>|xterm 388\x1b\\after";
+        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_split_apc_sequence() {
+        let mut pending = String::new();
+        // First chunk ends with a partial APC sequence.
+        let text1 = "hello\x1b_Gi=31337";
+        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
+        assert_eq!(pending, "\x1b_Gi=31337");
+        // Second chunk completes the APC with ST.
+        let text2 = ";OK\x1b\\world";
+        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_split_dcs_sequence() {
+        let mut pending = String::new();
+        let text1 = "hello\x1bP>|xterm";
+        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
+        assert_eq!(pending, "\x1bP>|xterm");
+        let text2 = " 388\x1b\\world";
+        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_has_visible_content_apc_sequence() {
+        // APC sequence should not count as visible content.
+        assert!(!has_visible_content("\x1b_Gi=31337;OK\x1b\\"));
+        assert!(!has_visible_content(
+            "\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+        ));
+    }
+
+    #[test]
+    fn test_has_visible_content_dcs_sequence() {
+        assert!(!has_visible_content("\x1bP>|xterm 388\x1b\\"));
+    }
+
+    #[test]
+    fn test_has_visible_content_apc_with_surrounding_text() {
+        assert!(has_visible_content("hello\x1b_Gi=31337;OK\x1b\\"));
+        assert!(has_visible_content("\x1b_Gi=31337;OK\x1b\\world"));
     }
 }

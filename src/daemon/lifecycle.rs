@@ -245,7 +245,7 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u
                 unsafe extern "C" {
                     fn setsid() -> i32;
                 }
-                unsafe { setsid() };
+                setsid();
                 Ok(())
             });
         }
