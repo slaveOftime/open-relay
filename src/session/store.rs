@@ -1407,7 +1407,7 @@ mod tests {
         let runtime = sessions.get("abc1234").unwrap();
         let locked = runtime.runtime.lock().unwrap();
         assert!(
-            locked.last_output_at.is_some(),
+            locked.last_output_at.is_none(),
             "suppression path should no longer mutate output epoch during reads"
         );
     }
