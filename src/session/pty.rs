@@ -8,22 +8,24 @@ use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, trace, warn};
 
 // ---------------------------------------------------------------------------
-// PtyHandle — owns the PTY file descriptors, reader/writer threads, and child
+// PtyHandle — owns the pseudo-terminal file descriptors, reader and writer
+// threads, and child process
 // ---------------------------------------------------------------------------
 
-/// Pure PTY ownership struct. Manages the master fd, the child process, and
+/// Pure pseudo-terminal ownership struct. Manages the master file descriptor,
+/// the child process, and
 /// the dedicated reader/writer threads.  No business logic (notifications,
 /// session metadata, etc.) lives here.
 pub struct PtyHandle {
     pub(crate) child: RuntimeChild,
-    /// Channel to the dedicated PTY writer thread.
+    /// Channel to the dedicated pseudo-terminal writer thread.
     pub(crate) writer_tx: mpsc::Sender<Vec<u8>>,
-    /// Kept alive so the master fd stays open; resize goes through this.
+    /// Kept alive so the master file descriptor stays open; resize goes through this.
     pub(crate) pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
 }
 
 impl PtyHandle {
-    /// Send raw bytes to the child's stdin via the writer thread.
+    /// Send raw bytes to the child process standard input via the writer thread.
     pub fn try_write_input(&self, data: Vec<u8>) -> std::result::Result<(), TrySendError<Vec<u8>>> {
         let len = data.len();
         let result = self.writer_tx.try_send(data);
@@ -35,7 +37,7 @@ impl PtyHandle {
         result
     }
 
-    /// Resize the PTY. Returns `true` on success.
+    /// Resize the pseudo-terminal. Returns `true` on success.
     pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
         let Some(master) = self.pty_master.as_mut() else {
             debug!(
@@ -56,7 +58,7 @@ impl PtyHandle {
         result
     }
 
-    /// Release PTY-owned handles once the session is completed.
+    /// Release pseudo-terminal-owned handles once the session is completed.
     ///
     /// This closes the stored master handle and replaces the public writer
     /// sender with a permanently closed channel so future writes fail fast.
@@ -69,7 +71,7 @@ impl PtyHandle {
         drop(previous_tx);
     }
 
-    /// Send SIGKILL / close ConPTY.
+    /// Forcefully terminate the child process or close the Windows ConPTY handle.
     pub fn kill(&mut self) -> std::io::Result<()> {
         let result = self.child.kill();
         match &result {
@@ -79,7 +81,7 @@ impl PtyHandle {
         result
     }
 
-    /// Non-blocking check for child exit. Returns `Some(exit_code)` if exited.
+    /// Perform a non-blocking child-process exit check.
     pub fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
         let result = self.child.try_wait_code();
         match &result {
@@ -90,6 +92,7 @@ impl PtyHandle {
         result
     }
 
+    /// Return the child process identifier when the platform exposes one.
     #[allow(dead_code)]
     pub fn process_id(&self) -> Option<u32> {
         self.child.process_id()
@@ -105,18 +108,21 @@ pub enum RuntimeChild {
 }
 
 impl RuntimeChild {
+    /// Return the wrapped child process identifier when available.
     pub fn process_id(&self) -> Option<u32> {
         match self {
             Self::Pty(child) => child.process_id(),
         }
     }
 
+    /// Terminate the wrapped child process.
     pub fn kill(&mut self) -> std::io::Result<()> {
         match self {
             Self::Pty(child) => child.kill(),
         }
     }
 
+    /// Perform a non-blocking wait and normalize the exit status to an `i32`.
     pub fn try_wait_code(&mut self) -> std::io::Result<Option<i32>> {
         match self {
             Self::Pty(child) => child
@@ -132,109 +138,142 @@ impl RuntimeChild {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalQuery {
+    /// Cursor Position Report query (`CSI 6 n`).
     CursorPositionReport,
+    /// Device Status Report query (`CSI 5 n`).
     DeviceStatusReport,
+    /// Operating System Command query for the foreground color (`OSC 10`).
     ForegroundColor,
+    /// Operating System Command query for the background color (`OSC 11`).
     BackgroundColor,
+    /// Primary Device Attributes query (`DA1`).
     PrimaryDeviceAttributes,
+    /// Secondary Device Attributes query (`DA2`).
     SecondaryDeviceAttributes,
+    /// xterm version query (`XTVERSION`).
     XtVersion,
+    /// DEC private mode report query (`DECRPM`) with one or more mode ids.
     DecPrivateModeReport(String),
+    /// Kitty keyboard protocol capability query.
     KittyKeyboard,
 }
 
-const TERMINAL_QUERY_PATTERNS: [(&str, TerminalQuery); 6] = [
-    ("\x1b[6n", TerminalQuery::CursorPositionReport),
-    ("\x1b[5n", TerminalQuery::DeviceStatusReport),
-    ("\x1b]10;?\x07", TerminalQuery::ForegroundColor),
-    ("\x1b]10;?\x1b\\", TerminalQuery::ForegroundColor),
-    ("\x1b]11;?\x07", TerminalQuery::BackgroundColor),
-    ("\x1b]11;?\x1b\\", TerminalQuery::BackgroundColor),
+/// Fixed terminal-capability queries that can be matched by exact byte text.
+const TERMINAL_QUERY_PATTERNS: [(&[u8], TerminalQuery); 6] = [
+    (b"\x1b[6n", TerminalQuery::CursorPositionReport),
+    (b"\x1b[5n", TerminalQuery::DeviceStatusReport),
+    (b"\x1b]10;?\x07", TerminalQuery::ForegroundColor),
+    (b"\x1b]10;?\x1b\\", TerminalQuery::ForegroundColor),
+    (b"\x1b]11;?\x07", TerminalQuery::BackgroundColor),
+    (b"\x1b]11;?\x1b\\", TerminalQuery::BackgroundColor),
 ];
 
-fn partial_csi_sequence_re() -> &'static regex::Regex {
-    static PARTIAL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    PARTIAL_RE.get_or_init(|| regex::Regex::new(r"\x1b(?:\[(?:[>?]?\d*(?:;\d*)*\$?)?)?$").unwrap())
+/// Build the byte-regular-expression matcher for a trailing partial
+/// Control Sequence Introducer sequence.
+fn partial_csi_sequence_re_bytes() -> &'static regex::bytes::Regex {
+    static PARTIAL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    PARTIAL_RE
+        .get_or_init(|| regex::bytes::Regex::new(r"\x1b(?:\[(?:[>?]?\d*(?:;\d*)*\$?)?)?$").unwrap())
 }
 
-fn private_dsr_query_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?\d+n").unwrap())
+/// Build the byte matcher for DEC private Device Status Report queries such
+/// as `CSI ? 996 n`.
+fn private_dsr_query_re_bytes() -> &'static regex::bytes::Regex {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\?\d+n").unwrap())
 }
 
-fn decrpm_query_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?(\d+(?:;\d+)*)\$p").unwrap())
+/// Build the byte matcher for DEC private mode report queries.
+fn decrpm_query_re_bytes() -> &'static regex::bytes::Regex {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\?(\d+(?:;\d+)*)\$p").unwrap())
 }
 
-fn xtversion_query_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\x1b\[>\d*q").unwrap())
+/// Build the byte matcher for xterm version queries.
+fn xtversion_query_re_bytes() -> &'static regex::bytes::Regex {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[>\d*q").unwrap())
 }
 
-fn da1_query_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\d*c").unwrap())
+/// Build the byte matcher for primary Device Attributes queries.
+fn da1_query_re_bytes() -> &'static regex::bytes::Regex {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\d*c").unwrap())
 }
 
-fn da2_query_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\x1b\[>\d*c").unwrap())
+/// Build the byte matcher for secondary Device Attributes queries.
+fn da2_query_re_bytes() -> &'static regex::bytes::Regex {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[>\d*c").unwrap())
 }
 
-fn kitty_keyboard_query_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"\x1b\[\?u").unwrap())
+/// Build the byte matcher for Kitty keyboard capability queries.
+fn kitty_keyboard_query_re_bytes() -> &'static regex::bytes::Regex {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\?u").unwrap())
 }
 
-pub fn find_next_terminal_query(
-    text: &str,
+/// Find the first occurrence of `needle` in `haystack` starting at `from`.
+fn find_bytes_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from + needle.len() > haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| from + p)
+}
+
+/// Find the earliest terminal-capability query in `data` starting at
+/// `search_from` and classify it into a typed query variant.
+fn find_next_terminal_query(
+    data: &[u8],
     search_from: usize,
 ) -> Option<(usize, usize, TerminalQuery)> {
     let fixed_match = TERMINAL_QUERY_PATTERNS
         .iter()
         .filter_map(|(pattern, query)| {
-            text[search_from..]
-                .find(pattern)
-                .map(|offset| (search_from + offset, pattern.len(), query.clone()))
+            find_bytes_from(data, pattern, search_from)
+                .map(|start| (start, pattern.len(), query.clone()))
         })
         .min_by_key(|(start, _, _)| *start);
 
-    let decrpm_match = decrpm_query_re()
-        .captures_at(text, search_from)
+    let decrpm_match = decrpm_query_re_bytes()
+        .captures_at(data, search_from)
         .and_then(|caps| {
             let whole = caps.get(0)?;
-            let modes = caps.get(1)?.as_str().to_string();
+            let mode_bytes = caps.get(1)?;
+            let modes = std::str::from_utf8(mode_bytes.as_bytes()).ok()?.to_string();
             Some((
                 whole.start(),
-                whole.as_str().len(),
+                whole.as_bytes().len(),
                 TerminalQuery::DecPrivateModeReport(modes),
             ))
         });
 
-    let xtversion_match = xtversion_query_re()
-        .find_at(text, search_from)
-        .map(|m| (m.start(), m.as_str().len(), TerminalQuery::XtVersion));
+    let xtversion_match = xtversion_query_re_bytes()
+        .find_at(data, search_from)
+        .map(|m| (m.start(), m.as_bytes().len(), TerminalQuery::XtVersion));
 
-    let da1_match = da1_query_re().find_at(text, search_from).map(|m| {
+    let da1_match = da1_query_re_bytes().find_at(data, search_from).map(|m| {
         (
             m.start(),
-            m.as_str().len(),
+            m.as_bytes().len(),
             TerminalQuery::PrimaryDeviceAttributes,
         )
     });
 
-    let da2_match = da2_query_re().find_at(text, search_from).map(|m| {
+    let da2_match = da2_query_re_bytes().find_at(data, search_from).map(|m| {
         (
             m.start(),
-            m.as_str().len(),
+            m.as_bytes().len(),
             TerminalQuery::SecondaryDeviceAttributes,
         )
     });
 
-    let kitty_match = kitty_keyboard_query_re()
-        .find_at(text, search_from)
-        .map(|m| (m.start(), m.as_str().len(), TerminalQuery::KittyKeyboard));
+    let kitty_match = kitty_keyboard_query_re_bytes()
+        .find_at(data, search_from)
+        .map(|m| (m.start(), m.as_bytes().len(), TerminalQuery::KittyKeyboard));
 
     [
         fixed_match,
@@ -249,27 +288,29 @@ pub fn find_next_terminal_query(
     .min_by_key(|(start, _, _)| *start)
 }
 
-pub fn terminal_query_tail_len(remainder: &str) -> usize {
-    let csi_tail = partial_csi_sequence_re()
+/// Return how many bytes at the end of `remainder` must be retained because
+/// they form an incomplete terminal-capability query.
+fn terminal_query_tail_len(remainder: &[u8]) -> usize {
+    let csi_tail = partial_csi_sequence_re_bytes()
         .find(remainder)
         .filter(|m| m.end() == remainder.len())
         .map(|m| remainder.len().saturating_sub(m.start()))
         .unwrap_or(0);
 
     let osc_tail = [
-        "\x1b]10;?\x1b",
-        "\x1b]11;?\x1b",
-        "\x1b]10;?",
-        "\x1b]11;?",
-        "\x1b]10;",
-        "\x1b]11;",
-        "\x1b]",
+        b"\x1b]10;?\x1b".as_slice(),
+        b"\x1b]11;?\x1b",
+        b"\x1b]10;?",
+        b"\x1b]11;?",
+        b"\x1b]10;",
+        b"\x1b]11;",
+        b"\x1b]",
     ]
     .into_iter()
-    .filter_map(|prefix| remainder.rfind(prefix).map(|start| (prefix, start)))
+    .filter_map(|prefix| rfind_bytes(remainder, prefix).map(|start| (prefix, start)))
     .filter(|(_, start)| {
         let suffix = &remainder[*start..];
-        !suffix.contains('\x07') && !suffix.contains("\x1b\\")
+        !suffix.contains(&0x07) && !suffix.windows(2).any(|w| w == b"\x1b\\")
     })
     .map(|(_, start)| remainder.len().saturating_sub(start))
     .max()
@@ -278,6 +319,7 @@ pub fn terminal_query_tail_len(remainder: &str) -> usize {
     csi_tail.max(osc_tail)
 }
 
+/// Format the daemon's synthetic reply to an xterm version query.
 fn xtversion_response() -> String {
     format!(
         "\x1bP>|{} {}\x1b\\",
@@ -286,6 +328,7 @@ fn xtversion_response() -> String {
     )
 }
 
+/// Format one DEC private mode report response per queried mode id.
 fn decrpm_responses(modes: &str) -> Vec<String> {
     modes
         .split(';')
@@ -294,7 +337,9 @@ fn decrpm_responses(modes: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn terminal_query_response(query: TerminalQuery, cursor: Option<(u16, u16)>) -> Vec<String> {
+/// Convert a parsed terminal-capability query into one or more response
+/// frames that can be written back to the pseudo terminal.
+fn terminal_query_response(query: TerminalQuery, cursor: Option<(u16, u16)>) -> Vec<String> {
     match query {
         TerminalQuery::CursorPositionReport => {
             let (row, col) = cursor.unwrap_or((1, 1));
@@ -317,6 +362,8 @@ pub fn terminal_query_response(query: TerminalQuery, cursor: Option<(u16, u16)>)
     }
 }
 
+/// Derive foreground and background Operating System Command color responses
+/// from the environment, falling back to a conservative white-on-black pair.
 fn terminal_report_colors() -> (String, String) {
     if let Ok(raw) = std::env::var("COLORFGBG") {
         let parsed: Vec<u8> = raw
@@ -336,14 +383,17 @@ fn terminal_report_colors() -> (String, String) {
     )
 }
 
+/// Format one Operating System Command color response.
 fn format_osc_color_response(ps: u8, color: &str) -> String {
     format!("\x1b]{ps};{color}\x1b\\")
 }
 
+/// Convert an RGB tuple into xterm's `rgb:rrrr/gggg/bbbb` string format.
 fn format_osc_rgb((red, green, blue): (u8, u8, u8)) -> String {
     format!("rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}")
 }
 
+/// Convert an xterm 256-color palette index into an RGB triple.
 fn xterm_color_to_rgb(index: u8) -> (u8, u8, u8) {
     match index {
         0 => (0x00, 0x00, 0x00),
@@ -385,33 +435,29 @@ fn xterm_color_to_rgb(index: u8) -> (u8, u8, u8) {
 // EscapeFilter — stateful per-attach ESC sequence stripper
 // ---------------------------------------------------------------------------
 
-/// Strips CPR/DSR terminal device responses and OSC 10/11 color responses
-/// from PTY output before display.  Carries incomplete sequences across chunk
-/// boundaries so ConPTY split-ESC cases are handled correctly.
+/// Strips Cursor Position Report and Device Status Report responses, plus
+/// Operating System Command color responses, from pseudo-terminal output
+/// before display. Carries incomplete sequences across chunk boundaries so
+/// Windows ConPTY split-escape cases are handled correctly.
 ///
 /// All regex state is static (shared); only the cross-chunk `pending` prefix
 /// is per-instance.
 pub struct EscapeFilter {
-    pending: String,
+    pending: Vec<u8>,
 }
 
 impl EscapeFilter {
+    /// Create an empty byte-preserving escape filter.
     pub fn new() -> Self {
         Self {
-            pending: String::new(),
+            pending: Vec::new(),
         }
     }
 
-    /// Filter a raw PTY byte slice and return the cleaned bytes.
+    /// Filter one raw pseudo-terminal byte slice and return the cleaned bytes.
     pub fn filter(&mut self, data: &[u8]) -> Vec<u8> {
         let pending_before = self.pending.len();
-        // Fast path: avoid a heap allocation when the data is already valid
-        // UTF-8 (the overwhelmingly common case for terminal output).
-        let chunk: std::borrow::Cow<'_, str> = match std::str::from_utf8(data) {
-            Ok(s) => std::borrow::Cow::Borrowed(s),
-            Err(_) => String::from_utf8_lossy(data),
-        };
-        let filtered = filter_cpr_chunk(&mut self.pending, &chunk).into_bytes();
+        let filtered = filter_cpr_chunk_bytes(&mut self.pending, data);
         if filtered.len() != data.len() || self.pending.len() != pending_before {
             trace!(
                 input_bytes = data.len(),
@@ -426,6 +472,7 @@ impl EscapeFilter {
 }
 
 impl Default for EscapeFilter {
+    /// Create the default byte-preserving escape filter.
     fn default() -> Self {
         Self::new()
     }
@@ -435,28 +482,28 @@ impl Default for EscapeFilter {
 // Daemon-side fallback query responder (no attach client)
 // ---------------------------------------------------------------------------
 
-/// Scan `data` for terminal capability queries and generate response bytes.
+/// Scan `data` for terminal-capability queries and generate response bytes.
 ///
 /// Responses are for the daemon to write back to the PTY stdin when no attach
-/// client is connected.  CPR always uses row 1 col 1 (the best the daemon can
-/// do without a real terminal).  `tail` carries partial query sequences across
-/// chunk boundaries.
+/// client is connected. Cursor Position Report replies always use row 1 col 1
+/// when no live terminal is attached. `tail` carries partial query sequences
+/// across chunk boundaries.
 ///
 /// Returns a list of response byte strings to write sequentially.
 ///
-/// OSC 10/11 colour probes are answered with a static best-guess response
-/// (white foreground, black background, or the `COLORFGBG` env var if set).
-/// DA1/DA2/XTVERSION and DECRPM/kitty-keyboard probes get conservative,
+/// Operating System Command color probes are answered with a static best-guess
+/// response (white foreground, black background, or the `COLORFGBG` env var if
+/// set). Primary Device Attributes, Secondary Device Attributes, xterm version,
+/// DEC private mode report, and Kitty keyboard probes get conservative,
 /// well-formed replies so detached apps do not block waiting for a real
 /// terminal to answer them.
 pub fn extract_query_responses_no_client(
     data: &[u8],
-    tail: &mut String,
+    tail: &mut Vec<u8>,
     cursor: (u16, u16),
 ) -> Vec<Vec<u8>> {
-    let text = String::from_utf8_lossy(data);
     let mut combined = std::mem::take(tail);
-    combined.push_str(&text);
+    combined.extend_from_slice(data);
 
     let mut responses = Vec::new();
     let mut search_from = 0usize;
@@ -479,7 +526,7 @@ pub fn extract_query_responses_no_client(
 
     let remainder = &combined[search_from..];
     let keep = terminal_query_tail_len(remainder);
-    *tail = remainder[remainder.len().saturating_sub(keep)..].to_string();
+    *tail = remainder[remainder.len().saturating_sub(keep)..].to_vec();
 
     if !responses.is_empty() || keep > 0 {
         debug!(
@@ -496,137 +543,145 @@ pub fn extract_query_responses_no_client(
 }
 
 // ---------------------------------------------------------------------------
-// filter_cpr_chunk — shared ESC-response filter (used by EscapeFilter)
+// filter_cpr_chunk — shared terminal-response filter (used by EscapeFilter)
 // ---------------------------------------------------------------------------
 
-/// Filters CPR (Cursor Position Report), OSC 10/11 color responses, and
-/// terminal-query sequences out of a single PTY chunk.
+/// Filter one pseudo-terminal chunk and strip synthetic terminal-response
+/// traffic such as Cursor Position Report replies, Device Status Report
+/// replies, Operating System Command color replies, and terminal-capability
+/// queries that would make the local terminal answer on its own.
 ///
-/// ConPTY on Windows echoes device/color responses into the master output
-/// stream.  The sequence is frequently split across PTY read boundaries at
-/// *any* byte, so `pending` carries a trailing prefix from one call to the
-/// next to ensure every fragment is reassembled before being examined.
+/// Windows ConPTY can echo device and color responses into the master output
+/// stream. The sequence is frequently split across read boundaries at any
+/// byte, so `pending` carries a trailing prefix from one call to the next to
+/// ensure every fragment is reassembled before being examined.
 ///
 /// Splitting points handled (all stripped):
-/// * Full CPR in one chunk:   `\x1b[35;1R`
+/// * Full Cursor Position Report in one chunk: `\x1b[35;1R`
 /// * ESC alone:               `…\x1b`  |  `[35;1R…`
-/// * Bare (no ESC from ConPTY): `…[35;1R…`
-/// * OSC 10/11 full or bare variants
+/// * Bare form with no Escape prefix from ConPTY: `…[35;1R…`
+/// * Full or bare Operating System Command 10 and 11 variants
 /// * Terminal queries that would cause the attach client's terminal to
-///   respond (DECRPM, XTVERSION, DA1/DA2, kitty keyboard, etc.)
-pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
+///   respond (DEC private mode report, xterm version, primary and secondary
+///   Device Attributes, Kitty keyboard, and related queries)
+fn filter_cpr_chunk_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
     let pending_before = pending.len();
-    static FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let full_re = FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
 
-    static BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let bare_re = BARE_RE.get_or_init(|| regex::Regex::new(r"\[\??\d+;\d+R").unwrap());
+    // Fast path: when no carried-over fragment exists and the chunk contains
+    // none of the bytes that begin strippable sequences, return verbatim.
+    // ESC (0x1b) starts all escape-prefixed patterns; `[` and `]` start the
+    // bare ConPTY variants; BEL (0x07) terminates some OSC sequences.
+    if pending_before == 0
+        && !chunk
+            .iter()
+            .any(|&b| b == 0x1b || b == b'[' || b == b']' || b == 0x07)
+    {
+        return chunk.to_vec();
+    }
 
-    // DSR/CPR *query* patterns — strip these so attach clients' terminals
-    // don't respond with their own CPR, which would leak into the child's stdin.
-    static DSR_QUERY_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let full_re = FULL_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
+
+    // Bare CPR without the ESC prefix — ConPTY on Windows sometimes drops
+    // the leading ESC byte. This can false-positive on text that happens to
+    // contain `[<digits>;<digits>R`, but stripping those rare sequences is
+    // an acceptable tradeoff for reliable ConPTY support.
+    static BARE_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let bare_re = BARE_RE.get_or_init(|| regex::bytes::Regex::new(r"\[\??\d+;\d+R").unwrap());
+
+    static DSR_QUERY_FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let dsr_query_full_re =
-        DSR_QUERY_FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b\[\d+n").unwrap());
+        DSR_QUERY_FULL_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\d+n").unwrap());
 
-    static DSR_QUERY_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    // Bare DSR query without ESC — same ConPTY prefix-drop tradeoff as above.
+    static DSR_QUERY_BARE_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let dsr_query_bare_re =
-        DSR_QUERY_BARE_RE.get_or_init(|| regex::Regex::new(r"\[[56]n").unwrap());
+        DSR_QUERY_BARE_RE.get_or_init(|| regex::bytes::Regex::new(r"\[[56]n").unwrap());
 
-    // Private-mode DSR queries (\x1b[?<digits>n) — the `?` variant is NOT
-    // caught by DSR_QUERY_FULL_RE above.  Programs like opencode/bubbletea
-    // send \x1b[?996n (DEC Locator) which would otherwise leak.
-    // DECRPM queries (\x1b[?<mode>$p) — opencode/bubbletea sends these to
-    // probe terminal modes.  If they leak to the attach client's terminal,
-    // the terminal responds with DECRPM replies that crossterm interprets as
-    // key events, sending garbage input back to the child.
-    // Window-size-in-pixels query (\x1b[14t, \x1b[16t, etc.).
-    static WINSIZE_QUERY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static WINSIZE_QUERY_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let winsize_query_re =
-        WINSIZE_QUERY_RE.get_or_init(|| regex::Regex::new(r"\x1b\[1[4-9]t").unwrap());
+        WINSIZE_QUERY_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[1[4-9]t").unwrap());
 
-    static OSC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static OSC_FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let osc_full_re = OSC_FULL_RE.get_or_init(|| {
-        regex::Regex::new(
+        regex::bytes::Regex::new(
             r"\x1b]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\x1b\\)",
         )
         .unwrap()
     });
 
-    static OSC_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static OSC_BARE_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let osc_bare_re = OSC_BARE_RE.get_or_init(|| {
-        regex::Regex::new(r"]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\\)")
-            .unwrap()
+        regex::bytes::Regex::new(
+            r"]1(?:0|1);rgb:[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}/[0-9A-Fa-f]{4}(?:\x07|\\)",
+        )
+        .unwrap()
     });
 
-    static GENERIC_OSC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static GENERIC_OSC_FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let generic_osc_full_re = GENERIC_OSC_FULL_RE.get_or_init(|| {
-        regex::Regex::new(r"\x1b]\d{1,3}(?:;[^\x07\x1b]*)*(?:\x07|\x1b\\)").unwrap()
+        regex::bytes::Regex::new(r"\x1b]\d{1,3}(?:;[^\x07\x1b]*)*(?:\x07|\x1b\\)").unwrap()
     });
 
-    static GENERIC_OSC_BARE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static GENERIC_OSC_BARE_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let generic_osc_bare_re = GENERIC_OSC_BARE_RE
-        .get_or_init(|| regex::Regex::new(r"]\d{1,3}(?:;[^\x07\\]*)*(?:\x07|\\)").unwrap());
+        .get_or_init(|| regex::bytes::Regex::new(r"]\d{1,3}(?:;[^\x07\\]*)*(?:\x07|\\)").unwrap());
 
-    // APC sequences (\x1b_...\x1b\\) — e.g. Kitty graphics protocol.
-    static APC_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static APC_FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let apc_full_re =
-        APC_FULL_RE.get_or_init(|| regex::Regex::new(r"\x1b_[^\x1b]*\x1b\\").unwrap());
+        APC_FULL_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b_[^\x1b]*\x1b\\").unwrap());
 
-    // DCS sequences (\x1bP...\x1b\\) — e.g. DECRQSS, sixel, XTVERSION.
-    static DCS_FULL_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static DCS_FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let dcs_full_re =
-        DCS_FULL_RE.get_or_init(|| regex::Regex::new(r"\x1bP[^\x1b]*\x1b\\").unwrap());
+        DCS_FULL_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1bP[^\x1b]*\x1b\\").unwrap());
 
-    // 1. Prepend any fragment saved from the previous chunk.
     let mut combined = std::mem::take(pending);
-    combined.push_str(chunk);
+    combined.extend_from_slice(chunk);
 
-    // 2. Save any trailing incomplete CPR/OSC/APC/DCS prefix for the next call.
-    let cpr_pending_start = partial_csi_sequence_re().find(&combined).map(|m| m.start());
-    let osc_pending_start = trailing_partial_osc_sequence_start(&combined);
-    let apc_dcs_pending_start = trailing_partial_apc_dcs_start(&combined);
+    let cpr_pending_start = partial_csi_sequence_re_bytes()
+        .find(&combined)
+        .map(|m| m.start());
+    let osc_pending_start = trailing_partial_osc_sequence_start_bytes(&combined);
+    let apc_dcs_pending_start = trailing_partial_apc_dcs_start_bytes(&combined);
     if let Some(start) = [cpr_pending_start, osc_pending_start, apc_dcs_pending_start]
         .into_iter()
         .flatten()
         .min()
     {
-        *pending = combined[start..].to_string();
+        *pending = combined[start..].to_vec();
         combined.truncate(start);
     }
 
-    // 3. Strip fully-formed ESC-prefixed CPRs.
-    let combined = full_re.replace_all(&combined, "");
+    let combined = full_re.replace_all(&combined, b"" as &[u8]);
+    let combined = bare_re.replace_all(&combined, b"" as &[u8]);
+    let combined = dsr_query_full_re.replace_all(&combined, b"" as &[u8]);
+    let combined = dsr_query_bare_re.replace_all(&combined, b"" as &[u8]);
+    let combined = osc_full_re.replace_all(&combined, b"" as &[u8]);
+    let combined = osc_bare_re.replace_all(&combined, b"" as &[u8]);
+    let combined = generic_osc_full_re.replace_all(&combined, b"" as &[u8]);
+    let combined = generic_osc_bare_re.replace_all(&combined, b"" as &[u8]);
+    let combined = private_dsr_query_re_bytes().replace_all(&combined, b"" as &[u8]);
+    let combined = decrpm_query_re_bytes().replace_all(&combined, b"" as &[u8]);
+    let combined = xtversion_query_re_bytes().replace_all(&combined, b"" as &[u8]);
+    let combined = da1_query_re_bytes().replace_all(&combined, b"" as &[u8]);
+    let combined = da2_query_re_bytes().replace_all(&combined, b"" as &[u8]);
+    // DA1/DA2 *response* patterns — ConPTY can echo these back into the
+    // master output stream alongside the queries they answer.
+    static DA1_RESP_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let da1_resp_re =
+        DA1_RESP_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\?\d+(?:;\d+)*c").unwrap());
+    static DA2_RESP_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let da2_resp_re =
+        DA2_RESP_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[>\d+(?:;\d+)*c").unwrap());
+    let combined = da1_resp_re.replace_all(&combined, b"" as &[u8]);
+    let combined = da2_resp_re.replace_all(&combined, b"" as &[u8]);
+    let combined = kitty_keyboard_query_re_bytes().replace_all(&combined, b"" as &[u8]);
+    let combined = winsize_query_re.replace_all(&combined, b"" as &[u8]);
+    let combined = apc_full_re.replace_all(&combined, b"" as &[u8]);
 
-    // 4. Strip bare CPRs (ESC missing / dropped by ConPTY).
-    let combined = bare_re.replace_all(&combined, "");
-
-    // 5. Strip DSR/CPR *query* sequences (e.g. \x1b[6n, \x1b[5n).
-    let combined = dsr_query_full_re.replace_all(&combined, "");
-    let combined = dsr_query_bare_re.replace_all(&combined, "");
-
-    // 6. Strip OSC 10/11 color responses, ESC-prefixed or bare.
-    let combined = osc_full_re.replace_all(&combined, "");
-    let combined = osc_bare_re.replace_all(&combined, "");
-
-    // 7. Strip generic OSC control sequences such as OSC 7 shell cwd updates.
-    let combined = generic_osc_full_re.replace_all(&combined, "");
-    let combined = generic_osc_bare_re.replace_all(&combined, "");
-
-    // 8. Strip terminal-query sequences that would cause the attach client's
-    //    real terminal to respond, injecting garbage into crossterm's stdin.
-    let combined = private_dsr_query_re().replace_all(&combined, "");
-    let combined = decrpm_query_re().replace_all(&combined, "");
-    let combined = xtversion_query_re().replace_all(&combined, "");
-    let combined = da1_query_re().replace_all(&combined, "");
-    let combined = da2_query_re().replace_all(&combined, "");
-    let combined = kitty_keyboard_query_re().replace_all(&combined, "");
-    let combined = winsize_query_re.replace_all(&combined, "");
-
-    // 9. Strip APC sequences (e.g. Kitty graphics protocol queries/responses).
-    let combined = apc_full_re.replace_all(&combined, "");
-
-    // 10. Strip DCS sequences (e.g. DECRQSS responses, sixel data).
-    let filtered = dcs_full_re.replace_all(&combined, "").into_owned();
+    let filtered = dcs_full_re
+        .replace_all(&combined, b"" as &[u8])
+        .into_owned();
     if filtered.len() != chunk.len() + pending_before || pending.len() != pending_before {
         trace!(
             pending_before,
@@ -639,47 +694,56 @@ pub fn filter_cpr_chunk(pending: &mut String, chunk: &str) -> String {
     filtered
 }
 
-/// Detect a trailing partial APC (`\x1b_`) or DCS (`\x1bP`) sequence that
-/// has not yet been terminated by ST (`\x1b\\`).
-pub(crate) fn trailing_partial_apc_dcs_start(text: &str) -> Option<usize> {
-    ["\x1b_", "\x1bP"]
+/// Detect a trailing partial Application Program Command or Device Control
+/// String sequence that has not yet been terminated by a String Terminator.
+fn trailing_partial_apc_dcs_start_bytes(text: &[u8]) -> Option<usize> {
+    [b"\x1b_".as_slice(), b"\x1bP".as_slice()]
         .into_iter()
-        .filter_map(|prefix| text.rfind(prefix))
+        .filter_map(|prefix| rfind_bytes(text, prefix))
         .filter(|&start| {
-            // Only keep if there is no complete ST after this prefix.
-            !text[start + 2..].contains("\x1b\\")
+            !text[start + 2..]
+                .windows(2)
+                .any(|window| window == b"\x1b\\")
         })
         .min()
 }
 
-pub(crate) fn trailing_partial_osc_sequence_start(text: &str) -> Option<usize> {
-    ["\x1b]10;rgb:", "\x1b]11;rgb:", "]10;rgb:", "]11;rgb:"]
-        .into_iter()
-        .filter_map(|prefix| text.rfind(prefix))
-        .filter(|start| is_partial_osc_color_response(&text[*start..]))
-        .chain(
-            ["\x1b]", "]"]
-                .into_iter()
-                .filter_map(|prefix| text.rfind(prefix))
-                .filter(|start| is_partial_generic_osc_sequence(&text[*start..])),
-        )
-        .min()
+/// Detect the earliest trailing partial Operating System Command sequence that
+/// should be carried into the next chunk.
+fn trailing_partial_osc_sequence_start_bytes(text: &[u8]) -> Option<usize> {
+    [
+        b"\x1b]10;rgb:".as_slice(),
+        b"\x1b]11;rgb:".as_slice(),
+        b"]10;rgb:".as_slice(),
+        b"]11;rgb:".as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|prefix| rfind_bytes(text, prefix))
+    .filter(|start| is_partial_osc_color_response_bytes(&text[*start..]))
+    .chain(
+        [b"\x1b]".as_slice(), b"]".as_slice()]
+            .into_iter()
+            .filter_map(|prefix| rfind_bytes(text, prefix))
+            .filter(|start| is_partial_generic_osc_sequence_bytes(&text[*start..])),
+    )
+    .min()
 }
 
-pub(crate) fn is_partial_osc_color_response(candidate: &str) -> bool {
-    let bytes = candidate.as_bytes();
+/// Return `true` when `candidate` is an incomplete Operating System Command
+/// 10 or 11 color response prefix that must stay buffered.
+fn is_partial_osc_color_response_bytes(candidate: &[u8]) -> bool {
     let mut index = 0usize;
 
-    if bytes.first() == Some(&0x1b) {
+    if candidate.first() == Some(&0x1b) {
         index += 1;
     }
-    if bytes.get(index) != Some(&b']') {
+    if candidate.get(index) != Some(&b']') {
         return false;
     }
     index += 1;
 
     let rest = &candidate[index..];
-    let prefix_len = if rest.starts_with("10;rgb:") || rest.starts_with("11;rgb:") {
+    let prefix_len = if rest.starts_with(b"10;rgb:") || rest.starts_with(b"11;rgb:") {
         7
     } else {
         return false;
@@ -690,7 +754,7 @@ pub(crate) fn is_partial_osc_color_response(candidate: &str) -> bool {
     let mut hex_in_component = 0usize;
     let mut saw_hex = false;
 
-    while let Some(&byte) = bytes.get(index) {
+    while let Some(&byte) = candidate.get(index) {
         if byte.is_ascii_hexdigit() {
             if hex_in_component == 4 {
                 return false;
@@ -712,10 +776,10 @@ pub(crate) fn is_partial_osc_color_response(candidate: &str) -> bool {
             }
             0x07 => return false,
             0x1b => {
-                return if index + 1 == bytes.len() {
+                return if index + 1 == candidate.len() {
                     slash_count == 2 && saw_hex
                 } else {
-                    bytes.get(index + 1) != Some(&b'\\')
+                    candidate.get(index + 1) != Some(&b'\\')
                 };
             }
             b'\\' => return false,
@@ -725,20 +789,21 @@ pub(crate) fn is_partial_osc_color_response(candidate: &str) -> bool {
     true
 }
 
-pub(crate) fn is_partial_generic_osc_sequence(candidate: &str) -> bool {
-    let bytes = candidate.as_bytes();
+/// Return `true` when `candidate` is an incomplete generic Operating System
+/// Command sequence that must stay buffered.
+fn is_partial_generic_osc_sequence_bytes(candidate: &[u8]) -> bool {
     let mut index = 0usize;
 
-    if bytes.first() == Some(&0x1b) {
+    if candidate.first() == Some(&0x1b) {
         index += 1;
     }
-    if bytes.get(index) != Some(&b']') {
+    if candidate.get(index) != Some(&b']') {
         return false;
     }
     index += 1;
 
     let digits_start = index;
-    while let Some(&byte) = bytes.get(index) {
+    while let Some(&byte) = candidate.get(index) {
         if byte.is_ascii_digit() {
             index += 1;
             continue;
@@ -749,19 +814,19 @@ pub(crate) fn is_partial_generic_osc_sequence(candidate: &str) -> bool {
     if index == digits_start || index - digits_start > 3 {
         return false;
     }
-    if bytes.get(index) != Some(&b';') {
+    if candidate.get(index) != Some(&b';') {
         return false;
     }
     index += 1;
 
-    while let Some(&byte) = bytes.get(index) {
+    while let Some(&byte) = candidate.get(index) {
         match byte {
             0x07 => return false,
             0x1b => {
-                return if index + 1 == bytes.len() {
+                return if index + 1 == candidate.len() {
                     true
                 } else {
-                    bytes.get(index + 1) != Some(&b'\\')
+                    candidate.get(index + 1) != Some(&b'\\')
                 };
             }
             b'\\' => return false,
@@ -772,56 +837,87 @@ pub(crate) fn is_partial_generic_osc_sequence(candidate: &str) -> bool {
     true
 }
 
+/// Find the last occurrence of `needle` inside `haystack`.
+fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(haystack.len());
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
 // ---------------------------------------------------------------------------
 // has_visible_content
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when `text` contains at least one character that is
-/// visually rendered (i.e. not whitespace and not part of an ANSI/VT escape
-/// sequence). Used to avoid advancing the silence clock on chunks that
-/// contain only cursor-movement or redraw escape sequences.
-pub(crate) fn has_visible_content(text: &str) -> bool {
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip CSI/OSC/other escape sequences.
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
+/// Return `true` when `data` contains at least one visibly rendered byte,
+/// rather than only whitespace, control characters, or ANSI/VT escape
+/// sequences.
+///
+/// This is used to avoid advancing the silence clock on chunks that contain
+/// only cursor movement, redraw operations, or other control traffic.
+///
+/// The check is byte-oriented: any byte above 0x20 (except DEL 0x7f) that
+/// is outside a recognized escape sequence counts as visible.  Bytes >= 0x80
+/// are treated as visible because they are UTF-8 continuation/leader bytes
+/// for printable characters.
+pub(crate) fn has_visible_content(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b == 0x1b {
+            i += 1;
+            if i >= data.len() {
+                break;
+            }
+            match data[i] {
+                // CSI sequence — skip parameter bytes until final byte.
+                b'[' => {
+                    i += 1;
+                    while i < data.len() {
+                        let c = data[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
                             break;
                         }
                     }
                 }
                 // OSC (\x1b]), APC (\x1b_), DCS (\x1bP), PM (\x1b^)
                 // All terminated by ST (\x1b\\) or BEL (\x07).
-                Some(']') | Some('_') | Some('P') | Some('^') => {
-                    chars.next();
-                    let mut prev = '\0';
-                    for c in chars.by_ref() {
-                        if c == '\x07' {
+                b']' | b'_' | b'P' | b'^' => {
+                    i += 1;
+                    let mut prev = 0u8;
+                    while i < data.len() {
+                        let c = data[i];
+                        i += 1;
+                        if c == 0x07 {
                             break;
                         }
-                        if prev == '\x1b' && c == '\\' {
+                        if prev == 0x1b && c == b'\\' {
                             break;
                         }
                         prev = c;
                     }
                 }
                 _ => {
-                    chars.next();
+                    i += 1;
                 }
             }
-        } else if !ch.is_whitespace() && !ch.is_control() {
+        } else if b > 0x20 && b != 0x7f {
             return true;
+        } else {
+            i += 1;
         }
     }
     false
 }
 
-/// Filter CPR/DSR escape sequences from replay chunks and concatenate into
-/// a single buffer.  Used by both the IPC and WebSocket attach handlers.
+/// Filter terminal-response traffic from replay chunks and concatenate the
+/// cleaned bytes into one buffer for attach initialization.
+///
+/// This is used by both the inter-process communication and WebSocket attach
+/// handlers.
 pub fn collect_filtered_chunks(
     chunks: &[(u64, bytes::Bytes)],
     filter: &mut EscapeFilter,
@@ -843,38 +939,38 @@ mod tests {
 
     #[test]
     fn test_has_visible_content_plain_text() {
-        assert!(has_visible_content("hello"));
-        assert!(has_visible_content("$ "));
-        assert!(has_visible_content("Do you want to continue?"));
+        assert!(has_visible_content(b"hello"));
+        assert!(has_visible_content(b"$ "));
+        assert!(has_visible_content(b"Do you want to continue?"));
     }
 
     #[test]
     fn test_has_visible_content_empty_and_whitespace() {
-        assert!(!has_visible_content(""));
-        assert!(!has_visible_content("   "));
-        assert!(!has_visible_content("\t\n\r"));
+        assert!(!has_visible_content(b""));
+        assert!(!has_visible_content(b"   "));
+        assert!(!has_visible_content(b"\t\n\r"));
     }
 
     #[test]
     fn test_has_visible_content_pure_ansi_csi() {
         // Cursor movement escape sequences — no visible characters.
-        assert!(!has_visible_content("\x1b[2J"));
-        assert!(!has_visible_content("\x1b[1A\x1b[1A\x1b[2K"));
-        assert!(!has_visible_content("\x1b[H\x1b[2J\x1b[?25l"));
+        assert!(!has_visible_content(b"\x1b[2J"));
+        assert!(!has_visible_content(b"\x1b[1A\x1b[1A\x1b[2K"));
+        assert!(!has_visible_content(b"\x1b[H\x1b[2J\x1b[?25l"));
     }
 
     #[test]
     fn test_has_visible_content_ansi_with_text() {
         // ANSI wrapping around visible text → true.
-        assert!(has_visible_content("\x1b[32mOK\x1b[0m"));
-        assert!(has_visible_content("\x1b[1;31mError\x1b[0m"));
+        assert!(has_visible_content(b"\x1b[32mOK\x1b[0m"));
+        assert!(has_visible_content(b"\x1b[1;31mError\x1b[0m"));
     }
 
     #[test]
     fn test_has_visible_content_osc_sequences() {
         // OSC title sequence — no visible characters.
-        assert!(!has_visible_content("\x1b]0;my title\x07"));
-        assert!(!has_visible_content("\x1b]2;Terminal\x1b\\"));
+        assert!(!has_visible_content(b"\x1b]0;my title\x07"));
+        assert!(!has_visible_content(b"\x1b]2;Terminal\x1b\\"));
     }
 
     // -----------------------------------------------------------------------
@@ -883,27 +979,27 @@ mod tests {
 
     #[test]
     fn test_find_next_terminal_query_matches_osc_before_csi() {
-        let text = "before\x1b]10;?\x07middle\x1b[6nafter";
+        let text = b"before\x1b]10;?\x07middle\x1b[6nafter";
         let found = find_next_terminal_query(text, 0);
         assert_eq!(
             found,
-            Some((6, "\x1b]10;?\x07".len(), TerminalQuery::ForegroundColor))
+            Some((6, b"\x1b]10;?\x07".len(), TerminalQuery::ForegroundColor))
         );
     }
 
     #[test]
     fn test_terminal_query_tail_len_keeps_partial_osc_sequence() {
         assert_eq!(
-            terminal_query_tail_len("text\x1b]10;?\x1b"),
-            "\x1b]10;?\x1b".len()
+            terminal_query_tail_len(b"text\x1b]10;?\x1b"),
+            b"\x1b]10;?\x1b".len()
         );
     }
 
     #[test]
     fn test_terminal_query_tail_len_keeps_partial_decrpm_sequence() {
         assert_eq!(
-            terminal_query_tail_len("text\x1b[?2004$"),
-            "\x1b[?2004$".len()
+            terminal_query_tail_len(b"text\x1b[?2004$"),
+            b"\x1b[?2004$".len()
         );
     }
 
@@ -958,43 +1054,52 @@ mod tests {
         assert_eq!(xterm_color_to_rgb(255), (0xee, 0xee, 0xee));
     }
 
+    fn filter_text_chunk(pending: &mut Vec<u8>, chunk: &str) -> String {
+        String::from_utf8(filter_cpr_chunk_bytes(pending, chunk.as_bytes()))
+            .expect("test chunk should remain valid UTF-8 after filtering")
+    }
+
+    fn pending_text(pending: &[u8]) -> &str {
+        std::str::from_utf8(pending).expect("test pending bytes should remain valid UTF-8")
+    }
+
     #[test]
     fn test_filter_cpr_chunk_strips_generic_osc_sequences() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug\x07after";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_filter_cpr_chunk_keeps_partial_generic_osc_sequence_pending() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "before");
+        assert_eq!(filter_text_chunk(&mut pending, text), "before");
         assert_eq!(
-            pending,
+            pending_text(&pending),
             "\x1b]7;file://host/home/binwen/open-relay/target/debug"
         );
     }
 
     #[test]
     fn test_filter_cpr_chunk_strips_dsr_queries() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // CPR query \x1b[6n and DSR query \x1b[5n should be stripped.
         let text = "hello\x1b[6nworld\x1b[5n!";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "helloworld!");
+        assert_eq!(filter_text_chunk(&mut pending, text), "helloworld!");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_filter_cpr_chunk_strips_split_dsr_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // First chunk ends with partial sequence \x1b[6
         let text1 = "hello\x1b[6";
-        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
+        assert_eq!(filter_text_chunk(&mut pending, text1), "hello");
         // Second chunk completes the query with `n`
         let text2 = "nworld";
-        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+        assert_eq!(filter_text_chunk(&mut pending, text2), "world");
     }
 
     // -----------------------------------------------------------------------
@@ -1003,76 +1108,76 @@ mod tests {
 
     #[test]
     fn test_filter_strips_decrpm_queries() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b[?2004$pafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_strips_multiple_decrpm_queries() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "\x1b[?1016$p\x1b[?2027$p\x1b[?2004$pvisible";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "visible");
+        assert_eq!(filter_text_chunk(&mut pending, text), "visible");
     }
 
     #[test]
     fn test_filter_strips_xtversion_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b[>0qafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_strips_da1_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b[cafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_strips_da2_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b[>cafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_strips_kitty_keyboard_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b[?uafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_strips_private_dsr_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // \x1b[?996n is a private-mode DSR that the plain \x1b[\d+n regex misses.
         let text = "before\x1b[?996nafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_strips_winsize_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b[14tafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 
     #[test]
     fn test_filter_preserves_restore_cursor_csi_u() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // \x1b[u is "restore cursor position" — must NOT be stripped.
         // Only \x1b[?u (kitty keyboard query) should be stripped.
         let text = "before\x1b[uafter";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "before\x1b[uafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "before\x1b[uafter");
     }
 
     #[test]
     fn test_filter_strips_opencode_startup_queries() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // Simulates the query burst that opencode/bubbletea sends at startup.
         let text = "\x1b[>0q\x1b[?25l\x1b[s\x1b[?1016$p\x1b[?2027$p\x1b[?2031$p\x1b[?1004$p\x1b[?2004$p\x1b[?2026$p\x1b[?u\x1b[H\x1b[?1049hTUI_CONTENT";
-        let result = filter_cpr_chunk(&mut pending, text);
+        let result = filter_text_chunk(&mut pending, text);
         // Queries stripped, mode-setting commands and content preserved.
         assert!(
             result.contains("\x1b[?25l"),
@@ -1096,18 +1201,18 @@ mod tests {
 
     #[test]
     fn test_filter_strips_split_decrpm_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // First chunk ends with partial DECRPM: \x1b[?2004$
         let text1 = "hello\x1b[?2004$";
-        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
+        assert_eq!(filter_text_chunk(&mut pending, text1), "hello");
         // Second chunk completes the query with `p`
         let text2 = "pworld";
-        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+        assert_eq!(filter_text_chunk(&mut pending, text2), "world");
     }
 
     #[test]
     fn test_extract_query_uses_cursor_position() {
-        let mut tail = String::new();
+        let mut tail = Vec::new();
         let data = b"\x1b[6n";
         let responses = extract_query_responses_no_client(data, &mut tail, (7, 3));
         assert_eq!(responses.len(), 1);
@@ -1115,8 +1220,22 @@ mod tests {
     }
 
     #[test]
+    fn test_escape_filter_preserves_invalid_utf8_bytes() {
+        let mut filter = EscapeFilter::new();
+        let input = b"before\x80\x1b[6nafter\xff";
+        assert_eq!(filter.filter(input), b"before\x80after\xff");
+    }
+
+    #[test]
+    fn test_escape_filter_preserves_invalid_utf8_bytes_across_split_query() {
+        let mut filter = EscapeFilter::new();
+        assert_eq!(filter.filter(b"before\x80\x1b[6"), b"before\x80");
+        assert_eq!(filter.filter(b"nafter\xff"), b"after\xff");
+    }
+
+    #[test]
     fn test_extract_query_answers_device_attributes_and_xtversion() {
-        let mut tail = String::new();
+        let mut tail = Vec::new();
         let data = b"\x1b[c\x1b[>c\x1b[>0q";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
         assert_eq!(responses.len(), 3);
@@ -1135,10 +1254,10 @@ mod tests {
 
     #[test]
     fn test_extract_query_answers_split_da2_query() {
-        let mut tail = String::new();
+        let mut tail = Vec::new();
         let responses1 = extract_query_responses_no_client(b"hello\x1b[>", &mut tail, (1, 1));
         assert!(responses1.is_empty());
-        assert_eq!(tail, "\x1b[>");
+        assert_eq!(tail, b"\x1b[>");
 
         let responses2 = extract_query_responses_no_client(b"cworld", &mut tail, (1, 1));
         assert_eq!(responses2, vec![b"\x1b[>1;0;0c".to_vec()]);
@@ -1147,7 +1266,7 @@ mod tests {
 
     #[test]
     fn test_extract_query_answers_decrpm_and_kitty_keyboard_queries() {
-        let mut tail = String::new();
+        let mut tail = Vec::new();
         let data = b"\x1b[?2004$p\x1b[?u";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
         assert_eq!(
@@ -1162,69 +1281,186 @@ mod tests {
 
     #[test]
     fn test_filter_strips_kitty_graphics_apc_response() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b_Gi=31337;OK\x1b\\after";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_filter_strips_kitty_graphics_apc_query() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\after";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_filter_strips_dcs_sequence() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text = "before\x1bP>|xterm 388\x1b\\after";
-        assert_eq!(filter_cpr_chunk(&mut pending, text), "beforeafter");
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_filter_strips_split_apc_sequence() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         // First chunk ends with a partial APC sequence.
         let text1 = "hello\x1b_Gi=31337";
-        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
-        assert_eq!(pending, "\x1b_Gi=31337");
+        assert_eq!(filter_text_chunk(&mut pending, text1), "hello");
+        assert_eq!(pending_text(&pending), "\x1b_Gi=31337");
         // Second chunk completes the APC with ST.
         let text2 = ";OK\x1b\\world";
-        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+        assert_eq!(filter_text_chunk(&mut pending, text2), "world");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_filter_strips_split_dcs_sequence() {
-        let mut pending = String::new();
+        let mut pending = Vec::new();
         let text1 = "hello\x1bP>|xterm";
-        assert_eq!(filter_cpr_chunk(&mut pending, text1), "hello");
-        assert_eq!(pending, "\x1bP>|xterm");
+        assert_eq!(filter_text_chunk(&mut pending, text1), "hello");
+        assert_eq!(pending_text(&pending), "\x1bP>|xterm");
         let text2 = " 388\x1b\\world";
-        assert_eq!(filter_cpr_chunk(&mut pending, text2), "world");
+        assert_eq!(filter_text_chunk(&mut pending, text2), "world");
         assert!(pending.is_empty());
     }
 
     #[test]
     fn test_has_visible_content_apc_sequence() {
         // APC sequence should not count as visible content.
-        assert!(!has_visible_content("\x1b_Gi=31337;OK\x1b\\"));
+        assert!(!has_visible_content(b"\x1b_Gi=31337;OK\x1b\\"));
         assert!(!has_visible_content(
-            "\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+            b"\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
         ));
     }
 
     #[test]
     fn test_has_visible_content_dcs_sequence() {
-        assert!(!has_visible_content("\x1bP>|xterm 388\x1b\\"));
+        assert!(!has_visible_content(b"\x1bP>|xterm 388\x1b\\"));
     }
 
     #[test]
     fn test_has_visible_content_apc_with_surrounding_text() {
-        assert!(has_visible_content("hello\x1b_Gi=31337;OK\x1b\\"));
-        assert!(has_visible_content("\x1b_Gi=31337;OK\x1b\\world"));
+        assert!(has_visible_content(b"hello\x1b_Gi=31337;OK\x1b\\"));
+        assert!(has_visible_content(b"\x1b_Gi=31337;OK\x1b\\world"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_empty_input() {
+        let mut pending = Vec::new();
+        assert_eq!(filter_text_chunk(&mut pending, ""), "");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_empty_input_with_pending_fragment() {
+        let mut pending = b"\x1b[".to_vec();
+        // Pending alone is a partial CSI — stays pending.
+        assert_eq!(filter_cpr_chunk_bytes(&mut pending, b""), b"");
+        assert_eq!(pending, b"\x1b[");
+        // Completing the sequence strips it.
+        assert_eq!(filter_cpr_chunk_bytes(&mut pending, b"6n"), b"");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_dsr_ok_response() {
+        let mut pending = Vec::new();
+        // \x1b[0n is the "device OK" DSR response — should be stripped.
+        let text = "before\x1b[0nafter";
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_back_to_back_queries_no_interleaving_text() {
+        let mut pending = Vec::new();
+        let text = "\x1b[6n\x1b[5n\x1b[c\x1b[>c\x1b[>0q\x1b[?u\x1b[14t";
+        assert_eq!(filter_text_chunk(&mut pending, text), "");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_plain_text_fast_path() {
+        let mut pending = Vec::new();
+        // Plain text with no ESC, brackets, or BEL — hits the fast path.
+        let text = "Hello, world! 123 foo bar\nline two\ttab";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_decrpm_responses_multi_mode() {
+        // Multi-mode DECRPM query should produce one response per mode id.
+        let responses = decrpm_responses("2004;1016");
+        assert_eq!(
+            responses,
+            vec!["\x1b[?2004;2$y".to_string(), "\x1b[?1016;2$y".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_extract_query_multi_mode_decrpm() {
+        let mut tail = Vec::new();
+        let data = b"\x1b[?2004;1016$p";
+        let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
+        assert_eq!(
+            responses,
+            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?1016;2$y".to_vec(),]
+        );
+    }
+
+    #[test]
+    fn test_terminal_query_tail_len_no_partial() {
+        // No trailing escape fragment — tail length should be 0.
+        assert_eq!(terminal_query_tail_len(b"hello world"), 0);
+        assert_eq!(terminal_query_tail_len(b""), 0);
+    }
+
+    #[test]
+    fn test_find_next_terminal_query_no_match() {
+        assert_eq!(find_next_terminal_query(b"plain text", 0), None);
+        assert_eq!(find_next_terminal_query(b"", 0), None);
+    }
+
+    #[test]
+    fn test_collect_filtered_chunks_strips_across_chunks() {
+        let chunks: Vec<(u64, bytes::Bytes)> = vec![
+            (0, bytes::Bytes::from_static(b"hello\x1b[")),
+            (1, bytes::Bytes::from_static(b"6nworld")),
+        ];
+        let mut filter = EscapeFilter::new();
+        let result = collect_filtered_chunks(&chunks, &mut filter);
+        assert_eq!(result, b"helloworld");
+    }
+
+    #[test]
+    fn test_filter_preserves_sgr_color_sequences() {
+        let mut pending = Vec::new();
+        // SGR color codes must not be stripped.
+        let text = "\x1b[38;5;196mred\x1b[0m \x1b[48;2;0;128;255mblue bg\x1b[0m";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_da1_response() {
+        let mut pending = Vec::new();
+        // DA1 response echoed by ConPTY: \x1b[?62;1;2;6;22c
+        let text = "before\x1b[?62;1;2;6;22cafter";
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_strips_da2_response() {
+        let mut pending = Vec::new();
+        // DA2 response echoed by ConPTY: \x1b[>1;0;0c
+        let text = "before\x1b[>1;0;0cafter";
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
     }
 }

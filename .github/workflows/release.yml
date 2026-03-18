@@ -83,7 +83,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-          generate_release_notes: true
+          generate_release_notes: false
 
   update-homebrew-formula:
     name: update-homebrew-formula
