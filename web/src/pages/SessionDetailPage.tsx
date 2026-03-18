@@ -136,7 +136,6 @@ export default function SessionDetailPage() {
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
-  const isPointerDraggingRef = useRef(false)
   const [replaySpeed, setReplaySpeed] = useState(1)
   const [totalLines, setTotalLines] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
@@ -589,7 +588,16 @@ export default function SessionDetailPage() {
       setWsConnected(false)
       setWsConnecting(false)
     }
-  }, [mode, id, node, sessionReady, pushConnectTrace, setSearchParams, wsReconnectKey, enqueueTerminalOutput])
+  }, [
+    mode,
+    id,
+    node,
+    sessionReady,
+    pushConnectTrace,
+    setSearchParams,
+    wsReconnectKey,
+    enqueueTerminalOutput,
+  ])
 
   useEffect(() => {
     if (mode !== 'attach') setWsConnecting(false)
@@ -1066,30 +1074,6 @@ export default function SessionDetailPage() {
                   />
                 </div>
               </div>
-              <div
-                className="absolute sm:hidden right-0 top-0 bottom-0 w-10 bg-transparent"
-                style={{ touchAction: 'none' }}
-                onPointerDown={(e) => {
-                  isPointerDraggingRef.current = true;
-                  (e.target as HTMLElement).setPointerCapture(e.pointerId)
-                }}
-                onPointerUp={(e) => {
-                  isPointerDraggingRef.current = false;
-                  (e.target as HTMLElement).releasePointerCapture(e.pointerId)
-                }}
-                onPointerCancel={(e) => {
-                  isPointerDraggingRef.current = false;
-                  (e.target as HTMLElement).releasePointerCapture(e.pointerId)
-                }}
-                onPointerMove={(e) => {
-                  if (!isPointerDraggingRef.current) return;
-                  if (mode === 'logs') {
-                    handleScrubRef.current?.(Math.max(0, replayIdxRef.current + e.movementY * 2))
-                  } else {
-                    termRef?.current?.scrollLines(e.movementY)
-                  }
-                }}
-              ></div>
             </div>
 
             {/* Scrubber (logs mode) */}

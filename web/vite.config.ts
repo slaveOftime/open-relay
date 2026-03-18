@@ -28,12 +28,10 @@ export default defineConfig({
         ],
       },
       devOptions: {
-        enabled: true,
+        enabled: false,
       },
       workbox: {
-        navigateFallback: '/index.html',
-        navigateFallbackAllowlist: [/^\//],
-        navigateFallbackDenylist: [/^\/api\//, /^\/sw-push\.js$/],
+        globIgnores: ['**/index.html'],
         // Do NOT add runtimeCaching rules for /api/ routes.
         //
         // On iOS PWA (standalone mode) WebKit routes WebSocket upgrade requests
@@ -42,12 +40,11 @@ export default defineConfig({
         // adds inter-process latency or breaks the upgrade entirely because
         // window.fetch() cannot complete a protocol upgrade.
         //
+        // The daemon already serves index.html as the SPA fallback, so keeping
+        // HTML out of the precache avoids stale shell responses for / and lets
+        // dev HMR use the normal network path without a service worker in front.
         // Leaving no matching route for /api/ means Workbox never calls
-        // respondWith(), so the browser handles those requests natively — the
-        // same fast path used in normal iOS Safari.  The pattern below was
-        // previously attempted but the $ anchor excluded all URLs with query
-        // strings (?token=, ?node=, ...), silently falling through to the old
-        // NetworkFirst rule and breaking WS connections with those params.
+        // respondWith(), so the browser handles those requests natively.
         runtimeCaching: [],
       },
     }),
