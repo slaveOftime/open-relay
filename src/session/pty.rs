@@ -593,6 +593,19 @@ pub fn extract_query_responses_no_client(
 ///   Device Attributes, Kitty keyboard, and related queries)
 fn filter_cpr_chunk_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
     let pending_before = pending.len();
+
+    // Fast path: when no carried-over fragment exists and the chunk contains
+    // none of the bytes that begin strippable sequences, return verbatim.
+    // ESC (0x1b) starts all escape-prefixed patterns; `[` and `]` start the
+    // bare ConPTY variants; BEL (0x07) terminates some OSC sequences.
+    if pending_before == 0
+        && !chunk
+            .iter()
+            .any(|&b| b == 0x1b || b == b'[' || b == b']' || b == 0x07)
+    {
+        return chunk.to_vec();
+    }
+
     static FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let full_re = FULL_RE.get_or_init(|| regex::bytes::Regex::new(r"\x1b\[\??\d+;\d+R").unwrap());
 
@@ -1327,5 +1340,106 @@ mod tests {
     fn test_has_visible_content_apc_with_surrounding_text() {
         assert!(has_visible_content("hello\x1b_Gi=31337;OK\x1b\\"));
         assert!(has_visible_content("\x1b_Gi=31337;OK\x1b\\world"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional edge-case tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_filter_empty_input() {
+        let mut pending = Vec::new();
+        assert_eq!(filter_text_chunk(&mut pending, ""), "");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_empty_input_with_pending_fragment() {
+        let mut pending = b"\x1b[".to_vec();
+        // Pending alone is a partial CSI — stays pending.
+        assert_eq!(filter_cpr_chunk_bytes(&mut pending, b""), b"");
+        assert_eq!(pending, b"\x1b[");
+        // Completing the sequence strips it.
+        assert_eq!(filter_cpr_chunk_bytes(&mut pending, b"6n"), b"");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_strips_dsr_ok_response() {
+        let mut pending = Vec::new();
+        // \x1b[0n is the "device OK" DSR response — should be stripped.
+        let text = "before\x1b[0nafter";
+        assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
+    }
+
+    #[test]
+    fn test_filter_back_to_back_queries_no_interleaving_text() {
+        let mut pending = Vec::new();
+        let text = "\x1b[6n\x1b[5n\x1b[c\x1b[>c\x1b[>0q\x1b[?u\x1b[14t";
+        assert_eq!(filter_text_chunk(&mut pending, text), "");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_plain_text_fast_path() {
+        let mut pending = Vec::new();
+        // Plain text with no ESC, brackets, or BEL — hits the fast path.
+        let text = "Hello, world! 123 foo bar\nline two\ttab";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_decrpm_responses_multi_mode() {
+        // Multi-mode DECRPM query should produce one response per mode id.
+        let responses = decrpm_responses("2004;1016");
+        assert_eq!(
+            responses,
+            vec!["\x1b[?2004;2$y".to_string(), "\x1b[?1016;2$y".to_string(),]
+        );
+    }
+
+    #[test]
+    fn test_extract_query_multi_mode_decrpm() {
+        let mut tail = String::new();
+        let data = b"\x1b[?2004;1016$p";
+        let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
+        assert_eq!(
+            responses,
+            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?1016;2$y".to_vec(),]
+        );
+    }
+
+    #[test]
+    fn test_terminal_query_tail_len_no_partial() {
+        // No trailing escape fragment — tail length should be 0.
+        assert_eq!(terminal_query_tail_len("hello world"), 0);
+        assert_eq!(terminal_query_tail_len(""), 0);
+    }
+
+    #[test]
+    fn test_find_next_terminal_query_no_match() {
+        assert_eq!(find_next_terminal_query("plain text", 0), None);
+        assert_eq!(find_next_terminal_query("", 0), None);
+    }
+
+    #[test]
+    fn test_collect_filtered_chunks_strips_across_chunks() {
+        let chunks: Vec<(u64, bytes::Bytes)> = vec![
+            (0, bytes::Bytes::from_static(b"hello\x1b[")),
+            (1, bytes::Bytes::from_static(b"6nworld")),
+        ];
+        let mut filter = EscapeFilter::new();
+        let result = collect_filtered_chunks(&chunks, &mut filter);
+        assert_eq!(result, b"helloworld");
+    }
+
+    #[test]
+    fn test_filter_preserves_sgr_color_sequences() {
+        let mut pending = Vec::new();
+        // SGR color codes must not be stripped.
+        let text = "\x1b[38;5;196mred\x1b[0m \x1b[48;2;0;128;255mblue bg\x1b[0m";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
     }
 }
