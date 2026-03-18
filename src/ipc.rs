@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerOptions,
@@ -42,7 +42,12 @@ pub fn bind(config: &AppConfig) -> io::Result<Listener> {
     } else {
         let socket_file = config.socket_file.to_string_lossy().to_string();
         let name = socket_file.as_str().to_fs_name::<GenericFilePath>()?;
-        ListenerOptions::new().name(name).create_tokio()
+        ListenerOptions::new()
+            .name(name)
+            .reclaim_name(true)
+            .try_overwrite(true)
+            .max_spin_time(Duration::from_millis(250))
+            .create_tokio()
     }
 }
 
