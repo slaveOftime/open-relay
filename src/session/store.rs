@@ -940,7 +940,7 @@ impl SessionStore {
     /// and output epoch.
     pub fn silent_candidates(
         &self,
-        suppression_window: Duration,
+        attach_suppression_window: Duration,
         min_notification_interval: Duration,
     ) -> Vec<SilentCandidate> {
         let now = Instant::now();
@@ -957,7 +957,11 @@ impl SessionStore {
                 // if there was attach activity in recent supression window.
                 // Because normally every input may cause some output, which should not be notified in short time.
                 if let Some(last_attach_activity) = snapshot.last_attach_activity_at {
-                    if now.duration_since(last_attach_activity) < suppression_window {
+                    if now.duration_since(last_attach_activity) < attach_suppression_window {
+                        // suppress notification and reset last_output_at to prevent repeated notifications
+                        // for the same output epoch after attach activity.
+                        let mut rt = runtime.runtime.lock().ok()?;
+                        rt.last_output_at = None;
                         return None;
                     }
                 }
