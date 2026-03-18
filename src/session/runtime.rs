@@ -423,7 +423,7 @@ pub fn spawn_session(
         }
         let mut buf = [0u8; 4096];
         let mut reader = reader;
-        let mut query_tail = String::new();
+        let mut query_tail = Vec::new();
         let mut cursor_tracker = CursorTracker::new(rows, cols);
         let mut persist_filter = EscapeFilter::new();
         loop {
@@ -467,7 +467,7 @@ pub fn spawn_session(
                         }
                     }
 
-                    let has_visible_output = has_visible_content(&String::from_utf8_lossy(&data));
+                    let has_visible_output = has_visible_content(&data);
                     let filtered_for_persist = persist_filter.filter(&data);
 
                     // Update in-memory ring + mode tracking (brief lock).
