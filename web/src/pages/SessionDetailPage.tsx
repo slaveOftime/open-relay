@@ -1070,7 +1070,7 @@ export default function SessionDetailPage() {
                     ref={termRef}
                     onData={mode === 'attach' ? sendInput : undefined}
                     onResize={mode === 'attach' ? handleTermResize : undefined}
-                    className="h-full"
+                    className="h-full min-w-full"
                   />
                 </div>
               </div>
