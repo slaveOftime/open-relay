@@ -347,18 +347,18 @@ impl RawModeGuard {
         //  \x1b[?1000l .. \x1b[?2004l  - disable mouse and bracketed-paste
         //                 modes the app may have enabled (belt-and-suspenders
         //                 alongside crossterm's DisableBracketedPaste below)
-        //  \x1b[J       - clear from cursor to end of display.  After
-        //                 exiting the child's altscreen the cursor is where
-        //                 it was when the child entered altscreen, so this
-        //                 erases any startup residue below.  For non-TUI
-        //                 children the cursor is already at the end of
-        //                 output, so this is a harmless no-op.
-        //  \r\n         - move to column 0 on a fresh line so the post-attach
-        //                 status message starts cleanly regardless of where
-        //                 the child left the cursor.
+        //  \x1b[H\x1b[2J - home cursor then erase entire display.  On
+        //                 modern terminals (VTE, xterm, kitty, Windows
+        //                 Terminal) ED 2 pushes the visible content into
+        //                 scrollback, so session output remains accessible
+        //                 via scroll-up.  This gives the post-detach status
+        //                 message and shell prompt a clean screen.  For TUI
+        //                 children, \x1b[?1049l already restored the main
+        //                 screen, so this clears any leftover startup
+        //                 residue that was on main before altscreen entry.
         let normalize: &[u8] = b"\x1b[?1049l\x1b[!p\x1b[0m\x1b[?25h\x1b[0 q\
             \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\
-            \x1b[J\r\n";
+            \x1b[H\x1b[2J";
         if let Err(err) = stdout.write_all(normalize) {
             if first_error.is_none() {
                 first_error = Some(err.into());
