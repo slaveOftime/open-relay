@@ -1,7 +1,6 @@
 use std::io::{IsTerminal, Write};
 
 use crossterm::{
-    cursor,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyCode,
         KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -92,12 +91,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     let mut detached = false;
     let mut stream_error: Option<AppError> = None;
     {
-        let mut raw_mode = RawModeGuard::new()?;
-        // Use the terminal's alternate screen buffer so that TUI draw
-        // commands (cursor positioning, color etc.) never touch the main
-        // screen or scrollback.  The main screen and its history are fully
-        // restored when we leave the alternate screen on teardown.
-        raw_mode.enter_alternate_screen()?;
+        let _raw_mode = RawModeGuard::new()?;
 
         // Initial resize + render.
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
@@ -112,6 +106,18 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         )
         .await?;
 
+        // Clear the visible screen and home the cursor before writing
+        // replay data.  The replay contains raw PTY output whose cursor
+        // positioning (absolute and relative) was calculated from row 1,
+        // col 1.  Without this clear, the replay starts from wherever the
+        // terminal cursor happens to be, offsetting all subsequent cursor
+        // operations and causing line-editing (backspace, arrow keys) in
+        // REPLs to target the wrong screen position.
+        //
+        // Most modern terminals push the visible content into scrollback
+        // on ED 2, so previous history remains scrollable.
+        write_bytes_to_stdout(b"\x1b[H\x1b[2J")?;
+
         // Write the initial replay bytes directly — the daemon has already
         // stripped CPR/DSR responses via EscapeFilter, so no further
         // processing is needed.  Writing raw bytes preserves all cursor-
@@ -120,15 +126,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         write_bytes_to_stdout(&initial_data)?;
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
-        // Drain any stale resize events queued by entering the alternate
-        // screen buffer and writing replay data before the main event loop.
+        // Drain any stale resize events queued by writing replay data
+        // before the main event loop.
         let _ = drain_pending_terminal_events();
-
-        // Grace period: ignore Event::Resize within this window to avoid
-        // stale resize events from the alternate screen switch or replay
-        // data (e.g. cursor positioning sequences that transiently affect
-        // the ConPTY buffer size on Windows).
-        let attach_started_at = std::time::Instant::now();
 
         // `read_response_from_reader` uses `read_line`, which is not safe to
         // keep cancelling with timeouts. Read daemon frames in a dedicated task
@@ -172,15 +172,8 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         .await?
                     }
                     Event::Resize(cols, rows) => {
-                        // Skip resize events that arrive shortly after
-                        // attach — these are artifacts from entering the
-                        // alternate screen buffer and writing replay data.
-                        if attach_started_at.elapsed() < std::time::Duration::from_millis(500) {
-                            continue;
-                        }
                         // Re-read the actual terminal size — the event may
-                        // carry stale dimensions (e.g. after entering the
-                        // alternate screen buffer on Windows/ConPTY).
+                        // carry stale dimensions on some platforms.
                         let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
                         if (actual_cols, actual_rows) != last_sent_size {
                             last_sent_size = (actual_cols, actual_rows);
@@ -308,12 +301,11 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 }
 
 // ---------------------------------------------------------------------------
-// RawModeGuard - RAII for terminal raw mode + optional alternate screen
+// RawModeGuard - RAII for terminal raw mode
 // ---------------------------------------------------------------------------
 
 pub struct RawModeGuard {
     cleaned_up: bool,
-    alternate_screen: bool,
 }
 
 impl RawModeGuard {
@@ -323,27 +315,7 @@ impl RawModeGuard {
         // Event::Paste rather than being injected as individual key events
         // (which would fire Enter after each line).
         let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-        Ok(Self {
-            cleaned_up: false,
-            alternate_screen: false,
-        })
-    }
-
-    #[allow(dead_code)]
-    pub fn enter_alternate_screen(&mut self) -> Result<()> {
-        if self.alternate_screen {
-            return Ok(());
-        }
-        let mut stdout = std::io::stdout();
-        execute!(
-            stdout,
-            terminal::EnterAlternateScreen,
-            cursor::MoveTo(0, 0),
-            terminal::Clear(terminal::ClearType::All)
-        )?;
-        stdout.flush()?;
-        self.alternate_screen = true;
-        Ok(())
+        Ok(Self { cleaned_up: false })
     }
 
     pub fn teardown_terminal(&mut self) -> Result<()> {
@@ -362,20 +334,31 @@ impl RawModeGuard {
         // entered its own alternate screen, changed cursor-key mode, enabled
         // mouse tracking, etc.  We undo all of that:
         //
-        //  \x1b[?1049l  - leave alternate screen (no-op if already on main)
+        //  \x1b[?1049l  - leave alternate screen (no-op if already on main).
+        //                 For TUI children this restores the main screen;
+        //                 for non-TUI children (REPLs, shells) this is a
+        //                 no-op and their output stays in scrollback.
         //  \x1b[!p      - DECSTR soft terminal reset (resets DECCKM, DECOM,
         //                 DECAWM, scroll region, etc. without clearing screen)
         //  \x1b[0m      - SGR reset (colors / bold / etc.)
         //  \x1b[?25h    - ensure cursor is visible
+        //  \x1b[0 q     - reset cursor style to terminal default (restores
+        //                 blinking); DECSCUSR with param 0
         //  \x1b[?1000l .. \x1b[?2004l  - disable mouse and bracketed-paste
         //                 modes the app may have enabled (belt-and-suspenders
         //                 alongside crossterm's DisableBracketedPaste below)
-        //
-        // We deliberately do NOT reposition the cursor: after leaving altscreen
-        // the cursor is where the main-screen left it (correct), and if we
-        // were already on main screen the shell will handle its own prompt.
-        let normalize: &[u8] = b"\x1b[?1049l\x1b[!p\x1b[0m\x1b[?25h\
-            \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+        //  \x1b[H\x1b[2J - home cursor then erase entire display.  On
+        //                 modern terminals (VTE, xterm, kitty, Windows
+        //                 Terminal) ED 2 pushes the visible content into
+        //                 scrollback, so session output remains accessible
+        //                 via scroll-up.  This gives the post-detach status
+        //                 message and shell prompt a clean screen.  For TUI
+        //                 children, \x1b[?1049l already restored the main
+        //                 screen, so this clears any leftover startup
+        //                 residue that was on main before altscreen entry.
+        let normalize: &[u8] = b"\x1b[?1049l\x1b[!p\x1b[0m\x1b[?25h\x1b[0 q\
+            \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\
+            \x1b[H\x1b[2J";
         if let Err(err) = stdout.write_all(normalize) {
             if first_error.is_none() {
                 first_error = Some(err.into());
