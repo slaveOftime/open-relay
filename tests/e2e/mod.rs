@@ -271,7 +271,10 @@ pub fn fetch_logs(tmp: &PathBuf, id: &str) -> String {
 }
 
 pub fn normalize_log_text(log: &str) -> String {
-    log.replace("\r\n", "\n").replace('\r', "\n")
+    log.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end_matches('\n')
+        .to_string()
 }
 
 pub fn wait_for_log(

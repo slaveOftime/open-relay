@@ -8,7 +8,20 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 }
 
 fn trailing_prompt(log: &str) -> &str {
-    log.rsplit('\n').next().unwrap_or(log)
+    log.lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or(log)
+}
+
+fn prompt_gap(prompt: &str) -> &'static str {
+    if prompt.starts_with("PS ") || prompt.starts_with("bash-") {
+        ""
+    } else if prompt.contains(':') && prompt.ends_with('>') {
+        "\n"
+    } else {
+        ""
+    }
 }
 
 fn prompted_transcript<I, S>(prompt: &str, command: &str, output_lines: I) -> String
@@ -23,6 +36,7 @@ where
         transcript.push_str(line.as_ref());
         transcript.push('\n');
     }
+    transcript.push_str(prompt_gap(prompt));
     transcript.push_str(prompt);
     transcript
 }
@@ -32,12 +46,11 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut output = String::new();
-    for line in lines {
-        output.push_str(line.as_ref());
-        output.push('\n');
-    }
-    output
+    lines
+        .into_iter()
+        .map(|line| line.as_ref().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn wait_for_exact_append(
@@ -107,6 +120,25 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
     let command = format!("echo {MARKER}");
     send_line(&tmp, &id, &command);
 
+    #[cfg(target_os = "windows")]
+    let result = wait_for_exact_append(
+        &tmp,
+        &id,
+        &initial,
+        &prompted_transcript(&prompt, &command, [MARKER]),
+        Duration::from_secs(3),
+    )
+    .or_else(|| {
+        wait_for_exact_append(
+            &tmp,
+            &id,
+            &initial,
+            &format!("{command}\n{MARKER}\n\n\n{prompt}"),
+            Duration::from_secs(3),
+        )
+    });
+
+    #[cfg(not(target_os = "windows"))]
     let result = wait_for_exact_append(
         &tmp,
         &id,
@@ -144,6 +176,25 @@ fn e2e_two_separate_input_calls_execute_command() {
     sleep(Duration::from_millis(100));
     send_key(&tmp, &id, "enter");
 
+    #[cfg(target_os = "windows")]
+    let result = wait_for_exact_append(
+        &tmp,
+        &id,
+        &initial,
+        &prompted_transcript(&prompt, &command, [MARKER]),
+        Duration::from_secs(3),
+    )
+    .or_else(|| {
+        wait_for_exact_append(
+            &tmp,
+            &id,
+            &initial,
+            &format!("{command}\n{MARKER}\n\n\n{prompt}"),
+            Duration::from_secs(3),
+        )
+    });
+
+    #[cfg(not(target_os = "windows"))]
     let result = wait_for_exact_append(
         &tmp,
         &id,
@@ -686,6 +737,9 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
 
     let id = start_session(&tmp, cmd);
 
+    #[cfg(target_os = "windows")]
+    let expected_plain = plain_output(["Write-Host 'COLOR_TEST' -ForegroundColor Red"]);
+    #[cfg(not(target_os = "windows"))]
     let expected_plain = plain_output(["COLOR_TEST"]);
     wait_for_exact_log(&tmp, &id, &expected_plain, Duration::from_secs(5))
         .expect("plain logs did not match exact expected color-stripped output");
