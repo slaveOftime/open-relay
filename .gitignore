@@ -3,6 +3,7 @@ node_modules
 /tmp
 /target
 /target-test
+/target-tests
 /web/dist
 /web/dev-dist
 test-results
