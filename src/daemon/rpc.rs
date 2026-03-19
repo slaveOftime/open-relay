@@ -1,10 +1,5 @@
 use interprocess::local_socket::tokio::Stream;
-use std::{
-    collections::VecDeque,
-    fs::File,
-    io::{BufRead, BufReader as StdBufReader},
-    sync::Arc,
-};
+use std::sync::Arc;
 use tokio::{io::BufReader, sync::mpsc};
 use tracing::info;
 
@@ -19,7 +14,7 @@ use crate::{
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
-        logs::{read_persisted_log_page, read_resize_events},
+        logs::{read_persisted_log_page, read_resize_events, render_log_file},
     },
 };
 
@@ -143,17 +138,18 @@ async fn dispatch_request(
             handle_stop(id, grace_seconds, session_store).await
         }
         RpcRequest::Kill { id } => handle_kill(id, session_store).await,
-        RpcRequest::LogsSnapshot { id, tail } => {
-            handle_logs_snapshot(id, tail, session_store, db).await
-        }
+        RpcRequest::LogsTail {
+            id,
+            tail,
+            term_cols,
+            keep_color,
+        } => handle_logs_tail(id, tail, term_cols, keep_color, db).await,
         RpcRequest::LogsPagination { id, offset, limit } => {
             handle_logs_pagination(id, offset, limit, db).await
         }
-        RpcRequest::LogsWait {
-            id,
-            tail,
-            timeout_secs,
-        } => handle_logs_wait(id, tail, timeout_secs, session_store, notification_tx, db).await,
+        RpcRequest::LogsWait { id, timeout_secs } => {
+            handle_logs_wait(id, timeout_secs, session_store, notification_tx, db).await
+        }
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
         }
@@ -254,17 +250,49 @@ async fn handle_kill(id: String, session_store: &SessionStoreHandle) -> RpcRespo
     }
 }
 
-async fn handle_logs_snapshot(
+async fn handle_logs_tail(
     id: String,
     tail: usize,
-    session_store: &SessionStoreHandle,
+    term_cols: u16,
+    keep_color: bool,
     db: &Arc<Database>,
 ) -> RpcResponse {
-    match read_logs_snapshot(&id, tail, session_store, db).await {
-        Some((lines, _running, resizes)) => RpcResponse::LogsSnapshot { lines, resizes },
-        None => RpcResponse::Error {
-            message: format!("session not found: {id}"),
-        },
+    let session_dir = match db.get_session_dir(&id).await {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return RpcResponse::Error {
+                message: format!("session not found: {id}"),
+            };
+        }
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    let log_path = session_dir.join("output.log");
+    let lines = match render_log_file(&log_path, tail, keep_color, term_cols, None) {
+        Ok(output) => output,
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    let resizes = match read_resize_events(&session_dir) {
+        Ok(resizes) => resizes,
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    RpcResponse::LogsTail {
+        output: lines,
+        resizes,
     }
 }
 
@@ -305,127 +333,48 @@ async fn handle_logs_pagination(
 
 async fn handle_logs_wait(
     id: String,
-    tail: usize,
     timeout_secs: u64,
     session_store: &SessionStoreHandle,
     notification_tx: &NotificationTx,
     db: &Arc<Database>,
 ) -> RpcResponse {
-    use crate::notification::event::NotificationKind;
+    if let Err(err) = db.get_session_dir(&id).await {
+        return RpcResponse::Error {
+            message: err.to_string(),
+        };
+    }
 
+    if !session_store.is_running(&id) || timeout_secs == 0 {
+        return RpcResponse::Empty;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut notify_rx = notification_tx.subscribe();
-    let initial = read_logs_snapshot(&id, tail, session_store, db).await;
 
-    match initial {
-        None => RpcResponse::Error {
-            message: format!("session not found: {id}"),
-        },
-        Some((mut lines, mut running, mut resizes)) => {
-            if !running {
-                return RpcResponse::LogsSnapshot { lines, resizes };
-            }
+    'wait: loop {
+        if tokio::time::Instant::now() >= deadline {
+            break 'wait;
+        }
 
-            let deadline = if timeout_secs == 0 {
-                None
-            } else {
-                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
-            };
-
-            'wait: loop {
-                if let Some(dl) = deadline {
-                    if tokio::time::Instant::now() >= dl {
-                        break 'wait;
-                    }
-                }
-
-                tokio::select! {
-                    biased;
-                    notif = notify_rx.recv() => {
-                        match notif {
-                            Ok(event) => {
-                                if matches!(event.kind, NotificationKind::InputNeeded)
-                                    && event.session_ids.iter().any(|s| s == &id)
-                                {
-                                    break 'wait;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
-                        }
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        let updated = read_logs_snapshot(&id, tail, session_store, db).await;
-                        if let Some((l, r, rs)) = updated {
-                            lines = l;
-                            running = r;
-                            resizes = rs;
-                        }
-                        if !running {
+        tokio::select! {
+            biased;
+            notif = notify_rx.recv() => {
+                match notif {
+                    Ok(event) => {
+                        if matches!(event.kind, crate::notification::event::NotificationKind::InputNeeded)
+                            && event.session_ids.iter().any(|s| s == &id)
+                        {
                             break 'wait;
                         }
-                        if let Some(dl) = deadline {
-                            if tokio::time::Instant::now() >= dl {
-                                break 'wait;
-                            }
-                        }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
                 }
             }
-
-            if let Some((l, _r, rs)) = read_logs_snapshot(&id, tail, session_store, db).await {
-                lines = l;
-                resizes = rs;
-            }
-
-            RpcResponse::LogsSnapshot { lines, resizes }
         }
     }
-}
 
-async fn read_logs_snapshot(
-    id: &str,
-    tail: usize,
-    session_store: &SessionStoreHandle,
-    db: &Arc<Database>,
-) -> Option<(Vec<String>, bool, Vec<crate::protocol::LogResize>)> {
-    let session_dir = db.get_session_dir(id).await.ok().flatten()?;
-    let lines = read_persisted_tail_lines(&session_dir, tail)?;
-    let resizes = read_resize_events(&session_dir).unwrap_or_default();
-    let running = session_store.is_running(id);
-    Some((lines, running, resizes))
-}
-
-fn read_persisted_tail_lines(session_dir: &std::path::Path, tail: usize) -> Option<Vec<String>> {
-    let file = match File::open(session_dir.join("output.log")) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(_) => return None,
-    };
-    if tail == 0 {
-        return Some(Vec::new());
-    }
-
-    let mut reader = StdBufReader::new(file);
-    let mut lines = VecDeque::with_capacity(tail);
-
-    loop {
-        let mut buf = String::new();
-        let bytes_read = reader.read_line(&mut buf).ok()?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        if !buf.ends_with('\n') {
-            buf.push('\n');
-        }
-
-        if lines.len() == tail {
-            lines.pop_front();
-        }
-        lines.push_back(buf);
-    }
-
-    Some(lines.into_iter().collect())
+    RpcResponse::Empty
 }
 
 async fn handle_api_key_add(name: String, db: &Arc<Database>) -> RpcResponse {
@@ -535,80 +484,4 @@ async fn handle_join_list(
     };
 
     RpcResponse::JoinList { joins }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::read_logs_snapshot;
-    use crate::{
-        db::Database,
-        session::{SessionMeta, SessionStatus, SessionStore},
-    };
-    use chrono::Utc;
-    use std::{fs, path::PathBuf, sync::Arc};
-
-    async fn make_test_db() -> (Arc<Database>, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("oly_rpc_logs_{}", uuid::Uuid::new_v4()));
-        let sessions_dir = root.join("sessions");
-        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let db_path = root.join("test.db");
-        let db = Arc::new(
-            Database::open(&db_path, sessions_dir.clone())
-                .await
-                .expect("open test db"),
-        );
-        (db, root, sessions_dir)
-    }
-
-    #[tokio::test]
-    async fn read_logs_snapshot_reads_persisted_files() {
-        let (db, root, sessions_dir) = make_test_db().await;
-        let store = Arc::new(SessionStore::new(900, Arc::clone(&db)));
-        let meta = SessionMeta {
-            id: "abc1234".to_string(),
-            title: None,
-            command: "cmd".to_string(),
-            args: vec![],
-            cwd: None,
-            created_at: Utc::now(),
-            started_at: Some(Utc::now()),
-            ended_at: None,
-            status: SessionStatus::Stopped,
-            pid: None,
-            exit_code: Some(0),
-        };
-        db.insert_session(&meta).await.expect("insert session");
-
-        let session_dir = sessions_dir.join(&meta.id);
-        fs::create_dir_all(&session_dir).expect("create session dir");
-        fs::write(
-            session_dir.join("output.log"),
-            b"disk line 1\ndisk line 2\ndisk line 3\n",
-        )
-        .expect("write output log");
-        fs::write(
-            session_dir.join("events.log"),
-            b"resize offset=12 rows=40 cols=120\n",
-        )
-        .expect("write events log");
-
-        let (lines, running, resizes) = read_logs_snapshot("abc1234", 2, &store, &db)
-            .await
-            .expect("read logs snapshot");
-
-        assert_eq!(lines, vec!["disk line 2\n", "disk line 3\n"]);
-        assert!(!running);
-        assert_eq!(
-            resizes,
-            vec![crate::protocol::LogResize {
-                offset: 12,
-                rows: 40,
-                cols: 120,
-            }]
-        );
-
-        drop(store);
-        drop(db);
-        let _ = fs::remove_dir_all(root);
-    }
 }

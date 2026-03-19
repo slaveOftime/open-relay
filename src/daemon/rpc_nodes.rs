@@ -184,7 +184,7 @@ async fn connect_and_relay(
                                     | RpcRequest::Stop { .. }
                                     | RpcRequest::Kill { .. }
                                     | RpcRequest::LogsWait { .. }
-                                    | RpcRequest::LogsSnapshot { .. }
+                                    | RpcRequest::LogsTail { .. }
                                     | RpcRequest::LogsPagination { .. } => r,
                                     _ => {
                                         warn!(%id, request_type = r.name(), "unsupported proxied RPC method");

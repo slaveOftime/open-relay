@@ -25,7 +25,6 @@ pub async fn run_logs(
         eprintln!("Waiting for session {id} to need input…");
         let inner = RpcRequest::LogsWait {
             id: id.to_string(),
-            tail,
             timeout_secs,
         };
         let req = if let Some(ref node_name) = node {
@@ -39,29 +38,32 @@ pub async fn run_logs(
         let _ = ipc::send_request(config, req).await;
     }
 
+    let term_cols = if no_truncate {
+        u16::MAX
+    } else {
+        terminal::size().map(|(w, _)| w).unwrap_or(80)
+    };
+
     if let Some(node_name) = node {
         // Remote logs via IPC NodeProxy.
-        let inner = RpcRequest::LogsSnapshot {
+        let inner = RpcRequest::LogsTail {
             id: id.to_string(),
             tail,
+            keep_color,
+            term_cols,
         };
         let req = RpcRequest::NodeProxy {
             node: node_name,
             inner: Box::new(inner),
         };
         return match ipc::send_request(config, req).await? {
-            RpcResponse::LogsSnapshot { lines, .. } => {
-                for line in lines {
-                    println!("{line}");
-                }
-                Ok(())
-            }
+            RpcResponse::LogsTail { output, .. } => print_log_output(output, keep_color),
             RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
             _ => Err(AppError::Protocol("unexpected response type".to_string())),
         };
     }
 
-    run_logs_local(config, id, tail, keep_color, no_truncate).await
+    run_logs_local(config, id, tail, keep_color, term_cols).await
 }
 
 async fn run_logs_local(
@@ -69,7 +71,7 @@ async fn run_logs_local(
     id: &str,
     tail: usize,
     keep_color: bool,
-    no_truncate: bool,
+    term_cols: u16,
 ) -> Result<()> {
     let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
     let session_dir = match db.get_session_dir(id).await? {
@@ -85,14 +87,12 @@ async fn run_logs_local(
         )));
     }
 
-    let term_cols = if no_truncate {
-        u16::MAX
-    } else {
-        terminal::size().map(|(w, _)| w).unwrap_or(80)
-    };
-
     let output = render_log_file(&log_path, tail, keep_color, term_cols, None)?;
 
+    print_log_output(output, keep_color)
+}
+
+fn print_log_output(output: Vec<u8>, keep_color: bool) -> Result<()> {
     let _reset_guard = crate::terminal_guards::ColorfulGuard::new(keep_color);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

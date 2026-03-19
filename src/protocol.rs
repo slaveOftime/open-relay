@@ -86,9 +86,11 @@ pub enum RpcRequest {
     Kill {
         id: String,
     },
-    LogsSnapshot {
+    LogsTail {
         id: String,
         tail: usize,
+        keep_color: bool,
+        term_cols: u16,
     },
     LogsPagination {
         id: String,
@@ -96,10 +98,9 @@ pub enum RpcRequest {
         limit: usize,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
-    /// times out), then return a snapshot.  Response is `LogsSnapshot`.
+    /// times out), then return a snapshot.  Response is `LogsTail`.
     LogsWait {
         id: String,
-        tail: usize,
         timeout_secs: u64,
     },
     // ── Node federation ──────────────────────────────────────────────────────
@@ -150,7 +151,7 @@ impl RpcRequest {
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Kill { .. } => "kill",
-            RpcRequest::LogsSnapshot { .. } => "logs_snapshot",
+            RpcRequest::LogsTail { .. } => "logs_tail",
             RpcRequest::LogsPagination { .. } => "logs_pagination",
             RpcRequest::LogsWait { .. } => "logs_wait",
             RpcRequest::NodeProxy { .. } => "node_proxy",
@@ -168,6 +169,7 @@ impl RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
+    Empty,
     Health {
         daemon_pid: u32,
     },
@@ -222,8 +224,8 @@ pub enum RpcResponse {
     Kill {
         killed: bool,
     },
-    LogsSnapshot {
-        lines: Vec<String>,
+    LogsTail {
+        output: Vec<u8>,
         #[serde(default)]
         resizes: Vec<LogResize>,
     },
