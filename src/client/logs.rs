@@ -92,19 +92,11 @@ async fn run_logs_local(
     };
 
     let output = render_log_file(&log_path, tail, keep_color, term_cols, None)?;
-    write_rendered_output(&output, keep_color)
-}
 
-/// Write the rendered CLI log output to stdout.
-///
-/// When color output is enabled, emit a final ANSI reset so styles do not
-/// leak into subsequent terminal output.
-fn write_rendered_output(output: &[u8], keep_color: bool) -> Result<()> {
     let _reset_guard = crate::terminal_guards::ColorfulGuard::new(keep_color);
-
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    out.write_all(output)?;
+    out.write_all(&output)?;
 
     Ok(())
 }

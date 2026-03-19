@@ -90,9 +90,10 @@ pub enum RpcRequest {
         id: String,
         tail: usize,
     },
-    LogsPoll {
+    LogsPagination {
         id: String,
-        cursor: u64,
+        offset: usize,
+        limit: usize,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
     /// times out), then return a snapshot.  Response is `LogsSnapshot`.
@@ -150,7 +151,7 @@ impl RpcRequest {
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Kill { .. } => "kill",
             RpcRequest::LogsSnapshot { .. } => "logs_snapshot",
-            RpcRequest::LogsPoll { .. } => "logs_poll",
+            RpcRequest::LogsPagination { .. } => "logs_pagination",
             RpcRequest::LogsWait { .. } => "logs_wait",
             RpcRequest::NodeProxy { .. } => "node_proxy",
             RpcRequest::ApiKeyAdd { .. } => "api_key_add",
@@ -223,15 +224,14 @@ pub enum RpcResponse {
     },
     LogsSnapshot {
         lines: Vec<String>,
-        cursor: u64,
-        running: bool,
         #[serde(default)]
         resizes: Vec<LogResize>,
     },
-    LogsPoll {
+    LogsPagination {
         lines: Vec<String>,
-        cursor: u64,
-        running: bool,
+        total: usize,
+        #[serde(default)]
+        resizes: Vec<LogResize>,
     },
     Ack,
     Error {

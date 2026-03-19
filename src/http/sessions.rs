@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -605,6 +605,18 @@ pub struct LogsParams {
     pub node: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct LogsResponseBody {
+    lines: Vec<String>,
+    next_offset: usize,
+    total: usize,
+    resizes: Vec<crate::protocol::LogResize>,
+}
+
+fn logs_response(body: LogsResponseBody) -> axum::response::Response {
+    Json(body).into_response()
+}
+
 pub async fn get_logs(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -613,33 +625,26 @@ pub async fn get_logs(
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(200).clamp(1, 5000);
 
-    // Proxy to remote node: use LogsSnapshot to get in-memory output buffer.
+    // Proxy to remote node via the paginated logs RPC.
     if let Some(ref node) = params.node {
-        let rpc = RpcRequest::LogsSnapshot {
+        let rpc = RpcRequest::LogsPagination {
             id: id.clone(),
-            tail: usize::MAX,
+            offset,
+            limit,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::LogsSnapshot {
+            Ok(RpcResponse::LogsPagination {
                 lines,
-                cursor: _,
-                running,
+                total,
                 resizes,
             }) => {
-                let total = lines.len();
-                let page: Vec<_> = lines.into_iter().skip(offset).take(limit).collect();
-                let next_offset = (offset + page.len()).min(total);
-                Json(serde_json::json!({
-                    "lines": page,
-                    "offset": offset,
-                    "limit": limit,
-                    "total": total,
-                    "has_more": next_offset < total,
-                    "next_offset": next_offset,
-                    "running": running,
-                    "resizes": resizes,
-                }))
-                .into_response()
+                let next_offset = offset.saturating_add(lines.len()).min(total);
+                logs_response(LogsResponseBody {
+                    lines,
+                    next_offset,
+                    total,
+                    resizes,
+                })
             }
             Ok(RpcResponse::Error { message }) => (
                 StatusCode::BAD_GATEWAY,
@@ -683,17 +688,12 @@ pub async fn get_logs(
         Some((lines, total)) => {
             let next_offset = offset.saturating_add(lines.len()).min(total);
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
-            Json(serde_json::json!({
-                "lines": lines,
-                "offset": offset,
-                "limit": limit,
-                "total": total,
-                "has_more": next_offset < total,
-                "next_offset": next_offset,
-                "running": false,
-                "resizes": resizes,
-            }))
-            .into_response()
+            logs_response(LogsResponseBody {
+                lines,
+                next_offset,
+                total,
+                resizes,
+            })
         }
         None => {
             debug!(session_id = %id, "session not found for logs (disk)");

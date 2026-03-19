@@ -819,47 +819,6 @@ impl SessionStore {
         results.into_iter().all(|stopped| stopped)
     }
 
-    pub async fn logs_snapshot(
-        &self,
-        id: &str,
-        tail: usize,
-    ) -> Option<(Vec<String>, u64, bool, Vec<crate::protocol::LogResize>)> {
-        let sessions = self.sessions.load();
-        let runtime = sessions.get(id)?.clone();
-        // Extract canonical filtered ring data under the lock, then release
-        // before heavy processing to avoid blocking the PTY reader thread.
-        let (chunks, cursor, resizes) = {
-            let rt = runtime.runtime.lock().ok()?;
-            let chunks: Vec<Bytes> = rt.ring.all_chunks().cloned().collect();
-            let cursor = rt.ring.end_offset();
-            let resizes = rt.resize_history.clone();
-            (chunks, cursor, resizes)
-        };
-        let running = runtime.snapshot().running;
-        let all_bytes: Vec<u8> = chunks.iter().flat_map(|b| b.iter().copied()).collect();
-        let text = String::from_utf8_lossy(&all_bytes);
-        let all_lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
-        let skip = all_lines.len().saturating_sub(tail);
-        let lines: Vec<String> = all_lines.into_iter().skip(skip).collect();
-        Some((lines, cursor, running, resizes))
-    }
-
-    pub async fn logs_poll(&self, id: &str, cursor: u64) -> Option<(Vec<String>, u64, bool)> {
-        let sessions = self.sessions.load();
-        let runtime = sessions.get(id)?.clone();
-        // Extract canonical filtered ring data under the lock, then release
-        // before UTF-8 decoding to avoid blocking the PTY reader thread.
-        let (chunks, end_offset) = {
-            let rt = runtime.runtime.lock().ok()?;
-            rt.ring.read_from(cursor)
-        };
-        let running = runtime.snapshot().running;
-        let bytes: Vec<u8> = chunks.iter().flat_map(|(_, b)| b.iter().copied()).collect();
-        let text = String::from_utf8_lossy(&bytes);
-        let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
-        Some((lines, end_offset, running))
-    }
-
     async fn lookup_runtime(
         &self,
         id: &str,

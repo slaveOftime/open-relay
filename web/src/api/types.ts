@@ -92,12 +92,8 @@ export interface NodeSummary {
 
 export interface LogsResponse {
   lines: string[]
-  offset: number
   next_offset: number
   total: number
-  has_more: boolean
-  limit: number
-  running: boolean
   resizes: LogResizeEvent[]
 }
 

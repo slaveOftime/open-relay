@@ -11,7 +11,8 @@ function readFixtureLines(text: string): string[] {
 }
 
 async function flushTerminal(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 0))
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  await new Promise((resolve) => setTimeout(resolve, 10))
 }
 
 function visibleBuffer(term: InstanceType<typeof Terminal>): string {
