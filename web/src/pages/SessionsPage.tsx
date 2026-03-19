@@ -915,12 +915,44 @@ export default function SessionsPage() {
     setSeriesMap(buildSeriesMap(items))
   }, [])
 
+  const applyLoadedSessionSnapshot = useCallback((items: SessionSummary[]) => {
+    const itemsById = new Map(items.map((session) => [session.id, session]))
+    setSessions((prev) => {
+      let changed = false
+      const next = prev.map((session) => {
+        const updated = itemsById.get(session.id)
+        if (!updated) return session
+        changed = true
+        return updated
+      })
+      return changed ? next : prev
+    })
+  }, [])
+
+  const replaceLoadedSession = useCallback((session: SessionSummary) => {
+    setSessions((prev) => {
+      const index = prev.findIndex((item) => item.id === session.id)
+      if (index === -1) return prev
+      const next = prev.slice()
+      next[index] = session
+      return next
+    })
+  }, [])
+
+  const removeLoadedSession = useCallback((sessionId: string) => {
+    setSessions((prev) => {
+      const index = prev.findIndex((item) => item.id === sessionId)
+      if (index === -1) return prev
+      return prev.filter((item) => item.id !== sessionId)
+    })
+  }, [])
+
   const loadLocal = useCallback(
     async (opts?: { background?: boolean }) => {
       if (selectedNode) return
 
       const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
-      if (shouldShowSkeleton) setLoading(true)
+      if (shouldShowSkeleton || !opts || opts?.background === false) setLoading(true)
       else setRefreshing(true)
 
       try {
@@ -947,10 +979,8 @@ export default function SessionsPage() {
           })
         }
       } finally {
-        if (isMounted.current) {
-          if (shouldShowSkeleton) setLoading(false)
-          setRefreshing(false)
-        }
+        setLoading(false)
+        setRefreshing(false)
       }
     },
     [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
@@ -1101,7 +1131,7 @@ export default function SessionsPage() {
     const cleanup = subscribeEvents((ev) => {
       if (ev.event === 'snapshot') {
         if (selectedNode) return
-        void reloadSessions({ background: true })
+        applyLoadedSessionSnapshot(ev.data)
         return
       }
       if (ev.event === 'session_created') {
@@ -1113,7 +1143,7 @@ export default function SessionsPage() {
       if (ev.event === 'session_updated') {
         if (selectedNode) return
         updateSparklineForSession(ev.data)
-        void reloadSessions({ background: true })
+        replaceLoadedSession(ev.data)
         return
       }
       if (ev.event === 'session_deleted') {
@@ -1133,7 +1163,13 @@ export default function SessionsPage() {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
     }
-  }, [reloadSessions, selectedNode])
+  }, [
+    applyLoadedSessionSnapshot,
+    removeLoadedSession,
+    replaceLoadedSession,
+    reloadSessions,
+    selectedNode,
+  ])
 
   const pagedSessions = sessions
 
@@ -1290,7 +1326,7 @@ export default function SessionsPage() {
           <div className="flex flex-wrap items-center gap-2 px-3 py-2 md:hidden">
             <div
               className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer min-w-0"
-              onClick={() => void reloadSessions({ background: true })}
+              onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
               <span className="truncate">Open Relay</span>
@@ -1299,7 +1335,7 @@ export default function SessionsPage() {
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => void reloadSessions({ background: true })}
+              onClick={() => void reloadSessions({ background: false })}
               disabled={loading || refreshing}
               aria-label="Refresh sessions"
             >
@@ -1445,7 +1481,7 @@ export default function SessionsPage() {
           <div className="hidden md:flex flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2.5">
             <div
               className="flex items-center gap-1 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer"
-              onClick={() => void reloadSessions({ background: true })}
+              onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
               <span>Open Relay</span>
@@ -1520,7 +1556,7 @@ export default function SessionsPage() {
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => void reloadSessions({ background: true })}
+              onClick={() => void reloadSessions({ background: false })}
               disabled={loading || refreshing}
             >
               <ReloadIcon className="h-4 w-4" />

@@ -14,7 +14,7 @@ use crate::{
     session::{SessionStore, StartSpec, logs::read_persisted_log_page},
 };
 
-use super::{AppState, SessionEvent};
+use super::AppState;
 
 // ---------------------------------------------------------------------------
 // Shared param for optional node routing
@@ -304,7 +304,7 @@ pub async fn create(
         };
 
     match result {
-        Ok((session_id, summary)) => {
+        Ok((session_id, _summary)) => {
             info!(
                 session_id,
                 cmd = body.cmd,
@@ -312,9 +312,6 @@ pub async fn create(
                 title = ?body.title,
                 "session created"
             );
-            if let Some(s) = summary {
-                let _ = state.event_tx.send(SessionEvent::SessionCreated(s));
-            }
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({ "session_id": session_id })),
@@ -462,17 +459,14 @@ pub async fn stop_session(
         };
     }
 
-    let (stopped, summary) = {
+    let stopped = {
         let stopped = state.store.stop_session(&id, grace).await;
-        let summary = state.store.get_summary(&id);
-        (stopped, summary)
+        let _ = state.store.get_summary(&id);
+        stopped
     };
 
     if stopped {
         info!(session_id = %id, grace_seconds = grace, "stop requested");
-        if let Some(s) = summary {
-            let _ = state.event_tx.send(SessionEvent::SessionUpdated(s));
-        }
         Json(serde_json::json!({ "stopped": true })).into_response()
     } else {
         warn!(session_id = %id, "stop: session not found");
@@ -521,17 +515,14 @@ pub async fn kill_session(
         };
     }
 
-    let (killed, summary) = {
+    let killed = {
         let killed = state.store.kill_session(&id).await;
-        let summary = state.store.get_summary(&id);
-        (killed, summary)
+        let _ = state.store.get_summary(&id);
+        killed
     };
 
     if killed {
         info!(session_id = %id, "kill requested");
-        if let Some(s) = summary {
-            let _ = state.event_tx.send(SessionEvent::SessionUpdated(s));
-        }
         Json(serde_json::json!({ "killed": true })).into_response()
     } else {
         warn!(session_id = %id, "kill: session not found");

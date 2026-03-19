@@ -10,7 +10,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
@@ -19,8 +18,11 @@ use tracing::{error, info};
 pub use auth::AuthState;
 
 use crate::{
-    config::AppConfig, db::Database, node::NodeRegistry, notification::dispatcher::Notifier,
-    protocol::SessionSummary, session::SessionStore,
+    config::AppConfig,
+    db::Database,
+    node::NodeRegistry,
+    notification::dispatcher::Notifier,
+    session::{SessionEvent, SessionStore},
 };
 
 #[derive(Clone)]
@@ -34,27 +36,6 @@ pub struct AppState {
     pub auth: Option<Arc<AuthState>>,
     /// Registry of connected secondary nodes (only populated on a primary daemon).
     pub node_registry: Arc<NodeRegistry>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-#[allow(dead_code)]
-pub enum SessionEvent {
-    SessionCreated(SessionSummary),
-    SessionUpdated(SessionSummary),
-    SessionDeleted {
-        id: String,
-    },
-    SessionNotification {
-        kind: String,
-        summary: String,
-        body: String,
-        session_ids: Vec<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        trigger_rule: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        trigger_detail: Option<String>,
-    },
 }
 
 // ── Release-only: embed the contents of web/dist into the binary ─────────────

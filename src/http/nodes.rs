@@ -229,7 +229,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                     warn!(node = %name, kind = %kind, "unknown forwarded notification kind");
                                 }
 
-                                let _ = state.event_tx.send(crate::http::SessionEvent::SessionNotification {
+                                let _ = state.event_tx.send(crate::session::SessionEvent::SessionNotification {
                                     kind,
                                     summary,
                                     body,
