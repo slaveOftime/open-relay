@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     error::{AppError, Result},
+    session::persist::append_output,
 };
 
 use super::pty::{
@@ -358,14 +359,15 @@ pub fn spawn_session(
     let runtime_child = RuntimeChild::Pty(child);
     meta.pid = runtime_child.process_id();
 
-    std::fs::write(full_dir.join("output.log"), b"")?;
-    std::fs::write(full_dir.join("events.log"), b"session created\n")?;
-    let _ = append_resize_event(&full_dir, 0, rows, cols);
+    append_output(&full_dir, "")?;
+    append_event(&full_dir, "session created")?;
+    append_resize_event(&full_dir, 0, rows, cols)?;
+
     let started_pid = meta
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "?".to_string());
-    let _ = append_event(&full_dir, &format!("session started pid={started_pid}"));
+    append_event(&full_dir, &format!("session started pid={started_pid}"))?;
 
     // Broadcast channel: each live attach subscriber holds a Receiver.
     let (broadcast_tx, _initial_rx) = broadcast::channel::<Arc<Bytes>>(256);
