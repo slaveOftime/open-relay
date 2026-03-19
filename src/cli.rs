@@ -17,6 +17,8 @@ pub enum Commands {
     Daemon(DaemonArgs),
     /// Create a session and run a command. Example: `oly start --detach --title "my fun demo" copilot`.
     Start(StartArgs),
+    /// Display the oly skill markdown.
+    Skill(SkillArgs),
     /// List sessions. Order is most recently created last.
     #[command(name = "ls")]
     List(ListArgs),
@@ -35,6 +37,9 @@ pub enum Commands {
     /// List secondary nodes currently connected to this (primary) daemon.
     Node(NodeArgs),
 }
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {}
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
