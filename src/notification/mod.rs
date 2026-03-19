@@ -9,14 +9,13 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     config::AppConfig,
     db::Database,
-    http,
     notification::{
         channel::{LocalOsNotificationChannel, NotificationChannel, WebPushChannel},
         dispatcher::Notifier,
         event::{NotificationEvent, NotificationTriggerRule},
         prompt::{compile_prompt_patterns, find_prompt_match, sanitize_body, strip_ansi_for_body},
     },
-    session::{SessionStore, SilentCandidate},
+    session::{SessionEvent, SessionStore, SilentCandidate},
 };
 
 /// Periodically checks all running sessions for silence and emits local OS
@@ -27,7 +26,7 @@ pub(super) async fn run_notification_monitor(
     notifier: Arc<Notifier>,
     session_store: Arc<SessionStore>,
     config: Arc<AppConfig>,
-    event_tx: tokio::sync::broadcast::Sender<http::SessionEvent>,
+    event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
 ) {
     let silence = std::time::Duration::from_secs(config.silence_seconds);
@@ -142,7 +141,7 @@ pub(super) async fn run_notification_monitor(
                 session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
 
                 let _ = notification_tx.send(event.clone());
-                let _ = event_tx.send(http::SessionEvent::SessionNotification {
+                let _ = event_tx.send(SessionEvent::SessionNotification {
                     kind: event.kind.as_str().to_string(),
                     summary: event.summary,
                     body: event.body,
