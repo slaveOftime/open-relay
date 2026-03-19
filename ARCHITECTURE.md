@@ -252,14 +252,15 @@ A dedicated `std::thread` (not a Tokio task) owns blocking reads from the master
 loop {
     read(master_fd, buf[4096])
     → extract_query_responses_no_client()   // strip/answer OSC/CPR queries
-    → push_raw(bytes)                        // ring buffer + mode tracking + persist
-    → broadcast_tx.send(bytes)              // fan-out to all attached clients
+    → EscapeFilter::filter(bytes)           // derive canonical filtered stream
+    → push_output(raw, filtered)            // mode tracking + ring + persist
+    → broadcast_tx.send(filtered)           // fan-out to all attached clients
 }
 ```
 
 - Blocking I/O on purpose — avoids Tokio thread starvation for high-bandwidth PTY output.
 - `extract_query_responses_no_client` answers ANSI color-query escape sequences so the child application does not block waiting for a response that only a real terminal would provide.  It also strips ConPTY/terminal-echo artifacts.
-- `push_raw` delegates to `ModeTracker::process()` for mode detection, appends to the ring buffer, persists to disk, and returns `Option<ModeSnapshot>` when modes change.
+- `push_output` delegates to `ModeTracker::process()` using the raw PTY bytes, but only the filtered bytes are appended to the ring buffer, persisted to disk, and broadcast to attached clients.
 
 ### PTY Writer Thread (`src/session/runtime.rs`)
 
@@ -277,7 +278,7 @@ Input bytes come from IPC `AttachInput` or HTTP `POST /sessions/:id/input`.  The
 
 - Fixed-capacity byte ring (default 512 KB).
 - New clients receive a replay of the ring contents as the first chunk of their attach stream.
-- Written by `push_raw`; read by `SessionStore::attach_subscribe_init()` for both IPC and WebSocket attach.
+- Written by `push_output`; read by `SessionStore::attach_subscribe_init()` for both IPC and WebSocket attach.
 
 ### Resize
 
@@ -421,7 +422,7 @@ Browser                           Daemon
   |  xterm.js writes replay          |
   |                                 |
   |  [broadcast_rx receives chunks] |
-  |<-- { type: "data", data } -------|  ← live output (EscapeFilter applied)
+  |<-- { type: "data", data } -------|  ← live output (already source-filtered)
   |<-- { type: "data", data } -------|
   |                                 |
   |  [ModeTracker detects change]    |
@@ -441,7 +442,7 @@ Browser                           Daemon
 
 **Resize ordering**: The client MUST NOT send `resize` before it receives `init`.  Sending resize first causes the child to emit a full-screen repaint (`\x1b[2J` + cursor home) that races with and blanks the ring-buffer replay.
 
-**CPR/OSC filtering**: An `EscapeFilter` strips cursor position reports and other terminal query responses from the broadcast stream before sending to clients.  These are artifacts of `extract_query_responses_no_client()` answering queries on behalf of attached terminals.
+**CPR/OSC filtering**: `EscapeFilter` now runs once in the PTY reader before bytes enter the ring buffer, broadcast stream, or persisted log. Attach handlers forward the already-filtered canonical stream directly.
 
 ---
 
@@ -462,7 +463,7 @@ The daemon tracks child-side terminal modes via `ModeTracker` (`src/session/mode
 - **Unknown modes**: Only modes 1 (DECCKM) and 2004 (bracketed paste) are tracked; other DEC private modes are silently ignored.
 - **Multiple modes per chunk**: A single byte slice may contain multiple mode-changing sequences; all are processed.
 
-`ModeSnapshot` captures the current state of all tracked modes.  It is returned by `push_raw()` when any mode changes, and is also available via `SessionRuntime::mode_snapshot()` for on-demand queries (e.g., at attach init time).
+`ModeSnapshot` captures the current state of all tracked modes.  It is updated by the PTY reader's `push_output()` path and is also available via `SessionRuntime::mode_snapshot()` for on-demand queries (e.g., at attach init time).
 
 ### DECCKM Transformation (Server-Side)
 
@@ -507,11 +508,11 @@ A real terminal would respond with a color spec.  The daemon is not a terminal, 
 
 **Root cause**: The PTY output path was transparent — it forwarded bytes to the ring buffer but never synthesized terminal responses.
 
-**Fix**: `extract_query_responses_no_client()` in `utils.rs` intercepts these queries and writes a synthetic response to the master fd before the bytes reach the ring buffer:
+**Fix**: `extract_query_responses_no_client()` in `src/session/pty.rs` intercepts these queries and writes a synthetic response to the master fd before the bytes reach the filtered ring buffer:
 - Reads `$COLORFGBG` environment variable if set (common in color-aware terminals).
 - Falls back to white foreground (`rgb:ffff/ffff/ffff`) and black background (`rgb:0000/0000/0000`).
 
-**Source**: `src/utils.rs` — `TerminalQuery::ForegroundColor`, `TerminalQuery::BackgroundColor`.
+**Source**: `src/session/pty.rs` — `TerminalQuery::ForegroundColor`, `TerminalQuery::BackgroundColor`.
 
 ---
 
@@ -543,9 +544,9 @@ A real terminal would respond with a color spec.  The daemon is not a terminal, 
 
 **Problem**: An attached AI tool enables Application Cursor Keys (`\x1b[?1h`) after the initial attach handshake.  The daemon captures the initial mode at attach time via `AttachStreamInit`, but never emits `AttachModeChanged` while the child is running.  The client's `child_app_cursor_keys` stays `false`.  When the user presses an arrow key, the client sends `\x1b[A` (normal mode) but the child expects `\x1bOA` (application mode) — movement is silently ignored or misinterpreted.
 
-**Root cause**: The mode-change detection in `push_raw()` updates `RuntimeState` correctly, but no IPC signal was wired up to propagate the change to attached clients.
+**Root cause**: The mode-change detection in the PTY reader updates `RuntimeState` correctly, but no IPC signal was wired up to propagate the change to attached clients.
 
-**Fix**: After `push_raw()` detects a mode change, the PTY reader thread (or broadcast path in `rpc.rs`) emits an `AttachModeChanged` frame to all currently-attached streaming clients.
+**Fix**: After `push_output()` updates the mode snapshot, the streaming paths compare the current `ModeSnapshot` after each forwarded chunk and emit an `AttachModeChanged` frame when needed.
 
 **Affected file**: `src/daemon/rpc.rs` — live broadcast loop.
 
@@ -569,9 +570,9 @@ A real terminal would respond with a color spec.  The daemon is not a terminal, 
 
 **Root cause**: ConPTY implementation quirk — it echoes the response to the master before the child consumes it.
 
-**Fix**: `BARE_CPR_RE` (regex `\[\d+;\d+R`) in `utils.rs` strips these sequences during `extract_query_responses_no_client()`.
+**Fix**: `EscapeFilter` in `src/session/pty.rs` strips these bare CPR sequences in the PTY reader before they reach the canonical retained stream.
 
-**Source**: `src/utils.rs` — `BARE_CPR_RE`.
+**Source**: `src/session/pty.rs` — `EscapeFilter`.
 
 ---
 
@@ -581,9 +582,9 @@ A real terminal would respond with a color spec.  The daemon is not a terminal, 
 
 **Root cause**: Echo pass-through from terminal emulator to PTY master.
 
-**Fix**: `GENERIC_OSC_FULL_RE` and `GENERIC_OSC_BARE_RE` strip OSC sequences (BEL-terminated and ST-terminated) during `extract_query_responses_no_client()`.
+**Fix**: `EscapeFilter` strips generic OSC sequences (BEL-terminated and ST-terminated) in the PTY reader before they are retained or broadcast.
 
-**Source**: `src/utils.rs`.
+**Source**: `src/session/pty.rs`.
 
 ---
 
@@ -594,12 +595,12 @@ A real terminal would respond with a color spec.  The daemon is not a terminal, 
 **Root cause**: POSIX `read()` on PTY master provides no framing — sequences can span arbitrary chunk boundaries.
 
 **Fix**: Two carry-forward buffers:
-- `query_tail: String` in the reader loop — carries the tail of a chunk that might be the start of a query sequence.
-- `EscapeFilter.pending: String` in `utils.rs` — carries incomplete escape sequences across calls to `filter()`.
+- `query_tail: Vec<u8>` in the reader loop — carries the tail of a chunk that might be the start of a query sequence.
+- `EscapeFilter.pending: Vec<u8>` in `src/session/pty.rs` — carries incomplete escape sequences across calls to `filter()`.
 
 Both are reset when the sequence is completed or proven not to be an escape sequence.
 
-**Source**: `src/utils.rs` — `EscapeFilter`; `src/session/runtime.rs` — `query_tail`.
+**Source**: `src/session/pty.rs` — `EscapeFilter`; `src/session/runtime.rs` — `query_tail`.
 
 ---
 
@@ -835,8 +836,8 @@ When an agent needs context, start from this file, then only open targeted files
 | Session lifecycle bug | `src/session/runtime.rs`, `src/session/store.rs`, `src/daemon/lifecycle.rs` |
 | IPC protocol bug | `src/daemon/rpc.rs`, `src/ipc.rs` |
 | CLI attach behavior | `src/client/attach.rs`, `src/client/input.rs` |
-| Terminal mode tracking | `src/session/runtime.rs` (`push_raw`), `src/client/attach.rs` (mode tracking) |
-| Escape sequence handling | `src/utils.rs` (`EscapeFilter`, `extract_query_responses_no_client`) |
+| Terminal mode tracking | `src/session/runtime.rs` (`push_output`), `src/client/attach.rs` (mode tracking) |
+| Escape sequence handling | `src/session/pty.rs` (`EscapeFilter`, `extract_query_responses_no_client`) |
 | API behavior bug | `src/http/*.rs`, `src/db.rs` |
 | Web terminal/UI bug | `web/src/pages/SessionDetailPage.tsx`, `web/src/components/XTerm.tsx` |
 | Key input translation | `web/src/utils/keyInput.ts`, `src/client/attach.rs` |

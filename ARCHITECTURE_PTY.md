@@ -128,7 +128,7 @@ src/session/
 │   └── ResizeSubscriber  Self-echo suppression for resize notifications
 ├── runtime.rs          SessionRuntime (ring + broadcast + pty + meta)
 │   ├── spawn_session() PTY spawn + thread creation
-│   ├── push_raw()      Ring write + mode tracking + persistence
+│   ├── push_output()   Filtered ring write + raw-mode tracking + persistence
 │   ├── resize_tx       Broadcast channel for resize notifications
 │   └── pty_size        Current PTY dimensions for dedupe + CPR sync
 ├── store.rs            SessionStore (session registry, attach/detach/resize)
@@ -185,9 +185,10 @@ std::thread::spawn("pty-reader-{id}") {
             writer_tx.send(resp);  // Write response back to PTY stdin
         }
 
-        // 2. Push to ring + mode track + persist + broadcast
+        // 2. Derive canonical filtered output, then retain/broadcast it
         let bytes = Bytes::copy_from_slice(&buf[..n]);
-        push_raw(bytes);  // → ring.push() + mode_tracker.process() + broadcast_tx.send()
+        let filtered = EscapeFilter::filter(bytes);
+        push_output(bytes, filtered);  // → mode_tracker.process(raw) + ring.push(filtered) + broadcast_tx.send(filtered)
     }
 }
 ```
@@ -231,8 +232,9 @@ When a client attaches, `attach_subscribe_init()`:
 3. Creates a new `broadcast::Receiver` for live output
 4. Returns the replay chunks + receiver + current mode snapshot
 
-The replay is sent as the `AttachStreamInit` response frame, filtered through
-`EscapeFilter` to strip device responses.
+The replay is sent as the `AttachStreamInit` response frame directly from the
+ring buffer.  The ring already stores the canonical filtered stream, so attach
+handlers no longer run their own `EscapeFilter` pass.
 
 ### Offset Tracking
 
@@ -310,18 +312,18 @@ PTY master fd
               │
               ▼
 ┌─────────────────────────────┐
-│ push_raw()                  │  Ring buffer append
-│   └─ mode_tracker.process() │  DEC private mode detection
-│   └─ persist()              │  Disk write
-│   └─ broadcast_tx.send()    │  Fan-out to all subscribers
-└─────────────┬───────────────┘
-              │
-              ▼ (per subscriber)
-┌─────────────────────────────┐
 │ EscapeFilter                │  Strips CPR/DSR echoes from output
 │                             │  Strips OSC 10/11 color responses
 │                             │  Strips generic OSC sequences
 │                             │  Handles cross-chunk partial sequences
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│ push_output()               │  mode_tracker.process(raw)
+│                             │  Ring buffer append (filtered bytes)
+│                             │  Disk write (same filtered bytes)
+│                             │  broadcast_tx.send(filtered)
 └─────────────┬───────────────┘
               │
               ▼
@@ -331,8 +333,9 @@ PTY master fd
 ### EscapeFilter Details
 
 ConPTY on Windows echoes terminal device responses (CPR, DSR, OSC color
-queries) back into the master output stream.  `EscapeFilter` strips these
-before forwarding to clients.
+queries) back into the master output stream.  `EscapeFilter` now strips these
+once in the PTY reader before bytes are retained in memory, persisted to
+`output.log`, or forwarded to clients.
 
 Patterns stripped:
 - **Full CPR**: `\x1b[<row>;<col>R` (with or without `?`)
@@ -351,12 +354,18 @@ Cross-chunk handling: `pending` field carries incomplete sequences across
 `filter()` calls.  This handles ConPTY splitting ESC sequences at arbitrary
 byte boundaries.
 
-### Persist Filter
+### Canonical Filtered Stream
 
-The `SessionRuntime` also runs its own `EscapeFilter` (the "persist filter")
-on all PTY output before writing to `output.log`.  This ensures that
-`oly logs` reads clean data from disk, free of CPR/DSR artifacts that would
-otherwise appear as garbage characters in the log output.
+`SessionRuntime` keeps raw PTY bytes only long enough to answer terminal
+queries, track modes, and update cursor state.  After that, a single long-lived
+`EscapeFilter` instance produces the canonical filtered stream used for:
+- ring-buffer replay
+- live broadcast fan-out
+- persisted `output.log`
+- log snapshot and polling reads
+
+This removes the older per-subscriber filter duplication and makes stream
+offsets refer to filtered bytes rather than raw PTY bytes.
 
 ### Query Response Generation
 
@@ -548,8 +557,8 @@ after entering the alternate screen before re-reading the actual terminal size.
 
 | Issue | Impact | Mitigation |
 |---|---|---|
-| Echo of device responses | CPR/DSR/OSC responses appear in master output | `EscapeFilter` strips them (both per-client and persist filter) |
-| DSR query forwarding | Queries like `\x1b[6n` forwarded to attach clients cause CPR response feedback loop | `EscapeFilter` strips DSR queries before sending to clients |
+| Echo of device responses | CPR/DSR/OSC responses appear in master output | `EscapeFilter` strips them once in the PTY reader before retention and fan-out |
+| DSR query forwarding | Queries like `\x1b[6n` forwarded to attach clients cause CPR response feedback loop | `EscapeFilter` strips DSR queries in the canonical filtered stream |
 | ESC split across reads | Sequences split at arbitrary byte boundaries | `pending` field in `EscapeFilter` carries fragments |
 | No SIGWINCH | ConPTY uses `ResizePseudoConsole()` internally | `portable_pty` abstracts this |
 | No SIGCHLD | Child exit detected via `WaitForSingleObject` | `try_wait()` polls periodically |
@@ -572,8 +581,8 @@ after entering the alternate screen before re-reading the actual terminal size.
 - PTY output is treated as raw bytes, not decoded as UTF-8
 - `String::from_utf8_lossy` used only in filter functions that need regex
 - JSON framing uses base64 for binary data, preserving all bytes
-- Cross-chunk `pending` buffers in `EscapeFilter` operate on `String` but
-  handle replacement characters gracefully
+- Cross-chunk `pending` buffers in `EscapeFilter` operate on bytes (`Vec<u8>`)
+  so non-UTF-8 PTY output is preserved exactly
 
 ---
 
@@ -645,7 +654,7 @@ while idle. This is necessary because:
 ### Invariants
 
 1. **Ring buffer is always consistent**: Push is atomic (single writer thread)
-2. **Mode state is always consistent**: ModeTracker is only called from push_raw
+2. **Mode state is always consistent**: ModeTracker is only called from the PTY reader's `push_output` path
 3. **Exit code is captured at most once**: `try_wait` → store → done
 4. **Cleanup always runs**: IPC handler has `attach_detach()` in all exit paths
 

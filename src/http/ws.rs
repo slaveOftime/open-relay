@@ -11,7 +11,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::session::mode_tracker::ModeSnapshot;
-use crate::session::pty::{EscapeFilter, collect_filtered_chunks};
+use crate::session::pty::collect_chunk_bytes;
 use crate::session::resize::ResizeSubscriber;
 
 use super::AppState;
@@ -32,7 +32,7 @@ pub struct AttachParams {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    /// Initial ring-buffer replay. `data` is base64-encoded raw PTY bytes.
+    /// Initial ring-buffer replay. `data` is base64-encoded filtered stream bytes.
     Init {
         data: String,
         #[serde(rename = "appCursorKeys")]
@@ -150,9 +150,7 @@ async fn handle_ws_streaming(
             }
         };
 
-    // Filter CPR/DSR from replay and send as init frame.
-    let mut init_filter = EscapeFilter::new();
-    let replay_bytes = collect_filtered_chunks(&replay_chunks, &mut init_filter);
+    let replay_bytes = collect_chunk_bytes(&replay_chunks);
 
     let init_msg = ServerMessage::Init {
         data: B64.encode(&replay_bytes),
@@ -199,7 +197,6 @@ async fn handle_ws_streaming(
         bracketed_paste_mode,
     };
 
-    let mut chunk_filter = EscapeFilter::new();
     let mut current_offset = end_offset;
     let mut completion_check = tokio::time::interval(Duration::from_millis(200));
     completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -216,8 +213,7 @@ async fn handle_ws_streaming(
                         if !running {
                             let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
                             if let Ok((chunks, _new_end, _rx, _bpm, _ack)) = resync {
-                                let mut resync_filter = EscapeFilter::new();
-                                let raw = collect_filtered_chunks(&chunks, &mut resync_filter);
+                                let raw = collect_chunk_bytes(&chunks);
                                 if !raw.is_empty() {
                                     debug!(
                                         session_id = %id,
@@ -253,22 +249,20 @@ async fn handle_ws_streaming(
             // PTY output from broadcast channel.
             chunk = broadcast_rx.recv() => {
                 match chunk {
-                    Ok(raw_arc) => {
-                        let filtered = chunk_filter.filter(&raw_arc);
-                        if !filtered.is_empty() {
+                    Ok(filtered_arc) => {
+                        if !filtered_arc.is_empty() {
                             let msg = ServerMessage::Data {
-                                data: B64.encode(&filtered),
+                                data: B64.encode(filtered_arc.as_ref()),
                             };
                             if !send_json(&mut socket, &msg).await {
                                 let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
                         }
-                        current_offset += raw_arc.len() as u64;
+                        current_offset += filtered_arc.len() as u64;
                         trace!(
                             session_id = %id,
-                            raw_bytes = raw_arc.len(),
-                            filtered_bytes = filtered.len(),
+                            filtered_bytes = filtered_arc.len(),
                             current_offset,
                             "forwarded live PTY output over local WebSocket"
                         );
@@ -306,8 +300,7 @@ async fn handle_ws_streaming(
                         match resync {
                             Ok((chunks, new_end, rx, bpm, ack)) => {
                                 broadcast_rx = rx;
-                                let mut resync_filter = EscapeFilter::new();
-                                let raw = collect_filtered_chunks(&chunks, &mut resync_filter);
+                                let raw = collect_chunk_bytes(&chunks);
                                 if !raw.is_empty() {
                                     debug!(
                                         session_id = %id,

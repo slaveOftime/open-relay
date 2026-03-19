@@ -913,18 +913,14 @@ pub(crate) fn has_visible_content(data: &[u8]) -> bool {
     false
 }
 
-/// Filter terminal-response traffic from replay chunks and concatenate the
-/// cleaned bytes into one buffer for attach initialization.
+/// Concatenate replay chunks into a single byte buffer.
 ///
-/// This is used by both the inter-process communication and WebSocket attach
-/// handlers.
-pub fn collect_filtered_chunks(
-    chunks: &[(u64, bytes::Bytes)],
-    filter: &mut EscapeFilter,
-) -> Vec<u8> {
+/// Replay chunks already reflect the canonical filtered stream retained by the
+/// runtime, so stream consumers do not need an additional filter pass here.
+pub fn collect_chunk_bytes(chunks: &[(u64, bytes::Bytes)]) -> Vec<u8> {
     let mut filtered = Vec::with_capacity(chunks.iter().map(|(_, chunk)| chunk.len()).sum());
     for (_, chunk) in chunks {
-        filtered.extend(filter.filter(chunk));
+        filtered.extend_from_slice(chunk);
     }
     filtered
 }
@@ -1429,14 +1425,13 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_filtered_chunks_strips_across_chunks() {
+    fn test_collect_chunk_bytes_concatenates_chunks() {
         let chunks: Vec<(u64, bytes::Bytes)> = vec![
             (0, bytes::Bytes::from_static(b"hello\x1b[")),
             (1, bytes::Bytes::from_static(b"6nworld")),
         ];
-        let mut filter = EscapeFilter::new();
-        let result = collect_filtered_chunks(&chunks, &mut filter);
-        assert_eq!(result, b"helloworld");
+        let result = collect_chunk_bytes(&chunks);
+        assert_eq!(result, b"hello\x1b[6nworld");
     }
 
     #[test]

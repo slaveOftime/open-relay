@@ -6,7 +6,7 @@ use crate::{
     error::Result,
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    session::pty::{EscapeFilter, collect_filtered_chunks},
+    session::pty::collect_chunk_bytes,
     session::resize::ResizeSubscriber,
 };
 
@@ -43,8 +43,7 @@ pub(super) async fn handle_attach_subscribe(
         }
     };
 
-    let mut init_filter = EscapeFilter::new();
-    let data = collect_filtered_chunks(&replay_chunks, &mut init_filter);
+    let data = collect_chunk_bytes(&replay_chunks);
 
     let running = session_store.is_running(&id);
     debug!(
@@ -90,7 +89,6 @@ pub(super) async fn handle_attach_subscribe(
         }
     });
 
-    let mut chunk_filter = EscapeFilter::new();
     let mut current_offset = end_offset;
     let mut completion_check = tokio::time::interval(std::time::Duration::from_millis(100));
     completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -125,8 +123,7 @@ pub(super) async fn handle_attach_subscribe(
                         };
 
                         if !chunks.is_empty() {
-                            let mut resync_filter = EscapeFilter::new();
-                            let raw = collect_filtered_chunks(&chunks, &mut resync_filter);
+                            let raw = collect_chunk_bytes(&chunks);
                             if !raw.is_empty() {
                                 debug!(
                                     session_id = %id,
@@ -195,24 +192,21 @@ pub(super) async fn handle_attach_subscribe(
 
                 chunk = broadcast_rx.recv() => {
                     match chunk {
-                        Ok(raw_arc) => {
-                            let filtered = chunk_filter.filter(&raw_arc);
-                            let filtered_len = filtered.len();
-                            if !filtered.is_empty() {
+                        Ok(filtered_arc) => {
+                            if !filtered_arc.is_empty() {
                                 ipc::write_response_to_writer(
                                     &mut writer,
                                     RpcResponse::AttachStreamChunk {
                                         offset: current_offset,
-                                        data: filtered,
+                                        data: filtered_arc.to_vec(),
                                     },
                                 )
                                 .await?;
                             }
-                            current_offset += raw_arc.len() as u64;
+                            current_offset += filtered_arc.len() as u64;
                             trace!(
                                 session_id = %id,
-                                raw_bytes = raw_arc.len(),
-                                filtered_bytes = filtered_len,
+                                filtered_bytes = filtered_arc.len(),
                                 current_offset,
                                 "forwarded live PTY output over IPC stream"
                             );
@@ -256,8 +250,7 @@ pub(super) async fn handle_attach_subscribe(
                                     }
                                 }
                             };
-                            let mut resync_filter = EscapeFilter::new();
-                            let raw = collect_filtered_chunks(&chunks, &mut resync_filter);
+                            let raw = collect_chunk_bytes(&chunks);
                             if !raw.is_empty() {
                                 debug!(
                                     session_id = %id,

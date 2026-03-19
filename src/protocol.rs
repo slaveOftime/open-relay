@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Serde helper: transparently encode `Vec<u8>` as a base64 string in JSON.
 /// This reduces wire size from ~4× (JSON integer arrays) to ~1.37× (base64).
@@ -173,19 +173,22 @@ pub enum RpcResponse {
     Start {
         session_id: String,
     },
-    /// Sent once after AttachSubscribe: ring tail replay (raw filtered bytes) + terminal mode flags.
+    /// Sent once after AttachSubscribe: ring tail replay from the canonical
+    /// filtered session stream + terminal mode flags.
     AttachStreamInit {
-        /// Raw PTY bytes (CPR/DSR responses stripped), ready to write directly to the terminal.
+        /// Filtered session-stream bytes, ready to write directly to the terminal.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
+        /// Canonical filtered-stream offset immediately after the replay bytes.
         end_offset: u64,
         running: bool,
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
     },
-    /// Stream chunk of new PTY output (filtered, ready to write to terminal).
+    /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
     AttachStreamChunk {
+        /// Canonical filtered-stream offset of the first byte in `data`.
         offset: u64,
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,

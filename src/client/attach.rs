@@ -107,7 +107,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         .await?;
 
         // Clear the visible screen and home the cursor before writing
-        // replay data.  The replay contains raw PTY output whose cursor
+        // replay data.  The replay contains filtered PTY output whose cursor
         // positioning (absolute and relative) was calculated from row 1,
         // col 1.  Without this clear, the replay starts from wherever the
         // terminal cursor happens to be, offsetting all subsequent cursor
