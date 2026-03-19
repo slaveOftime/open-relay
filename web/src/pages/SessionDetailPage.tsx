@@ -319,8 +319,10 @@ export default function SessionDetailPage() {
         setLogLines([...next])
         setScrubberMax(next.length)
         if (!isReplayingRef.current) {
-          termRef.current?.write(res.lines.join(''))
-          termRef.current?.scrollToBottom()
+          if (termRef.current) {
+            res.lines.forEach(termRef.current.write)
+            termRef.current.scrollToBottom()
+          }
           setReplayIdx(next.length)
         }
       }
@@ -689,9 +691,9 @@ export default function SessionDetailPage() {
         setTotalLines(res.total)
         nextOffsetRef.current = res.next_offset
         setScrubberMax(res.lines.length)
-        if (res.lines.length > 0) {
-          termRef.current?.write(res.lines.join(''))
-          termRef.current?.scrollToBottom()
+        if (res.lines.length > 0 && termRef.current) {
+          res.lines.forEach(termRef.current.write)
+          termRef.current.scrollToBottom()
         }
         setReplayIdx(res.lines.length)
         fetchSession(id!, node ?? undefined)
@@ -719,8 +721,8 @@ export default function SessionDetailPage() {
     }
     setReplayIdx(val)
     termRef.current?.reset()
-    if (logLinesRef.current.length > 0) {
-      termRef.current?.write(logLinesRef.current.slice(0, val + 1).join(''))
+    if (logLinesRef.current.length > 0 && termRef.current) {
+      logLinesRef.current.slice(0, val + 1).forEach(termRef.current.write)
     }
     termRef.current?.scrollToBottom()
     if (
@@ -767,7 +769,9 @@ export default function SessionDetailPage() {
         return
       }
       const BATCH = Math.max(1, Math.round(5 * replaySpeedRef.current))
-      termRef.current?.write(lines.slice(idx, idx + BATCH).join(''))
+      if (termRef.current) {
+        lines.slice(idx, idx + BATCH).forEach(termRef.current.write)
+      }
       idx += BATCH
       setReplayIdx(idx)
       replayRafRef.current = requestAnimationFrame(step)
