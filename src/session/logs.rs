@@ -34,7 +34,7 @@ pub fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<Vec<u8>> {
     let mut file = File::open(log_path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
 
-    let margin = (tail as u64) * 2 * BYTES_PER_LINE_ESTIMATE;
+    let margin = ((tail as u64) * 2).max(200) * BYTES_PER_LINE_ESTIMATE;
     let start = file_size.saturating_sub(margin);
 
     file.seek(SeekFrom::Start(start))?;
