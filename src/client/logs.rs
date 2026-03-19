@@ -91,7 +91,7 @@ async fn run_logs_local(
         terminal::size().map(|(w, _)| w).unwrap_or(80)
     };
 
-    let output = render_log_file(&log_path, tail, keep_color, term_cols)?;
+    let output = render_log_file(&log_path, tail, keep_color, term_cols, None)?;
     write_rendered_output(&output, keep_color)
 }
 
