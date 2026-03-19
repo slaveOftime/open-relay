@@ -24,12 +24,21 @@ fn prompt_gap(prompt: &str) -> &'static str {
     }
 }
 
+fn prompt_input_separator(prompt: &str) -> &'static str {
+    if prompt.starts_with("PS ") || prompt.starts_with("bash-") {
+        " "
+    } else {
+        ""
+    }
+}
+
 fn prompted_transcript<I, S>(prompt: &str, command: &str, output_lines: I) -> String
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
     let mut transcript = String::new();
+    transcript.push_str(prompt_input_separator(prompt));
     transcript.push_str(command);
     transcript.push('\n');
     for line in output_lines {

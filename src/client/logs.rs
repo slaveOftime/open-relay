@@ -7,7 +7,7 @@ use crate::{
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    session::logs::{read_tail_bytes, render_rows},
+    session::logs::render_log_file,
 };
 
 pub async fn run_logs(
@@ -91,63 +91,20 @@ async fn run_logs_local(
         terminal::size().map(|(w, _)| w).unwrap_or(80)
     };
 
-    // Step 1: seek to a position that gives `tail * 2` lines worth of bytes,
-    // providing enough context for the vt100 parser even with heavy escape usage.
-    let bytes = read_tail_bytes(&log_path, tail)?;
-
-    // Step 2: feed bytes into a vt100 parser sized to (tail rows × 2000 cols),
-    // then collect each visible row formatted and trimmed to the terminal width.
-    let rows = render_rows(&bytes, tail, term_cols, keep_color);
-
-    print_rows(&rows, keep_color)
+    let output = render_log_file(&log_path, tail, keep_color, term_cols)?;
+    write_rendered_output(&output, keep_color)
 }
 
-/// Write all rows to stdout, skipping any leading blank rows.
+/// Write the rendered CLI log output to stdout.
 ///
 /// When color output is enabled, emit a final ANSI reset so styles do not
 /// leak into subsequent terminal output.
-fn print_rows(rows: &[Vec<u8>], keep_color: bool) -> Result<()> {
-    let _reset_guard = TerminalResetGuard::new(keep_color);
-
-    // Find the first non-empty row so we don't print a sea of blank lines when
-    // the log is shorter than `tail`.
-    let first_content = rows
-        .iter()
-        .position(|r| !r.is_empty() && r.iter().any(|&b| !b.is_ascii_whitespace()))
-        .unwrap_or(0);
+fn write_rendered_output(output: &[u8], keep_color: bool) -> Result<()> {
+    let _reset_guard = crate::terminal_guards::ColorfulGuard::new(keep_color);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    for row in &rows[first_content..] {
-        out.write_all(row)?;
-        if keep_color {
-            out.write_all(b"\x1b[0m")?;
-        }
-        writeln!(out)?;
-    }
-
-    if keep_color {
-        out.write_all(b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h")?;
-    }
+    out.write_all(output)?;
 
     Ok(())
-}
-
-struct TerminalResetGuard {
-    enabled: bool,
-}
-
-impl TerminalResetGuard {
-    fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
-}
-
-impl Drop for TerminalResetGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h");
-            let _ = std::io::stdout().flush();
-        }
-    }
 }

@@ -12,6 +12,7 @@ mod notification;
 mod protocol;
 mod session;
 mod storage;
+mod terminal_guards;
 mod utils;
 
 use clap::Parser;
