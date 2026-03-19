@@ -1,5 +1,6 @@
 mod cli;
 mod client;
+mod clipboard;
 mod config;
 mod daemon;
 mod db;

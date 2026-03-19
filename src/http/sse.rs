@@ -17,10 +17,10 @@ use tracing::{debug, info, warn};
 
 use crate::{
     protocol::{ListQuery, ListSortField, SortOrder},
-    session::{SessionLiveSummary, SessionStore},
+    session::{SessionEvent, SessionLiveSummary, SessionStore},
 };
 
-use super::{AppState, SessionEvent};
+use super::AppState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionFingerprint {

@@ -62,6 +62,9 @@ mimalloc = { version = "0.1.48", features = ["v3"] }
 libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
 bytes = "1"
 arc-swap = "1"
+arboard = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+

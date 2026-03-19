@@ -16,7 +16,7 @@ use crate::{
     node::NodeRegistry,
     notification::event::NotificationEvent,
     protocol::{RpcRequest, RpcResponse},
-    session::SessionStore,
+    session::{SessionEvent, SessionStore},
     storage,
 };
 
@@ -354,7 +354,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let session_store = Arc::new(store);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
 
-    let (event_tx, _) = tokio::sync::broadcast::channel::<http::SessionEvent>(100);
+    let event_tx = session_store.event_tx();
     let notifier = Arc::new(crate::notification::build_notifier(db.clone(), &config));
 
     let auth_state = auth_hash.map(AuthState::new);
@@ -413,7 +413,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         }
 
         let _ = notification_tx.send(event.clone());
-        let _ = event_tx.send(http::SessionEvent::SessionNotification {
+        let _ = event_tx.send(SessionEvent::SessionNotification {
             kind: event.kind.as_str().to_string(),
             summary: event.summary,
             body: event.body,

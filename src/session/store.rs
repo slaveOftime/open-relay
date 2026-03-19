@@ -18,7 +18,7 @@ use crate::{
     db::Database,
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
-    session::{SessionLiveSummary, mode_tracker::ModeSnapshot},
+    session::{SessionEvent, SessionEventTx, SessionLiveSummary, mode_tracker::ModeSnapshot},
 };
 
 use super::{
@@ -117,6 +117,7 @@ pub struct SessionStore {
     mutable: TokioMutex<StoreMutableState>,
     eviction_ttl: Duration,
     db: Arc<Database>,
+    event_tx: SessionEventTx,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +139,7 @@ struct PreparedStart {
 
 impl SessionStore {
     pub fn new(eviction_seconds: u64, db: Arc<Database>) -> Self {
+        let (event_tx, _) = broadcast::channel(100);
         Self {
             sessions: ArcSwap::from_pointee(HashMap::new()),
             mutable: TokioMutex::new(StoreMutableState {
@@ -146,7 +148,12 @@ impl SessionStore {
             }),
             eviction_ttl: Duration::from_secs(eviction_seconds.max(1)),
             db,
+            event_tx,
         }
+    }
+
+    pub fn event_tx(&self) -> SessionEventTx {
+        self.event_tx.clone()
     }
 
     /// Persist and evict completed sessions that have aged past the in-memory
@@ -230,6 +237,10 @@ impl SessionStore {
                 rt.mark_completed(SessionStatus::Failed, None);
             }
             let _ = store_handle.abort_started_session(&session_id).await;
+        } else if let Some(summary) = store_handle.get_summary(&session_id) {
+            let _ = store_handle
+                .event_tx
+                .send(SessionEvent::SessionCreated(summary));
         }
 
         result
@@ -581,13 +592,21 @@ impl SessionStore {
             return false;
         };
 
-        Self::terminate_runtime(
+        let terminated = Self::terminate_runtime(
             id.to_string(),
             runtime,
             grace_seconds,
             requested_final_status,
         )
-        .await
+        .await;
+
+        if terminated {
+            if let Some(summary) = self.get_summary(id) {
+                let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
+            }
+        }
+
+        terminated
     }
 
     async fn terminate_runtime(

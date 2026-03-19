@@ -10,6 +10,7 @@ use crossterm::{
 use tokio::{io::BufReader, sync::mpsc};
 
 use crate::{
+    clipboard,
     config::AppConfig,
     error::{AppError, Result},
     ipc,
@@ -189,14 +190,34 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         }
                     }
                     Event::Key(key) => {
-                        if !matches!(key.kind, KeyEventKind::Press) {
-                            continue;
-                        }
                         if is_ctrl_d(key) {
                             detached = true;
                             running = false;
                             break;
                         }
+
+                        if let Some(data) = maybe_collect_clipboard_paste(
+                            config,
+                            id,
+                            node,
+                            key,
+                            child_bracketed_paste_mode,
+                        )? {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id_owned.clone(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+
+                        if !matches!(key.kind, KeyEventKind::Press) {
+                            continue;
+                        }
+
                         if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
                             ipc::write_request_to_writer(
                                 &mut write_half,
@@ -433,6 +454,27 @@ fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
     } else {
         data
     }
+}
+
+fn maybe_collect_clipboard_paste(
+    config: &AppConfig,
+    id: &str,
+    node: Option<&str>,
+    key: KeyEvent,
+    bracketed_paste_mode: bool,
+) -> Result<Option<String>> {
+    if node.is_some() || !is_clipboard_paste_key(key) {
+        return Ok(None);
+    }
+
+    Ok(clipboard::collect_clipboard_paste(config, id)?
+        .map(|data| wrap_paste_input(data, bracketed_paste_mode)))
+}
+
+fn is_clipboard_paste_key(key: KeyEvent) -> bool {
+    (key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+        || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert))
 }
 
 // ---------------------------------------------------------------------------

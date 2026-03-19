@@ -11,6 +11,7 @@ mod store;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use tokio::sync::broadcast;
 
 use crate::protocol::SessionSummary;
 pub use store::SessionStore;
@@ -86,3 +87,26 @@ pub struct SessionLiveSummary {
     pub summary: SessionSummary,
     pub last_output_at: Option<Instant>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+#[allow(dead_code)]
+pub enum SessionEvent {
+    SessionCreated(SessionSummary),
+    SessionUpdated(SessionSummary),
+    SessionDeleted {
+        id: String,
+    },
+    SessionNotification {
+        kind: String,
+        summary: String,
+        body: String,
+        session_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger_rule: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trigger_detail: Option<String>,
+    },
+}
+
+pub type SessionEventTx = broadcast::Sender<SessionEvent>;
