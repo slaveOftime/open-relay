@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::{error::Result, protocol::LogResize};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -33,7 +33,14 @@ pub struct ViewportSize {
 
 struct TailBytes {
     bytes: Vec<u8>,
+    start_offset: u64,
     end_offset: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ViewportReplayPlan {
+    initial: Option<LogResize>,
+    resizes: Vec<LogResize>,
 }
 
 /// Read a page of lines from a persisted `output.log`.
@@ -78,10 +85,10 @@ pub fn render_log_file(
     // Step 1: seek to a position that gives `tail * 2` lines worth of bytes,
     // providing enough context for the vt100 parser even with heavy escape usage.
     let tail_bytes = read_tail_bytes(log_path, tail)?;
-    let viewport = if viewport.is_some() {
-        viewport
+    let viewport_plan = if viewport.is_some() {
+        ViewportReplayPlan::default()
     } else {
-        read_latest_viewport_size(log_path, tail_bytes.end_offset)?
+        read_relevant_resize_events(log_path, tail_bytes.start_offset, tail_bytes.end_offset)?
     };
 
     Ok(render_log_bytes(
@@ -90,6 +97,7 @@ pub fn render_log_file(
         keep_color,
         term_cols,
         viewport,
+        &viewport_plan,
     ))
 }
 
@@ -105,6 +113,7 @@ fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes> {
 
     let margin = (tail as u64) * 2 * BYTES_PER_LINE_ESTIMATE;
     let start = file_size.saturating_sub(margin);
+    let mut start_offset = start;
 
     file.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::with_capacity((file_size - start) as usize);
@@ -114,41 +123,65 @@ fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes> {
     if start > 0 {
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             buf.drain(..=pos);
+            start_offset = start_offset.saturating_add((pos + 1) as u64);
         }
     }
 
     Ok(TailBytes {
         bytes: buf,
+        start_offset,
         end_offset: file_size,
     })
 }
 
-fn read_latest_viewport_size(log_path: &Path, output_offset: u64) -> Result<Option<ViewportSize>> {
-    let Some(session_dir) = log_path.parent() else {
-        return Ok(None);
-    };
-
+pub fn read_resize_events(session_dir: &Path) -> Result<Vec<LogResize>> {
     let events_path = session_dir.join("events.log");
     let Ok(file) = File::open(events_path) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     let reader = BufReader::new(file);
-    let mut latest = None;
+    let mut events = Vec::new();
 
     for line in reader.lines() {
         let line = line?;
-        if let Some((offset, viewport)) = parse_resize_event(&line) {
-            if offset <= output_offset {
-                latest = Some(viewport);
-            }
+        if let Some(event) = parse_resize_event(&line) {
+            events.push(event);
         }
     }
 
-    Ok(latest)
+    Ok(events)
 }
 
-fn parse_resize_event(line: &str) -> Option<(u64, ViewportSize)> {
+fn read_relevant_resize_events(
+    log_path: &Path,
+    start_offset: u64,
+    end_offset: u64,
+) -> Result<ViewportReplayPlan> {
+    let Some(session_dir) = log_path.parent() else {
+        return Ok(ViewportReplayPlan::default());
+    };
+
+    let mut initial = None;
+    let mut resizes = Vec::new();
+    for event in read_resize_events(session_dir)? {
+        if event.offset <= start_offset {
+            initial = Some(event);
+        } else if event.offset <= end_offset {
+            resizes.push(LogResize {
+                offset: event.offset.saturating_sub(start_offset),
+                rows: event.rows,
+                cols: event.cols,
+            });
+        } else {
+            break;
+        }
+    }
+
+    Ok(ViewportReplayPlan { initial, resizes })
+}
+
+fn parse_resize_event(line: &str) -> Option<LogResize> {
     let mut offset = None;
     let mut rows = None;
     let mut cols = None;
@@ -168,13 +201,11 @@ fn parse_resize_event(line: &str) -> Option<(u64, ViewportSize)> {
         }
     }
 
-    Some((
-        offset?,
-        ViewportSize {
-            rows: rows?,
-            cols: cols?,
-        },
-    ))
+    Some(LogResize {
+        offset: offset?,
+        rows: rows?,
+        cols: cols?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -199,13 +230,14 @@ fn render_rows(
     term_cols: u16,
     keep_color: bool,
     viewport: Option<ViewportSize>,
+    viewport_plan: &ViewportReplayPlan,
 ) -> Vec<Vec<u8>> {
     let mut parser = vt100::Parser::new(
-        parser_rows(bytes, tail, viewport),
-        parser_cols(bytes, term_cols, viewport),
+        parser_rows(bytes, tail, viewport, viewport_plan),
+        parser_cols(bytes, term_cols, viewport, viewport_plan),
         0,
     );
-    parser.process(bytes);
+    process_bytes_with_resizes(&mut parser, bytes, viewport_plan);
 
     let screen = parser.screen();
 
@@ -220,10 +252,19 @@ fn render_rows(
     content_rows.into_iter().skip(skip).collect()
 }
 
-fn parser_rows(bytes: &[u8], tail: usize, viewport: Option<ViewportSize>) -> u16 {
+fn parser_rows(
+    bytes: &[u8],
+    tail: usize,
+    viewport: Option<ViewportSize>,
+    viewport_plan: &ViewportReplayPlan,
+) -> u16 {
     if contains_alt_screen(bytes) {
-        viewport
+        viewport_plan
+            .initial
+            .as_ref()
             .map(|size| size.rows)
+            .or_else(|| viewport.map(|size| size.rows))
+            .or_else(|| viewport_plan.resizes.first().map(|size| size.rows))
             .or_else(|| estimate_alt_screen_rows(bytes))
             .unwrap_or(DEFAULT_ALT_SCREEN_ROWS)
     } else {
@@ -231,13 +272,43 @@ fn parser_rows(bytes: &[u8], tail: usize, viewport: Option<ViewportSize>) -> u16
     }
 }
 
-fn parser_cols(bytes: &[u8], term_cols: u16, viewport: Option<ViewportSize>) -> u16 {
+fn parser_cols(
+    bytes: &[u8],
+    term_cols: u16,
+    viewport: Option<ViewportSize>,
+    viewport_plan: &ViewportReplayPlan,
+) -> u16 {
     if contains_alt_screen(bytes) {
-        viewport
+        viewport_plan
+            .initial
+            .as_ref()
             .map(|size| size.cols)
+            .or_else(|| viewport.map(|size| size.cols))
+            .or_else(|| viewport_plan.resizes.first().map(|size| size.cols))
             .unwrap_or_else(|| term_cols.max(1))
     } else {
         PARSER_COLS
+    }
+}
+
+fn process_bytes_with_resizes(
+    parser: &mut vt100::Parser,
+    bytes: &[u8],
+    viewport_plan: &ViewportReplayPlan,
+) {
+    let mut processed = 0usize;
+
+    for resize in &viewport_plan.resizes {
+        let resize_offset = resize.offset.min(bytes.len() as u64) as usize;
+        if resize_offset > processed {
+            parser.process(&bytes[processed..resize_offset]);
+            processed = resize_offset;
+        }
+        parser.screen_mut().set_size(resize.rows, resize.cols);
+    }
+
+    if processed < bytes.len() {
+        parser.process(&bytes[processed..]);
     }
 }
 
@@ -320,12 +391,13 @@ fn render_log_bytes(
     keep_color: bool,
     term_cols: u16,
     viewport: Option<ViewportSize>,
+    viewport_plan: &ViewportReplayPlan,
 ) -> Vec<u8> {
     let bytes = latest_render_frame(bytes);
 
     // Step 2: feed bytes into a vt100 parser sized to (tail rows × 2000 cols),
     // then collect each visible row formatted and trimmed to the terminal width.
-    let rows = render_rows(bytes, tail, term_cols, keep_color, viewport);
+    let rows = render_rows(bytes, tail, term_cols, keep_color, viewport, viewport_plan);
 
     format_rows_for_output(&rows, keep_color)
 }
@@ -439,9 +511,10 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportSize, parse_resize_event, parser_cols, parser_rows, read_latest_viewport_size,
-        render_log_bytes, render_log_file,
+        ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
+        read_relevant_resize_events, read_resize_events, render_log_bytes, render_log_file,
     };
+    use crate::protocol::LogResize;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -453,6 +526,10 @@ mod tests {
                 .join(name),
         )
         .expect("read expected fixture")
+    }
+
+    fn empty_plan() -> ViewportReplayPlan {
+        ViewportReplayPlan::default()
     }
 
     #[test]
@@ -522,7 +599,7 @@ mod tests {
     fn keeps_visible_rows_below_cursor() {
         let bytes = b"\x1b[2J\x1b[1;1HTitle\x1b[5;1HOption 1\x1b[6;1HOption 2\x1b[2;1HSearch";
 
-        let output = render_log_bytes(bytes, 10, false, 80, None);
+        let output = render_log_bytes(bytes, 10, false, 80, None, &empty_plan());
         let rendered = String::from_utf8_lossy(&output);
 
         assert!(rendered.contains("Title"));
@@ -543,7 +620,7 @@ mod tests {
         )
         .as_bytes();
 
-        let output = render_log_bytes(bytes, 10, false, 80, None);
+        let output = render_log_bytes(bytes, 10, false, 80, None, &empty_plan());
         let rendered = String::from_utf8_lossy(&output);
 
         assert!(!rendered.contains("stale"));
@@ -558,18 +635,16 @@ mod tests {
 
         assert_eq!(
             parsed,
-            Some((
-                42,
-                ViewportSize {
-                    rows: 37,
-                    cols: 105,
-                },
-            ))
+            Some(LogResize {
+                offset: 42,
+                rows: 37,
+                cols: 105,
+            })
         );
     }
 
     #[test]
-    fn reads_latest_viewport_from_events_log() {
+    fn reads_all_resize_events_from_events_log() {
         let temp_dir = std::env::temp_dir().join(format!(
             "oly-log-render-{}-{}",
             std::process::id(),
@@ -587,21 +662,100 @@ mod tests {
         fs::write(&log_path, b"placeholder").expect("write output log");
         fs::write(
             &events_path,
-            b"resize offset=0 rows=24 cols=80\nresize offset=10 rows=37 cols=105\n",
+            b"resize offset=0 rows=24 cols=80\nresize offset=10 rows=30 cols=90\nresize offset=20 rows=37 cols=105\n",
         )
         .expect("write events log");
 
-        let viewport = read_latest_viewport_size(&log_path, 999).expect("read viewport");
+        let resizes = read_resize_events(&temp_dir).expect("read resizes");
 
         assert_eq!(
-            viewport,
-            Some(ViewportSize {
-                rows: 37,
-                cols: 105,
-            })
+            resizes,
+            vec![
+                LogResize {
+                    offset: 0,
+                    rows: 24,
+                    cols: 80,
+                },
+                LogResize {
+                    offset: 10,
+                    rows: 30,
+                    cols: 90,
+                },
+                LogResize {
+                    offset: 20,
+                    rows: 37,
+                    cols: 105,
+                },
+            ]
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn keeps_last_resize_before_tail_and_future_resizes() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "oly-log-render-plan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let log_path = temp_dir.join("output.log");
+        let events_path = temp_dir.join("events.log");
+        fs::write(&log_path, b"placeholder").expect("write output log");
+        fs::write(
+            &events_path,
+            b"resize offset=0 rows=24 cols=80\nresize offset=100 rows=30 cols=90\nresize offset=140 rows=37 cols=105\nresize offset=220 rows=50 cols=140\n",
+        )
+        .expect("write events log");
+
+        let plan = read_relevant_resize_events(&log_path, 120, 200).expect("read relevant resizes");
+
+        assert_eq!(
+            plan,
+            ViewportReplayPlan {
+                initial: Some(LogResize {
+                    offset: 100,
+                    rows: 30,
+                    cols: 90,
+                }),
+                resizes: vec![LogResize {
+                    offset: 20,
+                    rows: 37,
+                    cols: 105,
+                }],
+            }
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn applies_resize_history_during_alt_screen_replay() {
+        let bytes = b"\x1b[?1049h\x1b[2J\x1b[H12345";
+        let output = render_log_bytes(
+            bytes,
+            4,
+            false,
+            10,
+            None,
+            &ViewportReplayPlan {
+                initial: Some(LogResize {
+                    offset: 0,
+                    rows: 2,
+                    cols: 4,
+                }),
+                resizes: vec![],
+            },
+        );
+        let rendered = String::from_utf8_lossy(&output);
+
+        assert!(rendered.contains("1234"));
+        assert!(rendered.contains("5"));
     }
 
     #[test]
@@ -609,8 +763,8 @@ mod tests {
         let bytes = b"\x1b[?1049h\x1b[20;1Hstale\x1b[HSelect Model";
         let viewport = Some(ViewportSize { rows: 6, cols: 100 });
 
-        assert_eq!(parser_rows(bytes, 10, viewport), 6);
-        assert_eq!(parser_cols(bytes, 80, viewport), 100);
-        assert_eq!(parser_cols(bytes, 80, None), 80);
+        assert_eq!(parser_rows(bytes, 10, viewport, &empty_plan()), 6);
+        assert_eq!(parser_cols(bytes, 80, viewport, &empty_plan()), 100);
+        assert_eq!(parser_cols(bytes, 80, None, &empty_plan()), 80);
     }
 }

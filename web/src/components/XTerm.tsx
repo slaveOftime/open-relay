@@ -61,6 +61,7 @@ export interface XTermHandle {
   writeln(data: string): void
   clear(): void
   reset(): void
+  resize(cols: number, rows: number): void
   scrollToBottom(): void
   scrollToTop(): void
   scrollLines(amount: number): void
@@ -105,6 +106,11 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
     },
     reset() {
       termRef.current?.reset()
+    },
+    resize(cols: number, rows: number) {
+      if (!termRef.current || cols <= 0 || rows <= 0) return
+      termRef.current.resize(cols, rows)
+      lastResizeRef.current = { cols, rows }
     },
     scrollToBottom() {
       termRef.current?.scrollToBottom()

@@ -250,10 +250,11 @@ async fn handle_logs_snapshot(
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     match session_store.logs_snapshot(&id, tail).await {
-        Some((lines, cursor, running)) => RpcResponse::LogsSnapshot {
+        Some((lines, cursor, running, resizes)) => RpcResponse::LogsSnapshot {
             lines,
             cursor,
             running,
+            resizes,
         },
         None => RpcResponse::Error {
             message: format!("session not found: {id}"),
@@ -294,12 +295,13 @@ async fn handle_logs_wait(
         None => RpcResponse::Error {
             message: format!("session not found: {id}"),
         },
-        Some((mut lines, mut cursor, mut running)) => {
+        Some((mut lines, mut cursor, mut running, mut resizes)) => {
             if !running {
                 return RpcResponse::LogsSnapshot {
                     lines,
                     cursor,
                     running,
+                    resizes,
                 };
             }
 
@@ -333,10 +335,11 @@ async fn handle_logs_wait(
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         let updated = session_store.logs_snapshot(&id, tail).await;
-                        if let Some((l, c, r)) = updated {
+                        if let Some((l, c, r, rs)) = updated {
                             lines = l;
                             cursor = c;
                             running = r;
+                            resizes = rs;
                         }
                         if !running {
                             break 'wait;
@@ -350,16 +353,18 @@ async fn handle_logs_wait(
                 }
             }
 
-            if let Some((l, c, r)) = session_store.logs_snapshot(&id, tail).await {
+            if let Some((l, c, r, rs)) = session_store.logs_snapshot(&id, tail).await {
                 lines = l;
                 cursor = c;
                 running = r;
+                resizes = rs;
             }
 
             RpcResponse::LogsSnapshot {
                 lines,
                 cursor,
                 running,
+                resizes,
             }
         }
     }

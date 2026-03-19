@@ -3,6 +3,12 @@ import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import type { SessionSummary } from '@/api/types'
 import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from '@/api/client'
 import { formatAge } from '@/utils/format'
+import {
+  appendLogLines,
+  initialLogReplayState,
+  replayLogLines,
+  type LogReplayState,
+} from '@/utils/logReplay'
 import StatusBadge from '@/components/StatusBadge'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
@@ -155,6 +161,8 @@ export default function SessionDetailPage() {
   const isRunningRef = useRef(false)
   const isReplayingRef = useRef(false)
   const totalLinesRef = useRef(0)
+  const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
+  const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
   const nextOffsetRef = useRef(0)
   const isFetchingMoreRef = useRef(false)
   const termContainerRef = useRef<HTMLDivElement>(null)
@@ -313,6 +321,7 @@ export default function SessionDetailPage() {
         node ?? undefined
       )
       if (!isMounted.current) return
+      logResizesRef.current = res.resizes
       if (res.lines.length > 0) {
         const next = [...logLinesRef.current, ...res.lines]
         logLinesRef.current = next
@@ -320,11 +329,23 @@ export default function SessionDetailPage() {
         setScrubberMax(next.length)
         if (!isReplayingRef.current) {
           if (termRef.current) {
-            res.lines.forEach(termRef.current.write)
+            logReplayStateRef.current = appendLogLines(
+              termRef.current,
+              res.lines,
+              res.resizes,
+              logReplayStateRef.current
+            )
             termRef.current.scrollToBottom()
           }
           setReplayIdx(next.length)
         }
+      } else if (!isReplayingRef.current && termRef.current) {
+        logReplayStateRef.current = appendLogLines(
+          termRef.current,
+          [],
+          res.resizes,
+          logReplayStateRef.current
+        )
       }
       if (res.total !== totalLinesRef.current) {
         totalLinesRef.current = res.total
@@ -677,6 +698,8 @@ export default function SessionDetailPage() {
     setLogLines([])
     setScrubberMax(0)
     totalLinesRef.current = 0
+    logReplayStateRef.current = initialLogReplayState()
+    logResizesRef.current = []
     nextOffsetRef.current = 0
     isFetchingMoreRef.current = false
     setTotalLines(0)
@@ -686,14 +709,14 @@ export default function SessionDetailPage() {
       .then((res) => {
         if (cancelled || !isMounted.current) return
         logLinesRef.current = res.lines
+        logResizesRef.current = res.resizes
         setLogLines(res.lines)
         totalLinesRef.current = res.total
         setTotalLines(res.total)
         nextOffsetRef.current = res.next_offset
         setScrubberMax(res.lines.length)
-        if (res.lines.length > 0 && termRef.current) {
-          res.lines.forEach(termRef.current.write)
-          termRef.current.scrollToBottom()
+        if (termRef.current) {
+          logReplayStateRef.current = replayLogLines(termRef.current, res.lines, res.resizes)
         }
         setReplayIdx(res.lines.length)
         fetchSession(id!, node ?? undefined)
@@ -720,11 +743,14 @@ export default function SessionDetailPage() {
       isPausedRef.current = false
     }
     setReplayIdx(val)
-    termRef.current?.reset()
-    if (logLinesRef.current.length > 0 && termRef.current) {
-      logLinesRef.current.slice(0, val + 1).forEach(termRef.current.write)
+    if (termRef.current) {
+      logReplayStateRef.current = replayLogLines(
+        termRef.current,
+        logLinesRef.current,
+        logResizesRef.current,
+        val + 1
+      )
     }
-    termRef.current?.scrollToBottom()
     if (
       val >= logLinesRef.current.length - 1 &&
       !isFetchingMoreRef.current &&

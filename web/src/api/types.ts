@@ -98,6 +98,13 @@ export interface LogsResponse {
   has_more: boolean
   limit: number
   running: boolean
+  resizes: LogResizeEvent[]
+}
+
+export interface LogResizeEvent {
+  offset: number
+  rows: number
+  cols: number
 }
 
 export interface ListPage<T> {

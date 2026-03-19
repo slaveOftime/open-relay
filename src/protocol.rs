@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 5;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LogResize {
+    pub offset: u64,
+    pub rows: u16,
+    pub cols: u16,
+}
+
 /// Serde helper: transparently encode `Vec<u8>` as a base64 string in JSON.
 /// This reduces wire size from ~4× (JSON integer arrays) to ~1.37× (base64).
 mod base64_bytes {
@@ -218,6 +225,8 @@ pub enum RpcResponse {
         lines: Vec<String>,
         cursor: u64,
         running: bool,
+        #[serde(default)]
+        resizes: Vec<LogResize>,
     },
     LogsPoll {
         lines: Vec<String>,

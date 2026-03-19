@@ -11,7 +11,10 @@ use crate::{
     protocol::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
-    session::{SessionStore, StartSpec, logs::read_persisted_log_page},
+    session::{
+        SessionStore, StartSpec,
+        logs::{read_persisted_log_page, read_resize_events},
+    },
 };
 
 use super::AppState;
@@ -621,6 +624,7 @@ pub async fn get_logs(
                 lines,
                 cursor: _,
                 running,
+                resizes,
             }) => {
                 let total = lines.len();
                 let page: Vec<_> = lines.into_iter().skip(offset).take(limit).collect();
@@ -633,6 +637,7 @@ pub async fn get_logs(
                     "has_more": next_offset < total,
                     "next_offset": next_offset,
                     "running": running,
+                    "resizes": resizes,
                 }))
                 .into_response()
             }
@@ -677,6 +682,7 @@ pub async fn get_logs(
     match read_persisted_log_page(&session_dir, offset, limit) {
         Some((lines, total)) => {
             let next_offset = offset.saturating_add(lines.len()).min(total);
+            let resizes = read_resize_events(&session_dir).unwrap_or_default();
             Json(serde_json::json!({
                 "lines": lines,
                 "offset": offset,
@@ -685,6 +691,7 @@ pub async fn get_logs(
                 "has_more": next_offset < total,
                 "next_offset": next_offset,
                 "running": false,
+                "resizes": resizes,
             }))
             .into_response()
         }

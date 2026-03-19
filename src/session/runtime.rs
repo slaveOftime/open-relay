@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     config::AppConfig,
     error::{AppError, Result},
+    protocol::LogResize,
     session::persist::append_output,
 };
 
@@ -47,6 +48,8 @@ pub struct SessionRuntime {
     pub pty: PtyHandle,
     /// Current PTY dimensions, updated on every successful resize.
     pub pty_size: Option<(u16, u16)>,
+    /// Canonical filtered-stream resize history for log replay.
+    pub resize_history: Vec<LogResize>,
     pub completed_at: Option<Instant>,
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
@@ -263,6 +266,11 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
+            self.resize_history.push(LogResize {
+                offset: self.ring.end_offset(),
+                rows,
+                cols,
+            });
             // Notify all attached clients about the new size.
             let _ = self.resize_tx.send((rows, cols));
         }
@@ -408,6 +416,11 @@ pub fn spawn_session(
         resize_tx,
         pty: pty_handle,
         pty_size: Some((rows, cols)),
+        resize_history: vec![LogResize {
+            offset: 0,
+            rows,
+            cols,
+        }],
         completed_at: None,
         persisted: false,
         requested_final_status: None,
@@ -670,6 +683,7 @@ mod tests {
                 pty_master: None,
             },
             pty_size: None,
+            resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
@@ -937,6 +951,7 @@ mod tests {
                 pty_master: None,
             },
             pty_size: None,
+            resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
