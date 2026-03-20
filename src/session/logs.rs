@@ -818,22 +818,6 @@ mod tests {
         .expect("read expected fixture")
     }
 
-    fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join(name)
-    }
-
-    fn assert_or_update_fixture(name: &str, output: &[u8]) {
-        let fixture_path = fixture_path(name);
-        if std::env::var_os("UPDATE_GOLDENS").is_some() {
-            fs::write(&fixture_path, output).expect("write updated fixture");
-            return;
-        }
-
-        assert_eq!(output, expected_fixture(name));
-    }
-
     fn empty_plan() -> ViewportReplayPlan {
         ViewportReplayPlan::default()
     }
@@ -856,7 +840,7 @@ mod tests {
         )
         .expect("render copilot output log with color");
 
-        assert_or_update_fixture("output-copilot.expected", &output);
+        assert_eq!(output, expected_fixture("output-copilot.expected"));
     }
 
     #[test]
@@ -877,7 +861,7 @@ mod tests {
         )
         .expect("render opencode output log with color");
 
-        assert_or_update_fixture("output-opencode.expected", &output);
+        assert_eq!(output, expected_fixture("output-opencode.expected"));
     }
 
     #[test]
@@ -898,7 +882,7 @@ mod tests {
         )
         .expect("render codex output log with color");
 
-        assert_or_update_fixture("output-codex.expected", &output);
+        assert_eq!(output, expected_fixture("output-codex.expected"));
     }
 
     #[test]
