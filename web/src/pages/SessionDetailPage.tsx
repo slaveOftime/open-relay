@@ -7,6 +7,7 @@ import {
   appendLogChunks,
   encodeLogChunks,
   initialLogReplayState,
+  playNextBatch,
   replayLogChunks,
   seekLogChunks,
   type LogReplayState,
@@ -23,13 +24,13 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+// import {
+//   Select,
+//   SelectContent,
+//   SelectItem,
+//   SelectTrigger,
+//   SelectValue,
+// } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
@@ -143,7 +144,7 @@ export default function SessionDetailPage() {
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
-  const [replaySpeed, setReplaySpeed] = useState(1)
+  const [replaySpeed, _] = useState(0.5)
   const [totalChunks, setTotalChunks] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
   const [isOnline, setIsOnline] = useState(
@@ -157,7 +158,7 @@ export default function SessionDetailPage() {
   const modeRef = useRef(mode)
   const replayTimerRef = useRef<number | null>(null)
   const logChunksRef = useRef<Uint8Array[]>([])
-  const replaySpeedRef = useRef(1)
+  const replaySpeedRef = useRef(0.5)
   const isPausedRef = useRef(false)
   const isRunningRef = useRef(false)
   const isReplayingRef = useRef(false)
@@ -745,16 +746,21 @@ export default function SessionDetailPage() {
     }
   }, [mode, id, node, reloadTick])
 
+  const isScrubbingRef = useRef(false)
+  const wasPlayingBeforeScrubRef = useRef(false)
+
   const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)
       replayTimerRef.current = null
-      isReplayingRef.current = false
-      setIsReplaying(false)
-      setIsPaused(false)
-      isPausedRef.current = false
     }
+    // Enter paused state when scrubbing so we can resume easily
+    isReplayingRef.current = true
+    setIsReplaying(true)
+    setIsPaused(true)
+    isPausedRef.current = true
+
     commitReplayIdx(val, { force: true })
     if (termRef.current) {
       logReplayStateRef.current = seekLogChunks(
@@ -818,45 +824,50 @@ export default function SessionDetailPage() {
         isPausedRef.current = false
         return
       }
-      const maxBytesPerFrame = 8 * 1024 // 8KB hard limit per frame
-      const targetBatchSize = Math.max(1, Math.round(5 * replaySpeedRef.current))
-      
-      let nextIdx = logReplayStateRef.current.chunkCount
-      let accumulatedBytes = 0
-      let chunksToAdd = 0
+      const maxBytesPerFrame = 2560 // 2.5KB strict limit per frame
 
-      // 1. Calculate how many chunks to add in this frame
-      while (
-        chunksToAdd < targetBatchSize && 
-        nextIdx < chunks.length
-      ) {
-        accumulatedBytes += chunks[nextIdx].byteLength
-        nextIdx++
-        chunksToAdd++
-        
-        // Stop if we exceed the byte budget for this frame
-        if (accumulatedBytes >= maxBytesPerFrame) break
-      }
+      // We use playNextBatch which handles byte limits automatically, 
+      // even splitting large chunks if necessary.
+      // This prevents UI freezing on massive log chunks.
 
       // 2. Perform a SINGLE write operation for the entire batch
-      if (chunksToAdd > 0 && termRef.current) {
-        logReplayStateRef.current = seekLogChunks(
+      if (termRef.current) {
+        // Adjust max bytes based on speed
+        // To make low speeds actually feel slow, we scale exponentially
+        // 0.5x -> ~128 bytes/frame
+        // 1.0x -> ~2.5KB/frame
+        // 2.0x -> ~5KB/frame
+        let speedMultiplier = replaySpeedRef.current
+        if (speedMultiplier < 1) {
+           speedMultiplier = speedMultiplier * speedMultiplier * 0.2
+        }
+        
+        // Ensure at least some progress (32 bytes minimum)
+        const adjustedMaxBytes = Math.max(32, Math.round(maxBytesPerFrame * speedMultiplier))
+
+        logReplayStateRef.current = playNextBatch(
           termRef.current,
           chunks,
           logResizesRef.current,
           logReplayStateRef.current,
-          nextIdx,
-          { scrollToBottom: false }
+          adjustedMaxBytes,
+          () => {
+            if (isPausedRef.current || !isReplayingRef.current) return
+            
+            commitReplayIdx(logReplayStateRef.current.chunkCount)
+            
+            // Only schedule the next frame AFTER xterm has processed this batch.
+            // This guarantees we never flood the renderer or block the UI.
+            replayTimerRef.current = window.setTimeout(step, 10)
+          }
         )
         
         termRef.current.scrollToBottom()
+      } else {
+        // Fallback (should rarely happen)
+        commitReplayIdx(logReplayStateRef.current.chunkCount)
+        replayTimerRef.current = window.setTimeout(step, 10)
       }
-      
-      commitReplayIdx(logReplayStateRef.current.chunkCount)
-      
-      // 3. Schedule next frame with 30fps target (33ms)
-      // This slower cadence ensures xterm has ample time to render between writes
-      replayTimerRef.current = window.setTimeout(step, 33)
     }
     replayTimerRef.current = window.setTimeout(step, 0)
   }
@@ -864,6 +875,21 @@ export default function SessionDetailPage() {
   async function handleLoadPageAndReplay() {
     if (nextOffsetRef.current < totalChunksRef.current) {
       await fetchMoreLogsRef.current?.()
+    }
+  }
+
+  function handleSliderChange(val: number[]) {
+    if (!isScrubbingRef.current) {
+      wasPlayingBeforeScrubRef.current = isReplayingRef.current && !isPausedRef.current
+      isScrubbingRef.current = true
+    }
+    handleScrub(val[0] ?? 0)
+  }
+
+  function handleSliderCommit(val: number[]) {
+    isScrubbingRef.current = false
+    if (wasPlayingBeforeScrubRef.current) {
+      startReplay(val[0] ?? 0)
     }
   }
 
@@ -1167,7 +1193,8 @@ export default function SessionDetailPage() {
                     min={0}
                     max={scrubberMax}
                     value={[replayIdx]}
-                    onValueChange={(value) => handleScrub(value[0] ?? 0)}
+                    onValueChange={handleSliderChange}
+                    onValueCommit={handleSliderCommit}
                     aria-label="Replay scrubber"
                   />
                   <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
@@ -1216,7 +1243,7 @@ export default function SessionDetailPage() {
                         {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
                       </TooltipContent>
                     </Tooltip>
-                    <Select
+                    {/* <Select
                       value={String(replaySpeed)}
                       onValueChange={(v) => setReplaySpeed(Number(v))}
                     >
@@ -1230,7 +1257,7 @@ export default function SessionDetailPage() {
                         <SelectItem value="5">5×</SelectItem>
                         <SelectItem value="10">10×</SelectItem>
                       </SelectContent>
-                    </Select>
+                    </Select> */}
                   </div>
                 </div>
               </div>
