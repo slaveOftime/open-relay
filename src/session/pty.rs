@@ -451,9 +451,11 @@ fn xterm_color_to_rgb(index: u8) -> (u8, u8, u8) {
 // ---------------------------------------------------------------------------
 
 /// Strips Cursor Position Report and Device Status Report responses, plus
-/// Operating System Command color responses, from pseudo-terminal output
-/// before display. Carries incomplete sequences across chunk boundaries so
-/// Windows ConPTY split-escape cases are handled correctly.
+/// most generic Operating System Command traffic, from pseudo-terminal output
+/// before display. A small OSC passthrough allowlist is applied so selected
+/// one-way notifications can still reach attached terminals. Carries
+/// incomplete query/response sequences across chunk boundaries so Windows
+/// ConPTY split-escape cases are handled correctly.
 ///
 /// All regex state is static (shared); only the cross-chunk `pending` prefix
 /// is per-instance.
@@ -563,8 +565,9 @@ pub fn extract_query_responses_no_client(
 
 /// Filter one pseudo-terminal chunk and strip synthetic terminal-response
 /// traffic such as Cursor Position Report replies, Device Status Report
-/// replies, Operating System Command color replies, and terminal-capability
-/// queries that would make the local terminal answer on its own.
+/// replies, Operating System Command color replies, disallowed generic OSC
+/// sequences, and terminal-capability queries that would make the local
+/// terminal answer on its own.
 ///
 /// Windows ConPTY can echo device and color responses into the master output
 /// stream. The sequence is frequently split across read boundaries at any
@@ -673,8 +676,8 @@ fn filter_cpr_chunk_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
     let combined = dsr_query_bare_re.replace_all(&combined, b"" as &[u8]);
     let combined = osc_full_re.replace_all(&combined, b"" as &[u8]);
     let combined = osc_bare_re.replace_all(&combined, b"" as &[u8]);
-    let combined = generic_osc_full_re.replace_all(&combined, b"" as &[u8]);
-    let combined = generic_osc_bare_re.replace_all(&combined, b"" as &[u8]);
+    let combined = filter_generic_osc_with_allowlist(&combined, generic_osc_full_re, true);
+    let combined = filter_generic_osc_with_allowlist(&combined, generic_osc_bare_re, false);
     let combined = private_dsr_query_re_bytes().replace_all(&combined, b"" as &[u8]);
     let combined = decrpm_query_re_bytes().replace_all(&combined, b"" as &[u8]);
     let combined = xtversion_query_re_bytes().replace_all(&combined, b"" as &[u8]);
@@ -850,6 +853,54 @@ fn is_partial_generic_osc_sequence_bytes(candidate: &[u8]) -> bool {
     }
 
     true
+}
+
+fn filter_generic_osc_with_allowlist(
+    text: &[u8],
+    regex: &regex::bytes::Regex,
+    escaped_prefix: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut last_end = 0usize;
+
+    for mat in regex.find_iter(text) {
+        out.extend_from_slice(&text[last_end..mat.start()]);
+        let sequence = mat.as_bytes();
+        if allow_passthrough_generic_osc(sequence, escaped_prefix) {
+            out.extend_from_slice(sequence);
+        }
+        last_end = mat.end();
+    }
+
+    out.extend_from_slice(&text[last_end..]);
+    out
+}
+
+fn allow_passthrough_generic_osc(sequence: &[u8], escaped_prefix: bool) -> bool {
+    let mut index = if escaped_prefix { 2 } else { 1 };
+    let digits_start = index;
+    while let Some(&byte) = sequence.get(index) {
+        if byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let ps = &sequence[digits_start..index];
+    if sequence.get(index) != Some(&b';') {
+        return false;
+    }
+    let payload = &sequence[index + 1..];
+
+    // OSC 0/1/2: icon/window title notifications.
+    // 0 => icon + window title, 1 => icon title, 2 => window title.
+    // These are one-way notifications and safe to pass through.
+    //
+    // OSC 9;4;...: progress/busy notifications used by terminals that
+    // implement this convention. This is also one-way and safe to pass
+    // through to attached clients.
+    matches!(ps, b"0" | b"1" | b"2") || (ps == b"9" && payload.starts_with(b"4;"))
 }
 
 /// Find the last occurrence of `needle` inside `haystack`.
@@ -1075,7 +1126,38 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_cpr_chunk_strips_generic_osc_sequences() {
+    fn test_filter_cpr_chunk_preserves_title_osc_sequences() {
+        let mut pending = Vec::new();
+        let text = "before\x1b]0;relay build\x07after";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_preserves_busy_osc_sequences() {
+        let mut pending = Vec::new();
+        let text = "before\x1b]9;4;1;0\x07after";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_preserves_split_title_osc_sequence() {
+        let mut pending = Vec::new();
+        let text1 = "before\x1b]0;relay";
+        assert_eq!(filter_text_chunk(&mut pending, text1), "before");
+        assert_eq!(pending_text(&pending), "\x1b]0;relay");
+
+        let text2 = " busy\x07after";
+        assert_eq!(
+            filter_text_chunk(&mut pending, text2),
+            "\x1b]0;relay busy\x07after"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_strips_disallowed_generic_osc_sequences() {
         let mut pending = Vec::new();
         let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug\x07after";
         assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
@@ -1083,14 +1165,18 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_cpr_chunk_keeps_partial_generic_osc_sequence_pending() {
+    fn test_filter_cpr_chunk_strips_split_disallowed_generic_osc_sequence() {
         let mut pending = Vec::new();
-        let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug";
-        assert_eq!(filter_text_chunk(&mut pending, text), "before");
+        let text1 = "before\x1b]7;file://host/home/binwen/open-relay/target/debug";
+        assert_eq!(filter_text_chunk(&mut pending, text1), "before");
         assert_eq!(
             pending_text(&pending),
             "\x1b]7;file://host/home/binwen/open-relay/target/debug"
         );
+
+        let text2 = "\x07after";
+        assert_eq!(filter_text_chunk(&mut pending, text2), "after");
+        assert!(pending.is_empty());
     }
 
     #[test]
