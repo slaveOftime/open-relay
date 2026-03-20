@@ -35,7 +35,7 @@
 ### Stop + logs + input
 
 - [x] Implement `oly stop <id> [--grace <seconds>]` (graceful SIGTERM/TerminateProcess then force-kill fallback).
-- [x] Implement `oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <ms>]` from persisted logs.
+- [x] Implement `oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>]` from persisted logs.
 - [x] Default `--tail` to 40 lines.
 - [x] Implement `oly send <id> [CHUNK]...` for non-attach PTY input.
 - [x] Support piped stdin for input automation (`cmd xxx | oly send <id>`).

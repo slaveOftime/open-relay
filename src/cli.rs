@@ -1,5 +1,46 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+fn parse_timeout_ms(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("timeout cannot be empty".to_string());
+    }
+
+    if trimmed == "0" {
+        return Ok(0);
+    }
+
+    let suffix_start = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (amount, unit) = trimmed.split_at(suffix_start);
+    if amount.is_empty() {
+        return Err(format!(
+            "invalid timeout '{value}'; use a number optionally followed by ms, s, m, or h"
+        ));
+    }
+
+    let amount = amount.parse::<u64>().map_err(|_| {
+        format!("invalid timeout '{value}'; the numeric portion must be an unsigned integer")
+    })?;
+    let unit = unit.to_ascii_lowercase();
+    let multiplier = match unit.as_str() {
+        "" | "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => {
+            return Err(format!(
+                "invalid timeout unit in '{value}'; supported units are ms, s, m, and h"
+            ));
+        }
+    };
+
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("timeout is too large: {value}"))
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "oly",
@@ -204,8 +245,13 @@ pub struct LogsArgs {
     /// Block until the session needs input (or exits), then print logs.
     #[arg(long = "wait-for-prompt", short = 'w')]
     pub wait_for_prompt: bool,
-    /// Timeout in milliseconds for --wait-for-prompt (0 = infinite).
-    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    /// Timeout for --wait-for-prompt. Accepts plain milliseconds or units like 10s, 5m, or 1h. Use 0 to wait forever.
+    #[arg(
+        long,
+        default_value = "30s",
+        value_name = "DURATION",
+        value_parser = parse_timeout_ms
+    )]
     pub timeout: u64,
 }
 
@@ -323,4 +369,46 @@ pub struct JoinListArgs {
     /// For list all the nodes joined to the current daemon (primary)
     #[arg(long, short = 'p')]
     pub primary: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, parse_timeout_ms};
+    use clap::Parser;
+
+    #[test]
+    fn parses_timeout_units_directly() {
+        assert_eq!(parse_timeout_ms("600").unwrap(), 600);
+        assert_eq!(parse_timeout_ms("250ms").unwrap(), 250);
+        assert_eq!(parse_timeout_ms("10s").unwrap(), 10_000);
+        assert_eq!(parse_timeout_ms("2m").unwrap(), 120_000);
+        assert_eq!(parse_timeout_ms("1h").unwrap(), 3_600_000);
+        assert_eq!(parse_timeout_ms("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn clap_parses_logs_timeout_duration() {
+        let cli = Cli::try_parse_from(["oly", "logs", "session-1", "--timeout", "10s"]).unwrap();
+        let Commands::Logs(args) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(args.timeout, 10_000);
+    }
+
+    #[test]
+    fn logs_timeout_defaults_to_thirty_seconds() {
+        let cli = Cli::try_parse_from(["oly", "logs", "session-1"]).unwrap();
+        let Commands::Logs(args) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(args.timeout, 30_000);
+    }
+
+    #[test]
+    fn rejects_unknown_timeout_units() {
+        let err = Cli::try_parse_from(["oly", "logs", "session-1", "--timeout", "10d"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid timeout unit"));
+    }
 }

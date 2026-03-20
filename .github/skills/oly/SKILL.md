@@ -24,11 +24,11 @@ oly start --title "task 1" --cwd /path/to/working/directory --detach --disable-n
 Wait for a prompt or check progress:
 
 ```bash
-oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 600
+oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 ```
 
 - `--wait-for-prompt` blocks until input is needed or the timeout expires.
-- `--timeout` in milliseconds.
+- `--timeout` accepts plain milliseconds or basic units like `250ms`, `10s`, `5m`, and `1h`. `0` waits forever. Default value is 30s.
 
 > If the target command is supposed to be very fast for starting or reacting to send command, then there is no need to use those flags. 
 

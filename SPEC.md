@@ -42,7 +42,7 @@
    - `oly ls [--search <text>] [--status <status>]... [--since <RFC3339>] [--until <RFC3339>] [--limit <n>] [--node <name>]`
    - `oly attach <id> [--node <name>]`
    - `oly send <id> [CHUNK]... [--node <name>]`
-   - `oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <ms>] [--node <name>]`
+	 - `oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]`
 3. PTY-backed child process execution with detach/reattach.
 4. Rolling in-memory output buffer (default 10,000 lines) plus on-disk log persistence.
 5. Local notification when input is likely required.
@@ -183,14 +183,14 @@ Each session has:
 
 ### 5.5 Read logs
 
-`oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <ms>] [--node <name>]`
+`oly logs <id> [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]`
 
 - Reads persisted output without attaching.
 - `--tail` defaults to `40` lines.
 - By default, output strips ANSI color sequences unless `--keep-color` is set.
 - `--no-truncate` disables column truncation.
 - `--wait-for-prompt` blocks until the session needs input (or exits), then prints logs.
-- `--timeout` is in milliseconds and defaults to `30000`; set `0` for no timeout.
+- `--timeout` accepts plain milliseconds for compatibility or basic units (`ms`, `s`, `m`, `h`) and defaults to `30s`; set `0` for no timeout.
 
 ### 5.6 Send input without attach
 
