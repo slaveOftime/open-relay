@@ -408,8 +408,8 @@ mod tests {
         assert_eq!(wwwroot, state_dir.join("wwwroot"));
         assert!(wwwroot.is_dir());
         assert!(wwwroot.join("apps").is_dir());
-        let index =
-            fs::read_to_string(wwwroot.join("index.html")).expect("index.html should exist");
+        let index = fs::read_to_string(wwwroot.join("apps").join("index.html"))
+            .expect("index.html should exist");
         assert!(index.contains("oly dashboard"));
         assert!(index.contains("wwwroot/apps"));
         assert!(index.contains("/api/static/apps"));
