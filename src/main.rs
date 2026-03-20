@@ -30,7 +30,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const OLY_START_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly-start/SKILL.md");
+const OLY_START_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly/SKILL.md");
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {

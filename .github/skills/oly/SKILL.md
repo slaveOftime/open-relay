@@ -1,5 +1,5 @@
 ---
-name: oly-start
+name: oly
 description: "Use when starting a long-running or interactive CLI command with oly, especially when the task may need later input, should run detached, or should keep durable logs for supervision and resume."
 ---
 
@@ -28,6 +28,9 @@ oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 600
 ```
 
 - `--wait-for-prompt` blocks until input is needed or the timeout expires.
+- `--timeout` in milliseconds.
+
+> If the target command is supposed to be very fast for starting or reacting to send command, then there is no need to use those flags. 
 
 Send input:
 
