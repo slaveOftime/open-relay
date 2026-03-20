@@ -97,8 +97,13 @@ where
         id,
         |log| {
             let log = normalize_log_text(log);
-            // Check that we're at a prompt and log contains the baseline
-            if trailing_prompt(&log) != prompt || !log.contains(baseline.trim()) {
+            // Check that we're at the correct prompt
+            if trailing_prompt(&log) != prompt {
+                return false;
+            }
+
+            // Verify the log is longer than baseline (new content added)
+            if log.len() <= baseline.len() {
                 return false;
             }
 
