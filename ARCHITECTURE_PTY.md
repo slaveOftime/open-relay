@@ -1,9 +1,12 @@
 # PTY Management Architecture
 
-> Standalone architecture reference for PTY lifecycle, streaming protocols,
-> cross-platform edge cases, and escape-sequence handling in Open Relay.
+> Standalone architecture reference for PTY lifecycle, terminal mode tracking,
+> streaming protocols, escape-sequence handling, and PTY/platform edge cases in
+> Open Relay.
 >
 > See also: [`ARCHITECTURE.md`](ARCHITECTURE.md) for system-wide architecture.
+> Detailed edge cases and notes now live in
+> [`ARCHITECTURE_NOTES.md`](ARCHITECTURE_NOTES.md).
 
 ---
 
@@ -330,6 +333,11 @@ PTY master fd
         Client terminal
 ```
 
+This section is the source of truth for terminal query handling and filtered PTY
+output.  The detailed incident catalog for discovered escape-sequence quirks
+lives in
+[`ARCHITECTURE_NOTES.md`](./ARCHITECTURE_NOTES.md#1-architecture-wide-escape-sequence-edge-cases).
+
 ### EscapeFilter Details
 
 ConPTY on Windows echoes terminal device responses (CPR, DSR, OSC color
@@ -553,36 +561,10 @@ after entering the alternate screen before re-reading the actual terminal size.
 
 ## 12) Cross-Platform Edge Cases
 
-### ConPTY (Windows)
-
-| Issue | Impact | Mitigation |
-|---|---|---|
-| Echo of device responses | CPR/DSR/OSC responses appear in master output | `EscapeFilter` strips them once in the PTY reader before retention and fan-out |
-| DSR query forwarding | Queries like `\x1b[6n` forwarded to attach clients cause CPR response feedback loop | `EscapeFilter` strips DSR queries in the canonical filtered stream |
-| ESC split across reads | Sequences split at arbitrary byte boundaries | `pending` field in `EscapeFilter` carries fragments |
-| No SIGWINCH | ConPTY uses `ResizePseudoConsole()` internally | `portable_pty` abstracts this |
-| No SIGCHLD | Child exit detected via `WaitForSingleObject` | `try_wait()` polls periodically |
-| Process group semantics | No `setsid()` / process groups | ConPTY manages child lifetime |
-| Color response format | May differ from POSIX terminal | Static fallback in `terminal_report_colors()` |
-
-### POSIX PTY (Linux / macOS)
-
-| Issue | Impact | Mitigation |
-|---|---|---|
-| File descriptor leaks | Child inherits daemon's fds | `portable_pty` sets up PTY handles with `CLOEXEC` semantics |
-| Zombie processes | Parent must `waitpid()` after SIGCHLD | `try_wait()` polled in completion check loop |
-| Signal during fork | SIGCHLD between fork/exec can confuse child | `portable_pty` blocks signals during fork |
-| PTY master close race | Close master while child is writing → SIGPIPE | Reader thread detects `read() == 0` and breaks cleanly |
-| macOS PTY buffer size | Smaller than Linux (4KB vs 16KB) | No special handling needed; affects throughput only |
-| EMFILE/ENFILE in accept | FD exhaustion prevents new connections | Back off and retry with exponential delay |
-
-### Encoding Assumptions
-
-- PTY output is treated as raw bytes, not decoded as UTF-8
-- `String::from_utf8_lossy` used only in filter functions that need regex
-- JSON framing uses base64 for binary data, preserving all bytes
-- Cross-chunk `pending` buffers in `EscapeFilter` operate on bytes (`Vec<u8>`)
-  so non-UTF-8 PTY output is preserved exactly
+The detailed PTY cross-platform edge-case catalog now lives in
+[`ARCHITECTURE_NOTES.md`](./ARCHITECTURE_NOTES.md#4-pty-cross-platform-edge-cases),
+including the ConPTY- and POSIX-specific caveats plus the encoding assumptions
+for raw PTY byte handling.
 
 ---
 

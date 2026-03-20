@@ -1,6 +1,10 @@
 # Open Relay Architecture (Source of Truth)
 
-This document is the authoritative, repository-wide architecture reference for `open-relay` (`oly`).  It covers system design, runtime internals, IPC/WebSocket protocols, terminal-mode tracking, escape-sequence edge cases, cross-platform considerations, and the full feature specification.  Future agents and contributors should start here before opening any source file.
+This document is the authoritative, repository-wide architecture reference for `open-relay` (`oly`).  It covers system design, runtime internals, IPC/WebSocket protocols, and the full feature specification.  Future agents and contributors should start here before opening any source file.
+
+PTY and terminal behavior live in [`ARCHITECTURE_PTY.md`](./ARCHITECTURE_PTY.md).
+Detailed edge cases, limitations, and operational notes live in
+[`ARCHITECTURE_NOTES.md`](./ARCHITECTURE_NOTES.md).
 
 ---
 
@@ -11,16 +15,12 @@ This document is the authoritative, repository-wide architecture reference for `
 3. [Repository Structure and Responsibilities](#3-repository-structure-and-responsibilities)
 4. [Core Runtime Flows](#4-core-runtime-flows)
 5. [Data and State Model](#5-data-and-state-model)
-6. [PTY Layer Internals](#6-pty-layer-internals)
+6. [PTY Integration Overview](#6-pty-integration-overview)
 7. [IPC Protocol Reference](#7-ipc-protocol-reference)
 8. [WebSocket Attach Protocol](#8-websocket-attach-protocol)
-9. [Terminal Mode Tracking](#9-terminal-mode-tracking)
-10. [Escape Sequence Edge Cases](#10-escape-sequence-edge-cases)
-11. [Feature Specification](#11-feature-specification)
-12. [Build, Run, and Test Surfaces](#12-build-run-and-test-surfaces)
-13. [Configuration Reference](#13-configuration-reference)
-14. [Known Limitations and Cross-Platform Notes](#14-known-limitations-and-cross-platform-notes)
-15. [Agent Usage Notes](#15-agent-usage-notes)
+9. [Feature Specification](#9-feature-specification)
+10. [Build, Run, and Test Surfaces](#10-build-run-and-test-surfaces)
+11. [Configuration Reference](#11-configuration-reference)
 
 ---
 
@@ -183,106 +183,22 @@ Primary references:
     - `events.log`
     - other artifacts as needed
 
-## 6) PTY Layer Internals
+## 6) PTY Integration Overview
 
-> **Detailed PTY architecture is in [`ARCHITECTURE_PTY.md`](ARCHITECTURE_PTY.md).**
-> This section provides a summary; see the standalone doc for cross-platform
-> edge cases, signal handling, escape-sequence pipeline, and streaming protocol details.
+[`ARCHITECTURE_PTY.md`](./ARCHITECTURE_PTY.md) is the source of truth for PTY
+lifecycle, terminal mode tracking, escape-sequence handling, resize ordering,
+and cross-platform terminal behavior.
 
-### Allocation
+At the system level, the important boundaries are:
 
-| Platform | Mechanism | Library |
-|---|---|---|
-| Linux / macOS | `openpty(3)` — POSIX pseudoterminal pair | `portable_pty` |
-| Windows | ConPTY (`CreatePseudoConsole`) | `portable_pty` |
-
-`portable_pty` abstracts both backends behind a common `PtyPair` / `CommandBuilder` API.  The master side is held by the daemon; the slave side is handed to the child process.
-
-### PtyHandle (`src/session/pty.rs`)
-
-`PtyHandle` is the ownership boundary for PTY resources.  It encapsulates:
-
-| Field | Type | Purpose |
-|---|---|---|
-| `child` | `Box<dyn Child>` | Child process handle (wait, kill, pid) |
-| `writer_tx` | `mpsc::Sender<Vec<u8>>` | Channel to the writer thread |
-| `pty_master` | `Box<dyn MasterPty>` | Master-side fd for resize |
-
-Methods:
-- `write_input(data)` — sends bytes to the writer thread (non-blocking channel send)
-- `resize(rows, cols)` — calls `pty_master.resize()`, delivers `SIGWINCH` / ConPTY resize
-- `kill()` — terminates the child process
-- `try_wait()` — non-blocking check for child exit status
-- `process_id()` — returns the child PID if available
-
-The reader and writer threads are spawned in `spawn_session()` but are **not** owned by `PtyHandle` — they run independently and terminate when the master fd closes or the writer channel drops.
-
-### ModeTracker (`src/session/mode_tracker.rs`)
-
-A byte-level state machine that tracks DEC private mode sequences:
-
-```
-State transitions:
-  Normal → Esc (on 0x1b)
-  Esc    → Csi (on '[')     | Normal (anything else)
-  Csi    → CsiPrivate ('?') | Normal (anything else)
-  CsiPrivate → CsiParam (on digit)  | Normal (non-digit, non-';')
-  CsiParam   → process 'h'/'l' → Normal | collect digits/';'
-```
-
-Tracked modes:
-
-| Mode | DEC ID | Set sequence | Reset sequence |
-|---|---|---|---|
-| Application cursor keys (DECCKM) | 1 | `\x1b[?1h` | `\x1b[?1l` |
-| Bracketed paste mode | 2004 | `\x1b[?2004h` | `\x1b[?2004l` |
-
-`ModeTracker::process(bytes)` scans a byte slice and returns `Option<ModeSnapshot>` when any tracked mode changes.  It correctly handles sequences split across chunk boundaries — the parser state persists between calls.
-
-`ModeSnapshot` is a plain struct (`app_cursor_keys: bool`, `bracketed_paste_mode: bool`) used by attach handlers to:
-1. Include initial mode state in the attach init frame
-2. Transform arrow keys when DECCKM is active (see §7 Streaming Attach)
-3. Notify attached clients of mode changes mid-stream
-
-### PTY Reader Thread (`src/session/runtime.rs`)
-
-A dedicated `std::thread` (not a Tokio task) owns blocking reads from the master side:
-
-```
-loop {
-    read(master_fd, buf[4096])
-    → extract_query_responses_no_client()   // strip/answer OSC/CPR queries
-    → EscapeFilter::filter(bytes)           // derive canonical filtered stream
-    → push_output(raw, filtered)            // mode tracking + ring + persist
-    → broadcast_tx.send(filtered)           // fan-out to all attached clients
-}
-```
-
-- Blocking I/O on purpose — avoids Tokio thread starvation for high-bandwidth PTY output.
-- `extract_query_responses_no_client` answers ANSI color-query escape sequences so the child application does not block waiting for a response that only a real terminal would provide.  It also strips ConPTY/terminal-echo artifacts.
-- `push_output` delegates to `ModeTracker::process()` using the raw PTY bytes, but only the filtered bytes are appended to the ring buffer, persisted to disk, and broadcast to attached clients.
-
-### PTY Writer Thread (`src/session/runtime.rs`)
-
-A second `std::thread` drains an `mpsc` channel and writes to the master fd:
-
-```
-loop {
-    recv(input_rx) → write(master_fd, bytes)
-}
-```
-
-Input bytes come from IPC `AttachInput` or HTTP `POST /sessions/:id/input`.  The `SessionStore::attach_input()` method transparently transforms arrow key escape sequences when DECCKM is active (`\x1b[A` → `\x1bOA`).
-
-### Ring Buffer (`src/session/ring.rs`)
-
-- Fixed-capacity byte ring (default 512 KB).
-- New clients receive a replay of the ring contents as the first chunk of their attach stream.
-- Written by `push_output`; read by `SessionStore::attach_subscribe_init()` for both IPC and WebSocket attach.
-
-### Resize
-
-`SessionStore::resize(id, rows, cols)` calls `PtyHandle::resize()` on the master side.  The child receives `SIGWINCH` (POSIX) or a ConPTY resize event (Windows).  Resize must be sent **after** the initial ring-buffer replay has been delivered to a new client, or the child may emit a full-screen redraw that blanks the replayed output.
+- The daemon owns PTY allocation and the child process lifecycle through the
+  session runtime.
+- `SessionRuntime` retains filtered PTY output in the ring buffer, persists it
+  to disk, and broadcasts live chunks to attach clients.
+- `SessionStore` mediates input, resize, attach/detach, and stop operations for
+  the rest of the system.
+- IPC, WebSocket, and node-proxied clients all consume the same PTY-backed
+  session model even though their transport details differ.
 
 ---
 
@@ -446,183 +362,7 @@ Browser                           Daemon
 
 ---
 
-## 9) Terminal Mode Tracking
-
-The daemon tracks child-side terminal modes via `ModeTracker` (`src/session/mode_tracker.rs`), a byte-level state machine that scans raw PTY output.  The client must mirror these modes to translate user input correctly.
-
-| Mode | Enable sequence | Disable sequence | Child default | Effect on client input |
-|---|---|---|---|---|
-| **DECCKM** (Application Cursor Keys) | `\x1b[?1h` | `\x1b[?1l` | disabled | Arrow keys: disabled=`\x1b[A/B/C/D`, enabled=`\x1bOA/B/C/D` |
-| **Bracketed Paste Mode** | `\x1b[?2004h` | `\x1b[?2004l` | disabled | Paste: disabled=raw bytes, enabled=`\x1b[200~<data>\x1b[201~` |
-
-### ModeTracker Design
-
-`ModeTracker` uses a 5-state parser (Normal → Esc → Csi → CsiPrivate → CsiParam) that processes bytes one at a time.  It handles:
-
-- **Cross-chunk boundaries**: The parser state persists between `process()` calls, so an escape sequence split across two PTY read chunks is still correctly parsed.
-- **Unknown modes**: Only modes 1 (DECCKM) and 2004 (bracketed paste) are tracked; other DEC private modes are silently ignored.
-- **Multiple modes per chunk**: A single byte slice may contain multiple mode-changing sequences; all are processed.
-
-`ModeSnapshot` captures the current state of all tracked modes.  It is updated by the PTY reader's `push_output()` path and is also available via `SessionRuntime::mode_snapshot()` for on-demand queries (e.g., at attach init time).
-
-### DECCKM Transformation (Server-Side)
-
-`SessionStore::attach_input()` performs DECCKM arrow key transformation transparently on behalf of the client:
-
-- When `app_cursor_keys == true`: `\x1b[A/B/C/D` → `\x1bOA/B/C/D`
-- Spurious focus-loss sequences (`\x1b[O`) are filtered out
-
-This means IPC and WebSocket clients can always send normal-mode arrow keys — the daemon translates them if needed.
-
-### Client-Side Responsibilities
-
-The attach client (`src/client/attach.rs`) tracks mirrored copies:
-- `child_app_cursor_keys` — updated from `AttachStreamInit` and `AttachModeChanged`
-- `child_bracketed_paste` — updated from `AttachStreamInit` and `AttachModeChanged`
-
-On receipt of `crossterm::event::Event::Key`:
-- Translate arrow keys using the current `child_app_cursor_keys` value.
-
-On receipt of `crossterm::event::Event::Paste`:
-- `crossterm` strips the `\x1b[200~`/`\x1b[201~` markers.
-- If `child_bracketed_paste == true`, re-wrap the paste data in those markers before sending.
-
-The web client (`web/src/utils/keyInput.ts`) mirrors the same logic in TypeScript.
-
----
-
-## 10) Escape Sequence Edge Cases
-
-This section documents every non-obvious terminal escape sequence problem discovered during development.
-
----
-
-### EC-1: OSC Color Query Blocking (opencode / AI agents)
-
-**Problem**: Some AI coding tools (e.g., opencode) probe the terminal's foreground/background colors at startup using OSC 10/11 queries:
-```
-ESC ] 10 ; ? BEL      # query foreground color
-ESC ] 11 ; ? BEL      # query background color
-```
-A real terminal would respond with a color spec.  The daemon is not a terminal, so there is no response.  The child application blocks indefinitely waiting for the reply.
-
-**Root cause**: The PTY output path was transparent — it forwarded bytes to the ring buffer but never synthesized terminal responses.
-
-**Fix**: `extract_query_responses_no_client()` in `src/session/pty.rs` intercepts these queries and writes a synthetic response to the master fd before the bytes reach the filtered ring buffer:
-- Reads `$COLORFGBG` environment variable if set (common in color-aware terminals).
-- Falls back to white foreground (`rgb:ffff/ffff/ffff`) and black background (`rgb:0000/0000/0000`).
-
-**Source**: `src/session/pty.rs` — `TerminalQuery::ForegroundColor`, `TerminalQuery::BackgroundColor`.
-
----
-
-### EC-2: Duplicate `\x1b[?1049h` Blanks Alternate Screen
-
-**Problem**: Both the attach client (via `crossterm::execute!(stdout, EnterAlternateScreen)`) AND the child process may emit `\x1b[?1049h`.  The second invocation resets the alternate screen buffer, wiping any output already drawn.
-
-**Root cause**: The client unconditionally entered the alternate screen on attach, assuming it must set up terminal state.  But the child already manages its own screen.
-
-**Fix**: The attach client must **not** call `EnterAlternateScreen`.  The child's own `\x1b[?1049h` establishes the alternate screen.  The client's `RawModeGuard` teardown sends `\x1b[?1049l` on detach to cleanly exit regardless.
-
-**Affected file**: `src/client/attach.rs` — `run_attach_inner`, `run_attach_polled`.
-
----
-
-### EC-3: Resize Before Initial Data Race (Blank Screen on Reattach)
-
-**Problem**: A newly attaching client sends `AttachResize` to inform the daemon of its terminal size.  If this resize arrives before the ring-buffer replay is delivered, the child emits `\x1b[2J\x1b[H` (clear screen, cursor home) followed by a full repaint.  Those bytes arrive as `AttachData` frames **ahead of** or **mixed with** the ring replay, resulting in a blank or corrupted initial display.
-
-**Root cause**: Resize and initial data were not sequenced — the client optimistically sent resize as soon as the IPC connection opened.
-
-**Fix**: The `AttachStreamInit` frame carries `initial_data` (the full ring replay).  The client writes this replay to the terminal **before** sending `AttachResize`.  The daemon applies the resize only when it processes the `AttachResize` message, guaranteeing the replay is already consumed client-side.
-
-**Affected files**: `src/client/attach.rs` (send resize after parsing init), `src/daemon/rpc.rs` (emit `AttachStreamInit` with ring data).
-
----
-
-### EC-4: DECCKM Not Tracked Live (Wrong Arrow Keys in AI Tools)
-
-**Problem**: An attached AI tool enables Application Cursor Keys (`\x1b[?1h`) after the initial attach handshake.  The daemon captures the initial mode at attach time via `AttachStreamInit`, but never emits `AttachModeChanged` while the child is running.  The client's `child_app_cursor_keys` stays `false`.  When the user presses an arrow key, the client sends `\x1b[A` (normal mode) but the child expects `\x1bOA` (application mode) — movement is silently ignored or misinterpreted.
-
-**Root cause**: The mode-change detection in the PTY reader updates `RuntimeState` correctly, but no IPC signal was wired up to propagate the change to attached clients.
-
-**Fix**: After `push_output()` updates the mode snapshot, the streaming paths compare the current `ModeSnapshot` after each forwarded chunk and emit an `AttachModeChanged` frame when needed.
-
-**Affected file**: `src/daemon/rpc.rs` — live broadcast loop.
-
----
-
-### EC-5: Bracketed Paste Re-Wrapping
-
-**Problem**: `crossterm` parses `Event::Paste(text)` by stripping the `\x1b[200~` / `\x1b[201~` markers.  If the child has enabled Bracketed Paste Mode, it expects those markers — without them, the pasted text may be executed as commands rather than inserted as literal text.
-
-**Root cause**: `crossterm` strips markers at the event layer.  The attach client re-emits the text without re-adding them.
-
-**Fix**: When `child_bracketed_paste == true`, the client prepends `\x1b[200~` and appends `\x1b[201~` before writing the paste bytes to the IPC `AttachInput` frame.
-
-**Affected file**: `src/client/attach.rs` — input handler.
-
----
-
-### EC-6: ConPTY Bare CPR Echo
-
-**Problem**: On Windows, ConPTY echoes cursor-position-report responses (`[35;1R`) without the leading ESC byte back into the master-side output.  These bare sequences pollute the output stream visible to clients.
-
-**Root cause**: ConPTY implementation quirk — it echoes the response to the master before the child consumes it.
-
-**Fix**: `EscapeFilter` in `src/session/pty.rs` strips these bare CPR sequences in the PTY reader before they reach the canonical retained stream.
-
-**Source**: `src/session/pty.rs` — `EscapeFilter`.
-
----
-
-### EC-7: OSC 7 / Generic OSC Echo
-
-**Problem**: Shells and terminal apps send OSC 7 (`\x1b]7;file://hostname/path\x07`) to notify the terminal of the current working directory.  Some terminals echo this back through the PTY master, creating feedback loops.  Other OSC sequences may similarly be echoed.
-
-**Root cause**: Echo pass-through from terminal emulator to PTY master.
-
-**Fix**: `EscapeFilter` strips generic OSC sequences (BEL-terminated and ST-terminated) in the PTY reader before they are retained or broadcast.
-
-**Source**: `src/session/pty.rs`.
-
----
-
-### EC-8: Partial Escape Sequences Across `read()` Boundaries
-
-**Problem**: The PTY reader thread reads 4 KB chunks.  An escape sequence (e.g., an OSC string or a multi-byte CPR response) can be split across two consecutive `read()` calls.  Naive per-chunk processing would fail to recognize the split sequence.
-
-**Root cause**: POSIX `read()` on PTY master provides no framing — sequences can span arbitrary chunk boundaries.
-
-**Fix**: Two carry-forward buffers:
-- `query_tail: Vec<u8>` in the reader loop — carries the tail of a chunk that might be the start of a query sequence.
-- `EscapeFilter.pending: Vec<u8>` in `src/session/pty.rs` — carries incomplete escape sequences across calls to `filter()`.
-
-Both are reset when the sequence is completed or proven not to be an escape sequence.
-
-**Source**: `src/session/pty.rs` — `EscapeFilter`; `src/session/runtime.rs` — `query_tail`.
-
----
-
-### EC-9: Terminal Left in Bad State After Unexpected Client Exit
-
-**Problem**: If `oly attach` is killed with SIGKILL, or panics, Rust destructors do not run.  The terminal is left in raw mode (echo disabled, canonical mode off).  The user sees no input feedback and may not be able to recover without external intervention.
-
-**Root cause**: Raw mode is a process-level stty setting that survives process exit on POSIX.  `RawModeGuard::drop` sends a normalization string, but `Drop` is not called on SIGKILL.
-
-**Mitigation**:
-- `RawModeGuard::drop` sends a comprehensive normalize sequence:  
-  `\x1b[?1049l\x1b[!p\x1b[0m\x1b[?25h\x1b[?1000l...\x1b[?2004l`
-- This covers all known mode toggles for a clean detach under normal signals (SIGTERM, Ctrl-C, panic unwind).
-- For SIGKILL recovery: users must run `stty sane` or `reset` from another terminal or SSH session.
-
-**Cross-platform note**: On Windows, `crossterm` restores console mode via its own `Drop` implementation; ConPTY mode restoration is automatic.
-
-**Source**: `src/client/attach.rs` — `RawModeGuard::teardown_terminal`.
-
----
-
-## 11) Feature Specification
+## 9) Feature Specification
 
 ### F1 — Detached Session Start
 
@@ -744,11 +484,11 @@ Both are reset when the sequence is completed or proven not to be an escape sequ
 **Requirements**:
 - Config file location: `<state_dir>/config.toml`.
 - CLI flags override config file values.
-- See §13 for full option table.
+- See §11 for full option table.
 
 ---
 
-## 12) Build, Run, and Test Surfaces
+## 10) Build, Run, and Test Surfaces
 
 - Rust:
   - `cargo build`
@@ -763,7 +503,7 @@ Both are reset when the sequence is completed or proven not to be an escape sequ
 
 ---
 
-## 13) Configuration Reference
+## 11) Configuration Reference
 
 Config file: `<state_dir>/config.toml` (created on first run with defaults).
 
@@ -785,63 +525,4 @@ CLI flags (`oly --help`) override all config file values.
 
 ---
 
-## 14) Known Limitations and Cross-Platform Notes
-
-### Terminal Restoration on SIGKILL (All Platforms)
-
-Rust `Drop` implementations do not run on `SIGKILL`.  Raw mode is not restored.  Users must run `stty sane` (Linux/macOS) or close and reopen the terminal (Windows).
-
-### Windows ConPTY Quirks
-
-- ConPTY echoes bare CPR responses (`[35;1R`) into the master output stream.  These are stripped by `BARE_CPR_RE`.
-- ConPTY does not support all xterm extensions (e.g., mouse reporting beyond basic).
-- `SIGWINCH` does not exist on Windows; `portable_pty` translates resize events to ConPTY API calls.
-- Named pipes (IPC) have different path conventions: `\\.\pipe\oly-<user>`.
-
-### macOS Terminal.app
-
-- Does not set `$COLORFGBG` by default.  The color-query fallback (white-on-black) is used.
-- `EnterAlternateScreen` from the client side causes double invocation of `\x1b[?1049h` — the attach client must not call it (see EC-2).
-
-### Escape Sequence Fragmentation
-
-Large bursts of PTY output can send escape sequences across `read()` chunk boundaries.  The carry-forward buffers (`query_tail`, `EscapeFilter.pending`) handle known sequences, but novel sequences from future terminal capabilities may not be handled.
-
-### Multi-Client Input Multiplexing
-
-All attached clients write to the same PTY master.  Concurrent input from multiple clients interleaves at the byte level.  This is correct for automation (only one client sends input) but may be confusing for human multi-attach scenarios.  There is no UI indication of which client is typing.
-
-### Ring Buffer Overflow
-
-If a session emits more than `ring_capacity_bytes` of output before any client attaches, early output is lost.  `output.log` always has the full history.
-
-### Federation Latency
-
-Each input/output hop through a secondary node adds one WebSocket round-trip.  High-throughput sessions (e.g., video in terminal) may lag noticeably over high-latency links.
-
-### Auth Bypass Risk on Loopback-Only Deployments
-
-If `bind = "127.0.0.1"` and `auth_enabled = false`, any local process can control sessions.  This is intentional for trusted developer environments but must not be used on shared machines.
-
----
-
-## 15) Agent Usage Notes
-
-When an agent needs context, start from this file, then only open targeted files listed below for the exact flow being changed.
-
-### Practical Lookup Map
-
-| Problem area | Files to open |
-|---|---|
-| Session lifecycle bug | `src/session/runtime.rs`, `src/session/store.rs`, `src/daemon/lifecycle.rs` |
-| IPC protocol bug | `src/daemon/rpc.rs`, `src/ipc.rs` |
-| CLI attach behavior | `src/client/attach.rs`, `src/client/input.rs` |
-| Terminal mode tracking | `src/session/runtime.rs` (`push_output`), `src/client/attach.rs` (mode tracking) |
-| Escape sequence handling | `src/session/pty.rs` (`EscapeFilter`, `extract_query_responses_no_client`) |
-| API behavior bug | `src/http/*.rs`, `src/db.rs` |
-| Web terminal/UI bug | `web/src/pages/SessionDetailPage.tsx`, `web/src/components/XTerm.tsx` |
-| Key input translation | `web/src/utils/keyInput.ts`, `src/client/attach.rs` |
-| Federation issues | `src/node/*`, `src/client/join.rs`, `src/http/nodes.rs` |
-| Push notifications | `src/notification/*` |
-| Cross-platform / PTY | `src/session/runtime.rs`, `portable_pty` crate docs |
 
