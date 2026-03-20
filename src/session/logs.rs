@@ -14,9 +14,6 @@ use crate::{error::Result, protocol::LogResize};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Generous per-line byte budget that accounts for ANSI escape sequences.
-const BYTES_PER_LINE_ESTIMATE: u64 = 256;
-
 /// Fallback record size for raw PTY log pagination when no natural terminal
 /// boundary appears for a long stretch of bytes.
 const LOG_RECORD_FALLBACK_BYTES: usize = 2048;
@@ -362,25 +359,59 @@ fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes> {
     let mut file = File::open(log_path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
 
-    let margin = ((tail as u64) * 2).max(100) * BYTES_PER_LINE_ESTIMATE;
-    let start = file_size.saturating_sub(margin);
-    let mut start_offset = start;
+    if file_size == 0 {
+        return Ok(TailBytes {
+            bytes: Vec::new(),
+            start_offset: 0,
+            end_offset: 0,
+        });
+    }
 
-    file.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::with_capacity((file_size - start) as usize);
-    file.read_to_end(&mut buf)?;
+    // Check if file ends with newline to adjust our line counting
+    file.seek(SeekFrom::End(-1))?;
+    let mut last_byte = [0u8; 1];
+    file.read_exact(&mut last_byte)?;
+    let ends_with_newline = last_byte[0] == b'\n';
 
-    // Drop the first partial line when we didn't start at byte 0.
-    if start > 0 {
-        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            buf.drain(..=pos);
-            start_offset = start_offset.saturating_add((pos + 1) as u64);
+    // We want at least `tail * 2` lines, but ensure a minimum of 100 lines for context.
+    let lines_needed = (tail * 2).max(100) + if ends_with_newline { 1 } else { 0 };
+
+    let chunk_size = 64 * 1024; // 64KB chunks
+    let mut position = file_size;
+    let mut lines_found = 0;
+    let mut buf = vec![0u8; chunk_size];
+
+    while position > 0 && lines_found < lines_needed {
+        let to_read = std::cmp::min(position, chunk_size as u64);
+        position -= to_read;
+
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut buf[..to_read as usize])?;
+
+        let chunk = &buf[..to_read as usize];
+        for (i, &byte) in chunk.iter().enumerate().rev() {
+            if byte == b'\n' {
+                lines_found += 1;
+                if lines_found >= lines_needed {
+                    // Start reading *after* this newline
+                    position += (i as u64) + 1;
+                    break;
+                }
+            }
+        }
+
+        if lines_found >= lines_needed {
+            break;
         }
     }
 
+    file.seek(SeekFrom::Start(position))?;
+    let mut bytes = Vec::with_capacity((file_size - position) as usize);
+    file.read_to_end(&mut bytes)?;
+
     Ok(TailBytes {
-        bytes: buf,
-        start_offset,
+        bytes,
+        start_offset: position,
         end_offset: file_size,
     })
 }

@@ -1,70 +1,4 @@
-[?9001h[?1004h[m[?25h[>1u
-[?25l[H[?25h[?25l[?2004h[?1004h[22;2t[35m● Loading environment:[m[3;1H ~[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ⁠[?2004h[H[K
-[K
-[K
-[K
-[K
-[K
-[K
-[K[100C[35m[H╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
-│[46X[36m[46C╭─╮╭─╮[46X[35m[46C│
-│[46X[36m[46C╰─╯╰─╯[46X[35m[46C│
-│                                              █ [32m▘▝ [35m█                                              │
-│                                               ▔▔▔▔                                               │
-│[39X[1m[39CGitHub Copilot[m v1.0.7[38X[35m[38C│
-│[31X[m[31CCopilot uses AI. Check for mistakes.[31X[35m[31C│
-│                                                                                                  │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯[11;1H● Loading environment:[m[13;1H ~[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​[35m[11;1H● Loading environment:[K[m
-[K
- ~[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
-[K[100C[11;1H[K
-[K
-[K
-[K
-[K
-[K
-[K
-[K[100C[34m[11;1H● [m💡 No copilot instructions found. Run /init to generate a copilot-instructions.md file for this
-  project.[35m[14;1H● Loading environment:[m[16;1H ~[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339%[90m[14;1H╭[m[1m Confirm folder trust [90m[22m────────────────────────────────────────────────────────────────────────────╮
-│ ╭──────────────────────────────────────────────────────────────────────────────────────────────╮ │
-│ │ [mC:\Users\woo[81X[90m[81C│ │
-│ ╰──────────────────────────────────────────────────────────────────────────────────────────────╯ │
-│                                                                                                  │
-│ [mCopilot may read files in this folder. Reading untrusted files may lead Copilot to behave in     [90m│
-│ [munexpected ways. With your permission, Copilot may execute code or bash commands in this folder. [90m│
-│  [mExecuting untrusted code is unsafe.[61X[90m[61C│
-│                                                                                                  │
-│ [mDo you trust the files in this folder?[59X[90m[59C│
-│                                                                                                  │
-│ [36m❯ 1. Yes[89X[90m[89C│
-│   [m2. Yes, and remember this folder for future sessions[43X[90m[43C│
-│   [m3. No (Esc)[84X[90m[84C│
-│                                                                                                  │
-│ [m[1m↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[49X[90m[49C│
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯[m
-[100C[?2004l[?2004h[?2004h[35m[13;1H● Loading environment:[K[m
-[K
- ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
+[?9001h[?1004h[m[?25h[?1049h[?25l[K
 [K
 [K
 [K
@@ -75,83 +9,6 @@
 [K
 [K
 [K
-[K[100C[?2004l[?2004l[?2004h[?1004h[35m[13;1H◉ Loading environment:[K[m
-[K
- ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
-[K[100C[35m[13;1H◎ Loading environment:[K[m
-[K
- ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
-[K[100C[35m[13;1H○ Loading environment:[K[m
-[K
- ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
-[K[100C[13;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
-[K
-[K
-[K[100C[13;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /[7ma[27mdd-dir[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[36m[22m
-▋  /add-dir <directory>                          Add a directory to the allowed list for file access
-▋  [m/agent                                        Browse and select from available agents (if any)   
-▋  /allow-all, /yolo                             Enable all permissions (tools, paths, and URLs)
-▋  /changelog [summarize] [version | last <N> |… Display changelog for CLI versions. Add 'summarize…
-▋  /clear, /new                                  Clear the conversation history
-▋  /compact                                      Summarize conversation history to reduce context w…
-▋  /context                                      Show context window token usage and visualization
-▋  /copy                                         Copy the last response to the clipboard
-▋  /cwd, /cd [directory]                         Change working directory or show current directory
-▋  /delegate [prompt]                            Send this session to GitHub and Copilot will creat…[34m[13;1H● [mEnvironment loaded: 1 MCP server[K
-[K
- ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /[7ma[27mdd-dir[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[36m[22m
-▋  /add-dir <directory>                          Add a directory to the allowed list for file access
-▋  [m/agent                                        Browse and select from available agents (if any)   
-▋  /allow-all, /yolo                             Enable all permissions (tools, paths, and URLs)    
-▋  /changelog [summarize] [version | last <N> |… Display changelog for CLI versions. Add 'summarize…
-▋  /clear, /new                                  Clear the conversation history[K
-▋  /compact                                      Summarize conversation history to reduce context w…
-▋  /context                                      Show context window token usage and visualization  
-▋  /copy                                         Copy the last response to the clipboard[K
-▋  /cwd, /cd [directory]                         Change working directory or show current directory 
-▋  /delegate [prompt]                            Send this session to GitHub and Copilot will creat…[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /m[7mc[27mp[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [36m/mcp [show|add|edit|delete|disable|enable] [… Manage MCP server configuration[K[m
- /model, /models [model]                       Select AI model to use[K
- /streamer-mode, /on-air                       Toggle streamer mode (hides preview model names and …
- /compact                                      Summarize conversation history to reduce context win…
- /experimental [on|off|show]                   Show available experimental features, or enable/disa…
- /rename <name>                                Rename the current session (alias for /session renam…
- /resume [sessionId]                           Switch to a different session (optionally specify se…
- /terminal-setup                               Configure terminal for multiline input support (shif…
- /theme [default|dim|high-contrast|colorblind] View or set color mode[K
-[K
-[K
-[K[100C[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /mo[7md[27mel[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [36m/model, /models [model]                       Select AI model to use[K[m
- /streamer-mode, /on-air                       Toggle streamer mode (hides preview model names and …
 [K
 [K
 [K
@@ -160,177 +17,51 @@
 [K
 [K
 [K
-[K[100C[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /mod[7me[27ml[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [36m/model, /models [model]                       Select AI model to use[K[m
- /streamer-mode, /on-air                       Toggle streamer mode (hides preview model names and …
-[K
-[K[100C[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /mode[7ml[27m[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [36m/model, /models [model]                       Select AI model to use[K[m
- /streamer-mode, /on-air                       Toggle streamer mode (hides preview model names and …
-[K
-[K[100C[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /model[7m [27m[model][K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [36m/model, /models [model]                       Select AI model to use[K[m
 [K
 [K
-[K[100C[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ /models[7m [27m[model][K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [36m/model, /models [model]                       Select AI model to use[K[m
 [K
-[K[100C[15;1H ~                                                                              gpt-5.4 (high) (1x) [2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
-❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[K[2m
-────────────────────────────────────────────────────────────────────────────────────────────────────[22m
- [1mshift+tab[22m switch mode ​                                                     Remaining reqs.: -339% 
 [K
-[K[100C[1m[15;1HSelect Model[22m[K
 [K
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future
- sessions.[K
 [K
-Some models are not available. For information on Copilot policies and subscription, visit:[K
-https://github.com/settings/copilot/features[7m[23;1H [27mSearch models...[36m[25;1H❯ Gemini 3 Pro (Preview)[14X[90m[14C1x[m
-  GPT-5.4[29X[90m[29C1x[m
-  GPT-5.3-Codex[23X[90m[23C1x[m
-  GPT-5.2-Codex[23X[90m[23C1x[m
-  GPT-5.2[29X[90m[29C1x[m
-  GPT-5.1-Codex-Max[19X[90m[19C1x[m
-  GPT-5.1-Codex[90m[23C1x[K[60C[m
-  GPT-5.1[90m[29C1x[K[60C[m
-  GPT-5.4 mini[90m[21C0.33x[K[60C[m
-  GPT-5.1-Codex-Mini (Preview)     [90m0.33x[K[60C[m
-  GPT-5 mini[90m[26C0x[K[60C[m
-  GPT-4.1[90m[29C0x[K[60C[m
-[100C
-[1m↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[K[52C
-[100C[?2004l[?2004h[1m[6;1HSelect Model[22m[K
 [K
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future
- sessions.[K
 [K
-Some models are not available. For information on Copilot policies and subscription, visit:[K
-https://github.com/settings/copilot/features[K
-[K[7m
- [27mSearch models...[K
-[K[36m
-❯ Gemini 3 Pro (Preview) (default)        [90m1x[K[m
-  [32mGPT-5.4 ✓[31X[90m[31C1x[K[m
-  GPT-5.3-Codex[27X[90m[27C1x[K[m
-  GPT-5.2-Codex[27X[90m[27C1x[K[m
-  GPT-5.2[33X[90m[33C1x[K[m
-  GPT-5.1-Codex-Max[23X[90m[23C1x[K[m
-  GPT-5.1-Codex[27X[90m[27C1x[K[m
-  GPT-5.1[33X[90m[33C1x[K[m
-  GPT-5.4 mini[25X[90m[25C0.33x[K[m
-  GPT-5.1-Codex-Mini (Preview)[9X[90m[9C0.33x[K[m
-  GPT-5 mini[30X[90m[30C0x[K[m
-  GPT-4.1[33X[90m[33C0x[K[m
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[>1u
+[?25l[H[?25h[?25l[?1002h[?1006h[?2004h[22;2t[?2004h[?2026h[?2026l[35m╭──────────────────────────────────────────────────────────────────────────────────────────────────╮     
+│  [36m╭─╮╭─╮[90X[35m[90C│     
+│  [36m╰─╯╰─╯  [35m[1mGitHub Copilot[m v1.0.9[67X[35m[67C│     
+│  █ [32m▘▝ [35m█  [mDescribe a task to get started.[57X[35m[57C│     
+│   ▔▔▔▔                                                                                           │     
+│  [mTip: [36m/resume [mSwitch to a different session (optionally specify session ID or task ID)[11X[35m[11C│     
+│  [mCopilot uses AI, so always check for mistakes.[50X[35m[50C│     
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯     [m[?2004h[?2004h[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[34m[10;1H● [m💡 No copilot instructions found. Run /init to generate a copilot-instructions.md file for this        
+  project.[K[90m[18;1H╭───────────────────────────────────────────────────────────────────────────────────────────────────────╮│ [m[1mConfirm folder trust[22m                                                                                  [K[90m││ ───────────────────────────────────────────────────────────────────────────────────────────────────── ││ ╭───────────────────────────────────────────────────────────────────────────────────────────────────╮ ││ │ [mC:\Users\cnBinweW                                                                                 [K[90m│ ││ ╰───────────────────────────────────────────────────────────────────────────────────────────────────╯ ││                                                                                                       ││ [mCopilot may read files in this folder. Reading untrusted files may lead Copilot to behave in          [K[90m││ [munexpected ways. With your permission, Copilot may execute code or bash commands in this folder.      [90m││ [mExecuting untrusted code is unsafe.                                                                   [K[90m││                                                                                                       ││ [mDo you trust the files in this folder?                                                                [K[90m││                                                                                                       ││ [36m❯ 1. Yes                                                                                              [K[90m││   [m2. Yes, and remember this folder for future sessions                                                [K[90m││   [m3. No (Esc)                                                                                         [K[90m││                                                                                                       ││ [m[1m↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel                                                      [K[90m│╰───────────────────────────────────────────────────────────────────────────────────────────────────────╯[?2004l[m[?2004l[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[18;1H                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           [36;211H[?2004h[?1004h[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[32;1H ~                                                                                                       [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts                         [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m [1mshift+tab[22m switch mode ​                                                        Remaining reqs.: -340.3% [?2026h[?2026l[34m[13;1H● [mEnvironment loaded: 1 MCP server[K[71C[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[22;1H ~                                                                                                       [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m❯ /[7ma[27mdd-dir                                                                                               [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[36m[22m▋  /add-dir <directory>                          Add a directory to the allowed list for file access     ▋  [m/agent                                        Browse and select from available agents (if any)        ▋  /allow-all, /yolo                             Enable all permissions (tools, paths, and URLs)         ▋  /changelog [summarize] [version | last <N> |… Display changelog for CLI versions. Add 'summarize' to …▋  /clear, /new                                  Clear the conversation history                          ▋  /compact                                      Summarize conversation history to reduce context window…▋  /context                                      Show context window token usage and visualization       ▋  /copy                                         Copy the last response to the clipboard                 ▋  /cwd, /cd [directory]                         Change working directory or show current directory      ▋  /delegate [prompt]                            Send this session to GitHub and Copilot will create a PR                                                                                                         [36;211H[?2026h[?2026l[22;1H ~                                                                           Gemini 3 Pro (Preview) (1x) [?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[22;1H                                                                                                          ~                                                                           Gemini 3 Pro (Preview) (1x) [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m❯ /m[7mc[27mp                                                                                                   [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m [36m/mcp [show|add|edit|delete|disable|enable] [… Manage MCP server configuration                           [m /model, /models [model]                       Select AI model to use                                     /streamer-mode, /on-air                       Toggle streamer mode (hides preview model names and quota… /compact                                      Summarize conversation history to reduce context window u… /experimental [on|off|show]                   Show available experimental features, or enable/disable e… /rename <name>                                Rename the current session (alias for /session rename)     /resume [sessionId]                           Switch to a different session (optionally specify session… /terminal-setup                               Configure terminal for multiline input support (shift+ent… /theme [default|dim|high-contrast|colorblind] View or set color mode                                    [35;142H[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[23;1H                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                ~                                                                           Gemini 3 Pro (Preview) (1x) [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m❯ /mo[7md[27mel                                                                                                 [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m [36m/model, /models [model]                       Select AI model to use                                    [m /streamer-mode, /on-air                       Toggle streamer mode (hides preview model names and quota…[?2026h[?2026l[32;1H❯ /mod[7me[27ml                                                                                                 [32;203H[?2026h[?2026l
+❯ /mode[7ml[27m                                                                                                 [32;203H[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[30;1H                                                                                                          ~                                                                           Gemini 3 Pro (Preview) (1x) [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m❯ /model[7m [27m[model]                                                                                         [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m [36m/model, /models [model]                       Select AI model to use                                    [35;142H[?2026h[?2026l[m[33;1H❯ /models[7m [27m[model]                                                                                        [33;194H[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[31;1H                                                                                                          ~                                                                           Gemini 3 Pro (Preview) (1x) [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m❯ [7m [27mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts                         [2m─────────────────────────────────────────────────────────────────────────────────────────────────────────[22m [1mshift+tab[22m switch mode ​                                                        Remaining reqs.: -340.3% [?2004l[?2004h[?1006l[?1002l[?1002h[?1006h[?2026h[?2026l[H[K[34m
+● [m💡 No copilot instructions found. Run /init to generate a copilot-instructions.md file for this        
+  project.[K
+[K[34m
+● [mEnvironment loaded: 1 MCP server[K
 [K[1m
-↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[K
-[K[100C[1m[6;1HSelect Model[22m[K
+Select Model[22m[K
 [K
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future
- sessions.[K
-[K
-Some models are not available. For information on Copilot policies and subscription, visit:[K
-https://github.com/settings/copilot/features[K
-[K[7m
- [27mSearch models...[K
-[K
-  Gemini 3 Pro (Preview) (default)        [90m1x[K[36m
-❯ [32mGPT-5.4 ✓[31X[90m[31C1x[K[m
-  GPT-5.3-Codex[27X[90m[27C1x[K[m
-  GPT-5.2-Codex[27X[90m[27C1x[K[m
-  GPT-5.2[33X[90m[33C1x[K[m
-  GPT-5.1-Codex-Max[23X[90m[23C1x[K[m
-  GPT-5.1-Codex[27X[90m[27C1x[K[m
-  GPT-5.1[33X[90m[33C1x[K[m
-  GPT-5.4 mini[25X[90m[25C0.33x[K[m
-  GPT-5.1-Codex-Mini (Preview)[9X[90m[9C0.33x[K[m
-  GPT-5 mini[30X[90m[30C0x[K[m
-  GPT-4.1[33X[90m[33C0x[K[m
-[K[1m
-↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[K
-[K[100C[1m[6;1HSelect Model[22m[K
-[K
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future
- sessions.[K
+Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future     
+sessions.[K
 [K
 Some models are not available. For information on Copilot policies and subscription, visit:[K
-https://github.com/settings/copilot/features[K
-[K[7m
- [27mSearch models...[K
-[K
-  Gemini 3 Pro (Preview) (default)        [90m1x[K[m
-  [32mGPT-5.4 ✓[31X[90m[31C1x[K[36m
-❯ GPT-5.3-Codex[27X[90m[27C1x[K[m
-  GPT-5.2-Codex[27X[90m[27C1x[K[m
-  GPT-5.2[33X[90m[33C1x[K[m
-  GPT-5.1-Codex-Max[23X[90m[23C1x[K[m
-  GPT-5.1-Codex[27X[90m[27C1x[K[m
-  GPT-5.1[33X[90m[33C1x[K[m
-  GPT-5.4 mini[25X[90m[25C0.33x[K[m
-  GPT-5.1-Codex-Mini (Preview)[9X[90m[9C0.33x[K[m
-  GPT-5 mini[30X[90m[30C0x[K[m
-  GPT-4.1[33X[90m[33C0x[K[m
-[K[1m
-↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[K
-[K[100C[1m[6;1HSelect Model[22m[K
-[K
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future
- sessions.[K
-[K
-Some models are not available. For information on Copilot policies and subscription, visit:[K
-https://github.com/settings/copilot/features[K
-[K[7m
- [27mSearch models...[K
-[K
-  Gemini 3 Pro (Preview) (default)        [90m1x[K[m
-  [32mGPT-5.4 ✓[31X[90m[31C1x[K[m
-  GPT-5.3-Codex[27X[90m[27C1x[K[36m
-❯ GPT-5.2-Codex[27X[90m[27C1x[K[m
-  GPT-5.2[33X[90m[33C1x[K[m
-  GPT-5.1-Codex-Max[23X[90m[23C1x[K[m
-  GPT-5.1-Codex[27X[90m[27C1x[K[m
-  GPT-5.1[33X[90m[33C1x[K[m
-  GPT-5.4 mini[25X[90m[25C0.33x[K[m
-  GPT-5.1-Codex-Mini (Preview)[9X[90m[9C0.33x[K[m
-  GPT-5 mini[30X[90m[30C0x[K[m
-  GPT-4.1[33X[90m[33C0x[K[m
-[K[1m
-↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[K
-[K[100C[1m[6;1HSelect Model[22m[K
-[K
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future
- sessions.[K
-[K
-Some models are not available. For information on Copilot policies and subscription, visit:[K
-https://github.com/settings/copilot/features[K
-[K[7m
- [27mSearch models...[K
-[K
-  Gemini 3 Pro (Preview) (default)        [90m1x[K[m
-  [32mGPT-5.4 ✓[31X[90m[31C1x[K[m
-  GPT-5.3-Codex[27X[90m[27C1x[K[m
-  GPT-5.2-Codex[27X[90m[27C1x[K[36m
-❯ GPT-5.2[33X[90m[33C1x[K[m
-  GPT-5.1-Codex-Max[23X[90m[23C1x[K[m
-  GPT-5.1-Codex[27X[90m[27C1x[K[m
-  GPT-5.1[33X[90m[33C1x[K[m
-  GPT-5.4 mini[25X[90m[25C0.33x[K[m
-  GPT-5.1-Codex-Mini (Preview)[9X[90m[9C0.33x[K[m
-  GPT-5 mini[30X[90m[30C0x[K[m
-  GPT-4.1[33X[90m[33C0x[K[m
-[K[1m
-↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel[K
-[K[100C
+https://github.com/settings/copilot/features[K[7m[15;1H [27mSearch models...[K[36m[17;1H❯ Claude Sonnet 4.6[19X[90m[19C1x[K[m
+  Claude Sonnet 4.5                   [19X[90m1x                                                                 [m  Claude Haiku 4.5                 [17X[90m0.33x                                                                 [m  Claude Opus 4.6                     [21X[90m3x                                                                 [m  Claude Opus 4.5                     [21X[90m3x                                                                 [m  Claude Sonnet 4                     [21X[90m1x                                                                 [m  Gemini 3 Pro (Preview)              [14X[90m1x                                                                 [m  GPT-5.4                             [29X[90m1x                                                                 [m  GPT-5.3-Codex                       [23X[90m1x                                                                 [m  GPT-5.2-Codex                       [23X[90m1x                                                                 [m  GPT-5.2                             [29X[90m1x                                                                 [m  GPT-5.1-Codex-Max                   [19X[90m1x                                                                 [m  GPT-5.1-Codex                       [23X[90m1x                                                                 [m  GPT-5.1                             [29X[90m1x                                                                 [m  GPT-5.4 mini                     [21X[90m0.33x                                                                 [m  GPT-5.1-Codex-Mini (Preview)     [90m0.33x                                                                 [m  GPT-5 mini                          [26X[90m0x                                                                 [m  GPT-4.1                             [29X[90m0x                                                                 [m                                                                                                         [1m↑↓[22m to navigate · [1mEnter[22m to select · [1mEsc[22m to cancel                                                         [36;163H[?2026h[?2026l[36m[17;1H❯ Claude Sonnet 4.6 (default)[9X[90m[9C1x[K[m[23;1H  [32mGemini 3 Pro (Preview) ✓            [12X[90m1x                                                                 [23;171H[?2026h[?2026l[m[17;1H  Claude Sonnet 4.6 (default)[9X[90m[9C1x[K[36m
+❯ Claude Sonnet 4.5                   [19X[90m1x                                                                 [18;171H[?2026h[?2026l[m
+  Claude Sonnet 4.5                   [19X[90m1x                                                                 [36m❯ Claude Haiku 4.5                 [17X[90m0.33x                                                                 [19;171H[m[?2026h[?2026l
+  Claude Haiku 4.5                 [17X[90m0.33x                                                                 [36m❯ Claude Opus 4.6                     [21X[90m3x                                                                 [20;171H[m[?2026h[?2026l
+  Claude Opus 4.6                     [21X[90m3x                                                                 [36m❯ Claude Opus 4.5                     [21X[90m3x                                                                 [21;171H[?2026h[?2026l[m
+  Claude Opus 4.5                     [21X[90m3x                                                                 [36m❯ Claude Sonnet 4                     [21X[90m1x                                                                 [22;171H[m[?2026h[?2026l
+  Claude Sonnet 4                     [21X[90m1x                                                                 [36m❯ [32mGemini 3 Pro (Preview) ✓            [12X[90m1x                                                                 [23;171H[?2026h[?2026l[m
+  [32mGemini 3 Pro (Preview) ✓            [12X[90m1x                                                                 [36m❯ GPT-5.4                             [29X[90m1x                                                                 [24;171H
