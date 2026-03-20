@@ -892,12 +892,53 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn expected_fixture(name: &str) -> Vec<u8> {
-        fs::read(
+        let name = fixture_name(name);
+        let bytes = fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("tests")
                 .join(name),
         )
-        .expect("read expected fixture")
+        .expect("read expected fixture");
+
+        normalize_fixture_line_endings(&bytes)
+    }
+
+    fn assert_fixture_or_update(name: &str, output: &[u8]) {
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(fixture_name(name));
+        if std::env::var_os("OLY_UPDATE_LOG_FIXTURES").is_some() {
+            fs::write(&fixture_path, output).expect("write updated log fixture");
+        }
+
+        assert_eq!(output, expected_fixture(name));
+    }
+
+    fn fixture_name(name: &str) -> &str {
+        #[cfg(windows)]
+        if name == "output-copilot.expected" {
+            return "output-copilot.expected.windows";
+        }
+
+        name
+    }
+
+    fn normalize_fixture_line_endings(bytes: &[u8]) -> Vec<u8> {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+
+        while index < bytes.len() {
+            if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                normalized.push(b'\n');
+                index += 2;
+                continue;
+            }
+
+            normalized.push(bytes[index]);
+            index += 1;
+        }
+
+        normalized
     }
 
     fn empty_plan() -> ViewportReplayPlan {
@@ -922,7 +963,7 @@ mod tests {
         )
         .expect("render copilot output log with color");
 
-        assert_eq!(output, expected_fixture("output-copilot.expected"));
+        assert_fixture_or_update("output-copilot.expected", &output);
     }
 
     #[test]
@@ -943,7 +984,7 @@ mod tests {
         )
         .expect("render opencode output log with color");
 
-        assert_eq!(output, expected_fixture("output-opencode.expected"));
+        assert_fixture_or_update("output-opencode.expected", &output);
     }
 
     #[test]
