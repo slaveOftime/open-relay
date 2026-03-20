@@ -687,51 +687,102 @@ fn render_log_bytes(
     viewport: Option<ViewportSize>,
     viewport_plan: &ViewportReplayPlan,
 ) -> Vec<u8> {
-    let render_bytes = prepare_render_bytes(bytes);
+    let mut fallback_output = None;
 
-    // Step 2: feed bytes into a vt100 parser sized to (tail rows × 2000 cols),
-    // then collect each visible row formatted and trimmed to the terminal width.
-    let rows = render_rows(
-        &render_bytes,
-        tail,
-        term_cols,
-        keep_color,
-        viewport,
-        viewport_plan,
-    );
+    for render_bytes in prepare_render_bytes(bytes) {
+        // Step 2: feed bytes into a vt100 parser sized to the inferred frame
+        // dimensions, then collect each visible row formatted and trimmed to
+        // the terminal width.
+        let rows = render_rows(
+            &render_bytes,
+            tail,
+            term_cols,
+            keep_color,
+            viewport,
+            viewport_plan,
+        );
+        let output = format_rows_for_output(&rows, keep_color);
 
-    format_rows_for_output(&rows, keep_color)
+        if fallback_output.is_none() {
+            fallback_output = Some(output.clone());
+        }
+
+        if content_bounds(&rows).is_some() {
+            return output;
+        }
+    }
+
+    fallback_output.unwrap_or_else(|| format_rows_for_output(&[], keep_color))
 }
 
-fn prepare_render_bytes(bytes: &[u8]) -> RenderBytes<'_> {
+fn prepare_render_bytes(bytes: &[u8]) -> Vec<RenderBytes<'_>> {
     let has_alt_screen = contains_alt_screen(bytes);
-    let frame = latest_render_frame(bytes, has_alt_screen);
-
-    RenderBytes {
-        frame,
-        frame_has_alt_screen: contains_alt_screen(frame),
-    }
-}
-
-fn latest_render_frame(bytes: &[u8], has_alt_screen: bool) -> &[u8] {
     if !has_alt_screen {
-        return bytes;
+        return vec![RenderBytes {
+            frame: bytes,
+            frame_has_alt_screen: false,
+        }];
     }
 
-    last_subslice(bytes, b"\x1b[H\x1b[2J")
-        .or_else(|| last_subslice(bytes, b"\x1b[2J\x1b[H"))
-        .map(|start| &bytes[start..])
-        .unwrap_or(bytes)
+    frame_segments(bytes)
+        .into_iter()
+        .map(|frame| RenderBytes {
+            frame,
+            frame_has_alt_screen: contains_alt_screen(frame),
+        })
+        .collect()
 }
 
-fn last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
+fn frame_segments(bytes: &[u8]) -> Vec<&[u8]> {
+    let starts = frame_start_offsets(bytes);
+    if starts.is_empty() {
+        return vec![bytes];
     }
 
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
+    let mut frames = Vec::with_capacity(starts.len());
+    for (index, &start) in starts.iter().enumerate().rev() {
+        let end = starts.get(index + 1).copied().unwrap_or(bytes.len());
+        if start < end {
+            frames.push(&bytes[start..end]);
+        }
+    }
+
+    if frames.is_empty() {
+        vec![bytes]
+    } else {
+        frames
+    }
+}
+
+fn frame_start_offsets(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    for needle in [
+        b"\x1b[H\x1b[2J".as_slice(),
+        b"\x1b[2J\x1b[H".as_slice(),
+        b"\x1b[?1049h".as_slice(),
+        b"\x1b[?1047h".as_slice(),
+        b"\x1b[?1049l".as_slice(),
+        b"\x1b[?1047l".as_slice(),
+    ] {
+        extend_subslice_positions(bytes, needle, &mut starts);
+    }
+
+    starts.sort_unstable();
+    starts.dedup();
+    starts
+}
+
+fn extend_subslice_positions(haystack: &[u8], needle: &[u8], starts: &mut Vec<usize>) {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return;
+    }
+
+    starts.extend(
+        haystack
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == needle).then_some(index)),
+    );
 }
 
 fn format_rows_for_output(rows: &[Vec<u8>], keep_color: bool) -> Vec<u8> {
@@ -948,6 +999,33 @@ mod tests {
         assert!(rendered.contains("Title"));
         assert!(rendered.contains("Option 1"));
         assert!(rendered.contains("Option 2"));
+    }
+
+    #[test]
+    fn falls_back_to_previous_non_empty_alt_screen_frame() {
+        let bytes = concat!(
+            "\x1b[?1049h",
+            "\x1b[2J\x1b[HTitle",
+            "\x1b[2;1HSearch",
+            "\x1b[H\x1b[2J"
+        )
+        .as_bytes();
+
+        let output = render_log_bytes(bytes, 10, false, 80, None, &empty_plan());
+        let rendered = String::from_utf8_lossy(&output);
+
+        assert!(rendered.contains("Title"));
+        assert!(rendered.contains("Search"));
+    }
+
+    #[test]
+    fn falls_back_when_alt_screen_teardown_clears_final_output() {
+        let bytes = concat!("\x1b[?1049h", "\x1b[2J\x1b[HMenu", "\x1b[?1049l").as_bytes();
+
+        let output = render_log_bytes(bytes, 10, false, 80, None, &empty_plan());
+        let rendered = String::from_utf8_lossy(&output);
+
+        assert!(rendered.contains("Menu"));
     }
 
     #[test]

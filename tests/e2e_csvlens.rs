@@ -192,7 +192,11 @@ fn e2e_csvlens_live_logs_mark_message_and_ctrl_e_keeps_session_running() {
 
     let final_logs = fetch_logs(&tmp, &id);
     assert!(
-        final_logs.trim().is_empty(),
-        "expected logs to be empty after csvlens quits and clears the alternate screen.\nLogs:\n{final_logs}"
+        final_logs.contains("Marked line 3"),
+        "expected logs to preserve the last non-empty csvlens frame after alternate-screen teardown.\nLogs:\n{final_logs}"
+    );
+    assert!(
+        final_logs.contains("score"),
+        "expected logs to preserve the csvlens table after alternate-screen teardown.\nLogs:\n{final_logs}"
     );
 }
