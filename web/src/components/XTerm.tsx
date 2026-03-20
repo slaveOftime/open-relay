@@ -169,9 +169,10 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       fontSize: 13,
-      lineHeight: 1.4,
+      lineHeight: 1,
       cursorBlink: true,
       cursorStyle: 'block',
+      customGlyphs: true,
       scrollback: 2000,
       disableStdin: !onDataRef.current,
       macOptionClickForcesSelection: true,
