@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Publish single HTML dashboards and SPAs for supervised agent results inside oly.">
+  <meta name="oly:app-type" content="single-html">
+  <title>oly apps</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --background: 224 71% 4%;
+      --foreground: 213 31% 91%;
+      --card: 224 71% 6%;
+      --card-foreground: 213 31% 91%;
+      --secondary: 215 28% 17%;
+      --muted: 215 28% 17%;
+      --muted-foreground: 218 11% 65%;
+      --accent: 215 28% 17%;
+      --accent-foreground: 213 31% 91%;
+      --border: 216 34% 17%;
+      --primary: 160 84% 39%;
+      --primary-foreground: 0 0% 100%;
+      --ring: 239 84% 67%;
+      --terminal-bg: 222 47% 8%;
+      --terminal-fg: 210 40% 96%;
+      --radius: 18px;
+      --shadow: 0 24px 80px rgba(2, 8, 23, 0.45);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      min-height: 100%;
+      background: hsl(var(--background));
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top, rgba(16, 185, 129, 0.16), transparent 30%),
+        radial-gradient(circle at 85% 10%, rgba(99, 102, 241, 0.16), transparent 22%),
+        linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(2, 6, 23, 1));
+      color: hsl(var(--foreground));
+      font-family: "Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background:
+        linear-gradient(135deg, rgba(15, 23, 42, 0.35), transparent 45%),
+        repeating-linear-gradient(90deg,
+          rgba(148, 163, 184, 0.03) 0,
+          rgba(148, 163, 184, 0.03) 1px,
+          transparent 1px,
+          transparent 80px);
+      pointer-events: none;
+      z-index: -1;
+    }
+
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 40px 20px 56px;
+    }
+
+    h1,
+    h2,
+    p {
+      margin: 0;
+    }
+
+    .frame {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid hsl(var(--border));
+      border-radius: 28px;
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(15, 23, 42, 0.86)),
+        hsl(var(--card));
+      box-shadow: var(--shadow);
+    }
+
+    .frame::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(255, 255, 255, 0.05), transparent 28%);
+      pointer-events: none;
+    }
+
+    .hero {
+      position: relative;
+      padding: 28px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+      display: grid;
+      gap: 24px;
+    }
+
+    .hero-grid {
+      display: grid;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(52, 211, 153, 0.28);
+      background: rgba(15, 118, 110, 0.18);
+      color: rgb(167, 243, 208);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .eyebrow::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: rgb(16, 185, 129);
+      box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.15);
+    }
+
+    .hero-copy {
+      display: grid;
+      gap: 14px;
+      max-width: 680px;
+    }
+
+    h1 {
+      font-size: clamp(2.25rem, 5vw, 4.5rem);
+      line-height: 0.96;
+      letter-spacing: -0.06em;
+      font-weight: 800;
+    }
+
+    .lede {
+      max-width: 58ch;
+      color: hsl(var(--muted-foreground));
+      font-size: 16px;
+    }
+
+    .hero-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      padding-top: 6px;
+    }
+
+    .button,
+    .ghost-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      min-height: 44px;
+      padding: 0 16px;
+      border-radius: 999px;
+      text-decoration: none;
+      font-weight: 700;
+      transition: transform 160ms ease, border-color 160ms ease, background 160ms ease;
+    }
+
+    .button {
+      background: hsl(var(--primary));
+      color: hsl(var(--primary-foreground));
+      border: 1px solid rgba(52, 211, 153, 0.6);
+    }
+
+    .ghost-button {
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      color: hsl(var(--foreground));
+      background: rgba(15, 23, 42, 0.44);
+    }
+
+    .button:hover,
+    .ghost-button:hover,
+    .app-link:hover,
+    .app-link:focus-visible {
+      transform: translateY(-1px);
+    }
+
+    .hero-panel {
+      position: relative;
+      padding: 18px;
+      border-radius: 22px;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.8), rgba(2, 6, 23, 0.92));
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .panel-label {
+      color: hsl(var(--muted-foreground));
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .panel-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: hsl(var(--card-foreground));
+    }
+
+    .terminal {
+      padding: 16px;
+      border-radius: 18px;
+      background: hsl(var(--terminal-bg));
+      color: hsl(var(--terminal-fg));
+      font: 13px/1.6 Consolas, "SFMono-Regular", "Liberation Mono", Menlo, monospace;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .stats {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .stat {
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(30, 41, 59, 0.44);
+      border: 1px solid rgba(148, 163, 184, 0.1);
+    }
+
+    .stat-value {
+      display: block;
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
+
+    .stat-label {
+      display: block;
+      margin-top: 4px;
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+    }
+
+    .content {
+      display: grid;
+      gap: 20px;
+      padding: 24px 28px 28px;
+    }
+
+    .section-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: end;
+      justify-content: space-between;
+    }
+
+    .section-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .section-copy {
+      color: hsl(var(--muted-foreground));
+      max-width: 54ch;
+    }
+
+    .section-meta {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(30, 41, 59, 0.5);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    ul {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 14px;
+    }
+
+    .app-item {
+      animation: card-enter 240ms ease forwards;
+      opacity: 0;
+      transform: translateY(6px);
+    }
+
+    .app-link {
+      display: grid;
+      gap: 14px;
+      padding: 18px;
+      border-radius: 22px;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.72), rgba(15, 23, 42, 0.9));
+      color: hsl(var(--card-foreground));
+      text-decoration: none;
+      transition:
+        transform 160ms ease,
+        border-color 160ms ease,
+        background 160ms ease,
+        box-shadow 160ms ease;
+    }
+
+    .app-link:hover,
+    .app-link:focus-visible {
+      border-color: rgba(52, 211, 153, 0.45);
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, 0.78), rgba(15, 23, 42, 0.96));
+      box-shadow: 0 18px 40px rgba(2, 8, 23, 0.28);
+      outline: none;
+    }
+
+    .app-top {
+      display: flex;
+      gap: 12px;
+      align-items: start;
+      justify-content: space-between;
+    }
+
+    .app-heading {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .app-icon,
+    .app-icon-fallback {
+      flex: none;
+      width: 42px;
+      height: 42px;
+      border-radius: 12px;
+    }
+
+    .app-icon {
+      display: block;
+      object-fit: cover;
+    }
+
+    .app-icon-fallback {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, rgba(15, 118, 110, 0.8), rgba(20, 184, 166, 0.28));
+      border: 1px solid rgba(45, 212, 191, 0.22);
+      color: rgb(204, 251, 241);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .app-copy-wrap {
+      min-width: 0;
+      display: grid;
+      gap: 6px;
+    }
+
+    .app-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+    }
+
+    .app-badge {
+      flex: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: rgba(20, 184, 166, 0.12);
+      border: 1px solid rgba(45, 212, 191, 0.22);
+      color: rgb(153, 246, 228);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .app-badge[data-kind="spa"] {
+      background: rgba(99, 102, 241, 0.14);
+      border-color: rgba(129, 140, 248, 0.24);
+      color: rgb(199, 210, 254);
+    }
+
+    .app-badge[data-kind="single_html"] {
+      background: rgba(20, 184, 166, 0.12);
+      border-color: rgba(45, 212, 191, 0.22);
+      color: rgb(153, 246, 228);
+    }
+
+    .app-copy {
+      color: hsl(var(--muted-foreground));
+    }
+
+    .app-bottom {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .app-path {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: rgba(15, 23, 42, 0.86);
+      border: 1px solid rgba(148, 163, 184, 0.1);
+      color: rgb(191, 219, 254);
+      font: 12px/1.4 Consolas, "SFMono-Regular", "Liberation Mono", Menlo, monospace;
+      word-break: break-all;
+    }
+
+    .app-cta {
+      color: rgb(167, 243, 208);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .empty {
+      padding: 22px;
+      border-radius: 22px;
+      background: rgba(15, 23, 42, 0.68);
+      border: 1px dashed rgba(148, 163, 184, 0.24);
+      color: hsl(var(--muted-foreground));
+    }
+
+    .empty strong {
+      display: block;
+      margin-bottom: 6px;
+      color: hsl(var(--foreground));
+      font-size: 15px;
+    }
+
+    code {
+      display: inline-block;
+      padding: 0.15rem 0.4rem;
+      border-radius: 0.4rem;
+      background: rgba(15, 23, 42, 0.76);
+      color: rgb(191, 219, 254);
+      font: 0.92em Consolas, "SFMono-Regular", "Liberation Mono", Menlo, monospace;
+    }
+
+    .route-note {
+      color: hsl(var(--muted-foreground));
+      font-size: 12px;
+    }
+
+    .sr-only {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+
+    @keyframes card-enter {
+      from {
+        opacity: 0;
+        transform: translateY(6px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (min-width: 920px) {
+      .hero-grid {
+        grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+      }
+    }
+
+    @media (max-width: 720px) {
+      main {
+        padding: 18px 14px 28px;
+      }
+
+      .frame {
+        border-radius: 24px;
+      }
+
+      .hero,
+      .content {
+        padding-left: 18px;
+        padding-right: 18px;
+      }
+
+      .stats {
+        grid-template-columns: 1fr;
+      }
+
+      .app-top,
+      .app-bottom,
+      .section-head {
+        flex-direction: column;
+        align-items: stretch;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <section class="frame">
+      <div class="hero">
+        <div class="hero-grid">
+          <div class="hero-copy">
+            <span class="eyebrow">Open Relay</span>
+            <h1>oly dashboard</h1>
+            <p class="lede">Present agent results as single HTML pages or full SPAs inside a clean
+              supervised shell. Drop apps into <code>wwwroot/apps</code>, let <code>oly</code> discover
+              them, and expose result surfaces without losing the product's sharp operational feel.</p>
+            <div class="hero-actions">
+              <a class="button" href="#apps-section">Browse published apps</a>
+              <a class="ghost-button" href="/api/static/apps">Inspect app manifest</a>
+            </div>
+          </div>
+          <aside class="hero-panel" aria-label="Launch pattern">
+            <span class="panel-label">Agent Result Flow</span>
+            <div class="panel-title">Supervise once. Publish many result surfaces.</div>
+            <div class="terminal">[agent run] -> [oly session] -> [single HTML or SPA] -> [human review and
+              intervention]</div>
+            <div class="stats" aria-label="Capabilities overview">
+              <div class="stat">
+                <span class="stat-value" id="app-count">0</span>
+                <span class="stat-label">Discovered apps</span>
+              </div>
+              <div class="stat">
+                <span class="stat-value">HTML</span>
+                <span class="stat-label">Single-file dashboards</span>
+              </div>
+              <div class="stat">
+                <span class="stat-value">SPA</span>
+                <span class="stat-label">Rich result consoles</span>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+
+      <div class="content" id="apps-section">
+        <ul id="apps" aria-live="polite" aria-busy="true">
+          <li class="empty" id="loading-state">
+            <strong>Loading apps...</strong>
+            Reading the local app registry from <code>/api/static/apps</code>.
+          </li>
+        </ul>
+
+        <p class="route-note">Apps are served from their discovered routes under
+          <code>/apps/&lt;name&gt;/</code>.
+        </p>
+      </div>
+    </section>
+  </main>
+  <script>
+    const statusText = document.getElementById("status-text");
+    const appCount = document.getElementById("app-count");
+    const htmlCount = document.querySelectorAll(".stat-value")[1];
+    const spaCount = document.querySelectorAll(".stat-value")[2];
+
+    function formatAppKind(kind) {
+      return kind === "spa" ? "SPA" : "Single HTML";
+    }
+
+    function defaultDescriptionForKind(kind) {
+      return kind === "spa"
+        ? "Open this interactive result console to inspect agent output, filter state, and drive a richer review workflow."
+        : "Open this single-file result page to review a focused snapshot without extra runtime dependencies.";
+    }
+
+    function updateKindCounts(apps) {
+      let singleHtml = 0;
+      let spa = 0;
+
+      for (const app of apps) {
+        if (app && app.type === "spa") {
+          spa += 1;
+        } else {
+          singleHtml += 1;
+        }
+      }
+
+      htmlCount.textContent = String(singleHtml);
+      spaCount.textContent = String(spa);
+    }
+
+    function buildEmptyState(title, message) {
+      const item = document.createElement("li");
+      item.className = "empty";
+
+      const heading = document.createElement("strong");
+      heading.textContent = title;
+      item.appendChild(heading);
+      item.appendChild(document.createTextNode(message));
+      return item;
+    }
+
+    function buildAppItem(app, index) {
+      const item = document.createElement("li");
+      item.className = "app-item";
+      item.style.animationDelay = Math.min(index * 40, 220) + "ms";
+
+      const link = document.createElement("a");
+      link.className = "app-link";
+      link.href = app.href;
+
+      const top = document.createElement("div");
+      top.className = "app-top";
+
+      const heading = document.createElement("div");
+      heading.className = "app-heading";
+
+      const copy = document.createElement("div");
+      copy.className = "app-copy-wrap";
+
+      if (app.icon_href) {
+        const icon = document.createElement("img");
+        icon.className = "app-icon";
+        icon.src = app.icon_href;
+        icon.alt = "";
+        icon.loading = "lazy";
+        icon.decoding = "async";
+        icon.addEventListener("error", () => {
+          icon.replaceWith(buildAppIconFallback(app.title));
+        }, { once: true });
+        heading.appendChild(icon);
+      } else {
+        heading.appendChild(buildAppIconFallback(app.title));
+      }
+
+      const title = document.createElement("div");
+      title.className = "app-title";
+      title.textContent = app.title || "Untitled app";
+
+      const description = document.createElement("p");
+      description.className = "app-copy";
+      description.textContent = app.description || defaultDescriptionForKind(app.type);
+
+      copy.appendChild(title);
+      copy.appendChild(description);
+      heading.appendChild(copy);
+
+      const badge = document.createElement("span");
+      badge.className = "app-badge";
+      badge.dataset.kind = app.type || "single_html";
+      badge.textContent = formatAppKind(app.type);
+
+      top.appendChild(heading);
+      top.appendChild(badge);
+
+      const bottom = document.createElement("div");
+      bottom.className = "app-bottom";
+
+      const path = document.createElement("span");
+      path.className = "app-path";
+      path.textContent = app.href;
+
+      const cta = document.createElement("span");
+      cta.className = "app-cta";
+      cta.textContent = "Open app";
+
+      bottom.appendChild(path);
+      bottom.appendChild(cta);
+
+      link.appendChild(top);
+      link.appendChild(bottom);
+      item.appendChild(link);
+      return item;
+    }
+
+    function buildAppIconFallback(title) {
+      const fallback = document.createElement("span");
+      fallback.className = "app-icon-fallback";
+      fallback.setAttribute("aria-hidden", "true");
+      fallback.textContent = initialsFromTitle(title);
+      return fallback;
+    }
+
+    function initialsFromTitle(title) {
+      const safeTitle = typeof title === "string" ? title.trim() : "";
+      if (!safeTitle) {
+        return "AP";
+      }
+
+      const parts = safeTitle.split(/\s+/).filter(Boolean);
+      if (parts.length === 1) {
+        return parts[0].slice(0, 2).toUpperCase();
+      }
+
+      return (parts[0][0] + parts[1][0]).toUpperCase();
+    }
+
+    async function loadApps() {
+      const list = document.getElementById("apps");
+      list.setAttribute("aria-busy", "true");
+      try {
+        const response = await fetch("/api/static/apps", { headers: { "accept": "application/json" } });
+        if (!response.ok) {
+          throw new Error("Request failed with status " + response.status);
+        }
+        const apps = await response.json();
+        appCount.textContent = Array.isArray(apps) ? String(apps.length) : "0";
+        if (!Array.isArray(apps) || apps.length === 0) {
+          htmlCount.textContent = "0";
+          spaCount.textContent = "0";
+          list.replaceChildren(
+            buildEmptyState(
+              "No apps published yet",
+              "Create a child folder inside wwwroot/apps with its own index.html to register a new single HTML page or SPA."
+            )
+          );
+          statusText.textContent = "Waiting for published apps";
+          list.setAttribute("aria-busy", "false");
+          return;
+        }
+
+        updateKindCounts(apps);
+        const items = apps.map(buildAppItem);
+        list.replaceChildren.apply(list, items);
+        statusText.textContent = apps.length + (apps.length === 1 ? " app ready" : " apps ready");
+      } catch (error) {
+        appCount.textContent = "0";
+        htmlCount.textContent = "0";
+        spaCount.textContent = "0";
+        statusText.textContent = "Registry unavailable";
+        list.replaceChildren(
+          buildEmptyState(
+            "Could not load app list",
+            error && error.message ? error.message : "Unknown error"
+          )
+        );
+      } finally {
+        list.setAttribute("aria-busy", "false");
+      }
+    }
+
+    loadApps();
+  </script>
+</body>
+
+</html>

@@ -58,3 +58,24 @@ oly ls --help
 ```
 
 Use `oly <command> --help` for command-specific details.
+
+
+## Presenting with html
+
+When you want to show rich output to the user, publish it as either:
+
+- a single HTML page
+- a single-page application bundle
+
+Place each app in its own child folder under `<OLY-ROOT>/wwwroot/apps`, and make sure that folder contains an `index.html` entry point.
+
+For SPAs, use relative asset paths and set the base href to `./` so the app works correctly when served from its discovered route.
+
+Users can then open the app at `http://localhost:<OLY-PORT>/apps/<your-app-name>/`.
+
+- `<OLY-PORT>` is the port of oly's built-in http server, which is `15443` by default.
+- `<OLY-ROOT>` is the root directory of oly:
+
+  - `%USERPROFILE%/AppData/Local/oly` on Windows
+  - `$HOME/.local/state/oly` on Linux
+  - `$HOME/Library/Application Support/oly` on macOS
