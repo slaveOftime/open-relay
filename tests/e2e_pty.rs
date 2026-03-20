@@ -210,7 +210,11 @@ fn e2e_multiple_commands_appear_in_order() {
         &id,
         &initial,
         &prompt,
-        ["oly_e2e_order_first", "oly_e2e_order_second", "oly_e2e_order_third"],
+        [
+            "oly_e2e_order_first",
+            "oly_e2e_order_second",
+            "oly_e2e_order_third",
+        ],
         Duration::from_secs(3),
     );
     assert!(
