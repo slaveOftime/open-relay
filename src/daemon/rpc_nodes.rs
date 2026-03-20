@@ -174,22 +174,11 @@ async fn connect_and_relay(
                     NodeWsMessage::Rpc { id, request } => {
                         let req = match serde_json::from_value::<RpcRequest>(request) {
                             Ok(r) => {
-                                match r {
-                                    RpcRequest::Health { .. }
-                                    | RpcRequest::List { .. }
-                                    | RpcRequest::Start { .. }
-                                    | RpcRequest::AttachSubscribe { .. }
-                                    | RpcRequest::AttachInput { .. }
-                                    | RpcRequest::AttachResize { .. }
-                                    | RpcRequest::Stop { .. }
-                                    | RpcRequest::Kill { .. }
-                                    | RpcRequest::LogsWait { .. }
-                                    | RpcRequest::LogsTail { .. }
-                                    | RpcRequest::LogsPagination { .. } => r,
-                                    _ => {
-                                        warn!(%id, request_type = r.name(), "unsupported proxied RPC method");
-                                        continue;
-                                    }
+                                if is_supported_proxied_rpc(&r) {
+                                    r
+                                } else {
+                                    warn!(%id, request_type = r.name(), "unsupported proxied RPC method");
+                                    continue;
                                 }
                             }
                             Err(err) => {
@@ -279,6 +268,24 @@ async fn connect_and_relay(
     Ok(false)
 }
 
+fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
+    matches!(
+        request,
+        RpcRequest::Health { .. }
+            | RpcRequest::List { .. }
+            | RpcRequest::Start { .. }
+            | RpcRequest::AttachSubscribe { .. }
+            | RpcRequest::AttachInput { .. }
+            | RpcRequest::AttachResize { .. }
+            | RpcRequest::AttachDetach { .. }
+            | RpcRequest::Stop { .. }
+            | RpcRequest::Kill { .. }
+            | RpcRequest::LogsWait { .. }
+            | RpcRequest::LogsTail { .. }
+            | RpcRequest::LogsPagination { .. }
+    )
+}
+
 async fn relay_streaming_rpc(
     config: &AppConfig,
     request: RpcRequest,
@@ -324,6 +331,38 @@ async fn relay_streaming_rpc(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_supported_proxied_rpc;
+    use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
+
+    #[test]
+    fn proxied_detach_cleanup_is_supported() {
+        assert!(is_supported_proxied_rpc(&RpcRequest::AttachDetach {
+            id: "session-123".to_string(),
+        }));
+    }
+
+    #[test]
+    fn nested_node_proxy_is_rejected() {
+        assert!(!is_supported_proxied_rpc(&RpcRequest::NodeProxy {
+            node: "secondary-a".to_string(),
+            inner: Box::new(RpcRequest::List {
+                query: ListQuery {
+                    search: None,
+                    statuses: Vec::new(),
+                    since: None,
+                    until: None,
+                    limit: 10,
+                    offset: 0,
+                    sort: ListSortField::CreatedAt,
+                    order: SortOrder::Desc,
+                },
+            }),
+        }));
+    }
 }
 
 pub(super) async fn handle_node_proxy(
