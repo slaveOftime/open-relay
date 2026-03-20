@@ -531,13 +531,40 @@ pub fn extract_query_responses_no_client(
         else {
             break;
         };
-        let response_cursor = match query {
-            TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => Some(cursor),
-            _ => None,
-        };
-        for response in terminal_query_response(query, response_cursor) {
-            responses.push(response.into_bytes());
+        
+        // Only respond to queries that require daemon-side answers in detached mode:
+        // - CursorPositionReport (CPR): needed for layout positioning
+        // - DeviceStatusReport (DSR): needed for status checks
+        // - ForegroundColor/BackgroundColor (OSC 10/11): needed for theme detection
+        // 
+        // Do NOT respond to:
+        // - PrimaryDeviceAttributes (DA1)
+        // - SecondaryDeviceAttributes (DA2)  
+        // - XtVersion (XTVERSION)
+        // - DecPrivateModeReport (DECRPM)
+        // - KittyKeyboard
+        //
+        // These should only be answered by a real terminal or interactive client.
+        // Answering them in detached mode can cause interference with user input
+        // and corrupt the output stream.
+        let should_respond = matches!(
+            query,
+            TerminalQuery::CursorPositionReport
+                | TerminalQuery::DeviceStatusReport
+                | TerminalQuery::ForegroundColor
+                | TerminalQuery::BackgroundColor
+        );
+        
+        if should_respond {
+            let response_cursor = match query {
+                TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => Some(cursor),
+                _ => None,
+            };
+            for response in terminal_query_response(query, response_cursor) {
+                responses.push(response.into_bytes());
+            }
         }
+        
         search_from = match_start + query_len;
     }
 
@@ -1332,44 +1359,34 @@ mod tests {
 
     #[test]
     fn test_extract_query_answers_device_attributes_and_xtversion() {
+        // DA1, DA2, and XTVERSION queries should NOT be answered in detached mode
+        // as they can interfere with user input and corrupt output
         let mut tail = Vec::new();
         let data = b"\x1b[c\x1b[>c\x1b[>0q";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
-        assert_eq!(responses.len(), 3);
-        assert_eq!(responses[0], b"\x1b[?62;c");
-        assert_eq!(responses[1], b"\x1b[>1;0;0c");
-        assert_eq!(
-            responses[2],
-            format!(
-                "\x1bP>|{} {}\x1b\\",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            )
-            .into_bytes()
-        );
+        assert_eq!(responses.len(), 0);
     }
 
     #[test]
     fn test_extract_query_answers_split_da2_query() {
+        // DA2 queries should NOT be answered in detached mode
         let mut tail = Vec::new();
         let responses1 = extract_query_responses_no_client(b"hello\x1b[>", &mut tail, (1, 1));
         assert!(responses1.is_empty());
         assert_eq!(tail, b"\x1b[>");
 
         let responses2 = extract_query_responses_no_client(b"cworld", &mut tail, (1, 1));
-        assert_eq!(responses2, vec![b"\x1b[>1;0;0c".to_vec()]);
+        assert!(responses2.is_empty());
         assert!(tail.is_empty());
     }
 
     #[test]
     fn test_extract_query_answers_decrpm_and_kitty_keyboard_queries() {
+        // DECRPM and Kitty keyboard queries should NOT be answered in detached mode
         let mut tail = Vec::new();
         let data = b"\x1b[?2004$p\x1b[?u";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
-        assert_eq!(
-            responses,
-            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?0u".to_vec()]
-        );
+        assert!(responses.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1503,13 +1520,11 @@ mod tests {
 
     #[test]
     fn test_extract_query_multi_mode_decrpm() {
+        // DECRPM queries should NOT be answered in detached mode
         let mut tail = Vec::new();
         let data = b"\x1b[?2004;1016$p";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
-        assert_eq!(
-            responses,
-            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?1016;2$y".to_vec(),]
-        );
+        assert!(responses.is_empty());
     }
 
     #[test]
