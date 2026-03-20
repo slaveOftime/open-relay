@@ -10,6 +10,7 @@ export interface LogReplayTarget {
 export interface LogReplayState {
   bytesWritten: number
   nextResizeIndex: number
+  chunkCount: number
 }
 
 const encoder = new TextEncoder()
@@ -18,6 +19,7 @@ export function initialLogReplayState(): LogReplayState {
   return {
     bytesWritten: 0,
     nextResizeIndex: 0,
+    chunkCount: 0,
   }
 }
 
@@ -34,33 +36,73 @@ function applyPendingResizes(
   }
 }
 
-export function appendLogLines(
+export function appendLogChunks(
   target: Pick<LogReplayTarget, 'write' | 'resize'>,
-  lines: string[],
+  chunks: string[],
   resizes: LogResizeEvent[],
   state: LogReplayState
 ): LogReplayState {
+  return appendLogChunkRange(target, chunks, resizes, state, 0, chunks.length)
+}
+
+function appendLogChunkRange(
+  target: Pick<LogReplayTarget, 'write' | 'resize'>,
+  chunks: string[],
+  resizes: LogResizeEvent[],
+  state: LogReplayState,
+  startChunk: number,
+  endChunk: number
+): LogReplayState {
+  const safeStart = Math.max(0, Math.min(startChunk, chunks.length))
+  const safeEnd = Math.max(safeStart, Math.min(endChunk, chunks.length))
   const next: LogReplayState = { ...state }
 
   applyPendingResizes(target, resizes, next)
-  for (const line of lines) {
+  for (let index = safeStart; index < safeEnd; index += 1) {
+    const chunk = chunks[index]
     applyPendingResizes(target, resizes, next)
-    target.write(line)
-    next.bytesWritten += encoder.encode(line).length
+    target.write(chunk)
+    next.bytesWritten += encoder.encode(chunk).length
+    next.chunkCount += 1
   }
   applyPendingResizes(target, resizes, next)
 
   return next
 }
 
-export function replayLogLines(
+export function replayLogChunks(
   target: LogReplayTarget,
-  lines: string[],
+  chunks: string[],
   resizes: LogResizeEvent[],
-  lineCount = lines.length
+  chunkCount = chunks.length
 ): LogReplayState {
+  const safeChunkCount = Math.max(0, Math.min(chunkCount, chunks.length))
   target.reset()
-  const state = appendLogLines(target, lines.slice(0, lineCount), resizes, initialLogReplayState())
+  const state = appendLogChunkRange(
+    target,
+    chunks,
+    resizes,
+    initialLogReplayState(),
+    0,
+    safeChunkCount
+  )
   target.scrollToBottom()
   return state
+}
+
+export function seekLogChunks(
+  target: LogReplayTarget,
+  chunks: string[],
+  resizes: LogResizeEvent[],
+  state: LogReplayState,
+  chunkCount = chunks.length
+): LogReplayState {
+  const safeChunkCount = Math.max(0, Math.min(chunkCount, chunks.length))
+  if (safeChunkCount <= state.chunkCount) {
+    return replayLogChunks(target, chunks, resizes, safeChunkCount)
+  }
+
+  const next = appendLogChunkRange(target, chunks, resizes, state, state.chunkCount, safeChunkCount)
+  target.scrollToBottom()
+  return next
 }

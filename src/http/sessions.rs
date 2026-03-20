@@ -607,8 +607,7 @@ pub struct LogsParams {
 
 #[derive(Debug, Serialize)]
 struct LogsResponseBody {
-    lines: Vec<String>,
-    next_offset: usize,
+    chunks: Vec<String>,
     total: usize,
     resizes: Vec<crate::protocol::LogResize>,
 }
@@ -637,15 +636,11 @@ pub async fn get_logs(
                 lines,
                 total,
                 resizes,
-            }) => {
-                let next_offset = offset.saturating_add(lines.len()).min(total);
-                logs_response(LogsResponseBody {
-                    lines,
-                    next_offset,
-                    total,
-                    resizes,
-                })
-            }
+            }) => logs_response(LogsResponseBody {
+                chunks: lines,
+                total,
+                resizes,
+            }),
             Ok(RpcResponse::Error { message }) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
@@ -686,11 +681,9 @@ pub async fn get_logs(
 
     match read_persisted_log_page(&session_dir, offset, limit) {
         Some((lines, total)) => {
-            let next_offset = offset.saturating_add(lines.len()).min(total);
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             logs_response(LogsResponseBody {
-                lines,
-                next_offset,
+                chunks: lines,
                 total,
                 resizes,
             })

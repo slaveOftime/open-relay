@@ -4,9 +4,10 @@ import type { SessionSummary } from '@/api/types'
 import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from '@/api/client'
 import { formatAge } from '@/utils/format'
 import {
-  appendLogLines,
+  appendLogChunks,
   initialLogReplayState,
-  replayLogLines,
+  replayLogChunks,
+  seekLogChunks,
   type LogReplayState,
 } from '@/utils/logReplay'
 import StatusBadge from '@/components/StatusBadge'
@@ -128,7 +129,7 @@ export default function SessionDetailPage() {
   const node = searchParams.get('node')
 
   const [session, setSession] = useState<SessionSummary | null>(null)
-  const [logLines, setLogLines] = useState<string[]>([])
+  const [logChunks, setLogChunks] = useState<string[]>([])
   const [replayIdx, setReplayIdx] = useState(0)
   const [scrubberMax, setScrubberMax] = useState(0)
   const [wsConnected, setWsConnected] = useState(false)
@@ -143,7 +144,7 @@ export default function SessionDetailPage() {
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [replaySpeed, setReplaySpeed] = useState(1)
-  const [totalLines, setTotalLines] = useState(0)
+  const [totalChunks, setTotalChunks] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
   const [isOnline, setIsOnline] = useState(
     typeof navigator === 'undefined' ? true : navigator.onLine
@@ -155,12 +156,12 @@ export default function SessionDetailPage() {
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
   const replayRafRef = useRef<number | null>(null)
-  const logLinesRef = useRef<string[]>([])
+  const logChunksRef = useRef<string[]>([])
   const replaySpeedRef = useRef(1)
   const isPausedRef = useRef(false)
   const isRunningRef = useRef(false)
   const isReplayingRef = useRef(false)
-  const totalLinesRef = useRef(0)
+  const totalChunksRef = useRef(0)
   const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
   const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
   const nextOffsetRef = useRef(0)
@@ -312,7 +313,7 @@ export default function SessionDetailPage() {
 
   const fetchMoreLogs = useCallback(async () => {
     if (!id || isFetchingMoreRef.current) return
-    if (totalLinesRef.current > 0 && nextOffsetRef.current >= totalLinesRef.current) return
+    if (totalChunksRef.current > 0 && nextOffsetRef.current >= totalChunksRef.current) return
     isFetchingMoreRef.current = true
     try {
       const res = await fetchLogs(
@@ -322,16 +323,16 @@ export default function SessionDetailPage() {
       )
       if (!isMounted.current) return
       logResizesRef.current = res.resizes
-      if (res.lines.length > 0) {
-        const next = [...logLinesRef.current, ...res.lines]
-        logLinesRef.current = next
-        setLogLines([...next])
+      if (res.chunks.length > 0) {
+        const next = [...logChunksRef.current, ...res.chunks]
+        logChunksRef.current = next
+        setLogChunks([...next])
         setScrubberMax(next.length)
         if (!isReplayingRef.current) {
           if (termRef.current) {
-            logReplayStateRef.current = appendLogLines(
+            logReplayStateRef.current = appendLogChunks(
               termRef.current,
-              res.lines,
+              res.chunks,
               res.resizes,
               logReplayStateRef.current
             )
@@ -340,16 +341,16 @@ export default function SessionDetailPage() {
           setReplayIdx(next.length)
         }
       } else if (!isReplayingRef.current && termRef.current) {
-        logReplayStateRef.current = appendLogLines(
+        logReplayStateRef.current = appendLogChunks(
           termRef.current,
           [],
           res.resizes,
           logReplayStateRef.current
         )
       }
-      if (res.total !== totalLinesRef.current) {
-        totalLinesRef.current = res.total
-        setTotalLines(res.total)
+      if (res.total !== totalChunksRef.current) {
+        totalChunksRef.current = res.total
+        setTotalChunks(res.total)
       }
       nextOffsetRef.current = res.next_offset
     } catch {
@@ -371,7 +372,7 @@ export default function SessionDetailPage() {
       if (
         e.deltaY > 0 &&
         !isFetchingMoreRef.current &&
-        nextOffsetRef.current < totalLinesRef.current
+        nextOffsetRef.current < totalChunksRef.current
       ) {
         fetchMoreLogsRef.current?.()
       } else if (e.deltaY < 0 && replayIdxRef.current > 0) {
@@ -389,7 +390,7 @@ export default function SessionDetailPage() {
       if (
         (e.key === 'PageDown' || e.key === 'ArrowDown' || e.key === 'ArrowRight') &&
         !isFetchingMoreRef.current &&
-        nextOffsetRef.current < totalLinesRef.current
+        nextOffsetRef.current < totalChunksRef.current
       ) {
         e.preventDefault()
         fetchMoreLogsRef.current?.()
@@ -524,7 +525,7 @@ export default function SessionDetailPage() {
             }
             if (isMounted.current) setWsConnected(true)
           },
-          onInit: (data, _appCursorKeys, _bracketedPasteMode) => {
+          onInit: (data) => {
             if (!gotSnapshot) {
               pushConnectTrace(`init received (${data.length} bytes)`)
               gotSnapshot = true
@@ -536,7 +537,7 @@ export default function SessionDetailPage() {
             lastWsFrameAtRef.current = Date.now()
             enqueueTerminalOutput([data])
           },
-          onModeChanged: (_appCursorKeys, _bracketedPasteMode) => {
+          onModeChanged: () => {
             lastWsFrameAtRef.current = Date.now()
             // Mode changes are tracked server-side; client doesn't need to act.
           },
@@ -694,31 +695,31 @@ export default function SessionDetailPage() {
     setIsReplaying(false)
     setIsPaused(false)
     isPausedRef.current = false
-    logLinesRef.current = []
-    setLogLines([])
+    logChunksRef.current = []
+    setLogChunks([])
     setScrubberMax(0)
-    totalLinesRef.current = 0
+    totalChunksRef.current = 0
     logReplayStateRef.current = initialLogReplayState()
     logResizesRef.current = []
     nextOffsetRef.current = 0
     isFetchingMoreRef.current = false
-    setTotalLines(0)
+    setTotalChunks(0)
 
     let cancelled = false
     fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
       .then((res) => {
         if (cancelled || !isMounted.current) return
-        logLinesRef.current = res.lines
+        logChunksRef.current = res.chunks
         logResizesRef.current = res.resizes
-        setLogLines(res.lines)
-        totalLinesRef.current = res.total
-        setTotalLines(res.total)
+        setLogChunks(res.chunks)
+        totalChunksRef.current = res.total
+        setTotalChunks(res.total)
         nextOffsetRef.current = res.next_offset
-        setScrubberMax(res.lines.length)
+        setScrubberMax(res.chunks.length)
         if (termRef.current) {
-          logReplayStateRef.current = replayLogLines(termRef.current, res.lines, res.resizes)
+          logReplayStateRef.current = replayLogChunks(termRef.current, res.chunks, res.resizes)
         }
-        setReplayIdx(res.lines.length)
+        setReplayIdx(res.chunks.length)
         fetchSession(id!, node ?? undefined)
           .then((s) => {
             if (isMounted.current) setSession(s)
@@ -744,17 +745,18 @@ export default function SessionDetailPage() {
     }
     setReplayIdx(val)
     if (termRef.current) {
-      logReplayStateRef.current = replayLogLines(
+      logReplayStateRef.current = seekLogChunks(
         termRef.current,
-        logLinesRef.current,
+        logChunksRef.current,
         logResizesRef.current,
-        val + 1
+        logReplayStateRef.current,
+        val
       )
     }
     if (
-      val >= logLinesRef.current.length - 1 &&
+      val >= logChunksRef.current.length - 1 &&
       !isFetchingMoreRef.current &&
-      nextOffsetRef.current < totalLinesRef.current
+      nextOffsetRef.current < totalChunksRef.current
     ) {
       fetchMoreLogsRef.current?.()
     }
@@ -770,19 +772,29 @@ export default function SessionDetailPage() {
     isPausedRef.current = false
     isReplayingRef.current = true
     setIsReplaying(true)
-    let idx = fromIdx
     if (fromIdx === 0) {
       setReplayIdx(0)
+      logReplayStateRef.current = initialLogReplayState()
       termRef.current?.reset()
+    } else if (termRef.current && logReplayStateRef.current.chunkCount !== fromIdx) {
+      logReplayStateRef.current = seekLogChunks(
+        termRef.current,
+        logChunksRef.current,
+        logResizesRef.current,
+        logReplayStateRef.current,
+        fromIdx
+      )
+      setReplayIdx(logReplayStateRef.current.chunkCount)
     }
     function step() {
       if (isPausedRef.current) {
         replayRafRef.current = null
         return
       }
-      const lines = logLinesRef.current
-      if (idx >= lines.length) {
-        if (nextOffsetRef.current < totalLinesRef.current) {
+      const chunks = logChunksRef.current
+      let idx = logReplayStateRef.current.chunkCount
+      if (idx >= chunks.length) {
+        if (nextOffsetRef.current < totalChunksRef.current) {
           if (!isFetchingMoreRef.current) fetchMoreLogsRef.current?.()
           replayRafRef.current = requestAnimationFrame(step)
           return
@@ -794,11 +806,18 @@ export default function SessionDetailPage() {
         isPausedRef.current = false
         return
       }
-      const BATCH = Math.max(1, Math.round(5 * replaySpeedRef.current))
+      const batchSize = Math.max(1, Math.round(5 * replaySpeedRef.current))
+      const nextIdx = Math.min(chunks.length, idx + batchSize)
       if (termRef.current) {
-        lines.slice(idx, idx + BATCH).forEach(termRef.current.write)
+        logReplayStateRef.current = seekLogChunks(
+          termRef.current,
+          chunks,
+          logResizesRef.current,
+          logReplayStateRef.current,
+          nextIdx
+        )
+        idx = logReplayStateRef.current.chunkCount
       }
-      idx += BATCH
       setReplayIdx(idx)
       replayRafRef.current = requestAnimationFrame(step)
     }
@@ -806,7 +825,7 @@ export default function SessionDetailPage() {
   }
 
   async function handleLoadPageAndReplay() {
-    if (nextOffsetRef.current < totalLinesRef.current) {
+    if (nextOffsetRef.current < totalChunksRef.current) {
       await fetchMoreLogsRef.current?.()
     }
   }
@@ -878,7 +897,7 @@ export default function SessionDetailPage() {
   const isRunning = isSessionRunning(session)
 
   // Unused var suppression
-  void logLines
+  void logChunks
 
   const attachedState = (
     <div className="flex items-center gap-2 opacity-60 text-xs">
@@ -1118,7 +1137,7 @@ export default function SessionDetailPage() {
                     aria-label="Replay scrubber"
                   />
                   <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
-                    {totalLines > scrubberMax ? `${scrubberMax}/${totalLines}` : scrubberMax}
+                    {totalChunks > scrubberMax ? `${scrubberMax}/${totalChunks}` : scrubberMax}
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -1134,9 +1153,9 @@ export default function SessionDetailPage() {
                         <ChevronLeftIcon className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent>Back 10 lines</TooltipContent>
+                    <TooltipContent>Back 10 chunks</TooltipContent>
                   </Tooltip>
-                  {totalLines > scrubberMax && (
+                  {totalChunks > scrubberMax && (
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button variant="secondary" size="icon" onClick={handleLoadPageAndReplay}>

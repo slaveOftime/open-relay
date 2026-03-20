@@ -91,8 +91,7 @@ export interface NodeSummary {
 }
 
 export interface LogsResponse {
-  lines: string[]
-  next_offset: number
+  chunks: string[]
   total: number
   resizes: LogResizeEvent[]
 }

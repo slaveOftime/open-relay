@@ -2,11 +2,11 @@ import { describe, expect, it } from 'vitest'
 import xtermPkg from '@xterm/xterm'
 import codexLog from '../../../tests/output-codex.log?raw'
 import opencodeLog from '../../../tests/output-opencode.log?raw'
-import { appendLogLines, initialLogReplayState, replayLogLines } from './logReplay'
+import { appendLogChunks, initialLogReplayState, replayLogChunks } from './logReplay'
 
 const { Terminal } = xtermPkg as typeof import('@xterm/xterm')
 
-function readFixtureLines(text: string): string[] {
+function readFixtureChunks(text: string): string[] {
   return text.match(/[^\n]*\n|[^\n]+$/g) ?? []
 }
 
@@ -32,7 +32,7 @@ describe('logReplay', () => {
       scrollToBottom: () => operations.push('scroll'),
     }
 
-    const state = replayLogLines(
+    const state = replayLogChunks(
       target,
       ['ab', 'cdef', 'g'],
       [
@@ -52,7 +52,7 @@ describe('logReplay', () => {
       'write:g',
       'scroll',
     ])
-    expect(state).toEqual({ bytesWritten: 7, nextResizeIndex: 3 })
+    expect(state).toEqual({ bytesWritten: 7, nextResizeIndex: 3, chunkCount: 3 })
   })
 
   it('can append additional log pages while preserving resize progress', () => {
@@ -63,7 +63,7 @@ describe('logReplay', () => {
     }
 
     let state = initialLogReplayState()
-    state = appendLogLines(
+    state = appendLogChunks(
       target,
       ['ab'],
       [
@@ -72,7 +72,7 @@ describe('logReplay', () => {
       ],
       state
     )
-    state = appendLogLines(
+    state = appendLogChunks(
       target,
       ['cd', 'ef'],
       [
@@ -83,19 +83,19 @@ describe('logReplay', () => {
     )
 
     expect(operations).toEqual(['resize:80x24', 'write:ab', 'write:cd', 'resize:90x30', 'write:ef'])
-    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 2 })
+    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 2, chunkCount: 3 })
   })
 
   it('replays the codex log fixture into xterm', async () => {
     const term = new Terminal({ cols: 105, rows: 37, scrollback: 2000 })
-    replayLogLines(
+    replayLogChunks(
       {
         reset: () => term.reset(),
         write: (data: string) => term.write(data),
         resize: (cols: number, rows: number) => term.resize(cols, rows),
         scrollToBottom: () => term.scrollToBottom(),
       },
-      readFixtureLines(codexLog),
+      readFixtureChunks(codexLog),
       [{ offset: 0, rows: 37, cols: 105 }]
     )
     await flushTerminal()
@@ -109,14 +109,14 @@ describe('logReplay', () => {
 
   it('replays the opencode log fixture into xterm', async () => {
     const term = new Terminal({ cols: 105, rows: 37, scrollback: 2000 })
-    replayLogLines(
+    replayLogChunks(
       {
         reset: () => term.reset(),
         write: (data: string) => term.write(data),
         resize: (cols: number, rows: number) => term.resize(cols, rows),
         scrollToBottom: () => term.scrollToBottom(),
       },
-      readFixtureLines(opencodeLog),
+      readFixtureChunks(opencodeLog),
       [{ offset: 0, rows: 37, cols: 105 }]
     )
     await flushTerminal()
