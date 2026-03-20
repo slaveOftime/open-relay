@@ -5,6 +5,7 @@ import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from 
 import { formatAge } from '@/utils/format'
 import {
   appendLogChunks,
+  encodeLogChunks,
   initialLogReplayState,
   replayLogChunks,
   seekLogChunks,
@@ -129,7 +130,6 @@ export default function SessionDetailPage() {
   const node = searchParams.get('node')
 
   const [session, setSession] = useState<SessionSummary | null>(null)
-  const [logChunks, setLogChunks] = useState<string[]>([])
   const [replayIdx, setReplayIdx] = useState(0)
   const [scrubberMax, setScrubberMax] = useState(0)
   const [wsConnected, setWsConnected] = useState(false)
@@ -156,7 +156,7 @@ export default function SessionDetailPage() {
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
   const replayRafRef = useRef<number | null>(null)
-  const logChunksRef = useRef<string[]>([])
+  const logChunksRef = useRef<Uint8Array[]>([])
   const replaySpeedRef = useRef(1)
   const isPausedRef = useRef(false)
   const isRunningRef = useRef(false)
@@ -181,6 +181,8 @@ export default function SessionDetailPage() {
   const lastSentResizeRef = useRef<{ cols: number; rows: number } | null>(null)
   const lastReconnectTriggerAtRef = useRef(0)
   const lastWsFrameAtRef = useRef(0)
+  const replayUiLastCommitAtRef = useRef(0)
+  const replayCommittedIdxRef = useRef(0)
 
   const flushTerminalOutput = useCallback(() => {
     outputFlushRafRef.current = null
@@ -282,9 +284,6 @@ export default function SessionDetailPage() {
     replaySpeedRef.current = replaySpeed
   }, [replaySpeed])
   useEffect(() => {
-    replayIdxRef.current = replayIdx
-  }, [replayIdx])
-  useEffect(() => {
     isPausedRef.current = isPaused
   }, [isPaused])
   useEffect(() => {
@@ -299,6 +298,23 @@ export default function SessionDetailPage() {
   useEffect(() => {
     modeRef.current = mode
   }, [mode])
+
+  const commitReplayIdx = useCallback((idx: number, opts?: { force?: boolean }) => {
+    replayIdxRef.current = idx
+
+    if (!opts?.force) {
+      const now = performance.now()
+      if (idx === replayCommittedIdxRef.current || now - replayUiLastCommitAtRef.current < 50) {
+        return
+      }
+      replayUiLastCommitAtRef.current = now
+    } else {
+      replayUiLastCommitAtRef.current = performance.now()
+    }
+
+    replayCommittedIdxRef.current = idx
+    setReplayIdx(idx)
+  }, [])
 
   useEffect(() => {
     const handleOnline = () => setIsOnline(true)
@@ -316,29 +332,26 @@ export default function SessionDetailPage() {
     if (totalChunksRef.current > 0 && nextOffsetRef.current >= totalChunksRef.current) return
     isFetchingMoreRef.current = true
     try {
-      const res = await fetchLogs(
-        id,
-        { offset: nextOffsetRef.current, limit: 1000 },
-        node ?? undefined
-      )
+      const requestOffset = nextOffsetRef.current
+      const res = await fetchLogs(id, { offset: requestOffset, limit: 1000 }, node ?? undefined)
       if (!isMounted.current) return
       logResizesRef.current = res.resizes
+      const encodedChunks = encodeLogChunks(res.chunks)
       if (res.chunks.length > 0) {
-        const next = [...logChunksRef.current, ...res.chunks]
+        const next = [...logChunksRef.current, ...encodedChunks]
         logChunksRef.current = next
-        setLogChunks([...next])
         setScrubberMax(next.length)
         if (!isReplayingRef.current) {
           if (termRef.current) {
             logReplayStateRef.current = appendLogChunks(
               termRef.current,
-              res.chunks,
+              encodedChunks,
               res.resizes,
               logReplayStateRef.current
             )
             termRef.current.scrollToBottom()
           }
-          setReplayIdx(next.length)
+          commitReplayIdx(next.length, { force: true })
         }
       } else if (!isReplayingRef.current && termRef.current) {
         logReplayStateRef.current = appendLogChunks(
@@ -352,7 +365,7 @@ export default function SessionDetailPage() {
         totalChunksRef.current = res.total
         setTotalChunks(res.total)
       }
-      nextOffsetRef.current = res.next_offset
+      nextOffsetRef.current = Math.min(res.total, requestOffset + res.chunks.length)
     } catch {
       /* ignore */
     } finally {
@@ -690,13 +703,12 @@ export default function SessionDetailPage() {
   useEffect(() => {
     if (mode !== 'logs' || !id) return
     termRef.current?.reset()
-    setReplayIdx(0)
+    commitReplayIdx(0, { force: true })
     isReplayingRef.current = false
     setIsReplaying(false)
     setIsPaused(false)
     isPausedRef.current = false
     logChunksRef.current = []
-    setLogChunks([])
     setScrubberMax(0)
     totalChunksRef.current = 0
     logReplayStateRef.current = initialLogReplayState()
@@ -709,17 +721,17 @@ export default function SessionDetailPage() {
     fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
       .then((res) => {
         if (cancelled || !isMounted.current) return
-        logChunksRef.current = res.chunks
+        const encodedChunks = encodeLogChunks(res.chunks)
+        logChunksRef.current = encodedChunks
         logResizesRef.current = res.resizes
-        setLogChunks(res.chunks)
         totalChunksRef.current = res.total
         setTotalChunks(res.total)
-        nextOffsetRef.current = res.next_offset
+        nextOffsetRef.current = Math.min(res.total, res.chunks.length)
         setScrubberMax(res.chunks.length)
         if (termRef.current) {
-          logReplayStateRef.current = replayLogChunks(termRef.current, res.chunks, res.resizes)
+          logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
         }
-        setReplayIdx(res.chunks.length)
+        commitReplayIdx(res.chunks.length, { force: true })
         fetchSession(id!, node ?? undefined)
           .then((s) => {
             if (isMounted.current) setSession(s)
@@ -743,7 +755,7 @@ export default function SessionDetailPage() {
       setIsPaused(false)
       isPausedRef.current = false
     }
-    setReplayIdx(val)
+    commitReplayIdx(val, { force: true })
     if (termRef.current) {
       logReplayStateRef.current = seekLogChunks(
         termRef.current,
@@ -773,7 +785,7 @@ export default function SessionDetailPage() {
     isReplayingRef.current = true
     setIsReplaying(true)
     if (fromIdx === 0) {
-      setReplayIdx(0)
+      commitReplayIdx(0, { force: true })
       logReplayStateRef.current = initialLogReplayState()
       termRef.current?.reset()
     } else if (termRef.current && logReplayStateRef.current.chunkCount !== fromIdx) {
@@ -784,7 +796,7 @@ export default function SessionDetailPage() {
         logReplayStateRef.current,
         fromIdx
       )
-      setReplayIdx(logReplayStateRef.current.chunkCount)
+      commitReplayIdx(logReplayStateRef.current.chunkCount, { force: true })
     }
     function step() {
       if (isPausedRef.current) {
@@ -818,7 +830,7 @@ export default function SessionDetailPage() {
         )
         idx = logReplayStateRef.current.chunkCount
       }
-      setReplayIdx(idx)
+      commitReplayIdx(idx)
       replayRafRef.current = requestAnimationFrame(step)
     }
     replayRafRef.current = requestAnimationFrame(step)
@@ -895,9 +907,6 @@ export default function SessionDetailPage() {
   }
 
   const isRunning = isSessionRunning(session)
-
-  // Unused var suppression
-  void logChunks
 
   const attachedState = (
     <div className="flex items-center gap-2 opacity-60 text-xs">

@@ -2,12 +2,18 @@ import { describe, expect, it } from 'vitest'
 import xtermPkg from '@xterm/xterm'
 import codexLog from '../../../tests/output-codex.log?raw'
 import opencodeLog from '../../../tests/output-opencode.log?raw'
-import { appendLogChunks, initialLogReplayState, replayLogChunks } from './logReplay'
+import {
+  appendLogChunks,
+  encodeLogChunks,
+  initialLogReplayState,
+  replayLogChunks,
+} from './logReplay'
 
 const { Terminal } = xtermPkg as typeof import('@xterm/xterm')
+const decoder = new TextDecoder()
 
-function readFixtureChunks(text: string): string[] {
-  return text.match(/[^\n]*\n|[^\n]+$/g) ?? []
+function readFixtureChunks(text: string): Uint8Array[] {
+  return encodeLogChunks(text.match(/[^\n]*\n|[^\n]+$/g) ?? [])
 }
 
 async function flushTerminal(): Promise<void> {
@@ -27,20 +33,17 @@ describe('logReplay', () => {
     const operations: string[] = []
     const target = {
       reset: () => operations.push('reset'),
-      write: (data: string) => operations.push(`write:${data}`),
+      write: (data: string | Uint8Array) =>
+        operations.push(`write:${typeof data === 'string' ? data : decoder.decode(data)}`),
       resize: (cols: number, rows: number) => operations.push(`resize:${cols}x${rows}`),
       scrollToBottom: () => operations.push('scroll'),
     }
 
-    const state = replayLogChunks(
-      target,
-      ['ab', 'cdef', 'g'],
-      [
-        { offset: 0, rows: 24, cols: 80 },
-        { offset: 2, rows: 30, cols: 90 },
-        { offset: 6, rows: 40, cols: 100 },
-      ]
-    )
+    const state = replayLogChunks(target, encodeLogChunks(['ab', 'cdef', 'g']), [
+      { offset: 0, rows: 24, cols: 80 },
+      { offset: 2, rows: 30, cols: 90 },
+      { offset: 6, rows: 40, cols: 100 },
+    ])
 
     expect(operations).toEqual([
       'reset',
@@ -55,17 +58,37 @@ describe('logReplay', () => {
     expect(state).toEqual({ bytesWritten: 7, nextResizeIndex: 3, chunkCount: 3 })
   })
 
+  it('batches adjacent chunks into fewer terminal writes', () => {
+    const writes: string[] = []
+    const target = {
+      write: (data: string | Uint8Array) =>
+        writes.push(typeof data === 'string' ? data : decoder.decode(data)),
+      resize: () => {},
+    }
+
+    const state = appendLogChunks(
+      target,
+      encodeLogChunks(['ab', 'cd', 'ef']),
+      [],
+      initialLogReplayState()
+    )
+
+    expect(writes).toEqual(['abcdef'])
+    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 0, chunkCount: 3 })
+  })
+
   it('can append additional log pages while preserving resize progress', () => {
     const operations: string[] = []
     const target = {
-      write: (data: string) => operations.push(`write:${data}`),
+      write: (data: string | Uint8Array) =>
+        operations.push(`write:${typeof data === 'string' ? data : decoder.decode(data)}`),
       resize: (cols: number, rows: number) => operations.push(`resize:${cols}x${rows}`),
     }
 
     let state = initialLogReplayState()
     state = appendLogChunks(
       target,
-      ['ab'],
+      encodeLogChunks(['ab']),
       [
         { offset: 0, rows: 24, cols: 80 },
         { offset: 4, rows: 30, cols: 90 },
@@ -74,7 +97,7 @@ describe('logReplay', () => {
     )
     state = appendLogChunks(
       target,
-      ['cd', 'ef'],
+      encodeLogChunks(['cd', 'ef']),
       [
         { offset: 0, rows: 24, cols: 80 },
         { offset: 4, rows: 30, cols: 90 },
@@ -91,7 +114,7 @@ describe('logReplay', () => {
     replayLogChunks(
       {
         reset: () => term.reset(),
-        write: (data: string) => term.write(data),
+        write: (data: string | Uint8Array) => term.write(data),
         resize: (cols: number, rows: number) => term.resize(cols, rows),
         scrollToBottom: () => term.scrollToBottom(),
       },
@@ -112,7 +135,7 @@ describe('logReplay', () => {
     replayLogChunks(
       {
         reset: () => term.reset(),
-        write: (data: string) => term.write(data),
+        write: (data: string | Uint8Array) => term.write(data),
         resize: (cols: number, rows: number) => term.resize(cols, rows),
         scrollToBottom: () => term.scrollToBottom(),
       },
