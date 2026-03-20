@@ -184,9 +184,9 @@ pub struct AttachArgs {
 pub struct LogsArgs {
     /// Session ID to show logs for. If omitted, uses the most recently created session.
     pub id: Option<String>,
-    /// Number of recent lines to display.
-    #[arg(long, default_value_t = 40)]
-    pub tail: usize,
+    /// Number of recent lines to display. By default it uses the current terminal height - 1, or 40 if it cannot be determined.
+    #[arg(long)]
+    pub tail: Option<usize>,
     /// Keep ANSI color codes in output.
     #[arg(long = "keep-color")]
     pub keep_color: bool,

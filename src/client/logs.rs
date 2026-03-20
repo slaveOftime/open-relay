@@ -13,7 +13,7 @@ use crate::{
 pub async fn run_logs(
     config: &AppConfig,
     id: &str,
-    tail: usize,
+    tail: Option<usize>,
     keep_color: bool,
     no_truncate: bool,
     node: Option<String>,
@@ -37,6 +37,12 @@ pub async fn run_logs(
         };
         let _ = ipc::send_request(config, req).await;
     }
+
+    let tail = tail.unwrap_or_else(|| {
+        terminal::size()
+            .map(|(_, h)| (h - 1) as usize)
+            .unwrap_or(40)
+    });
 
     let term_cols = if no_truncate {
         u16::MAX
