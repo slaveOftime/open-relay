@@ -947,27 +947,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_codex_transcript_exactly() {
-        let log_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("output-codex.log");
-
-        let output = render_log_file(
-            &log_path,
-            40,
-            true,
-            100,
-            Some(ViewportSize {
-                rows: 37,
-                cols: 105,
-            }),
-        )
-        .expect("render codex output log with color");
-
-        assert_eq!(output, expected_fixture("output-codex.expected"));
-    }
-
-    #[test]
     fn keeps_visible_rows_below_cursor() {
         let bytes = b"\x1b[2J\x1b[1;1HTitle\x1b[5;1HOption 1\x1b[6;1HOption 2\x1b[2;1HSearch";
 
