@@ -18,14 +18,14 @@ pub async fn run_logs(
     no_truncate: bool,
     node: Option<String>,
     wait_for_prompt: bool,
-    timeout_secs: u64,
+    timeout_ms: u64,
 ) -> Result<()> {
     // ── --wait-for-prompt path ────────────────────────────────────────────────
     if wait_for_prompt {
         eprintln!("Waiting for session {id} to need input…");
         let inner = RpcRequest::LogsWait {
             id: id.to_string(),
-            timeout_secs,
+            timeout_ms,
         };
         let req = if let Some(ref node_name) = node {
             RpcRequest::NodeProxy {

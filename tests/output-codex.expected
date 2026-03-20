@@ -1,26 +1,26 @@
 [34m● [m💡 No copilot instructions found. Run /init to generate a copilot-instructions.md file for this   [0m
-  project.[0m
+[0m
+[0m
+[0m
+[0m
+[0m
+[0m
+[0m
+[0m
+[0m
 [0m
 [34m● [mEnvironment loaded: 1 MCP server[0m
-[0m
-[1mSelect Model[0m
-[0m
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future[0m
-sessions.[0m
-[0m
-Some models are not available. For information on Copilot policies and subscription, visit:[0m
-https://github.com/settings/copilot/features[0m
 [0m
 [7m [mSearch models...[0m
 [0m
   Claude Sonnet 4.6 (default)[9C[90m1x[K[0m
-[36m❯ Claude Sonnet 4.5                   [90m1x                                                            [0m
-  Claude Sonnet 4.5                   [90m1x                                                            [0m
-  Claude Haiku 4.5                 [90m0.33x                                                            [0m
-  Claude Opus 4.6                     [90m3x                                                            [0m
-  Claude Opus 4.5                     [90m3x                                                            [0m
-  Claude Sonnet 4                     [90m1x                                                            [0m
+                                        [36m❯ Claude Sonnet 4.5                   [90m1x                    [0m
+                                   [0m
+[0m
+[0m
+                                                                                                    [0m
   [32mGemini 3 Pro (Preview) ✓            [90m1x                                                            [0m
+[0m
 [0m
 [0m
 [0m

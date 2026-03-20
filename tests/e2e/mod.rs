@@ -19,13 +19,17 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::sleep,
     time::{Duration, Instant},
 };
 
 // Global e2e serialiser
 pub static E2E_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_TMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
 pub fn oly_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oly"))
@@ -50,8 +54,11 @@ fn socket_name_for_tmp(tmp_dir: &PathBuf) -> String {
 }
 
 pub fn make_tmp_dir(name: &str) -> PathBuf {
-    let dir = env::temp_dir().join(format!("oly_e2e_{name}"));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = env::temp_dir().join(format!(
+        "oly_e2e_{name}_{}_{}",
+        std::process::id(),
+        NEXT_TMP_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }

@@ -101,7 +101,7 @@ pub enum RpcRequest {
     /// times out), then return a snapshot.  Response is `LogsTail`.
     LogsWait {
         id: String,
-        timeout_secs: u64,
+        timeout_ms: u64,
     },
     // ── Node federation ──────────────────────────────────────────────────────
     /// Proxy an inner request to a named secondary node.

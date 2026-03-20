@@ -1,38 +1,28 @@
- ~                                                                              gpt-5.4 (high) (1x) [0m
-[2m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
-❯ [7m [mType @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts[0m
-[2m────────────────────────────────────────────────────────────────────────────────────────────────────[0m
+ [1mshift+tab[m switch mode ​                                                     Remaining reqs.: -339% [0m
+[0m
+[0m
+[0m
+[0m
 [1mSelect Model[0m
 [0m
-Choose the AI model to use for Copilot CLI. The selected model will be persisted and used for future[0m
- sessions.[0m
+[12CChoose the AI model to use for Copilot CLI. The selected model will be persisted and use[0m
 [0m
-Some models are not available. For information on Copilot policies and subscription, visit:[0m
-https://github.com/settings/copilot/features[0m
+[0m
+[0m
+[0m
+[34m● [mEnvironment loaded: 1 MCP server[0m
+[0m
+[1mSelect Model[0m
+[0m
+[12CChoose the AI model to use for Copilot CLI. The selected model will be persisted and use[0m
+[0m
+[0m
+[0m
+[0m
 [0m
 [7m [mSearch models...[0m
 [0m
-  Gemini 3 Pro (Preview) (default)        [90m1x[K[0m
-  [32mGPT-5.4 ✓[31X[31C[90m1x[K[0m
-  GPT-5.3-Codex[27C[90m1x[K[0m
-  GPT-5.2-Codex[27C[90m1x[K[0m
-[36m❯ GPT-5.2[33X[33C[90m1x[K[0m
-  GPT-5.1-Codex-Max[23C[90m1x[K[0m
-  GPT-5.1-Codex[27C[90m1x[K[0m
-  GPT-5.1[33C[90m1x[K[0m
-  GPT-5.4 mini[25C[90m0.33x[K[0m
-  GPT-5.1-Codex-Mini (Preview)[9C[90m0.33x[K[0m
-  GPT-5 mini[30C[90m0x[K[0m
-  GPT-4.1[33C[90m0x[K[0m
-[0m
-[1m↑↓[m to navigate · [1mEnter[m to select · [1mEsc[m to cancel[0m
-[0m
-  GPT-5.1-Codex[23C[90m1x[K[0m
-  GPT-5.1[29C[90m1x[K[0m
-  GPT-5.4 mini[21C[90m0.33x[K[0m
-  GPT-5.1-Codex-Mini (Preview)     [90m0.33x[K[0m
-  GPT-5 mini[26C[90m0x[K[0m
-  GPT-4.1[29C[90m0x[K[0m
-[0m
-[1m↑↓[m to navigate · [1mEnter[m to select · [1mEsc[m to cancel[0m
+[36m❯ Gemini 3 Pro (Preview)[14X[14C[90m1x[0m
+[40C  GPT-5.4[29C[90m1x[0m
+[80C  GPT-5.3-Codex[0m
 [0m[39m[49m[?25h

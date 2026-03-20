@@ -147,8 +147,8 @@ async fn dispatch_request(
         RpcRequest::LogsPagination { id, offset, limit } => {
             handle_logs_pagination(id, offset, limit, db).await
         }
-        RpcRequest::LogsWait { id, timeout_secs } => {
-            handle_logs_wait(id, timeout_secs, session_store, notification_tx, db).await
+        RpcRequest::LogsWait { id, timeout_ms } => {
+            handle_logs_wait(id, timeout_ms, session_store, notification_tx, db).await
         }
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
@@ -333,7 +333,7 @@ async fn handle_logs_pagination(
 
 async fn handle_logs_wait(
     id: String,
-    timeout_secs: u64,
+    timeout_ms: u64,
     session_store: &SessionStoreHandle,
     notification_tx: &NotificationTx,
     db: &Arc<Database>,
@@ -344,20 +344,25 @@ async fn handle_logs_wait(
         };
     }
 
-    if !session_store.is_running(&id) || timeout_secs == 0 {
+    if !session_store.is_running(&id) || timeout_ms == 0 {
         return RpcResponse::Empty;
     }
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut notify_rx = notification_tx.subscribe();
+    let mut state_poll = tokio::time::interval(std::time::Duration::from_millis(100));
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
 
     'wait: loop {
-        if tokio::time::Instant::now() >= deadline {
-            break 'wait;
-        }
-
         tokio::select! {
             biased;
+            _ = &mut deadline_sleep => break 'wait,
+            _ = state_poll.tick() => {
+                if !session_store.is_running(&id) {
+                    break 'wait;
+                }
+            }
             notif = notify_rx.recv() => {
                 match notif {
                     Ok(event) => {

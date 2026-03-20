@@ -27,6 +27,8 @@ fn prompt_gap(prompt: &str) -> &'static str {
 fn prompt_input_separator(prompt: &str) -> &'static str {
     if prompt.starts_with("PS ") || prompt.starts_with("bash-") {
         " "
+    } else if matches!(prompt, "$" | "#" | "%") {
+        " "
     } else {
         ""
     }
@@ -405,29 +407,26 @@ fn e2e_ctrl_c_interrupts_sleep_and_returns_prompt() {
     let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
         .expect("sh did not reach a stable prompt within 3 s");
     let prompt = trailing_prompt(&initial).to_string();
+    let command = "sleep 60";
+    let echoed = format!("{initial}{}{}\n", prompt_input_separator(&prompt), command);
 
-    send_line(&tmp, &id, "sleep 60");
-    wait_for_exact_log(
-        &tmp,
-        &id,
-        &format!("{initial}sleep 60\n"),
-        Duration::from_secs(3),
-    )
-    .expect("sh did not echo `sleep 60` exactly before Ctrl-C");
+    send_line(&tmp, &id, command);
+    wait_for_exact_log(&tmp, &id, &echoed, Duration::from_secs(3))
+        .expect("sh did not echo `sleep 60` exactly before Ctrl-C");
     sleep(Duration::from_millis(400));
     send_key(&tmp, &id, "ctrl+c");
 
     let recovered = wait_for_exact_log(
         &tmp,
         &id,
-        &format!("{initial}sleep 60\n^C\n{prompt}"),
+        &format!("{echoed}^C\n{prompt}"),
         Duration::from_secs(3),
     )
     .or_else(|| {
         wait_for_exact_log(
             &tmp,
             &id,
-            &format!("{initial}sleep 60\n{prompt}"),
+            &format!("{echoed}{prompt}"),
             Duration::from_secs(3),
         )
     });
@@ -447,9 +446,8 @@ fn e2e_special_keys_reach_pty_without_error() {
 
     let id = start_session(&tmp, &["sh"]);
 
-    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+    wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
         .expect("sh did not reach a stable prompt within 3 s");
-    let prompt = trailing_prompt(&initial).to_string();
 
     for key in &["shift+tab", "up", "down", "left", "right", "home", "end"] {
         let key_chunk = format!("key:{key}");
@@ -464,6 +462,11 @@ fn e2e_special_keys_reach_pty_without_error() {
         );
     }
 
+    send_key(&tmp, &id, "ctrl+c");
+    let recovered = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("session did not return to a stable prompt after special-key inputs");
+    let prompt = trailing_prompt(&recovered).to_string();
+
     const MARKER: &str = "oly_e2e_special_keys_alive";
     let command = format!("echo {MARKER}");
     send_line(&tmp, &id, &command);
@@ -471,7 +474,7 @@ fn e2e_special_keys_reach_pty_without_error() {
     let result = wait_for_exact_append(
         &tmp,
         &id,
-        &initial,
+        &recovered,
         &prompted_transcript(&prompt, &command, [MARKER]),
         Duration::from_secs(3),
     );
