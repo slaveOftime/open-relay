@@ -6,30 +6,40 @@
 //! - Helper functions for starting sessions, sending input, polling logs
 //! - Test environment setup (tmp dirs, socket names, state isolation)
 //!
-//! ## Named-pipe isolation on Windows
+//! ## IPC isolation
 //!
-//! The oly IPC socket on Windows is a named pipe with a fixed name
-//! (`open-relay.oly.sock`), which is a global OS resource.  All tests in e2e
-//! binaries are serialised via `E2E_LOCK` so that no two daemons are started
-//! concurrently.  The `cli_errors` test binary never starts a daemon, so there
-//! is no cross-binary conflict.
+//! Each test uses its own `OLY_STATE_DIR` plus a unique `OLY_SOCKET_NAME`, so
+//! daemons can run concurrently without colliding on IPC resources.
 
 use std::{
     env, fs,
     net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     thread::sleep,
     time::{Duration, Instant},
 };
 
-// Global e2e serialiser
-pub static E2E_LOCK: Mutex<()> = Mutex::new(());
+/// Tests no longer need a global in-binary lock:
+/// - each test gets its own `OLY_STATE_DIR`
+/// - each test gets a unique `OLY_SOCKET_NAME`
+/// - each daemon listens on its own tmp-backed resources
+///
+/// Keep the old `.lock().unwrap_or_else(...)` call sites working so the suite can
+/// run in parallel without a broad call-site rewrite.
+pub static E2E_LOCK: NoopLock = NoopLock;
 static NEXT_TMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+pub struct NoopLock;
+
+pub struct NoopGuard;
+
+impl NoopLock {
+    pub fn lock(&self) -> Result<NoopGuard, std::sync::PoisonError<NoopGuard>> {
+        Ok(NoopGuard)
+    }
+}
 
 pub fn oly_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oly"))
@@ -105,8 +115,6 @@ fn wait_for_daemon_ready(
 ) -> DaemonGuard {
     let deadline = Instant::now() + timeout;
     loop {
-        sleep(Duration::from_millis(250));
-
         if let Some(status) = child
             .try_wait()
             .expect("failed to check daemon child status")
@@ -144,6 +152,8 @@ fn wait_for_daemon_ready(
                 probe_stderr,
             );
         }
+
+        sleep(Duration::from_millis(250));
     }
 }
 
