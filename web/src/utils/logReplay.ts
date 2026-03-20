@@ -29,7 +29,6 @@ function applyPendingResizes(
   while (state.nextResizeIndex < resizes.length) {
     const resize = resizes[state.nextResizeIndex]
     if (resize.offset > state.bytesWritten) break
-    console.info(`Applying log resize: ${resize.cols} cols, ${resize.rows} rows (offset: ${resize.offset})`)
     target.resize(resize.cols, resize.rows)
     state.nextResizeIndex += 1
   }

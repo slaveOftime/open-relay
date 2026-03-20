@@ -16,8 +16,9 @@ async function flushTerminal(): Promise<void> {
 }
 
 function visibleBuffer(term: InstanceType<typeof Terminal>): string {
-  return Array.from({ length: term.rows }, (_, index) =>
-    term.buffer.active.getLine(index)?.translateToString(true) ?? ''
+  return Array.from(
+    { length: term.rows },
+    (_, index) => term.buffer.active.getLine(index)?.translateToString(true) ?? ''
   ).join('\n')
 }
 
@@ -71,7 +72,15 @@ describe('logReplay', () => {
       ],
       state
     )
-    state = appendLogLines(target, ['cd', 'ef'], [{ offset: 0, rows: 24, cols: 80 }, { offset: 4, rows: 30, cols: 90 }], state)
+    state = appendLogLines(
+      target,
+      ['cd', 'ef'],
+      [
+        { offset: 0, rows: 24, cols: 80 },
+        { offset: 4, rows: 30, cols: 90 },
+      ],
+      state
+    )
 
     expect(operations).toEqual(['resize:80x24', 'write:ab', 'write:cd', 'resize:90x30', 'write:ef'])
     expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 2 })

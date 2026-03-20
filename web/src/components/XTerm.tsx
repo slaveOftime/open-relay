@@ -71,7 +71,7 @@ export interface XTermHandle {
 }
 
 interface Props {
-  autoFit: boolean,
+  autoFit: boolean
   /** Called with raw keyboard data from xterm (use for WebSocket sendInput) */
   onData?: (data: string) => void
   /** Called when the terminal is resized by FitAddon (cols, rows) */
@@ -79,7 +79,10 @@ interface Props {
   className?: string
 }
 
-const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ autoFit, onData, onResize, className }, ref) {
+const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
+  { autoFit, onData, onResize, className },
+  ref
+) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -109,10 +112,16 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ autoFit, onData, o
       termRef.current?.reset()
     },
     resize(cols: number, rows: number) {
-      if (!termRef.current || cols <= 0 || rows <= 0) return
-      console.log(`Requested terminal resize: ${cols} cols, ${rows} rows`)
+      if (
+        !termRef.current ||
+        cols <= 0 ||
+        rows <= 0 ||
+        (cols === termRef.current.cols && rows === termRef.current.rows)
+      ) {
+        return
+      }
+      console.debug(`Resizing xterm to ${cols} cols and ${rows} rows`)
       termRef.current.resize(cols, rows)
-      console.log(`Actual terminal size after resize attempt: ${termRef.current.cols} cols, ${termRef.current.rows} rows`)
       lastResizeRef.current = { cols, rows }
     },
     scrollToBottom() {
@@ -171,8 +180,8 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ autoFit, onData, o
     term.open(containerRef.current)
     termRef.current = term
     lastResizeRef.current = null
-    
-    if (autoFit)  {
+
+    if (autoFit) {
       const fitAddon = new FitAddon()
       term.loadAddon(fitAddon)
       fitRef.current = fitAddon

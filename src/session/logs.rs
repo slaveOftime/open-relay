@@ -21,6 +21,8 @@ const BYTES_PER_LINE_ESTIMATE: u64 = 256;
 /// boundary appears for a long stretch of bytes.
 const LOG_RECORD_FALLBACK_BYTES: usize = 2048;
 
+const ESCAPE_BYTE: u8 = 0x1b;
+
 /// Wide parser column count — prevents any line wrapping inside the vt100 grid
 /// for plain scrollback-style logs.
 const PARSER_COLS: u16 = 2000;
@@ -39,6 +41,11 @@ struct TailBytes {
     bytes: Vec<u8>,
     start_offset: u64,
     end_offset: u64,
+}
+
+struct RenderBytes<'a> {
+    frame: &'a [u8],
+    frame_has_alt_screen: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -154,45 +161,73 @@ where
     }
 
     fn process_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.process_byte(byte);
+        let mut remaining = bytes;
+
+        while !remaining.is_empty() {
+            if !self.pending_escape.is_empty() {
+                let consumed = self.process_pending_escape_bytes(remaining);
+                remaining = &remaining[consumed..];
+                continue;
+            }
+
+            let Some(special_index) = find_special_record_byte(remaining) else {
+                self.push_plain_bytes(remaining);
+                break;
+            };
+
+            self.push_plain_bytes(&remaining[..special_index]);
+
+            match remaining[special_index] {
+                b'\n' | b'\r' => {
+                    self.current_record.push(remaining[special_index]);
+                    self.flush_current_record();
+                }
+                ESCAPE_BYTE => self.pending_escape.push(ESCAPE_BYTE),
+                _ => unreachable!("special record byte lookup returned unsupported byte"),
+            }
+
+            remaining = &remaining[special_index + 1..];
         }
     }
 
-    fn process_byte(&mut self, byte: u8) {
-        if self.pending_escape.is_empty() {
-            match byte {
-                b'\n' | b'\r' => {
-                    self.current_record.push(byte);
-                    self.flush_current_record();
+    fn process_pending_escape_bytes(&mut self, bytes: &[u8]) -> usize {
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.pending_escape.push(byte);
+
+            match ansi_sequence_status(&self.pending_escape) {
+                AnsiSequenceStatus::Incomplete => {}
+                AnsiSequenceStatus::Complete => {
+                    let is_boundary = is_record_boundary_sequence(&self.pending_escape);
+                    self.flush_pending_escape(is_boundary);
+                    return index + 1;
                 }
-                0x1b => self.pending_escape.push(byte),
-                _ => {
-                    self.current_record.push(byte);
-                    self.flush_fallback_record();
+                AnsiSequenceStatus::Invalid => {
+                    self.flush_pending_escape(false);
+                    return index + 1;
                 }
             }
-            return;
         }
 
-        self.pending_escape.push(byte);
-        match ansi_sequence_status(&self.pending_escape) {
-            AnsiSequenceStatus::Incomplete => {}
-            AnsiSequenceStatus::Complete => {
-                if !self.current_record.is_empty()
-                    && is_record_boundary_sequence(&self.pending_escape)
-                {
-                    self.flush_current_record();
-                }
-                self.current_record.extend_from_slice(&self.pending_escape);
-                self.pending_escape.clear();
-                self.flush_fallback_record();
+        bytes.len()
+    }
+
+    fn push_plain_bytes(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let available = LOG_RECORD_FALLBACK_BYTES.saturating_sub(self.current_record.len());
+            if available == 0 {
+                self.flush_current_record();
+                continue;
             }
-            AnsiSequenceStatus::Invalid => {
-                self.current_record.extend_from_slice(&self.pending_escape);
-                self.pending_escape.clear();
-                self.flush_fallback_record();
+
+            if bytes.len() <= available {
+                self.current_record.extend_from_slice(bytes);
+                return;
             }
+
+            let split_at = utf8_boundary_at_or_before(bytes, available).max(1);
+            self.current_record.extend_from_slice(&bytes[..split_at]);
+            self.flush_current_record();
+            bytes = &bytes[split_at..];
         }
     }
 
@@ -214,15 +249,20 @@ where
         self.current_record.clear();
     }
 
-    fn flush_fallback_record(&mut self) {
-        while self.current_record.len() >= LOG_RECORD_FALLBACK_BYTES {
-            let split_at =
-                utf8_boundary_at_or_before(&self.current_record, LOG_RECORD_FALLBACK_BYTES).max(1);
-            let tail = self.current_record.split_off(split_at);
-            (self.on_record)(&self.current_record);
-            self.current_record = tail;
+    fn flush_pending_escape(&mut self, is_boundary: bool) {
+        if is_boundary && !self.current_record.is_empty() {
+            self.flush_current_record();
         }
+
+        self.current_record.extend_from_slice(&self.pending_escape);
+        self.pending_escape.clear();
     }
+}
+
+fn find_special_record_byte(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .iter()
+        .position(|&byte| matches!(byte, b'\n' | b'\r' | ESCAPE_BYTE))
 }
 
 fn utf8_boundary_at_or_before(bytes: &[u8], end: usize) -> usize {
@@ -241,7 +281,7 @@ enum AnsiSequenceStatus {
 }
 
 fn ansi_sequence_status(bytes: &[u8]) -> AnsiSequenceStatus {
-    if bytes.first().copied() != Some(0x1b) {
+    if bytes.first().copied() != Some(ESCAPE_BYTE) {
         return AnsiSequenceStatus::Invalid;
     }
 
@@ -271,7 +311,7 @@ fn ansi_sequence_status(bytes: &[u8]) -> AnsiSequenceStatus {
 }
 
 fn is_record_boundary_sequence(sequence: &[u8]) -> bool {
-    if sequence.len() < 3 || sequence[0] != 0x1b || sequence[1] != b'[' {
+    if sequence.len() < 3 || sequence[0] != ESCAPE_BYTE || sequence[1] != b'[' {
         return false;
     }
 
@@ -436,7 +476,7 @@ fn parse_resize_event(line: &str) -> Option<LogResize> {
 /// must approximate the PTY viewport height, otherwise absolute cursor writes
 /// can leave stale off-screen rows visible in an oversized virtual screen.
 fn render_rows(
-    bytes: &[u8],
+    render_bytes: &RenderBytes<'_>,
     tail: usize,
     term_cols: u16,
     keep_color: bool,
@@ -444,11 +484,22 @@ fn render_rows(
     viewport_plan: &ViewportReplayPlan,
 ) -> Vec<Vec<u8>> {
     let mut parser = vt100::Parser::new(
-        parser_rows(bytes, tail, viewport, viewport_plan),
-        parser_cols(bytes, term_cols, viewport, viewport_plan),
+        parser_rows(
+            render_bytes.frame,
+            render_bytes.frame_has_alt_screen,
+            tail,
+            viewport,
+            viewport_plan,
+        ),
+        parser_cols(
+            render_bytes.frame_has_alt_screen,
+            term_cols,
+            viewport,
+            viewport_plan,
+        ),
         0,
     );
-    process_bytes_with_resizes(&mut parser, bytes, viewport_plan);
+    process_bytes_with_resizes(&mut parser, render_bytes.frame, viewport_plan);
 
     let screen = parser.screen();
 
@@ -465,11 +516,12 @@ fn render_rows(
 
 fn parser_rows(
     bytes: &[u8],
+    has_alt_screen: bool,
     tail: usize,
     viewport: Option<ViewportSize>,
     viewport_plan: &ViewportReplayPlan,
 ) -> u16 {
-    if contains_alt_screen(bytes) {
+    if has_alt_screen {
         viewport_plan
             .initial
             .as_ref()
@@ -484,12 +536,12 @@ fn parser_rows(
 }
 
 fn parser_cols(
-    bytes: &[u8],
+    has_alt_screen: bool,
     term_cols: u16,
     viewport: Option<ViewportSize>,
     viewport_plan: &ViewportReplayPlan,
 ) -> u16 {
-    if contains_alt_screen(bytes) {
+    if has_alt_screen {
         viewport_plan
             .initial
             .as_ref()
@@ -604,17 +656,34 @@ fn render_log_bytes(
     viewport: Option<ViewportSize>,
     viewport_plan: &ViewportReplayPlan,
 ) -> Vec<u8> {
-    let bytes = latest_render_frame(bytes);
+    let render_bytes = prepare_render_bytes(bytes);
 
     // Step 2: feed bytes into a vt100 parser sized to (tail rows × 2000 cols),
     // then collect each visible row formatted and trimmed to the terminal width.
-    let rows = render_rows(bytes, tail, term_cols, keep_color, viewport, viewport_plan);
+    let rows = render_rows(
+        &render_bytes,
+        tail,
+        term_cols,
+        keep_color,
+        viewport,
+        viewport_plan,
+    );
 
     format_rows_for_output(&rows, keep_color)
 }
 
-fn latest_render_frame(bytes: &[u8]) -> &[u8] {
-    if !contains_alt_screen(bytes) {
+fn prepare_render_bytes(bytes: &[u8]) -> RenderBytes<'_> {
+    let has_alt_screen = contains_alt_screen(bytes);
+    let frame = latest_render_frame(bytes, has_alt_screen);
+
+    RenderBytes {
+        frame,
+        frame_has_alt_screen: contains_alt_screen(frame),
+    }
+}
+
+fn latest_render_frame(bytes: &[u8], has_alt_screen: bool) -> &[u8] {
+    if !has_alt_screen {
         return bytes;
     }
 
@@ -637,17 +706,14 @@ fn last_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn format_rows_for_output(rows: &[Vec<u8>], keep_color: bool) -> Vec<u8> {
     let mut out = Vec::new();
 
+    if rows.is_empty() {
+        append_color_reset(&mut out, keep_color);
+        return out;
+    }
+
     // Find the first non-empty row so we don't print a sea of blank lines when
     // the log is shorter than `tail`.
-    let first_content = rows
-        .iter()
-        .position(|r| !r.is_empty() && r.iter().any(|&b| !b.is_ascii_whitespace()))
-        .unwrap_or(0);
-
-    let mut last_content = rows
-        .iter()
-        .rposition(|r| !r.is_empty() && r.iter().any(|&b| !b.is_ascii_whitespace()))
-        .unwrap_or(first_content);
+    let (first_content, mut last_content) = content_bounds(rows).unwrap_or((0, 0));
 
     last_content = trim_repeated_trailing_suffix(rows, first_content, last_content);
 
@@ -659,11 +725,24 @@ fn format_rows_for_output(rows: &[Vec<u8>], keep_color: bool) -> Vec<u8> {
         out.push(b'\n');
     }
 
+    append_color_reset(&mut out, keep_color);
+
+    out
+}
+
+fn content_bounds(rows: &[Vec<u8>]) -> Option<(usize, usize)> {
+    let first = rows.iter().position(|row| !row_is_blank(row))?;
+    let last = rows
+        .iter()
+        .rposition(|row| !row_is_blank(row))
+        .unwrap_or(first);
+    Some((first, last))
+}
+
+fn append_color_reset(out: &mut Vec<u8>, keep_color: bool) {
     if keep_color {
         out.extend_from_slice(b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h");
     }
-
-    out
 }
 
 fn trim_repeated_trailing_suffix(
@@ -711,12 +790,11 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
         return row;
     }
 
-    row[..row
+    let end = row
         .iter()
         .rposition(|&byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
-        .unwrap_or(0)]
-        .as_ref()
+        .map_or(0, |index| index + 1);
+    &row[..end]
 }
 
 #[cfg(test)]
@@ -975,9 +1053,9 @@ mod tests {
         let bytes = b"\x1b[?1049h\x1b[20;1Hstale\x1b[HSelect Model";
         let viewport = Some(ViewportSize { rows: 6, cols: 100 });
 
-        assert_eq!(parser_rows(bytes, 10, viewport, &empty_plan()), 6);
-        assert_eq!(parser_cols(bytes, 80, viewport, &empty_plan()), 100);
-        assert_eq!(parser_cols(bytes, 80, None, &empty_plan()), 80);
+        assert_eq!(parser_rows(bytes, true, 10, viewport, &empty_plan()), 6);
+        assert_eq!(parser_cols(true, 80, viewport, &empty_plan()), 100);
+        assert_eq!(parser_cols(true, 80, None, &empty_plan()), 80);
     }
 
     #[test]
