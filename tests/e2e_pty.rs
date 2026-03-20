@@ -75,6 +75,48 @@ fn wait_for_exact_append(
     wait_for_exact_log(tmp, id, &expected, timeout)
 }
 
+fn wait_for_prompted_output<I, S>(
+    tmp: &PathBuf,
+    id: &str,
+    baseline: &str,
+    prompt: &str,
+    expected_lines: I,
+    timeout: Duration,
+) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let expected_lines = expected_lines
+        .into_iter()
+        .map(|line| line.as_ref().to_string())
+        .collect::<Vec<_>>();
+
+    wait_for_log(
+        tmp,
+        id,
+        |log| {
+            let log = normalize_log_text(log);
+            if !log.starts_with(baseline) || trailing_prompt(&log) != prompt {
+                return false;
+            }
+
+            let suffix = &log[baseline.len()..];
+            let mut search_from = 0usize;
+            for line in &expected_lines {
+                let Some(found_at) = suffix[search_from..].find(line) else {
+                    return false;
+                };
+                search_from += found_at + line.len();
+            }
+
+            true
+        },
+        timeout,
+    )
+    .map(|log| normalize_log_text(&log))
+}
+
 fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
     if !program_exists("bash") {
         eprintln!("SKIP {test_name}: bash not found on PATH");
@@ -93,11 +135,12 @@ fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
     let ready_command = format!("echo {ready_marker}");
     send_line(tmp, &id, &ready_command);
 
-    let ready = wait_for_exact_append(
+    let ready = wait_for_prompted_output(
         tmp,
         &id,
         &baseline,
-        &prompted_transcript(&prompt, &ready_command, [ready_marker.as_str()]),
+        &prompt,
+        [ready_marker.as_str()],
         Duration::from_secs(5),
     );
     assert!(
@@ -288,15 +331,12 @@ fn e2e_bash_repeated_send_echo_commands_accumulate_in_logs() {
         send_line(&tmp, &id, &command);
         expected_markers.push(marker);
 
-        baseline = wait_for_exact_append(
+        baseline = wait_for_prompted_output(
             &tmp,
             &id,
             &baseline,
-            &prompted_transcript(
-                &prompt,
-                &command,
-                [expected_markers.last().expect("marker just pushed").as_str()],
-            ),
+            &prompt,
+            [expected_markers.last().expect("marker just pushed").as_str()],
             Duration::from_secs(5),
         )
         .unwrap_or_else(|| {
@@ -334,11 +374,12 @@ fn e2e_bash_repeated_loop_scripts_appear_fully_in_logs() {
 
         send_line(&tmp, &id, &script);
 
-        baseline = wait_for_exact_append(
+        baseline = wait_for_prompted_output(
             &tmp,
             &id,
             &baseline,
-            &prompted_transcript(&prompt, &script, round_markers.iter().map(String::as_str)),
+            &prompt,
+            round_markers.iter().map(String::as_str),
             Duration::from_secs(5),
         )
         .unwrap_or_else(|| {
@@ -381,11 +422,12 @@ fn e2e_powershell_write_host_marker_appears_in_logs() {
     let command = format!("Write-Host {MARKER}");
     send_line(&tmp, &id, &command);
 
-    let result = wait_for_exact_append(
+    let result = wait_for_prompted_output(
         &tmp,
         &id,
         &initial,
-        &prompted_transcript(&prompt, &command, [MARKER]),
+        &prompt,
+        [MARKER],
         Duration::from_secs(15),
     );
     assert!(

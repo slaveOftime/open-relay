@@ -531,15 +531,15 @@ pub fn extract_query_responses_no_client(
         else {
             break;
         };
-        
+
         // Only respond to queries that require daemon-side answers in detached mode:
         // - CursorPositionReport (CPR): needed for layout positioning
         // - DeviceStatusReport (DSR): needed for status checks
         // - ForegroundColor/BackgroundColor (OSC 10/11): needed for theme detection
-        // 
+        //
         // Do NOT respond to:
         // - PrimaryDeviceAttributes (DA1)
-        // - SecondaryDeviceAttributes (DA2)  
+        // - SecondaryDeviceAttributes (DA2)
         // - XtVersion (XTVERSION)
         // - DecPrivateModeReport (DECRPM)
         // - KittyKeyboard
@@ -554,17 +554,19 @@ pub fn extract_query_responses_no_client(
                 | TerminalQuery::ForegroundColor
                 | TerminalQuery::BackgroundColor
         );
-        
+
         if should_respond {
             let response_cursor = match query {
-                TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => Some(cursor),
+                TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => {
+                    Some(cursor)
+                }
                 _ => None,
             };
             for response in terminal_query_response(query, response_cursor) {
                 responses.push(response.into_bytes());
             }
         }
-        
+
         search_from = match_start + query_len;
     }
 
