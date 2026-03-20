@@ -623,34 +623,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_test_child_with_exit_code(exit_code: i32) -> RuntimeChild {
-        #[cfg(target_os = "windows")]
-        let mut cmd = portable_pty::CommandBuilder::new("cmd.exe");
-        #[cfg(target_os = "windows")]
-        {
-            let exit_arg = exit_code.to_string();
-            cmd.arg("/c");
-            cmd.arg("exit");
-            cmd.arg(exit_arg);
+        RuntimeChild::Mock {
+            exit_code: Some(exit_code),
         }
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = portable_pty::CommandBuilder::new("sh");
-        #[cfg(not(target_os = "windows"))]
-        {
-            let command = format!("exit {exit_code}");
-            cmd.arg("-c");
-            cmd.arg(command);
-        }
-
-        let pty = portable_pty::native_pty_system()
-            .openpty(portable_pty::PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty in test");
-        let child = pty.slave.spawn_command(cmd).expect("spawn in test");
-        RuntimeChild::Pty(child)
     }
 
     fn new_runtime_with(status: SessionStatus, exit_code: i32) -> SessionRuntime {
@@ -705,7 +680,8 @@ mod tests {
     }
 
     fn refresh_until_completed(rt: &mut SessionRuntime) {
-        for _ in 0..100 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
             if rt.refresh_status() {
                 return;
             }

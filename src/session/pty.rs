@@ -105,6 +105,10 @@ impl PtyHandle {
 
 pub enum RuntimeChild {
     Pty(Box<dyn portable_pty::Child + Send + Sync>),
+    #[cfg(test)]
+    Mock {
+        exit_code: Option<i32>,
+    },
 }
 
 impl RuntimeChild {
@@ -112,6 +116,8 @@ impl RuntimeChild {
     pub fn process_id(&self) -> Option<u32> {
         match self {
             Self::Pty(child) => child.process_id(),
+            #[cfg(test)]
+            Self::Mock { .. } => None,
         }
     }
 
@@ -119,6 +125,13 @@ impl RuntimeChild {
     pub fn kill(&mut self) -> std::io::Result<()> {
         match self {
             Self::Pty(child) => child.kill(),
+            #[cfg(test)]
+            Self::Mock { exit_code } => {
+                if exit_code.is_none() {
+                    *exit_code = Some(1);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -128,6 +141,8 @@ impl RuntimeChild {
             Self::Pty(child) => child
                 .try_wait()
                 .map(|opt| opt.map(|status| status.exit_code() as i32)),
+            #[cfg(test)]
+            Self::Mock { exit_code } => Ok(*exit_code),
         }
     }
 }
