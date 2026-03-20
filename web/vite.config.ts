@@ -15,7 +15,7 @@ export default defineConfig({
       includeAssets: ['touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
       manifest: {
         name: 'Open Relay',
-        short_name: 'Open Relay',
+        short_name: 'Oly',
         description: 'Persistent PTY session manager',
         start_url: '/',
         scope: '/',

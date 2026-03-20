@@ -139,6 +139,10 @@ impl AppConfig {
             notification_hook,
         })
     }
+
+    pub fn wwwroot_dir(&self) -> PathBuf {
+        self.state_dir.join("wwwroot")
+    }
 }
 
 // ---------------------------------------------------------------------------

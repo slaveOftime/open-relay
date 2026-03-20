@@ -11,6 +11,18 @@ use crossterm::{
 
 use crate::error::{AppError, Result};
 
+fn terminal_tab_state_save_bytes() -> &'static [u8] {
+    // XTWINOPS 22;0 saves icon + window title on the terminal's title stack.
+    b"\x1b[22;0t"
+}
+
+fn terminal_tab_state_restore_bytes() -> &'static [u8] {
+    // XTWINOPS 23;0 restores icon + window title from the title stack.
+    // OSC 9;4;0;0 clears any forwarded progress indicator. There is no
+    // portable query/restore sequence for terminal progress state.
+    b"\x1b[23;0t\x1b]9;4;0;0\x07"
+}
+
 pub struct RawModeGuard {
     cleaned_up: bool,
 }
@@ -18,6 +30,7 @@ pub struct RawModeGuard {
 impl RawModeGuard {
     pub fn new() -> Result<Self> {
         terminal::enable_raw_mode()?;
+        let _ = std::io::stdout().write_all(terminal_tab_state_save_bytes());
         // Enable bracketed paste so multi-line pastes arrive as a single
         // Event::Paste rather than being injected as individual key events
         // (which would fire Enter after each line).
@@ -80,6 +93,12 @@ impl RawModeGuard {
             }
         }
 
+        if let Err(err) = stdout.write_all(terminal_tab_state_restore_bytes()) {
+            if first_error.is_none() {
+                first_error = Some(err.into());
+            }
+        }
+
         if let Err(err) = stdout.flush() {
             if first_error.is_none() {
                 first_error = Some(err.into());
@@ -118,5 +137,23 @@ impl Drop for ColorfulGuard {
             let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h");
             let _ = std::io::stdout().flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{terminal_tab_state_restore_bytes, terminal_tab_state_save_bytes};
+
+    #[test]
+    fn terminal_tab_state_save_uses_title_stack_push() {
+        assert_eq!(terminal_tab_state_save_bytes(), b"\x1b[22;0t");
+    }
+
+    #[test]
+    fn terminal_tab_state_restore_restores_title_and_clears_progress() {
+        assert_eq!(
+            terminal_tab_state_restore_bytes(),
+            b"\x1b[23;0t\x1b]9;4;0;0\x07"
+        );
     }
 }
