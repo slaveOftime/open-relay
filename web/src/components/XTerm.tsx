@@ -71,6 +71,7 @@ export interface XTermHandle {
 }
 
 interface Props {
+  autoFit: boolean,
   /** Called with raw keyboard data from xterm (use for WebSocket sendInput) */
   onData?: (data: string) => void
   /** Called when the terminal is resized by FitAddon (cols, rows) */
@@ -78,7 +79,7 @@ interface Props {
   className?: string
 }
 
-const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, className }, ref) {
+const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ autoFit, onData, onResize, className }, ref) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -109,7 +110,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
     },
     resize(cols: number, rows: number) {
       if (!termRef.current || cols <= 0 || rows <= 0) return
+      console.log(`Requested terminal resize: ${cols} cols, ${rows} rows`)
       termRef.current.resize(cols, rows)
+      console.log(`Actual terminal size after resize attempt: ${termRef.current.cols} cols, ${termRef.current.rows} rows`)
       lastResizeRef.current = { cols, rows }
     },
     scrollToBottom() {
@@ -165,16 +168,15 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
       macOptionClickForcesSelection: true,
     })
 
-    const fitAddon = new FitAddon()
-    term.loadAddon(fitAddon)
-    // const canvasAddon = new CanvasAddon()
-    // term.loadAddon(canvasAddon)
-
     term.open(containerRef.current)
-
     termRef.current = term
-    fitRef.current = fitAddon
     lastResizeRef.current = null
+    
+    if (autoFit)  {
+      const fitAddon = new FitAddon()
+      term.loadAddon(fitAddon)
+      fitRef.current = fitAddon
+    }
 
     const emitResizeIfChanged = () => {
       const next = { cols: term.cols, rows: term.rows }
@@ -189,7 +191,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
       initialRaf = 0
       if (!termRef.current) return
       try {
-        fitAddon.fit()
+        fitRef.current?.fit()
         emitResizeIfChanged()
       } catch {
         /* ignore if already disposed */
@@ -209,7 +211,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
         pendingRaf = 0
         if (!termRef.current) return
         try {
-          fitAddon.fit()
+          fitRef.current?.fit()
           emitResizeIfChanged()
         } catch {
           /* ignore during unmount */
@@ -260,7 +262,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm({ onData, onResize, 
     <div
       ref={containerRef}
       className={className}
-      style={{ width: '100%', height: '100%', overflow: 'hidden', touchAction: 'none' }}
+      style={{ overflow: 'hidden', touchAction: 'none' }}
     />
   )
 })

@@ -317,7 +317,7 @@ export default function SessionDetailPage() {
     try {
       const res = await fetchLogs(
         id,
-        { offset: nextOffsetRef.current, limit: 500 },
+        { offset: nextOffsetRef.current, limit: 1000 },
         node ?? undefined
       )
       if (!isMounted.current) return
@@ -705,7 +705,7 @@ export default function SessionDetailPage() {
     setTotalLines(0)
 
     let cancelled = false
-    fetchLogs(id!, { offset: 0, limit: 200 }, node ?? undefined)
+    fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
       .then((res) => {
         if (cancelled || !isMounted.current) return
         logLinesRef.current = res.lines
@@ -1095,14 +1095,13 @@ export default function SessionDetailPage() {
               className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4`}
             >
               <div className="h-full w-full overflow-x-auto">
-                <div className={`h-full ${mode === 'logs' ? 'w-500 min-w-full' : ''}`}>
-                  <XTerm
-                    ref={termRef}
-                    onData={mode === 'attach' ? sendInput : undefined}
-                    onResize={mode === 'attach' ? handleTermResize : undefined}
-                    className="h-full min-w-full"
-                  />
-                </div>
+                <XTerm
+                  ref={termRef}
+                  autoFit={mode === 'attach'}
+                  onData={mode === 'attach' ? sendInput : undefined}
+                  onResize={mode === 'attach' ? handleTermResize : undefined}
+                  className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
+                />
               </div>
             </div>
 

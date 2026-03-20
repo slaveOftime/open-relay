@@ -17,6 +17,10 @@ use crate::{error::Result, protocol::LogResize};
 /// Generous per-line byte budget that accounts for ANSI escape sequences.
 const BYTES_PER_LINE_ESTIMATE: u64 = 256;
 
+/// Fallback record size for raw PTY log pagination when no natural terminal
+/// boundary appears for a long stretch of bytes.
+const LOG_RECORD_FALLBACK_BYTES: usize = 2048;
+
 /// Wide parser column count — prevents any line wrapping inside the vt100 grid
 /// for plain scrollback-style logs.
 const PARSER_COLS: u16 = 2000;
@@ -45,34 +49,241 @@ struct ViewportReplayPlan {
 
 /// Read a page of lines from a persisted `output.log`.
 ///
-/// Returns `(lines, total_line_count)` or `None` if the file can't be opened.
-/// Lines are returned with their trailing newline intact.
+/// Returns `(records, total_record_count)` or `None` if the file can't be
+/// opened. For raw PTY streams, records are split on terminal-aware boundaries
+/// first and fall back to fixed-size chunks when the stream contains no `\n`.
 pub fn read_persisted_log_page(
     session_dir: &Path,
     offset: usize,
     limit: usize,
 ) -> Option<(Vec<String>, usize)> {
     let file = File::open(session_dir.join("output.log")).ok()?;
-    let mut reader = BufReader::new(file);
+    let mut page = PaginatedLogRecords::new(offset, limit);
+    scan_persisted_log_records(file, |record| page.push(record)).ok()?;
+    Some(page.finish())
+}
 
-    let end = offset.saturating_add(limit);
-    let mut total = 0usize;
-    let mut lines = Vec::with_capacity(limit);
+#[cfg(test)]
+fn split_persisted_log_records(bytes: &[u8]) -> Vec<String> {
+    let mut records = Vec::new();
+    scan_persisted_log_records(std::io::Cursor::new(bytes), |record| {
+        records.push(String::from_utf8_lossy(record).into_owned());
+    })
+    .expect("scan in-memory log bytes");
+    records
+}
 
-    loop {
-        let mut buf = String::new();
-        let bytes_read = reader.read_line(&mut buf).ok()?;
-        if bytes_read == 0 {
-            break;
+struct PaginatedLogRecords {
+    offset: usize,
+    end: usize,
+    total: usize,
+    records: Vec<String>,
+}
+
+impl PaginatedLogRecords {
+    fn new(offset: usize, limit: usize) -> Self {
+        Self {
+            offset,
+            end: offset.saturating_add(limit),
+            total: 0,
+            records: Vec::with_capacity(limit),
         }
-
-        if total >= offset && total < end {
-            lines.push(buf);
-        }
-        total += 1;
     }
 
-    Some((lines, total))
+    fn push(&mut self, record: &[u8]) {
+        if record.is_empty() {
+            return;
+        }
+
+        if self.total >= self.offset && self.total < self.end {
+            self.records
+                .push(String::from_utf8_lossy(record).into_owned());
+        }
+        self.total += 1;
+    }
+
+    fn finish(self) -> (Vec<String>, usize) {
+        (self.records, self.total)
+    }
+}
+
+fn scan_persisted_log_records<R, F>(reader: R, on_record: F) -> std::io::Result<()>
+where
+    R: Read,
+    F: FnMut(&[u8]),
+{
+    let mut scanner = LogRecordScanner::new(on_record);
+    let mut reader = BufReader::new(reader);
+
+    loop {
+        let consumed = {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+
+            scanner.process_bytes(chunk);
+            chunk.len()
+        };
+        reader.consume(consumed);
+    }
+
+    scanner.finish();
+    Ok(())
+}
+
+struct LogRecordScanner<F>
+where
+    F: FnMut(&[u8]),
+{
+    current_record: Vec<u8>,
+    pending_escape: Vec<u8>,
+    on_record: F,
+}
+
+impl<F> LogRecordScanner<F>
+where
+    F: FnMut(&[u8]),
+{
+    fn new(on_record: F) -> Self {
+        Self {
+            current_record: Vec::with_capacity(LOG_RECORD_FALLBACK_BYTES),
+            pending_escape: Vec::new(),
+            on_record,
+        }
+    }
+
+    fn process_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.process_byte(byte);
+        }
+    }
+
+    fn process_byte(&mut self, byte: u8) {
+        if self.pending_escape.is_empty() {
+            match byte {
+                b'\n' | b'\r' => {
+                    self.current_record.push(byte);
+                    self.flush_current_record();
+                }
+                0x1b => self.pending_escape.push(byte),
+                _ => {
+                    self.current_record.push(byte);
+                    self.flush_fallback_record();
+                }
+            }
+            return;
+        }
+
+        self.pending_escape.push(byte);
+        match ansi_sequence_status(&self.pending_escape) {
+            AnsiSequenceStatus::Incomplete => {}
+            AnsiSequenceStatus::Complete => {
+                if !self.current_record.is_empty()
+                    && is_record_boundary_sequence(&self.pending_escape)
+                {
+                    self.flush_current_record();
+                }
+                self.current_record.extend_from_slice(&self.pending_escape);
+                self.pending_escape.clear();
+                self.flush_fallback_record();
+            }
+            AnsiSequenceStatus::Invalid => {
+                self.current_record.extend_from_slice(&self.pending_escape);
+                self.pending_escape.clear();
+                self.flush_fallback_record();
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.pending_escape.is_empty() {
+            self.current_record.extend_from_slice(&self.pending_escape);
+            self.pending_escape.clear();
+        }
+
+        self.flush_current_record();
+    }
+
+    fn flush_current_record(&mut self) {
+        if self.current_record.is_empty() {
+            return;
+        }
+
+        (self.on_record)(&self.current_record);
+        self.current_record.clear();
+    }
+
+    fn flush_fallback_record(&mut self) {
+        while self.current_record.len() >= LOG_RECORD_FALLBACK_BYTES {
+            let split_at =
+                utf8_boundary_at_or_before(&self.current_record, LOG_RECORD_FALLBACK_BYTES).max(1);
+            let tail = self.current_record.split_off(split_at);
+            (self.on_record)(&self.current_record);
+            self.current_record = tail;
+        }
+    }
+}
+
+fn utf8_boundary_at_or_before(bytes: &[u8], end: usize) -> usize {
+    let mut candidate = end.min(bytes.len());
+    while candidate > 0 && std::str::from_utf8(&bytes[..candidate]).is_err() {
+        candidate -= 1;
+    }
+
+    candidate
+}
+
+enum AnsiSequenceStatus {
+    Incomplete,
+    Complete,
+    Invalid,
+}
+
+fn ansi_sequence_status(bytes: &[u8]) -> AnsiSequenceStatus {
+    if bytes.first().copied() != Some(0x1b) {
+        return AnsiSequenceStatus::Invalid;
+    }
+
+    let Some(second) = bytes.get(1).copied() else {
+        return AnsiSequenceStatus::Incomplete;
+    };
+
+    match second {
+        b'[' => {
+            if bytes[2..].iter().any(|byte| (0x40..=0x7e).contains(byte)) {
+                AnsiSequenceStatus::Complete
+            } else {
+                AnsiSequenceStatus::Incomplete
+            }
+        }
+        b']' | b'P' | b'X' | b'^' | b'_' => {
+            if bytes.last().copied() == Some(0x07)
+                || (bytes.len() >= 2 && bytes[bytes.len() - 2..] == [0x1b, b'\\'])
+            {
+                AnsiSequenceStatus::Complete
+            } else {
+                AnsiSequenceStatus::Incomplete
+            }
+        }
+        _ => AnsiSequenceStatus::Complete,
+    }
+}
+
+fn is_record_boundary_sequence(sequence: &[u8]) -> bool {
+    if sequence.len() < 3 || sequence[0] != 0x1b || sequence[1] != b'[' {
+        return false;
+    }
+
+    let final_byte = *sequence.last().unwrap_or(&0);
+    let params = &sequence[2..sequence.len() - 1];
+
+    matches!(final_byte, b'H' | b'f' | b'd' | b'G' | b'J' | b'K')
+        || is_alt_screen_toggle(params, final_byte)
+}
+
+fn is_alt_screen_toggle(params: &[u8], final_byte: u8) -> bool {
+    matches!(final_byte, b'h' | b'l') && matches!(params, b"?1049" | b"?1047")
 }
 
 pub fn render_log_file(
@@ -513,6 +724,7 @@ mod tests {
     use super::{
         ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
         read_relevant_resize_events, read_resize_events, render_log_bytes, render_log_file,
+        split_persisted_log_records,
     };
     use crate::protocol::LogResize;
     use std::fs;
@@ -766,5 +978,33 @@ mod tests {
         assert_eq!(parser_rows(bytes, 10, viewport, &empty_plan()), 6);
         assert_eq!(parser_cols(bytes, 80, viewport, &empty_plan()), 100);
         assert_eq!(parser_cols(bytes, 80, None, &empty_plan()), 80);
+    }
+
+    #[test]
+    fn splits_persisted_logs_on_terminal_boundaries_without_newlines() {
+        let records = split_persisted_log_records(
+            b"\x1b[2J\x1b[HTitle\x1b[5;1HOption 1\x1b[6;1HOption 2\x1b[2;1HSearch",
+        );
+
+        assert_eq!(
+            records,
+            vec![
+                "\x1b[2J".to_string(),
+                "\x1b[HTitle".to_string(),
+                "\x1b[5;1HOption 1".to_string(),
+                "\x1b[6;1HOption 2".to_string(),
+                "\x1b[2;1HSearch".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_persisted_logs_by_fallback_size_when_no_boundaries_exist() {
+        let bytes = vec![b'a'; super::LOG_RECORD_FALLBACK_BYTES + 17];
+        let records = split_persisted_log_records(&bytes);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].len(), super::LOG_RECORD_FALLBACK_BYTES);
+        assert_eq!(records[1].len(), 17);
     }
 }
