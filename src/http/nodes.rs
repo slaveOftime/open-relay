@@ -198,6 +198,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                 trigger_rule,
                                 trigger_detail,
                             }) => {
+                                let summary = format!("[{}] {}", name, summary);
                                 let trigger_rule_enum =
                                     trigger_rule.as_deref().and_then(NotificationTriggerRule::parse);
                                 let maybe_kind = match kind.as_str() {
