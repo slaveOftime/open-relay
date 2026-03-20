@@ -143,7 +143,7 @@ pub struct StartArgs {
     /// Disable notifications for this session.
     #[arg(long)]
     pub disable_notifications: bool,
-    /// Absolute working directory for the command. Defaults to the caller's current directory.
+    /// Working directory for the command. Relative paths are resolved from the caller's current directory.
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
     /// Command and arguments to run. Passed through as-is.
