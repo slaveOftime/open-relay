@@ -130,28 +130,30 @@ pub(super) async fn run_notification_monitor(
                 trigger_detail,
             );
 
-            let dispatched = if candidate.notifications_enabled {
-                notifier.dispatch(&event).await.any_delivered()
-            } else {
-                // This is useful for supervisor agent to take over when to send notifications
-                true
-            };
-
-            if dispatched {
-                session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
-
-                let _ = notification_tx.send(event.clone());
-                let _ = event_tx.send(SessionEvent::SessionNotification {
-                    kind: event.kind.as_str().to_string(),
-                    summary: event.summary,
-                    body: event.body,
-                    session_ids: event.session_ids,
-                    trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
-                    trigger_detail: event.trigger_detail,
+            if candidate.notifications_enabled {
+                let notifier = Arc::clone(&notifier);
+                let event = event.clone();
+                let session_id = session_id.clone();
+                tokio::spawn(async move {
+                    if !notifier.dispatch(&event).await.any_delivered() {
+                        warn!(session_id, "notification delivery failed on all channels");
+                    }
                 });
-            } else {
-                warn!(session_id, "notification delivery failed on all channels");
             }
+
+            // This is useful for supervisor agent to take over when to send notifications
+            let _ = notification_tx.send(event.clone());
+
+            let _ = event_tx.send(SessionEvent::SessionNotification {
+                kind: event.kind.as_str().to_string(),
+                summary: event.summary,
+                body: event.body,
+                session_ids: event.session_ids,
+                trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
+                trigger_detail: event.trigger_detail,
+            });
+
+            session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
         }
     }
 }

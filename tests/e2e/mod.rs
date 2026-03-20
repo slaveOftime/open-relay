@@ -19,13 +19,17 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread::sleep,
     time::{Duration, Instant},
 };
 
 // Global e2e serialiser
 pub static E2E_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_TMP_DIR: AtomicUsize = AtomicUsize::new(0);
 
 pub fn oly_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oly"))
@@ -50,8 +54,11 @@ fn socket_name_for_tmp(tmp_dir: &PathBuf) -> String {
 }
 
 pub fn make_tmp_dir(name: &str) -> PathBuf {
-    let dir = env::temp_dir().join(format!("oly_e2e_{name}"));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = env::temp_dir().join(format!(
+        "oly_e2e_{name}_{}_{}",
+        std::process::id(),
+        NEXT_TMP_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
@@ -257,12 +264,24 @@ pub fn send_key(tmp: &PathBuf, id: &str, key: &str) {
     );
 }
 
-pub fn fetch_logs(tmp: &PathBuf, id: &str) -> String {
+pub fn fetch_logs_with_tail(tmp: &PathBuf, id: &str, tail: usize) -> String {
+    let tail = tail.to_string();
     let output = oly_cmd(tmp)
-        .args(["logs", id, "--tail", "200", "--no-truncate"])
+        .args(["logs", id, "--tail", &tail, "--no-truncate"])
         .output()
         .expect("`oly logs` failed to execute");
     String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+pub fn fetch_logs(tmp: &PathBuf, id: &str) -> String {
+    fetch_logs_with_tail(tmp, id, 200)
+}
+
+pub fn normalize_log_text(log: &str) -> String {
+    log.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim_end_matches('\n')
+        .to_string()
 }
 
 pub fn wait_for_log(
@@ -275,6 +294,50 @@ pub fn wait_for_log(
     while Instant::now() < deadline {
         let log = fetch_logs(tmp, id);
         if predicate(&log) {
+            return Some(log);
+        }
+        sleep(Duration::from_millis(250));
+    }
+    None
+}
+
+pub fn wait_for_stable_log(tmp: &PathBuf, id: &str, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let mut previous_non_empty: Option<String> = None;
+    while Instant::now() < deadline {
+        let log = normalize_log_text(&fetch_logs(tmp, id));
+        if !log.trim().is_empty() {
+            if previous_non_empty.as_deref() == Some(log.as_str()) {
+                return Some(log);
+            }
+            previous_non_empty = Some(log);
+        }
+        sleep(Duration::from_millis(250));
+    }
+    None
+}
+
+pub fn wait_for_exact_log(
+    tmp: &PathBuf,
+    id: &str,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    wait_for_exact_log_with_tail(tmp, id, 200, expected, timeout)
+}
+
+pub fn wait_for_exact_log_with_tail(
+    tmp: &PathBuf,
+    id: &str,
+    tail: usize,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let expected = normalize_log_text(expected);
+    while Instant::now() < deadline {
+        let log = normalize_log_text(&fetch_logs_with_tail(tmp, id, tail));
+        if log == expected {
             return Some(log);
         }
         sleep(Duration::from_millis(250));

@@ -1,13 +1,13 @@
 use bytes::Bytes;
 use std::collections::VecDeque;
 
-/// A byte-limited ring buffer for raw PTY output chunks.
+/// A byte-limited ring buffer for canonical filtered PTY output chunks.
 ///
 /// Each chunk is stored with its absolute byte offset within the overall
 /// output stream.  When inserting a new chunk would exceed `capacity_bytes`,
 /// the oldest chunks are evicted first to make room.
 pub struct RingBuffer {
-    /// `(start_byte_offset_of_chunk, raw_bytes)` in insertion order.
+    /// `(start_byte_offset_of_chunk, filtered_bytes)` in insertion order.
     chunks: VecDeque<(u64, Bytes)>,
     /// Total bytes ever written — equals the end offset of the last chunk.
     total_bytes_written: u64,

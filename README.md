@@ -17,6 +17,7 @@ If this solves a real problem for you, give the repo a star so more people can f
 
 For a full repository architecture map, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 For the PTY/session internals specifically, see [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
+For edge cases, limitations, and operational notes, see [ARCHITECTURE_NOTES.md](./ARCHITECTURE_NOTES.md).
 
 ---
 
@@ -134,7 +135,7 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 | `oly start [--detach] [--disable-notifications] [--cwd DIR] <cmd>` | Launch session in PTY |
 | `oly ls` | Show sessions (supports search/status/time filters) |
 | `oly attach <id>` | Reattach (replays buffer first) |
-| `oly logs <id> [--tail N] [--wait-for-prompt]` | Read logs without attaching |
+| `oly logs <id> [--tail N] [--wait-for-prompt] [--timeout DURATION]` | Read logs without attaching |
 | `oly send <id> [CHUNK]...` | Send input without attaching |
 | `oly stop <id>` | Graceful stop |
 
@@ -153,3 +154,5 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 All session commands support `--node <name>` to target a connected secondary.
 
 Detach from an attached session: `Ctrl-]` then `d`.
+
+When using `oly logs --wait-for-prompt`, `--timeout` accepts plain milliseconds for compatibility or basic units like `250ms`, `10s`, `5m`, and `1h`. The default is `30s`, and `0` waits forever.

@@ -12,6 +12,7 @@ mod notification;
 mod protocol;
 mod session;
 mod storage;
+mod terminal_guards;
 mod utils;
 
 use clap::Parser;
@@ -19,6 +20,7 @@ use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand}
 use crossterm::terminal;
 use error::{AppError, Result};
 use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
+use std::path::{Path, PathBuf};
 
 use crate::config::AppConfig;
 
@@ -28,7 +30,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const OLY_START_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly-start/SKILL.md");
+const OLY_START_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly/SKILL.md");
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -69,6 +71,36 @@ fn node_wrap(node: Option<String>, req: RpcRequest) -> RpcRequest {
             inner: Box::new(req),
         },
     }
+}
+
+fn resolve_start_cwd(base_dir: &Path, cwd: Option<String>) -> Result<String> {
+    let resolved = match cwd {
+        Some(cwd) => {
+            let path = PathBuf::from(cwd);
+            if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            }
+        }
+        None => base_dir.to_path_buf(),
+    };
+
+    if !resolved.exists() {
+        return Err(AppError::Protocol(format!(
+            "working directory does not exist: {}",
+            resolved.display()
+        )));
+    }
+
+    if !resolved.is_dir() {
+        return Err(AppError::Protocol(format!(
+            "working directory is not a directory: {}",
+            resolved.display()
+        )));
+    }
+
+    Ok(resolved.to_string_lossy().into_owned())
 }
 
 /// Resolve a session ID: return the given ID or fetch the most recently created session.
@@ -162,11 +194,7 @@ async fn run() -> Result<()> {
             let mut iter = cmd_and_args.into_iter();
             let cmd = iter.next().unwrap(); // guaranteed by num_args = 1..
             let args: Vec<String> = iter.collect();
-            let cwd = cwd.or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|path| path.display().to_string())
-            });
+            let cwd = Some(resolve_start_cwd(&std::env::current_dir()?, cwd)?);
             let (rows, cols) = if detach {
                 (None, None)
             } else {
@@ -371,5 +399,51 @@ async fn run() -> Result<()> {
                 }
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_start_cwd;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("oly-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[test]
+    fn resolves_relative_cwd_against_current_dir() {
+        let base = unique_temp_dir("base");
+        let child = base.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        let resolved = resolve_start_cwd(&base, Some("child".to_string())).unwrap();
+
+        assert_eq!(resolved, child.to_string_lossy());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_cwd() {
+        let base = unique_temp_dir("missing-base");
+        fs::create_dir_all(&base).unwrap();
+        let missing = base.join("missing");
+
+        let err = resolve_start_cwd(&base, Some("missing".to_string())).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "protocol error: working directory does not exist: {}",
+                missing.display()
+            )
+        );
+        fs::remove_dir_all(base).unwrap();
     }
 }

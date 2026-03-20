@@ -1,7 +1,113 @@
 mod e2e;
 
 use e2e::*;
-use std::{fs, thread::sleep, time::Duration};
+use std::{fs, path::PathBuf, thread::sleep, time::Duration};
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.match_indices(needle).count()
+}
+
+fn trailing_prompt(log: &str) -> &str {
+    log.lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or(log)
+}
+
+fn plain_output<I, S>(lines: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    lines
+        .into_iter()
+        .map(|line| line.as_ref().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn wait_for_prompted_output<I, S>(
+    tmp: &PathBuf,
+    id: &str,
+    baseline: &str,
+    prompt: &str,
+    expected_lines: I,
+    timeout: Duration,
+) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let expected_lines = expected_lines
+        .into_iter()
+        .map(|line| line.as_ref().to_string())
+        .collect::<Vec<_>>();
+
+    wait_for_log(
+        tmp,
+        id,
+        |log| {
+            let log = normalize_log_text(log);
+            // Check that we're at the correct prompt
+            if trailing_prompt(&log) != prompt {
+                return false;
+            }
+
+            // Verify the log is longer than baseline (new content added)
+            if log.len() <= baseline.len() {
+                return false;
+            }
+
+            // Verify all expected lines are present in order
+            let mut search_from = 0usize;
+            for line in &expected_lines {
+                let Some(found_at) = log[search_from..].find(line) else {
+                    return false;
+                };
+                search_from += found_at + line.len();
+            }
+
+            true
+        },
+        timeout,
+    )
+    .map(|log| normalize_log_text(&log))
+}
+
+fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
+    if !program_exists("bash") {
+        eprintln!("SKIP {test_name}: bash not found on PATH");
+        return None;
+    }
+
+    let id = start_session(tmp, &["bash", "--noprofile", "--norc"]);
+    let baseline = wait_for_stable_log(tmp, &id, Duration::from_secs(5)).unwrap_or_else(|| {
+        panic!(
+            "bash did not reach a stable prompt within 5 s.\nLogs:\n{}",
+            fetch_logs(tmp, &id)
+        )
+    });
+    let prompt = trailing_prompt(&baseline).to_string();
+    let ready_marker = format!("oly_e2e_bash_ready_{test_name}");
+    let ready_command = format!("echo {ready_marker}");
+    send_line(tmp, &id, &ready_command);
+
+    let ready = wait_for_prompted_output(
+        tmp,
+        &id,
+        &baseline,
+        &prompt,
+        [ready_marker.as_str()],
+        Duration::from_secs(5),
+    );
+    assert!(
+        ready.is_some(),
+        "bash did not echo readiness marker '{ready_marker}'.\nLogs:\n{}",
+        fetch_logs(tmp, &id)
+    );
+
+    Some(id)
+}
 
 #[test]
 fn e2e_native_shell_echo_marker_appears_in_logs() {
@@ -16,24 +122,21 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
 
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(3),
-    );
-    assert!(
-        initial.is_some(),
-        "shell produced no output within 3 s; session = {id}"
-    );
+    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3)).unwrap_or_else(|| {
+        panic!("shell did not reach a stable prompt within 3 s; session = {id}")
+    });
+    let prompt = trailing_prompt(&initial).to_string();
 
     const MARKER: &str = "oly_e2e_native_echo_marker";
-    send_line(&tmp, &id, &format!("echo {MARKER}"));
+    let command = format!("echo {MARKER}");
+    send_line(&tmp, &id, &command);
 
-    let result = wait_for_log(
+    let result = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| log.contains(MARKER),
+        &initial,
+        &prompt,
+        [MARKER],
         Duration::from_secs(3),
     );
     assert!(
@@ -56,23 +159,22 @@ fn e2e_two_separate_input_calls_execute_command() {
 
     let id = start_session(&tmp, shell);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(3),
-    )
-    .expect("shell produced no output within 3 s");
+    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("shell did not reach a stable prompt within 3 s");
+    let prompt = trailing_prompt(&initial).to_string();
 
     const MARKER: &str = "oly_e2e_two_inputs_marker";
-    send_text_only(&tmp, &id, &format!("echo {MARKER}"));
+    let command = format!("echo {MARKER}");
+    send_text_only(&tmp, &id, &command);
     sleep(Duration::from_millis(100));
     send_key(&tmp, &id, "enter");
 
-    let result = wait_for_log(
+    let result = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| log.contains(MARKER),
+        &initial,
+        &prompt,
+        [MARKER],
         Duration::from_secs(3),
     );
     assert!(
@@ -95,43 +197,119 @@ fn e2e_multiple_commands_appear_in_order() {
 
     let id = start_session(&tmp, shell);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(3),
-    )
-    .expect("shell produced no output within 3 s");
+    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("shell did not reach a stable prompt within 3 s");
+    let prompt = trailing_prompt(&initial).to_string();
 
     send_line(&tmp, &id, "echo oly_e2e_order_first");
     send_line(&tmp, &id, "echo oly_e2e_order_second");
     send_line(&tmp, &id, "echo oly_e2e_order_third");
 
-    let result = wait_for_log(
+    let result = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| log.contains("oly_e2e_order_third"),
+        &initial,
+        &prompt,
+        ["oly_e2e_order_first", "oly_e2e_order_second", "oly_e2e_order_third"],
         Duration::from_secs(3),
     );
     assert!(
         result.is_some(),
-        "third marker not found in logs.\nLogs:\n{}",
+        "command transcript did not match exact expected output.\nLogs:\n{}",
         fetch_logs(&tmp, &id)
     );
+}
 
-    let log = fetch_logs(&tmp, &id);
-    let pos_first = log.find("oly_e2e_order_first");
-    let pos_second = log.find("oly_e2e_order_second");
-    let pos_third = log.find("oly_e2e_order_third");
+#[test]
+fn e2e_bash_repeated_send_echo_commands_accumulate_in_logs() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_bash_repeated_echo");
+    let _daemon = start_daemon(&tmp);
 
-    assert!(
-        pos_first.is_some() && pos_second.is_some() && pos_third.is_some(),
-        "one or more markers missing.\nLogs:\n{log}"
-    );
-    assert!(
-        pos_first.unwrap() < pos_second.unwrap() && pos_second.unwrap() < pos_third.unwrap(),
-        "markers appeared out of order.\nLogs:\n{log}"
-    );
+    let Some(id) = start_bash_session(
+        &tmp,
+        "e2e_bash_repeated_send_echo_commands_accumulate_in_logs",
+    ) else {
+        return;
+    };
+
+    let mut baseline = wait_for_stable_log(&tmp, &id, Duration::from_secs(5))
+        .expect("bash did not return to a stable prompt after readiness check");
+    let mut expected_markers = Vec::new();
+    for round in 1..=4 {
+        let marker = format!("oly_e2e_bash_echo_round_{round}");
+        let command = format!("echo {marker}");
+        let prompt = trailing_prompt(&baseline).to_string();
+        send_line(&tmp, &id, &command);
+        expected_markers.push(marker);
+
+        baseline = wait_for_prompted_output(
+            &tmp,
+            &id,
+            &baseline,
+            &prompt,
+            [expected_markers.last().expect("marker just pushed").as_str()],
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "repeated echo transcript did not match exact expected output after round {round}.\nLogs:\n{}",
+                fetch_logs(&tmp, &id)
+            )
+        });
+    }
+}
+
+#[test]
+fn e2e_bash_repeated_loop_scripts_appear_fully_in_logs() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_bash_repeated_loops");
+    let _daemon = start_daemon(&tmp);
+
+    let Some(id) = start_bash_session(&tmp, "e2e_bash_repeated_loop_scripts_appear_fully_in_logs")
+    else {
+        return;
+    };
+
+    let mut baseline = wait_for_stable_log(&tmp, &id, Duration::from_secs(5))
+        .expect("bash did not return to a stable prompt after readiness check");
+    let mut expected_markers = Vec::new();
+    for round in 1..=3 {
+        let script = format!("for i in 1 2 3 4; do echo oly_e2e_bash_loop_r{round}_i$i; done");
+        let prompt = trailing_prompt(&baseline).to_string();
+        let round_markers: Vec<String> = (1..=4)
+            .map(|item| format!("oly_e2e_bash_loop_r{round}_i{item}"))
+            .collect();
+        for item in 1..=4 {
+            expected_markers.push(format!("oly_e2e_bash_loop_r{round}_i{item}"));
+        }
+
+        send_line(&tmp, &id, &script);
+
+        baseline = wait_for_prompted_output(
+            &tmp,
+            &id,
+            &baseline,
+            &prompt,
+            round_markers.iter().map(String::as_str),
+            Duration::from_secs(5),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "loop transcript did not match exact expected output after round {round}.\nLogs:\n{}",
+                fetch_logs(&tmp, &id)
+            )
+        });
+    }
+
+    let final_log = fetch_logs(&tmp, &id);
+    for marker in &expected_markers {
+        assert_eq!(
+            count_occurrences(&final_log, marker),
+            1,
+            "expected loop marker {marker:?} exactly once in logs.\nLogs:\n{final_log}"
+        );
+    }
 }
 
 #[test]
@@ -147,24 +325,21 @@ fn e2e_powershell_write_host_marker_appears_in_logs() {
 
     let id = start_session(&tmp, &["pwsh", "-NoLogo", "-NoProfile"]);
 
-    let initial = wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(15),
-    );
-    assert!(
-        initial.is_some(),
-        "pwsh produced no output within 15 s; session = {id}"
-    );
+    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(15)).unwrap_or_else(|| {
+        panic!("pwsh did not reach a stable prompt within 15 s; session = {id}")
+    });
+    let prompt = trailing_prompt(&initial).to_string();
 
     const MARKER: &str = "oly_e2e_pwsh_write_host_marker";
-    send_line(&tmp, &id, &format!("Write-Host {MARKER}"));
+    let command = format!("Write-Host {MARKER}");
+    send_line(&tmp, &id, &command);
 
-    let result = wait_for_log(
+    let result = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| log.contains(MARKER),
+        &initial,
+        &prompt,
+        [MARKER],
         Duration::from_secs(15),
     );
     assert!(
@@ -183,27 +358,23 @@ fn e2e_ctrl_c_interrupts_sleep_and_returns_prompt() {
 
     let id = start_session(&tmp, &["sh"]);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(3),
-    )
-    .expect("sh produced no output within 3 s");
+    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("sh did not reach a stable prompt within 3 s");
+    let prompt = trailing_prompt(&initial).to_string();
+    let command = "sleep 60";
 
-    send_line(&tmp, &id, "sleep 60");
-    sleep(Duration::from_millis(400));
+    send_line(&tmp, &id, command);
+    // Just wait for the command to be echoed
+    sleep(Duration::from_millis(500));
     send_key(&tmp, &id, "ctrl+c");
 
-    let recovered = wait_for_log(
+    // Check that we recovered to a prompt
+    let recovered = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| {
-            log.matches('$').count() >= 2
-                || log.contains("^C")
-                || log.contains("Interrupt")
-                || log.contains("interrupt")
-        },
+        &initial,
+        &prompt,
+        Vec::<&str>::new(),
         Duration::from_secs(3),
     );
     assert!(
@@ -222,13 +393,8 @@ fn e2e_special_keys_reach_pty_without_error() {
 
     let id = start_session(&tmp, &["sh"]);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(3),
-    )
-    .expect("sh produced no output within 3 s");
+    wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("sh did not reach a stable prompt within 3 s");
 
     for key in &["shift+tab", "up", "down", "left", "right", "home", "end"] {
         let key_chunk = format!("key:{key}");
@@ -243,13 +409,21 @@ fn e2e_special_keys_reach_pty_without_error() {
         );
     }
 
-    const MARKER: &str = "oly_e2e_special_keys_alive";
-    send_line(&tmp, &id, &format!("echo {MARKER}"));
+    send_key(&tmp, &id, "ctrl+c");
+    let recovered = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("session did not return to a stable prompt after special-key inputs");
+    let prompt = trailing_prompt(&recovered).to_string();
 
-    let result = wait_for_log(
+    const MARKER: &str = "oly_e2e_special_keys_alive";
+    let command = format!("echo {MARKER}");
+    send_line(&tmp, &id, &command);
+
+    let result = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| log.contains(MARKER),
+        &recovered,
+        &prompt,
+        [MARKER],
         Duration::from_secs(3),
     );
     assert!(
@@ -273,12 +447,8 @@ fn e2e_logs_available_after_session_exits() {
     let id = start_session(&tmp, cmd);
 
     const MARKER: &str = "oly_e2e_exit_output_marker";
-    let result = wait_for_log(
-        &tmp,
-        &id,
-        |log| log.contains(MARKER),
-        Duration::from_secs(3),
-    );
+    let expected = plain_output([MARKER]);
+    let result = wait_for_exact_log(&tmp, &id, &expected, Duration::from_secs(3));
     assert!(
         result.is_some(),
         "marker '{MARKER}' not found after session exit.\nLogs:\n{}",
@@ -341,12 +511,8 @@ fn e2e_attach_completed_session_succeeds_with_piped_stdio_cross_platform() {
 
     let id = start_session(&tmp, cmd);
 
-    let logged = wait_for_log(
-        &tmp,
-        &id,
-        |log| log.contains(MARKER),
-        Duration::from_secs(3),
-    );
+    let expected = plain_output([MARKER]);
+    let logged = wait_for_exact_log(&tmp, &id, &expected, Duration::from_secs(3));
     assert!(
         logged.is_some(),
         "completed session marker '{MARKER}' not found in logs.\nLogs:\n{}",
@@ -389,26 +555,22 @@ fn e2e_logs_contain_no_escape_artifacts() {
 
     let id = start_session(&tmp, shell);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| !log.trim().is_empty(),
-        Duration::from_secs(3),
-    )
-    .expect("shell produced no output within 3 s");
+    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+        .expect("shell did not reach a stable prompt within 3 s");
+    let prompt = trailing_prompt(&initial).to_string();
 
     send_line(&tmp, &id, "echo ARTIFACT_CHECK_1");
     send_line(&tmp, &id, "echo ARTIFACT_CHECK_2");
 
-    wait_for_log(
+    let log = wait_for_prompted_output(
         &tmp,
         &id,
-        |log| log.contains("ARTIFACT_CHECK_2"),
+        &initial,
+        &prompt,
+        ["ARTIFACT_CHECK_1", "ARTIFACT_CHECK_2"],
         Duration::from_secs(3),
     )
-    .expect("second marker not found in logs");
-
-    let log = fetch_logs(&tmp, &id);
+    .expect("echo transcript did not match exact expected output");
     let has_cpr_response =
         log.contains(";1R") || log.contains(";80R") || log.contains("\x1b[") && log.contains("R");
     let has_dsr_query = log.contains("[6n") || log.contains("[5n");
@@ -437,15 +599,12 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     let id1 = start_session(&tmp, shell);
     let id2 = start_session(&tmp, shell);
 
-    for id in [&id1, &id2] {
-        wait_for_log(
-            &tmp,
-            id,
-            |log| !log.trim().is_empty(),
-            Duration::from_secs(3),
-        )
-        .unwrap_or_else(|| panic!("session {id} produced no output within 3 s"));
-    }
+    let initial1 = wait_for_stable_log(&tmp, &id1, Duration::from_secs(3))
+        .unwrap_or_else(|| panic!("session {id1} did not reach a stable prompt within 3 s"));
+    let initial2 = wait_for_stable_log(&tmp, &id2, Duration::from_secs(3))
+        .unwrap_or_else(|| panic!("session {id2} did not reach a stable prompt within 3 s"));
+    let prompt1 = trailing_prompt(&initial1).to_string();
+    let prompt2 = trailing_prompt(&initial2).to_string();
 
     const MARKER_1: &str = "oly_e2e_session_alpha";
     const MARKER_2: &str = "oly_e2e_session_beta";
@@ -453,24 +612,25 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     send_line(&tmp, &id1, &format!("echo {MARKER_1}"));
     send_line(&tmp, &id2, &format!("echo {MARKER_2}"));
 
-    wait_for_log(
+    let log1 = wait_for_prompted_output(
         &tmp,
         &id1,
-        |log| log.contains(MARKER_1),
+        &initial1,
+        &prompt1,
+        [MARKER_1],
         Duration::from_secs(3),
     )
-    .expect("marker 1 not found in session 1 logs");
+    .expect("session 1 transcript did not match exact expected output");
 
-    wait_for_log(
+    let log2 = wait_for_prompted_output(
         &tmp,
         &id2,
-        |log| log.contains(MARKER_2),
+        &initial2,
+        &prompt2,
+        [MARKER_2],
         Duration::from_secs(3),
     )
-    .expect("marker 2 not found in session 2 logs");
-
-    let log1 = fetch_logs(&tmp, &id1);
-    let log2 = fetch_logs(&tmp, &id2);
+    .expect("session 2 transcript did not match exact expected output");
 
     assert!(
         !log1.contains(MARKER_2),
@@ -499,26 +659,22 @@ fn e2e_high_bandwidth_output_logs_intact() {
 
     let id = start_session(&tmp, cmd);
 
-    let result = wait_for_log(
-        &tmp,
-        &id,
-        |log| log.contains("LINE_500"),
-        Duration::from_secs(10),
-    );
+    let expected = plain_output((1..=500).map(|i| format!("LINE_{i}")));
+    let result = wait_for_exact_log_with_tail(&tmp, &id, 600, &expected, Duration::from_secs(10));
     assert!(
         result.is_some(),
-        "LINE_500 not found — high-bandwidth output may have been lost.\nLogs (tail):\n{}",
-        fetch_logs(&tmp, &id)
+        "high-bandwidth output did not match the exact expected transcript.\nLogs (tail):\n{}",
+        fetch_logs_with_tail(&tmp, &id, 600)
     );
 
     let full_log = oly_cmd(&tmp)
         .args(["logs", &id, "--tail", "600", "--no-truncate"])
         .output()
         .expect("`oly logs --tail 600` failed");
-    let full_text = String::from_utf8_lossy(&full_log.stdout);
-    assert!(
-        full_text.contains("LINE_1"),
-        "LINE_1 not found with --tail 600 — early output may have been dropped.\nLogs:\n{full_text}"
+    let full_text = normalize_log_text(&String::from_utf8_lossy(&full_log.stdout));
+    assert_eq!(
+        full_text, expected,
+        "high-bandwidth --tail 600 output did not match the exact expected transcript.\nLogs:\n{full_text}"
     );
 }
 
@@ -539,18 +695,17 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
 
     let id = start_session(&tmp, cmd);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| log.contains("COLOR_TEST"),
-        Duration::from_secs(5),
-    )
-    .expect("COLOR_TEST not found in logs");
+    #[cfg(target_os = "windows")]
+    let expected_plain = plain_output(["Write-Host 'COLOR_TEST' -ForegroundColor Red"]);
+    #[cfg(not(target_os = "windows"))]
+    let expected_plain = plain_output(["COLOR_TEST"]);
+    wait_for_exact_log(&tmp, &id, &expected_plain, Duration::from_secs(5))
+        .expect("plain logs did not match exact expected color-stripped output");
 
-    let plain = fetch_logs(&tmp, &id);
-    assert!(
-        plain.contains("COLOR_TEST"),
-        "plain logs should contain text.\nLogs:\n{plain}"
+    let plain = normalize_log_text(&fetch_logs(&tmp, &id));
+    assert_eq!(
+        plain, expected_plain,
+        "plain logs should match the exact expected color-stripped output.\nLogs:\n{plain}"
     );
 
     let colored = oly_cmd(&tmp)
@@ -636,20 +791,16 @@ fn e2e_stopped_session_logs_persist_on_disk() {
 
     let id = start_session(&tmp, cmd);
 
-    wait_for_log(
-        &tmp,
-        &id,
-        |log| log.contains("PERSIST_CHECK_MARKER"),
-        Duration::from_secs(3),
-    )
-    .expect("marker not found before eviction");
+    let expected = plain_output(["PERSIST_CHECK_MARKER"]);
+    wait_for_exact_log(&tmp, &id, &expected, Duration::from_secs(3))
+        .expect("persisted session logs did not match the exact expected output before eviction");
 
     sleep(Duration::from_secs(3));
 
-    let log = fetch_logs(&tmp, &id);
-    assert!(
-        log.contains("PERSIST_CHECK_MARKER"),
-        "logs should persist on disk after session eviction.\nLogs:\n{log}"
+    let log = normalize_log_text(&fetch_logs(&tmp, &id));
+    assert_eq!(
+        log, expected,
+        "logs should persist on disk after session eviction with the exact original output.\nLogs:\n{log}"
     );
 }
 

@@ -91,13 +91,15 @@ export interface NodeSummary {
 }
 
 export interface LogsResponse {
-  lines: string[]
-  offset: number
-  next_offset: number
+  chunks: string[]
   total: number
-  has_more: boolean
-  limit: number
-  running: boolean
+  resizes: LogResizeEvent[]
+}
+
+export interface LogResizeEvent {
+  offset: number
+  rows: number
+  cols: number
 }
 
 export interface ListPage<T> {

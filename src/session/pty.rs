@@ -105,6 +105,10 @@ impl PtyHandle {
 
 pub enum RuntimeChild {
     Pty(Box<dyn portable_pty::Child + Send + Sync>),
+    #[cfg(test)]
+    Mock {
+        exit_code: Option<i32>,
+    },
 }
 
 impl RuntimeChild {
@@ -112,6 +116,8 @@ impl RuntimeChild {
     pub fn process_id(&self) -> Option<u32> {
         match self {
             Self::Pty(child) => child.process_id(),
+            #[cfg(test)]
+            Self::Mock { .. } => None,
         }
     }
 
@@ -119,6 +125,13 @@ impl RuntimeChild {
     pub fn kill(&mut self) -> std::io::Result<()> {
         match self {
             Self::Pty(child) => child.kill(),
+            #[cfg(test)]
+            Self::Mock { exit_code } => {
+                if exit_code.is_none() {
+                    *exit_code = Some(1);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -128,6 +141,8 @@ impl RuntimeChild {
             Self::Pty(child) => child
                 .try_wait()
                 .map(|opt| opt.map(|status| status.exit_code() as i32)),
+            #[cfg(test)]
+            Self::Mock { exit_code } => Ok(*exit_code),
         }
     }
 }
@@ -436,9 +451,11 @@ fn xterm_color_to_rgb(index: u8) -> (u8, u8, u8) {
 // ---------------------------------------------------------------------------
 
 /// Strips Cursor Position Report and Device Status Report responses, plus
-/// Operating System Command color responses, from pseudo-terminal output
-/// before display. Carries incomplete sequences across chunk boundaries so
-/// Windows ConPTY split-escape cases are handled correctly.
+/// most generic Operating System Command traffic, from pseudo-terminal output
+/// before display. A small OSC passthrough allowlist is applied so selected
+/// one-way notifications can still reach attached terminals. Carries
+/// incomplete query/response sequences across chunk boundaries so Windows
+/// ConPTY split-escape cases are handled correctly.
 ///
 /// All regex state is static (shared); only the cross-chunk `pending` prefix
 /// is per-instance.
@@ -514,13 +531,42 @@ pub fn extract_query_responses_no_client(
         else {
             break;
         };
-        let response_cursor = match query {
-            TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => Some(cursor),
-            _ => None,
-        };
-        for response in terminal_query_response(query, response_cursor) {
-            responses.push(response.into_bytes());
+
+        // Only respond to queries that require daemon-side answers in detached mode:
+        // - CursorPositionReport (CPR): needed for layout positioning
+        // - DeviceStatusReport (DSR): needed for status checks
+        // - ForegroundColor/BackgroundColor (OSC 10/11): needed for theme detection
+        //
+        // Do NOT respond to:
+        // - PrimaryDeviceAttributes (DA1)
+        // - SecondaryDeviceAttributes (DA2)
+        // - XtVersion (XTVERSION)
+        // - DecPrivateModeReport (DECRPM)
+        // - KittyKeyboard
+        //
+        // These should only be answered by a real terminal or interactive client.
+        // Answering them in detached mode can cause interference with user input
+        // and corrupt the output stream.
+        let should_respond = matches!(
+            query,
+            TerminalQuery::CursorPositionReport
+                | TerminalQuery::DeviceStatusReport
+                | TerminalQuery::ForegroundColor
+                | TerminalQuery::BackgroundColor
+        );
+
+        if should_respond {
+            let response_cursor = match query {
+                TerminalQuery::CursorPositionReport | TerminalQuery::DeviceStatusReport => {
+                    Some(cursor)
+                }
+                _ => None,
+            };
+            for response in terminal_query_response(query, response_cursor) {
+                responses.push(response.into_bytes());
+            }
         }
+
         search_from = match_start + query_len;
     }
 
@@ -548,8 +594,9 @@ pub fn extract_query_responses_no_client(
 
 /// Filter one pseudo-terminal chunk and strip synthetic terminal-response
 /// traffic such as Cursor Position Report replies, Device Status Report
-/// replies, Operating System Command color replies, and terminal-capability
-/// queries that would make the local terminal answer on its own.
+/// replies, Operating System Command color replies, disallowed generic OSC
+/// sequences, and terminal-capability queries that would make the local
+/// terminal answer on its own.
 ///
 /// Windows ConPTY can echo device and color responses into the master output
 /// stream. The sequence is frequently split across read boundaries at any
@@ -658,8 +705,8 @@ fn filter_cpr_chunk_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
     let combined = dsr_query_bare_re.replace_all(&combined, b"" as &[u8]);
     let combined = osc_full_re.replace_all(&combined, b"" as &[u8]);
     let combined = osc_bare_re.replace_all(&combined, b"" as &[u8]);
-    let combined = generic_osc_full_re.replace_all(&combined, b"" as &[u8]);
-    let combined = generic_osc_bare_re.replace_all(&combined, b"" as &[u8]);
+    let combined = filter_generic_osc_with_allowlist(&combined, generic_osc_full_re, true);
+    let combined = filter_generic_osc_with_allowlist(&combined, generic_osc_bare_re, false);
     let combined = private_dsr_query_re_bytes().replace_all(&combined, b"" as &[u8]);
     let combined = decrpm_query_re_bytes().replace_all(&combined, b"" as &[u8]);
     let combined = xtversion_query_re_bytes().replace_all(&combined, b"" as &[u8]);
@@ -837,6 +884,54 @@ fn is_partial_generic_osc_sequence_bytes(candidate: &[u8]) -> bool {
     true
 }
 
+fn filter_generic_osc_with_allowlist(
+    text: &[u8],
+    regex: &regex::bytes::Regex,
+    escaped_prefix: bool,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut last_end = 0usize;
+
+    for mat in regex.find_iter(text) {
+        out.extend_from_slice(&text[last_end..mat.start()]);
+        let sequence = mat.as_bytes();
+        if allow_passthrough_generic_osc(sequence, escaped_prefix) {
+            out.extend_from_slice(sequence);
+        }
+        last_end = mat.end();
+    }
+
+    out.extend_from_slice(&text[last_end..]);
+    out
+}
+
+fn allow_passthrough_generic_osc(sequence: &[u8], escaped_prefix: bool) -> bool {
+    let mut index = if escaped_prefix { 2 } else { 1 };
+    let digits_start = index;
+    while let Some(&byte) = sequence.get(index) {
+        if byte.is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let ps = &sequence[digits_start..index];
+    if sequence.get(index) != Some(&b';') {
+        return false;
+    }
+    let payload = &sequence[index + 1..];
+
+    // OSC 0/1/2: icon/window title notifications.
+    // 0 => icon + window title, 1 => icon title, 2 => window title.
+    // These are one-way notifications and safe to pass through.
+    //
+    // OSC 9;4;...: progress/busy notifications used by terminals that
+    // implement this convention. This is also one-way and safe to pass
+    // through to attached clients.
+    matches!(ps, b"0" | b"1" | b"2") || (ps == b"9" && payload.starts_with(b"4;"))
+}
+
 /// Find the last occurrence of `needle` inside `haystack`.
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -913,18 +1008,14 @@ pub(crate) fn has_visible_content(data: &[u8]) -> bool {
     false
 }
 
-/// Filter terminal-response traffic from replay chunks and concatenate the
-/// cleaned bytes into one buffer for attach initialization.
+/// Concatenate replay chunks into a single byte buffer.
 ///
-/// This is used by both the inter-process communication and WebSocket attach
-/// handlers.
-pub fn collect_filtered_chunks(
-    chunks: &[(u64, bytes::Bytes)],
-    filter: &mut EscapeFilter,
-) -> Vec<u8> {
+/// Replay chunks already reflect the canonical filtered stream retained by the
+/// runtime, so stream consumers do not need an additional filter pass here.
+pub fn collect_chunk_bytes(chunks: &[(u64, bytes::Bytes)]) -> Vec<u8> {
     let mut filtered = Vec::with_capacity(chunks.iter().map(|(_, chunk)| chunk.len()).sum());
     for (_, chunk) in chunks {
-        filtered.extend(filter.filter(chunk));
+        filtered.extend_from_slice(chunk);
     }
     filtered
 }
@@ -1064,7 +1155,38 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_cpr_chunk_strips_generic_osc_sequences() {
+    fn test_filter_cpr_chunk_preserves_title_osc_sequences() {
+        let mut pending = Vec::new();
+        let text = "before\x1b]0;relay build\x07after";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_preserves_busy_osc_sequences() {
+        let mut pending = Vec::new();
+        let text = "before\x1b]9;4;1;0\x07after";
+        assert_eq!(filter_text_chunk(&mut pending, text), text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_preserves_split_title_osc_sequence() {
+        let mut pending = Vec::new();
+        let text1 = "before\x1b]0;relay";
+        assert_eq!(filter_text_chunk(&mut pending, text1), "before");
+        assert_eq!(pending_text(&pending), "\x1b]0;relay");
+
+        let text2 = " busy\x07after";
+        assert_eq!(
+            filter_text_chunk(&mut pending, text2),
+            "\x1b]0;relay busy\x07after"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_strips_disallowed_generic_osc_sequences() {
         let mut pending = Vec::new();
         let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug\x07after";
         assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
@@ -1072,14 +1194,18 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_cpr_chunk_keeps_partial_generic_osc_sequence_pending() {
+    fn test_filter_cpr_chunk_strips_split_disallowed_generic_osc_sequence() {
         let mut pending = Vec::new();
-        let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug";
-        assert_eq!(filter_text_chunk(&mut pending, text), "before");
+        let text1 = "before\x1b]7;file://host/home/binwen/open-relay/target/debug";
+        assert_eq!(filter_text_chunk(&mut pending, text1), "before");
         assert_eq!(
             pending_text(&pending),
             "\x1b]7;file://host/home/binwen/open-relay/target/debug"
         );
+
+        let text2 = "\x07after";
+        assert_eq!(filter_text_chunk(&mut pending, text2), "after");
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -1235,44 +1361,34 @@ mod tests {
 
     #[test]
     fn test_extract_query_answers_device_attributes_and_xtversion() {
+        // DA1, DA2, and XTVERSION queries should NOT be answered in detached mode
+        // as they can interfere with user input and corrupt output
         let mut tail = Vec::new();
         let data = b"\x1b[c\x1b[>c\x1b[>0q";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
-        assert_eq!(responses.len(), 3);
-        assert_eq!(responses[0], b"\x1b[?62;c");
-        assert_eq!(responses[1], b"\x1b[>1;0;0c");
-        assert_eq!(
-            responses[2],
-            format!(
-                "\x1bP>|{} {}\x1b\\",
-                env!("CARGO_PKG_NAME"),
-                env!("CARGO_PKG_VERSION")
-            )
-            .into_bytes()
-        );
+        assert_eq!(responses.len(), 0);
     }
 
     #[test]
     fn test_extract_query_answers_split_da2_query() {
+        // DA2 queries should NOT be answered in detached mode
         let mut tail = Vec::new();
         let responses1 = extract_query_responses_no_client(b"hello\x1b[>", &mut tail, (1, 1));
         assert!(responses1.is_empty());
         assert_eq!(tail, b"\x1b[>");
 
         let responses2 = extract_query_responses_no_client(b"cworld", &mut tail, (1, 1));
-        assert_eq!(responses2, vec![b"\x1b[>1;0;0c".to_vec()]);
+        assert!(responses2.is_empty());
         assert!(tail.is_empty());
     }
 
     #[test]
     fn test_extract_query_answers_decrpm_and_kitty_keyboard_queries() {
+        // DECRPM and Kitty keyboard queries should NOT be answered in detached mode
         let mut tail = Vec::new();
         let data = b"\x1b[?2004$p\x1b[?u";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
-        assert_eq!(
-            responses,
-            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?0u".to_vec()]
-        );
+        assert!(responses.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1406,13 +1522,11 @@ mod tests {
 
     #[test]
     fn test_extract_query_multi_mode_decrpm() {
+        // DECRPM queries should NOT be answered in detached mode
         let mut tail = Vec::new();
         let data = b"\x1b[?2004;1016$p";
         let responses = extract_query_responses_no_client(data, &mut tail, (1, 1));
-        assert_eq!(
-            responses,
-            vec![b"\x1b[?2004;2$y".to_vec(), b"\x1b[?1016;2$y".to_vec(),]
-        );
+        assert!(responses.is_empty());
     }
 
     #[test]
@@ -1429,14 +1543,13 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_filtered_chunks_strips_across_chunks() {
+    fn test_collect_chunk_bytes_concatenates_chunks() {
         let chunks: Vec<(u64, bytes::Bytes)> = vec![
             (0, bytes::Bytes::from_static(b"hello\x1b[")),
             (1, bytes::Bytes::from_static(b"6nworld")),
         ];
-        let mut filter = EscapeFilter::new();
-        let result = collect_filtered_chunks(&chunks, &mut filter);
-        assert_eq!(result, b"helloworld");
+        let result = collect_chunk_bytes(&chunks);
+        assert_eq!(result, b"hello\x1b[6nworld");
     }
 
     #[test]

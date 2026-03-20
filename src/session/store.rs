@@ -406,9 +406,10 @@ impl SessionStore {
         }
     }
 
-    /// Initialise an attach subscription: return the ring content since
-    /// `from_byte_offset` (or all content if `None`), the current end offset,
-    /// a live broadcast receiver, and the current terminal mode flags.
+    /// Initialise a streaming subscription: return the canonical filtered ring
+    /// content since `from_byte_offset` (or all content if `None`), the current
+    /// filtered-stream end offset, a live broadcast receiver, and the current
+    /// terminal mode flags.
     pub async fn attach_subscribe_init(
         &self,
         id: &str,
@@ -818,44 +819,6 @@ impl SessionStore {
         results.into_iter().all(|stopped| stopped)
     }
 
-    pub async fn logs_snapshot(&self, id: &str, tail: usize) -> Option<(Vec<String>, u64, bool)> {
-        let sessions = self.sessions.load();
-        let runtime = sessions.get(id)?.clone();
-        // Extract ring data under the lock, then release before heavy processing
-        // to avoid blocking the PTY reader thread.
-        let (chunks, cursor) = {
-            let rt = runtime.runtime.lock().ok()?;
-            let chunks: Vec<Bytes> = rt.ring.all_chunks().cloned().collect();
-            let cursor = rt.ring.end_offset();
-            (chunks, cursor)
-        };
-        let running = runtime.snapshot().running;
-        let mut filter = crate::session::pty::EscapeFilter::new();
-        let all_bytes: Vec<u8> = chunks.iter().flat_map(|b| filter.filter(b)).collect();
-        let text = String::from_utf8_lossy(&all_bytes);
-        let all_lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
-        let skip = all_lines.len().saturating_sub(tail);
-        let lines: Vec<String> = all_lines.into_iter().skip(skip).collect();
-        Some((lines, cursor, running))
-    }
-
-    pub async fn logs_poll(&self, id: &str, cursor: u64) -> Option<(Vec<String>, u64, bool)> {
-        let sessions = self.sessions.load();
-        let runtime = sessions.get(id)?.clone();
-        // Extract ring data under the lock, then release before filtering
-        // to avoid blocking the PTY reader thread.
-        let (chunks, end_offset) = {
-            let rt = runtime.runtime.lock().ok()?;
-            rt.ring.read_from(cursor)
-        };
-        let running = runtime.snapshot().running;
-        let mut filter = crate::session::pty::EscapeFilter::new();
-        let raw: Vec<u8> = chunks.iter().flat_map(|(_, b)| filter.filter(b)).collect();
-        let text = String::from_utf8_lossy(&raw);
-        let lines: Vec<String> = text.lines().map(|l| format!("{l}\n")).collect();
-        Some((lines, end_offset, running))
-    }
-
     async fn lookup_runtime(
         &self,
         id: &str,
@@ -1114,6 +1077,7 @@ mod tests {
                 pty_master: Some(pty_master),
             },
             pty_size: None,
+            resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
@@ -1508,6 +1472,7 @@ mod tests {
                 pty_master: Some(pty_master),
             },
             pty_size: None,
+            resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,

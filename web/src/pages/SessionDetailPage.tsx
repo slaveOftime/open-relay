@@ -3,6 +3,15 @@ import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import type { SessionSummary } from '@/api/types'
 import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from '@/api/client'
 import { formatAge } from '@/utils/format'
+import {
+  appendLogChunks,
+  encodeLogChunks,
+  initialLogReplayState,
+  playNextBatch,
+  replayLogChunks,
+  seekLogChunks,
+  type LogReplayState,
+} from '@/utils/logReplay'
 import StatusBadge from '@/components/StatusBadge'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
@@ -15,13 +24,13 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+// import {
+//   Select,
+//   SelectContent,
+//   SelectItem,
+//   SelectTrigger,
+//   SelectValue,
+// } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
@@ -122,7 +131,6 @@ export default function SessionDetailPage() {
   const node = searchParams.get('node')
 
   const [session, setSession] = useState<SessionSummary | null>(null)
-  const [logLines, setLogLines] = useState<string[]>([])
   const [replayIdx, setReplayIdx] = useState(0)
   const [scrubberMax, setScrubberMax] = useState(0)
   const [wsConnected, setWsConnected] = useState(false)
@@ -136,8 +144,8 @@ export default function SessionDetailPage() {
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
-  const [replaySpeed, setReplaySpeed] = useState(1)
-  const [totalLines, setTotalLines] = useState(0)
+  const [replaySpeed, _] = useState(0.5)
+  const [totalChunks, setTotalChunks] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
   const [isOnline, setIsOnline] = useState(
     typeof navigator === 'undefined' ? true : navigator.onLine
@@ -148,13 +156,15 @@ export default function SessionDetailPage() {
   const wsConnectedRef = useRef(false)
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
-  const replayRafRef = useRef<number | null>(null)
-  const logLinesRef = useRef<string[]>([])
-  const replaySpeedRef = useRef(1)
+  const replayTimerRef = useRef<number | null>(null)
+  const logChunksRef = useRef<Uint8Array[]>([])
+  const replaySpeedRef = useRef(0.5)
   const isPausedRef = useRef(false)
   const isRunningRef = useRef(false)
   const isReplayingRef = useRef(false)
-  const totalLinesRef = useRef(0)
+  const totalChunksRef = useRef(0)
+  const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
+  const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
   const nextOffsetRef = useRef(0)
   const isFetchingMoreRef = useRef(false)
   const termContainerRef = useRef<HTMLDivElement>(null)
@@ -172,6 +182,8 @@ export default function SessionDetailPage() {
   const lastSentResizeRef = useRef<{ cols: number; rows: number } | null>(null)
   const lastReconnectTriggerAtRef = useRef(0)
   const lastWsFrameAtRef = useRef(0)
+  const replayUiLastCommitAtRef = useRef(0)
+  const replayCommittedIdxRef = useRef(0)
 
   const flushTerminalOutput = useCallback(() => {
     outputFlushRafRef.current = null
@@ -273,9 +285,6 @@ export default function SessionDetailPage() {
     replaySpeedRef.current = replaySpeed
   }, [replaySpeed])
   useEffect(() => {
-    replayIdxRef.current = replayIdx
-  }, [replayIdx])
-  useEffect(() => {
     isPausedRef.current = isPaused
   }, [isPaused])
   useEffect(() => {
@@ -291,6 +300,23 @@ export default function SessionDetailPage() {
     modeRef.current = mode
   }, [mode])
 
+  const commitReplayIdx = useCallback((idx: number, opts?: { force?: boolean }) => {
+    replayIdxRef.current = idx
+
+    if (!opts?.force) {
+      const now = performance.now()
+      if (idx === replayCommittedIdxRef.current || now - replayUiLastCommitAtRef.current < 100) {
+        return
+      }
+      replayUiLastCommitAtRef.current = now
+    } else {
+      replayUiLastCommitAtRef.current = performance.now()
+    }
+
+    replayCommittedIdxRef.current = idx
+    setReplayIdx(idx)
+  }, [])
+
   useEffect(() => {
     const handleOnline = () => setIsOnline(true)
     const handleOffline = () => setIsOnline(false)
@@ -304,31 +330,43 @@ export default function SessionDetailPage() {
 
   const fetchMoreLogs = useCallback(async () => {
     if (!id || isFetchingMoreRef.current) return
-    if (totalLinesRef.current > 0 && nextOffsetRef.current >= totalLinesRef.current) return
+    if (totalChunksRef.current > 0 && nextOffsetRef.current >= totalChunksRef.current) return
     isFetchingMoreRef.current = true
     try {
-      const res = await fetchLogs(
-        id,
-        { offset: nextOffsetRef.current, limit: 500 },
-        node ?? undefined
-      )
+      const requestOffset = nextOffsetRef.current
+      const res = await fetchLogs(id, { offset: requestOffset, limit: 1000 }, node ?? undefined)
       if (!isMounted.current) return
-      if (res.lines.length > 0) {
-        const next = [...logLinesRef.current, ...res.lines]
-        logLinesRef.current = next
-        setLogLines([...next])
+      logResizesRef.current = res.resizes
+      const encodedChunks = encodeLogChunks(res.chunks)
+      if (res.chunks.length > 0) {
+        const next = [...logChunksRef.current, ...encodedChunks]
+        logChunksRef.current = next
         setScrubberMax(next.length)
         if (!isReplayingRef.current) {
-          termRef.current?.write(res.lines.join(''))
-          termRef.current?.scrollToBottom()
-          setReplayIdx(next.length)
+          if (termRef.current) {
+            logReplayStateRef.current = appendLogChunks(
+              termRef.current,
+              encodedChunks,
+              res.resizes,
+              logReplayStateRef.current
+            )
+            termRef.current.scrollToBottom()
+          }
+          commitReplayIdx(next.length, { force: true })
         }
+      } else if (!isReplayingRef.current && termRef.current) {
+        logReplayStateRef.current = appendLogChunks(
+          termRef.current,
+          [],
+          res.resizes,
+          logReplayStateRef.current
+        )
       }
-      if (res.total !== totalLinesRef.current) {
-        totalLinesRef.current = res.total
-        setTotalLines(res.total)
+      if (res.total !== totalChunksRef.current) {
+        totalChunksRef.current = res.total
+        setTotalChunks(res.total)
       }
-      nextOffsetRef.current = res.next_offset
+      nextOffsetRef.current = Math.min(res.total, requestOffset + res.chunks.length)
     } catch {
       /* ignore */
     } finally {
@@ -348,7 +386,7 @@ export default function SessionDetailPage() {
       if (
         e.deltaY > 0 &&
         !isFetchingMoreRef.current &&
-        nextOffsetRef.current < totalLinesRef.current
+        nextOffsetRef.current < totalChunksRef.current
       ) {
         fetchMoreLogsRef.current?.()
       } else if (e.deltaY < 0 && replayIdxRef.current > 0) {
@@ -366,7 +404,7 @@ export default function SessionDetailPage() {
       if (
         (e.key === 'PageDown' || e.key === 'ArrowDown' || e.key === 'ArrowRight') &&
         !isFetchingMoreRef.current &&
-        nextOffsetRef.current < totalLinesRef.current
+        nextOffsetRef.current < totalChunksRef.current
       ) {
         e.preventDefault()
         fetchMoreLogsRef.current?.()
@@ -501,7 +539,7 @@ export default function SessionDetailPage() {
             }
             if (isMounted.current) setWsConnected(true)
           },
-          onInit: (data, _appCursorKeys, _bracketedPasteMode) => {
+          onInit: (data) => {
             if (!gotSnapshot) {
               pushConnectTrace(`init received (${data.length} bytes)`)
               gotSnapshot = true
@@ -513,7 +551,7 @@ export default function SessionDetailPage() {
             lastWsFrameAtRef.current = Date.now()
             enqueueTerminalOutput([data])
           },
-          onModeChanged: (_appCursorKeys, _bracketedPasteMode) => {
+          onModeChanged: () => {
             lastWsFrameAtRef.current = Date.now()
             // Mode changes are tracked server-side; client doesn't need to act.
           },
@@ -666,34 +704,35 @@ export default function SessionDetailPage() {
   useEffect(() => {
     if (mode !== 'logs' || !id) return
     termRef.current?.reset()
-    setReplayIdx(0)
+    commitReplayIdx(0, { force: true })
     isReplayingRef.current = false
     setIsReplaying(false)
     setIsPaused(false)
     isPausedRef.current = false
-    logLinesRef.current = []
-    setLogLines([])
+    logChunksRef.current = []
     setScrubberMax(0)
-    totalLinesRef.current = 0
+    totalChunksRef.current = 0
+    logReplayStateRef.current = initialLogReplayState()
+    logResizesRef.current = []
     nextOffsetRef.current = 0
     isFetchingMoreRef.current = false
-    setTotalLines(0)
+    setTotalChunks(0)
 
     let cancelled = false
-    fetchLogs(id!, { offset: 0, limit: 200 }, node ?? undefined)
+    fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
       .then((res) => {
         if (cancelled || !isMounted.current) return
-        logLinesRef.current = res.lines
-        setLogLines(res.lines)
-        totalLinesRef.current = res.total
-        setTotalLines(res.total)
-        nextOffsetRef.current = res.next_offset
-        setScrubberMax(res.lines.length)
-        if (res.lines.length > 0) {
-          termRef.current?.write(res.lines.join(''))
-          termRef.current?.scrollToBottom()
+        const encodedChunks = encodeLogChunks(res.chunks)
+        logChunksRef.current = encodedChunks
+        logResizesRef.current = res.resizes
+        totalChunksRef.current = res.total
+        setTotalChunks(res.total)
+        nextOffsetRef.current = Math.min(res.total, res.chunks.length)
+        setScrubberMax(res.chunks.length)
+        if (termRef.current) {
+          logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
         }
-        setReplayIdx(res.lines.length)
+        commitReplayIdx(res.chunks.length, { force: true })
         fetchSession(id!, node ?? undefined)
           .then((s) => {
             if (isMounted.current) setSession(s)
@@ -707,26 +746,35 @@ export default function SessionDetailPage() {
     }
   }, [mode, id, node, reloadTick])
 
+  const isScrubbingRef = useRef(false)
+  const wasPlayingBeforeScrubRef = useRef(false)
+
   const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
-    if (replayRafRef.current !== null) {
-      cancelAnimationFrame(replayRafRef.current)
-      replayRafRef.current = null
-      isReplayingRef.current = false
-      setIsReplaying(false)
-      setIsPaused(false)
-      isPausedRef.current = false
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
     }
-    setReplayIdx(val)
-    termRef.current?.reset()
-    if (logLinesRef.current.length > 0) {
-      termRef.current?.write(logLinesRef.current.slice(0, val + 1).join(''))
+    // Enter paused state when scrubbing so we can resume easily
+    isReplayingRef.current = true
+    setIsReplaying(true)
+    setIsPaused(true)
+    isPausedRef.current = true
+
+    commitReplayIdx(val, { force: true })
+    if (termRef.current) {
+      logReplayStateRef.current = seekLogChunks(
+        termRef.current,
+        logChunksRef.current,
+        logResizesRef.current,
+        logReplayStateRef.current,
+        val
+      )
     }
-    termRef.current?.scrollToBottom()
     if (
-      val >= logLinesRef.current.length - 1 &&
+      val >= logChunksRef.current.length - 1 &&
       !isFetchingMoreRef.current &&
-      nextOffsetRef.current < totalLinesRef.current
+      nextOffsetRef.current < totalChunksRef.current
     ) {
       fetchMoreLogsRef.current?.()
     }
@@ -734,50 +782,114 @@ export default function SessionDetailPage() {
   handleScrubRef.current = handleScrub
 
   function startReplay(fromIdx = 0) {
-    if (replayRafRef.current !== null) {
-      cancelAnimationFrame(replayRafRef.current)
-      replayRafRef.current = null
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
     }
     setIsPaused(false)
     isPausedRef.current = false
     isReplayingRef.current = true
     setIsReplaying(true)
-    let idx = fromIdx
     if (fromIdx === 0) {
-      setReplayIdx(0)
+      commitReplayIdx(0, { force: true })
+      logReplayStateRef.current = initialLogReplayState()
       termRef.current?.reset()
+    } else if (termRef.current && logReplayStateRef.current.chunkCount !== fromIdx) {
+      logReplayStateRef.current = seekLogChunks(
+        termRef.current,
+        logChunksRef.current,
+        logResizesRef.current,
+        logReplayStateRef.current,
+        fromIdx
+      )
+      commitReplayIdx(logReplayStateRef.current.chunkCount, { force: true })
     }
     function step() {
       if (isPausedRef.current) {
-        replayRafRef.current = null
+        replayTimerRef.current = null
         return
       }
-      const lines = logLinesRef.current
-      if (idx >= lines.length) {
-        if (nextOffsetRef.current < totalLinesRef.current) {
+      const chunks = logChunksRef.current
+      let idx = logReplayStateRef.current.chunkCount
+      if (idx >= chunks.length) {
+        if (nextOffsetRef.current < totalChunksRef.current) {
           if (!isFetchingMoreRef.current) fetchMoreLogsRef.current?.()
-          replayRafRef.current = requestAnimationFrame(step)
+          replayTimerRef.current = window.setTimeout(step, 10)
           return
         }
-        replayRafRef.current = null
+        replayTimerRef.current = null
         isReplayingRef.current = false
         setIsReplaying(false)
         setIsPaused(false)
         isPausedRef.current = false
         return
       }
-      const BATCH = Math.max(1, Math.round(5 * replaySpeedRef.current))
-      termRef.current?.write(lines.slice(idx, idx + BATCH).join(''))
-      idx += BATCH
-      setReplayIdx(idx)
-      replayRafRef.current = requestAnimationFrame(step)
+      const maxBytesPerFrame = 2560 // 2.5KB strict limit per frame
+
+      // We use playNextBatch which handles byte limits automatically, 
+      // even splitting large chunks if necessary.
+      // This prevents UI freezing on massive log chunks.
+
+      // 2. Perform a SINGLE write operation for the entire batch
+      if (termRef.current) {
+        // Adjust max bytes based on speed
+        // To make low speeds actually feel slow, we scale exponentially
+        // 0.5x -> ~128 bytes/frame
+        // 1.0x -> ~2.5KB/frame
+        // 2.0x -> ~5KB/frame
+        let speedMultiplier = replaySpeedRef.current
+        if (speedMultiplier < 1) {
+           speedMultiplier = speedMultiplier * speedMultiplier * 0.2
+        }
+        
+        // Ensure at least some progress (32 bytes minimum)
+        const adjustedMaxBytes = Math.max(32, Math.round(maxBytesPerFrame * speedMultiplier))
+
+        logReplayStateRef.current = playNextBatch(
+          termRef.current,
+          chunks,
+          logResizesRef.current,
+          logReplayStateRef.current,
+          adjustedMaxBytes,
+          () => {
+            if (isPausedRef.current || !isReplayingRef.current) return
+            
+            commitReplayIdx(logReplayStateRef.current.chunkCount)
+            
+            // Only schedule the next frame AFTER xterm has processed this batch.
+            // This guarantees we never flood the renderer or block the UI.
+            replayTimerRef.current = window.setTimeout(step, 10)
+          }
+        )
+        
+        termRef.current.scrollToBottom()
+      } else {
+        // Fallback (should rarely happen)
+        commitReplayIdx(logReplayStateRef.current.chunkCount)
+        replayTimerRef.current = window.setTimeout(step, 10)
+      }
     }
-    replayRafRef.current = requestAnimationFrame(step)
+    replayTimerRef.current = window.setTimeout(step, 0)
   }
 
   async function handleLoadPageAndReplay() {
-    if (nextOffsetRef.current < totalLinesRef.current) {
+    if (nextOffsetRef.current < totalChunksRef.current) {
       await fetchMoreLogsRef.current?.()
+    }
+  }
+
+  function handleSliderChange(val: number[]) {
+    if (!isScrubbingRef.current) {
+      wasPlayingBeforeScrubRef.current = isReplayingRef.current && !isPausedRef.current
+      isScrubbingRef.current = true
+    }
+    handleScrub(val[0] ?? 0)
+  }
+
+  function handleSliderCommit(val: number[]) {
+    isScrubbingRef.current = false
+    if (wasPlayingBeforeScrubRef.current) {
+      startReplay(val[0] ?? 0)
     }
   }
 
@@ -787,9 +899,9 @@ export default function SessionDetailPage() {
     } else if (!isPaused) {
       setIsPaused(true)
       isPausedRef.current = true
-      if (replayRafRef.current !== null) {
-        cancelAnimationFrame(replayRafRef.current)
-        replayRafRef.current = null
+      if (replayTimerRef.current !== null) {
+        clearTimeout(replayTimerRef.current)
+        replayTimerRef.current = null
       }
     } else {
       setIsPaused(false)
@@ -846,9 +958,6 @@ export default function SessionDetailPage() {
   }
 
   const isRunning = isSessionRunning(session)
-
-  // Unused var suppression
-  void logLines
 
   const attachedState = (
     <div className="flex items-center gap-2 opacity-60 text-xs">
@@ -1065,14 +1174,13 @@ export default function SessionDetailPage() {
               className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4`}
             >
               <div className="h-full w-full overflow-x-auto">
-                <div className={`h-full ${mode === 'logs' ? 'w-500 min-w-full' : ''}`}>
-                  <XTerm
-                    ref={termRef}
-                    onData={mode === 'attach' ? sendInput : undefined}
-                    onResize={mode === 'attach' ? handleTermResize : undefined}
-                    className="h-full min-w-full"
-                  />
-                </div>
+                <XTerm
+                  ref={termRef}
+                  autoFit={mode === 'attach'}
+                  onData={mode === 'attach' ? sendInput : undefined}
+                  onResize={mode === 'attach' ? handleTermResize : undefined}
+                  className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
+                />
               </div>
             </div>
 
@@ -1085,11 +1193,12 @@ export default function SessionDetailPage() {
                     min={0}
                     max={scrubberMax}
                     value={[replayIdx]}
-                    onValueChange={(value) => handleScrub(value[0] ?? 0)}
+                    onValueChange={handleSliderChange}
+                    onValueCommit={handleSliderCommit}
                     aria-label="Replay scrubber"
                   />
                   <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
-                    {totalLines > scrubberMax ? `${scrubberMax}/${totalLines}` : scrubberMax}
+                    {totalChunks > scrubberMax ? `${scrubberMax}/${totalChunks}` : scrubberMax}
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -1105,9 +1214,9 @@ export default function SessionDetailPage() {
                         <ChevronLeftIcon className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
-                    <TooltipContent>Back 10 lines</TooltipContent>
+                    <TooltipContent>Back 10 chunks</TooltipContent>
                   </Tooltip>
-                  {totalLines > scrubberMax && (
+                  {totalChunks > scrubberMax && (
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button variant="secondary" size="icon" onClick={handleLoadPageAndReplay}>
@@ -1134,7 +1243,7 @@ export default function SessionDetailPage() {
                         {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
                       </TooltipContent>
                     </Tooltip>
-                    <Select
+                    {/* <Select
                       value={String(replaySpeed)}
                       onValueChange={(v) => setReplaySpeed(Number(v))}
                     >
@@ -1148,7 +1257,7 @@ export default function SessionDetailPage() {
                         <SelectItem value="5">5×</SelectItem>
                         <SelectItem value="10">10×</SelectItem>
                       </SelectContent>
-                    </Select>
+                    </Select> */}
                   </div>
                 </div>
               </div>

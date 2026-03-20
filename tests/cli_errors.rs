@@ -105,7 +105,7 @@ fn skill_command_prints_embedded_markdown() {
     assert!(output.status.success(), "`oly skill` should exit 0");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = include_str!("../.github/skills/oly-start/SKILL.md");
+    let expected = include_str!("../.github/skills/oly/SKILL.md");
     assert_eq!(
         stdout, expected,
         "`oly skill` should print embedded markdown"

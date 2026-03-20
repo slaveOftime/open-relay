@@ -12,7 +12,10 @@ use crate::{
     ipc,
     node::NodeRegistry,
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
-    session::{SessionStore, StartSpec},
+    session::{
+        SessionStore, StartSpec,
+        logs::{read_persisted_log_page, read_resize_events, render_log_file},
+    },
 };
 
 use super::{JoinHandles, NotificationTx, SessionStoreHandle};
@@ -135,15 +138,18 @@ async fn dispatch_request(
             handle_stop(id, grace_seconds, session_store).await
         }
         RpcRequest::Kill { id } => handle_kill(id, session_store).await,
-        RpcRequest::LogsSnapshot { id, tail } => {
-            handle_logs_snapshot(id, tail, session_store).await
-        }
-        RpcRequest::LogsPoll { id, cursor } => handle_logs_poll(id, cursor, session_store).await,
-        RpcRequest::LogsWait {
+        RpcRequest::LogsTail {
             id,
             tail,
-            timeout_secs,
-        } => handle_logs_wait(id, tail, timeout_secs, session_store, notification_tx).await,
+            term_cols,
+            keep_color,
+        } => handle_logs_tail(id, tail, term_cols, keep_color, db).await,
+        RpcRequest::LogsPagination { id, offset, limit } => {
+            handle_logs_pagination(id, offset, limit, db).await
+        }
+        RpcRequest::LogsWait { id, timeout_ms } => {
+            handle_logs_wait(id, timeout_ms, session_store, notification_tx, db).await
+        }
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
         }
@@ -244,34 +250,81 @@ async fn handle_kill(id: String, session_store: &SessionStoreHandle) -> RpcRespo
     }
 }
 
-async fn handle_logs_snapshot(
+async fn handle_logs_tail(
     id: String,
     tail: usize,
-    session_store: &SessionStoreHandle,
+    term_cols: u16,
+    keep_color: bool,
+    db: &Arc<Database>,
 ) -> RpcResponse {
-    match session_store.logs_snapshot(&id, tail).await {
-        Some((lines, cursor, running)) => RpcResponse::LogsSnapshot {
-            lines,
-            cursor,
-            running,
-        },
-        None => RpcResponse::Error {
-            message: format!("session not found: {id}"),
-        },
+    let session_dir = match db.get_session_dir(&id).await {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return RpcResponse::Error {
+                message: format!("session not found: {id}"),
+            };
+        }
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    let log_path = session_dir.join("output.log");
+    let lines = match render_log_file(&log_path, tail, keep_color, term_cols, None) {
+        Ok(output) => output,
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    let resizes = match read_resize_events(&session_dir) {
+        Ok(resizes) => resizes,
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    RpcResponse::LogsTail {
+        output: lines,
+        resizes,
     }
 }
 
-async fn handle_logs_poll(
+async fn handle_logs_pagination(
     id: String,
-    cursor: u64,
-    session_store: &SessionStoreHandle,
+    offset: usize,
+    limit: usize,
+    db: &Arc<Database>,
 ) -> RpcResponse {
-    match session_store.logs_poll(&id, cursor).await {
-        Some((lines, cursor, running)) => RpcResponse::LogsPoll {
-            lines,
-            cursor,
-            running,
-        },
+    let session_dir = match db.get_session_dir(&id).await {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return RpcResponse::Error {
+                message: format!("session not found: {id}"),
+            };
+        }
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    match read_persisted_log_page(&session_dir, offset, limit) {
+        Some((lines, total)) => {
+            let resizes = read_resize_events(&session_dir).unwrap_or_default();
+            RpcResponse::LogsPagination {
+                lines,
+                total,
+                resizes,
+            }
+        }
         None => RpcResponse::Error {
             message: format!("session not found: {id}"),
         },
@@ -280,89 +333,53 @@ async fn handle_logs_poll(
 
 async fn handle_logs_wait(
     id: String,
-    tail: usize,
-    timeout_secs: u64,
+    timeout_ms: u64,
     session_store: &SessionStoreHandle,
     notification_tx: &NotificationTx,
+    db: &Arc<Database>,
 ) -> RpcResponse {
-    use crate::notification::event::NotificationKind;
+    if let Err(err) = db.get_session_dir(&id).await {
+        return RpcResponse::Error {
+            message: err.to_string(),
+        };
+    }
 
+    if !session_store.is_running(&id) || timeout_ms == 0 {
+        return RpcResponse::Empty;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut notify_rx = notification_tx.subscribe();
-    let initial = session_store.logs_snapshot(&id, tail).await;
+    let mut state_poll = tokio::time::interval(std::time::Duration::from_millis(100));
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
 
-    match initial {
-        None => RpcResponse::Error {
-            message: format!("session not found: {id}"),
-        },
-        Some((mut lines, mut cursor, mut running)) => {
-            if !running {
-                return RpcResponse::LogsSnapshot {
-                    lines,
-                    cursor,
-                    running,
-                };
-            }
-
-            let deadline = if timeout_secs == 0 {
-                None
-            } else {
-                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs))
-            };
-
-            'wait: loop {
-                if let Some(dl) = deadline {
-                    if tokio::time::Instant::now() >= dl {
-                        break 'wait;
-                    }
+    'wait: loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline_sleep => break 'wait,
+            _ = state_poll.tick() => {
+                if !session_store.is_running(&id) {
+                    break 'wait;
                 }
-
-                tokio::select! {
-                    biased;
-                    notif = notify_rx.recv() => {
-                        match notif {
-                            Ok(event) => {
-                                if matches!(event.kind, NotificationKind::InputNeeded)
-                                    && event.session_ids.iter().any(|s| s == &id)
-                                {
-                                    break 'wait;
-                                }
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
-                        }
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                        let updated = session_store.logs_snapshot(&id, tail).await;
-                        if let Some((l, c, r)) = updated {
-                            lines = l;
-                            cursor = c;
-                            running = r;
-                        }
-                        if !running {
+            }
+            notif = notify_rx.recv() => {
+                match notif {
+                    Ok(event) => {
+                        if matches!(event.kind, crate::notification::event::NotificationKind::InputNeeded)
+                            && event.session_ids.iter().any(|s| s == &id)
+                        {
                             break 'wait;
                         }
-                        if let Some(dl) = deadline {
-                            if tokio::time::Instant::now() >= dl {
-                                break 'wait;
-                            }
-                        }
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
                 }
-            }
-
-            if let Some((l, c, r)) = session_store.logs_snapshot(&id, tail).await {
-                lines = l;
-                cursor = c;
-                running = r;
-            }
-
-            RpcResponse::LogsSnapshot {
-                lines,
-                cursor,
-                running,
             }
         }
     }
+
+    RpcResponse::Empty
 }
 
 async fn handle_api_key_add(name: String, db: &Arc<Database>) -> RpcResponse {

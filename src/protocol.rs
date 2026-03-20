@@ -1,7 +1,14 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LogResize {
+    pub offset: u64,
+    pub rows: u16,
+    pub cols: u16,
+}
 
 /// Serde helper: transparently encode `Vec<u8>` as a base64 string in JSON.
 /// This reduces wire size from ~4× (JSON integer arrays) to ~1.37× (base64).
@@ -79,20 +86,22 @@ pub enum RpcRequest {
     Kill {
         id: String,
     },
-    LogsSnapshot {
+    LogsTail {
         id: String,
         tail: usize,
+        keep_color: bool,
+        term_cols: u16,
     },
-    LogsPoll {
+    LogsPagination {
         id: String,
-        cursor: u64,
+        offset: usize,
+        limit: usize,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
-    /// times out), then return a snapshot.  Response is `LogsSnapshot`.
+    /// times out), then return a snapshot.  Response is `LogsTail`.
     LogsWait {
         id: String,
-        tail: usize,
-        timeout_secs: u64,
+        timeout_ms: u64,
     },
     // ── Node federation ──────────────────────────────────────────────────────
     /// Proxy an inner request to a named secondary node.
@@ -142,8 +151,8 @@ impl RpcRequest {
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Kill { .. } => "kill",
-            RpcRequest::LogsSnapshot { .. } => "logs_snapshot",
-            RpcRequest::LogsPoll { .. } => "logs_poll",
+            RpcRequest::LogsTail { .. } => "logs_tail",
+            RpcRequest::LogsPagination { .. } => "logs_pagination",
             RpcRequest::LogsWait { .. } => "logs_wait",
             RpcRequest::NodeProxy { .. } => "node_proxy",
             RpcRequest::ApiKeyAdd { .. } => "api_key_add",
@@ -160,6 +169,7 @@ impl RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
+    Empty,
     Health {
         daemon_pid: u32,
     },
@@ -173,19 +183,22 @@ pub enum RpcResponse {
     Start {
         session_id: String,
     },
-    /// Sent once after AttachSubscribe: ring tail replay (raw filtered bytes) + terminal mode flags.
+    /// Sent once after AttachSubscribe: ring tail replay from the canonical
+    /// filtered session stream + terminal mode flags.
     AttachStreamInit {
-        /// Raw PTY bytes (CPR/DSR responses stripped), ready to write directly to the terminal.
+        /// Filtered session-stream bytes, ready to write directly to the terminal.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
+        /// Canonical filtered-stream offset immediately after the replay bytes.
         end_offset: u64,
         running: bool,
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
     },
-    /// Stream chunk of new PTY output (filtered, ready to write to terminal).
+    /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
     AttachStreamChunk {
+        /// Canonical filtered-stream offset of the first byte in `data`.
         offset: u64,
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
@@ -211,15 +224,16 @@ pub enum RpcResponse {
     Kill {
         killed: bool,
     },
-    LogsSnapshot {
-        lines: Vec<String>,
-        cursor: u64,
-        running: bool,
+    LogsTail {
+        output: Vec<u8>,
+        #[serde(default)]
+        resizes: Vec<LogResize>,
     },
-    LogsPoll {
+    LogsPagination {
         lines: Vec<String>,
-        cursor: u64,
-        running: bool,
+        total: usize,
+        #[serde(default)]
+        resizes: Vec<LogResize>,
     },
     Ack,
     Error {
