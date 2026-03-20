@@ -131,25 +131,6 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
     let command = format!("echo {MARKER}");
     send_line(&tmp, &id, &command);
 
-    #[cfg(target_os = "windows")]
-    let result = wait_for_exact_append(
-        &tmp,
-        &id,
-        &initial,
-        &prompted_transcript(&prompt, &command, [MARKER]),
-        Duration::from_secs(3),
-    )
-    .or_else(|| {
-        wait_for_exact_append(
-            &tmp,
-            &id,
-            &initial,
-            &format!("{command}\n{MARKER}\n\n\n{prompt}"),
-            Duration::from_secs(3),
-        )
-    });
-
-    #[cfg(not(target_os = "windows"))]
     let result = wait_for_prompted_output(
         &tmp,
         &id,
@@ -188,25 +169,6 @@ fn e2e_two_separate_input_calls_execute_command() {
     sleep(Duration::from_millis(100));
     send_key(&tmp, &id, "enter");
 
-    #[cfg(target_os = "windows")]
-    let result = wait_for_exact_append(
-        &tmp,
-        &id,
-        &initial,
-        &prompted_transcript(&prompt, &command, [MARKER]),
-        Duration::from_secs(3),
-    )
-    .or_else(|| {
-        wait_for_exact_append(
-            &tmp,
-            &id,
-            &initial,
-            &format!("{command}\n{MARKER}\n\n\n{prompt}"),
-            Duration::from_secs(3),
-        )
-    });
-
-    #[cfg(not(target_os = "windows"))]
     let result = wait_for_prompted_output(
         &tmp,
         &id,
