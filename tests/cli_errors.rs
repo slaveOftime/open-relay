@@ -91,6 +91,28 @@ fn help_text_is_neutral_and_simple() {
 }
 
 // ---------------------------------------------------------------------------
+// oly skill - prints embedded skill markdown
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skill_command_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill"])
+        .output()
+        .expect("failed to run oly skill");
+
+    assert!(output.status.success(), "`oly skill` should exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = include_str!("../.github/skills/oly-start/SKILL.md");
+    assert_eq!(
+        stdout, expected,
+        "`oly skill` should print embedded markdown"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // oly stop – daemon unavailable
 // ---------------------------------------------------------------------------
 
