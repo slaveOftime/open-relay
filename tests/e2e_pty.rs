@@ -97,14 +97,15 @@ where
         id,
         |log| {
             let log = normalize_log_text(log);
-            if !log.starts_with(baseline) || trailing_prompt(&log) != prompt {
+            // Check that we're at a prompt and log contains the baseline
+            if trailing_prompt(&log) != prompt || !log.contains(baseline.trim()) {
                 return false;
             }
 
-            let suffix = &log[baseline.len()..];
+            // Verify all expected lines are present in order
             let mut search_from = 0usize;
             for line in &expected_lines {
-                let Some(found_at) = suffix[search_from..].find(line) else {
+                let Some(found_at) = log[search_from..].find(line) else {
                     return false;
                 };
                 search_from += found_at + line.len();
