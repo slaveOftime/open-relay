@@ -143,7 +143,8 @@ export function seekLogChunks(
   chunks: LogReplayChunk[],
   resizes: LogResizeEvent[],
   state: LogReplayState,
-  chunkCount = chunks.length
+  chunkCount = chunks.length,
+  options?: { scrollToBottom?: boolean }
 ): LogReplayState {
   const safeChunkCount = Math.max(0, Math.min(chunkCount, chunks.length))
   if (safeChunkCount <= state.chunkCount) {
@@ -151,6 +152,8 @@ export function seekLogChunks(
   }
 
   const next = appendLogChunkRange(target, chunks, resizes, state, state.chunkCount, safeChunkCount)
-  target.scrollToBottom()
+  if (options?.scrollToBottom !== false) {
+    target.scrollToBottom()
+  }
   return next
 }

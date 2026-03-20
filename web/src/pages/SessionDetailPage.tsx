@@ -155,7 +155,7 @@ export default function SessionDetailPage() {
   const wsConnectedRef = useRef(false)
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
-  const replayRafRef = useRef<number | null>(null)
+  const replayTimerRef = useRef<number | null>(null)
   const logChunksRef = useRef<Uint8Array[]>([])
   const replaySpeedRef = useRef(1)
   const isPausedRef = useRef(false)
@@ -304,7 +304,7 @@ export default function SessionDetailPage() {
 
     if (!opts?.force) {
       const now = performance.now()
-      if (idx === replayCommittedIdxRef.current || now - replayUiLastCommitAtRef.current < 50) {
+      if (idx === replayCommittedIdxRef.current || now - replayUiLastCommitAtRef.current < 100) {
         return
       }
       replayUiLastCommitAtRef.current = now
@@ -747,9 +747,9 @@ export default function SessionDetailPage() {
 
   const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
-    if (replayRafRef.current !== null) {
-      cancelAnimationFrame(replayRafRef.current)
-      replayRafRef.current = null
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
       isReplayingRef.current = false
       setIsReplaying(false)
       setIsPaused(false)
@@ -776,9 +776,9 @@ export default function SessionDetailPage() {
   handleScrubRef.current = handleScrub
 
   function startReplay(fromIdx = 0) {
-    if (replayRafRef.current !== null) {
-      cancelAnimationFrame(replayRafRef.current)
-      replayRafRef.current = null
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
     }
     setIsPaused(false)
     isPausedRef.current = false
@@ -800,7 +800,7 @@ export default function SessionDetailPage() {
     }
     function step() {
       if (isPausedRef.current) {
-        replayRafRef.current = null
+        replayTimerRef.current = null
         return
       }
       const chunks = logChunksRef.current
@@ -808,32 +808,57 @@ export default function SessionDetailPage() {
       if (idx >= chunks.length) {
         if (nextOffsetRef.current < totalChunksRef.current) {
           if (!isFetchingMoreRef.current) fetchMoreLogsRef.current?.()
-          replayRafRef.current = requestAnimationFrame(step)
+          replayTimerRef.current = window.setTimeout(step, 10)
           return
         }
-        replayRafRef.current = null
+        replayTimerRef.current = null
         isReplayingRef.current = false
         setIsReplaying(false)
         setIsPaused(false)
         isPausedRef.current = false
         return
       }
-      const batchSize = Math.max(1, Math.round(5 * replaySpeedRef.current))
-      const nextIdx = Math.min(chunks.length, idx + batchSize)
-      if (termRef.current) {
+      const maxBytesPerFrame = 8 * 1024 // 8KB hard limit per frame
+      const targetBatchSize = Math.max(1, Math.round(5 * replaySpeedRef.current))
+      
+      let nextIdx = logReplayStateRef.current.chunkCount
+      let accumulatedBytes = 0
+      let chunksToAdd = 0
+
+      // 1. Calculate how many chunks to add in this frame
+      while (
+        chunksToAdd < targetBatchSize && 
+        nextIdx < chunks.length
+      ) {
+        accumulatedBytes += chunks[nextIdx].byteLength
+        nextIdx++
+        chunksToAdd++
+        
+        // Stop if we exceed the byte budget for this frame
+        if (accumulatedBytes >= maxBytesPerFrame) break
+      }
+
+      // 2. Perform a SINGLE write operation for the entire batch
+      if (chunksToAdd > 0 && termRef.current) {
         logReplayStateRef.current = seekLogChunks(
           termRef.current,
           chunks,
           logResizesRef.current,
           logReplayStateRef.current,
-          nextIdx
+          nextIdx,
+          { scrollToBottom: false }
         )
-        idx = logReplayStateRef.current.chunkCount
+        
+        termRef.current.scrollToBottom()
       }
-      commitReplayIdx(idx)
-      replayRafRef.current = requestAnimationFrame(step)
+      
+      commitReplayIdx(logReplayStateRef.current.chunkCount)
+      
+      // 3. Schedule next frame with 30fps target (33ms)
+      // This slower cadence ensures xterm has ample time to render between writes
+      replayTimerRef.current = window.setTimeout(step, 33)
     }
-    replayRafRef.current = requestAnimationFrame(step)
+    replayTimerRef.current = window.setTimeout(step, 0)
   }
 
   async function handleLoadPageAndReplay() {
@@ -848,9 +873,9 @@ export default function SessionDetailPage() {
     } else if (!isPaused) {
       setIsPaused(true)
       isPausedRef.current = true
-      if (replayRafRef.current !== null) {
-        cancelAnimationFrame(replayRafRef.current)
-        replayRafRef.current = null
+      if (replayTimerRef.current !== null) {
+        clearTimeout(replayTimerRef.current)
+        replayTimerRef.current = null
       }
     } else {
       setIsPaused(false)
