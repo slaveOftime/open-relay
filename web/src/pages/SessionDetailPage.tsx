@@ -826,7 +826,7 @@ export default function SessionDetailPage() {
       }
       const maxBytesPerFrame = 2560 // 2.5KB strict limit per frame
 
-      // We use playNextBatch which handles byte limits automatically, 
+      // We use playNextBatch which handles byte limits automatically,
       // even splitting large chunks if necessary.
       // This prevents UI freezing on massive log chunks.
 
@@ -839,9 +839,9 @@ export default function SessionDetailPage() {
         // 2.0x -> ~5KB/frame
         let speedMultiplier = replaySpeedRef.current
         if (speedMultiplier < 1) {
-           speedMultiplier = speedMultiplier * speedMultiplier * 0.2
+          speedMultiplier = speedMultiplier * speedMultiplier * 0.2
         }
-        
+
         // Ensure at least some progress (32 bytes minimum)
         const adjustedMaxBytes = Math.max(32, Math.round(maxBytesPerFrame * speedMultiplier))
 
@@ -853,15 +853,15 @@ export default function SessionDetailPage() {
           adjustedMaxBytes,
           () => {
             if (isPausedRef.current || !isReplayingRef.current) return
-            
+
             commitReplayIdx(logReplayStateRef.current.chunkCount)
-            
+
             // Only schedule the next frame AFTER xterm has processed this batch.
             // This guarantees we never flood the renderer or block the UI.
             replayTimerRef.current = window.setTimeout(step, 10)
           }
         )
-        
+
         termRef.current.scrollToBottom()
       } else {
         // Fallback (should rarely happen)

@@ -130,15 +130,19 @@ export type SessionEvent =
   | { event: 'session_deleted'; data: { id: string } }
   | {
       event: 'session_notification'
-      data: {
-        kind: string
-        summary: string
-        body: string
-        session_ids: string[]
-        trigger_rule?: string
-        trigger_detail?: string
-      }
+      data: SessionNotificationData
     }
+
+export type SessionNotificationData = {
+  kind: string
+  title: string
+  description: string
+  body: string
+  navigation_url?: string
+  session_ids: string[]
+  trigger_rule?: string
+  trigger_detail?: string
+}
 
 // ---------------------------------------------------------------------------
 // WebSocket protocol

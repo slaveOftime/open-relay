@@ -109,7 +109,7 @@ function appendLogChunkRange(
   const safeEnd = Math.max(safeStart, Math.min(endChunk, chunks.length))
   const next: LogReplayState = { ...state }
   const pendingWrite = { chunks: [] as LogReplayChunk[], byteLength: 0 }
-  
+
   // If we are starting from a different chunk than the state indicates, reset offset
   if (next.chunkCount !== safeStart) {
     next.chunkCount = safeStart
@@ -117,7 +117,7 @@ function appendLogChunkRange(
   }
 
   applyPendingResizesWithFlush(target, resizes, next, pendingWrite)
-  
+
   let bytesAdded = 0
   const maxBytes = options?.maxBytes ?? Infinity
 
@@ -126,10 +126,10 @@ function appendLogChunkRange(
 
     const fullChunk = chunks[index]
     const remainingInChunk = fullChunk.length - next.chunkOffset
-    
+
     // Determine how much of this chunk we can add
     const bytesToTake = Math.min(remainingInChunk, maxBytes - bytesAdded)
-    
+
     // Optimisation: If taking the whole remaining chunk, no copy/slice needed if offset is 0
     let chunkToAdd: LogReplayChunk
     if (next.chunkOffset === 0 && bytesToTake === fullChunk.length) {
@@ -142,9 +142,9 @@ function appendLogChunkRange(
     pendingWrite.byteLength += chunkToAdd.length
     next.bytesWritten += chunkToAdd.length
     bytesAdded += chunkToAdd.length
-    
+
     next.chunkOffset += bytesToTake
-    
+
     // If we finished this chunk, move to next
     if (next.chunkOffset >= fullChunk.length) {
       next.chunkCount += 1
@@ -228,7 +228,7 @@ export function playNextBatch(
     resizes,
     state,
     state.chunkCount, // Start from current chunk
-    chunks.length,    // Try to go to end, but maxBytes will stop us
+    chunks.length, // Try to go to end, but maxBytes will stop us
     { callback, maxBytes }
   )
 }

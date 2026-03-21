@@ -52,8 +52,8 @@ pub(super) async fn run_notification_monitor(
         }
 
         for candidate in candidates {
-            let session_id = candidate.session_id;
-            let excerpt = candidate.raw_excerpt;
+            let session_id = candidate.session_id.clone();
+            let excerpt = candidate.raw_excerpt.clone();
             let output_epoch = candidate.output_epoch;
 
             debug!(session_id, "evaluating notification triggers for candidate");
@@ -66,7 +66,7 @@ pub(super) async fn run_notification_monitor(
 
             let clean = strip_ansi_for_body(&excerpt);
 
-            let (trigger_rule, trigger_detail, body) =
+            let (trigger_rule, trigger_detail) =
                 if let Some(pattern) = find_prompt_match(&excerpt, &patterns) {
                     info!(
                         session_id,
@@ -74,57 +74,29 @@ pub(super) async fn run_notification_monitor(
                         pattern = pattern.as_str(),
                         "notification triggered"
                     );
-                    let raw = clean
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .find(|line| {
-                            patterns
-                                .iter()
-                                .any(|re| re.as_str() == pattern && re.is_match(line))
-                        })
-                        .unwrap_or("")
-                        .trim();
-                    (
-                        NotificationTriggerRule::RegexPattern,
-                        Some(pattern.clone()),
-                        sanitize_body(raw),
-                    )
+                    (NotificationTriggerRule::RegexPattern, Some(pattern.clone()))
                 } else if let Some(llm_detail) = evaluate_llm_direct_trigger(&clean) {
                     info!(
                         session_id,
                         trigger_rule = NotificationTriggerRule::LlmCheck.as_str(),
                         "notification triggered"
                     );
-                    let raw = clean
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .last()
-                        .unwrap_or("")
-                        .trim();
-                    (
-                        NotificationTriggerRule::LlmCheck,
-                        Some(llm_detail),
-                        sanitize_body(raw),
-                    )
+                    (NotificationTriggerRule::LlmCheck, Some(llm_detail))
                 } else if Instant::now().duration_since(output_epoch) >= silence {
                     info!(
                         session_id,
                         trigger_rule = NotificationTriggerRule::Silence.as_str(),
                         "notification triggered"
                     );
-                    let raw = clean
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .last()
-                        .unwrap_or("")
-                        .trim();
-                    (NotificationTriggerRule::Silence, None, sanitize_body(raw))
+                    (NotificationTriggerRule::Silence, None)
                 } else {
                     continue;
                 };
 
+            let body = sanitize_notification_excerpt(&excerpt);
             let event = NotificationEvent::input_needed_with_trigger(
                 session_id.clone(),
+                candidate.session_title.clone(),
                 body,
                 trigger_rule,
                 trigger_detail,
@@ -146,8 +118,10 @@ pub(super) async fn run_notification_monitor(
 
             let _ = event_tx.send(SessionEvent::SessionNotification {
                 kind: event.kind.as_str().to_string(),
-                summary: event.summary,
+                title: event.title,
+                description: event.description,
                 body: event.body,
+                navigation_url: event.navigation_url,
                 session_ids: event.session_ids,
                 trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
                 trigger_detail: event.trigger_detail,
@@ -160,6 +134,16 @@ pub(super) async fn run_notification_monitor(
 
 fn evaluate_llm_direct_trigger(_excerpt: &str) -> Option<String> {
     None
+}
+
+fn sanitize_notification_excerpt(input: &str) -> String {
+    strip_ansi_for_body(input)
+        .lines()
+        .map(str::trim)
+        .map(sanitize_body)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(super) fn build_notifier(db: Arc<Database>, config: &AppConfig) -> Notifier {

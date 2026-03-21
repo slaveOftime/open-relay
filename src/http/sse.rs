@@ -142,8 +142,10 @@ pub async fn events_handler(
                     ),
                     super::SessionEvent::SessionNotification {
                         kind,
-                        summary,
+                        title,
+                        description,
                         body,
+                        navigation_url,
                         session_ids,
                         trigger_rule,
                         trigger_detail,
@@ -151,8 +153,10 @@ pub async fn events_handler(
                         "session_notification",
                         serde_json::to_string(&serde_json::json!({
                             "kind": kind,
-                            "summary": summary,
+                            "title": title,
+                            "description": description,
                             "body": body,
+                            "navigation_url": navigation_url,
                             "session_ids": session_ids,
                             "trigger_rule": trigger_rule,
                             "trigger_detail": trigger_detail,

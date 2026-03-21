@@ -242,8 +242,10 @@ async fn connect_and_relay(
                     Ok(event) => {
                         let relay = NodeWsMessage::Notification {
                             kind: event.kind.as_str().to_string(),
-                            summary: event.summary,
+                            title: event.title,
+                            description: event.description,
                             body: event.body,
+                            navigation_url: event.navigation_url,
                             session_ids: event.session_ids,
                             trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
                             trigger_detail: event.trigger_detail,

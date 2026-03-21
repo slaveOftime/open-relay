@@ -123,6 +123,7 @@ pub struct SessionStore {
 #[derive(Debug, Clone)]
 pub struct SilentCandidate {
     pub session_id: String,
+    pub session_title: Option<String>,
     pub raw_excerpt: String,
     pub output_epoch: Instant,
     pub notifications_enabled: bool,
@@ -975,6 +976,7 @@ impl SessionStore {
 
                 Some(SilentCandidate {
                     session_id: snapshot.summary.id.clone(),
+                    session_title: snapshot.summary.title.clone(),
                     raw_excerpt: excerpt,
                     output_epoch: last_output,
                     notifications_enabled: snapshot.notifications_enabled,
