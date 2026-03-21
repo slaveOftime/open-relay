@@ -64,6 +64,11 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      '/apps': {
+        target: 'http://127.0.0.1:15443',
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
   test: {

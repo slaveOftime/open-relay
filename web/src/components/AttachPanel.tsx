@@ -204,12 +204,12 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                   <Button
                     type="button"
                     variant="ghost"
-                    className="absolute bottom-2 right-2 p-2"
+                    className="absolute bottom-2 right-2 p-1"
                     disabled={!customInput.trim()}
                     onClick={handleSendButtonClick}
                     onDoubleClick={handleSendButtonDoubleClick}
                   >
-                    <SendIcon className="h-6 w-6 text-[hsl(var(--primary))]" />
+                    <SendIcon className="h-5 w-5 text-[hsl(var(--primary))]" />
                   </Button>
                 </TooltipTrigger>
               </Tooltip>
@@ -258,7 +258,7 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
               <Input
                 id="custom-keys"
                 className="text-sm"
-                placeholder="Keys separated by whitespace"
+                placeholder="Keys separated by whitespace. Press enter to send."
                 value={customKeys}
                 onChange={(e) => setCustomKeys(e.target.value)}
                 onKeyDown={(e) => {
@@ -268,13 +268,6 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                   }
                 }}
               />
-              <Button
-                variant="ghost"
-                disabled={!customKeys.trim()}
-                onClick={() => handleSendCustomKeys(customKeys)}
-              >
-                <SendIcon className="h-4 w-4" />
-              </Button>
             </div>
           </div>
         </div>
