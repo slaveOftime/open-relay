@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -55,7 +55,7 @@ const popularKeys = [
   { key: 'shift', label: 'shift', instant: false },
   { key: 'alt', label: 'alt', instant: false },
   { key: 'meta', label: 'meta', instant: false },
-  { key: 'tab', label: 'tab', instant: false },
+  { key: 'tab', label: 'tab', instant: true },
   { key: 'shift+tab', label: 'shift+tab', instant: true },
   { key: 'esc', label: 'esc', instant: true },
   { key: 'enter', label: 'enter', instant: true },
@@ -80,13 +80,48 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [customInput, setCustomInput] = useState('')
   const [customKeys, setCustomKeys] = useState('')
-  const [inputHistory, setInputHistory] = useState<InputHistoryEntry[]>(() => loadInputHistory())
+  const customInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const sendClickTimeoutRef = useRef<number | null>(null)
 
-  function handleCustomSend() {
-    if (!customInput) return
+  function resizeCustomInput() {
+    const textarea = customInputRef.current
+    if (!textarea) return
+
+    textarea.style.height = 'auto'
+
+    const computedStyle = window.getComputedStyle(textarea)
+    const lineHeight = Number.parseFloat(computedStyle.lineHeight) || 20
+    const paddingHeight =
+      Number.parseFloat(computedStyle.paddingTop) + Number.parseFloat(computedStyle.paddingBottom)
+    const borderHeight =
+      Number.parseFloat(computedStyle.borderTopWidth) +
+      Number.parseFloat(computedStyle.borderBottomWidth)
+    const maxHeight = lineHeight * 8 + paddingHeight + borderHeight
+    const nextHeight = Math.min(textarea.scrollHeight, maxHeight)
+
+    textarea.style.height = `${nextHeight}px`
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
+  }
+
+  useEffect(() => {
+    resizeCustomInput()
+  }, [customInput])
+
+  useEffect(() => {
+    return () => {
+      if (sendClickTimeoutRef.current !== null) {
+        window.clearTimeout(sendClickTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  function handleCustomSend(sendEnter = false) {
+    if (!customInput.trim()) return
     saveInputHistory(customInput)
-    setInputHistory(loadInputHistory())
     sendInput(customInput)
+    if (sendEnter) {
+      handleSendKeySpec('enter')
+    }
     setCustomInput('')
   }
 
@@ -122,7 +157,25 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
     }, 0)
   }
 
-  const historyTop = [...inputHistory].sort((a, b) => b.count - a.count).slice(0, 15)
+  function clearPendingSingleClick() {
+    if (sendClickTimeoutRef.current !== null) {
+      window.clearTimeout(sendClickTimeoutRef.current)
+      sendClickTimeoutRef.current = null
+    }
+  }
+
+  function handleSendButtonClick() {
+    clearPendingSingleClick()
+    sendClickTimeoutRef.current = window.setTimeout(() => {
+      handleCustomSend(false)
+      sendClickTimeoutRef.current = null
+    }, 250)
+  }
+
+  function handleSendButtonDoubleClick() {
+    clearPendingSingleClick()
+    handleCustomSend(true)
+  }
 
   return (
     <div>
@@ -134,51 +187,29 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
             <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
               Text Input
             </p>
-            <datalist id="or-input-history">
-              {historyTop.map((e) => (
-                <option key={e.text} value={e.text} />
-              ))}
-            </datalist>
-            <div className="flex items-center gap-1">
-              <Input
-                className="text-sm flex-1 min-w-0"
-                placeholder="Type text then press Enter"
-                list="or-input-history"
+            <div className="relative">
+              <textarea
+                ref={customInputRef}
+                className="flex min-h-[72px] w-full rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--secondary))] px-3 py-2 pr-12 text-sm text-[hsl(var(--foreground))] placeholder:text-[hsl(var(--muted-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 transition-colors resize-none"
+                placeholder="Type text here. Enter adds a new line."
+                rows={3}
                 value={customInput}
                 onChange={(e) => setCustomInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault()
-                    handleCustomSend()
-                  }
-                }}
               />
               <Tooltip>
-                <TooltipContent>Send the input and press Enter</TooltipContent>
+                <TooltipContent>
+                  Single click sends text. Double click sends text and Enter.
+                </TooltipContent>
                 <TooltipTrigger asChild>
                   <Button
+                    type="button"
                     variant="ghost"
+                    className="absolute bottom-2 right-2 p-1"
                     disabled={!customInput.trim()}
-                    onClick={() => {
-                      setCustomInput(customInput)
-                      handleCustomSend()
-                      handleSendKeySpec('enter') // send an extra enter to trigger processing, since some inputs may be buffered until enter is pressed
-                    }}
+                    onClick={handleSendButtonClick}
+                    onDoubleClick={handleSendButtonDoubleClick}
                   >
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke-width="1.5"
-                      stroke="currentColor"
-                      className="w-4 h-4"
-                    >
-                      <path
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        d="m7.49 12-3.75 3.75m0 0 3.75 3.75m-3.75-3.75h16.5V4.499"
-                      />
-                    </svg>
+                    <SendIcon className="h-5 w-5 text-[hsl(var(--primary))]" />
                   </Button>
                 </TooltipTrigger>
               </Tooltip>
@@ -227,7 +258,7 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
               <Input
                 id="custom-keys"
                 className="text-sm"
-                placeholder="Keys separated by whitespace"
+                placeholder="Keys separated by whitespace. Press enter to send."
                 value={customKeys}
                 onChange={(e) => setCustomKeys(e.target.value)}
                 onKeyDown={(e) => {
@@ -237,13 +268,6 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
                   }
                 }}
               />
-              <Button
-                variant="ghost"
-                disabled={!customKeys.trim()}
-                onClick={() => handleSendCustomKeys(customKeys)}
-              >
-                <SendIcon className="h-4 w-4" />
-              </Button>
             </div>
           </div>
         </div>

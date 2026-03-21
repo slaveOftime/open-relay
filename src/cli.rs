@@ -161,6 +161,9 @@ pub struct ListArgs {
     /// Filter by title or ID substring (case-insensitive).
     #[arg(long)]
     pub search: Option<String>,
+    /// Print machine-readable JSON instead of the default table.
+    #[arg(long)]
+    pub json: bool,
     /// Only show sessions with these statuses (repeatable).
     #[arg(long = "status", short = 's', value_enum)]
     pub status: Vec<ListStatus>,

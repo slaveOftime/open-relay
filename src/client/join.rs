@@ -85,7 +85,7 @@ pub async fn run_join(config: &AppConfig, url: String, name: String, key: String
     };
     save_join_config(config, &join)?;
 
-    match ipc::send_request(
+    match ipc::send_request_checked(
         config,
         crate::protocol::RpcRequest::JoinStart {
             url,
@@ -101,7 +101,6 @@ pub async fn run_join(config: &AppConfig, url: String, name: String, key: String
             );
             Ok(())
         }
-        Ok(RpcResponse::Error { message }) => Err(AppError::DaemonUnavailable(message)),
         Err(AppError::DaemonUnavailable(_)) => {
             // Daemon not running — config is saved; will connect on next daemon start.
             println!(
@@ -110,6 +109,7 @@ pub async fn run_join(config: &AppConfig, url: String, name: String, key: String
             );
             Ok(())
         }
+        Err(err) => Err(err),
         _ => Err(AppError::Protocol("unexpected response".into())),
     }
 }

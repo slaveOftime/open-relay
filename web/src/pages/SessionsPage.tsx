@@ -65,6 +65,7 @@ import {
   CopyIcon,
   Cross2Icon,
   FileTextIcon,
+  GridIcon,
   Link2Icon,
   MixerHorizontalIcon,
   PlayIcon,
@@ -478,17 +479,17 @@ function SessionCard({
       <Card
         className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
-        <CardContent className="px-4 pt-3.5 pb-3 flex flex-col gap-2">
+        <CardContent className="px-3 pt-3 pb-3 flex flex-col gap-2">
           {/* Row 1: id, status, pid, created at */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold">
               {session.id.slice(0, 7)}
             </span>
-            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
-            <div className="flex-1" />
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
               {formatTimestamp(session.created_at)}
             </span>
+            <div className="flex-1" />
+            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
           </div>
 
           {/* Row 2: title */}
@@ -1365,6 +1366,11 @@ export default function SessionsPage() {
             >
               <BellIcon className="h-4 w-4" />
             </Button>
+            <Button asChild variant="ghost" size="icon">
+              <a href="/apps" aria-label="Apps">
+                <GridIcon className="h-4 w-4" />
+              </a>
+            </Button>
             <Button size="icon" onClick={() => setShowNewSession(true)} aria-label="New session">
               <PlusIcon className="h-4 w-4" />
             </Button>
@@ -1571,6 +1577,13 @@ export default function SessionsPage() {
             >
               <BellIcon className="h-4 w-4" />
               <span className="hidden xl:inline">{pushButtonLabel}</span>
+            </Button>
+
+            <Button asChild size="sm" variant="ghost">
+              <a href="/apps">
+                <GridIcon className="h-4 w-4" />
+                <span>Apps</span>
+              </a>
             </Button>
 
             <Button size="sm" onClick={() => setShowNewSession(true)}>

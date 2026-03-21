@@ -175,7 +175,7 @@ pub async fn start(
 }
 
 pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
-    match ipc::send_request(&config, RpcRequest::DaemonStop { grace_seconds }).await? {
+    match ipc::send_request_checked(&config, RpcRequest::DaemonStop { grace_seconds }).await? {
         RpcResponse::DaemonStop { stopped } => {
             if !stopped {
                 eprintln!(
@@ -184,7 +184,6 @@ pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
             }
             Ok(())
         }
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
         _ => Err(AppError::Protocol("unexpected response type".to_string())),
     }
 }

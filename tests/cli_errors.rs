@@ -4,6 +4,8 @@
 ///
 /// Each test uses an isolated temporary state directory so it never
 /// accidentally connects to a real running daemon.
+mod e2e;
+
 use std::{env, fs, path::PathBuf, process::Command};
 
 // Path to the compiled `oly` binary, set by Cargo when building tests.
@@ -66,6 +68,34 @@ fn list_without_daemon_succeeds_gracefully() {
             "expected next-step hint for empty list, got: {stdout}"
         );
     }
+}
+
+#[test]
+fn list_json_without_daemon_prints_machine_readable_output() {
+    let tmp = make_tmp_dir("list_json_no_daemon");
+    let output = oly_cmd(&tmp)
+        .args(["ls", "--json"])
+        .output()
+        .expect("failed to run oly ls --json");
+
+    assert!(
+        output.status.success(),
+        "`oly ls --json` should exit 0 without a daemon; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+
+    assert_eq!(value["items"], serde_json::json!([]));
+    assert_eq!(value["total"], serde_json::json!(0));
+    assert_eq!(value["offset"], serde_json::json!(0));
+    assert_eq!(value["limit"], serde_json::json!(10));
+    assert!(
+        !stdout.contains("No sessions"),
+        "json output should not mix table/hint text into stdout: {stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -354,4 +384,31 @@ fn input_valid_arrow_keys_reach_daemon_check() {
             "arrow key '{key}' should be a valid key spec; got: {stderr}"
         );
     }
+}
+
+#[test]
+fn input_live_daemon_session_error_is_not_reported_as_unavailable() {
+    let tmp = e2e::make_tmp_dir("input_live_daemon_missing_session");
+    let _daemon = e2e::start_daemon(&tmp);
+    let missing_id = "let x = 123;;";
+
+    let output = e2e::oly_cmd(&tmp)
+        .args(["send", missing_id, "hello"])
+        .output()
+        .expect("failed to run oly send against live daemon");
+
+    assert!(
+        !output.status.success(),
+        "`oly send` should exit non-zero when the daemon rejects an unknown session"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("session not running: {missing_id}")),
+        "expected precise session error from live daemon, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("daemon is unavailable"),
+        "live daemon request failures should not be mislabeled as availability issues: {stderr}"
+    );
 }

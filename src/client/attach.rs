@@ -62,7 +62,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     .await?;
 
     // Receive the init frame.
-    let init = ipc::read_response_from_reader(&mut reader).await?;
+    let init = ipc::read_checked_response_from_reader(&mut reader).await?;
     let (initial_data, mut running, mut child_bracketed_paste_mode, mut child_app_cursor_keys) =
         match init {
             RpcResponse::AttachStreamInit {
@@ -72,7 +72,6 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 app_cursor_keys,
                 ..
             } => (data, running, bracketed_paste_mode, app_cursor_keys),
-            RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
             _ => return Err(AppError::Protocol("unexpected response type".to_string())),
         };
 
@@ -83,14 +82,11 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         while running {
-            match ipc::read_response_from_reader(&mut reader).await? {
+            match ipc::read_checked_response_from_reader(&mut reader).await? {
                 RpcResponse::AttachStreamChunk { data, .. } => write_bytes_to_stdout(&data)?,
                 RpcResponse::AttachModeChanged { .. } => {}
                 RpcResponse::AttachStreamDone { .. } => {
                     running = false;
-                }
-                RpcResponse::Error { message } => {
-                    return Err(AppError::DaemonUnavailable(message));
                 }
                 _ => {}
             }
@@ -149,7 +145,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
             loop {
-                let frame = ipc::read_response_from_reader(&mut reader).await;
+                let frame = ipc::read_checked_response_from_reader(&mut reader).await;
                 let done = frame.is_err();
                 if frame_tx.send(frame).is_err() {
                     break;
@@ -358,34 +354,33 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     stream_error = Some(err);
                     break;
                 }
-                Ok(Some(Ok(RpcResponse::AttachStreamChunk { data, .. }))) => {
-                    // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
-                    write_bytes_to_stdout(&data)?;
-                }
-                Ok(Some(Ok(RpcResponse::AttachModeChanged {
-                    app_cursor_keys,
-                    bracketed_paste_mode,
-                }))) => {
-                    child_app_cursor_keys = app_cursor_keys;
-                    child_bracketed_paste_mode = bracketed_paste_mode;
-                }
-                Ok(Some(Ok(RpcResponse::AttachResized { rows: _, cols: _ }))) => {
-                    // Another client resized the PTY.  We cannot
-                    // programmatically resize the terminal window (only the
-                    // screen buffer on Windows, which corrupts the display).
-                    // Instead, update last_sent_size to the actual terminal
-                    // size so that the dedup guard in Event::Resize prevents
-                    // echoing our unchanged dimensions back to the server.
-                    let (actual_cols, actual_rows) = terminal::size().unwrap_or((80, 24));
-                    last_sent_size = (actual_cols, actual_rows);
-                }
-                Ok(Some(Ok(RpcResponse::AttachStreamDone { .. }))) => {
-                    running = false;
-                }
-                Ok(Some(Ok(RpcResponse::Error { message }))) => {
-                    return Err(AppError::DaemonUnavailable(message));
-                }
-                Ok(Some(Ok(_))) => {}
+                Ok(Some(Ok(response))) => match response {
+                    RpcResponse::AttachStreamChunk { data, .. } => {
+                        // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
+                        write_bytes_to_stdout(&data)?;
+                    }
+                    RpcResponse::AttachModeChanged {
+                        app_cursor_keys,
+                        bracketed_paste_mode,
+                    } => {
+                        child_app_cursor_keys = app_cursor_keys;
+                        child_bracketed_paste_mode = bracketed_paste_mode;
+                    }
+                    RpcResponse::AttachResized { rows: _, cols: _ } => {
+                        // Another client resized the PTY.  We cannot
+                        // programmatically resize the terminal window (only the
+                        // screen buffer on Windows, which corrupts the display).
+                        // Instead, update last_sent_size to the actual terminal
+                        // size so that the dedup guard in Event::Resize prevents
+                        // echoing our unchanged dimensions back to the server.
+                        let (actual_cols, actual_rows) = terminal::size().unwrap_or((80, 24));
+                        last_sent_size = (actual_cols, actual_rows);
+                    }
+                    RpcResponse::AttachStreamDone { .. } => {
+                        running = false;
+                    }
+                    _ => {}
+                },
             }
         }
 
