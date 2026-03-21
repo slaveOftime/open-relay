@@ -31,9 +31,10 @@ impl RawModeGuard {
     pub fn new() -> Result<Self> {
         terminal::enable_raw_mode()?;
         let _ = std::io::stdout().write_all(terminal_tab_state_save_bytes());
-        // Enable bracketed paste so multi-line pastes arrive as a single
-        // Event::Paste rather than being injected as individual key events
-        // (which would fire Enter after each line).
+        // Keep local bracketed paste enabled so terminal pastes arrive as a
+        // single Event::Paste even when the child app itself has not enabled
+        // DECSET 2004. Whether we wrap forwarded bytes for the child is a
+        // separate decision handled in the attach client.
         let _ = execute!(std::io::stdout(), EnableBracketedPaste);
         Ok(Self { cleaned_up: false })
     }

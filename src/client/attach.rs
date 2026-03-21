@@ -1,4 +1,7 @@
-use std::io::{IsTerminal, Write};
+use std::{
+    io::{IsTerminal, Write},
+    time::{Duration, Instant},
+};
 
 use crossterm::{
     event::{
@@ -16,6 +19,14 @@ use crate::{
     ipc,
     protocol::{RpcRequest, RpcResponse},
 };
+
+const PASTE_BURST_WAIT: Duration = Duration::from_millis(30);
+const PASTE_KEY_SUPPRESS_WINDOW: Duration = Duration::from_millis(150);
+
+struct PendingKeyBurst {
+    data: String,
+    deadline: Instant,
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -149,12 +160,27 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             }
         });
 
+        let mut pending_key_burst: Option<PendingKeyBurst> = None;
+        let mut suppress_paste_keys_until: Option<Instant> = None;
+
         while running {
             // Drain all pending keyboard/resize events first.
             loop {
-                match event::poll(std::time::Duration::from_millis(0)) {
+                match event::poll(pending_key_burst_poll_timeout(pending_key_burst.as_ref())) {
                     Ok(true) => {}
-                    Ok(false) => break,
+                    Ok(false) => {
+                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id_owned.clone(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                        }
+                        break;
+                    }
                     Err(err) => {
                         stream_error = Some(err.into());
                         running = false;
@@ -163,16 +189,40 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 }
                 match event::read()? {
                     Event::Paste(data) => {
+                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id_owned.clone(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                        }
+                        suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
                         ipc::write_request_to_writer(
                             &mut write_half,
                             RpcRequest::AttachInput {
                                 id: id_owned.clone(),
-                                data: wrap_paste_input(data, child_bracketed_paste_mode),
+                                data: wrap_paste_input(
+                                    normalize_paste_text(data),
+                                    child_bracketed_paste_mode,
+                                ),
                             },
                         )
                         .await?
                     }
                     Event::Resize(cols, rows) => {
+                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id_owned.clone(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                        }
                         // Re-read the actual terminal size — the event may
                         // carry stale dimensions on some platforms.
                         let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
@@ -190,10 +240,8 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         }
                     }
                     Event::Key(key) => {
-                        if is_ctrl_d(key) {
-                            detached = true;
-                            running = false;
-                            break;
+                        if should_suppress_paste_followup_key(key, suppress_paste_keys_until) {
+                            continue;
                         }
 
                         if let Some(data) = maybe_collect_clipboard_paste(
@@ -203,6 +251,8 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             key,
                             child_bracketed_paste_mode,
                         )? {
+                            pending_key_burst = None;
+                            suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
                             ipc::write_request_to_writer(
                                 &mut write_half,
                                 RpcRequest::AttachInput {
@@ -218,6 +268,42 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             continue;
                         }
 
+                        if is_ctrl_d(key) {
+                            if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst)
+                            {
+                                ipc::write_request_to_writer(
+                                    &mut write_half,
+                                    RpcRequest::AttachInput {
+                                        id: id_owned.clone(),
+                                        data,
+                                    },
+                                )
+                                .await?;
+                            }
+                            detached = true;
+                            running = false;
+                            break;
+                        }
+
+                        if push_pending_key_burst(
+                            &mut pending_key_burst,
+                            key,
+                            child_app_cursor_keys,
+                        ) {
+                            continue;
+                        }
+
+                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id_owned.clone(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                        }
+
                         if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
                             ipc::write_request_to_writer(
                                 &mut write_half,
@@ -230,6 +316,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         }
                     }
                     Event::Mouse(mouse) => {
+                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
+                            ipc::write_request_to_writer(
+                                &mut write_half,
+                                RpcRequest::AttachInput {
+                                    id: id_owned.clone(),
+                                    data,
+                                },
+                            )
+                            .await?;
+                        }
                         let data = map_mouse_to_sgr_input(mouse);
                         ipc::write_request_to_writer(
                             &mut write_half,
@@ -361,6 +457,81 @@ fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
     }
 }
 
+fn normalize_paste_text(data: String) -> String {
+    data.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn next_pending_key_burst_deadline() -> Instant {
+    Instant::now() + PASTE_BURST_WAIT
+}
+
+fn next_paste_key_suppression_deadline() -> Instant {
+    Instant::now() + PASTE_KEY_SUPPRESS_WINDOW
+}
+
+fn pending_key_burst_poll_timeout(pending: Option<&PendingKeyBurst>) -> Duration {
+    pending.map_or(Duration::from_millis(0), |pending| {
+        pending.deadline.saturating_duration_since(Instant::now())
+    })
+}
+
+fn should_suppress_paste_followup_key(key: KeyEvent, deadline: Option<Instant>) -> bool {
+    let Some(deadline) = deadline else {
+        return false;
+    };
+
+    if Instant::now() >= deadline {
+        return false;
+    }
+
+    is_clipboard_paste_key(key)
+        || matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
+}
+
+fn take_pending_key_burst_data(pending: &mut Option<PendingKeyBurst>) -> Option<String> {
+    pending.take().map(|pending| pending.data)
+}
+
+fn push_pending_key_burst(
+    pending: &mut Option<PendingKeyBurst>,
+    key: KeyEvent,
+    app_cursor_keys: bool,
+) -> bool {
+    let Some(data) = paste_candidate_key_data(key, app_cursor_keys) else {
+        return false;
+    };
+
+    match pending {
+        Some(pending) => {
+            pending.data.push_str(&data);
+            pending.deadline = next_pending_key_burst_deadline();
+        }
+        None => {
+            *pending = Some(PendingKeyBurst {
+                data,
+                deadline: next_pending_key_burst_deadline(),
+            });
+        }
+    }
+
+    true
+}
+
+fn paste_candidate_key_data(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
+    match key.code {
+        KeyCode::Enter => Some("\r".to_string()),
+        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => Some("\t".to_string()),
+        KeyCode::Char(_)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            map_key_to_input(key, app_cursor_keys)
+        }
+        _ => None,
+    }
+}
+
 fn maybe_collect_clipboard_paste(
     config: &AppConfig,
     id: &str,
@@ -372,13 +543,15 @@ fn maybe_collect_clipboard_paste(
         return Ok(None);
     }
 
-    Ok(clipboard::collect_clipboard_paste(config, id)?
+    Ok(clipboard::collect_clipboard_paste(config, id, true)?
+        .map(normalize_paste_text)
         .map(|data| wrap_paste_input(data, bracketed_paste_mode)))
 }
 
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
-    (key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+    matches!(key.code, KeyCode::Char('\u{16}'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
         || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert))
 }
 
@@ -556,6 +729,72 @@ mod tests {
         assert_eq!(
             wrap_paste_input("hello\nworld".to_string(), true),
             "\x1b[200~hello\nworld\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn test_normalize_paste_text_converts_crlf_to_lf() {
+        assert_eq!(
+            normalize_paste_text("line1\r\nline2\r\nline3".to_string()),
+            "line1\nline2\nline3"
+        );
+    }
+
+    #[test]
+    fn test_normalize_paste_text_converts_lone_cr_to_lf() {
+        assert_eq!(
+            normalize_paste_text("line1\rline2\rline3".to_string()),
+            "line1\nline2\nline3"
+        );
+    }
+
+    #[test]
+    fn test_is_clipboard_paste_key_accepts_ctrl_v_as_control_character() {
+        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('\u{16}'))));
+    }
+
+    #[test]
+    fn test_is_clipboard_paste_key_accepts_bare_control_character() {
+        assert!(is_clipboard_paste_key(press(KeyCode::Char('\u{16}'))));
+    }
+
+    #[test]
+    fn test_paste_candidate_key_data_accepts_plain_text_keys() {
+        assert_eq!(
+            paste_candidate_key_data(press(KeyCode::Char('a')), false),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            paste_candidate_key_data(press(KeyCode::Enter), false),
+            Some("\r".to_string())
+        );
+    }
+
+    #[test]
+    fn test_paste_candidate_key_data_rejects_control_keys() {
+        assert_eq!(
+            paste_candidate_key_data(ctrl_press(KeyCode::Char('c')), false),
+            None
+        );
+        assert_eq!(paste_candidate_key_data(press(KeyCode::Left), false), None);
+    }
+
+    #[test]
+    fn test_push_pending_key_burst_appends_text() {
+        let mut pending = None;
+        assert!(push_pending_key_burst(
+            &mut pending,
+            press(KeyCode::Char('a')),
+            false
+        ));
+        assert!(push_pending_key_burst(
+            &mut pending,
+            press(KeyCode::Char('b')),
+            false
+        ));
+        assert_eq!(
+            take_pending_key_burst_data(&mut pending),
+            Some("ab".to_string())
         );
     }
 

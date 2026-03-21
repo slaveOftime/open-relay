@@ -9,7 +9,11 @@ use crate::{
     error::{AppError, Result},
 };
 
-pub fn collect_clipboard_paste(config: &AppConfig, id: &str) -> Result<Option<String>> {
+pub fn collect_clipboard_paste(
+    config: &AppConfig,
+    id: &str,
+    ignore_text: bool,
+) -> Result<Option<String>> {
     if let Some(paths) = read_clipboard_files()? {
         let files_dir = ensure_session_files_dir(config, id)?;
         let mut saved_paths = Vec::with_capacity(paths.len());
@@ -24,6 +28,10 @@ pub fn collect_clipboard_paste(config: &AppConfig, id: &str) -> Result<Option<St
         let files_dir = ensure_session_files_dir(config, id)?;
         let saved_path = save_clipboard_image(&files_dir, image)?;
         return Ok(Some(saved_path.display().to_string()));
+    }
+
+    if ignore_text {
+        return Ok(None);
     }
 
     read_clipboard_text()

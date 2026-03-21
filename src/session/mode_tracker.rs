@@ -22,6 +22,8 @@ pub struct ModeTracker {
     bracketed_paste_mode: bool,
     state: State,
     param: u32,
+    pending_app_cursor_keys: bool,
+    pending_bracketed_paste_mode: bool,
 }
 
 impl ModeTracker {
@@ -31,6 +33,8 @@ impl ModeTracker {
             bracketed_paste_mode: false,
             state: State::Normal,
             param: 0,
+            pending_app_cursor_keys: false,
+            pending_bracketed_paste_mode: false,
         }
     }
 
@@ -66,6 +70,7 @@ impl ModeTracker {
                     if b == b'?' {
                         self.state = State::CsiPrivate;
                         self.param = 0;
+                        self.clear_pending_modes();
                     } else {
                         // Not a DEC private sequence — skip.
                         self.state = if b == 0x1b { State::Esc } else { State::Normal };
@@ -88,14 +93,20 @@ impl ModeTracker {
                             .param
                             .saturating_mul(10)
                             .saturating_add((b - b'0') as u32);
+                    } else if b == b';' {
+                        self.record_current_param();
+                        self.param = 0;
                     } else if b == b'h' {
-                        self.apply(true);
+                        self.record_current_param();
+                        self.apply_pending(true);
                         self.state = State::Normal;
                     } else if b == b'l' {
-                        self.apply(false);
+                        self.record_current_param();
+                        self.apply_pending(false);
                         self.state = State::Normal;
                     } else {
                         // Unexpected byte — reset.
+                        self.clear_pending_modes();
                         self.state = if b == 0x1b { State::Esc } else { State::Normal };
                     }
                 }
@@ -106,12 +117,28 @@ impl ModeTracker {
         if after != before { Some(after) } else { None }
     }
 
-    fn apply(&mut self, enable: bool) {
+    fn record_current_param(&mut self) {
         match self.param {
-            1 => self.app_cursor_keys = enable,
-            2004 => self.bracketed_paste_mode = enable,
+            1 => self.pending_app_cursor_keys = true,
+            2004 => self.pending_bracketed_paste_mode = true,
             _ => {}
         }
+    }
+
+    fn apply_pending(&mut self, enable: bool) {
+        if self.pending_app_cursor_keys {
+            self.app_cursor_keys = enable;
+        }
+        if self.pending_bracketed_paste_mode {
+            self.bracketed_paste_mode = enable;
+        }
+        self.param = 0;
+        self.clear_pending_modes();
+    }
+
+    fn clear_pending_modes(&mut self) {
+        self.pending_app_cursor_keys = false;
+        self.pending_bracketed_paste_mode = false;
     }
 }
 
@@ -160,11 +187,37 @@ mod tests {
     }
 
     #[test]
+    fn combined_modes_in_single_sequence() {
+        let mut t = ModeTracker::new();
+        let snap = t.process(b"\x1b[?1;2004h").unwrap();
+        assert!(snap.app_cursor_keys);
+        assert!(snap.bracketed_paste_mode);
+    }
+
+    #[test]
+    fn combined_modes_disable_in_single_sequence() {
+        let mut t = ModeTracker::new();
+        t.process(b"\x1b[?1;2004h");
+        let snap = t.process(b"\x1b[?1;2004l").unwrap();
+        assert!(!snap.app_cursor_keys);
+        assert!(!snap.bracketed_paste_mode);
+    }
+
+    #[test]
     fn split_across_chunks() {
         let mut t = ModeTracker::new();
         // Split "\x1b[?2004h" between "200" and "4h"
         assert!(t.process(b"\x1b[?200").is_none());
         let snap = t.process(b"4h").unwrap();
+        assert!(snap.bracketed_paste_mode);
+    }
+
+    #[test]
+    fn combined_modes_split_across_chunks() {
+        let mut t = ModeTracker::new();
+        assert!(t.process(b"\x1b[?1;200").is_none());
+        let snap = t.process(b"4h").unwrap();
+        assert!(snap.app_cursor_keys);
         assert!(snap.bracketed_paste_mode);
     }
 
