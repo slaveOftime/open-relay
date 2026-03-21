@@ -68,6 +68,34 @@ fn list_without_daemon_succeeds_gracefully() {
     }
 }
 
+#[test]
+fn list_json_without_daemon_prints_machine_readable_output() {
+    let tmp = make_tmp_dir("list_json_no_daemon");
+    let output = oly_cmd(&tmp)
+        .args(["ls", "--json"])
+        .output()
+        .expect("failed to run oly ls --json");
+
+    assert!(
+        output.status.success(),
+        "`oly ls --json` should exit 0 without a daemon; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout should be valid JSON");
+
+    assert_eq!(value["items"], serde_json::json!([]));
+    assert_eq!(value["total"], serde_json::json!(0));
+    assert_eq!(value["offset"], serde_json::json!(0));
+    assert_eq!(value["limit"], serde_json::json!(10));
+    assert!(
+        !stdout.contains("No sessions"),
+        "json output should not mix table/hint text into stdout: {stdout}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // oly --help – short, neutral language
 // ---------------------------------------------------------------------------
