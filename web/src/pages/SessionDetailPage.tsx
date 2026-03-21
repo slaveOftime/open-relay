@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import type { SessionSummary } from '@/api/types'
 import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from '@/api/client'
-import { formatAge } from '@/utils/format'
+import { formatAge, sessionDisplayName } from '@/utils/format'
 import {
   appendLogChunks,
   encodeLogChunks,
@@ -13,6 +13,7 @@ import {
   type LogReplayState,
 } from '@/utils/logReplay'
 import StatusBadge from '@/components/StatusBadge'
+import CommandLogo from '@/components/CommandLogo'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
 import { Button } from '@/components/ui/button'
@@ -1129,7 +1130,10 @@ export default function SessionDetailPage() {
         {session && (
           <div className="flex items-center gap-x-4 gap-y-0.5 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-xs text-[hsl(var(--muted-foreground))] shrink-0 flex-wrap">
             <span className="text-[hsl(var(--foreground))] font-mono truncate max-w-[50vw] sm:max-w-none">
-              {session.command} {session.args.join(' ')}
+              <span className="inline-flex min-w-0 items-center gap-2">
+                <CommandLogo command={session.command} size={18} />
+                <span className="truncate">{sessionDisplayName(session)}</span>
+              </span>
             </span>
             {session.cwd && (
               <span className="hidden sm:inline">

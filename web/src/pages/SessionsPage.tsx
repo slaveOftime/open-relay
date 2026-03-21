@@ -28,6 +28,7 @@ import {
   parseArgString,
 } from '@/utils/format'
 import Logo from '@/components/Logo'
+import CommandLogo from '@/components/CommandLogo'
 import SseStatusDot from '@/components/SseStatusDot'
 import StatusBadge from '@/components/StatusBadge'
 import SparklineSvg, { SparklineStore } from '@/components/SparklineSvg'
@@ -170,6 +171,13 @@ function normalizeStoredNode(value: unknown): string | null {
   return trimmed === '' ? null : trimmed
 }
 
+function matchesSelectedNode(
+  selectedNode: string | null,
+  eventNode: string | null | undefined
+): boolean {
+  return (selectedNode ?? null) === normalizeStoredNode(eventNode)
+}
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
     const message = error.message.trim()
@@ -252,6 +260,25 @@ function SkeletonCard() {
   )
 }
 
+function GroupHeaderLabel({
+  groupBy,
+  keyLabel,
+  items,
+}: {
+  groupBy: GroupBy
+  keyLabel: string
+  items: SessionSummary[]
+}) {
+  if (groupBy !== 'command') return <>{keyLabel}</>
+  const groupCommand = items[0]?.command ?? keyLabel
+  return (
+    <span className="inline-flex items-center gap-2">
+      <CommandLogo command={groupCommand} size={16} />
+      <span>{keyLabel}</span>
+    </span>
+  )
+}
+
 // ── Session Row ────────────────────────────────────────────────────────────
 
 function SessionRow({
@@ -322,8 +349,9 @@ function SessionRow({
 
         {/* CMD */}
         <TableCell className="px-3 py-2.5 truncate max-w-0">
-          <span className="text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            {sessionDisplayName(session)}
+          <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+            <CommandLogo command={session.command} size={18} />
+            <span className="truncate">{sessionDisplayName(session)}</span>
           </span>
         </TableCell>
 
@@ -504,8 +532,13 @@ function SessionCard({
                   {session.title}
                 </span>
               )}
-              <span className={`block text-base font-medium truncate leading-snug ${titleTone}`}>
-                {session.command} {session.args ? session.args.join(' ') : ''}
+              <span
+                className={`flex min-w-0 items-center gap-2 text-base font-medium leading-snug ${titleTone}`}
+              >
+                <CommandLogo command={session.command} size={18} />
+                <span className="truncate">
+                  {session.command} {session.args ? session.args.join(' ') : ''}
+                </span>
               </span>
             </span>
           </Button>
@@ -1136,19 +1169,20 @@ export default function SessionsPage() {
         return
       }
       if (ev.event === 'session_created') {
-        if (selectedNode) return
+        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         updateSparklineForSession(ev.data)
         void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_updated') {
-        if (selectedNode) return
+        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         updateSparklineForSession(ev.data)
         replaceLoadedSession(ev.data)
         return
       }
       if (ev.event === 'session_deleted') {
-        if (selectedNode) return
+        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
+        removeLoadedSession(ev.data.id)
         sparklines.remove(ev.data.id)
         void reloadSessions({ background: true })
         return
@@ -1606,7 +1640,7 @@ export default function SessionsPage() {
                 <div key={key || '__flat__'}>
                   {groupBy !== 'none' && key && (
                     <div className="px-4 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-t border-[hsl(var(--border))]">
-                      {key}
+                      <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                     </div>
                   )}
                   {items.map((s) => (
@@ -1709,7 +1743,7 @@ export default function SessionsPage() {
                           colSpan={8}
                           className="px-3 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-[hsl(var(--border))]"
                         >
-                          {key}
+                          <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                         </TableCell>
                       </TableRow>
                     )}
