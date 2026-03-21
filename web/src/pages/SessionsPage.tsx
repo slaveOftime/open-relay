@@ -1155,8 +1155,7 @@ export default function SessionsPage() {
       }
       if (ev.event === 'session_notification') {
         if (pushStateRef.current === 'subscribed') return
-        const tag = ev.data.session_ids[0] ?? 'open-relay-session-notification'
-        void showSessionNotification(ev.data.summary, ev.data.body, tag)
+        void showSessionNotification(ev.data)
         return
       }
     }, setSseStatus)

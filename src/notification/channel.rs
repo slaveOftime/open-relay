@@ -44,8 +44,12 @@ impl LocalOsNotificationChannel {
     ///
     /// Supported placeholders:
     /// - `{kind}`           – e.g. `input_needed`
-    /// - `{summary}`        – one-line summary
+    /// - `{title}`          – one-line notification title
+    /// - `{summary}`        – alias for `{title}` for backwards compatibility
+    /// - `{description}`    – short notification description
     /// - `{body}`           – notification body text
+    /// - `{rendered_body}`  – description + body combined for display
+    /// - `{navigation_url}` – destination URL, or empty string
     /// - `{session_ids}`    – comma-separated session IDs
     /// - `{trigger_rule}`   – trigger rule name, or empty string
     /// - `{trigger_detail}` – trigger detail, or empty string
@@ -68,6 +72,7 @@ impl LocalOsNotificationChannel {
             .map(|r| r.as_str().to_string())
             .unwrap_or_default();
         let trigger_detail = event.trigger_detail.clone().unwrap_or_default();
+        let navigation_url = event.navigation_url.clone().unwrap_or_default();
 
         let tokens = match split_hook_command(hook) {
             Some(t) => t,
@@ -79,8 +84,10 @@ impl LocalOsNotificationChannel {
 
         let substitute = |s: String| -> String {
             s.replace("{kind}", event.kind.as_str())
-                .replace("{summary}", &event.summary)
+                .replace("{title}", &event.title)
+                .replace("{description}", &event.description)
                 .replace("{body}", &event.body)
+                .replace("{navigation_url}", &navigation_url)
                 .replace("{session_ids}", &session_ids)
                 .replace("{trigger_rule}", &trigger_rule)
                 .replace("{trigger_detail}", &trigger_detail)
@@ -95,8 +102,10 @@ impl LocalOsNotificationChannel {
         let result = std::process::Command::new(&program)
             .args(&args)
             .env("OLY_EVENT_KIND", event.kind.as_str())
-            .env("OLY_EVENT_SUMMARY", &event.summary)
+            .env("OLY_EVENT_TITLE", &event.title)
+            .env("OLY_EVENT_DESCRIPTION", &event.description)
             .env("OLY_EVENT_BODY", &event.body)
+            .env("OLY_EVENT_NAVIGATION_URL", &navigation_url)
             .env("OLY_EVENT_SESSION_IDS", &session_ids)
             .env("OLY_EVENT_TRIGGER_RULE", &trigger_rule)
             .env("OLY_EVENT_TRIGGER_DETAIL", &trigger_detail)
@@ -127,8 +136,8 @@ impl NotificationChannel for LocalOsNotificationChannel {
             LocalOsNotificationChannel::play_beep();
 
             notify_rust::Notification::new()
-                .summary(&format!("oly: {}", event.summary))
-                .body(&event.body)
+                .summary(&format!("oly: {}", event.title))
+                .body(&event.rendered_body())
                 .show()
                 .map_err(|err| {
                     AppError::Protocol(format!("OS notification delivery failed: {err}"))
@@ -330,8 +339,10 @@ impl NotificationChannel for WebPushChannel {
         }
 
         let payload = serde_json::json!({
-            "summary": event.summary,
+            "title": event.title,
+            "description": event.description,
             "body": event.body,
+            "navigation_url": event.navigation_url,
             "session_ids": event.session_ids,
         })
         .to_string();

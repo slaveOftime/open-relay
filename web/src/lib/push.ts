@@ -1,5 +1,12 @@
 import { deletePushSubscription, fetchPushPublicKey, upsertPushSubscription } from '@/api/client'
-import type { PushSubscriptionInput } from '@/api/types'
+import type { PushSubscriptionInput, SessionNotificationData } from '@/api/types'
+
+import {
+  notificationBody,
+  notificationNavigationUrl,
+  notificationTag,
+  notificationTitle,
+} from '@/lib/notifications'
 
 export type PushSetupState = 'unsupported' | 'unconfigured' | 'denied' | 'idle' | 'subscribed'
 
@@ -149,21 +156,25 @@ export async function disablePushNotifications(): Promise<PushSetupState> {
   return nextState
 }
 
-export async function showSessionNotification(
-  summary: string,
-  body: string,
-  tag: string
-): Promise<void> {
+export async function showSessionNotification(payload: SessionNotificationData): Promise<void> {
   if (!('Notification' in window) || Notification.permission !== 'granted') return
 
+  const title = notificationTitle(payload)
+  const body = notificationBody(payload)
+  const tag = notificationTag(payload)
   const registration = await navigator.serviceWorker.getRegistration(PUSH_SW_SCOPE)
   if (registration) {
-    await registration.showNotification(summary, {
+    await registration.showNotification(title, {
       body,
       tag,
+      data: payload,
     })
     return
   }
 
-  new Notification(summary, { body, tag })
+  const notification = new Notification(title, { body, tag, data: payload })
+  notification.onclick = () => {
+    window.focus()
+    window.location.assign(notificationNavigationUrl(payload))
+  }
 }

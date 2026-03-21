@@ -321,8 +321,11 @@ pub enum NodeWsMessage {
     /// Secondary -> Primary: notification event produced by the secondary daemon.
     Notification {
         kind: String,
-        summary: String,
+        title: String,
+        description: String,
         body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        navigation_url: Option<String>,
         session_ids: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_rule: Option<String>,

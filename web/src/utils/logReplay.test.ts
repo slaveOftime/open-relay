@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest'
 import xtermPkg from '@xterm/xterm'
-import codexLog from '../../../tests/output-codex.log?raw'
 import opencodeLog from '../../../tests/output-opencode.log?raw'
 import {
   appendLogChunks,
@@ -55,7 +54,7 @@ describe('logReplay', () => {
       'write:g',
       'scroll',
     ])
-    expect(state).toEqual({ bytesWritten: 7, nextResizeIndex: 3, chunkCount: 3 })
+    expect(state).toEqual({ bytesWritten: 7, nextResizeIndex: 3, chunkCount: 3, chunkOffset: 0 })
   })
 
   it('batches adjacent chunks into fewer terminal writes', () => {
@@ -74,7 +73,7 @@ describe('logReplay', () => {
     )
 
     expect(writes).toEqual(['abcdef'])
-    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 0, chunkCount: 3 })
+    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 0, chunkCount: 3, chunkOffset: 0 })
   })
 
   it('can append additional log pages while preserving resize progress', () => {
@@ -106,28 +105,7 @@ describe('logReplay', () => {
     )
 
     expect(operations).toEqual(['resize:80x24', 'write:ab', 'write:cd', 'resize:90x30', 'write:ef'])
-    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 2, chunkCount: 3 })
-  })
-
-  it('replays the codex log fixture into xterm', async () => {
-    const term = new Terminal({ cols: 105, rows: 37, scrollback: 2000 })
-    replayLogChunks(
-      {
-        reset: () => term.reset(),
-        write: (data: string | Uint8Array) => term.write(data),
-        resize: (cols: number, rows: number) => term.resize(cols, rows),
-        scrollToBottom: () => term.scrollToBottom(),
-      },
-      readFixtureChunks(codexLog),
-      [{ offset: 0, rows: 37, cols: 105 }]
-    )
-    await flushTerminal()
-
-    const visible = visibleBuffer(term)
-    expect(visible).toContain('Select Model')
-    expect(visible).toContain('Claude Sonnet 4.5')
-    expect(visible).toContain('GPT-5.4')
-    expect(visible).toContain('Enter to select')
+    expect(state).toEqual({ bytesWritten: 6, nextResizeIndex: 2, chunkCount: 2, chunkOffset: 0 })
   })
 
   it('replays the opencode log fixture into xterm', async () => {

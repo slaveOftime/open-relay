@@ -192,13 +192,15 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                             }
                             Ok(NodeWsMessage::Notification {
                                 kind,
-                                summary,
+                                title,
+                                description,
                                 body,
+                                navigation_url,
                                 session_ids,
                                 trigger_rule,
                                 trigger_detail,
                             }) => {
-                                let summary = format!("[{}] {}", name, summary);
+                                let title = format!("[{}] {}", name, title);
                                 let trigger_rule_enum =
                                     trigger_rule.as_deref().and_then(NotificationTriggerRule::parse);
                                 let maybe_kind = match kind.as_str() {
@@ -210,8 +212,10 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                 if let Some(kind_enum) = maybe_kind {
                                     let event = NotificationEvent {
                                         kind: kind_enum,
-                                        summary: summary.clone(),
+                                        title: title.clone(),
+                                        description: description.clone(),
                                         body: body.clone(),
+                                        navigation_url: navigation_url.clone(),
                                         session_ids: session_ids.clone(),
                                         trigger_rule: trigger_rule_enum,
                                         trigger_detail: trigger_detail.clone(),
@@ -232,8 +236,10 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
                                 let _ = state.event_tx.send(crate::session::SessionEvent::SessionNotification {
                                     kind,
-                                    summary,
+                                    title,
+                                    description,
                                     body,
+                                    navigation_url,
                                     session_ids,
                                     trigger_rule,
                                     trigger_detail,

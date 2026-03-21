@@ -54,12 +54,12 @@ pub fn strip_ansi_for_body(input: &str) -> String {
 /// Normalizes notification body content to language-oriented text.
 ///
 /// Kept:
-/// - Unicode alphabetic characters (`char::is_alphabetic`), including non-Latin scripts.
+/// - Unicode alphanumeric characters (`char::is_alphanumeric`), including non-Latin scripts.
 /// - Common punctuation: `.,;:!?'-_()[]{}"/@#&+*=<>%$\\|`
 /// - Whitespace collapsed to a single ASCII space.
 ///
 /// Dropped:
-/// - Digits, emoji, control characters, and other symbols.
+/// - Emoji, control characters, and other symbols.
 pub fn sanitize_body(s: &str) -> String {
     const COMMON_PUNCTUATION: &str = ".,;:!?'-_()[]{}\"/@#&+*=<>%$\\|";
 
@@ -67,7 +67,7 @@ pub fn sanitize_body(s: &str) -> String {
     let mut last_was_space = false;
 
     for ch in s.chars() {
-        if ch.is_alphabetic() || COMMON_PUNCTUATION.contains(ch) {
+        if ch.is_alphanumeric() || COMMON_PUNCTUATION.contains(ch) {
             out.push(ch);
             last_was_space = false;
         } else if ch.is_whitespace() {
@@ -320,12 +320,12 @@ mod tests {
     #[test]
     fn test_sanitize_body_keeps_letters_spaces_and_punctuation() {
         let input = "  123  Héllo, 世界!   [ok]?  ";
-        assert_eq!(sanitize_body(input), "Héllo, 世界! [ok]?");
+        assert_eq!(sanitize_body(input), "123 Héllo, 世界! [ok]?");
     }
 
     #[test]
     fn test_sanitize_body_drops_emoji_and_symbols() {
         let input = "Ready ✅ @ 42% -> go🚀";
-        assert_eq!(sanitize_body(input), "Ready @ % -> go");
+        assert_eq!(sanitize_body(input), "Ready @ 42% -> go");
     }
 }

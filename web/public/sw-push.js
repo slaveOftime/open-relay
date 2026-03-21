@@ -1,7 +1,9 @@
 self.addEventListener('push', (event) => {
   let payload = {
-    summary: 'Open Relay notification',
+    title: 'Open Relay notification',
+    description: '',
     body: '',
+    navigation_url: '/',
     session_ids: [],
   }
 
@@ -13,9 +15,11 @@ self.addEventListener('push', (event) => {
     }
   }
 
-  const title = payload.summary || 'Open Relay notification'
+  const description = (payload.description || '').trim()
+  const body = (payload.body || '').trim()
+  const title = (payload.title || '').trim() || 'Open Relay notification'
   const options = {
-    body: payload.body || '',
+    body: description && body ? `${description}\n\n${body}` : description || body,
     tag: payload.session_ids?.[0] || 'open-relay-session-notification',
     data: payload,
   }
@@ -26,8 +30,7 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close()
 
-  const sessionId = event.notification?.data?.session_ids?.[0]
-  const targetUrl = sessionId ? `/session/${encodeURIComponent(sessionId)}` : '/'
+  const targetUrl = event.notification?.data?.navigation_url || '/'
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
