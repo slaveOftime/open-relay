@@ -164,6 +164,30 @@ impl SessionRuntime {
             && self.notified_output_epoch == self.last_output_at
     }
 
+    pub fn set_notifications_enabled(&mut self, enabled: bool) {
+        if self.notifications_enabled == enabled {
+            return;
+        }
+        self.notifications_enabled = enabled;
+        info!(
+            session_id = %self.meta.id,
+            notifications_enabled = enabled,
+            "session notification setting updated"
+        );
+        let event = if enabled {
+            "notifications enabled"
+        } else {
+            "notifications disabled"
+        };
+        if let Err(err) = append_event(&self.dir, event) {
+            warn!(
+                session_id = %self.meta.id,
+                %err,
+                "failed to persist notification-setting event"
+            );
+        }
+    }
+
     /// Returns `true` when at least one attach subscriber is currently live.
     #[allow(dead_code)]
     pub fn has_active_attach_client(&self) -> bool {

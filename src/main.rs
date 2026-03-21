@@ -16,7 +16,7 @@ mod terminal_guards;
 mod utils;
 
 use clap::Parser;
-use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand};
+use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
 use crossterm::terminal;
 use error::{AppError, Result};
 use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
@@ -221,6 +221,36 @@ async fn run() -> Result<()> {
                         eprintln!(
                             "warning: started session {session_id}, but failed to attach: {err}"
                         );
+                    }
+                    Ok(())
+                }
+                _ => Err(AppError::Protocol("unexpected response type".to_string())),
+            }
+        }
+
+        Commands::Notify(notify_args) => {
+            let (id, enabled, node) = match notify_args.command {
+                NotifyCommand::Disable(args) => {
+                    let id =
+                        resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+                    (id, false, args.node)
+                }
+                NotifyCommand::Enable(args) => {
+                    let id =
+                        resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+                    (id, true, args.node)
+                }
+            };
+            let inner = RpcRequest::NotifySet {
+                id: id.clone(),
+                enabled,
+            };
+            match ipc::send_request_checked(&config, node_wrap(node, inner)).await? {
+                RpcResponse::Ack => {
+                    if enabled {
+                        println!("Notifications enabled for session {id}.");
+                    } else {
+                        println!("Notifications disabled for session {id}.");
                     }
                     Ok(())
                 }

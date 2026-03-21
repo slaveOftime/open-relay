@@ -127,12 +127,62 @@ Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logge
 
 ---
 
+## Notification hooks 🔔
+
+If the built-in OS notification is not enough, `oly` can also launch your own hook command on every delivered notification. This is useful for piping alerts into Slack wrappers, custom desktop automation, pagers, or supervisor scripts.
+
+Set `notification_hook` in your `config.json` under the `OLY_STATE_DIR` state folder:
+
+```json
+{
+  "notification_hook": "python C:\\scripts\\oly_notify.py {kind} {session_ids}"
+}
+```
+
+The hook is spawned fire-and-forget after local notification delivery. Arguments support placeholder substitution from the event payload:
+
+- `{kind}`
+- `{title}` and `{summary}` (same title value)
+- `{description}`
+- `{body}`
+- `{navigation_url}`
+- `{node}`
+- `{session_ids}`
+- `{trigger_rule}`
+- `{trigger_detail}`
+
+The same data is also exported as environment variables:
+
+- `OLY_EVENT_KIND`
+- `OLY_EVENT_TITLE`
+- `OLY_EVENT_SUMMARY` (same value as `OLY_EVENT_TITLE`)
+- `OLY_EVENT_DESCRIPTION`
+- `OLY_EVENT_BODY`
+- `OLY_EVENT_NAVIGATION_URL`
+- `OLY_EVENT_NODE`
+- `OLY_EVENT_SESSION_IDS`
+- `OLY_EVENT_TRIGGER_RULE`
+- `OLY_EVENT_TRIGGER_DETAIL`
+
+Example:
+
+```json
+{
+  "notification_hook": "pwsh -File C:\\scripts\\notify.ps1 {kind} {node} {session_ids}"
+}
+```
+
+Use quoted arguments if values may contain spaces. Hooks are best-effort: failures are logged, but they do not block session execution or notification delivery.
+
+---
+
 ## Commands 📋
 
 | Command | What it does |
 |---|---|
 | `oly daemon start` | Start background daemon |
 | `oly start [--detach] [--disable-notifications] [--cwd DIR] <cmd>` | Launch session in PTY |
+| `oly notify <enable\|disable\|suppress> <id>` | Toggle notifications for a running session |
 | `oly ls` | Show sessions (supports search/status/time filters) |
 | `oly attach <id>` | Reattach (replays buffer first) |
 | `oly logs <id> [--tail N] [--wait-for-prompt] [--timeout DURATION]` | Read logs without attaching |

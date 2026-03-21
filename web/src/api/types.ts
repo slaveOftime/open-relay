@@ -68,6 +68,7 @@ export interface SessionSummary {
   created_at: string // ISO 8601
   cwd: string | null
   input_needed: boolean
+  node?: string | null
 }
 
 export interface CreateSessionSpec {
@@ -127,7 +128,7 @@ export type SessionEvent =
   | { event: 'snapshot'; data: SessionSummary[] }
   | { event: 'session_created'; data: SessionSummary }
   | { event: 'session_updated'; data: SessionSummary }
-  | { event: 'session_deleted'; data: { id: string } }
+  | { event: 'session_deleted'; data: { id: string; node?: string | null } }
   | {
       event: 'session_notification'
       data: SessionNotificationData
@@ -142,6 +143,7 @@ export type SessionNotificationData = {
   session_ids: string[]
   trigger_rule?: string
   trigger_detail?: string
+  node?: string | null
 }
 
 // ---------------------------------------------------------------------------

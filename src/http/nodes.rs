@@ -15,6 +15,7 @@ use crate::{
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
     protocol::{NodeSummary, NodeWsMessage, RpcResponse},
+    session::SessionEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -200,41 +201,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                 trigger_rule,
                                 trigger_detail,
                             }) => {
-                                let title = format!("[{}] {}", name, title);
-                                let trigger_rule_enum =
-                                    trigger_rule.as_deref().and_then(NotificationTriggerRule::parse);
-                                let maybe_kind = match kind.as_str() {
-                                    "input_needed" => Some(NotificationKind::InputNeeded),
-                                    "startup_recovery" => Some(NotificationKind::StartupRecovery),
-                                    _ => None,
-                                };
-
-                                if let Some(kind_enum) = maybe_kind {
-                                    let event = NotificationEvent {
-                                        kind: kind_enum,
-                                        title: title.clone(),
-                                        description: description.clone(),
-                                        body: body.clone(),
-                                        navigation_url: navigation_url.clone(),
-                                        session_ids: session_ids.clone(),
-                                        trigger_rule: trigger_rule_enum,
-                                        trigger_detail: trigger_detail.clone(),
-                                    };
-                                    let outcome = state.notifier.dispatch(&event).await;
-                                    if !outcome.any_delivered() {
-                                        warn!(
-                                            node = %name,
-                                            kind = %kind,
-                                            attempted = outcome.attempted,
-                                            failed_channels = ?outcome.failed_channels,
-                                            "forwarded notification delivery failed on all channels"
-                                        );
-                                    }
-                                } else {
-                                    warn!(node = %name, kind = %kind, "unknown forwarded notification kind");
-                                }
-
-                                let _ = state.event_tx.send(crate::session::SessionEvent::SessionNotification {
+                                let payload = SessionEvent::SessionNotification {
                                     kind,
                                     title,
                                     description,
@@ -243,7 +210,12 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                     session_ids,
                                     trigger_rule,
                                     trigger_detail,
-                                });
+                                    node: Some(name.clone()),
+                                };
+                                handle_forwarded_session_event(&state, &name, payload).await;
+                            }
+                            Ok(NodeWsMessage::SessionEvent { payload }) => {
+                                handle_forwarded_session_event(&state, &name, payload).await;
                             }
                             _ => {}
                         }
@@ -273,6 +245,65 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
     state.node_registry.disconnect(&name).await;
     warn!(node = %name, "secondary node disconnected");
+}
+
+async fn handle_forwarded_session_event(state: &AppState, node_name: &str, payload: SessionEvent) {
+    let delivered = crate::http::sse::session_event_for_delivery(&payload, Some(node_name));
+
+    if let SessionEvent::SessionNotification {
+        kind,
+        title,
+        description,
+        body,
+        navigation_url,
+        session_ids,
+        trigger_rule,
+        trigger_detail,
+        ..
+    } = &delivered
+    {
+        let title = format!("[{}] {}", node_name, title);
+        let delivered_node = match &delivered {
+            SessionEvent::SessionNotification { node, .. } => node.clone(),
+            _ => None,
+        };
+        let trigger_rule_enum = trigger_rule
+            .as_deref()
+            .and_then(NotificationTriggerRule::parse);
+        let maybe_kind = match kind.as_str() {
+            "input_needed" => Some(NotificationKind::InputNeeded),
+            "startup_recovery" => Some(NotificationKind::StartupRecovery),
+            _ => None,
+        };
+
+        if let Some(kind_enum) = maybe_kind {
+            let event = NotificationEvent {
+                kind: kind_enum,
+                title,
+                description: description.clone(),
+                body: body.clone(),
+                navigation_url: navigation_url.clone(),
+                session_ids: session_ids.clone(),
+                trigger_rule: trigger_rule_enum,
+                trigger_detail: trigger_detail.clone(),
+                node: delivered_node,
+            };
+            let outcome = state.notifier.dispatch(&event).await;
+            if !outcome.any_delivered() {
+                warn!(
+                    node = %node_name,
+                    kind = %kind,
+                    attempted = outcome.attempted,
+                    failed_channels = ?outcome.failed_channels,
+                    "forwarded notification delivery failed on all channels"
+                );
+            }
+        } else {
+            warn!(node = %node_name, kind = %kind, "unknown forwarded notification kind");
+        }
+    }
+
+    let _ = state.event_tx.send(delivered);
 }
 // ---------------------------------------------------------------------------
 // Helpers

@@ -273,7 +273,7 @@ function GroupHeaderLabel({
   const groupCommand = items[0]?.command ?? keyLabel
   return (
     <span className="inline-flex items-center gap-2">
-      <CommandLogo command={groupCommand} size={16} />
+      <CommandLogo command={groupCommand} size={24} />
       <span>{keyLabel}</span>
     </span>
   )
@@ -350,7 +350,7 @@ function SessionRow({
         {/* CMD */}
         <TableCell className="px-3 py-2.5 truncate max-w-0">
           <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            <CommandLogo command={session.command} size={18} />
+            <CommandLogo command={session.command} size={24} />
             <span className="truncate">{sessionDisplayName(session)}</span>
           </span>
         </TableCell>
@@ -535,7 +535,7 @@ function SessionCard({
               <span
                 className={`flex min-w-0 items-center gap-2 text-base font-medium leading-snug ${titleTone}`}
               >
-                <CommandLogo command={session.command} size={18} />
+                <CommandLogo command={session.command} size={24} />
                 <span className="truncate">
                   {session.command} {session.args ? session.args.join(' ') : ''}
                 </span>
@@ -1430,7 +1430,7 @@ export default function SessionsPage() {
                   <SelectContent>
                     <SelectItem value="none">No grouping</SelectItem>
                     <SelectItem value="cwd">Group by CWD</SelectItem>
-                    <SelectItem value="command">Group by agent</SelectItem>
+                    <SelectItem value="command">Group by CMD</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select

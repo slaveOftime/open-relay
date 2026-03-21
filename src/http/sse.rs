@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tracing::{debug, info, warn};
 
 use crate::{
-    protocol::{ListQuery, ListSortField, SortOrder},
+    protocol::{ListQuery, ListSortField, SessionSummary, SortOrder},
     session::{SessionEvent, SessionLiveSummary, SessionStore},
 };
 
@@ -30,6 +30,12 @@ struct SessionFingerprint {
     last_output_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EncodedSessionEvent {
+    pub event_name: &'static str,
+    pub data: String,
+}
+
 impl From<&SessionLiveSummary> for SessionFingerprint {
     fn from(value: &SessionLiveSummary) -> Self {
         Self {
@@ -38,6 +44,101 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
             input_needed: value.summary.input_needed,
             last_output_at: value.last_output_at,
         }
+    }
+}
+
+fn merge_node(existing: &Option<String>, node: Option<&str>) -> Option<String> {
+    existing.clone().or_else(|| node.map(str::to_string))
+}
+
+pub(crate) fn session_summary_for_delivery(
+    summary: &SessionSummary,
+    node: Option<&str>,
+) -> SessionSummary {
+    let mut summary = summary.clone();
+    summary.node = merge_node(&summary.node, node);
+    summary
+}
+
+pub(crate) fn session_event_for_delivery(event: &SessionEvent, node: Option<&str>) -> SessionEvent {
+    match event {
+        SessionEvent::SessionCreated(summary) => {
+            SessionEvent::SessionCreated(session_summary_for_delivery(summary, node))
+        }
+        SessionEvent::SessionUpdated(summary) => {
+            SessionEvent::SessionUpdated(session_summary_for_delivery(summary, node))
+        }
+        SessionEvent::SessionDeleted { id, node: existing } => SessionEvent::SessionDeleted {
+            id: id.clone(),
+            node: merge_node(existing, node),
+        },
+        SessionEvent::SessionNotification {
+            kind,
+            title,
+            description,
+            body,
+            navigation_url,
+            session_ids,
+            trigger_rule,
+            trigger_detail,
+            node: existing,
+        } => SessionEvent::SessionNotification {
+            kind: kind.clone(),
+            title: title.clone(),
+            description: description.clone(),
+            body: body.clone(),
+            navigation_url: navigation_url.clone(),
+            session_ids: session_ids.clone(),
+            trigger_rule: trigger_rule.clone(),
+            trigger_detail: trigger_detail.clone(),
+            node: merge_node(existing, node),
+        },
+    }
+}
+
+pub(crate) fn encode_session_event(event: &SessionEvent) -> EncodedSessionEvent {
+    match event {
+        SessionEvent::SessionCreated(summary) => EncodedSessionEvent {
+            event_name: "session_created",
+            data: serde_json::to_string(summary).unwrap_or_default(),
+        },
+        SessionEvent::SessionUpdated(summary) => EncodedSessionEvent {
+            event_name: "session_updated",
+            data: serde_json::to_string(summary).unwrap_or_default(),
+        },
+        SessionEvent::SessionDeleted { id, node } => EncodedSessionEvent {
+            event_name: "session_deleted",
+            data: serde_json::to_string(&serde_json::json!({
+                "id": id,
+                "node": node,
+            }))
+            .unwrap_or_default(),
+        },
+        SessionEvent::SessionNotification {
+            kind,
+            title,
+            description,
+            body,
+            navigation_url,
+            session_ids,
+            trigger_rule,
+            trigger_detail,
+            node,
+        } => EncodedSessionEvent {
+            event_name: "session_notification",
+            data: serde_json::to_string(&serde_json::json!({
+                "kind": kind,
+                "title": title,
+                "description": description,
+                "body": body,
+                "navigation_url": navigation_url,
+                "session_ids": session_ids,
+                "trigger_rule": trigger_rule,
+                "trigger_detail": trigger_detail,
+                "node": node,
+            }))
+            .unwrap_or_default(),
+        },
     }
 }
 
@@ -59,7 +160,7 @@ pub(super) async fn run_session_poller(
         interval.tick().await;
         let sessions = store.list_live_summaries();
 
-        let mut seen_ids = std::collections::HashSet::with_capacity(last_sent.len());
+        let mut seen_ids = HashSet::with_capacity(last_sent.len());
 
         // First poll establishes a baseline without emitting any events.
         if !initialized {
@@ -111,7 +212,14 @@ pub async fn events_handler(
             sort: ListSortField::CreatedAt,
             order: SortOrder::Desc,
         };
-        state.store.list_summaries(&q).await.unwrap_or_default()
+        state
+            .store
+            .list_summaries(&q)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|summary| session_summary_for_delivery(&summary, None))
+            .collect::<Vec<_>>()
     };
 
     debug!(snapshot_count = initial.len(), "SSE client connected");
@@ -127,44 +235,10 @@ pub async fn events_handler(
     let live_stream = BroadcastStream::new(rx).filter_map(|msg| async move {
         match msg {
             Ok(ev) => {
-                let (event_name, data) = match &ev {
-                    super::SessionEvent::SessionCreated(s) => (
-                        "session_created",
-                        serde_json::to_string(s).unwrap_or_default(),
-                    ),
-                    super::SessionEvent::SessionUpdated(s) => (
-                        "session_updated",
-                        serde_json::to_string(s).unwrap_or_default(),
-                    ),
-                    super::SessionEvent::SessionDeleted { id } => (
-                        "session_deleted",
-                        serde_json::to_string(&serde_json::json!({ "id": id })).unwrap_or_default(),
-                    ),
-                    super::SessionEvent::SessionNotification {
-                        kind,
-                        title,
-                        description,
-                        body,
-                        navigation_url,
-                        session_ids,
-                        trigger_rule,
-                        trigger_detail,
-                    } => (
-                        "session_notification",
-                        serde_json::to_string(&serde_json::json!({
-                            "kind": kind,
-                            "title": title,
-                            "description": description,
-                            "body": body,
-                            "navigation_url": navigation_url,
-                            "session_ids": session_ids,
-                            "trigger_rule": trigger_rule,
-                            "trigger_detail": trigger_detail,
-                        }))
-                        .unwrap_or_default(),
-                    ),
-                };
-                Some(Ok(Event::default().event(event_name).data(data)))
+                let encoded = encode_session_event(&session_event_for_delivery(&ev, None));
+                Some(Ok(Event::default()
+                    .event(encoded.event_name)
+                    .data(encoded.data)))
             }
             Err(_) => {
                 warn!("SSE receiver lagged, dropping event");
@@ -174,4 +248,59 @@ pub async fn events_handler(
     });
 
     Sse::new(initial_stream.chain(live_stream)).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_session_event, session_event_for_delivery};
+    use crate::{protocol::SessionSummary, session::SessionEvent};
+    use chrono::{TimeZone, Utc};
+
+    fn sample_summary() -> SessionSummary {
+        SessionSummary {
+            id: "sess-123".to_string(),
+            title: Some("demo".to_string()),
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            pid: Some(42),
+            status: "running".to_string(),
+            age: "5m".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap(),
+            cwd: Some("C:\\work".to_string()),
+            input_needed: true,
+            node: None,
+        }
+    }
+
+    #[test]
+    fn delivery_helper_applies_node_to_summary_events() {
+        let event = SessionEvent::SessionUpdated(sample_summary());
+        let delivered = session_event_for_delivery(&event, Some("worker-a"));
+
+        let SessionEvent::SessionUpdated(summary) = delivered else {
+            panic!("expected session_updated");
+        };
+        assert_eq!(summary.node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn delivery_helper_applies_node_to_notifications() {
+        let event = SessionEvent::SessionNotification {
+            kind: "input_needed".to_string(),
+            title: "Input required".to_string(),
+            description: "Waiting".to_string(),
+            body: "Password:".to_string(),
+            navigation_url: Some("/session/sess-123?mode=attach".to_string()),
+            session_ids: vec!["sess-123".to_string()],
+            trigger_rule: Some("regex_pattern".to_string()),
+            trigger_detail: None,
+            node: None,
+        };
+
+        let delivered = session_event_for_delivery(&event, Some("worker-a"));
+        let encoded = encode_session_event(&delivered);
+
+        assert_eq!(encoded.event_name, "session_notification");
+        assert!(encoded.data.contains("\"node\":\"worker-a\""));
+    }
 }

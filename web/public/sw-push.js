@@ -1,3 +1,16 @@
+function notificationNavigationUrl(payload) {
+  const base =
+    typeof payload?.navigation_url === 'string' && payload.navigation_url.trim()
+      ? payload.navigation_url.trim()
+      : '/'
+  const node = typeof payload?.node === 'string' && payload.node.trim() ? payload.node.trim() : ''
+  const path =
+    !node || !base.startsWith('/')
+      ? base
+      : `${base}${base.includes('?') ? '&' : '?'}node=${encodeURIComponent(node)}`
+  return new URL(path, self.location.origin).toString()
+}
+
 self.addEventListener('push', (event) => {
   let payload = {
     title: 'Open Relay notification',
@@ -30,12 +43,18 @@ self.addEventListener('push', (event) => {
 self.addEventListener('notificationclick', (event) => {
   event.notification.close()
 
-  const targetUrl = event.notification?.data?.navigation_url || '/'
+  const targetUrl = notificationNavigationUrl(event.notification?.data || {})
 
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
-      if (clients.length > 0 && 'navigate' in clients[0]) {
-        return clients[0].navigate(targetUrl).then((client) => client?.focus?.())
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async (clients) => {
+      for (const client of clients) {
+        if (!('navigate' in client)) continue
+        try {
+          const navigated = await client.navigate(targetUrl)
+          if (navigated?.focus) return navigated.focus()
+        } catch {
+          // Fall back to opening a new app window if this client refuses navigation.
+        }
       }
       return self.clients.openWindow(targetUrl)
     })

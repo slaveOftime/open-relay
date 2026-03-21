@@ -52,6 +52,7 @@ pub struct NotificationEvent {
     pub session_ids: Vec<String>,
     pub trigger_rule: Option<NotificationTriggerRule>,
     pub trigger_detail: Option<String>,
+    pub node: Option<String>,
 }
 
 impl NotificationEvent {
@@ -95,6 +96,7 @@ impl NotificationEvent {
             session_ids: vec![session_id],
             trigger_rule: Some(trigger_rule),
             trigger_detail,
+            node: None,
         }
     }
 
@@ -125,6 +127,7 @@ impl NotificationEvent {
             session_ids: sessions.iter().map(|s| s.id.clone()).collect(),
             trigger_rule: None,
             trigger_detail: None,
+            node: None,
         }
     }
 
@@ -199,6 +202,7 @@ mod tests {
             session_ids: vec!["session-123".to_string()],
             trigger_rule: Some(NotificationTriggerRule::RegexPattern),
             trigger_detail: None,
+            node: None,
         };
 
         assert_eq!(
