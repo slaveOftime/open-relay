@@ -75,9 +75,8 @@ async fn send_data(config: &AppConfig, id: &str, data: String, node: Option<&str
             inner: Box::new(inner),
         },
     };
-    match ipc::send_request(config, req).await? {
+    match ipc::send_request_checked(config, req).await? {
         RpcResponse::Ack => Ok(()),
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
         _ => Err(AppError::Protocol("unexpected response type".to_string())),
     }
 }

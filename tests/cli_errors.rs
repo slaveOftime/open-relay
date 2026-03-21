@@ -4,6 +4,8 @@
 ///
 /// Each test uses an isolated temporary state directory so it never
 /// accidentally connects to a real running daemon.
+mod e2e;
+
 use std::{env, fs, path::PathBuf, process::Command};
 
 // Path to the compiled `oly` binary, set by Cargo when building tests.
@@ -382,4 +384,31 @@ fn input_valid_arrow_keys_reach_daemon_check() {
             "arrow key '{key}' should be a valid key spec; got: {stderr}"
         );
     }
+}
+
+#[test]
+fn input_live_daemon_session_error_is_not_reported_as_unavailable() {
+    let tmp = e2e::make_tmp_dir("input_live_daemon_missing_session");
+    let _daemon = e2e::start_daemon(&tmp);
+    let missing_id = "let x = 123;;";
+
+    let output = e2e::oly_cmd(&tmp)
+        .args(["send", missing_id, "hello"])
+        .output()
+        .expect("failed to run oly send against live daemon");
+
+    assert!(
+        !output.status.success(),
+        "`oly send` should exit non-zero when the daemon rejects an unknown session"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("session not running: {missing_id}")),
+        "expected precise session error from live daemon, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("daemon is unavailable"),
+        "live daemon request failures should not be mislabeled as availability issues: {stderr}"
+    );
 }

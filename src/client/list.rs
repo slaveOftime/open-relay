@@ -28,14 +28,13 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
             node: node_name,
             inner: Box::new(inner),
         };
-        match ipc::send_request(config, req).await? {
+        match ipc::send_request_checked(config, req).await? {
             RpcResponse::List { sessions, total } => (sessions, total),
-            RpcResponse::Error { message } => return Err(AppError::DaemonUnavailable(message)),
             _ => return Err(AppError::Protocol("unexpected response type".to_string())),
         }
     } else {
         // Daemon handles DB + in-memory overlay; fall back to DB-only when unavailable.
-        match ipc::send_request(
+        match ipc::send_request_checked(
             config,
             RpcRequest::List {
                 query: query.clone(),
@@ -44,7 +43,6 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
         .await
         {
             Ok(RpcResponse::List { sessions, total }) => (sessions, total),
-            Ok(RpcResponse::Error { message }) => return Err(AppError::DaemonUnavailable(message)),
             Ok(_) => return Err(AppError::Protocol("unexpected response type".to_string())),
             Err(AppError::DaemonUnavailable(_)) | Err(AppError::Protocol(_)) => {
                 used_db_fallback = true;
@@ -211,7 +209,7 @@ pub fn truncate_display_value(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_query, input_required_label, session_json};
+    use super::{build_list_query, format_created_at_local, input_required_label, session_json};
     use crate::{cli::ListArgs, protocol::SessionSummary};
     use chrono::{TimeZone, Utc};
 
@@ -251,11 +249,9 @@ mod tests {
         };
 
         let value = session_json(&session);
+        let expected_created_at = format_created_at_local(created_at);
 
-        assert_eq!(
-            value["created_at"],
-            serde_json::json!("2026-03-21 18:11:12")
-        );
+        assert_eq!(value["created_at"], serde_json::json!(expected_created_at));
         assert_eq!(value["input_needed"], serde_json::json!(true));
     }
 

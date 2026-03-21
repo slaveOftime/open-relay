@@ -132,7 +132,7 @@ async fn resolve_session_id(
         None => inner,
     };
 
-    match ipc::send_request(config, request).await? {
+    match ipc::send_request_checked(config, request).await? {
         RpcResponse::List { sessions, .. } => {
             if let Some(session) = sessions.into_iter().next() {
                 Ok(session.id)
@@ -142,7 +142,6 @@ async fn resolve_session_id(
                 ))
             }
         }
-        RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
         _ => Err(AppError::Protocol("unexpected response type".to_string())),
     }
 }
@@ -211,7 +210,7 @@ async fn run() -> Result<()> {
                 disable_notifications,
             };
             let request = node_wrap(node, inner);
-            match ipc::send_request(&config, request).await? {
+            match ipc::send_request_checked(&config, request).await? {
                 RpcResponse::Start { session_id } => {
                     if detach {
                         println!("{session_id}");
@@ -225,7 +224,6 @@ async fn run() -> Result<()> {
                     }
                     Ok(())
                 }
-                RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
                 _ => Err(AppError::Protocol("unexpected response type".to_string())),
             }
         }
@@ -237,12 +235,11 @@ async fn run() -> Result<()> {
                 id: id.clone(),
                 grace_seconds: stop_args.grace,
             };
-            match ipc::send_request(&config, node_wrap(stop_args.node, inner)).await? {
+            match ipc::send_request_checked(&config, node_wrap(stop_args.node, inner)).await? {
                 RpcResponse::Stop { stopped } if stopped => {
                     println!("Session {id} stopped. Check logs with `oly logs {id}`");
                     Ok(())
                 }
-                RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
                 _ => Err(AppError::Protocol("unexpected response type".to_string())),
             }
         }
@@ -288,7 +285,9 @@ async fn run() -> Result<()> {
         // ── API key management (primary side) ────────────────────────────────
         Commands::ApiKey(api_key_args) => match api_key_args.command {
             ApiKeyCommand::Add(args) => {
-                match ipc::send_request(&config, RpcRequest::ApiKeyAdd { name: args.name }).await? {
+                match ipc::send_request_checked(&config, RpcRequest::ApiKeyAdd { name: args.name })
+                    .await?
+                {
                     RpcResponse::ApiKeyAdd { plaintext_key } => {
                         println!(
                             "API key registered. Key (store it securely — printed only once):"
@@ -296,12 +295,11 @@ async fn run() -> Result<()> {
                         println!("{plaintext_key}");
                         Ok(())
                     }
-                    RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
                     _ => Err(AppError::Protocol("unexpected response".into())),
                 }
             }
             ApiKeyCommand::List => {
-                match ipc::send_request(&config, RpcRequest::ApiKeyList).await? {
+                match ipc::send_request_checked(&config, RpcRequest::ApiKeyList).await? {
                     RpcResponse::ApiKeyList { keys } => {
                         if keys.is_empty() {
                             println!("No API keys registered.");
@@ -317,12 +315,11 @@ async fn run() -> Result<()> {
                         }
                         Ok(())
                     }
-                    RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
                     _ => Err(AppError::Protocol("unexpected response".into())),
                 }
             }
             ApiKeyCommand::Remove(args) => {
-                match ipc::send_request(
+                match ipc::send_request_checked(
                     &config,
                     RpcRequest::ApiKeyRemove {
                         name: args.name.clone(),
@@ -338,7 +335,6 @@ async fn run() -> Result<()> {
                         }
                         Ok(())
                     }
-                    RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
                     _ => Err(AppError::Protocol("unexpected response".into())),
                 }
             }
@@ -346,21 +342,22 @@ async fn run() -> Result<()> {
 
         // ── Node listing (primary side) ──────────────────────────────────────
         Commands::Node(node_args) => match node_args.command {
-            NodeCommand::List => match ipc::send_request(&config, RpcRequest::NodeList).await? {
-                RpcResponse::NodeList { nodes } => {
-                    if nodes.is_empty() {
-                        println!("No secondary nodes connected.");
-                    } else {
-                        println!("{}", "NAME");
-                        for n in nodes {
-                            println!("{}", n);
+            NodeCommand::List => {
+                match ipc::send_request_checked(&config, RpcRequest::NodeList).await? {
+                    RpcResponse::NodeList { nodes } => {
+                        if nodes.is_empty() {
+                            println!("No secondary nodes connected.");
+                        } else {
+                            println!("{}", "NAME");
+                            for n in nodes {
+                                println!("{}", n);
+                            }
                         }
+                        Ok(())
                     }
-                    Ok(())
+                    _ => Err(AppError::Protocol("unexpected response".into())),
                 }
-                RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
-                _ => Err(AppError::Protocol("unexpected response".into())),
-            },
+            }
         },
 
         // ── Join management (secondary side) ─────────────────────────────────
@@ -370,7 +367,7 @@ async fn run() -> Result<()> {
             }
             JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
             JoinCommand::List(args) => {
-                match ipc::send_request(
+                match ipc::send_request_checked(
                     &config,
                     RpcRequest::JoinList {
                         primary: args.primary,
@@ -394,7 +391,6 @@ async fn run() -> Result<()> {
                         }
                         Ok(())
                     }
-                    RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
                     _ => Err(AppError::Protocol("unexpected response".into())),
                 }
             }

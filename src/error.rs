@@ -16,6 +16,8 @@ pub enum AppError {
     DaemonAlreadyRunning,
     #[error("daemon is unavailable: {0}")]
     DaemonUnavailable(String),
+    #[error("{0}")]
+    RequestFailed(String),
     /// Reserved for future milestone feature gates.
     #[allow(dead_code)]
     #[error("unsupported command in this milestone: {0}")]

@@ -62,9 +62,8 @@ pub async fn run_logs(
             node: node_name,
             inner: Box::new(inner),
         };
-        return match ipc::send_request(config, req).await? {
+        return match ipc::send_request_checked(config, req).await? {
             RpcResponse::LogsTail { output, .. } => print_log_output(output, keep_color),
-            RpcResponse::Error { message } => Err(AppError::DaemonUnavailable(message)),
             _ => Err(AppError::Protocol("unexpected response type".to_string())),
         };
     }

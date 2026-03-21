@@ -56,6 +56,11 @@ pub async fn send_request(config: &AppConfig, request: RpcRequest) -> Result<Rpc
     send_request_on_stream(stream, request).await
 }
 
+pub async fn send_request_checked(config: &AppConfig, request: RpcRequest) -> Result<RpcResponse> {
+    let response = send_request(config, request).await?;
+    ensure_success_response(response)
+}
+
 pub async fn send_request_on_stream(
     mut stream: Stream,
     request: RpcRequest,
@@ -88,6 +93,13 @@ pub async fn send_request_on_stream(
     }
 
     Ok(response.payload)
+}
+
+pub fn ensure_success_response(response: RpcResponse) -> Result<RpcResponse> {
+    match response {
+        RpcResponse::Error { message } => Err(AppError::RequestFailed(message)),
+        other => Ok(other),
+    }
 }
 
 #[allow(dead_code)]
@@ -183,6 +195,13 @@ pub async fn read_response_from_reader(
     Ok(envelope.payload)
 }
 
+pub async fn read_checked_response_from_reader(
+    reader: &mut BufReader<ReadHalf<Stream>>,
+) -> Result<RpcResponse> {
+    let response = read_response_from_reader(reader).await?;
+    ensure_success_response(response)
+}
+
 /// Write a single `RpcRequest` to the write-half of a split stream (used by client).
 pub async fn write_request_to_writer(
     writer: &mut WriteHalf<Stream>,
@@ -197,4 +216,30 @@ pub async fn write_request_to_writer(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_success_response;
+    use crate::{error::AppError, protocol::RpcResponse};
+
+    #[test]
+    fn ensure_success_response_preserves_non_error_payloads() {
+        let response = ensure_success_response(RpcResponse::Ack).expect("ack should pass through");
+        assert!(matches!(response, RpcResponse::Ack));
+    }
+
+    #[test]
+    fn ensure_success_response_maps_error_payloads_to_request_failed() {
+        let err = ensure_success_response(RpcResponse::Error {
+            message: "session not running: demo".to_string(),
+        })
+        .expect_err("error payload should become an application error");
+
+        assert!(matches!(
+            err,
+            AppError::RequestFailed(ref message) if message == "session not running: demo"
+        ));
+        assert_eq!(err.to_string(), "session not running: demo");
+    }
 }
