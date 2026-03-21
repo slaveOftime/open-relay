@@ -8,8 +8,8 @@ pub mod ws;
 #[allow(unused_imports)]
 use axum::{
     Router,
-    extract::State,
-    http::{Method, StatusCode, Uri},
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -133,9 +133,52 @@ pub async fn serve(state: AppState) {
     }
 }
 
-async fn serve_static(State(state): State<AppState>, method: Method, uri: Uri) -> Response {
+async fn serve_static(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let wwwroot_dir = state.config.wwwroot_dir();
+    let auth_token = auth::extract_request_token_parts(&headers, uri.query());
+    let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
+
+    match apps::resolve_app_request(&wwwroot_dir, &uri) {
+        Ok(Some(apps::AppRequestTarget::LocalFile(candidate))) => {
+            if let Some(response) =
+                auth::authorize_request(&state, uri.path(), auth_token.clone(), client_ip.clone())
+                    .await
+            {
+                return response;
+            }
+            match try_read_local_asset(&wwwroot_dir, &candidate).await {
+                Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
+                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+                Err(err) => {
+                    error!(%err, path = %candidate, "failed to read static file from wwwroot");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        Ok(Some(apps::AppRequestTarget::Proxy(target_urls))) => {
+            if let Some(response) =
+                auth::authorize_request(&state, uri.path(), auth_token.clone(), client_ip.clone())
+                    .await
+            {
+                return response;
+            }
+            return apps::proxy_app_request(&method, &headers, &target_urls).await;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            error!(%err, path = %uri.path(), "failed to resolve app request from wwwroot");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
 
     let candidates = match static_request_candidates(&uri) {
@@ -143,9 +186,21 @@ async fn serve_static(State(state): State<AppState>, method: Method, uri: Uri) -
         Err(status) => return status.into_response(),
     };
 
-    for candidate in &candidates {
-        match try_read_local_asset(&state.config.wwwroot_dir(), candidate).await {
-            Ok(Some(bytes)) => return build_bytes_response(candidate, bytes),
+    let local_candidate = match apps::find_existing_local_asset(&wwwroot_dir, &candidates) {
+        Ok(candidate) => candidate,
+        Err(err) => {
+            error!(%err, path = %uri.path(), "failed to inspect static file in wwwroot");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Some(candidate) = local_candidate {
+        if let Some(response) =
+            auth::authorize_request(&state, uri.path(), auth_token, client_ip).await
+        {
+            return response;
+        }
+        match try_read_local_asset(&wwwroot_dir, &candidate).await {
+            Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
             Ok(None) => {}
             Err(err) => {
                 error!(%err, path = %candidate, "failed to read static file from wwwroot");

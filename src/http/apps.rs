@@ -1,12 +1,16 @@
 use axum::{
     Json,
+    body::Body,
     extract::State,
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
-use serde::Serialize;
+use reqwest::Url;
+use serde::{Deserialize, Serialize};
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
 };
 use tracing::{error, info};
 
@@ -15,6 +19,27 @@ use crate::config::AppConfig;
 use super::AppState;
 
 const DEFAULT_WWWROOT_INDEX: &str = include_str!("apps-index.html");
+const APP_MANIFEST_FILE: &str = "oly.app.json";
+const FORWARDED_REQUEST_HEADERS: [&str; 6] = [
+    "accept",
+    "accept-language",
+    "cache-control",
+    "if-modified-since",
+    "if-none-match",
+    "user-agent",
+];
+const PROXIED_RESPONSE_HEADERS: [&str; 8] = [
+    "content-type",
+    "cache-control",
+    "content-disposition",
+    "accept-ranges",
+    "content-range",
+    "etag",
+    "last-modified",
+    "location",
+];
+
+static APP_PROXY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +56,37 @@ pub(super) struct StaticApp {
     icon_href: Option<String>,
     #[serde(rename = "type")]
     app_type: StaticAppKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppEntry {
+    Local { entry_path: String },
+    Proxy { entry_url: Url },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppDefinition {
+    static_app: StaticApp,
+    entry: AppEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AppRequestTarget {
+    LocalFile(String),
+    Proxy(Vec<Url>),
+}
+
+#[derive(Debug, Deserialize)]
+struct AppManifest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default, alias = "icon", alias = "iconHref")]
+    icon_href: Option<String>,
+    #[serde(default, rename = "type", alias = "appType")]
+    app_type: Option<String>,
+    entry: String,
 }
 
 pub(super) fn ensure_wwwroot(config: &AppConfig) -> io::Result<PathBuf> {
@@ -58,6 +114,124 @@ pub(super) async fn list_static_apps(State(state): State<AppState>) -> Response 
     }
 }
 
+pub(super) fn resolve_app_request(
+    wwwroot: &Path,
+    uri: &Uri,
+) -> io::Result<Option<AppRequestTarget>> {
+    let Some((slug, request_tail, trailing_slash)) = split_app_request_path(uri.path()) else {
+        return Ok(None);
+    };
+
+    let app_dir = wwwroot.join("apps").join(&slug);
+    let Some(definition) = load_app_definition(&app_dir, &slug)? else {
+        return Ok(None);
+    };
+
+    match definition.entry {
+        AppEntry::Local { entry_path } => {
+            for candidate in
+                app_local_request_candidates(&entry_path, &request_tail, trailing_slash)
+            {
+                let relative_path = format!("apps/{slug}/{candidate}");
+                if local_asset_exists(wwwroot, &relative_path)? {
+                    return Ok(Some(AppRequestTarget::LocalFile(relative_path)));
+                }
+            }
+            Ok(None)
+        }
+        AppEntry::Proxy { entry_url } => Ok(Some(AppRequestTarget::Proxy(
+            build_proxy_target_urls(&entry_url, uri.path(), &request_tail, uri.query())?,
+        ))),
+    }
+}
+
+pub(super) fn find_existing_local_asset(
+    wwwroot: &Path,
+    candidates: &[String],
+) -> io::Result<Option<String>> {
+    for candidate in candidates {
+        if local_asset_exists(wwwroot, candidate)? {
+            return Ok(Some(candidate.clone()));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) async fn proxy_app_request(
+    request_method: &Method,
+    headers: &HeaderMap,
+    target_urls: &[Url],
+) -> Response {
+    if target_urls.is_empty() {
+        error!("proxied app request was missing upstream targets");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+
+    let method = match reqwest::Method::from_bytes(request_method.as_str().as_bytes()) {
+        Ok(method) => method,
+        Err(err) => {
+            error!(%err, method = %request_method, "invalid proxied app method");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+
+    let mut last_not_found = None;
+    for target_url in target_urls {
+        let mut upstream = app_proxy_client().request(method.clone(), target_url.clone());
+        for header_name in FORWARDED_REQUEST_HEADERS {
+            if let Some(value) = headers.get(header_name) {
+                upstream = upstream.header(header_name, value.clone());
+            }
+        }
+
+        let upstream = match upstream.send().await {
+            Ok(response) => response,
+            Err(err) => {
+                error!(%err, url = %target_url, "failed to proxy app request");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        };
+
+        let status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut builder = axum::http::Response::builder().status(status);
+        for header_name in PROXIED_RESPONSE_HEADERS {
+            if let Some(value) = upstream.headers().get(header_name) {
+                builder = builder.header(header_name, value.clone());
+            }
+        }
+
+        if status == StatusCode::NOT_FOUND {
+            last_not_found = Some(
+                builder
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response()),
+            );
+            continue;
+        }
+
+        if *request_method == Method::HEAD {
+            return builder
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        }
+
+        let body = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(%err, url = %target_url, "failed to read proxied app response body");
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+        };
+
+        return builder
+            .body(Body::from(body))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    }
+
+    last_not_found.unwrap_or_else(|| StatusCode::BAD_GATEWAY.into_response())
+}
+
 fn discover_static_apps(wwwroot: &Path) -> io::Result<Vec<StaticApp>> {
     let apps_dir = wwwroot.join("apps");
     if !apps_dir.exists() {
@@ -73,21 +247,146 @@ fn discover_static_apps(wwwroot: &Path) -> io::Result<Vec<StaticApp>> {
             continue;
         }
 
-        let index_path = entry.path().join("index.html");
-        if !index_path.is_file() {
-            continue;
-        }
-
         let slug = name.to_string_lossy();
-        apps.push(build_static_app(
-            &index_path,
-            &format!("/apps/{slug}/"),
-            slug.as_ref(),
-        )?);
+        if let Some(definition) = load_app_definition(&entry.path(), slug.as_ref())? {
+            apps.push(definition.static_app);
+        }
     }
 
     apps.sort_by(|left, right| left.href.cmp(&right.href));
     Ok(apps)
+}
+
+fn load_app_definition(app_dir: &Path, slug: &str) -> io::Result<Option<AppDefinition>> {
+    let app_href = format!("/apps/{slug}/");
+    if let Some(manifest) = load_app_manifest(app_dir)? {
+        return Ok(Some(build_manifest_app_definition(
+            app_dir, &app_href, slug, manifest,
+        )?));
+    }
+
+    let index_path = app_dir.join("index.html");
+    if !index_path.is_file() {
+        return Ok(None);
+    }
+
+    Ok(Some(AppDefinition {
+        static_app: build_static_app(&index_path, &app_href, slug)?,
+        entry: AppEntry::Local {
+            entry_path: "index.html".into(),
+        },
+    }))
+}
+
+fn build_manifest_app_definition(
+    app_dir: &Path,
+    app_href: &str,
+    fallback_title: &str,
+    manifest: AppManifest,
+) -> io::Result<AppDefinition> {
+    let entry = resolve_manifest_entry(app_dir, &manifest.entry)?;
+    let entry_html = match &entry {
+        AppEntry::Local { entry_path } => maybe_read_entry_html(app_dir, entry_path)?,
+        AppEntry::Proxy { .. } => None,
+    };
+
+    let title = cleaned_field(manifest.title)
+        .or_else(|| entry_html.as_deref().and_then(extract_title))
+        .unwrap_or_else(|| fallback_title.to_string());
+    let description = cleaned_field(manifest.description)
+        .or_else(|| entry_html.as_deref().and_then(extract_app_description));
+    let icon_href = cleaned_field(manifest.icon_href)
+        .and_then(|value| resolve_manifest_asset_href(app_href, &value))
+        .or_else(|| {
+            entry_html
+                .as_deref()
+                .and_then(|html| extract_app_icon_href(html, app_href))
+        })
+        .or_else(|| detect_app_icon_href(Some(app_dir), app_href));
+    let app_type = cleaned_field(manifest.app_type)
+        .as_deref()
+        .and_then(StaticAppKind::from_meta_value)
+        .or_else(|| entry_html.as_deref().map(extract_app_kind))
+        .unwrap_or(StaticAppKind::SingleHtml);
+
+    Ok(AppDefinition {
+        static_app: StaticApp {
+            href: app_href.to_string(),
+            title,
+            description,
+            icon_href,
+            app_type,
+        },
+        entry,
+    })
+}
+
+fn load_app_manifest(app_dir: &Path) -> io::Result<Option<AppManifest>> {
+    let manifest_path = app_dir.join(APP_MANIFEST_FILE);
+    if manifest_path.is_file() {
+        return Ok(Some(read_manifest_file(&manifest_path)?));
+    }
+
+    Ok(None)
+}
+
+fn read_manifest_file(path: &Path) -> io::Result<AppManifest> {
+    let raw = std::fs::read_to_string(path)?;
+    parse_manifest(&raw, path)
+}
+
+fn parse_manifest(raw: &str, source_path: &Path) -> io::Result<AppManifest> {
+    serde_json::from_str(raw)
+        .map_err(|err| invalid_data(format!("failed to parse {}: {err}", source_path.display())))
+}
+
+fn resolve_manifest_entry(app_dir: &Path, entry: &str) -> io::Result<AppEntry> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err(invalid_data("app manifest entry cannot be empty"));
+    }
+
+    if let Ok(url) = Url::parse(entry) {
+        if matches!(url.scheme(), "http" | "https") {
+            return Ok(AppEntry::Proxy { entry_url: url });
+        }
+    }
+
+    let entry_path = normalize_relative_asset_path(entry)
+        .ok_or_else(|| invalid_data("app manifest entry must stay inside the app directory"))?;
+    let full_path = app_dir.join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if !full_path.is_file() {
+        return Err(invalid_data(format!(
+            "app manifest entry {} does not exist",
+            full_path.display()
+        )));
+    }
+
+    Ok(AppEntry::Local { entry_path })
+}
+
+fn maybe_read_entry_html(app_dir: &Path, entry_path: &str) -> io::Result<Option<String>> {
+    let extension = Path::new(entry_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    if !matches!(extension.as_deref(), Some("html" | "htm")) {
+        return Ok(None);
+    }
+
+    let full_path = app_dir.join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    Ok(Some(std::fs::read_to_string(full_path)?))
+}
+
+fn cleaned_field(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
 }
 
 fn build_static_app(index_path: &Path, href: &str, fallback_title: &str) -> io::Result<StaticApp> {
@@ -104,6 +403,188 @@ fn build_static_app(index_path: &Path, href: &str, fallback_title: &str) -> io::
         icon_href,
         app_type,
     })
+}
+
+fn split_app_request_path(path: &str) -> Option<(String, String, bool)> {
+    let remainder = path.strip_prefix("/apps/")?;
+    if remainder.is_empty() {
+        return None;
+    }
+
+    let trailing_slash = path.ends_with('/');
+    let normalized = normalize_relative_asset_path(remainder)?;
+    let (slug, tail) = normalized
+        .split_once('/')
+        .map_or((normalized.as_str(), ""), |(slug, tail)| (slug, tail));
+
+    if slug.is_empty() {
+        None
+    } else {
+        Some((slug.to_string(), tail.to_string(), trailing_slash))
+    }
+}
+
+fn app_local_request_candidates(
+    entry_path: &str,
+    request_tail: &str,
+    trailing_slash: bool,
+) -> Vec<String> {
+    if request_tail.is_empty() {
+        return vec![entry_path.to_string()];
+    }
+
+    let mut candidates = local_request_candidates(request_tail, trailing_slash);
+    if let Some(entry_dir) = entry_parent_dir(entry_path) {
+        for candidate in local_request_candidates(request_tail, trailing_slash) {
+            let prefixed = format!("{entry_dir}/{candidate}");
+            if !candidates.contains(&prefixed) {
+                candidates.push(prefixed);
+            }
+        }
+    }
+
+    candidates
+}
+
+fn local_request_candidates(path: &str, trailing_slash: bool) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(3);
+    if trailing_slash {
+        candidates.push(format!("{path}/index.html"));
+        return candidates;
+    }
+
+    candidates.push(path.to_string());
+    if Path::new(path).extension().is_none() {
+        candidates.push(format!("{path}.html"));
+    }
+    candidates.push(format!("{path}/index.html"));
+    candidates.dedup();
+    candidates
+}
+
+fn entry_parent_dir(entry_path: &str) -> Option<String> {
+    normalize_relative_asset_path(
+        Path::new(entry_path)
+            .parent()
+            .and_then(|parent| parent.to_str())
+            .unwrap_or_default(),
+    )
+}
+
+fn normalize_relative_asset_path(path: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn local_asset_exists(wwwroot: &Path, relative_path: &str) -> io::Result<bool> {
+    let full_path = wwwroot.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    match std::fs::metadata(full_path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn build_proxy_target_urls(
+    entry_url: &Url,
+    request_path: &str,
+    request_tail: &str,
+    query: Option<&str>,
+) -> io::Result<Vec<Url>> {
+    let mut targets = Vec::new();
+    if request_tail.is_empty() {
+        targets.push(with_proxy_query(entry_url.clone(), query));
+    } else {
+        let entry_relative = entry_url.join(request_tail).map_err(|err| {
+            invalid_data(format!(
+                "failed to join proxied app URL {entry_url} with {request_tail}: {err}"
+            ))
+        })?;
+        targets.push(with_proxy_query(entry_relative, query));
+
+        let root_relative = origin_root_url(entry_url)
+            .join(request_tail)
+            .map_err(|err| {
+                invalid_data(format!(
+                    "failed to build root-relative proxied app URL {entry_url} with {request_tail}: {err}"
+                ))
+            })?;
+        let root_relative = with_proxy_query(root_relative, query);
+        if !targets.iter().any(|existing| existing == &root_relative) {
+            targets.push(root_relative);
+        }
+
+        let public_path_relative = origin_root_url(entry_url)
+            .join(request_path.trim_start_matches('/'))
+            .map_err(|err| {
+                invalid_data(format!(
+                    "failed to build public-path proxied app URL {entry_url} with {request_path}: {err}"
+                ))
+            })?;
+        let public_path_relative = with_proxy_query(public_path_relative, query);
+        if !targets
+            .iter()
+            .any(|existing| existing == &public_path_relative)
+        {
+            targets.push(public_path_relative);
+        }
+    }
+
+    Ok(targets)
+}
+
+fn with_proxy_query(mut target: Url, query: Option<&str>) -> Url {
+    if let Some(filtered_query) = filtered_proxy_query(query) {
+        let merged_query = match target.query() {
+            Some(existing) if !existing.is_empty() => format!("{existing}&{filtered_query}"),
+            _ => filtered_query,
+        };
+        target.set_query(Some(&merged_query));
+    }
+
+    target
+}
+
+fn origin_root_url(entry_url: &Url) -> Url {
+    let mut root = entry_url.clone();
+    root.set_path("/");
+    root.set_query(None);
+    root.set_fragment(None);
+    root
+}
+
+fn filtered_proxy_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    let filtered = query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| *pair != "token" && !pair.starts_with("token="))
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        None
+    } else {
+        Some(filtered.join("&"))
+    }
+}
+
+fn app_proxy_client() -> &'static reqwest::Client {
+    APP_PROXY_CLIENT.get_or_init(reqwest::Client::new)
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 fn extract_title(html: &str) -> Option<String> {
@@ -221,6 +702,23 @@ fn resolve_app_asset_href(app_href: &str, asset_href: &str) -> Option<String> {
     }
 
     Some(format!("{base}{normalized}"))
+}
+
+fn resolve_manifest_asset_href(app_href: &str, asset_href: &str) -> Option<String> {
+    let asset_href = asset_href.trim();
+    if asset_href.is_empty() {
+        return None;
+    }
+
+    if asset_href.starts_with("http://")
+        || asset_href.starts_with("https://")
+        || asset_href.starts_with("//")
+        || asset_href.starts_with("data:")
+    {
+        return Some(asset_href.to_string());
+    }
+
+    resolve_app_asset_href(app_href, asset_href)
 }
 
 fn extract_meta_content(html: &str, attribute_value: &str) -> Option<String> {
@@ -363,11 +861,14 @@ impl StaticAppKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        StaticApp, StaticAppKind, discover_static_apps, ensure_wwwroot, extract_app_description,
-        extract_app_icon_href, extract_app_kind, extract_meta_content, extract_title,
-        resolve_app_asset_href,
+        APP_MANIFEST_FILE, AppRequestTarget, StaticApp, StaticAppKind,
+        app_local_request_candidates, discover_static_apps, ensure_wwwroot,
+        extract_app_description, extract_app_icon_href, extract_app_kind, extract_meta_content,
+        extract_title, resolve_app_asset_href, resolve_app_request,
     };
     use crate::config::AppConfig;
+    use axum::http::Uri;
+    use reqwest::Url;
     use std::{fs, path::PathBuf};
     use uuid::Uuid;
 
@@ -490,6 +991,186 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn discover_static_apps_prefers_manifest_over_index_html() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("reporting");
+
+        fs::create_dir_all(&app_dir).expect("app directory should be created");
+        fs::write(
+            app_dir.join("index.html"),
+            "<html><head><title>Fallback Index</title></head></html>",
+        )
+        .expect("fallback index should be written");
+
+        fs::write(
+            app_dir.join("dashboard.html"),
+            "<html><head><title>Dashboard HTML</title></head><body>ok</body></html>",
+        )
+        .expect("dashboard entry should be written");
+
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            r#"{
+                "title": "Reporting Center",
+                "description": "Manifest metadata wins",
+                "entry": "dashboard.html"
+            }"#,
+        )
+        .expect("manifest should be written");
+
+        let apps = discover_static_apps(&wwwroot).expect("apps should be discovered");
+
+        assert_eq!(
+            apps,
+            vec![StaticApp {
+                href: "/apps/reporting/".into(),
+                title: "Reporting Center".into(),
+                description: Some("Manifest metadata wins".into()),
+                icon_href: None,
+                app_type: StaticAppKind::SingleHtml,
+            }]
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn resolve_app_request_uses_manifest_entry_and_nested_assets() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("nested");
+        fs::create_dir_all(app_dir.join("dist").join("assets"))
+            .expect("dist assets directory should be created");
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            r#"{
+                "title": "Nested",
+                "entry": "dist/index.html"
+            }"#,
+        )
+        .expect("manifest should be written");
+        fs::write(
+            app_dir.join("dist").join("index.html"),
+            "<html><head><title>Nested App</title></head></html>",
+        )
+        .expect("entry should be written");
+        fs::write(
+            app_dir.join("dist").join("assets").join("main.js"),
+            "console.log('nested');",
+        )
+        .expect("asset should be written");
+
+        let root_uri: Uri = "/apps/nested/".parse().expect("URI should parse");
+        let asset_uri: Uri = "/apps/nested/assets/main.js"
+            .parse()
+            .expect("URI should parse");
+
+        let root = resolve_app_request(&wwwroot, &root_uri).expect("request should resolve");
+        let asset = resolve_app_request(&wwwroot, &asset_uri).expect("request should resolve");
+
+        assert_eq!(
+            root,
+            Some(AppRequestTarget::LocalFile(
+                "apps/nested/dist/index.html".into()
+            ))
+        );
+        assert_eq!(
+            asset,
+            Some(AppRequestTarget::LocalFile(
+                "apps/nested/dist/assets/main.js".into()
+            ))
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn resolve_app_request_builds_proxy_url_from_manifest_entry() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("remote");
+        fs::create_dir_all(&app_dir).expect("app directory should be created");
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            r#"{
+                "title": "Remote",
+                "entry": "https://example.com/dash/index.html?mode=full"
+            }"#,
+        )
+        .expect("manifest should be written");
+
+        let uri: Uri = "/apps/remote/assets/main.js?theme=dark&token=secret"
+            .parse()
+            .expect("URI should parse");
+
+        let resolved = resolve_app_request(&wwwroot, &uri).expect("request should resolve");
+
+        assert_eq!(
+            resolved,
+            Some(AppRequestTarget::Proxy(vec![
+                Url::parse("https://example.com/dash/assets/main.js?theme=dark")
+                    .expect("proxy URL should parse"),
+                Url::parse("https://example.com/assets/main.js?theme=dark")
+                    .expect("root fallback proxy URL should parse"),
+                Url::parse("https://example.com/apps/remote/assets/main.js?theme=dark")
+                    .expect("public-path fallback proxy URL should parse"),
+            ]))
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn resolve_app_request_adds_root_fallback_for_vite_client() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("demo2");
+        fs::create_dir_all(&app_dir).expect("app directory should be created");
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            r#"{
+                "title": "Remote Demo",
+                "entry": "http://127.0.0.1:5173/"
+            }"#,
+        )
+        .expect("manifest should be written");
+
+        let uri: Uri = "/apps/demo2/@vite/client"
+            .parse()
+            .expect("URI should parse");
+
+        let resolved = resolve_app_request(&wwwroot, &uri).expect("request should resolve");
+
+        assert_eq!(
+            resolved,
+            Some(AppRequestTarget::Proxy(vec![
+                Url::parse("http://127.0.0.1:5173/@vite/client")
+                    .expect("entry-relative vite URL should parse"),
+                Url::parse("http://127.0.0.1:5173/apps/demo2/@vite/client")
+                    .expect("public-path vite URL should parse"),
+            ]))
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn app_local_request_candidates_include_entry_directory_fallback() {
+        let candidates = app_local_request_candidates("dist/index.html", "assets/main.js", false);
+
+        assert_eq!(
+            candidates,
+            vec![
+                "assets/main.js".to_string(),
+                "assets/main.js/index.html".to_string(),
+                "dist/assets/main.js".to_string(),
+                "dist/assets/main.js/index.html".to_string(),
+            ]
+        );
     }
 
     #[test]
