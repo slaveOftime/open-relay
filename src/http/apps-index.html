@@ -546,7 +546,7 @@
         <div class="hero-grid">
           <div class="hero-copy">
             <span class="eyebrow">Open Relay</span>
-            <h1>oly dashboard</h1>
+            <h1>oly little apps</h1>
             <p class="lede">Present agent results as single HTML pages or full SPAs inside a clean
               supervised shell. Drop apps into <code>wwwroot/apps</code>, let <code>oly</code> discover
               them, and expose result surfaces without losing the product's sharp operational feel.</p>
@@ -566,11 +566,11 @@
                 <span class="stat-label">Discovered apps</span>
               </div>
               <div class="stat">
-                <span class="stat-value">HTML</span>
+                <span class="stat-value" id="html-count">0</span>
                 <span class="stat-label">Single-file dashboards</span>
               </div>
               <div class="stat">
-                <span class="stat-value">SPA</span>
+                <span class="stat-value" id="spa-count">0</span>
                 <span class="stat-label">Rich result consoles</span>
               </div>
             </div>
@@ -593,10 +593,9 @@
     </section>
   </main>
   <script>
-    const statusText = document.getElementById("status-text");
     const appCount = document.getElementById("app-count");
-    const htmlCount = document.querySelectorAll(".stat-value")[1];
-    const spaCount = document.querySelectorAll(".stat-value")[2];
+    const htmlCount = document.getElementById("html-count");
+    const spaCount = document.getElementById("spa-count");
 
     function formatAppKind(kind) {
       return kind === "spa" ? "SPA" : "Single HTML";
@@ -749,7 +748,6 @@
               "Create a child folder inside wwwroot/apps with its own index.html to register a new single HTML page or SPA."
             )
           );
-          statusText.textContent = "Waiting for published apps";
           list.setAttribute("aria-busy", "false");
           return;
         }
@@ -757,12 +755,10 @@
         updateKindCounts(apps);
         const items = apps.map(buildAppItem);
         list.replaceChildren.apply(list, items);
-        statusText.textContent = apps.length + (apps.length === 1 ? " app ready" : " apps ready");
       } catch (error) {
         appCount.textContent = "0";
         htmlCount.textContent = "0";
         spaCount.textContent = "0";
-        statusText.textContent = "Registry unavailable";
         list.replaceChildren(
           buildEmptyState(
             "Could not load app list",

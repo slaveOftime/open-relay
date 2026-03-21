@@ -7,9 +7,9 @@ use std::{
 
 use axum::{
     Json,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -21,6 +21,7 @@ const MAX_FAILED_ATTEMPTS: u32 = 3;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60); // 15 minutes
 /// How often the background task sweeps the lockout table for expired entries.
 const LOCKOUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
+const AUTH_COOKIE_NAME: &str = "oly_auth_token";
 
 // ── AuthState ────────────────────────────────────────────────────────────────
 
@@ -152,7 +153,7 @@ pub struct LoginResponse {
 /// Checks `X-Real-IP` first (nginx single-proxy style), then the first entry
 /// of `X-Forwarded-For`, then falls back to the direct peer IP. Allows correct
 /// per-client lockout when the daemon is exposed through a reverse-proxy tunnel.
-fn effective_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+pub(super) fn effective_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
     headers
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
@@ -191,7 +192,12 @@ pub async fn login(
     let Some(auth) = &state.auth else {
         // No auth configured; treat as always-authenticated.
         debug!(ip = %client_ip, "auth: login called in no-auth mode");
-        return (StatusCode::OK, Json(serde_json::json!({ "token": "" }))).into_response();
+        return (
+            StatusCode::OK,
+            [(axum::http::header::SET_COOKIE, clear_auth_cookie())],
+            Json(serde_json::json!({ "token": "" })),
+        )
+            .into_response();
     };
 
     info!(ip = %client_ip, "auth: login attempt");
@@ -231,7 +237,12 @@ pub async fn login(
         let token = uuid::Uuid::new_v4().to_string();
         auth.tokens.lock().await.insert(token.clone());
         info!(ip = %client_ip, "auth: login success — token issued");
-        return (StatusCode::OK, Json(LoginResponse { token })).into_response();
+        return (
+            StatusCode::OK,
+            [(axum::http::header::SET_COOKIE, build_auth_cookie(&token))],
+            Json(LoginResponse { token }),
+        )
+            .into_response();
     }
 
     // ── Failed attempt ───────────────────────────────────────────────────────
@@ -276,15 +287,15 @@ pub async fn logout(
     let client_ip = effective_ip(&headers, peer.ip());
 
     let Some(auth) = &state.auth else {
-        return StatusCode::OK.into_response();
+        return (
+            StatusCode::OK,
+            [(axum::http::header::SET_COOKIE, clear_auth_cookie())],
+        )
+            .into_response();
     };
 
-    if let Some(token) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        let removed = auth.tokens.lock().await.remove(token);
+    if let Some(token) = extract_request_token_parts(&headers, None) {
+        let removed = auth.tokens.lock().await.remove(&token);
         if removed {
             info!(ip = %client_ip, "auth: logout — token revoked");
         } else {
@@ -292,7 +303,11 @@ pub async fn logout(
         }
     }
 
-    StatusCode::OK.into_response()
+    (
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, clear_auth_cookie())],
+    )
+        .into_response()
 }
 
 // ── Auth Middleware ──────────────────────────────────────────────────────────
@@ -301,63 +316,157 @@ pub async fn logout(
 /// except `/api/health` and `/api/auth/*`.
 pub async fn require_auth(
     State(state): State<AppState>,
-    request: axum::extract::Request,
+    request: Request,
     next: axum::middleware::Next,
-) -> axum::response::Response {
-    let Some(auth) = state.auth.as_ref().map(Arc::clone) else {
-        // No-auth mode: pass through unconditionally.
-        return next.run(request).await;
-    };
-
+) -> Response {
     let path = request.uri().path().to_owned();
 
-    // Always public: health probe, auth endpoints, and non-API (static assets).
     if path == "/api/health" || path.starts_with("/api/auth/") || !path.starts_with("/api/") {
         return next.run(request).await;
     }
 
-    // Extract Bearer token from the Authorization header, or fall back to the
-    // `?token=` query parameter (required for SSE/WebSocket where browsers
-    // cannot set custom headers via EventSource / WebSocket APIs).
-    let token = request
-        .headers()
+    let token = extract_request_token(&request);
+    let client_ip = extract_request_client_ip(&request);
+    if let Some(response) = authorize_request(&state, &path, token, client_ip).await {
+        return response;
+    }
+
+    next.run(request).await
+}
+
+pub(super) async fn authorize_request(
+    state: &AppState,
+    path: &str,
+    token: Option<String>,
+    client_ip: Option<String>,
+) -> Option<Response> {
+    let Some(auth) = state.auth.as_ref().map(Arc::clone) else {
+        return None;
+    };
+
+    if let Some(token) = token {
+        if auth.is_valid_token(&token).await {
+            debug!(path = %path, "auth: authorized request");
+            return None;
+        }
+    }
+
+    let client_ip = client_ip.unwrap_or_else(|| "unknown".to_string());
+
+    warn!(ip = %client_ip, path = %path, "auth: unauthorized request rejected");
+
+    Some(
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response(),
+    )
+}
+
+pub(super) fn extract_request_token(request: &Request) -> Option<String> {
+    extract_request_token_parts(request.headers(), request.uri().query())
+}
+
+pub(super) fn extract_request_client_ip(request: &Request) -> Option<String> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| effective_ip(request.headers(), ci.0.ip()).to_string())
+}
+
+pub(super) fn extract_request_token_parts(
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<String> {
+    headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|s| s.to_owned())
         .or_else(|| {
-            request.uri().query().and_then(|q| {
+            query.and_then(|q| {
                 q.split('&')
-                    .find(|p| p.starts_with("token="))
-                    .and_then(|p| p.strip_prefix("token="))
-                    .map(|t| t.to_owned())
+                    .find(|part| part.starts_with("token="))
+                    .and_then(|part| part.strip_prefix("token="))
+                    .map(|token| token.to_owned())
             })
-        });
+        })
+        .or_else(|| extract_cookie_token(headers))
+}
 
-    if let Some(ref token) = token {
-        if auth.is_valid_token(token).await {
-            debug!(path = %path, "auth: authorized request");
-            return next.run(request).await;
-        }
+fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|cookie| {
+                let (name, value) = cookie.trim().split_once('=')?;
+                if name == AUTH_COOKIE_NAME && !value.is_empty() {
+                    Some(value.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn build_auth_cookie(token: &str) -> String {
+    format!("{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax")
+}
+
+fn clear_auth_cookie() -> String {
+    format!("{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AUTH_COOKIE_NAME, build_auth_cookie, clear_auth_cookie, extract_request_token_parts,
+    };
+    use axum::http::{HeaderMap, header};
+
+    #[test]
+    fn extract_request_token_prefers_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer header-token".parse().expect("header should parse"),
+        );
+        headers.insert(
+            header::COOKIE,
+            format!("{AUTH_COOKIE_NAME}=cookie-token")
+                .parse()
+                .expect("cookie should parse"),
+        );
+
+        let token = extract_request_token_parts(&headers, Some("token=query-token"));
+
+        assert_eq!(token.as_deref(), Some("header-token"));
     }
 
-    // Unauthorized — log with client IP (ConnectInfo is in request extensions
-    // because the server is started with into_make_service_with_connect_info).
-    let client_ip = {
-        let peer_ip = request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|ci| ci.0.ip());
-        peer_ip
-            .map(|ip| effective_ip(request.headers(), ip).to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    #[test]
+    fn extract_request_token_reads_cookie_when_no_header_or_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!("other=x; {AUTH_COOKIE_NAME}=cookie-token; third=y")
+                .parse()
+                .expect("cookie should parse"),
+        );
 
-    warn!(ip = %client_ip, path = %path, "auth: unauthorized request rejected");
+        let token = extract_request_token_parts(&headers, None);
 
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": "unauthorized" })),
-    )
-        .into_response()
+        assert_eq!(token.as_deref(), Some("cookie-token"));
+    }
+
+    #[test]
+    fn auth_cookie_headers_include_browser_scope() {
+        let set_cookie = build_auth_cookie("abc123");
+        let clear_cookie = clear_auth_cookie();
+
+        assert!(set_cookie.contains("HttpOnly"));
+        assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(clear_cookie.contains("Max-Age=0"));
+    }
 }
