@@ -861,7 +861,7 @@ impl StaticAppKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_MANIFEST_FILE, AppRequestTarget, StaticApp, StaticAppKind,
+        APP_MANIFEST_FILE, AppRequestTarget, DEFAULT_WWWROOT_INDEX, StaticApp, StaticAppKind,
         app_local_request_candidates, discover_static_apps, ensure_wwwroot,
         extract_app_description, extract_app_icon_href, extract_app_kind, extract_meta_content,
         extract_title, resolve_app_asset_href, resolve_app_request,
@@ -911,7 +911,8 @@ mod tests {
         assert!(wwwroot.join("apps").is_dir());
         let index = fs::read_to_string(wwwroot.join("apps").join("index.html"))
             .expect("index.html should exist");
-        assert!(index.contains("oly dashboard"));
+        assert_eq!(index, DEFAULT_WWWROOT_INDEX);
+        assert!(index.contains("oly little apps"));
         assert!(index.contains("wwwroot/apps"));
         assert!(index.contains("/api/static/apps"));
 
@@ -922,14 +923,14 @@ mod tests {
     fn ensure_wwwroot_preserves_existing_index() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
-        fs::create_dir_all(&wwwroot).expect("wwwroot directory should exist");
-        fs::write(wwwroot.join("index.html"), "custom").expect("custom index should be written");
+        let apps = wwwroot.join("apps");
+        fs::create_dir_all(&apps).expect("apps directory should exist");
+        fs::write(apps.join("index.html"), "custom").expect("custom index should be written");
         let config = test_config(state_dir.clone());
 
         ensure_wwwroot(&config).expect("wwwroot bootstrap should succeed");
 
-        let index =
-            fs::read_to_string(wwwroot.join("index.html")).expect("index.html should exist");
+        let index = fs::read_to_string(apps.join("index.html")).expect("index.html should exist");
         assert_eq!(index, "custom");
 
         let _ = fs::remove_dir_all(state_dir);
