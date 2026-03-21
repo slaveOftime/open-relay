@@ -64,7 +64,7 @@ jobs:
       - name: Test
         run: |
           cargo test
-          cd web && npm test
+          cd web && npm install && npm test
 
       - name: Build Release
         run: cargo build --release
