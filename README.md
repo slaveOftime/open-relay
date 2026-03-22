@@ -174,6 +174,8 @@ Example:
 
 Use quoted arguments if values may contain spaces. Hooks are best-effort: failures are logged, but they do not block session execution or notification delivery.
 
+You can use this hook together with `oly send` for bidirectional communication.
+
 ---
 
 ## Commands 📋
