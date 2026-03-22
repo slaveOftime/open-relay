@@ -212,10 +212,10 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                     trigger_detail,
                                     node: Some(name.clone()),
                                 };
-                                handle_forwarded_session_event(&state, &name, payload).await;
+                                handle_forwarded_session_event(&state, &name, payload, true).await;
                             }
                             Ok(NodeWsMessage::SessionEvent { payload }) => {
-                                handle_forwarded_session_event(&state, &name, payload).await;
+                                handle_forwarded_session_event(&state, &name, payload, false).await;
                             }
                             _ => {}
                         }
@@ -247,7 +247,12 @@ async fn handle_join(socket: WebSocket, state: AppState) {
     warn!(node = %name, "secondary node disconnected");
 }
 
-async fn handle_forwarded_session_event(state: &AppState, node_name: &str, payload: SessionEvent) {
+async fn handle_forwarded_session_event(
+    state: &AppState,
+    node_name: &str,
+    payload: SessionEvent,
+    send_to_channels: bool,
+) {
     let delivered = crate::http::sse::session_event_for_delivery(&payload, Some(node_name));
 
     if let SessionEvent::SessionNotification {
@@ -276,30 +281,32 @@ async fn handle_forwarded_session_event(state: &AppState, node_name: &str, paylo
             _ => None,
         };
 
-        if let Some(kind_enum) = maybe_kind {
-            let event = NotificationEvent {
-                kind: kind_enum,
-                title,
-                description: description.clone(),
-                body: body.clone(),
-                navigation_url: navigation_url.clone(),
-                session_ids: session_ids.clone(),
-                trigger_rule: trigger_rule_enum,
-                trigger_detail: trigger_detail.clone(),
-                node: delivered_node,
-            };
-            let outcome = state.notifier.dispatch(&event).await;
-            if !outcome.any_delivered() {
-                warn!(
-                    node = %node_name,
-                    kind = %kind,
-                    attempted = outcome.attempted,
-                    failed_channels = ?outcome.failed_channels,
-                    "forwarded notification delivery failed on all channels"
-                );
+        if send_to_channels {
+            if let Some(kind_enum) = maybe_kind {
+                let event = NotificationEvent {
+                    kind: kind_enum,
+                    title,
+                    description: description.clone(),
+                    body: body.clone(),
+                    navigation_url: navigation_url.clone(),
+                    session_ids: session_ids.clone(),
+                    trigger_rule: trigger_rule_enum,
+                    trigger_detail: trigger_detail.clone(),
+                    node: delivered_node,
+                };
+                let outcome = state.notifier.dispatch(&event).await;
+                if !outcome.any_delivered() {
+                    warn!(
+                        node = %node_name,
+                        kind = %kind,
+                        attempted = outcome.attempted,
+                        failed_channels = ?outcome.failed_channels,
+                        "forwarded notification delivery failed on all channels"
+                    );
+                }
+            } else {
+                warn!(node = %node_name, kind = %kind, "unknown forwarded notification kind");
             }
-        } else {
-            warn!(node = %node_name, kind = %kind, "unknown forwarded notification kind");
         }
     }
 
