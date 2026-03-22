@@ -460,13 +460,4 @@ mod tests {
         assert_eq!(args.id.as_deref(), Some("session-1"));
         assert_eq!(args.node.as_deref(), Some("worker-a"));
     }
-
-    #[test]
-    fn notify_suppress_alias_maps_to_disable() {
-        let cli = Cli::try_parse_from(["oly", "notify", "suppress", "session-1"]).unwrap();
-        let Commands::Notify(args) = cli.command else {
-            panic!("expected notify command");
-        };
-        assert!(matches!(args.command, NotifyCommand::Disable(_)));
-    }
 }

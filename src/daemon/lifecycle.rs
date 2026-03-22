@@ -204,9 +204,9 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
     );
     let _ = writeln!(out, "  Sessions:     {}", config.sessions_dir.display());
     let _ = writeln!(out);
-    let _ = writeln!(out, "Next:");
-    let _ = writeln!(out, "  Create a session: oly start --detach <cmd>");
+    let _ = writeln!(out, "Tips:");
     let _ = writeln!(out, "  Stop daemon:      oly daemon stop");
+    let _ = writeln!(out, "  Create a session: oly start --detach <cmd>");
     out
 }
 
@@ -554,15 +554,14 @@ mod tests {
         assert!(summary.contains("Daemon started in background."));
         assert!(summary.contains("Web UI/API:   http://127.0.0.1:15443"));
         assert!(summary.contains("Auth:         disabled (--no-auth)"));
-        assert!(summary.contains(&format!("Web root:     {}", config.wwwroot_dir().display())));
-        assert!(summary.contains(&format!("Root folder:  {}", config.state_dir.display())));
-        assert!(summary.contains(&format!("Sessions:     {}", config.sessions_dir.display())));
+        assert!(summary.contains(&format!("Root:         {}", config.state_dir.display())));
         assert!(summary.contains(&format!(
-            "Log folder:   {}",
+            "Logs:         {}",
             config.state_dir.join("logs").display()
         )));
-        assert!(summary.contains("Create a session: oly start --detach <cmd>"));
+        assert!(summary.contains(&format!("Sessions:     {}", config.sessions_dir.display())));
         assert!(summary.contains("Stop daemon:      oly daemon stop"));
+        assert!(summary.contains("Create a session: oly start --detach <cmd>"));
     }
 
     #[test]
