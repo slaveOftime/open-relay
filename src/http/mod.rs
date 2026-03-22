@@ -21,7 +21,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::broadcast;
-use tower_http::cors::CorsLayer;
+use tower_http::{compression::CompressionLayer, cors::CorsLayer};
 use tracing::{error, info};
 
 pub use auth::AuthState;
@@ -109,6 +109,7 @@ pub async fn serve(state: AppState) {
         .route("/api/nodes/join", get(nodes::join_handler))
         .route("/api/static/apps", get(apps::list_static_apps))
         .merge(protected_router)
+        .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .fallback(serve_static)
         .with_state(state);

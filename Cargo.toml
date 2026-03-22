@@ -42,7 +42,7 @@ crossterm = "0.29"
 vt100 = "0.16.2"
 which = "8"
 axum = { version = "0.8", features = ["ws", "macros"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "compression-br", "compression-gzip"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
@@ -64,6 +64,7 @@ bytes = "1"
 arc-swap = "1"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

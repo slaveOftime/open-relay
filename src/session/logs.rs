@@ -4,9 +4,11 @@
 //! persisted `output.log` files from disk.  This module consolidates that logic
 //! so every consumer shares the same code path.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 use crate::{error::Result, protocol::LogResize};
 
@@ -28,6 +30,9 @@ const PARSER_COLS: u16 = 2000;
 /// is visible in the retained log tail.
 const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 
+const LOG_INDEX_OFFSETS_FILE: &str = "output.log.idx";
+const LOG_INDEX_META_FILE: &str = "output.log.idx.meta";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ViewportSize {
     pub rows: u16,
@@ -43,6 +48,73 @@ struct TailBytes {
 struct RenderBytes<'a> {
     frame: &'a [u8],
     frame_has_alt_screen: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct LogRecordScannerState {
+    current_record: Vec<u8>,
+    pending_escape: Vec<u8>,
+}
+
+impl LogRecordScannerState {
+    fn trailing_len(&self) -> u64 {
+        (self.current_record.len() + self.pending_escape.len()) as u64
+    }
+
+    fn has_trailing_record(&self) -> bool {
+        !self.current_record.is_empty() || !self.pending_escape.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PersistedLogIndexMeta {
+    indexed_len: u64,
+    scanner_state: LogRecordScannerState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PersistedLogIndex {
+    indexed_len: u64,
+    complete_record_end_offsets: Vec<u64>,
+    scanner_state: LogRecordScannerState,
+}
+
+impl PersistedLogIndex {
+    fn from_meta(meta: PersistedLogIndexMeta, complete_record_end_offsets: Vec<u64>) -> Self {
+        Self {
+            indexed_len: meta.indexed_len,
+            complete_record_end_offsets,
+            scanner_state: meta.scanner_state,
+        }
+    }
+
+    fn to_meta(&self) -> PersistedLogIndexMeta {
+        PersistedLogIndexMeta {
+            indexed_len: self.indexed_len,
+            scanner_state: self.scanner_state.clone(),
+        }
+    }
+
+    fn total_records(&self) -> usize {
+        self.complete_record_end_offsets.len()
+            + usize::from(self.scanner_state.has_trailing_record())
+    }
+
+    fn last_complete_end_offset(&self) -> u64 {
+        self.complete_record_end_offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn is_consistent_with(&self, file_len: u64) -> bool {
+        self.indexed_len <= file_len
+            && self.last_complete_end_offset() <= self.indexed_len
+            && self.scanner_state.trailing_len()
+                <= self
+                    .indexed_len
+                    .saturating_sub(self.last_complete_end_offset())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -61,10 +133,27 @@ pub fn read_persisted_log_page(
     offset: usize,
     limit: usize,
 ) -> Option<(Vec<String>, usize)> {
-    let file = File::open(session_dir.join("output.log")).ok()?;
+    let log_path = session_dir.join("output.log");
+    if let Ok(index) = sync_persisted_log_index(&log_path)
+        && let Ok(records) = read_persisted_log_page_from_index(&log_path, &index, offset, limit)
+    {
+        return Some((records, index.total_records()));
+    }
+
+    let file = File::open(log_path).ok()?;
     let mut page = PaginatedLogRecords::new(offset, limit);
     scan_persisted_log_records(file, |record| page.push(record)).ok()?;
     Some(page.finish())
+}
+
+pub fn refresh_persisted_log_index(session_dir: &Path) -> Result<()> {
+    let log_path = session_dir.join("output.log");
+    let Ok(_) = fs::metadata(&log_path) else {
+        return Ok(());
+    };
+
+    sync_persisted_log_index(&log_path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -117,6 +206,19 @@ where
     F: FnMut(&[u8]),
 {
     let mut scanner = LogRecordScanner::new(on_record);
+    process_persisted_log_reader(reader, &mut scanner)?;
+    scanner.finish();
+    Ok(())
+}
+
+fn process_persisted_log_reader<R, F>(
+    reader: R,
+    scanner: &mut LogRecordScanner<F>,
+) -> std::io::Result<()>
+where
+    R: Read,
+    F: FnMut(&[u8]),
+{
     let mut reader = BufReader::new(reader);
 
     loop {
@@ -132,7 +234,6 @@ where
         reader.consume(consumed);
     }
 
-    scanner.finish();
     Ok(())
 }
 
@@ -140,8 +241,7 @@ struct LogRecordScanner<F>
 where
     F: FnMut(&[u8]),
 {
-    current_record: Vec<u8>,
-    pending_escape: Vec<u8>,
+    state: LogRecordScannerState,
     on_record: F,
 }
 
@@ -150,18 +250,22 @@ where
     F: FnMut(&[u8]),
 {
     fn new(on_record: F) -> Self {
-        Self {
-            current_record: Vec::with_capacity(LOG_RECORD_FALLBACK_BYTES),
-            pending_escape: Vec::new(),
-            on_record,
-        }
+        Self::from_state(LogRecordScannerState::default(), on_record)
+    }
+
+    fn from_state(state: LogRecordScannerState, on_record: F) -> Self {
+        Self { state, on_record }
+    }
+
+    fn into_state(self) -> LogRecordScannerState {
+        self.state
     }
 
     fn process_bytes(&mut self, bytes: &[u8]) {
         let mut remaining = bytes;
 
         while !remaining.is_empty() {
-            if !self.pending_escape.is_empty() {
+            if !self.state.pending_escape.is_empty() {
                 let consumed = self.process_pending_escape_bytes(remaining);
                 remaining = &remaining[consumed..];
                 continue;
@@ -176,10 +280,10 @@ where
 
             match remaining[special_index] {
                 b'\n' | b'\r' => {
-                    self.current_record.push(remaining[special_index]);
+                    self.state.current_record.push(remaining[special_index]);
                     self.flush_current_record();
                 }
-                ESCAPE_BYTE => self.pending_escape.push(ESCAPE_BYTE),
+                ESCAPE_BYTE => self.state.pending_escape.push(ESCAPE_BYTE),
                 _ => unreachable!("special record byte lookup returned unsupported byte"),
             }
 
@@ -189,12 +293,12 @@ where
 
     fn process_pending_escape_bytes(&mut self, bytes: &[u8]) -> usize {
         for (index, &byte) in bytes.iter().enumerate() {
-            self.pending_escape.push(byte);
+            self.state.pending_escape.push(byte);
 
-            match ansi_sequence_status(&self.pending_escape) {
+            match ansi_sequence_status(&self.state.pending_escape) {
                 AnsiSequenceStatus::Incomplete => {}
                 AnsiSequenceStatus::Complete => {
-                    let is_boundary = is_record_boundary_sequence(&self.pending_escape);
+                    let is_boundary = is_record_boundary_sequence(&self.state.pending_escape);
                     self.flush_pending_escape(is_boundary);
                     return index + 1;
                 }
@@ -210,50 +314,230 @@ where
 
     fn push_plain_bytes(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
-            let available = LOG_RECORD_FALLBACK_BYTES.saturating_sub(self.current_record.len());
+            let available =
+                LOG_RECORD_FALLBACK_BYTES.saturating_sub(self.state.current_record.len());
             if available == 0 {
                 self.flush_current_record();
                 continue;
             }
 
             if bytes.len() <= available {
-                self.current_record.extend_from_slice(bytes);
+                self.state.current_record.extend_from_slice(bytes);
                 return;
             }
 
             let split_at = utf8_boundary_at_or_before(bytes, available).max(1);
-            self.current_record.extend_from_slice(&bytes[..split_at]);
+            self.state
+                .current_record
+                .extend_from_slice(&bytes[..split_at]);
             self.flush_current_record();
             bytes = &bytes[split_at..];
         }
     }
 
     fn finish(&mut self) {
-        if !self.pending_escape.is_empty() {
-            self.current_record.extend_from_slice(&self.pending_escape);
-            self.pending_escape.clear();
+        if !self.state.pending_escape.is_empty() {
+            let pending_escape = std::mem::take(&mut self.state.pending_escape);
+            self.state.current_record.extend_from_slice(&pending_escape);
         }
 
         self.flush_current_record();
     }
 
     fn flush_current_record(&mut self) {
-        if self.current_record.is_empty() {
+        if self.state.current_record.is_empty() {
             return;
         }
 
-        (self.on_record)(&self.current_record);
-        self.current_record.clear();
+        (self.on_record)(&self.state.current_record);
+        self.state.current_record.clear();
     }
 
     fn flush_pending_escape(&mut self, is_boundary: bool) {
-        if is_boundary && !self.current_record.is_empty() {
+        if is_boundary && !self.state.current_record.is_empty() {
             self.flush_current_record();
         }
 
-        self.current_record.extend_from_slice(&self.pending_escape);
-        self.pending_escape.clear();
+        let pending_escape = std::mem::take(&mut self.state.pending_escape);
+        self.state.current_record.extend_from_slice(&pending_escape);
     }
+}
+
+fn read_persisted_log_page_from_index(
+    log_path: &Path,
+    index: &PersistedLogIndex,
+    offset: usize,
+    limit: usize,
+) -> std::io::Result<Vec<String>> {
+    let total = index.total_records();
+    if limit == 0 || offset >= total {
+        return Ok(Vec::new());
+    }
+
+    let end = offset.saturating_add(limit).min(total);
+    let complete_count = index.complete_record_end_offsets.len();
+    let start_offset = if offset == 0 {
+        0
+    } else {
+        index.complete_record_end_offsets[offset - 1]
+    };
+    let end_offset = if end <= complete_count {
+        index.complete_record_end_offsets[end - 1]
+    } else {
+        index.indexed_len
+    };
+
+    let mut file = File::open(log_path)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+
+    let mut bytes = vec![0u8; (end_offset - start_offset) as usize];
+    file.read_exact(&mut bytes)?;
+
+    let complete_end = end.min(complete_count);
+    let requested_complete_offsets = &index.complete_record_end_offsets[offset..complete_end];
+    let mut records = Vec::with_capacity(end - offset);
+    let mut record_start = 0usize;
+
+    for &record_end in requested_complete_offsets {
+        let relative_end = (record_end - start_offset) as usize;
+        records.push(String::from_utf8_lossy(&bytes[record_start..relative_end]).into_owned());
+        record_start = relative_end;
+    }
+
+    if end > complete_count && record_start < bytes.len() {
+        records.push(String::from_utf8_lossy(&bytes[record_start..]).into_owned());
+    }
+
+    Ok(records)
+}
+
+fn sync_persisted_log_index(log_path: &Path) -> std::io::Result<PersistedLogIndex> {
+    let file_len = fs::metadata(log_path)?.len();
+
+    let mut index = match load_persisted_log_index(log_path) {
+        Ok(index) if index.is_consistent_with(file_len) => index,
+        _ => return rebuild_persisted_log_index(log_path, file_len),
+    };
+
+    if index.indexed_len < file_len {
+        let new_offsets = extend_persisted_log_index(log_path, &mut index, file_len)?;
+        append_log_index_offsets(log_path, &new_offsets)?;
+        write_log_index_meta(log_path, &index.to_meta())?;
+    }
+
+    Ok(index)
+}
+
+fn rebuild_persisted_log_index(
+    log_path: &Path,
+    file_len: u64,
+) -> std::io::Result<PersistedLogIndex> {
+    let mut index = PersistedLogIndex::default();
+    let complete_offsets = extend_persisted_log_index(log_path, &mut index, file_len)?;
+    index.complete_record_end_offsets = complete_offsets;
+    write_log_index_offsets(log_path, &index.complete_record_end_offsets)?;
+    write_log_index_meta(log_path, &index.to_meta())?;
+    Ok(index)
+}
+
+fn extend_persisted_log_index(
+    log_path: &Path,
+    index: &mut PersistedLogIndex,
+    file_len: u64,
+) -> std::io::Result<Vec<u64>> {
+    let mut file = File::open(log_path)?;
+    file.seek(SeekFrom::Start(index.indexed_len))?;
+
+    let mut completed_end = index
+        .indexed_len
+        .saturating_sub(index.scanner_state.trailing_len());
+    let mut new_offsets = Vec::new();
+    let state = std::mem::take(&mut index.scanner_state);
+    let mut scanner = LogRecordScanner::from_state(state, |record| {
+        completed_end += record.len() as u64;
+        new_offsets.push(completed_end);
+    });
+
+    process_persisted_log_reader(file, &mut scanner)?;
+    index.scanner_state = scanner.into_state();
+    index.indexed_len = file_len;
+    index
+        .complete_record_end_offsets
+        .extend_from_slice(&new_offsets);
+
+    Ok(new_offsets)
+}
+
+fn load_persisted_log_index(log_path: &Path) -> std::io::Result<PersistedLogIndex> {
+    let meta = read_log_index_meta(log_path)?;
+    let offsets = read_log_index_offsets(log_path)?;
+    Ok(PersistedLogIndex::from_meta(meta, offsets))
+}
+
+fn read_log_index_meta(log_path: &Path) -> std::io::Result<PersistedLogIndexMeta> {
+    let bytes = fs::read(log_index_meta_path(log_path))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+fn read_log_index_offsets(log_path: &Path) -> std::io::Result<Vec<u64>> {
+    let bytes = fs::read(log_index_offsets_path(log_path))?;
+    if bytes.len() % std::mem::size_of::<u64>() != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "log index offsets file has invalid length",
+        ));
+    }
+
+    Ok(bytes
+        .chunks_exact(std::mem::size_of::<u64>())
+        .map(|chunk| {
+            let mut buf = [0u8; std::mem::size_of::<u64>()];
+            buf.copy_from_slice(chunk);
+            u64::from_le_bytes(buf)
+        })
+        .collect())
+}
+
+fn write_log_index_offsets(log_path: &Path, offsets: &[u64]) -> std::io::Result<()> {
+    let mut bytes = Vec::with_capacity(offsets.len() * std::mem::size_of::<u64>());
+    for offset in offsets {
+        bytes.extend_from_slice(&offset.to_le_bytes());
+    }
+
+    fs::write(log_index_offsets_path(log_path), bytes)
+}
+
+fn append_log_index_offsets(log_path: &Path, offsets: &[u64]) -> std::io::Result<()> {
+    if offsets.is_empty() {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_index_offsets_path(log_path))?;
+    for offset in offsets {
+        file.write_all(&offset.to_le_bytes())?;
+    }
+    file.flush()
+}
+
+fn write_log_index_meta(log_path: &Path, meta: &PersistedLogIndexMeta) -> std::io::Result<()> {
+    let path = log_index_meta_path(log_path);
+    let temp_path = path.with_extension("meta.tmp");
+    let bytes = serde_json::to_vec(meta)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    fs::write(&temp_path, bytes)?;
+    fs::rename(temp_path, path)
+}
+
+fn log_index_offsets_path(log_path: &Path) -> PathBuf {
+    log_path.with_file_name(LOG_INDEX_OFFSETS_FILE)
+}
+
+fn log_index_meta_path(log_path: &Path) -> PathBuf {
+    log_path.with_file_name(LOG_INDEX_META_FILE)
 }
 
 fn find_special_record_byte(bytes: &[u8]) -> Option<usize> {
@@ -883,11 +1167,13 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 mod tests {
     use super::{
         ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
-        read_relevant_resize_events, read_resize_events, render_log_bytes, render_log_file,
+        read_persisted_log_page, read_relevant_resize_events, read_resize_events,
+        refresh_persisted_log_index, render_log_bytes, render_log_file,
         split_persisted_log_records,
     };
     use crate::protocol::LogResize;
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -943,6 +1229,17 @@ mod tests {
 
     fn empty_plan() -> ViewportReplayPlan {
         ViewportReplayPlan::default()
+    }
+
+    fn temp_session_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
     }
 
     #[test]
@@ -1213,5 +1510,40 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].len(), super::LOG_RECORD_FALLBACK_BYTES);
         assert_eq!(records[1].len(), 17);
+    }
+
+    #[test]
+    fn persisted_log_index_extends_across_append_boundaries() {
+        let temp_dir = temp_session_dir("oly-log-index");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let log_path = temp_dir.join("output.log");
+        fs::write(&log_path, b"alpha").expect("write initial output log");
+        refresh_persisted_log_index(&temp_dir).expect("index initial output log");
+
+        let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial page");
+        assert_eq!(lines, vec!["alpha".to_string()]);
+        assert_eq!(total, 1);
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .expect("open output log for append");
+        file.write_all(b" beta\ngamma")
+            .expect("append output log continuation");
+        file.flush().expect("flush appended output log");
+
+        refresh_persisted_log_index(&temp_dir).expect("extend persisted log index");
+
+        let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended page");
+        assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
+        assert_eq!(total, 2);
+
+        let (tail_lines, tail_total) =
+            read_persisted_log_page(&temp_dir, 1, 10).expect("read trailing page");
+        assert_eq!(tail_lines, vec!["gamma".to_string()]);
+        assert_eq!(tail_total, 2);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

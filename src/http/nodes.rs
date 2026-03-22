@@ -14,7 +14,9 @@ use crate::{
     http::AppState,
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
-    protocol::{NodeSummary, NodeWsMessage, RpcResponse},
+    protocol::{
+        NodeSummary, NodeWsMessage, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+    },
     session::SessionEvent,
 };
 
@@ -47,11 +49,11 @@ async fn handle_join(socket: WebSocket, state: AppState) {
 
     // ── Step 1: read handshake ────────────────────────────────────────────
     let first = match ws_rx.next().await {
-        Some(Ok(Message::Text(t))) => t.to_string(),
+        Some(Ok(Message::Binary(data))) => data,
         _ => return,
     };
 
-    let handshake: NodeWsMessage = match serde_json::from_str(&first) {
+    let handshake: NodeWsMessage = match decode_node_ws_payload(&first) {
         Ok(m) => m,
         Err(_) => {
             send_error(&mut ws_tx, "invalid handshake format").await;
@@ -98,110 +100,108 @@ async fn handle_join(socket: WebSocket, state: AppState) {
     state.node_registry.connect(name.clone(), handle).await;
 
     // ── Step 5: send Joined (node is already visible in registry) ────────
-    let joined_text = match serde_json::to_string(&NodeWsMessage::Joined) {
-        Ok(t) => t,
-        Err(_) => {
-            state.node_registry.disconnect(&name).await;
-            return;
-        }
-    };
-    if ws_tx.send(Message::Text(joined_text.into())).await.is_err() {
+    if send_node_message(&mut ws_tx, &NodeWsMessage::Joined)
+        .await
+        .is_err()
+    {
         state.node_registry.disconnect(&name).await;
         return;
     }
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
-    loop {
+    let disconnect_reason = loop {
         tokio::select! {
             // Outgoing: channel → WS
             msg = send_rx.recv() => {
-                let Some((id, req_json)) = msg else { break };
-                let ws_msg = NodeWsMessage::Rpc { id, request: req_json };
-                let text = match serde_json::to_string(&ws_msg) {
-                    Ok(t) => t,
-                    Err(_) => continue,
+                let Some((id, req_json)) = msg else {
+                    break "node RPC relay channel closed".to_string();
                 };
-                if ws_tx.send(Message::Text(text.into())).await.is_err() {
-                    break;
+                let ws_msg = NodeWsMessage::Rpc { id, request: req_json };
+                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg).await {
+                    break format!("failed to send proxied RPC to node WebSocket: {err}");
                 }
             }
             // Incoming: WS → resolve pending RPC callers
             incoming = ws_rx.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<NodeWsMessage>(&text) {
-                            Ok(NodeWsMessage::RpcResponse { id, response }) => {
-                                if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
-                                    let sender = {
-                                        let mut pm = pending_recv.lock().await;
-                                        pm.remove(&id)
-                                    };
-                                    if let Some(sender) = sender {
-                                        match sender {
-                                            PendingRpc::OneShot(tx) => {
-                                                let _ = tx.send(Ok(rpc_resp));
-                                            }
-                                            PendingRpc::Stream(tx) => {
-                                                let _ = tx.send(Ok(rpc_resp)).await;
-                                            }
-                                        }
-                                    }
-                                }
+                    Some(Ok(frame)) => {
+                        let message = match frame {
+                            Message::Close(frame) => {
+                                break close_frame_disconnect_reason(frame);
                             }
-                            Ok(NodeWsMessage::RpcStreamFrame { id, response, done }) => {
-                                if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
-                                    if done {
-                                        // Final frame — remove sender from pending and send.
+                            other => match parse_node_message(other) {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    warn!(node = %name, %err, "failed to decode secondary node frame");
+                                    continue;
+                                }
+                            },
+                        };
+                        match message {
+                            node_message => match node_message {
+                                NodeWsMessage::RpcResponse { id, response } => {
+                                    if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
                                         let sender = {
                                             let mut pm = pending_recv.lock().await;
                                             pm.remove(&id)
                                         };
                                         if let Some(sender) = sender {
                                             match sender {
-                                                PendingRpc::Stream(tx) => {
-                                                    let _ = tx.send(Ok(rpc_resp)).await;
-                                                }
                                                 PendingRpc::OneShot(tx) => {
                                                     let _ = tx.send(Ok(rpc_resp));
                                                 }
-                                            }
-                                        }
-                                    } else {
-                                        // Intermediate frame — clone sender (under lock), drop
-                                        // lock, then send with backpressure.
-                                        let tx_clone = {
-                                            let pm = pending_recv.lock().await;
-                                            if let Some(PendingRpc::Stream(tx)) = pm.get(&id) {
-                                                Some(tx.clone())
-                                            } else {
-                                                None
-                                            }
-                                        };
-                                        if let Some(tx) = tx_clone {
-                                            if tx.send(Ok(rpc_resp)).await.is_err() {
-                                                // Receiver dropped; clean up pending entry.
-                                                let mut pm = pending_recv.lock().await;
-                                                pm.remove(&id);
+                                                PendingRpc::Stream(tx) => {
+                                                    let _ = tx.send(Ok(rpc_resp)).await;
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                            Ok(NodeWsMessage::Ping) => {
-                                let pong = serde_json::to_string(&NodeWsMessage::Pong).unwrap_or_default();
-                                let _ = ws_tx.send(Message::Text(pong.into())).await;
-                            }
-                            Ok(NodeWsMessage::Notification {
-                                kind,
-                                title,
-                                description,
-                                body,
-                                navigation_url,
-                                session_ids,
-                                trigger_rule,
-                                trigger_detail,
-                            }) => {
-                                let payload = SessionEvent::SessionNotification {
+                                NodeWsMessage::RpcStreamFrame { id, response, done } => {
+                                    if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
+                                        if done {
+                                            let sender = {
+                                                let mut pm = pending_recv.lock().await;
+                                                pm.remove(&id)
+                                            };
+                                            if let Some(sender) = sender {
+                                                match sender {
+                                                    PendingRpc::Stream(tx) => {
+                                                        let _ = tx.send(Ok(rpc_resp)).await;
+                                                    }
+                                                    PendingRpc::OneShot(tx) => {
+                                                        let _ = tx.send(Ok(rpc_resp));
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let tx_clone = {
+                                                let pm = pending_recv.lock().await;
+                                                if let Some(PendingRpc::Stream(tx)) = pm.get(&id) {
+                                                    Some(tx.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            };
+                                            if let Some(tx) = tx_clone {
+                                                if tx.send(Ok(rpc_resp)).await.is_err() {
+                                                    let mut pm = pending_recv.lock().await;
+                                                    pm.remove(&id);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                NodeWsMessage::Ping => {
+                                    if let Err(err) = send_node_message(
+                                        &mut ws_tx,
+                                        &NodeWsMessage::Pong,
+                                    )
+                                    .await {
+                                        break format!("failed to send pong to node WebSocket: {err}");
+                                    }
+                                }
+                                NodeWsMessage::Notification {
                                     kind,
                                     title,
                                     description,
@@ -210,26 +210,40 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                     session_ids,
                                     trigger_rule,
                                     trigger_detail,
-                                    node: Some(name.clone()),
-                                };
-                                handle_forwarded_session_event(&state, &name, payload, true).await;
+                                } => {
+                                    let payload = SessionEvent::SessionNotification {
+                                        kind,
+                                        title,
+                                        description,
+                                        body,
+                                        navigation_url,
+                                        session_ids,
+                                        trigger_rule,
+                                        trigger_detail,
+                                        node: Some(name.clone()),
+                                    };
+                                    handle_forwarded_session_event(&state, &name, payload, true)
+                                        .await;
+                                }
+                                NodeWsMessage::SessionEvent { payload } => {
+                                    handle_forwarded_session_event(&state, &name, payload, false)
+                                        .await;
+                                }
+                                _ => {}
                             }
-                            Ok(NodeWsMessage::SessionEvent { payload }) => {
-                                handle_forwarded_session_event(&state, &name, payload, false).await;
-                            }
-                            _ => {}
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    _ => {}
+                    Some(Err(err)) => break format!("node WebSocket receive error: {err}"),
+                    None => break "node WebSocket stream ended".to_string(),
                 }
             }
         }
-    }
+    };
 
     // Drain pending waiters with an error so callers don't hang.
-    {
+    let drained_waiters = {
         let mut pm = pending_recv.lock().await;
+        let drained_waiters = pm.len();
         let err = || crate::error::AppError::NodeNotConnected(name.clone());
         for (_, sender) in pm.drain() {
             match sender {
@@ -241,10 +255,11 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                 }
             }
         }
-    }
+        drained_waiters
+    };
 
     state.node_registry.disconnect(&name).await;
-    warn!(node = %name, "secondary node disconnected");
+    warn!(node = %name, reason = %disconnect_reason, drained_waiters, "secondary node disconnected");
 }
 
 async fn handle_forwarded_session_event(
@@ -333,7 +348,37 @@ async fn send_error(
     let msg = NodeWsMessage::Error {
         message: message.to_string(),
     };
-    if let Ok(text) = serde_json::to_string(&msg) {
-        let _ = ws_tx.send(Message::Text(text.into())).await;
+    if let Ok(payload) = encode_node_ws_payload(&msg) {
+        let _ = ws_tx.send(Message::Binary(payload.into())).await;
+    }
+}
+
+async fn send_node_message(
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: &NodeWsMessage,
+) -> Result<(), String> {
+    match encode_node_ws_payload(message) {
+        Ok(payload) => ws_tx
+            .send(Message::Binary(payload.into()))
+            .await
+            .map_err(|err| err.to_string()),
+        Err(err) => {
+            warn!(%err, "failed to encode node WebSocket frame");
+            Err(err.to_string())
+        }
+    }
+}
+
+fn parse_node_message(frame: Message) -> std::io::Result<NodeWsMessage> {
+    match frame {
+        Message::Binary(data) => decode_node_ws_payload(&data),
+        _ => Err(std::io::Error::other("unsupported node WebSocket frame")),
+    }
+}
+
+fn close_frame_disconnect_reason(frame: Option<axum::extract::ws::CloseFrame>) -> String {
+    match frame {
+        Some(frame) => format!("peer sent close frame: {frame:?}"),
+        None => "peer sent close frame".to_string(),
     }
 }
