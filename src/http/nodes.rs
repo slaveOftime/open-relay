@@ -100,31 +100,45 @@ async fn handle_join(socket: WebSocket, state: AppState) {
     state.node_registry.connect(name.clone(), handle).await;
 
     // ── Step 5: send Joined (node is already visible in registry) ────────
-    if !send_node_message(&mut ws_tx, &NodeWsMessage::Joined).await {
+    if send_node_message(&mut ws_tx, &NodeWsMessage::Joined)
+        .await
+        .is_err()
+    {
         state.node_registry.disconnect(&name).await;
         return;
     }
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
-    loop {
+    let disconnect_reason = loop {
         tokio::select! {
             // Outgoing: channel → WS
             msg = send_rx.recv() => {
-                let Some((id, req_json)) = msg else { break };
+                let Some((id, req_json)) = msg else {
+                    break "node RPC relay channel closed".to_string();
+                };
                 let ws_msg = NodeWsMessage::Rpc { id, request: req_json };
-                if !send_node_message(&mut ws_tx, &ws_msg).await {
-                    break;
+                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg).await {
+                    break format!("failed to send proxied RPC to node WebSocket: {err}");
                 }
             }
             // Incoming: WS → resolve pending RPC callers
             incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(frame)) => {
-                        let Some(message) = parse_node_message(frame) else {
-                            break;
+                        let message = match frame {
+                            Message::Close(frame) => {
+                                break close_frame_disconnect_reason(frame);
+                            }
+                            other => match parse_node_message(other) {
+                                Ok(message) => message,
+                                Err(err) => {
+                                    warn!(node = %name, %err, "failed to decode secondary node frame");
+                                    continue;
+                                }
+                            },
                         };
                         match message {
-                            Ok(node_message) => match node_message {
+                            node_message => match node_message {
                                 NodeWsMessage::RpcResponse { id, response } => {
                                     if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
                                         let sender = {
@@ -179,11 +193,13 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                     }
                                 }
                                 NodeWsMessage::Ping => {
-                                    let _ = send_node_message(
+                                    if let Err(err) = send_node_message(
                                         &mut ws_tx,
                                         &NodeWsMessage::Pong,
                                     )
-                                    .await;
+                                    .await {
+                                        break format!("failed to send pong to node WebSocket: {err}");
+                                    }
                                 }
                                 NodeWsMessage::Notification {
                                     kind,
@@ -214,21 +230,20 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                         .await;
                                 }
                                 _ => {}
-                            },
-                            Err(err) => {
-                                warn!(node = %name, %err, "failed to decode secondary node frame");
                             }
                         }
                     }
-                    Some(Err(_)) | None => break,
+                    Some(Err(err)) => break format!("node WebSocket receive error: {err}"),
+                    None => break "node WebSocket stream ended".to_string(),
                 }
             }
         }
-    }
+    };
 
     // Drain pending waiters with an error so callers don't hang.
-    {
+    let drained_waiters = {
         let mut pm = pending_recv.lock().await;
+        let drained_waiters = pm.len();
         let err = || crate::error::AppError::NodeNotConnected(name.clone());
         for (_, sender) in pm.drain() {
             match sender {
@@ -240,10 +255,11 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                 }
             }
         }
-    }
+        drained_waiters
+    };
 
     state.node_registry.disconnect(&name).await;
-    warn!(node = %name, "secondary node disconnected");
+    warn!(node = %name, reason = %disconnect_reason, drained_waiters, "secondary node disconnected");
 }
 
 async fn handle_forwarded_session_event(
@@ -340,22 +356,29 @@ async fn send_error(
 async fn send_node_message(
     ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: &NodeWsMessage,
-) -> bool {
+) -> Result<(), String> {
     match encode_node_ws_payload(message) {
-        Ok(payload) => ws_tx.send(Message::Binary(payload.into())).await.is_ok(),
+        Ok(payload) => ws_tx
+            .send(Message::Binary(payload.into()))
+            .await
+            .map_err(|err| err.to_string()),
         Err(err) => {
             warn!(%err, "failed to encode node WebSocket frame");
-            false
+            Err(err.to_string())
         }
     }
 }
 
-fn parse_node_message(frame: Message) -> Option<std::io::Result<NodeWsMessage>> {
+fn parse_node_message(frame: Message) -> std::io::Result<NodeWsMessage> {
     match frame {
-        Message::Binary(data) => Some(decode_node_ws_payload(&data)),
-        Message::Close(_) => None,
-        _ => Some(Err(std::io::Error::other(
-            "unsupported node WebSocket frame",
-        ))),
+        Message::Binary(data) => decode_node_ws_payload(&data),
+        _ => Err(std::io::Error::other("unsupported node WebSocket frame")),
+    }
+}
+
+fn close_frame_disconnect_reason(frame: Option<axum::extract::ws::CloseFrame>) -> String {
+    match frame {
+        Some(frame) => format!("peer sent close frame: {frame:?}"),
+        None => "peer sent close frame".to_string(),
     }
 }
