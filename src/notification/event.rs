@@ -205,9 +205,6 @@ mod tests {
             node: None,
         };
 
-        assert_eq!(
-            event.rendered_body(),
-            "Session needs attention.\nPassword:"
-        );
+        assert_eq!(event.rendered_body(), "Session needs attention.\nPassword:");
     }
 }

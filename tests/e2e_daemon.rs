@@ -204,7 +204,9 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let (mut ws1, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .expect("connect worker1 websocket");
-        ws1.send(node_ws_json_frame(json!({"type": "join", "name": "worker1", "key": key})))
+        ws1.send(node_ws_json_frame(
+            json!({"type": "join", "name": "worker1", "key": key}),
+        ))
         .await
         .expect("send worker1 join message");
         let first = timeout(Duration::from_secs(2), ws1.next())
@@ -244,7 +246,9 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .await
             .expect("connect duplicate websocket");
         ws_dup
-            .send(node_ws_json_frame(json!({"type": "join", "name": "worker1", "key": key})))
+            .send(node_ws_json_frame(
+                json!({"type": "join", "name": "worker1", "key": key}),
+            ))
             .await
             .expect("send duplicate join message");
         let dup = timeout(Duration::from_secs(2), ws_dup.next())
@@ -270,7 +274,9 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let (mut ws2, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .expect("connect worker2 websocket");
-        ws2.send(node_ws_json_frame(json!({"type": "join", "name": "worker2", "key": key})))
+        ws2.send(node_ws_json_frame(
+            json!({"type": "join", "name": "worker2", "key": key}),
+        ))
         .await
         .expect("send worker2 join message");
         let second = timeout(Duration::from_secs(2), ws2.next())
@@ -304,7 +310,9 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let (mut ws3, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .expect("connect worker3 websocket");
-        ws3.send(node_ws_json_frame(json!({"type": "join", "name": "worker3", "key": key})))
+        ws3.send(node_ws_json_frame(
+            json!({"type": "join", "name": "worker3", "key": key}),
+        ))
         .await
         .expect("send worker3 join message");
 

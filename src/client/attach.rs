@@ -158,8 +158,14 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
         let mut pending_key_burst: Option<PendingKeyBurst> = None;
         let mut suppress_paste_keys_until: Option<Instant> = None;
+        let mut shutdown_rx = spawn_attach_shutdown_listener();
 
         while running {
+            if shutdown_rx.try_recv().is_ok() {
+                detached = true;
+                break;
+            }
+
             // Drain all pending keyboard/resize events first.
             loop {
                 match event::poll(pending_key_burst_poll_timeout(pending_key_burst.as_ref())) {
@@ -424,6 +430,79 @@ fn attach_proxy(node: Option<&str>, req: RpcRequest) -> RpcRequest {
             inner: Box::new(req),
         },
     }
+}
+
+fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
+    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                let _ = shutdown_tx.send(());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let _ = terminate.recv().await;
+                let _ = shutdown_tx.send(());
+            });
+        }
+
+        if let Ok(mut hangup) = signal(SignalKind::hangup()) {
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let _ = hangup.recv().await;
+                let _ = shutdown_tx.send(());
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+
+        if let Ok(mut ctrl_break) = ctrl_break() {
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let _ = ctrl_break.recv().await;
+                let _ = shutdown_tx.send(());
+            });
+        }
+
+        if let Ok(mut ctrl_close) = ctrl_close() {
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let _ = ctrl_close.recv().await;
+                let _ = shutdown_tx.send(());
+            });
+        }
+
+        if let Ok(mut ctrl_logoff) = ctrl_logoff() {
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let _ = ctrl_logoff.recv().await;
+                let _ = shutdown_tx.send(());
+            });
+        }
+
+        if let Ok(mut ctrl_shutdown) = ctrl_shutdown() {
+            let shutdown_tx = shutdown_tx.clone();
+            tokio::spawn(async move {
+                let _ = ctrl_shutdown.recv().await;
+                let _ = shutdown_tx.send(());
+            });
+        }
+    }
+
+    shutdown_rx
 }
 
 fn drain_pending_terminal_events() -> Result<()> {
