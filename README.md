@@ -1,137 +1,235 @@
 # oly — Open Relay
 
-<p align="center"><img src="./assets/icon-demo.svg" width="160" /></p>
-
-[![Watch the video](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.png)](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.mp4)
-
-<p align="center"><a href="./assets/oly-full-demo.mp4">Download or open the full demo video</a></p>
+<p align="center">
+  <img src="./assets/icon-demo.svg" width="160" alt="oly logo" />
+</p>
 
 [![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-> Run any CLI like a managed service.
+[![Watch the demo](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.png)](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.mp4)
 
-`oly` turns long-running and interactive CLI workflows into persistent, supervised sessions for humans and AI agents. Close the terminal, keep the process alive, get notified when input is needed, and jump back in from anywhere.
+<p align="center"><a href="./assets/oly-full-demo.mp4">Open or download the full demo video</a></p>
 
-If this solves a real problem for you, give the repo a star so more people can find it.
+> Run interactive CLIs and AI agents like managed services.
 
-For a full repository architecture map, see [ARCHITECTURE.md](./ARCHITECTURE.md).
-For the PTY/session internals specifically, see [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
-For edge cases, limitations, and operational notes, see [ARCHITECTURE_NOTES.md](./ARCHITECTURE_NOTES.md).
+`oly` gives long-running terminal jobs a durable home.
 
----
+Start a command once, detach, close your terminal, come back later, inspect logs, send input only when needed, or reattach and take over. It is built for AI agent workflows, interactive CLIs, and any session you do not want tied to one fragile terminal window.
 
-## The problem 😤
+If `oly` saves you time, please star the repo. That helps more people discover it.
 
-You start an agent or interactive CLI task. It runs for 20 minutes. Halfway through it hits a `y/n` prompt and just... sits there. You had to keep a terminal open, stay at your desk, babysit it.
-
-**That's over.**
+For deep implementation details, see [ARCHITECTURE.md](./ARCHITECTURE.md), [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
 
 ---
 
-## What oly does ⚡
+## Why people use `oly`
 
-- Turns interactive CLIs into managed, auditable sessions
-- Owns agent sessions in a background daemon — closing your terminal changes nothing
-- Replays buffered output when you reattach (no lost context)
-- Detects when input is likely needed and notifies you
-- Lets you inject input without attaching (`oly send <id> key:enter`)
-- Keeps auditable logs of everything
+- **Detach without losing the process.** The daemon owns the session, not your terminal.
+- **Stop babysitting prompts.** Watch logs or wait for likely input-needed checkpoints.
+- **Intervene surgically.** Send text or keys without attaching.
+- **Resume with context.** Reattach and replay buffered output first.
+- **Keep an audit trail.** Session output and lifecycle events persist on disk.
+- **Control it from more than one place.** Use the CLI, the web UI, or route work to connected nodes.
 
-### Who it's for
-
-- People running AI coding agents that stall on prompts, permissions, or long-running work
-- Anyone using interactive CLIs that should survive terminal closes, disconnects, or context switches
-- Teams that want auditable logs and remote intervention instead of fragile ad-hoc shell sessions
-
-### Agent-supervises-agent 🤖 👀 🤖
-
-You can run one agent to supervise another. When the supervisor hits something it's unsure about — or something that needs elevated permission — it escalates to you. You decide whether to approve, modify, or abort. You're still in the loop, just not watching.
+`oly` is not trying to replace your favorite terminal. It is a supervision layer for long-lived, interactive workloads. A simple CLI proxy.
 
 ---
 
-## Install 📦
+## Install
+
+### npm
 
 ```sh
-npm i @slaveoftime/oly -g
+npm i -g @slaveoftime/oly
 ```
+
+### Cargo
 
 ```sh
 cargo install oly
 ```
+
+### Homebrew
 
 ```sh
 brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
 brew install slaveOftime/open-relay/oly
 ```
 
-> Supported platform
-> - **macOS**: Apple Silicon (`arm64`)
-> - **Linux**: x86_64 / AMD64
-> - **Windows**: x86_64 / AMD64
+### Prebuilt binaries
 
+Download the latest release from the [Releases page](https://github.com/slaveOftime/open-relay/releases).
 
-### Pre-built binaries
+Current release artifacts are published for:
 
-Download the latest release for your platform from the [Releases page](https://github.com/Slaveoftime/open-relay/releases).
-
-- **macOS**: Download `oly-macos-arm64.zip`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
-- **Linux**: Download `oly-linux-amd64.zip`, unzip, `chmod +x oly`, and move to `/usr/local/bin`.
-- **Windows**: Download `oly-windows-amd64.zip`, unzip, and add to your PATH.
+- **macOS**: Apple Silicon (`arm64`)
+- **Linux**: `x86_64` / AMD64
+- **Windows**: `x86_64` / AMD64
 
 ---
 
-## Quick start 🚀
+## Quick start
 
-The CLI is for both humans and AI agents.
-
-If you only try one workflow, make it this one: start the daemon, launch a session detached, inspect logs, then send input only when needed.
+If you only try one workflow, make it this one:
 
 ```sh
-# Start the daemon (once per boot, or add to your init)
-oly daemon start
+# Start the daemon.
+# By default, the local web UI/API is enabled and protected by a password
+# you set at startup.
+oly daemon start --detach
 
-# Launch an agent session and detach immediately
-oly start --title "code is cheap" --detach copilot
+# Launch a detached session
+oly start copilot
 
-# Check what's running
+# See what's running
 oly ls
 
-# Peek at output without attaching
-oly logs <id>
+# Check recent output and optionally wait for an input-needed checkpoint
+oly logs <id> --wait-for-prompt --timeout 1m
 
-# Something needs your input — send it without a terminal
+# Send input without attaching
 oly send <id> "yes" key:enter
 
-# Actually attach and drive it yourself
-# Ctrl+D to detach anytime
+# Reattach when you want full control
 oly attach <id>
 
-# Stop it when done
+# Stop the session
 oly stop <id>
 ```
 
----
+Useful behavior to know:
 
-## Remote supervision 🌐
-
-Access and manage sessions from a browser, with push notification support. Intervene from anywhere.
-
-`oly` has no built-in network listener — deliberately. Expose it the way you control:
-
-```
-[anywhere] → [your auth gateway] → [tunnel] → [oly daemon, local IPC]
-```
-
-Put Cloudflare Access, Tailscale, or any auth proxy in front. Every action logged. Your rules. 🔒
+- `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
+- To detach from an attached session, press `Ctrl-]`, then `d`.
+- `oly ls --json` prints machine-readable output for scripts and agents.
 
 ---
 
-## Notification hooks 🔔
+## What `oly` does well
 
-If the built-in OS notification is not enough, `oly` can also launch your own hook command on every delivered notification. This is useful for piping alerts into Slack wrappers, custom desktop automation, pagers, or supervisor scripts.
+### 1. Supervise agent sessions
 
-Set `notification_hook` in your `config.json` under the `OLY_STATE_DIR` state folder:
+Run coding agents, REPLs, installers, or approval-heavy workflows in the background without keeping one terminal open forever.
+
+### 2. Detect likely human checkpoints
+
+`oly logs --wait-for-prompt` lets you block until a session likely needs attention, then inspect the output before deciding what to do next.
+
+### 3. Let humans stay in the loop
+
+When a process needs confirmation, credentials, or a decision, you or agent can send input directly:
+
+```sh
+oly send <id> "continue" key:enter
+oly send <id> key:ctrl+c
+oly send <id> key:up key:enter
+```
+
+### 4. Keep a browser-accessible control plane
+
+By default, `oly daemon start -d` also serves a local web UI and HTTP API on `http://127.0.0.1:15443`.
+
+- Use `--port` to change the port.
+- Use `--no-http` for CLI-only operation.
+- Use `--no-auth` only if you understand the risk and are protecting access elsewhere.
+
+### 5. Route work to other machines
+
+`oly` can connect multiple daemons together so one primary can supervise sessions on secondary nodes.
+
+---
+
+## Core workflow patterns
+
+### Detached agent run
+
+```sh
+oly start --title "fix failing tests" --detach copilot
+oly logs --wait-for-prompt
+oly send <id> "approve" key:enter
+```
+
+### Watch logs without attaching
+
+```sh
+oly logs <id> --tail 80
+oly logs <id> --tail 80 --keep-color
+oly logs <id> --tail 120 --no-truncate
+```
+
+### Start on a connected node
+
+```sh
+oly start --node worker-1 --title "nightly task" --detach claude
+oly logs --node worker-1 --wait-for-prompt <id>
+```
+
+---
+
+## Command reference
+
+### Session and daemon commands
+
+| Command | Purpose |
+| --- | --- |
+| `oly daemon start [--detach] [--port <port>] [--no-auth] [--no-http]` | Start the daemon, optional local web API/UI |
+| `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
+| `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
+| `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]` | List sessions |
+| `oly attach [id] [--node <name>]` | Reattach to a session |
+| `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching |
+| `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session |
+| `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
+| `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
+| `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
+| `oly skill` | Print the bundled `oly` skill markdown |
+
+Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `key:esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, modifier forms like `key:ctrl+c`, `key:alt+x`, `key:meta+enter`, `key:shift+tab`, and raw bytes via `key:hex:...`.
+
+### Federation commands
+
+| Command | Purpose |
+| --- | --- |
+| `oly api-key add <name>` | Create an API key on the primary and print it once |
+| `oly api-key ls` | List API key labels on the primary |
+| `oly api-key remove <name>` | Revoke an API key on the primary |
+| `oly join start --name <name> --key <key> <url>` | Connect this daemon to a primary |
+| `oly join stop --name <name>` | Disconnect and remove a saved join config |
+| `oly join ls` | List saved outbound join configs on this daemon |
+| `oly join ls --primary` | Ask the daemon for currently active primary-side joins |
+| `oly node ls` | List secondary nodes currently connected to the primary |
+
+---
+
+## Browser access and remote supervision
+
+`oly` serves its HTTP API and web UI on loopback by default:
+
+```text
+http://127.0.0.1:15443
+```
+
+That default is deliberate. The safe pattern is:
+
+```text
+browser or phone -> your auth gateway -> your tunnel -> local oly HTTP service
+```
+
+Examples:
+
+- Cloudflare Access
+- Tailscale / Headscale
+- SSH tunnel
+- your own reverse proxy with strong auth
+
+This keeps `oly` small and local-first while still supporting remote intervention when you need it.
+
+---
+
+## Notification hooks
+
+If desktop notifications are not enough, you can configure a custom notification hook in `config.json` under `OLY_STATE_DIR` (or the default state directory for your OS).
 
 ```json
 {
@@ -139,10 +237,10 @@ Set `notification_hook` in your `config.json` under the `OLY_STATE_DIR` state fo
 }
 ```
 
-The hook is spawned fire-and-forget after local notification delivery. Arguments support placeholder substitution from the event payload:
+Placeholders available in the command:
 
 - `{kind}`
-- `{title}` and `{summary}` (same title value)
+- `{title}` / `{summary}`
 - `{description}`
 - `{body}`
 - `{navigation_url}`
@@ -151,60 +249,48 @@ The hook is spawned fire-and-forget after local notification delivery. Arguments
 - `{trigger_rule}`
 - `{trigger_detail}`
 
-The same data is also exported as environment variables:
+The same values are also exported as `OLY_EVENT_*` environment variables.
 
-- `OLY_EVENT_KIND`
-- `OLY_EVENT_TITLE`
-- `OLY_EVENT_SUMMARY` (same value as `OLY_EVENT_TITLE`)
-- `OLY_EVENT_DESCRIPTION`
-- `OLY_EVENT_BODY`
-- `OLY_EVENT_NAVIGATION_URL`
-- `OLY_EVENT_NODE`
-- `OLY_EVENT_SESSION_IDS`
-- `OLY_EVENT_TRIGGER_RULE`
-- `OLY_EVENT_TRIGGER_DETAIL`
-
-Example:
-
-```json
-{
-  "notification_hook": "pwsh -File C:\\scripts\\notify.ps1 {kind} {node} {session_ids}"
-}
-```
-
-Use quoted arguments if values may contain spaces. Hooks are best-effort: failures are logged, but they do not block session execution or notification delivery.
-
-You can use this hook together with `oly send` for bidirectional communication.
+Hooks are best-effort: failures are logged, but they do not block the session or notification pipeline.
 
 ---
 
-## Commands 📋
+## State, config, and files
 
-| Command | What it does |
-|---|---|
-| `oly daemon start` | Start background daemon |
-| `oly start [--detach] [--disable-notifications] [--cwd DIR] <cmd>` | Launch session in PTY |
-| `oly notify <enable\|disable\|suppress> <id>` | Toggle notifications for a running session |
-| `oly ls` | Show sessions (supports search/status/time filters) |
-| `oly attach <id>` | Reattach (replays buffer first) |
-| `oly logs <id> [--tail N] [--wait-for-prompt] [--timeout DURATION]` | Read logs without attaching |
-| `oly send <id> [CHUNK]...` | Send input without attaching |
-| `oly stop <id>` | Graceful stop |
+Default state directory:
 
-### Federation commands
+- **Windows**: `%LOCALAPPDATA%\oly`
+- **Linux**: `$XDG_STATE_HOME/oly` or `~/.local/state/oly`
+- **macOS**: `~/Library/Application Support/oly`
 
-| Command | What it does |
-|---|---|
-| `oly api-key add <name>` | Create API key on primary (printed once) |
-| `oly api-key ls` | List API key labels on primary |
-| `oly api-key remove <name>` | Revoke API key on primary |
-| `oly join start --name <name> --key <key> <url>` | Connect this daemon as a secondary |
-| `oly join ls` | List saved join configs on this daemon |
-| `oly join stop --name <name>` | Disconnect and remove a saved join config |
-| `oly node ls` | List currently connected secondary nodes on primary |
+You can override it with `OLY_STATE_DIR`.
 
-All session commands support `--node <name>` to target a connected secondary.
+Inside that directory, `oly` stores:
 
-Detach from an attached session: `Ctrl-]` then `d`.
+- the SQLite database
+- daemon logs
+- session logs and metadata
+- generated default `config.json`
+- saved join configs on secondary nodes
+- optional `wwwroot` static content
 
-When using `oly logs --wait-for-prompt`, `--timeout` accepts plain milliseconds for compatibility or basic units like `250ms`, `10s`, `5m`, and `1h`. The default is `30s`, and `0` waits forever.
+---
+
+## Good fits for `oly`
+
+- GitHub Copilot CLI, Claude Code, Gemini CLI, OpenCode, and similar agent workflows
+- Long-running installs or migrations that may need approval later
+- Interactive REPLs or TUIs you want to resume safely
+- Background automation that still needs occasional human intervention
+- Single-operator or small-team setups that want a lightweight supervision layer
+
+---
+
+## Learn more
+
+- [SPEC.md](./SPEC.md) for the implementation-aligned product spec
+- [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview
+- [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md) for PTY behavior
+- [ARCHITECTURE_NOTES.md](./ARCHITECTURE_NOTES.md) for edge cases and operational notes
+
+If you are building agent workflows and want durable, inspectable terminal sessions, `oly` is for you.
