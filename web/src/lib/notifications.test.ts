@@ -21,7 +21,25 @@ describe('notifications helpers', () => {
     expect(notificationNavigationUrl({ navigation_url: '/session/session-123' })).toBe(
       '/session/session-123'
     )
+    expect(
+      notificationNavigationUrl({
+        navigation_url: '/session/session-123?mode=attach',
+        node: 'worker 1',
+      })
+    ).toBe('/session/session-123?mode=attach&node=worker%201')
     expect(notificationNavigationUrl({ navigation_url: '' })).toBe('/')
+  })
+
+  it('can resolve absolute same-origin navigation urls for service-worker clicks', () => {
+    expect(
+      notificationNavigationUrl(
+        {
+          navigation_url: '/session/session-123?mode=attach',
+          node: 'worker 1',
+        },
+        'https://relay.test'
+      )
+    ).toBe('https://relay.test/session/session-123?mode=attach&node=worker%201')
   })
 
   it('uses sensible title and tag fallbacks', () => {

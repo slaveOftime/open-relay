@@ -71,6 +71,7 @@ impl SessionRuntimeSnapshot {
                 created_at: rt.meta.created_at,
                 cwd: rt.meta.cwd.clone(),
                 input_needed,
+                node: None,
             },
             last_output_at: rt.last_output_at,
             mode_snapshot: rt.mode_snapshot(),
@@ -470,6 +471,28 @@ impl SessionStore {
         rt.detach_attach_client();
         runtime.refresh_snapshot(&rt);
         debug!(session_id = id, "attach detach acknowledged");
+        Ok(())
+    }
+
+    pub async fn set_notifications_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> std::result::Result<(), SessionLookupError> {
+        let runtime = self.lookup_runtime(id).await?;
+        let Ok(mut rt) = runtime.runtime.lock() else {
+            return Err(SessionLookupError::Evicted);
+        };
+        if rt.is_completed() {
+            return Err(SessionLookupError::NotRunning);
+        }
+        rt.set_notifications_enabled(enabled);
+        runtime.refresh_snapshot(&rt);
+        debug!(
+            session_id = id,
+            notifications_enabled = enabled,
+            "session notification setting updated"
+        );
         Ok(())
     }
 
@@ -1327,6 +1350,51 @@ mod tests {
         // Should not panic.
         let now = Instant::now();
         store.mark_notified("does_not_exist", now, now);
+    }
+
+    #[tokio::test]
+    async fn test_set_notifications_enabled_updates_runtime_and_snapshot() {
+        let runtime = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(5)),
+        );
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        store
+            .set_notifications_enabled("abc1234", false)
+            .await
+            .expect("disable notifications");
+
+        let sessions = store.sessions.load();
+        let handle = sessions.get("abc1234").expect("runtime should exist");
+        let snapshot = handle.snapshot();
+        assert!(!snapshot.notifications_enabled);
+
+        let rt = handle.runtime.lock().unwrap();
+        assert!(!rt.notifications_enabled);
+    }
+
+    #[tokio::test]
+    async fn test_set_notifications_enabled_unknown_id_returns_error() {
+        let store = SessionStore::new(900, make_test_db().await);
+        let result = store.set_notifications_enabled("missing", false).await;
+        assert!(matches!(result, Err(SessionLookupError::NotRunning)));
+    }
+
+    #[tokio::test]
+    async fn test_set_notifications_enabled_rejects_completed_session() {
+        let runtime = make_runtime(
+            "done123",
+            SessionStatus::Stopped,
+            "",
+            Some(Duration::from_secs(5)),
+        );
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let result = store.set_notifications_enabled("done123", false).await;
+        assert!(matches!(result, Err(SessionLookupError::NotRunning)));
     }
 
     #[tokio::test]

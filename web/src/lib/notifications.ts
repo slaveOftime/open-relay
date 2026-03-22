@@ -21,8 +21,19 @@ export function notificationTag(payload: Pick<SessionNotificationData, 'session_
   return payload.session_ids[0] ?? DEFAULT_NOTIFICATION_TAG
 }
 
-export function notificationNavigationUrl(
-  payload: Pick<SessionNotificationData, 'navigation_url'>
+function notificationNavigationPath(
+  payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>
 ): string {
-  return payload.navigation_url?.trim() || '/'
+  const base = payload.navigation_url?.trim() || '/'
+  const node = payload.node?.trim()
+  if (!node || !base.startsWith('/')) return base
+  return `${base}${base.includes('?') ? '&' : '?'}node=${encodeURIComponent(node)}`
+}
+
+export function notificationNavigationUrl(
+  payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>,
+  origin?: string
+): string {
+  const path = notificationNavigationPath(payload)
+  return origin ? new URL(path, origin).toString() : path
 }

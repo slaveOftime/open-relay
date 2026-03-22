@@ -48,8 +48,8 @@ impl LocalOsNotificationChannel {
     /// - `{summary}`        – alias for `{title}` for backwards compatibility
     /// - `{description}`    – short notification description
     /// - `{body}`           – notification body text
-    /// - `{rendered_body}`  – description + body combined for display
     /// - `{navigation_url}` – destination URL, or empty string
+    /// - `{node}`           – source node name, or empty string
     /// - `{session_ids}`    – comma-separated session IDs
     /// - `{trigger_rule}`   – trigger rule name, or empty string
     /// - `{trigger_detail}` – trigger detail, or empty string
@@ -73,6 +73,7 @@ impl LocalOsNotificationChannel {
             .unwrap_or_default();
         let trigger_detail = event.trigger_detail.clone().unwrap_or_default();
         let navigation_url = event.navigation_url.clone().unwrap_or_default();
+        let node = event.node.clone().unwrap_or_default();
 
         let tokens = match split_hook_command(hook) {
             Some(t) => t,
@@ -85,9 +86,11 @@ impl LocalOsNotificationChannel {
         let substitute = |s: String| -> String {
             s.replace("{kind}", event.kind.as_str())
                 .replace("{title}", &event.title)
+                .replace("{summary}", &event.title)
                 .replace("{description}", &event.description)
                 .replace("{body}", &event.body)
                 .replace("{navigation_url}", &navigation_url)
+                .replace("{node}", &node)
                 .replace("{session_ids}", &session_ids)
                 .replace("{trigger_rule}", &trigger_rule)
                 .replace("{trigger_detail}", &trigger_detail)
@@ -103,9 +106,11 @@ impl LocalOsNotificationChannel {
             .args(&args)
             .env("OLY_EVENT_KIND", event.kind.as_str())
             .env("OLY_EVENT_TITLE", &event.title)
+            .env("OLY_EVENT_SUMMARY", &event.title)
             .env("OLY_EVENT_DESCRIPTION", &event.description)
             .env("OLY_EVENT_BODY", &event.body)
             .env("OLY_EVENT_NAVIGATION_URL", &navigation_url)
+            .env("OLY_EVENT_NODE", &node)
             .env("OLY_EVENT_SESSION_IDS", &session_ids)
             .env("OLY_EVENT_TRIGGER_RULE", &trigger_rule)
             .env("OLY_EVENT_TRIGGER_DETAIL", &trigger_detail)
@@ -343,6 +348,7 @@ impl NotificationChannel for WebPushChannel {
             "description": event.description,
             "body": event.body,
             "navigation_url": event.navigation_url,
+            "node": event.node,
             "session_ids": event.session_ids,
         })
         .to_string();
@@ -595,6 +601,9 @@ fn validate_vapid_subject(subject: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::split_hook_command;
+    use crate::notification::event::{
+        NotificationEvent, NotificationKind, NotificationTriggerRule,
+    };
 
     #[test]
     fn test_simple_tokens() {
@@ -651,18 +660,39 @@ mod tests {
 
     #[test]
     fn test_placeholder_substitution_in_all_tokens() {
-        // Verify that substitute logic (done in run_hook) works as expected
-        // by composing it here manually with the same replace chain.
-        let tokens = split_hook_command("/usr/bin/curl -d {body} {summary}").unwrap();
-        let body = "hello world";
-        let summary = "test-summary";
+        let tokens =
+            split_hook_command("/usr/bin/curl -d {body} {summary} {rendered_body} {node}").unwrap();
+        let event = NotificationEvent {
+            kind: NotificationKind::InputNeeded,
+            title: "test-summary".to_string(),
+            description: "Needs input".to_string(),
+            body: "hello world".to_string(),
+            navigation_url: Some("/session/abc123".to_string()),
+            session_ids: vec!["abc123".to_string()],
+            trigger_rule: Some(NotificationTriggerRule::RegexPattern),
+            trigger_detail: Some("(?i)password:".to_string()),
+            node: Some("worker-a".to_string()),
+        };
+        let rendered_body = event.rendered_body();
         let result: Vec<String> = tokens
             .into_iter()
-            .map(|t| t.replace("{body}", body).replace("{summary}", summary))
+            .map(|t| {
+                t.replace("{body}", &event.body)
+                    .replace("{summary}", &event.title)
+                    .replace("{rendered_body}", &rendered_body)
+                    .replace("{node}", event.node.as_deref().unwrap_or_default())
+            })
             .collect();
         assert_eq!(
             result,
-            vec!["/usr/bin/curl", "-d", "hello world", "test-summary"]
+            vec![
+                "/usr/bin/curl",
+                "-d",
+                "hello world",
+                "test-summary",
+                "Needs input\n\nhello world",
+                "worker-a"
+            ]
         );
     }
 }

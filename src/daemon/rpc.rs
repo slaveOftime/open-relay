@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use super::{JoinHandles, NotificationTx, SessionStoreHandle};
+use super::{JoinHandles, NotificationTx, SessionEventTx, SessionStoreHandle};
 use super::{
     rpc_attach::{
         handle_attach_detach, handle_attach_input, handle_attach_resize, handle_attach_subscribe,
@@ -37,6 +37,7 @@ pub(super) async fn handle_client(
     node_registry: Arc<NodeRegistry>,
     db: Arc<Database>,
     join_handles: JoinHandles,
+    session_event_tx: SessionEventTx,
     notification_tx: NotificationTx,
 ) -> Result<()> {
     // Peek at the request without consuming the stream so we can decide whether
@@ -76,6 +77,7 @@ pub(super) async fn handle_client(
         &node_registry,
         &db,
         &join_handles,
+        &session_event_tx,
         &notification_tx,
     )
     .await?;
@@ -91,6 +93,7 @@ async fn dispatch_request(
     node_registry: &Arc<NodeRegistry>,
     db: &Arc<Database>,
     join_handles: &JoinHandles,
+    session_event_tx: &SessionEventTx,
     notification_tx: &NotificationTx,
 ) -> Result<RpcResponse> {
     let response = match request {
@@ -122,6 +125,9 @@ async fn dispatch_request(
                 disable_notifications,
             )
             .await
+        }
+        RpcRequest::NotifySet { id, enabled } => {
+            handle_notify_set(id, enabled, session_store).await
         }
         RpcRequest::AttachSubscribe { .. } => {
             // Handled before dispatch in handle_client; should not reach here.
@@ -157,7 +163,7 @@ async fn dispatch_request(
         RpcRequest::ApiKeyList => handle_api_key_list(db).await,
         RpcRequest::ApiKeyRemove { name } => handle_api_key_remove(name, db).await,
         RpcRequest::JoinStart { url, name, key } => {
-            handle_join_start(config, join_handles, notification_tx, url, name, key).await?
+            handle_join_start(config, join_handles, session_event_tx, url, name, key).await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
         RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
@@ -247,6 +253,26 @@ async fn handle_kill(id: String, session_store: &SessionStoreHandle) -> RpcRespo
         RpcResponse::Error {
             message: format!("session not found or failed to kill: {id}"),
         }
+    }
+}
+
+async fn handle_notify_set(
+    id: String,
+    enabled: bool,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match session_store.set_notifications_enabled(&id, enabled).await {
+        Ok(()) => {
+            info!(
+                session_id = id,
+                notifications_enabled = enabled,
+                "session notification setting updated"
+            );
+            RpcResponse::Ack
+        }
+        Err(_) => RpcResponse::Error {
+            message: format!("session not found or not running: {id}"),
+        },
     }
 }
 
@@ -438,7 +464,7 @@ async fn handle_api_key_remove(name: String, db: &Arc<Database>) -> RpcResponse 
 async fn handle_join_start(
     config: &Arc<AppConfig>,
     join_handles: &JoinHandles,
-    notification_tx: &NotificationTx,
+    session_event_tx: &SessionEventTx,
     url: String,
     name: String,
     key: String,
@@ -450,7 +476,7 @@ async fn handle_join_start(
     };
     client::join::save_join_config(config, &join)?;
     let (abort, stop_tx) =
-        spawn_join_connector(join, Arc::clone(config), notification_tx.subscribe());
+        spawn_join_connector(join, Arc::clone(config), session_event_tx.subscribe());
     join_handles.lock().await.insert(name, (abort, stop_tx));
     Ok(RpcResponse::Ack)
 }

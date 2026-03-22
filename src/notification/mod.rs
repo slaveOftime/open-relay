@@ -111,6 +111,11 @@ pub(super) async fn run_notification_monitor(
                         warn!(session_id, "notification delivery failed on all channels");
                     }
                 });
+            } else {
+                debug!(
+                    session_id,
+                    "notifications disabled for session, skipping delivery to channels"
+                );
             }
 
             // This is useful for supervisor agent to take over when to send notifications
@@ -125,6 +130,7 @@ pub(super) async fn run_notification_monitor(
                 session_ids: event.session_ids,
                 trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
                 trigger_detail: event.trigger_detail,
+                node: event.node,
             });
 
             session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());

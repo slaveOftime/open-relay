@@ -246,6 +246,7 @@ mod tests {
             created_at,
             cwd: Some("C:/work".to_string()),
             input_needed: true,
+            node: None,
         };
 
         let value = session_json(&session);

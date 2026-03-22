@@ -162,12 +162,16 @@ export async function showSessionNotification(payload: SessionNotificationData):
   const title = notificationTitle(payload)
   const body = notificationBody(payload)
   const tag = notificationTag(payload)
+  const navigationUrl = notificationNavigationUrl(payload, window.location.origin)
   const registration = await navigator.serviceWorker.getRegistration(PUSH_SW_SCOPE)
   if (registration) {
     await registration.showNotification(title, {
       body,
       tag,
-      data: payload,
+      data: {
+        ...payload,
+        navigation_url: navigationUrl,
+      },
     })
     return
   }
@@ -175,6 +179,6 @@ export async function showSessionNotification(payload: SessionNotificationData):
   const notification = new Notification(title, { body, tag, data: payload })
   notification.onclick = () => {
     window.focus()
-    window.location.assign(notificationNavigationUrl(payload))
+    window.location.assign(navigationUrl)
   }
 }

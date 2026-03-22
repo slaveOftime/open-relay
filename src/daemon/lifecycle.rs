@@ -1,4 +1,4 @@
-use std::{fs::File, process::Stdio, sync::Arc, time::Duration};
+use std::{fmt::Write as _, fs::File, process::Stdio, sync::Arc, time::Duration};
 
 use interprocess::local_socket::traits::tokio::Listener as _;
 use tokio::sync::{Mutex, mpsc};
@@ -165,13 +165,49 @@ pub async fn start(
     if detach && !foreground_internal {
         spawn_detached(no_auth, no_http, auth_hash.as_deref(), config.http_port)?;
         wait_for_daemon_ready(&config, std::time::Duration::from_secs(60)).await?;
-        println!(
-            "Daemon started in background. To create a session, run `oly start --detach <cmd>`"
-        );
+        print_detached_start_summary(&config, no_http, no_auth);
         return Ok(());
     }
 
     run_foreground(config, auth_hash, no_http).await
+}
+
+fn print_detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) {
+    print!("{}", detached_start_summary(config, no_http, no_auth));
+}
+
+fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "Daemon started in background.");
+    let _ = writeln!(out);
+
+    if no_http {
+        let _ = writeln!(out, "  HTTP:         disabled (--no-http)");
+    } else {
+        let _ = writeln!(out, "  Web UI/API:   http://127.0.0.1:{}", config.http_port);
+        let _ = writeln!(
+            out,
+            "  Auth:         {}",
+            if no_auth {
+                "disabled (--no-auth)"
+            } else {
+                "enabled"
+            }
+        );
+    }
+
+    let _ = writeln!(out, "  Root:         {}", config.state_dir.display());
+    let _ = writeln!(
+        out,
+        "  Logs:         {}",
+        config.state_dir.join("logs").display()
+    );
+    let _ = writeln!(out, "  Sessions:     {}", config.sessions_dir.display());
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Tips:");
+    let _ = writeln!(out, "  Stop daemon:      oly daemon stop");
+    let _ = writeln!(out, "  Create a session: oly start --detach <cmd>");
+    out
 }
 
 pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
@@ -319,21 +355,6 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
-    for join in client::join::load_join_configs(&config) {
-        let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
-            join.clone(),
-            Arc::clone(&config),
-            notification_tx.subscribe(),
-        );
-        join_handles
-            .lock()
-            .await
-            .insert(join.name, (abort, stop_tx));
-    }
-    {
-        let count = join_handles.lock().await.len();
-        info!(count, "join connectors initialized");
-    }
 
     // Remove any stale socket file left by a crashed daemon.  On macOS (and
     // other platforms without abstract-namespace sockets) the file-based Unix
@@ -351,9 +372,23 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         (store, startup_failed_sessions)
     };
     let session_store = Arc::new(store);
-    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
-
     let event_tx = session_store.event_tx();
+    for join in client::join::load_join_configs(&config) {
+        let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
+            join.clone(),
+            Arc::clone(&config),
+            event_tx.subscribe(),
+        );
+        join_handles
+            .lock()
+            .await
+            .insert(join.name, (abort, stop_tx));
+    }
+    {
+        let count = join_handles.lock().await.len();
+        info!(count, "join connectors initialized");
+    }
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let notifier = Arc::new(crate::notification::build_notifier(db.clone(), &config));
 
     let auth_state = auth_hash.map(AuthState::new);
@@ -421,6 +456,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             session_ids: event.session_ids,
             trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
             trigger_detail: event.trigger_detail,
+            node: event.node,
         });
     }
 
@@ -449,6 +485,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                         let registry_clone = node_registry.clone();
                         let db_clone = db.clone();
                         let handles_clone = join_handles.clone();
+                        let event_tx_clone = event_tx.clone();
                         let notification_tx_clone = notification_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_client(
@@ -459,6 +496,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                                 registry_clone,
                                 db_clone,
                                 handles_clone,
+                                event_tx_clone,
                                 notification_tx_clone,
                             ).await {
                                 error!(%err, "client handling error");
@@ -475,4 +513,65 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     info!("daemon stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::detached_start_summary;
+    use crate::config::AppConfig;
+
+    fn test_config() -> AppConfig {
+        let state_dir = PathBuf::from("test-state");
+        AppConfig {
+            http_port: 15443,
+            log_level: "info".to_string(),
+            ring_buffer_bytes: 1_048_576,
+            stop_grace_seconds: 5,
+            prompt_patterns: Vec::new(),
+            web_push_subject: None,
+            web_push_vapid_public_key: None,
+            web_push_vapid_private_key: None,
+            state_dir: state_dir.clone(),
+            sessions_dir: state_dir.join("sessions"),
+            db_file: state_dir.join("oly.db"),
+            lock_file: state_dir.join("daemon.lock"),
+            socket_name: "test.sock".to_string(),
+            socket_file: state_dir.join("daemon.sock"),
+            silence_seconds: 10,
+            session_eviction_seconds: 15,
+            max_running_sessions: 50,
+            notification_hook: None,
+        }
+    }
+
+    #[test]
+    fn detached_summary_includes_http_url_and_paths() {
+        let config = test_config();
+        let summary = detached_start_summary(&config, false, true);
+
+        assert!(summary.contains("Daemon started in background."));
+        assert!(summary.contains("Web UI/API:   http://127.0.0.1:15443"));
+        assert!(summary.contains("Auth:         disabled (--no-auth)"));
+        assert!(summary.contains(&format!("Root:         {}", config.state_dir.display())));
+        assert!(summary.contains(&format!(
+            "Logs:         {}",
+            config.state_dir.join("logs").display()
+        )));
+        assert!(summary.contains(&format!("Sessions:     {}", config.sessions_dir.display())));
+        assert!(summary.contains("Stop daemon:      oly daemon stop"));
+        assert!(summary.contains("Create a session: oly start --detach <cmd>"));
+    }
+
+    #[test]
+    fn detached_summary_marks_http_disabled() {
+        let config = test_config();
+        let summary = detached_start_summary(&config, true, false);
+
+        assert!(summary.contains("HTTP:         disabled (--no-http)"));
+        assert!(!summary.contains("Web UI/API:"));
+        assert!(!summary.contains("Web root:"));
+        assert!(!summary.contains("Auth:"));
+    }
 }

@@ -28,6 +28,7 @@ import {
   parseArgString,
 } from '@/utils/format'
 import Logo from '@/components/Logo'
+import CommandLogo from '@/components/CommandLogo'
 import SseStatusDot from '@/components/SseStatusDot'
 import StatusBadge from '@/components/StatusBadge'
 import SparklineSvg, { SparklineStore } from '@/components/SparklineSvg'
@@ -44,7 +45,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import {
   Select,
   SelectContent,
@@ -170,6 +170,13 @@ function normalizeStoredNode(value: unknown): string | null {
   return trimmed === '' ? null : trimmed
 }
 
+function matchesSelectedNode(
+  selectedNode: string | null,
+  eventNode: string | null | undefined
+): boolean {
+  return (selectedNode ?? null) === normalizeStoredNode(eventNode)
+}
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
     const message = error.message.trim()
@@ -252,6 +259,25 @@ function SkeletonCard() {
   )
 }
 
+function GroupHeaderLabel({
+  groupBy,
+  keyLabel,
+  items,
+}: {
+  groupBy: GroupBy
+  keyLabel: string
+  items: SessionSummary[]
+}) {
+  if (groupBy !== 'command') return <>{keyLabel}</>
+  const groupCommand = items[0]?.command ?? keyLabel
+  return (
+    <span className="inline-flex items-center gap-2">
+      <CommandLogo command={groupCommand} size={24} />
+      <span>{keyLabel}</span>
+    </span>
+  )
+}
+
 // ── Session Row ────────────────────────────────────────────────────────────
 
 function SessionRow({
@@ -322,8 +348,9 @@ function SessionRow({
 
         {/* CMD */}
         <TableCell className="px-3 py-2.5 truncate max-w-0">
-          <span className="text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            {sessionDisplayName(session)}
+          <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+            <CommandLogo command={session.command} size={24} />
+            <span className="truncate">{sessionDisplayName(session)}</span>
           </span>
         </TableCell>
 
@@ -351,10 +378,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg
-            series={series}
-            enableAnimation={isRunning && (node == null || node === '__local__')}
-          />
+          <SparklineSvg series={series} enableAnimation={isRunning} />
         </TableCell>
 
         {/* PID */}
@@ -504,8 +528,13 @@ function SessionCard({
                   {session.title}
                 </span>
               )}
-              <span className={`block text-base font-medium truncate leading-snug ${titleTone}`}>
-                {session.command} {session.args ? session.args.join(' ') : ''}
+              <span
+                className={`flex min-w-0 items-center gap-2 text-base font-medium leading-snug ${titleTone}`}
+              >
+                <CommandLogo command={session.command} size={24} />
+                <span className="truncate">
+                  {session.command} {session.args ? session.args.join(' ') : ''}
+                </span>
               </span>
             </span>
           </Button>
@@ -526,7 +555,7 @@ function SessionCard({
           )}
 
           {/* Row 4: activity sparkline */}
-          {session.status === 'running' && (node == null || node === '__local__') && (
+          {session.status === 'running' && (
             <div className="pt-1 w-full opacity-90">
               <SparklineSvg
                 series={series}
@@ -1136,19 +1165,20 @@ export default function SessionsPage() {
         return
       }
       if (ev.event === 'session_created') {
-        if (selectedNode) return
+        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         updateSparklineForSession(ev.data)
         void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_updated') {
-        if (selectedNode) return
+        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         updateSparklineForSession(ev.data)
         replaceLoadedSession(ev.data)
         return
       }
       if (ev.event === 'session_deleted') {
-        if (selectedNode) return
+        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
+        removeLoadedSession(ev.data.id)
         sparklines.remove(ev.data.id)
         void reloadSessions({ background: true })
         return
@@ -1261,7 +1291,7 @@ export default function SessionsPage() {
     sortOrder !== SortOrder.Desc
 
   const statusChips: { label: string; value: SessionStatusFilter }[] = [
-    { label: 'All', value: 'all' },
+    { label: 'All status', value: 'all' },
     { label: 'Running', value: 'running' },
     { label: 'Stopped', value: 'stopped' },
     { label: 'Killed', value: 'killed' },
@@ -1295,6 +1325,29 @@ export default function SessionsPage() {
     }
     await handleEnablePush()
   }
+
+  const statusFilterView = (
+    <Select
+      value={statusFilter}
+      onValueChange={(v) => {
+        if (isSessionStatusFilter(v)) {
+          setStatusFilter(v)
+          setPage(0)
+        }
+      }}
+    >
+      <SelectTrigger className="flex-1 sm:flex-0 h-8 text-xs">
+        <SelectValue placeholder="All statuses" />
+      </SelectTrigger>
+      <SelectContent>
+        {statusChips.map((chip) => (
+          <SelectItem key={chip.value} value={chip.value}>
+            {chip.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
 
   return (
     <TooltipProvider>
@@ -1396,29 +1449,10 @@ export default function SessionsPage() {
                   <SelectContent>
                     <SelectItem value="none">No grouping</SelectItem>
                     <SelectItem value="cwd">Group by CWD</SelectItem>
-                    <SelectItem value="command">Group by agent</SelectItem>
+                    <SelectItem value="command">Group by CMD</SelectItem>
                   </SelectContent>
                 </Select>
-                <Select
-                  value={statusFilter}
-                  onValueChange={(v) => {
-                    if (isSessionStatusFilter(v)) {
-                      setStatusFilter(v)
-                      setPage(0)
-                    }
-                  }}
-                >
-                  <SelectTrigger className="flex-1 h-8 text-xs">
-                    <SelectValue placeholder="All statuses" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {statusChips.map((chip) => (
-                      <SelectItem key={chip.value} value={chip.value}>
-                        {chip.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                {statusFilterView}
               </div>
               <div className="flex gap-2">
                 <Select
@@ -1503,7 +1537,7 @@ export default function SessionsPage() {
             />
 
             <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
-              <SelectTrigger className="w-40 h-8 text-sm">
+              <SelectTrigger className="flex-0 h-8 text-sm">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1514,49 +1548,11 @@ export default function SessionsPage() {
             </Select>
 
             {/* Status filter (responsive) */}
-            <Select
-              value={statusFilter}
-              onValueChange={(v) => {
-                if (isSessionStatusFilter(v)) {
-                  setStatusFilter(v)
-                  setPage(0)
-                }
-              }}
-            >
-              <SelectTrigger className="h-8 w-36 text-sm xl:hidden">
-                <SelectValue placeholder="All statuses" />
-              </SelectTrigger>
-              <SelectContent>
-                {statusChips.map((chip) => (
-                  <SelectItem key={chip.value} value={chip.value}>
-                    {chip.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            <div className="hidden xl:flex items-center gap-1.5">
-              <ToggleGroup
-                type="single"
-                value={statusFilter}
-                onValueChange={(v) => {
-                  if (isSessionStatusFilter(v)) {
-                    setStatusFilter(v)
-                    setPage(0)
-                  }
-                }}
-              >
-                {statusChips.map((chip) => (
-                  <ToggleGroupItem key={chip.value} value={chip.value}>
-                    {chip.label}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            </div>
-
-            <div className="flex-1" />
+            {statusFilterView}
 
             <NodeSelector nodes={nodes} selected={selectedNode} onChange={handleNodeChange} />
+
+            <div className="flex-1" />
 
             <Button
               size="sm"
@@ -1565,7 +1561,12 @@ export default function SessionsPage() {
               disabled={loading || refreshing}
             >
               <ReloadIcon className="h-4 w-4" />
-              <span className="hidden xl:inline">Refresh</span>
+            </Button>
+
+            <Button asChild size="sm" variant="ghost">
+              <a href="/apps">
+                <GridIcon className="h-4 w-4" />
+              </a>
             </Button>
 
             <Button
@@ -1576,13 +1577,6 @@ export default function SessionsPage() {
             >
               <BellIcon className="h-4 w-4" />
               <span className="hidden xl:inline">{pushButtonLabel}</span>
-            </Button>
-
-            <Button asChild size="sm" variant="ghost">
-              <a href="/apps">
-                <GridIcon className="h-4 w-4" />
-                <span>Apps</span>
-              </a>
             </Button>
 
             <Button size="sm" onClick={() => setShowNewSession(true)}>
@@ -1606,7 +1600,7 @@ export default function SessionsPage() {
                 <div key={key || '__flat__'}>
                   {groupBy !== 'none' && key && (
                     <div className="px-4 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-t border-[hsl(var(--border))]">
-                      {key}
+                      <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                     </div>
                   )}
                   {items.map((s) => (
@@ -1709,7 +1703,7 @@ export default function SessionsPage() {
                           colSpan={8}
                           className="px-3 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-[hsl(var(--border))]"
                         >
-                          {key}
+                          <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                         </TableCell>
                       </TableRow>
                     )}

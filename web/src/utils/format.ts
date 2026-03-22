@@ -93,21 +93,33 @@ export function sessionDisplayName(s: { command: string; args: string[] }): stri
   return [s.command, ...s.args].map(shellQuote).join(' ').slice(0, 64)
 }
 
-export function agentName(command: string): string {
+export function commandBaseName(command: string): string {
   const base = command.split(/[/\\]/).pop() ?? command
+  return base.replace(/\.(?:exe|cmd|bat|ps1)$/i, '')
+}
+
+export function agentName(command: string): string {
+  const base = commandBaseName(command)
   const known: Record<string, string> = {
     claude: 'Claude Code',
     'claude-code': 'Claude Code',
-    gemini: 'Gemini-CLI',
-    'gemini-cli': 'Gemini-CLI',
-    aider: 'Aider v0.2',
-    bash: 'Shell',
+    gemini: 'Gemini CLI',
+    'gemini-cli': 'Gemini CLI',
+    powershell: 'PowerShell',
+    pwsh: 'PowerShell',
+    codex: 'Codex',
+    opencode: 'OpenCode',
+    qwen: 'Qwen',
+    'qwen-code': 'Qwen',
+    aider: 'Aider',
+    bash: 'Bash',
     sh: 'Shell',
-    zsh: 'Shell',
-    cmd: 'Shell',
+    zsh: 'Zsh',
+    cmd: 'Command Prompt',
     node: 'Node.js',
     python: 'Python',
     python3: 'Python',
+    copilot: 'GitHub Copilot',
   }
   return known[base.toLowerCase()] ?? base
 }

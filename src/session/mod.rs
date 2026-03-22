@@ -88,7 +88,7 @@ pub struct SessionLiveSummary {
     pub last_output_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum SessionEvent {
@@ -96,6 +96,8 @@ pub enum SessionEvent {
     SessionUpdated(SessionSummary),
     SessionDeleted {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
     },
     SessionNotification {
         kind: String,
@@ -109,6 +111,8 @@ pub enum SessionEvent {
         trigger_rule: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         trigger_detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
     },
 }
 

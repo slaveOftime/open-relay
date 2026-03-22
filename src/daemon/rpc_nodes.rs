@@ -13,20 +13,21 @@ use crate::{
     client::join::JoinConfig,
     config::AppConfig,
     error::Result,
+    http::sse::session_event_for_delivery,
     ipc,
     node::NodeRegistry,
-    notification::event::NotificationEvent,
     protocol::{NodeWsMessage, RpcRequest, RpcResponse},
+    session::SessionEvent,
 };
 
 pub(super) fn spawn_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
-    notification_rx: broadcast::Receiver<NotificationEvent>,
+    session_event_rx: broadcast::Receiver<SessionEvent>,
 ) -> (tokio::task::AbortHandle, watch::Sender<bool>) {
     let (stop_tx, stop_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
-        run_join_connector(join, local_config, notification_rx, stop_rx).await;
+        run_join_connector(join, local_config, session_event_rx, stop_rx).await;
     });
     (task.abort_handle(), stop_tx)
 }
@@ -34,14 +35,14 @@ pub(super) fn spawn_join_connector(
 async fn run_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
-    mut notification_rx: broadcast::Receiver<NotificationEvent>,
+    mut session_event_rx: broadcast::Receiver<SessionEvent>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
     const BACKOFF: &[u64] = &[1, 2, 4, 8, 16, 32, 60];
     let mut attempt = 0usize;
 
     loop {
-        match connect_and_relay(&join, &local_config, &mut notification_rx, &mut stop_rx).await {
+        match connect_and_relay(&join, &local_config, &mut session_event_rx, &mut stop_rx).await {
             Ok(true) => {
                 info!(node = %join.name, "join connector stopped");
                 return;
@@ -75,7 +76,7 @@ async fn run_join_connector(
 async fn connect_and_relay(
     join: &JoinConfig,
     local_config: &Arc<AppConfig>,
-    notification_rx: &mut broadcast::Receiver<NotificationEvent>,
+    session_event_rx: &mut broadcast::Receiver<SessionEvent>,
     stop_rx: &mut watch::Receiver<bool>,
 ) -> Result<bool> {
     let base = join.primary_url.trim_end_matches('/');
@@ -237,18 +238,11 @@ async fn connect_and_relay(
                     _ => {}
                 }
             }
-            notif = notification_rx.recv() => {
-                match notif {
+            session_event = session_event_rx.recv() => {
+                match session_event {
                     Ok(event) => {
-                        let relay = NodeWsMessage::Notification {
-                            kind: event.kind.as_str().to_string(),
-                            title: event.title,
-                            description: event.description,
-                            body: event.body,
-                            navigation_url: event.navigation_url,
-                            session_ids: event.session_ids,
-                            trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
-                            trigger_detail: event.trigger_detail,
+                        let relay = NodeWsMessage::SessionEvent {
+                            payload: session_event_for_delivery(&event, Some(join.name.as_str())),
                         };
                         let relay_text = match serde_json::to_string(&relay) {
                             Ok(t) => t,
@@ -259,7 +253,7 @@ async fn connect_and_relay(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(node = %join.name, skipped, "notification relay lagged");
+                        warn!(node = %join.name, skipped, "session event relay lagged");
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -276,6 +270,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
         RpcRequest::Health { .. }
             | RpcRequest::List { .. }
             | RpcRequest::Start { .. }
+            | RpcRequest::NotifySet { .. }
             | RpcRequest::AttachSubscribe { .. }
             | RpcRequest::AttachInput { .. }
             | RpcRequest::AttachResize { .. }

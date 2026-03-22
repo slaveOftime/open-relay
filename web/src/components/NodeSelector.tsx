@@ -23,11 +23,11 @@ export function NodeSelector({ nodes, selected, onChange, className }: NodeSelec
       value={selected ?? '__local__'}
       onValueChange={(v) => onChange(v === '__local__' ? null : v)}
     >
-      <SelectTrigger className={cn('h-8 w-36 text-xs', className)}>
+      <SelectTrigger className={cn('flex-1 sm:flex-0 h-8 text-xs uppercase', className)}>
         <SelectValue />
       </SelectTrigger>
       <SelectContent>
-        <SelectItem value="__local__" className="text-xs">
+        <SelectItem value="__local__" className="text-xs uppercase">
           Local
         </SelectItem>
         {nodes.map((n) => (

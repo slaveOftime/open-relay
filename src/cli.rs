@@ -58,6 +58,8 @@ pub enum Commands {
     Daemon(DaemonArgs),
     /// Create a session and run a command. Example: `oly start --detach --title "my fun demo" copilot`.
     Start(StartArgs),
+    /// Enable or disable notifications for a running session.
+    Notify(NotifyArgs),
     /// Display the oly skill markdown.
     Skill(SkillArgs),
     /// List sessions. Order is most recently created last.
@@ -203,6 +205,29 @@ pub struct StartArgs {
         value_name = "CMD [ARGS]...",
     )]
     pub cmd_and_args: Vec<String>,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct NotifyArgs {
+    #[command(subcommand)]
+    pub command: NotifyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotifyCommand {
+    /// Disable notifications for a running session.
+    Disable(NotifyToggleArgs),
+    /// Enable notifications for a running session.
+    Enable(NotifyToggleArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct NotifyToggleArgs {
+    /// Session ID to update. If omitted, uses the most recently created session.
+    pub id: Option<String>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
@@ -376,7 +401,7 @@ pub struct JoinListArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, parse_timeout_ms};
+    use super::{Cli, Commands, NotifyCommand, parse_timeout_ms};
     use clap::Parser;
 
     #[test]
@@ -413,5 +438,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid timeout unit"));
+    }
+
+    #[test]
+    fn notify_disable_parses_node_and_id() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "notify",
+            "disable",
+            "session-1",
+            "--node",
+            "worker-a",
+        ])
+        .unwrap();
+        let Commands::Notify(args) = cli.command else {
+            panic!("expected notify command");
+        };
+        let NotifyCommand::Disable(args) = args.command else {
+            panic!("expected notify disable subcommand");
+        };
+        assert_eq!(args.id.as_deref(), Some("session-1"));
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
     }
 }

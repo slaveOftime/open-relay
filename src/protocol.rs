@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::session::SessionEvent;
+
 pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -62,6 +64,10 @@ pub enum RpcRequest {
         cols: Option<u16>,
         #[serde(default)]
         disable_notifications: bool,
+    },
+    NotifySet {
+        id: String,
+        enabled: bool,
     },
     AttachSubscribe {
         id: String,
@@ -145,6 +151,7 @@ impl RpcRequest {
             RpcRequest::DaemonStop { .. } => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
+            RpcRequest::NotifySet { .. } => "notify_set",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
             RpcRequest::AttachResize { .. } => "attach_resize",
@@ -332,6 +339,10 @@ pub enum NodeWsMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_detail: Option<String>,
     },
+    /// Secondary -> Primary: node-aware session event produced for SSE delivery.
+    SessionEvent {
+        payload: SessionEvent,
+    },
     Ping,
     Pong,
 }
@@ -350,6 +361,7 @@ pub struct SessionSummary {
     pub cwd: Option<String>,
     #[serde(default)]
     pub input_needed: bool,
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

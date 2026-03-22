@@ -400,6 +400,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool) -> SessionSummary
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
         input_needed,
+        node: None,
     }
 }
 
