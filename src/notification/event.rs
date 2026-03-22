@@ -139,7 +139,7 @@ impl NotificationEvent {
             (true, true) => String::new(),
             (false, true) => self.description.trim().to_string(),
             (true, false) => self.body.trim().to_string(),
-            (false, false) => format!("{}\n\n{}", self.description.trim(), self.body.trim()),
+            (false, false) => format!("{}\n{}", self.description.trim(), self.body.trim()),
         }
     }
 }
@@ -207,7 +207,7 @@ mod tests {
 
         assert_eq!(
             event.rendered_body(),
-            "Session needs attention.\n\nPassword:"
+            "Session needs attention.\nPassword:"
         );
     }
 }

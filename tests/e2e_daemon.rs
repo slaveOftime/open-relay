@@ -11,6 +11,19 @@ use std::{
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+fn node_ws_json_frame(value: serde_json::Value) -> WsMessage {
+    WsMessage::Binary(value.to_string().into_bytes().into())
+}
+
+fn expect_node_ws_json(frame: WsMessage, context: &str) -> serde_json::Value {
+    match frame {
+        WsMessage::Binary(bytes) => {
+            serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("parse {context}: {err}"))
+        }
+        other => panic!("unexpected {context} frame: {other:?}"),
+    }
+}
+
 #[test]
 fn e2e_start_spawn_failure_exits_nonzero_with_clear_error() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -191,11 +204,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let (mut ws1, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .expect("connect worker1 websocket");
-        ws1.send(WsMessage::Text(
-            json!({"type": "join", "name": "worker1", "key": key})
-                .to_string()
-                .into(),
-        ))
+        ws1.send(node_ws_json_frame(json!({"type": "join", "name": "worker1", "key": key})))
         .await
         .expect("send worker1 join message");
         let first = timeout(Duration::from_secs(2), ws1.next())
@@ -203,12 +212,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .expect("timed out waiting for worker1 join response")
             .expect("worker1 websocket closed")
             .expect("worker1 websocket read failed");
-        let first_text = match first {
-            WsMessage::Text(text) => text,
-            other => panic!("unexpected worker1 response frame: {other:?}"),
-        };
-        let first_json: serde_json::Value =
-            serde_json::from_str(&first_text).expect("parse worker1 join response");
+        let first_json = expect_node_ws_json(first, "worker1 join response");
         assert_eq!(
             first_json.get("type").and_then(|v| v.as_str()),
             Some("joined"),
@@ -240,11 +244,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .await
             .expect("connect duplicate websocket");
         ws_dup
-            .send(WsMessage::Text(
-                json!({"type": "join", "name": "worker1", "key": key})
-                    .to_string()
-                    .into(),
-            ))
+            .send(node_ws_json_frame(json!({"type": "join", "name": "worker1", "key": key})))
             .await
             .expect("send duplicate join message");
         let dup = timeout(Duration::from_secs(2), ws_dup.next())
@@ -252,12 +252,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .expect("timed out waiting for duplicate join response")
             .expect("duplicate websocket closed")
             .expect("duplicate websocket read failed");
-        let dup_text = match dup {
-            WsMessage::Text(text) => text,
-            other => panic!("unexpected duplicate response frame: {other:?}"),
-        };
-        let dup_json: serde_json::Value =
-            serde_json::from_str(&dup_text).expect("parse duplicate join response");
+        let dup_json = expect_node_ws_json(dup, "duplicate join response");
         assert_eq!(
             dup_json.get("type").and_then(|v| v.as_str()),
             Some("error"),
@@ -275,11 +270,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let (mut ws2, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .expect("connect worker2 websocket");
-        ws2.send(WsMessage::Text(
-            json!({"type": "join", "name": "worker2", "key": key})
-                .to_string()
-                .into(),
-        ))
+        ws2.send(node_ws_json_frame(json!({"type": "join", "name": "worker2", "key": key})))
         .await
         .expect("send worker2 join message");
         let second = timeout(Duration::from_secs(2), ws2.next())
@@ -287,12 +278,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .expect("timed out waiting for worker2 join response")
             .expect("worker2 websocket closed")
             .expect("worker2 websocket read failed");
-        let second_text = match second {
-            WsMessage::Text(text) => text,
-            other => panic!("unexpected worker2 response frame: {other:?}"),
-        };
-        let second_json: serde_json::Value =
-            serde_json::from_str(&second_text).expect("parse worker2 join response");
+        let second_json = expect_node_ws_json(second, "worker2 join response");
         assert_eq!(
             second_json.get("type").and_then(|v| v.as_str()),
             Some("joined"),
@@ -318,11 +304,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
         let (mut ws3, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .expect("connect worker3 websocket");
-        ws3.send(WsMessage::Text(
-            json!({"type": "join", "name": "worker3", "key": key})
-                .to_string()
-                .into(),
-        ))
+        ws3.send(node_ws_json_frame(json!({"type": "join", "name": "worker3", "key": key})))
         .await
         .expect("send worker3 join message");
 
@@ -331,12 +313,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .expect("timed out waiting for worker3 join response")
             .expect("worker3 websocket closed")
             .expect("worker3 websocket read failed");
-        let third_text = match third {
-            WsMessage::Text(text) => text,
-            other => panic!("unexpected worker3 response frame: {other:?}"),
-        };
-        let third_json: serde_json::Value =
-            serde_json::from_str(&third_text).expect("parse worker3 join response");
+        let third_json = expect_node_ws_json(third, "worker3 join response");
         assert_eq!(
             third_json.get("type").and_then(|v| v.as_str()),
             Some("error"),

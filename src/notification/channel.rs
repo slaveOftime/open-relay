@@ -690,7 +690,7 @@ mod tests {
                 "-d",
                 "hello world",
                 "test-summary",
-                "Needs input\n\nhello world",
+                "Needs input\nhello world",
                 "worker-a"
             ]
         );
