@@ -50,4 +50,7 @@ jobs:
 
       - name: Test
         run: |
-          cd web && npm install && npm test
+          cd web
+          npm install
+          npm test
+          npm run build
