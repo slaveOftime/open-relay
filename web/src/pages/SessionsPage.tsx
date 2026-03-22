@@ -45,7 +45,6 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 import {
   Select,
   SelectContent,
@@ -379,10 +378,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg
-            series={series}
-            enableAnimation={isRunning}
-          />
+          <SparklineSvg series={series} enableAnimation={isRunning} />
         </TableCell>
 
         {/* PID */}
@@ -1295,7 +1291,7 @@ export default function SessionsPage() {
     sortOrder !== SortOrder.Desc
 
   const statusChips: { label: string; value: SessionStatusFilter }[] = [
-    { label: 'All', value: 'all' },
+    { label: 'All status', value: 'all' },
     { label: 'Running', value: 'running' },
     { label: 'Stopped', value: 'stopped' },
     { label: 'Killed', value: 'killed' },
@@ -1329,6 +1325,29 @@ export default function SessionsPage() {
     }
     await handleEnablePush()
   }
+
+  const statusFilterView = (
+    <Select
+      value={statusFilter}
+      onValueChange={(v) => {
+        if (isSessionStatusFilter(v)) {
+          setStatusFilter(v)
+          setPage(0)
+        }
+      }}
+    >
+      <SelectTrigger className="flex-1 sm:flex-0 h-8 text-xs">
+        <SelectValue placeholder="All statuses" />
+      </SelectTrigger>
+      <SelectContent>
+        {statusChips.map((chip) => (
+          <SelectItem key={chip.value} value={chip.value}>
+            {chip.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
 
   return (
     <TooltipProvider>
@@ -1433,26 +1452,7 @@ export default function SessionsPage() {
                     <SelectItem value="command">Group by CMD</SelectItem>
                   </SelectContent>
                 </Select>
-                <Select
-                  value={statusFilter}
-                  onValueChange={(v) => {
-                    if (isSessionStatusFilter(v)) {
-                      setStatusFilter(v)
-                      setPage(0)
-                    }
-                  }}
-                >
-                  <SelectTrigger className="flex-1 h-8 text-xs">
-                    <SelectValue placeholder="All statuses" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {statusChips.map((chip) => (
-                      <SelectItem key={chip.value} value={chip.value}>
-                        {chip.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                {statusFilterView}
               </div>
               <div className="flex gap-2">
                 <Select
@@ -1537,7 +1537,7 @@ export default function SessionsPage() {
             />
 
             <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
-              <SelectTrigger className="w-40 h-8 text-sm">
+              <SelectTrigger className="flex-0 h-8 text-sm">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -1548,49 +1548,11 @@ export default function SessionsPage() {
             </Select>
 
             {/* Status filter (responsive) */}
-            <Select
-              value={statusFilter}
-              onValueChange={(v) => {
-                if (isSessionStatusFilter(v)) {
-                  setStatusFilter(v)
-                  setPage(0)
-                }
-              }}
-            >
-              <SelectTrigger className="h-8 w-36 text-sm xl:hidden">
-                <SelectValue placeholder="All statuses" />
-              </SelectTrigger>
-              <SelectContent>
-                {statusChips.map((chip) => (
-                  <SelectItem key={chip.value} value={chip.value}>
-                    {chip.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-
-            <div className="hidden xl:flex items-center gap-1.5">
-              <ToggleGroup
-                type="single"
-                value={statusFilter}
-                onValueChange={(v) => {
-                  if (isSessionStatusFilter(v)) {
-                    setStatusFilter(v)
-                    setPage(0)
-                  }
-                }}
-              >
-                {statusChips.map((chip) => (
-                  <ToggleGroupItem key={chip.value} value={chip.value}>
-                    {chip.label}
-                  </ToggleGroupItem>
-                ))}
-              </ToggleGroup>
-            </div>
-
-            <div className="flex-1" />
+            {statusFilterView}
 
             <NodeSelector nodes={nodes} selected={selectedNode} onChange={handleNodeChange} />
+
+            <div className="flex-1" />
 
             <Button
               size="sm"
@@ -1599,7 +1561,12 @@ export default function SessionsPage() {
               disabled={loading || refreshing}
             >
               <ReloadIcon className="h-4 w-4" />
-              <span className="hidden xl:inline">Refresh</span>
+            </Button>
+
+            <Button asChild size="sm" variant="ghost">
+              <a href="/apps">
+                <GridIcon className="h-4 w-4" />
+              </a>
             </Button>
 
             <Button
@@ -1610,13 +1577,6 @@ export default function SessionsPage() {
             >
               <BellIcon className="h-4 w-4" />
               <span className="hidden xl:inline">{pushButtonLabel}</span>
-            </Button>
-
-            <Button asChild size="sm" variant="ghost">
-              <a href="/apps">
-                <GridIcon className="h-4 w-4" />
-                <span>Apps</span>
-              </a>
             </Button>
 
             <Button size="sm" onClick={() => setShowNewSession(true)}>
