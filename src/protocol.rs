@@ -1,9 +1,15 @@
 use chrono::{DateTime, Utc};
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::time::Instant;
+use tracing::debug;
 
 use crate::session::SessionEvent;
 
 pub const PROTOCOL_VERSION: u16 = 5;
+pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
+const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LogResize {
@@ -43,6 +49,94 @@ mod base64_bytes {
 pub struct RpcEnvelope<T> {
     pub version: u16,
     pub payload: T,
+}
+
+pub fn encode_node_ws_payload(message: &NodeWsMessage) -> std::io::Result<Vec<u8>> {
+    let start = Instant::now();
+    let message_type = node_ws_message_type(message);
+    let json = serde_json::to_vec(message).map_err(std::io::Error::other)?;
+    let json_len = json.len();
+    if json.len() < NODE_WS_BINARY_COMPRESS_MIN_BYTES {
+        debug!(
+            message_type,
+            compressed = false,
+            input_bytes = json_len,
+            output_bytes = json_len,
+            elapsed_us = start.elapsed().as_micros(),
+            "encoded node WebSocket payload"
+        );
+        return Ok(json);
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&json)?;
+    let compressed = encoder.finish()?;
+    if compressed.len() >= json.len() {
+        debug!(
+            message_type,
+            compressed = false,
+            input_bytes = json_len,
+            output_bytes = json_len,
+            candidate_compressed_bytes = compressed.len(),
+            elapsed_us = start.elapsed().as_micros(),
+            "encoded node WebSocket payload"
+        );
+        return Ok(json);
+    }
+
+    let mut payload = Vec::with_capacity(NODE_WS_BINARY_MAGIC.len() + compressed.len());
+    payload.extend_from_slice(NODE_WS_BINARY_MAGIC);
+    payload.extend_from_slice(&compressed);
+    debug!(
+        message_type,
+        compressed = true,
+        input_bytes = json_len,
+        compressed_bytes = compressed.len(),
+        output_bytes = payload.len(),
+        elapsed_us = start.elapsed().as_micros(),
+        "encoded node WebSocket payload"
+    );
+    Ok(payload)
+}
+
+pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> {
+    let start = Instant::now();
+    let payload_len = payload.len();
+    let compressed = payload.starts_with(NODE_WS_BINARY_MAGIC);
+    let json = if compressed {
+        let mut decoder = GzDecoder::new(&payload[NODE_WS_BINARY_MAGIC.len()..]);
+        let mut json = Vec::new();
+        decoder.read_to_end(&mut json)?;
+        json
+    } else {
+        payload.to_vec()
+    };
+
+    let message = serde_json::from_slice(&json).map_err(std::io::Error::other)?;
+    debug!(
+        message_type = node_ws_message_type(&message),
+        compressed,
+        input_bytes = payload_len,
+        decoded_json_bytes = json.len(),
+        elapsed_us = start.elapsed().as_micros(),
+        "decoded node WebSocket payload"
+    );
+    Ok(message)
+}
+
+fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
+    match message {
+        NodeWsMessage::Join { .. } => "join",
+        NodeWsMessage::Joined { .. } => "joined",
+        NodeWsMessage::Error { .. } => "error",
+        NodeWsMessage::Rpc { .. } => "rpc",
+        NodeWsMessage::RpcResponse { .. } => "rpc_response",
+        NodeWsMessage::RpcStreamFrame { .. } => "rpc_stream_frame",
+        NodeWsMessage::Notification { .. } => "notification",
+        NodeWsMessage::SessionEvent { .. } => "session_event",
+        NodeWsMessage::Ping => "ping",
+        NodeWsMessage::Pong => "pong",
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -345,6 +439,55 @@ pub enum NodeWsMessage {
     },
     Ping,
     Pong,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NodeWsMessage, decode_node_ws_payload, encode_node_ws_payload};
+
+    #[test]
+    fn node_ws_payload_round_trips_uncompressed_binary_json() {
+        let message = NodeWsMessage::Join {
+            name: "worker-a".into(),
+            key: "secret".into(),
+        };
+
+        let payload = encode_node_ws_payload(&message).expect("encode payload");
+        let decoded = decode_node_ws_payload(&payload).expect("decode payload");
+
+        match decoded {
+            NodeWsMessage::Join { name, key } => {
+                assert_eq!(name, "worker-a");
+                assert_eq!(key, "secret");
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_ws_payload_round_trips_compressed_binary_json() {
+        let message = NodeWsMessage::Notification {
+            kind: "input_needed".into(),
+            title: "x".repeat(256),
+            description: "y".repeat(256),
+            body: "z".repeat(512),
+            navigation_url: Some("/session/abc".into()),
+            session_ids: vec!["abc".into(), "def".into()],
+            trigger_rule: Some("always".into()),
+            trigger_detail: Some("detail".into()),
+        };
+
+        let payload = encode_node_ws_payload(&message).expect("encode payload");
+        let decoded = decode_node_ws_payload(&payload).expect("decode payload");
+
+        match decoded {
+            NodeWsMessage::Notification { title, body, .. } => {
+                assert_eq!(title.len(), 256);
+                assert_eq!(body.len(), 512);
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

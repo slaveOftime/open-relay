@@ -5,7 +5,6 @@ import type {
   CreateSessionSpec,
   LogsResponse,
   SessionEvent,
-  WsServerMessage,
   WsClientMessage,
   PushSubscriptionInput,
   AuthStatus,
@@ -339,13 +338,16 @@ export function subscribeEvents(
 // WebSocket PTY attach
 // ---------------------------------------------------------------------------
 
-/** Decode a base64 string into a Uint8Array of raw bytes. */
-function base64ToBytes(b64: string): Uint8Array {
-  const bin = atob(b64)
-  const bytes = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-  return bytes
-}
+const textDecoder = new TextDecoder()
+const WS_FRAME_INIT = 1
+const WS_FRAME_DATA = 2
+const WS_FRAME_MODE_CHANGED = 3
+const WS_FRAME_RESIZED = 4
+const WS_FRAME_SESSION_ENDED = 5
+const WS_FRAME_ERROR = 6
+const WS_FRAME_PONG = 7
+const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
+const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
 
 export interface AttachOptions {
   /** Called with decoded raw PTY bytes from the initial ring-buffer replay. */
@@ -386,6 +388,7 @@ export class AttachSocket {
     const qs = params.toString()
     const url = `${proto}//${host}/api/sessions/${sessionId}/attach${qs ? `?${qs}` : ''}`
     this.ws = new WebSocket(url)
+    this.ws.binaryType = 'arraybuffer'
 
     this.ws.onopen = () => opts.onOpen()
     this.ws.onclose = (e) => {
@@ -395,28 +398,50 @@ export class AttachSocket {
 
     this.ws.onmessage = (e) => {
       try {
-        const msg = JSON.parse(e.data) as WsServerMessage
-        switch (msg.type) {
-          case 'init':
-            opts.onInit(base64ToBytes(msg.data), msg.appCursorKeys, msg.bracketedPasteMode)
-            break
-          case 'data':
-            opts.onData(base64ToBytes(msg.data))
-            break
-          case 'mode_changed':
-            opts.onModeChanged(msg.appCursorKeys, msg.bracketedPasteMode)
-            break
-          case 'resized':
-            opts.onResized?.(msg.rows, msg.cols)
-            break
-          case 'session_ended':
-            opts.onSessionEnded(msg.exit_code)
-            break
-          case 'error':
-            opts.onError(msg.message)
-            break
-          case 'pong':
-            break
+        if (!(e.data instanceof ArrayBuffer)) return
+
+        const bytes = new Uint8Array(e.data)
+        if (bytes.length === 0) return
+        const tag = bytes[0]
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+
+        switch (tag) {
+          case WS_FRAME_INIT: {
+            const flags = bytes[1] ?? 0
+            opts.onInit(
+              bytes.subarray(2),
+              (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
+              (flags & WS_FLAG_BRACKETED_PASTE_MODE) !== 0
+            )
+            return
+          }
+          case WS_FRAME_DATA:
+            opts.onData(bytes.subarray(1))
+            return
+          case WS_FRAME_MODE_CHANGED: {
+            const flags = bytes[1] ?? 0
+            opts.onModeChanged(
+              (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
+              (flags & WS_FLAG_BRACKETED_PASTE_MODE) !== 0
+            )
+            return
+          }
+          case WS_FRAME_RESIZED:
+            if (bytes.length >= 5) {
+              opts.onResized?.(view.getUint16(1, false), view.getUint16(3, false))
+            }
+            return
+          case WS_FRAME_SESSION_ENDED: {
+            const hasExitCode = bytes[1] === 1
+            const exitCode = hasExitCode && bytes.length >= 6 ? view.getInt32(2, false) : null
+            opts.onSessionEnded(exitCode)
+            return
+          }
+          case WS_FRAME_ERROR:
+            opts.onError(textDecoder.decode(bytes.subarray(1)))
+            return
+          case WS_FRAME_PONG:
+            return
         }
       } catch {
         /* ignore malformed frames */

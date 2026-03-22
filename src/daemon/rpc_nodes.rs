@@ -16,7 +16,9 @@ use crate::{
     http::sse::session_event_for_delivery,
     ipc,
     node::NodeRegistry,
-    protocol::{NodeWsMessage, RpcRequest, RpcResponse},
+    protocol::{
+        NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+    },
     session::SessionEvent,
 };
 
@@ -96,15 +98,15 @@ async fn connect_and_relay(
         name: join.name.clone(),
         key: join.api_key.clone(),
     };
-    let text = serde_json::to_string(&handshake)?;
+    let handshake_payload = encode_node_ws_payload(&handshake)?;
     ws_tx
-        .send(WsMessage::Text(text.into()))
+        .send(WsMessage::Binary(handshake_payload.into()))
         .await
         .map_err(|e| crate::error::AppError::Protocol(e.to_string()))?;
 
     match ws_rx.next().await {
-        Some(Ok(WsMessage::Text(t))) => {
-            match serde_json::from_str::<NodeWsMessage>(&t)
+        Some(Ok(frame)) => {
+            match decode_node_message(frame)
                 .map_err(|e| crate::error::AppError::Protocol(e.to_string()))?
             {
                 NodeWsMessage::Joined => {
@@ -149,26 +151,22 @@ async fn connect_and_relay(
                     response: response_json,
                     done,
                 };
-                let reply_text = match serde_json::to_string(&reply) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if ws_tx.send(WsMessage::Text(reply_text.into())).await.is_err() {
+                if !send_node_message(&mut ws_tx, &reply).await {
                     break;
                 }
             }
             incoming = ws_rx.next() => {
                 let Some(msg_result) = incoming else { break };
 
-                let text = match msg_result {
-                    Ok(WsMessage::Text(t)) => t,
+                let node_msg = match msg_result {
                     Ok(WsMessage::Close(_)) | Err(_) => break,
-                    _ => continue,
-                };
-
-                let node_msg: NodeWsMessage = match serde_json::from_str(&text) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                    Ok(frame) => match decode_node_message(frame) {
+                        Ok(message) => message,
+                        Err(err) => {
+                            warn!(node = %join.name, %err, "failed to decode primary node frame");
+                            continue;
+                        }
+                    },
                 };
 
                 match node_msg {
@@ -222,18 +220,12 @@ async fn connect_and_relay(
                             id,
                             response: response_json,
                         };
-                        let reply_text = match serde_json::to_string(&reply) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        };
-                        if ws_tx.send(WsMessage::Text(reply_text.into())).await.is_err() {
+                        if !send_node_message(&mut ws_tx, &reply).await {
                             break;
                         }
                     }
                     NodeWsMessage::Ping => {
-                        if let Ok(pong) = serde_json::to_string(&NodeWsMessage::Pong) {
-                            let _ = ws_tx.send(WsMessage::Text(pong.into())).await;
-                        }
+                        let _ = send_node_message(&mut ws_tx, &NodeWsMessage::Pong).await;
                     }
                     _ => {}
                 }
@@ -244,11 +236,7 @@ async fn connect_and_relay(
                         let relay = NodeWsMessage::SessionEvent {
                             payload: session_event_for_delivery(&event, Some(join.name.as_str())),
                         };
-                        let relay_text = match serde_json::to_string(&relay) {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        };
-                        if ws_tx.send(WsMessage::Text(relay_text.into())).await.is_err() {
+                        if !send_node_message(&mut ws_tx, &relay).await {
                             break;
                         }
                     }
@@ -262,6 +250,31 @@ async fn connect_and_relay(
     }
 
     Ok(false)
+}
+
+async fn send_node_message(
+    ws_tx: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        WsMessage,
+    >,
+    message: &NodeWsMessage,
+) -> bool {
+    match encode_node_ws_payload(message) {
+        Ok(payload) => ws_tx.send(WsMessage::Binary(payload.into())).await.is_ok(),
+        Err(err) => {
+            warn!(%err, "failed to encode node connector frame");
+            false
+        }
+    }
+}
+
+fn decode_node_message(frame: WsMessage) -> std::io::Result<NodeWsMessage> {
+    match frame {
+        WsMessage::Binary(data) => decode_node_ws_payload(&data),
+        _ => Err(std::io::Error::other("unsupported node connector frame")),
+    }
 }
 
 fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {

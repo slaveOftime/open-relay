@@ -32,17 +32,17 @@ pub struct AttachParams {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    /// Initial ring-buffer replay. `data` is base64-encoded filtered stream bytes.
+    /// Initial ring-buffer replay. `data` contains filtered stream bytes.
     Init {
-        data: String,
+        data: Vec<u8>,
         #[serde(rename = "appCursorKeys")]
         app_cursor_keys: bool,
         #[serde(rename = "bracketedPasteMode")]
         bracketed_paste_mode: bool,
     },
-    /// Incremental PTY output chunk. `data` is base64-encoded.
+    /// Incremental PTY output chunk.
     Data {
-        data: String,
+        data: Vec<u8>,
     },
     /// Terminal mode changed mid-stream.
     ModeChanged {
@@ -75,6 +75,16 @@ enum ClientMessage {
     Ping,
 }
 
+const WS_FRAME_INIT: u8 = 1;
+const WS_FRAME_DATA: u8 = 2;
+const WS_FRAME_MODE_CHANGED: u8 = 3;
+const WS_FRAME_RESIZED: u8 = 4;
+const WS_FRAME_SESSION_ENDED: u8 = 5;
+const WS_FRAME_ERROR: u8 = 6;
+const WS_FRAME_PONG: u8 = 7;
+const WS_FLAG_APP_CURSOR_KEYS: u8 = 1 << 0;
+const WS_FLAG_BRACKETED_PASTE_MODE: u8 = 1 << 1;
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -89,14 +99,71 @@ pub async fn attach_handler(
     ws.on_upgrade(move |socket| handle_ws(socket, state, id, params.node, params.rows, params.cols))
 }
 
-async fn send_json(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
-    match serde_json::to_string(msg) {
-        Ok(json) => socket.send(Message::Text(json.into())).await.is_ok(),
-        Err(err) => {
-            warn!(%err, "failed to serialize WebSocket message");
-            false
-        }
+fn mode_flags(app_cursor_keys: bool, bracketed_paste_mode: bool) -> u8 {
+    let mut flags = 0;
+    if app_cursor_keys {
+        flags |= WS_FLAG_APP_CURSOR_KEYS;
     }
+    if bracketed_paste_mode {
+        flags |= WS_FLAG_BRACKETED_PASTE_MODE;
+    }
+    flags
+}
+
+async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
+    let payload = match msg {
+        ServerMessage::Init {
+            data,
+            app_cursor_keys,
+            bracketed_paste_mode,
+        } => {
+            let mut payload = Vec::with_capacity(2 + data.len());
+            payload.push(WS_FRAME_INIT);
+            payload.push(mode_flags(*app_cursor_keys, *bracketed_paste_mode));
+            payload.extend_from_slice(data);
+            payload
+        }
+        ServerMessage::Data { data } => {
+            let mut payload = Vec::with_capacity(1 + data.len());
+            payload.push(WS_FRAME_DATA);
+            payload.extend_from_slice(data);
+            payload
+        }
+        ServerMessage::ModeChanged {
+            app_cursor_keys,
+            bracketed_paste_mode,
+        } => vec![
+            WS_FRAME_MODE_CHANGED,
+            mode_flags(*app_cursor_keys, *bracketed_paste_mode),
+        ],
+        ServerMessage::Resized { rows, cols } => {
+            let mut payload = Vec::with_capacity(5);
+            payload.push(WS_FRAME_RESIZED);
+            payload.extend_from_slice(&rows.to_be_bytes());
+            payload.extend_from_slice(&cols.to_be_bytes());
+            payload
+        }
+        ServerMessage::SessionEnded { exit_code } => {
+            let mut payload = Vec::with_capacity(6);
+            payload.push(WS_FRAME_SESSION_ENDED);
+            match exit_code {
+                Some(code) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&code.to_be_bytes());
+                }
+                None => payload.push(0),
+            }
+            payload
+        }
+        ServerMessage::Error { message } => {
+            let mut payload = Vec::with_capacity(1 + message.len());
+            payload.push(WS_FRAME_ERROR);
+            payload.extend_from_slice(message.as_bytes());
+            payload
+        }
+        ServerMessage::Pong => vec![WS_FRAME_PONG],
+    };
+    socket.send(Message::Binary(payload.into())).await.is_ok()
 }
 
 async fn handle_ws(
@@ -128,7 +195,6 @@ async fn handle_ws_streaming(
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
 ) {
-    use base64::{Engine, engine::general_purpose::STANDARD as B64};
     use tokio::sync::broadcast::error::RecvError;
 
     // Subscribe to broadcast + get ring replay, all under one lock.
@@ -139,7 +205,7 @@ async fn handle_ws_streaming(
             Ok(t) => t,
             Err(err) => {
                 warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
-                let _ = send_json(
+                let _ = send_server_message(
                     &mut socket,
                     &ServerMessage::Error {
                         message: err.message(&id),
@@ -151,13 +217,14 @@ async fn handle_ws_streaming(
         };
 
     let replay_bytes = collect_chunk_bytes(&replay_chunks);
+    let replay_bytes_len = replay_bytes.len();
 
     let init_msg = ServerMessage::Init {
-        data: B64.encode(&replay_bytes),
+        data: replay_bytes,
         app_cursor_keys,
         bracketed_paste_mode,
     };
-    if !send_json(&mut socket, &init_msg).await {
+    if !send_server_message(&mut socket, &init_msg).await {
         debug!(session_id = %id, "local WebSocket closed before init frame could be sent");
         return;
     }
@@ -171,7 +238,7 @@ async fn handle_ws_streaming(
     debug!(
         session_id = %id,
         replay_chunks = replay_chunks.len(),
-        replay_bytes = replay_bytes.len(),
+        replay_bytes = replay_bytes_len,
         end_offset,
         app_cursor_keys,
         bracketed_paste_mode,
@@ -223,23 +290,23 @@ async fn handle_ws_streaming(
                                         "sending final buffered output before local WebSocket shutdown"
                                     );
                                     let msg = ServerMessage::Data {
-                                        data: B64.encode(&raw),
+                                        data: raw,
                                     };
-                                    if !send_json(&mut socket, &msg).await {
+                                    if !send_server_message(&mut socket, &msg).await {
                                         let _ = state.store.attach_detach(&id).await;
                                         return;
                                     }
                                 }
                             }
                             info!(session_id = %id, ?exit_code, "WS session ended");
-                            let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+                            let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                             let _ = state.store.attach_detach(&id).await;
                             return;
                         }
                     }
                     Err(_) => {
                         warn!(session_id = %id, "local WebSocket stream status lookup failed");
-                        let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
                     }
@@ -252,9 +319,9 @@ async fn handle_ws_streaming(
                     Ok(filtered_arc) => {
                         if !filtered_arc.is_empty() {
                             let msg = ServerMessage::Data {
-                                data: B64.encode(filtered_arc.as_ref()),
+                                data: filtered_arc.to_vec(),
                             };
-                            if !send_json(&mut socket, &msg).await {
+                            if !send_server_message(&mut socket, &msg).await {
                                 let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
@@ -277,7 +344,7 @@ async fn handle_ws_streaming(
                                     bracketed_paste_mode = modes.bracketed_paste_mode,
                                     "local WebSocket terminal mode changed"
                                 );
-                                if !send_json(&mut socket, &ServerMessage::ModeChanged {
+                                if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
                                     app_cursor_keys: modes.app_cursor_keys,
                                     bracketed_paste_mode: modes.bracketed_paste_mode,
                                 }).await {
@@ -311,9 +378,9 @@ async fn handle_ws_streaming(
                                         "replayed buffered PTY output for local WebSocket resync"
                                     );
                                     let msg = ServerMessage::Data {
-                                        data: B64.encode(&raw),
+                                        data: raw,
                                     };
-                                    if !send_json(&mut socket, &msg).await {
+                                    if !send_server_message(&mut socket, &msg).await {
                                         let _ = state.store.attach_detach(&id).await;
                                         return;
                                     }
@@ -326,7 +393,7 @@ async fn handle_ws_streaming(
                             }
                             Err(_) => {
                                 warn!(session_id = %id, "local WebSocket resync failed");
-                                let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                                let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
                                 let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
@@ -335,7 +402,7 @@ async fn handle_ws_streaming(
                     Err(RecvError::Closed) => {
                         let exit_code = state.store.get_exit_code(&id);
                         info!(session_id = %id, ?exit_code, "local WebSocket broadcast channel closed");
-                        let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
                     }
@@ -350,7 +417,7 @@ async fn handle_ws_streaming(
                             Ok(ClientMessage::Input { data }) => {
                                 debug!(session_id = %id, bytes = data.len(), "WS input received");
                                 if let Err(err) = state.store.attach_input(&id, &data).await {
-                                    let _ = send_json(&mut socket, &ServerMessage::Error {
+                                    let _ = send_server_message(&mut socket, &ServerMessage::Error {
                                         message: err.message(&id),
                                     }).await;
                                     let _ = state.store.attach_detach(&id).await;
@@ -361,7 +428,7 @@ async fn handle_ws_streaming(
                                 debug!(session_id = %id, rows, cols, "WS resize received");
                                 resize_sub.mark_sent(rows, cols);
                                 if let Err(err) = state.store.attach_resize(&id, rows, cols).await {
-                                    let _ = send_json(&mut socket, &ServerMessage::Error {
+                                    let _ = send_server_message(&mut socket, &ServerMessage::Error {
                                         message: err.message(&id),
                                     }).await;
                                     let _ = state.store.attach_detach(&id).await;
@@ -375,7 +442,7 @@ async fn handle_ws_streaming(
                             }
                             Ok(ClientMessage::Ping) => {
                                 trace!(session_id = %id, "local WebSocket ping received");
-                                let _ = send_json(&mut socket, &ServerMessage::Pong).await;
+                                let _ = send_server_message(&mut socket, &ServerMessage::Pong).await;
                             }
                             Err(err) => {
                                 warn!(session_id = %id, %err, "failed to parse local WebSocket client message");
@@ -398,7 +465,7 @@ async fn handle_ws_streaming(
                     rows, cols,
                     "forwarding resize notification to local WebSocket client"
                 );
-                if !send_json(&mut socket, &ServerMessage::Resized { rows, cols }).await {
+                if !send_server_message(&mut socket, &ServerMessage::Resized { rows, cols }).await {
                     let _ = state.store.attach_detach(&id).await;
                     return;
                 }
@@ -419,8 +486,6 @@ async fn handle_ws_proxied_streaming(
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
 ) {
-    use base64::{Engine, engine::general_purpose::STANDARD as B64};
-
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
     // Resize PTY via node proxy before subscribing.
@@ -453,7 +518,7 @@ async fn handle_ws_proxied_streaming(
         Ok(pair) => pair,
         Err(err) => {
             warn!(session_id = %id, node = %node, %err, "failed to open proxied WebSocket stream");
-            let _ = send_json(
+            let _ = send_server_message(
                 &mut socket,
                 &ServerMessage::Error {
                     message: format!("failed to open proxy stream: {err}"),
@@ -481,18 +546,19 @@ async fn handle_ws_proxied_streaming(
                                 bracketed_paste_mode,
                                 ..
                             } => {
+                                let replay_bytes = data.len();
                                 let msg = ServerMessage::Init {
-                                    data: B64.encode(&data),
+                                    data,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                 };
-                                if !send_json(&mut socket, &msg).await {
+                                if !send_server_message(&mut socket, &msg).await {
                                     break;
                                 }
                                 debug!(
                                     session_id = %id,
                                     node = %node,
-                                    replay_bytes = data.len(),
+                                    replay_bytes,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                     "proxied WebSocket init frame received"
@@ -503,9 +569,9 @@ async fn handle_ws_proxied_streaming(
                                 if !data.is_empty() {
                                     trace!(session_id = %id, node = %node, bytes = data.len(), "forwarding proxied PTY output");
                                     let msg = ServerMessage::Data {
-                                        data: B64.encode(&data),
+                                        data,
                                     };
-                                    if !send_json(&mut socket, &msg).await {
+                                    if !send_server_message(&mut socket, &msg).await {
                                         break;
                                     }
                                 }
@@ -521,7 +587,7 @@ async fn handle_ws_proxied_streaming(
                                     bracketed_paste_mode,
                                     "proxied WebSocket terminal mode changed"
                                 );
-                                let _ = send_json(&mut socket, &ServerMessage::ModeChanged {
+                                let _ = send_server_message(&mut socket, &ServerMessage::ModeChanged {
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                 }).await;
@@ -533,19 +599,19 @@ async fn handle_ws_proxied_streaming(
                                     rows, cols,
                                     "proxied WebSocket resize notification received"
                                 );
-                                let _ = send_json(&mut socket, &ServerMessage::Resized {
+                                let _ = send_server_message(&mut socket, &ServerMessage::Resized {
                                     rows,
                                     cols,
                                 }).await;
                             }
                             RpcResponse::AttachStreamDone { exit_code } => {
                                 info!(session_id = %id, node = %node, ?exit_code, "proxied WebSocket stream ended");
-                                let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+                                let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                                 break;
                             }
                             RpcResponse::Error { message } => {
                                 warn!(session_id = %id, node = %node, %message, "proxied WebSocket stream returned an error");
-                                let _ = send_json(&mut socket, &ServerMessage::Error { message }).await;
+                                let _ = send_server_message(&mut socket, &ServerMessage::Error { message }).await;
                                 break;
                             }
                             _ => {}
@@ -553,12 +619,12 @@ async fn handle_ws_proxied_streaming(
                     }
                     Some(Err(err)) => {
                         warn!(session_id = %id, %err, "proxy stream error");
-                        let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
                         break;
                     }
                     None => {
                         // Stream channel closed.
-                        let _ = send_json(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
                         break;
                     }
                 }
@@ -600,7 +666,7 @@ async fn handle_ws_proxied_streaming(
                             }
                             Ok(ClientMessage::Ping) => {
                                 trace!(session_id = %id, node = %node, "proxied WebSocket ping received");
-                                let _ = send_json(&mut socket, &ServerMessage::Pong).await;
+                                let _ = send_server_message(&mut socket, &ServerMessage::Pong).await;
                             }
                             Err(err) => {
                                 warn!(session_id = %id, node = %node, %err, "failed to parse proxied WebSocket client message");
