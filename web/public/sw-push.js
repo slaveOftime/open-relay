@@ -1,4 +1,10 @@
 function notificationNavigationUrl(payload) {
+  const launch =
+    typeof payload?.launch_url === 'string' && payload.launch_url.trim()
+      ? payload.launch_url.trim()
+      : ''
+  if (launch) return new URL(launch, self.location.origin).toString()
+
   const base =
     typeof payload?.navigation_url === 'string' && payload.navigation_url.trim()
       ? payload.navigation_url.trim()

@@ -2,6 +2,7 @@ import type { SessionNotificationData } from '@/api/types'
 
 const DEFAULT_NOTIFICATION_TITLE = 'Open Relay notification'
 const DEFAULT_NOTIFICATION_TAG = 'open-relay-session-notification'
+export const NOTIFICATION_TARGET_PARAM = 'open-relay-target'
 
 export function notificationTitle(payload: Pick<SessionNotificationData, 'title'>): string {
   return payload.title.trim() || DEFAULT_NOTIFICATION_TITLE
@@ -30,10 +31,38 @@ function notificationNavigationPath(
   return `${base}${base.includes('?') ? '&' : '?'}node=${encodeURIComponent(node)}`
 }
 
+function notificationLaunchPath(
+  payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>
+): string {
+  const targetPath = notificationNavigationPath(payload)
+  if (!targetPath.startsWith('/')) return targetPath
+  if (targetPath === '/') return '/'
+  return `/?${NOTIFICATION_TARGET_PARAM}=${encodeURIComponent(targetPath)}`
+}
+
 export function notificationNavigationUrl(
   payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>,
   origin?: string
 ): string {
   const path = notificationNavigationPath(payload)
   return origin ? new URL(path, origin).toString() : path
+}
+
+export function notificationLaunchUrl(
+  payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>,
+  origin?: string
+): string {
+  const path = notificationLaunchPath(payload)
+  return origin ? new URL(path, origin).toString() : path
+}
+
+export function notificationLaunchTargetFromUrl(currentUrl: string): string | null {
+  const baseOrigin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'http://localhost'
+  const url = new URL(currentUrl, baseOrigin)
+  const target = url.searchParams.get(NOTIFICATION_TARGET_PARAM)?.trim()
+  if (!target || !target.startsWith('/')) return null
+  return target
 }

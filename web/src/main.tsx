@@ -1,6 +1,7 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { registerSW } from 'virtual:pwa-register'
+import { notificationLaunchTargetFromUrl } from '@/lib/notifications'
 import './index.css'
 import App from './App'
 import ErrorBoundary from '@/components/ErrorBoundary'
@@ -20,6 +21,13 @@ function restoreLaunchRoute() {
   window.history.replaceState(null, '', saved)
 }
 
+function restoreNotificationLaunchTarget() {
+  const target = notificationLaunchTargetFromUrl(window.location.href)
+  if (!target) return
+  window.history.replaceState(null, '', target)
+}
+
+restoreNotificationLaunchTarget()
 restoreLaunchRoute()
 
 if (import.meta.env.PROD) {
