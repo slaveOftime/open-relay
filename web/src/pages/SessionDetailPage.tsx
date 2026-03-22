@@ -373,7 +373,7 @@ export default function SessionDetailPage() {
     } finally {
       isFetchingMoreRef.current = false
     }
-  }, [id, node])
+  }, [id, node, commitReplayIdx])
 
   const fetchMoreLogsRef = useRef<(() => Promise<void>) | null>(null)
   useEffect(() => {
@@ -720,32 +720,37 @@ export default function SessionDetailPage() {
     setTotalChunks(0)
 
     let cancelled = false
-    fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
-      .then((res) => {
-        if (cancelled || !isMounted.current) return
-        const encodedChunks = encodeLogChunks(res.chunks)
-        logChunksRef.current = encodedChunks
-        logResizesRef.current = res.resizes
-        totalChunksRef.current = res.total
-        setTotalChunks(res.total)
-        nextOffsetRef.current = Math.min(res.total, res.chunks.length)
-        setScrubberMax(res.chunks.length)
-        if (termRef.current) {
-          logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
-        }
-        commitReplayIdx(res.chunks.length, { force: true })
-        fetchSession(id!, node ?? undefined)
-          .then((s) => {
-            if (isMounted.current) setSession(s)
-          })
-          .catch(() => {})
-      })
-      .catch(() => {})
+    // Defer to avoid StrictMode double-fetch.
+    const raf = requestAnimationFrame(() => {
+      if (cancelled) return
+      fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
+        .then((res) => {
+          if (cancelled || !isMounted.current) return
+          const encodedChunks = encodeLogChunks(res.chunks)
+          logChunksRef.current = encodedChunks
+          logResizesRef.current = res.resizes
+          totalChunksRef.current = res.total
+          setTotalChunks(res.total)
+          nextOffsetRef.current = Math.min(res.total, res.chunks.length)
+          setScrubberMax(res.chunks.length)
+          if (termRef.current) {
+            logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
+          }
+          commitReplayIdx(res.chunks.length, { force: true })
+          fetchSession(id!, node ?? undefined)
+            .then((s) => {
+              if (!cancelled && isMounted.current) setSession(s)
+            })
+            .catch(() => {})
+        })
+        .catch(() => {})
+    })
 
     return () => {
       cancelled = true
+      cancelAnimationFrame(raf)
     }
-  }, [mode, id, node, reloadTick])
+  }, [mode, id, node, reloadTick, commitReplayIdx])
 
   const isScrubbingRef = useRef(false)
   const wasPlayingBeforeScrubRef = useRef(false)

@@ -171,10 +171,7 @@ export default function CommandLogo({
 
   return (
     <span
-      className={cn(
-        'inline-flex shrink-0 items-center justify-center overflow-hidden rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--background))] shadow-sm',
-        className
-      )}
+      className={cn('inline-flex shrink-0 items-center justify-center overflow-hidden', className)}
       style={{ width: size, height: size }}
       aria-hidden="true"
     >
