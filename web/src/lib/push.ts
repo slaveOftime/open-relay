@@ -3,6 +3,7 @@ import type { PushSubscriptionInput, SessionNotificationData } from '@/api/types
 
 import {
   notificationBody,
+  notificationLaunchUrl,
   notificationNavigationUrl,
   notificationTag,
   notificationTitle,
@@ -163,6 +164,7 @@ export async function showSessionNotification(payload: SessionNotificationData):
   const body = notificationBody(payload)
   const tag = notificationTag(payload)
   const navigationUrl = notificationNavigationUrl(payload, window.location.origin)
+  const launchUrl = notificationLaunchUrl(payload, window.location.origin)
   const registration = await navigator.serviceWorker.getRegistration(PUSH_SW_SCOPE)
   if (registration) {
     await registration.showNotification(title, {
@@ -170,6 +172,7 @@ export async function showSessionNotification(payload: SessionNotificationData):
       tag,
       data: {
         ...payload,
+        launch_url: launchUrl,
         navigation_url: navigationUrl,
       },
     })
@@ -179,6 +182,6 @@ export async function showSessionNotification(payload: SessionNotificationData):
   const notification = new Notification(title, { body, tag, data: payload })
   notification.onclick = () => {
     window.focus()
-    window.location.assign(navigationUrl)
+    window.location.assign(launchUrl)
   }
 }

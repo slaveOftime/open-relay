@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import {
   notificationBody,
+  notificationLaunchTargetFromUrl,
+  notificationLaunchUrl,
   notificationNavigationUrl,
   notificationTag,
   notificationTitle,
@@ -40,6 +42,32 @@ describe('notifications helpers', () => {
         'https://relay.test'
       )
     ).toBe('https://relay.test/session/session-123?mode=attach&node=worker%201')
+  })
+
+  it('wraps deep links in a stable root launch url for standalone notification opens', () => {
+    expect(
+      notificationLaunchUrl(
+        {
+          navigation_url: '/session/session-123?mode=attach',
+          node: 'worker 1',
+        },
+        'https://relay.test'
+      )
+    ).toBe(
+      'https://relay.test/?open-relay-target=%2Fsession%2Fsession-123%3Fmode%3Dattach%26node%3Dworker%25201'
+    )
+    expect(notificationLaunchUrl({ navigation_url: '' }, 'https://relay.test')).toBe(
+      'https://relay.test/'
+    )
+  })
+
+  it('extracts wrapped notification launch targets during app startup', () => {
+    expect(
+      notificationLaunchTargetFromUrl(
+        'https://relay.test/?open-relay-target=%2Fsession%2Fsession-123%3Fmode%3Dattach%26node%3Dworker%25201'
+      )
+    ).toBe('/session/session-123?mode=attach&node=worker%201')
+    expect(notificationLaunchTargetFromUrl('https://relay.test/')).toBeNull()
   })
 
   it('uses sensible title and tag fallbacks', () => {
