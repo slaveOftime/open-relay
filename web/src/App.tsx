@@ -1,7 +1,8 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import LoginDialog from './components/LoginDialog'
 import { getAuthStatus, getToken } from './api/client'
+import { notificationClickMessageTarget } from '@/lib/notifications'
 
 const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 const SessionDetailPage = lazy(() => import('./pages/SessionDetailPage'))
@@ -15,6 +16,26 @@ function LastRoutePersistence() {
     const current = `${location.pathname}${location.search}${location.hash}`
     localStorage.setItem(LAST_ROUTE_KEY, current)
   }, [location.pathname, location.search, location.hash])
+
+  return null
+}
+
+function NotificationClickRouting() {
+  const navigate = useNavigate()
+
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return
+
+    function onMessage(event: MessageEvent) {
+      const target = notificationClickMessageTarget(event.data, window.location.origin)
+      if (!target) return
+      navigate(target)
+      window.focus()
+    }
+
+    navigator.serviceWorker.addEventListener('message', onMessage)
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage)
+  }, [navigate])
 
   return null
 }
@@ -42,7 +63,7 @@ export default function App() {
       })
   }, [])
 
-  const handleLoginSuccess = useCallback((_token: string) => {
+  const handleLoginSuccess = useCallback(() => {
     setIsAuthed(true)
   }, [])
 
@@ -62,6 +83,7 @@ export default function App() {
   return (
     <BrowserRouter>
       <LastRoutePersistence />
+      <NotificationClickRouting />
       <LoginDialog open={showLogin} onSuccess={handleLoginSuccess} />
 
       {/* Render the app; when auth is required but not yet granted, the login

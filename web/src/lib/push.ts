@@ -182,6 +182,6 @@ export async function showSessionNotification(payload: SessionNotificationData):
   const notification = new Notification(title, { body, tag, data: payload })
   notification.onclick = () => {
     window.focus()
-    window.location.assign(launchUrl)
+    window.location.assign(navigationUrl)
   }
 }

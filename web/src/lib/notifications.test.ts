@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  NOTIFICATION_CLICK_MESSAGE,
   notificationBody,
+  notificationClickMessageTarget,
   notificationLaunchTargetFromUrl,
   notificationLaunchUrl,
+  normalizeNotificationTarget,
   notificationNavigationUrl,
   notificationTag,
   notificationTitle,
@@ -68,6 +71,48 @@ describe('notifications helpers', () => {
       )
     ).toBe('/session/session-123?mode=attach&node=worker%201')
     expect(notificationLaunchTargetFromUrl('https://relay.test/')).toBeNull()
+  })
+
+  it('normalizes notification targets and rejects cross-origin urls', () => {
+    expect(
+      normalizeNotificationTarget('/session/session-123?mode=attach', 'https://relay.test')
+    ).toBe('/session/session-123?mode=attach')
+    expect(
+      normalizeNotificationTarget(
+        'https://relay.test/session/session-123?mode=attach',
+        'https://relay.test'
+      )
+    ).toBe('/session/session-123?mode=attach')
+    expect(
+      normalizeNotificationTarget(
+        'https://evil.test/session/session-123?mode=attach',
+        'https://relay.test'
+      )
+    ).toBeNull()
+  })
+
+  it('extracts deep-link targets from service worker click messages', () => {
+    expect(
+      notificationClickMessageTarget(
+        {
+          type: NOTIFICATION_CLICK_MESSAGE,
+          target: 'https://relay.test/session/session-123?mode=attach&node=worker%201',
+        },
+        'https://relay.test'
+      )
+    ).toBe('/session/session-123?mode=attach&node=worker%201')
+    expect(
+      notificationClickMessageTarget({ type: NOTIFICATION_CLICK_MESSAGE }, 'https://relay.test')
+    ).toBeNull()
+    expect(
+      notificationClickMessageTarget(
+        {
+          type: NOTIFICATION_CLICK_MESSAGE,
+          target: 'https://evil.test/session/session-123?mode=attach',
+        },
+        'https://relay.test'
+      )
+    ).toBeNull()
   })
 
   it('uses sensible title and tag fallbacks', () => {
