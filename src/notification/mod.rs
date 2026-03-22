@@ -111,6 +111,8 @@ pub(super) async fn run_notification_monitor(
                         warn!(session_id, "notification delivery failed on all channels");
                     }
                 });
+            } else {
+                debug!(session_id, "notifications disabled for session, skipping delivery to channels");
             }
 
             // This is useful for supervisor agent to take over when to send notifications
