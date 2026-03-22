@@ -136,21 +136,21 @@ impl NotificationChannel for LocalOsNotificationChannel {
     }
 
     async fn send(&self, event: &NotificationEvent) -> Result<()> {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-        {
-            LocalOsNotificationChannel::play_beep();
-
-            notify_rust::Notification::new()
-                .summary(&format!("oly: {}", event.title))
-                .body(&event.rendered_body())
-                .show()
-                .map_err(|err| {
-                    AppError::Protocol(format!("OS notification delivery failed: {err}"))
-                })?;
-        }
-
         if let Some(hook) = &self.hook {
             LocalOsNotificationChannel::run_hook(hook, event);
+        } else {
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            {
+                LocalOsNotificationChannel::play_beep();
+
+                notify_rust::Notification::new()
+                    .summary(&format!("oly: {}", event.title))
+                    .body(&event.rendered_body())
+                    .show()
+                    .map_err(|err| {
+                        AppError::Protocol(format!("OS notification delivery failed: {err}"))
+                    })?;
+            }
         }
 
         Ok(())
