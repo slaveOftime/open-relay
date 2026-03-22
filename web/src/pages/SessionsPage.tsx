@@ -381,7 +381,7 @@ function SessionRow({
         <TableCell className="px-3 py-2.5">
           <SparklineSvg
             series={series}
-            enableAnimation={isRunning && (node == null || node === '__local__')}
+            enableAnimation={isRunning}
           />
         </TableCell>
 
@@ -559,7 +559,7 @@ function SessionCard({
           )}
 
           {/* Row 4: activity sparkline */}
-          {session.status === 'running' && (node == null || node === '__local__') && (
+          {session.status === 'running' && (
             <div className="pt-1 w-full opacity-90">
               <SparklineSvg
                 series={series}
