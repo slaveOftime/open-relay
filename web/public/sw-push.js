@@ -69,7 +69,7 @@ self.addEventListener('push', (event) => {
   const body = (payload.body || '').trim()
   const title = (payload.title || '').trim() || 'Open Relay notification'
   const options = {
-    body: description && body ? `${description}\n\n${body}` : description || body,
+    body: description && body ? `${description}\n${body}` : description || body,
     tag: payload.session_ids?.[0] || 'open-relay-session-notification',
     data: payload,
   }
