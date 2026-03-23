@@ -60,6 +60,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-
 
+      - name: Build web
+        run: |
+          cd web
+          npm install
+          npm run build
+
       - name: Test
         run: |
           cargo test
