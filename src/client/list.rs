@@ -144,6 +144,7 @@ fn session_json(session: &SessionSummary) -> Value {
         "created_at": format_created_at_local(session.created_at),
         "cwd": session.cwd,
         "input_needed": session.input_needed,
+        "total_bytes": session.total_bytes,
     })
 }
 
@@ -247,6 +248,7 @@ mod tests {
             cwd: Some("C:/work".to_string()),
             input_needed: true,
             node: None,
+            total_bytes: 4096,
         };
 
         let value = session_json(&session);
@@ -254,6 +256,7 @@ mod tests {
 
         assert_eq!(value["created_at"], serde_json::json!(expected_created_at));
         assert_eq!(value["input_needed"], serde_json::json!(true));
+        assert_eq!(value["total_bytes"], serde_json::json!(4096));
     }
 
     #[test]

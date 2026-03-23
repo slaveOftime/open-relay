@@ -8,12 +8,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    db::meta_to_summary,
     protocol::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
     session::{
         SessionStore, StartSpec,
         logs::{read_persisted_log_page, read_resize_events},
+        persist::current_output_offset_by_id,
     },
 };
 
@@ -386,8 +388,8 @@ pub async fn get_session(
 
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
-            use crate::db::meta_to_summary;
-            Json(meta_to_summary(&meta, false)).into_response()
+            let total_bytes = current_output_offset_by_id(&state.config.sessions_dir, &id);
+            Json(meta_to_summary(&meta, false, total_bytes)).into_response()
         }
         Ok(None) => {
             debug!(session_id = %id, "session not found");

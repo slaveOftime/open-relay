@@ -1,4 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+
+const SPARKLINE_NUM_BUCKETS = 40
+const SPARKLINE_BUCKET_MS = 2_000
+const SPARKLINE_BUCKET_SECONDS = SPARKLINE_BUCKET_MS / 1_000
+const RECENT_RATE_BUCKETS = 5
 
 interface Props {
   series: number[]
@@ -7,6 +14,35 @@ interface Props {
   fullWidth?: boolean
   className?: string
   enableAnimation: boolean
+}
+
+type SparklinePoint = {
+  x: number
+  y: number
+}
+
+type SparklinePalette = {
+  stroke: string
+  strokeSoft: string
+  fill: string
+  dot: string
+  baseline: string
+}
+
+const RUNNING_PALETTE: SparklinePalette = {
+  stroke: '#16A34A',
+  strokeSoft: '#22C55E55',
+  fill: '#22C55E14',
+  dot: '#4ADE80',
+  baseline: '#22C55E33',
+}
+
+const IDLE_PALETTE: SparklinePalette = {
+  stroke: '#94A3B8',
+  strokeSoft: '#CBD5E144',
+  fill: '#CBD5E112',
+  dot: '#CBD5E1',
+  baseline: '#CBD5E133',
 }
 
 export default function SparklineSvg({
@@ -36,11 +72,99 @@ export default function SparklineSvg({
   }, [fullWidth])
 
   const renderWidth = fullWidth ? measuredWidth : width
-  const svg = buildSparklineSvg(series, renderWidth, height, enableAnimation)
   const classes = fullWidth
     ? `block w-full align-middle ${className ?? ''}`.trim()
     : `inline-block align-middle ${className ?? ''}`.trim()
-  return <span ref={hostRef} className={classes} dangerouslySetInnerHTML={{ __html: svg }} />
+
+  const recentRate = useMemo(() => calculateRecentBytesPerSecond(series), [series])
+  const peakRate = useMemo(() => calculatePeakBytesPerSecond(series), [series])
+  const averageRate = useMemo(() => calculateAverageBytesPerSecond(series), [series])
+  const tooltipLabel = useMemo(
+    () =>
+      `${enableAnimation ? 'Running' : 'Stopped'} activity\nRecent: ${formatBytesPerSecond(recentRate)}\nPeak: ${formatBytesPerSecond(peakRate)}\nAverage: ${formatBytesPerSecond(averageRate)}`,
+    [averageRate, enableAnimation, peakRate, recentRate]
+  )
+  const model = useMemo(
+    () => buildSparklineModel(series, renderWidth, height, enableAnimation),
+    [enableAnimation, height, renderWidth, series]
+  )
+
+  return (
+    <Tooltip delayDuration={150}>
+      <TooltipTrigger asChild>
+        <span ref={hostRef} className={classes} aria-label={tooltipLabel}>
+          <svg
+            width={renderWidth}
+            height={height}
+            viewBox={`0 0 ${renderWidth} ${height}`}
+            xmlns="http://www.w3.org/2000/svg"
+            className="overflow-visible"
+            role="img"
+            aria-hidden="true"
+          >
+            <title>{tooltipLabel}</title>
+            <line
+              x1="0"
+              y1={model.baselineY}
+              x2={renderWidth}
+              y2={model.baselineY}
+              stroke={model.palette.baseline}
+              strokeWidth="1"
+            />
+            <polygon points={model.areaPoints} fill={model.palette.fill} />
+            <polyline
+              points={model.linePoints}
+              fill="none"
+              stroke={model.palette.strokeSoft}
+              strokeWidth="4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <polyline
+              points={model.linePoints}
+              fill="none"
+              stroke={model.palette.stroke}
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <circle cx={model.lastPoint.x} cy={model.lastPoint.y} r="1.7" fill={model.palette.dot}>
+              {enableAnimation ? (
+                <>
+                  <animate
+                    attributeName="r"
+                    values="1.4;2.1;1.4"
+                    dur="1.5s"
+                    repeatCount="indefinite"
+                  />
+                  <animate
+                    attributeName="opacity"
+                    values="0.7;1;0.7"
+                    dur="1.5s"
+                    repeatCount="indefinite"
+                  />
+                </>
+              ) : null}
+            </circle>
+          </svg>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="center">
+        <div className="text-xs leading-tight">
+          <div className="font-medium">{enableAnimation ? 'Running' : 'Stopped'} activity</div>
+          <div className="text-[hsl(var(--muted-foreground))]">
+            Recent {formatBytesPerSecond(recentRate)}
+          </div>
+          <div className="text-[hsl(var(--muted-foreground))]">
+            Peak {formatBytesPerSecond(peakRate)}
+          </div>
+          <div className="text-[hsl(var(--muted-foreground))]">
+            Average {formatBytesPerSecond(averageRate)}
+          </div>
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -49,10 +173,13 @@ export default function SparklineSvg({
 
 /** Rolling activity history using time-bucketed counts (bucketMs-wide slots). */
 export class SparklineStore {
-  private readonly numBuckets = 40
-  private readonly bucketMs = 2_000 // 2 s per bucket → 80 s window
+  private readonly numBuckets = SPARKLINE_NUM_BUCKETS
+  private readonly bucketMs = SPARKLINE_BUCKET_MS
 
-  private data = new Map<string, { counts: number[]; lastBucket: number }>()
+  private data = new Map<
+    string,
+    { counts: number[]; lastBucket: number; lastTotalBytes: number | null }
+  >()
 
   private nowBucket(): number {
     return Math.floor(Date.now() / this.bucketMs)
@@ -61,14 +188,18 @@ export class SparklineStore {
   private getOrCreate(id: string) {
     let entry = this.data.get(id)
     if (!entry) {
-      entry = { counts: new Array(this.numBuckets).fill(0), lastBucket: this.nowBucket() }
+      entry = {
+        counts: new Array(this.numBuckets).fill(0),
+        lastBucket: this.nowBucket(),
+        lastTotalBytes: null,
+      }
       this.data.set(id, entry)
     }
     return entry
   }
 
   /** Advance the ring buffer to the current bucket, zero-filling gaps. */
-  private advance(entry: { counts: number[]; lastBucket: number }) {
+  private advance(entry: { counts: number[]; lastBucket: number; lastTotalBytes: number | null }) {
     const now = this.nowBucket()
     const delta = now - entry.lastBucket
     if (delta <= 0) return
@@ -91,6 +222,16 @@ export class SparklineStore {
     entry.counts[entry.counts.length - 1] += value
   }
 
+  /** Record absolute byte totals and add the positive delta into the current bucket. */
+  recordTotal(id: string, totalBytes: number, previousTotalBytes?: number): void {
+    const entry = this.getOrCreate(id)
+    this.advance(entry)
+    const baseline = previousTotalBytes ?? entry.lastTotalBytes ?? totalBytes
+    const delta = Math.max(totalBytes - baseline, 0)
+    entry.lastTotalBytes = totalBytes
+    if (delta > 0) entry.counts[entry.counts.length - 1] += delta
+  }
+
   /** Returns the current bucket series (advances to now first). */
   getSeries(id: string): number[] {
     const entry = this.data.get(id)
@@ -104,61 +245,87 @@ export class SparklineStore {
   }
 }
 
-/** Build an SVG sparkline polyline string from a series of values. */
-function buildSparklineSvg(
+function buildSparklineModel(
   series: number[],
-  width = 80,
-  height = 22,
-  enableAnimation: boolean
-): string {
+  width: number,
+  height: number,
+  isRunning: boolean
+): {
+  areaPoints: string
+  linePoints: string
+  lastPoint: SparklinePoint
+  baselineY: number
+  palette: SparklinePalette
+} {
+  const baselineY = Math.max(2, height - 4)
+  const palette = isRunning ? RUNNING_PALETTE : IDLE_PALETTE
+  const points = buildSparklinePoints(series, width, height)
+  const linePoints = points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ')
+  const areaPoints = [
+    `0,${baselineY.toFixed(2)}`,
+    ...points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`),
+    `${width.toFixed(2)},${baselineY.toFixed(2)}`,
+  ].join(' ')
+
+  return {
+    areaPoints,
+    linePoints,
+    lastPoint: points[points.length - 1] ?? { x: width, y: baselineY },
+    baselineY,
+    palette,
+  }
+}
+
+function buildSparklinePoints(series: number[], width: number, height: number): SparklinePoint[] {
   if (series.length < 2) {
-    return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
-      <line x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}" stroke="#4ADE8066" stroke-width="1.25">
-        ${enableAnimation ? '<animate attributeName="opacity" values="0.35;0.7;0.35" dur="2.2s" repeatCount="indefinite" />' : ''}
-      </line>
-    </svg>`
+    const baselineY = Math.max(2, height - 4)
+    return [
+      { x: 0, y: baselineY },
+      { x: width, y: baselineY },
+    ]
   }
 
-  const max = Math.max(...series, 1)
+  const maxValue = Math.max(...series, 0)
+  const topPadding = 3
+  const bottomPadding = 4
+  const range = Math.max(height - topPadding - bottomPadding, 1)
   const step = width / (series.length - 1)
-  const points = series.map((v, i) => {
-    const x = i * step
-    const y = height - (v / max) * (height - 4) - 2
+
+  return series.map((value, index) => {
+    const x = index * step
+    const normalized = maxValue <= 0 ? 0 : Math.log10(value + 1) / Math.log10(maxValue + 1)
+    const emphasis = normalized <= 0 ? 0 : Math.pow(normalized, 0.85)
+    const y = height - bottomPadding - emphasis * range
     return { x, y }
   })
+}
 
-  const path = points.reduce((acc, p, i) => {
-    if (i === 0) return `M ${p.x.toFixed(1)} ${p.y.toFixed(1)}`
-    const p0 = points[i - 2] ?? points[i - 1]
-    const p1 = points[i - 1]
-    const p2 = p
-    const p3 = points[i + 1] ?? p2
-    const cp1x = p1.x + (p2.x - p0.x) / 6
-    const cp1y = p1.y + (p2.y - p0.y) / 6
-    const cp2x = p2.x - (p3.x - p1.x) / 6
-    const cp2y = p2.y - (p3.y - p1.y) / 6
-    return `${acc} C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)} ${cp2x.toFixed(1)} ${cp2y.toFixed(1)} ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`
-  }, '')
+function calculateRecentBytesPerSecond(series: number[]): number {
+  const recent = series.slice(-RECENT_RATE_BUCKETS)
+  if (recent.length === 0) return 0
+  const total = recent.reduce((sum, value) => sum + value, 0)
+  return total / (recent.length * SPARKLINE_BUCKET_SECONDS)
+}
 
-  const first = points[0]
-  const last = points[points.length - 1]
-  const areaPath = `${path} L ${last.x.toFixed(1)} ${height.toFixed(1)} L ${first.x.toFixed(1)} ${height.toFixed(1)} Z`
+function calculatePeakBytesPerSecond(series: number[]): number {
+  return Math.max(...series, 0) / SPARKLINE_BUCKET_SECONDS
+}
 
-  return `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"
-      xmlns="http://www.w3.org/2000/svg" style="overflow:visible">
-    <path d="${areaPath}" fill="#4ADE801A"/>
-    <path d="${path}" fill="none" stroke="#4ADE8055" stroke-width="3.2" stroke-linecap="round"
-      stroke-linejoin="round" style="filter:blur(1.2px)"/>
-    <path d="${path}" fill="none" stroke="#4ADE80" stroke-width="1.7" stroke-linecap="round"
-      stroke-linejoin="round" />
-    <path d="${path}" fill="none" stroke="#BBF7D0" stroke-width="1.1" stroke-linecap="round"
-      stroke-linejoin="round" pathLength="100" stroke-dasharray="16 120">
-      ${enableAnimation ? '<animate attributeName="stroke-dashoffset" values="116;0" dur="2.4s" repeatCount="indefinite" />' : ''}
-      ${enableAnimation ? '<animate attributeName="opacity" values="0.25;0.95;0.25" dur="2.4s" repeatCount="indefinite" />' : ''}
-    </path>
-    <circle cx="${last.x.toFixed(1)}" cy="${last.y.toFixed(1)}" r="1.8" fill="#86EFAC">
-      ${enableAnimation ? '<animate attributeName="r" values="1.6;2.5;1.6" dur="1.6s" repeatCount="indefinite" />' : ''}
-      ${enableAnimation ? '<animate attributeName="opacity" values="0.65;1;0.65" dur="1.6s" repeatCount="indefinite" />' : ''}
-    </circle>
-  </svg>`
+function calculateAverageBytesPerSecond(series: number[]): number {
+  if (series.length === 0) return 0
+  const total = series.reduce((sum, value) => sum + value, 0)
+  return total / (series.length * SPARKLINE_BUCKET_SECONDS)
+}
+
+function formatBytesPerSecond(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B/s'
+  const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s', 'TiB/s']
+  let scaled = value
+  let unitIndex = 0
+  while (scaled >= 1024 && unitIndex < units.length - 1) {
+    scaled /= 1024
+    unitIndex += 1
+  }
+  const digits = scaled >= 100 || unitIndex === 0 ? 0 : scaled >= 10 ? 1 : 2
+  return `${scaled.toFixed(digits)} ${units[unitIndex]}`
 }

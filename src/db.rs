@@ -6,7 +6,10 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use crate::{
     error::Result,
     protocol::{ListQuery, PushSubscriptionInput, PushSubscriptionRecord, SessionSummary},
-    session::{SessionMeta, SessionStatus, persist::format_age},
+    session::{
+        SessionMeta, SessionStatus,
+        persist::{current_output_offset_by_id, format_age},
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -217,7 +220,11 @@ impl Database {
 
         let summaries: Vec<SessionSummary> = rows
             .iter()
-            .map(|r| meta_to_summary(&row_to_meta(r), false))
+            .map(|r| {
+                let row = row_to_meta(r);
+                let total_bytes = current_output_offset_by_id(&self.sessions_dir, &row.id);
+                meta_to_summary(&row, false, total_bytes)
+            })
             .collect();
 
         Ok(summaries)
@@ -388,7 +395,7 @@ fn parse_dt(s: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool) -> SessionSummary {
+pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64) -> SessionSummary {
     SessionSummary {
         id: meta.id.clone(),
         title: meta.title.clone(),
@@ -401,6 +408,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool) -> SessionSummary
         cwd: meta.cwd.clone(),
         input_needed,
         node: None,
+        total_bytes,
     }
 }
 

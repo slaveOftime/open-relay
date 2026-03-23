@@ -7,6 +7,7 @@ import {
   isSessionStatusFilter,
   isSessionSortField,
   isSortOrder,
+  type SessionNotificationData,
   type SessionSummary,
   type SessionStatusFilter,
   type NodeSummary,
@@ -219,7 +220,7 @@ function fetchSessionsOnce(params: ListParams) {
 
 function buildSeriesMap(items: SessionSummary[]) {
   items.forEach((session) => {
-    sparklines.ensure(session.id)
+    sparklines.recordTotal(session.id, session.total_bytes)
   })
   return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
 }
@@ -229,7 +230,13 @@ function syncSeriesMap(items: SessionSummary[]) {
 }
 
 function updateSparklineForSession(session: SessionSummary) {
-  sparklines.touch(session.id)
+  sparklines.recordTotal(session.id, session.total_bytes)
+}
+
+function updateSparklineForNotification(notification: SessionNotificationData) {
+  notification.session_ids.forEach((sessionId) => {
+    sparklines.recordTotal(sessionId, notification.last_total_bytes)
+  })
 }
 
 // ── Skeleton loading ───────────────────────────────────────────────────────
@@ -951,6 +958,10 @@ export default function SessionsPage() {
     setSeriesMap(buildSeriesMap(items))
   }, [])
 
+  const refreshRenderedSparklines = useCallback(() => {
+    setSeriesMap((prev) => new Map(Array.from(prev.keys(), (id) => [id, sparklines.getSeries(id)])))
+  }, [])
+
   const applyLoadedSessionSnapshot = useCallback((items: SessionSummary[]) => {
     const itemsById = new Map(items.map((session) => [session.id, session]))
     setSessions((prev) => {
@@ -1179,6 +1190,7 @@ export default function SessionsPage() {
       if (ev.event === 'session_updated') {
         if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         updateSparklineForSession(ev.data)
+        refreshRenderedSparklines()
         replaceLoadedSession(ev.data)
         return
       }
@@ -1190,6 +1202,10 @@ export default function SessionsPage() {
         return
       }
       if (ev.event === 'session_notification') {
+        if (matchesSelectedNode(selectedNode, ev.data.node)) {
+          updateSparklineForNotification(ev.data)
+          refreshRenderedSparklines()
+        }
         if (pushStateRef.current === 'subscribed') return
         void showSessionNotification(ev.data)
         return
@@ -1204,6 +1220,7 @@ export default function SessionsPage() {
     removeLoadedSession,
     replaceLoadedSession,
     reloadSessions,
+    refreshRenderedSparklines,
     selectedNode,
   ])
 

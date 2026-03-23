@@ -28,6 +28,7 @@ struct SessionFingerprint {
     pid: Option<u32>,
     input_needed: bool,
     last_output_at: Option<Instant>,
+    last_total_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +44,7 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
             pid: value.summary.pid,
             input_needed: value.summary.input_needed,
             last_output_at: value.last_output_at,
+            last_total_bytes: value.summary.total_bytes,
         }
     }
 }
@@ -82,6 +84,7 @@ pub(crate) fn session_event_for_delivery(event: &SessionEvent, node: Option<&str
             trigger_rule,
             trigger_detail,
             node: existing,
+            last_total_bytes,
         } => SessionEvent::SessionNotification {
             kind: kind.clone(),
             title: title.clone(),
@@ -92,6 +95,7 @@ pub(crate) fn session_event_for_delivery(event: &SessionEvent, node: Option<&str
             trigger_rule: trigger_rule.clone(),
             trigger_detail: trigger_detail.clone(),
             node: merge_node(existing, node),
+            last_total_bytes: last_total_bytes.clone(),
         },
     }
 }
@@ -124,6 +128,7 @@ pub(crate) fn encode_session_event(event: &SessionEvent) -> EncodedSessionEvent 
             trigger_rule,
             trigger_detail,
             node,
+            last_total_bytes,
         } => EncodedSessionEvent {
             event_name: "session_notification",
             data: serde_json::to_string(&serde_json::json!({
@@ -136,6 +141,7 @@ pub(crate) fn encode_session_event(event: &SessionEvent) -> EncodedSessionEvent 
                 "trigger_rule": trigger_rule,
                 "trigger_detail": trigger_detail,
                 "node": node,
+                "last_total_bytes": last_total_bytes,
             }))
             .unwrap_or_default(),
         },
@@ -269,6 +275,7 @@ mod tests {
             cwd: Some("C:\\work".to_string()),
             input_needed: true,
             node: None,
+            total_bytes: 0,
         }
     }
 
@@ -295,6 +302,7 @@ mod tests {
             trigger_rule: Some("regex_pattern".to_string()),
             trigger_detail: None,
             node: None,
+            last_total_bytes: 0,
         };
 
         let delivered = session_event_for_delivery(&event, Some("worker-a"));
