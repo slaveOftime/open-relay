@@ -51,7 +51,7 @@ oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 Guidance:
 
 - `--wait-for-prompt` blocks until the session likely needs input or the timeout expires.
-- `--timeout` accepts plain milliseconds or units such as `250ms`, `10s`, `5m`, and `1h`. The default is `30s`.
+- `--timeout` accepts plain milliseconds or units such as `250ms`, `10s`, `5m`, and `1h`. The default is `5m`.
 - `oly logs` can omit the ID and target the most recently created session.
 - If the task should finish soon, reduce `--timeout` so you do not wait longer than necessary.
 - If the task is expected to run for a while, increase `--timeout` to avoid unnecessary polling.

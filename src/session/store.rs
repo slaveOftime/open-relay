@@ -401,9 +401,9 @@ impl SessionStore {
                     .map(|last_output| {
                         std::time::Instant::now().duration_since(last_output) >= duration
                     })
-                    .unwrap_or(false)
+                    .unwrap_or(true)
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Returns the current terminal mode snapshot for the session, if available.

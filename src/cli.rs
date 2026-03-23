@@ -276,7 +276,7 @@ pub struct LogsArgs {
     /// Timeout for --wait-for-prompt. Accepts plain milliseconds or units like 10s, 5m, or 1h.
     #[arg(
         long,
-        default_value = "30s",
+        default_value = "5m",
         value_name = "DURATION",
         value_parser = parse_timeout_ms
     )]
