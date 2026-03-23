@@ -177,6 +177,12 @@ function matchesSelectedNode(
   return (selectedNode ?? null) === normalizeStoredNode(eventNode)
 }
 
+function sessionPageTitle(selectedNode: string | null): string {
+  const normalized = normalizeStoredNode(selectedNode)
+  if (!normalized || normalized.toLowerCase() === 'local') return 'Open Relay'
+  return normalized
+}
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
     const message = error.message.trim()
@@ -1259,6 +1265,7 @@ export default function SessionsPage() {
   }
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
+  const pageTitle = sessionPageTitle(selectedNode)
 
   function handleSort(field: SessionSortField) {
     let nextSortField = sortField
@@ -1382,7 +1389,7 @@ export default function SessionsPage() {
               onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
-              <span className="truncate">Open Relay</span>
+              <span className="truncate">{pageTitle}</span>
             </div>
             <div className="flex-1 min-w-0" />
             <Button
@@ -1410,6 +1417,11 @@ export default function SessionsPage() {
                 <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-[hsl(var(--primary))]" />
               )}
             </Button>
+            <Button asChild variant="ghost" size="icon">
+              <a href="/apps" aria-label="Apps">
+                <GridIcon className="h-4 w-4" />
+              </a>
+            </Button>
             <Button
               variant={pushEnabled ? 'link' : 'ghost'}
               size="icon"
@@ -1417,11 +1429,6 @@ export default function SessionsPage() {
               disabled={pushState === 'unsupported' || pushState === 'unconfigured'}
             >
               <BellIcon className="h-4 w-4" />
-            </Button>
-            <Button asChild variant="ghost" size="icon">
-              <a href="/apps" aria-label="Apps">
-                <GridIcon className="h-4 w-4" />
-              </a>
             </Button>
             <Button size="icon" onClick={() => setShowNewSession(true)} aria-label="New session">
               <PlusIcon className="h-4 w-4" />
