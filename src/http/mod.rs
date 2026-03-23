@@ -5,7 +5,6 @@ pub mod sessions;
 pub mod sse;
 pub mod ws;
 
-#[allow(unused_imports)]
 use axum::{
     Router,
     extract::{ConnectInfo, State},
@@ -13,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-#[cfg(not(debug_assertions))]
 use rust_embed::RustEmbed;
 use std::{
     io,
@@ -50,7 +48,6 @@ pub struct AppState {
 // ── Release-only: embed the contents of web/dist into the binary ─────────────
 // `build.rs` guarantees that `npm run build` has already run in release mode,
 // so the folder is always present when this crate is compiled with --release.
-#[cfg(not(debug_assertions))]
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
 struct WebAssets;
@@ -210,11 +207,15 @@ async fn serve_static(
         }
     }
 
-    #[cfg(not(debug_assertions))]
     for candidate in &candidates {
         if let Some(asset) = WebAssets::get(candidate) {
             return build_bytes_response(candidate, asset.data.into_owned());
         }
+    }
+
+    let default_asset_name = "index.html";
+    if let Some(asset) = WebAssets::get(default_asset_name) {
+        return build_bytes_response(default_asset_name, asset.data.into_owned());
     }
 
     StatusCode::NOT_FOUND.into_response()
