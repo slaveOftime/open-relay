@@ -429,7 +429,7 @@ mod tests {
         let Commands::Logs(args) = cli.command else {
             panic!("expected logs command");
         };
-        assert_eq!(args.timeout, 30_000);
+        assert_eq!(args.timeout, 300_000);
     }
 
     #[test]
