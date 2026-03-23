@@ -30,8 +30,7 @@ oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 ```
 
 - `--wait-for-prompt` blocks until the session likely needs input or the timeout expires.
-- `--timeout` accepts plain milliseconds or units like `250ms`, `10s`, `5m`, and `1h`.
-- `0` waits forever. Default value is `30s`.
+- `--timeout` accepts plain milliseconds or units like `250ms`, `10s`, `5m`, and `1h`. Default value is `30s`.
 - `oly logs` can omit the ID and will target the most recently created session.
 
 Send input without attaching:

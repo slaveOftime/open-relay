@@ -378,6 +378,30 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    pub fn is_input_needed(&self, id: &str) -> bool {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| handle.snapshot().summary.input_needed)
+            .unwrap_or(false)
+    }
+
+    pub fn is_silent_for(&self, id: &str, duration: std::time::Duration) -> bool {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| {
+                handle
+                    .snapshot()
+                    .last_output_at
+                    .map(|last_output| {
+                        std::time::Instant::now().duration_since(last_output) >= duration
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
+
     /// Returns the current terminal mode snapshot for the session, if available.
     pub fn get_mode_snapshot(
         &self,

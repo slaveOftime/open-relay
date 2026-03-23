@@ -273,7 +273,7 @@ pub struct LogsArgs {
     /// Block until the session needs input (or exits), then print logs.
     #[arg(long = "wait-for-prompt", short = 'w')]
     pub wait_for_prompt: bool,
-    /// Timeout for --wait-for-prompt. Accepts plain milliseconds or units like 10s, 5m, or 1h. Use 0 to wait forever.
+    /// Timeout for --wait-for-prompt. Accepts plain milliseconds or units like 10s, 5m, or 1h.
     #[arg(
         long,
         default_value = "30s",

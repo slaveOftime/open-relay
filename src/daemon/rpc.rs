@@ -370,7 +370,11 @@ async fn handle_logs_wait(
         };
     }
 
-    if !session_store.is_running(&id) || timeout_ms == 0 {
+    if timeout_ms == 0
+        || !session_store.is_running(&id)
+        || session_store.is_input_needed(&id)
+        || session_store.is_silent_for(&id, std::time::Duration::from_secs(10))
+    {
         return RpcResponse::Empty;
     }
 
