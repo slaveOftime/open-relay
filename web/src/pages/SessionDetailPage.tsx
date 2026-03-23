@@ -1184,6 +1184,7 @@ export default function SessionDetailPage() {
             >
               <div className="h-full w-full overflow-x-auto">
                 <XTerm
+                  key={mode}
                   ref={termRef}
                   autoFit={mode === 'attach'}
                   onData={mode === 'attach' ? sendInput : undefined}
