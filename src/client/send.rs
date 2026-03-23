@@ -27,10 +27,14 @@ pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<Stri
     let mut sent_any = false;
 
     // Process ordered chunks left to right
-    for chunk in &send_args.chunks {
+    for (index, chunk) in send_args.chunks.iter().enumerate() {
         let data = resolve_chunk(chunk)?;
         send_data(config, &id, data, node.as_deref()).await?;
         sent_any = true;
+        // Small delay between chunks to let PTY respond and avoid overwhelming it
+        if index + 1 < send_args.chunks.len() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 
     // Piped stdin (only when no explicit chunks were given)

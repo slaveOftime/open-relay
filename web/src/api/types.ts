@@ -69,6 +69,7 @@ export interface SessionSummary {
   cwd: string | null
   input_needed: boolean
   node?: string | null
+  total_bytes: number
 }
 
 export interface CreateSessionSpec {
@@ -144,6 +145,7 @@ export type SessionNotificationData = {
   trigger_rule?: string
   trigger_detail?: string
   node?: string | null
+  last_total_bytes: number
 }
 
 // ---------------------------------------------------------------------------

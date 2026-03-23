@@ -131,6 +131,7 @@ pub(super) async fn run_notification_monitor(
                 trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
                 trigger_detail: event.trigger_detail,
                 node: event.node,
+                last_total_bytes: candidate.last_total_bytes,
             });
 
             session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());

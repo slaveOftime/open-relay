@@ -62,6 +62,10 @@ pub fn current_output_offset(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+pub fn current_output_offset_by_id(dir: &Path, session_id: &str) -> u64 {
+    current_output_offset(&dir.join(session_id))
+}
+
 pub fn format_age(
     created_at: DateTime<Utc>,
     started_at: Option<DateTime<Utc>>,

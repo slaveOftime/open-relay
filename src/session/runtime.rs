@@ -40,6 +40,8 @@ pub struct SessionRuntime {
     pub dir: PathBuf,
     /// Byte-limited ring buffer of canonical filtered PTY output.
     pub ring: RingBuffer,
+    /// Total length of canonical filtered PTY output bytes.
+    pub total_bytes: u64,
     /// Sends canonical filtered PTY output chunks to all live attach subscribers.
     pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
     /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
@@ -113,6 +115,7 @@ impl SessionRuntime {
         // Add the canonical filtered bytes to the in-memory ring. Fully stripped
         // chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
+            self.total_bytes = self.total_bytes.saturating_add(filtered_data.len() as u64);
             self.ring.push(filtered_data);
         }
 
@@ -436,6 +439,7 @@ pub fn spawn_session(
         meta: meta.clone(),
         dir: full_dir,
         ring: RingBuffer::new(config.ring_buffer_bytes),
+        total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
         pty: pty_handle,
@@ -674,6 +678,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             ring: RingBuffer::new(4096), // small capacity for tests
+            total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -851,6 +856,17 @@ mod tests {
     }
 
     #[test]
+    fn test_push_output_tracks_total_bytes_from_filtered_stream() {
+        let mut rt = new_runtime();
+        let raw = bytes::Bytes::from_static(b"before\x1b[6nafter");
+        let filtered = bytes::Bytes::from_static(b"beforeafter");
+
+        rt.push_output(&raw, filtered, true);
+
+        assert_eq!(rt.total_bytes, 11);
+    }
+
+    #[test]
     fn test_push_output_drops_fully_stripped_chunks_from_ring() {
         let mut rt = new_runtime();
         let raw = bytes::Bytes::from_static(b"\x1b[6n");
@@ -860,6 +876,7 @@ mod tests {
         let (chunks, end_offset) = rt.ring.read_from(0);
         assert!(chunks.is_empty());
         assert_eq!(end_offset, 0);
+        assert_eq!(rt.total_bytes, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -943,6 +960,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
             ring: RingBuffer::new(4096),
+            total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {

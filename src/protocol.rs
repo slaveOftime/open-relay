@@ -432,6 +432,7 @@ pub enum NodeWsMessage {
         trigger_rule: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger_detail: Option<String>,
+        last_total_bytes: u64,
     },
     /// Secondary -> Primary: node-aware session event produced for SSE delivery.
     SessionEvent {
@@ -475,6 +476,7 @@ mod tests {
             session_ids: vec!["abc".into(), "def".into()],
             trigger_rule: Some("always".into()),
             trigger_detail: Some("detail".into()),
+            last_total_bytes: 0,
         };
 
         let payload = encode_node_ws_payload(&message).expect("encode payload");
@@ -505,6 +507,7 @@ pub struct SessionSummary {
     #[serde(default)]
     pub input_needed: bool,
     pub node: Option<String>,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

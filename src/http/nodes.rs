@@ -210,6 +210,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                     session_ids,
                                     trigger_rule,
                                     trigger_detail,
+                                    last_total_bytes,
                                 } => {
                                     let payload = SessionEvent::SessionNotification {
                                         kind,
@@ -221,6 +222,7 @@ async fn handle_join(socket: WebSocket, state: AppState) {
                                         trigger_rule,
                                         trigger_detail,
                                         node: Some(name.clone()),
+                                        last_total_bytes,
                                     };
                                     handle_forwarded_session_event(&state, &name, payload, true)
                                         .await;

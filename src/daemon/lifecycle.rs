@@ -457,6 +457,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
             trigger_detail: event.trigger_detail,
             node: event.node,
+            last_total_bytes: 0,
         });
     }
 

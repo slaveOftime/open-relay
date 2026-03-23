@@ -44,6 +44,7 @@ struct StoreMutableState {
 
 #[derive(Debug, Clone)]
 struct SessionRuntimeSnapshot {
+    total_bytes: u64,
     summary: SessionSummary,
     last_output_at: Option<Instant>,
     mode_snapshot: ModeSnapshot,
@@ -60,6 +61,7 @@ impl SessionRuntimeSnapshot {
     fn from_runtime(rt: &SessionRuntime) -> Self {
         let input_needed = rt.input_needed();
         Self {
+            total_bytes: rt.total_bytes,
             summary: SessionSummary {
                 id: rt.meta.id.clone(),
                 title: rt.meta.title.clone(),
@@ -72,6 +74,7 @@ impl SessionRuntimeSnapshot {
                 cwd: rt.meta.cwd.clone(),
                 input_needed,
                 node: None,
+                total_bytes: rt.total_bytes,
             },
             last_output_at: rt.last_output_at,
             mode_snapshot: rt.mode_snapshot(),
@@ -128,6 +131,7 @@ pub struct SilentCandidate {
     pub raw_excerpt: String,
     pub output_epoch: Instant,
     pub notifications_enabled: bool,
+    pub last_total_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -376,6 +380,30 @@ impl SessionStore {
             .get(id)
             .map(|handle| handle.snapshot().running)
             .unwrap_or(false)
+    }
+
+    pub fn is_input_needed(&self, id: &str) -> bool {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| handle.snapshot().summary.input_needed)
+            .unwrap_or(false)
+    }
+
+    pub fn is_silent_for(&self, id: &str, duration: std::time::Duration) -> bool {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| {
+                handle
+                    .snapshot()
+                    .last_output_at
+                    .map(|last_output| {
+                        std::time::Instant::now().duration_since(last_output) >= duration
+                    })
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true)
     }
 
     /// Returns the current terminal mode snapshot for the session, if available.
@@ -1003,6 +1031,7 @@ impl SessionStore {
                     raw_excerpt: excerpt,
                     output_epoch: last_output,
                     notifications_enabled: snapshot.notifications_enabled,
+                    last_total_bytes: snapshot.total_bytes,
                 })
             })
             .collect()
@@ -1094,6 +1123,7 @@ mod tests {
             meta,
             dir,
             ring,
+            total_bytes: excerpt.as_bytes().len() as u64,
             broadcast_tx,
             resize_tx,
             pty: super::super::pty::PtyHandle {
@@ -1534,6 +1564,7 @@ mod tests {
             meta,
             dir,
             ring: RingBuffer::new(4096),
+            total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: super::super::pty::PtyHandle {
