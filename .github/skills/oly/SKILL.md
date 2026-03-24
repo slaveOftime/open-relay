@@ -95,6 +95,23 @@ Notes:
 - Detach from an attached session with `Ctrl-]`, then `d`.
 - `oly ls --json` is preferred for scripts and agents.
 
+### 5) Notification
+
+Use `oly notify` to send a notification that may be delivered through any configured channel:
+
+```bash
+oly notify <ID> --title "Job complete" --description "The data processing task has finished." --body "Check the results at /path/to/results."
+```
+
+- `<ID>` is optional, use it when you want to mark this notifcation as the source of the specific session.
+
+You can also toggle a session's notifications on or off, this is useful when you want to supervise the session yourself and avoid redundant or distracting notifications:
+
+```bash
+oly notify enable <ID>
+oly notify disable <ID>
+```
+
 ## Help
 
 Use the built-in help when you need command details:
