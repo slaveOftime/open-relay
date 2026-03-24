@@ -169,7 +169,8 @@ pub struct PtyHandle {
 PTY master fds on Linux are pollable with `epoll`, but:
 1. ConPTY on Windows is **not** pollable — it requires blocking `ReadFile`.
 2. `portable_pty` provides blocking `Read`/`Write` traits, not async.
-3. Spawning 2 OS threads per session is acceptable for our scale (dozens, not thousands).
+3. Spawning a small handful of OS threads per session is acceptable for our scale
+   (dozens, not thousands).
 
 ---
 
@@ -188,10 +189,11 @@ std::thread::spawn("pty-reader-{id}") {
             writer_tx.send(resp);  // Write response back to PTY stdin
         }
 
-        // 2. Derive canonical filtered output, then retain/broadcast it
+        // 2. Derive canonical filtered output, then queue it for coalesced
+        //    retain/broadcast
         let bytes = Bytes::copy_from_slice(&buf[..n]);
         let filtered = EscapeFilter::filter(bytes);
-        push_output(bytes, filtered);  // → mode_tracker.process(raw) + ring.push(filtered) + broadcast_tx.send(filtered)
+        output_tx.send(filtered);
     }
 }
 ```
@@ -199,6 +201,33 @@ std::thread::spawn("pty-reader-{id}") {
 **Why a blocking thread?**  High-bandwidth PTY output (e.g., `cat /dev/urandom`)
 would starve the Tokio executor if run as an async task.  A dedicated thread
 ensures PTY reads never block other tasks.
+
+### Output Processor Thread
+
+Open Relay also runs a lightweight PTY output processor thread that sits between
+the reader and live subscribers/persistence:
+
+```text
+std::thread::spawn("pty-output-{id}") {
+    let pending = vec![];
+    loop {
+        let event = if pending.is_empty() { recv() } else { recv_timeout(window) };
+        if pending.len() + next_filtered.len() <= max_bytes {
+            pending.extend(next_filtered);
+            continue;
+        }
+        flush(pending);  // ring.push + output.log append + broadcast
+        pending = next_filtered;
+    }
+}
+```
+
+The processor batches adjacent filtered PTY chunks for a short window before
+persisting/broadcasting them.  That reduces log fragmentation and live fan-out
+chatter during brief redraw bursts without needing a full terminal-screen
+model.  By default the batch window is `15ms` and the pending buffer is capped
+at `20 KiB`; whichever limit is hit first triggers a flush.
+
 
 ### Writer Thread
 
@@ -543,8 +572,8 @@ clients are notified.
 ### CursorTracker Synchronization
 
 The PTY reader thread maintains a `CursorTracker` for generating CPR responses.
-After each read is pushed into the runtime, the reader briefly locks
-`SessionRuntime` and syncs the tracker's dimensions from
+After each read updates runtime mode/output bookkeeping, the reader briefly
+locks `SessionRuntime` and syncs the tracker's dimensions from
 `SessionRuntime::pty_size` via `set_size()`.  That keeps subsequent CPR
 responses aligned with the latest successful PTY resize, including resizes that
 originated from another attached client.
@@ -556,6 +585,9 @@ window drag), each triggers a `SIGWINCH`.  The child may emit partial redraws
 for intermediate sizes.  Mitigation: the web UI debounces resize sends by
 120ms, and the CLI attach path ignores stale resize events for the first 500ms
 after entering the alternate screen before re-reading the actual terminal size.
+The PTY output processor also batches adjacent filtered output for a short
+configurable window (20ms by default, repo-overridable in `.git\config`) before
+persisting/broadcasting it.
 
 ---
 
@@ -636,7 +668,7 @@ while idle. This is necessary because:
 ### Invariants
 
 1. **Ring buffer is always consistent**: Push is atomic (single writer thread)
-2. **Mode state is always consistent**: ModeTracker is only called from the PTY reader's `push_output` path
+2. **Mode state is always consistent**: ModeTracker is only called from the PTY reader's raw-output tracking path
 3. **Exit code is captured at most once**: `try_wait` → store → done
 4. **Cleanup always runs**: IPC handler has `attach_detach()` in all exit paths
 
