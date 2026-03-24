@@ -154,11 +154,11 @@ async fn serve_static(
             {
                 return response;
             }
-            match try_read_local_asset(&wwwroot_dir, &candidate).await {
+            match try_read_static_file(&candidate).await {
                 Ok(Some(bytes)) => return build_bytes_response(&candidate, bytes),
                 Ok(None) => return StatusCode::NOT_FOUND.into_response(),
                 Err(err) => {
-                    error!(%err, path = %candidate, "failed to read static file from wwwroot");
+                    error!(%err, path = %candidate.display(), "failed to read app static file");
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             }
@@ -259,6 +259,11 @@ fn normalize_static_path(path: &str) -> Option<String> {
 
 async fn try_read_local_asset(wwwroot: &Path, relative_path: &str) -> io::Result<Option<Vec<u8>>> {
     let full_path = wwwroot.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    try_read_static_file(&full_path).await
+}
+
+async fn try_read_static_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let full_path = path;
     match tokio::fs::metadata(&full_path).await {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => return Ok(None),
@@ -269,7 +274,8 @@ async fn try_read_local_asset(wwwroot: &Path, relative_path: &str) -> io::Result
     Ok(Some(tokio::fs::read(full_path).await?))
 }
 
-fn build_bytes_response(path: &str, bytes: Vec<u8>) -> axum::response::Response {
+fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::response::Response {
+    let path = path.as_ref();
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     (
         [(

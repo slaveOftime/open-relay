@@ -60,8 +60,14 @@ pub(super) struct StaticApp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppEntry {
-    Local { entry_path: String },
-    Proxy { entry_url: Url },
+    Local {
+        entry_path: String,
+        entry_source_path: PathBuf,
+        redirect_files: Vec<PathBuf>,
+    },
+    Proxy {
+        entry_url: Url,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +78,7 @@ struct AppDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AppRequestTarget {
-    LocalFile(String),
+    LocalFile(PathBuf),
     Proxy(Vec<Url>),
 }
 
@@ -82,10 +88,12 @@ struct AppManifest {
     title: Option<String>,
     #[serde(default)]
     description: Option<String>,
-    #[serde(default, alias = "icon", alias = "iconHref")]
+    #[serde(default)]
     icon_href: Option<String>,
-    #[serde(default, rename = "type", alias = "appType")]
+    #[serde(default)]
     app_type: Option<String>,
+    #[serde(default)]
+    redirect_files: Vec<String>,
     entry: String,
 }
 
@@ -128,13 +136,21 @@ pub(super) fn resolve_app_request(
     };
 
     match definition.entry {
-        AppEntry::Local { entry_path } => {
-            for candidate in
-                app_local_request_candidates(&entry_path, &request_tail, trailing_slash)
-            {
-                let relative_path = format!("apps/{slug}/{candidate}");
-                if local_asset_exists(wwwroot, &relative_path)? {
-                    return Ok(Some(AppRequestTarget::LocalFile(relative_path)));
+        AppEntry::Local {
+            entry_path,
+            redirect_files,
+            ..
+        } => {
+            let request_candidates =
+                app_local_request_candidates(&entry_path, &request_tail, trailing_slash);
+            if let Some(path) = find_existing_app_local_asset(&app_dir, &request_candidates)? {
+                return Ok(Some(AppRequestTarget::LocalFile(path)));
+            }
+            for redirect_path in &redirect_files {
+                if let Some(path) =
+                    find_existing_redirect_asset(redirect_path, &request_candidates)?
+                {
+                    return Ok(Some(AppRequestTarget::LocalFile(path)));
                 }
             }
             Ok(None)
@@ -274,6 +290,8 @@ fn load_app_definition(app_dir: &Path, slug: &str) -> io::Result<Option<AppDefin
         static_app: build_static_app(&index_path, &app_href, slug)?,
         entry: AppEntry::Local {
             entry_path: "index.html".into(),
+            entry_source_path: index_path,
+            redirect_files: Vec::new(),
         },
     }))
 }
@@ -284,9 +302,17 @@ fn build_manifest_app_definition(
     fallback_title: &str,
     manifest: AppManifest,
 ) -> io::Result<AppDefinition> {
-    let entry = resolve_manifest_entry(app_dir, &manifest.entry)?;
+    let entry = resolve_manifest_entry(app_dir, &manifest.entry, &manifest.redirect_files)?;
     let entry_html = match &entry {
-        AppEntry::Local { entry_path } => maybe_read_entry_html(app_dir, entry_path)?,
+        AppEntry::Local {
+            entry_source_path, ..
+        } => maybe_read_entry_html(entry_source_path)?,
+        AppEntry::Proxy { .. } => None,
+    };
+    let entry_source_dir = match &entry {
+        AppEntry::Local {
+            entry_source_path, ..
+        } => entry_source_path.parent(),
         AppEntry::Proxy { .. } => None,
     };
 
@@ -302,6 +328,7 @@ fn build_manifest_app_definition(
                 .as_deref()
                 .and_then(|html| extract_app_icon_href(html, app_href))
         })
+        .or_else(|| detect_app_icon_href(entry_source_dir, app_href))
         .or_else(|| detect_app_icon_href(Some(app_dir), app_href));
     let app_type = cleaned_field(manifest.app_type)
         .as_deref()
@@ -340,7 +367,11 @@ fn parse_manifest(raw: &str, source_path: &Path) -> io::Result<AppManifest> {
         .map_err(|err| invalid_data(format!("failed to parse {}: {err}", source_path.display())))
 }
 
-fn resolve_manifest_entry(app_dir: &Path, entry: &str) -> io::Result<AppEntry> {
+fn resolve_manifest_entry(
+    app_dir: &Path,
+    entry: &str,
+    redirect_files: &[String],
+) -> io::Result<AppEntry> {
     let entry = entry.trim();
     if entry.is_empty() {
         return Err(invalid_data("app manifest entry cannot be empty"));
@@ -348,25 +379,38 @@ fn resolve_manifest_entry(app_dir: &Path, entry: &str) -> io::Result<AppEntry> {
 
     if let Ok(url) = Url::parse(entry) {
         if matches!(url.scheme(), "http" | "https") {
+            if !redirect_files.is_empty() {
+                return Err(invalid_data(
+                    "app manifest redirect files require a local entry",
+                ));
+            }
             return Ok(AppEntry::Proxy { entry_url: url });
         }
     }
 
     let entry_path = normalize_relative_asset_path(entry)
         .ok_or_else(|| invalid_data("app manifest entry must stay inside the app directory"))?;
-    let full_path = app_dir.join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if !full_path.is_file() {
+    let redirect_files = resolve_manifest_redirect_files(app_dir, redirect_files)?;
+    let Some(entry_source_path) =
+        resolve_manifest_entry_source(app_dir, &entry_path, &redirect_files)?
+    else {
         return Err(invalid_data(format!(
-            "app manifest entry {} does not exist",
-            full_path.display()
+            "app manifest entry {} does not exist in the app directory or redirect files",
+            app_dir
+                .join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR))
+                .display()
         )));
-    }
+    };
 
-    Ok(AppEntry::Local { entry_path })
+    Ok(AppEntry::Local {
+        entry_path,
+        entry_source_path,
+        redirect_files,
+    })
 }
 
-fn maybe_read_entry_html(app_dir: &Path, entry_path: &str) -> io::Result<Option<String>> {
-    let extension = Path::new(entry_path)
+fn maybe_read_entry_html(entry_source_path: &Path) -> io::Result<Option<String>> {
+    let extension = entry_source_path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase());
@@ -374,8 +418,73 @@ fn maybe_read_entry_html(app_dir: &Path, entry_path: &str) -> io::Result<Option<
         return Ok(None);
     }
 
-    let full_path = app_dir.join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    Ok(Some(std::fs::read_to_string(full_path)?))
+    Ok(Some(std::fs::read_to_string(entry_source_path)?))
+}
+
+fn resolve_manifest_entry_source(
+    app_dir: &Path,
+    entry_path: &str,
+    redirect_files: &[PathBuf],
+) -> io::Result<Option<PathBuf>> {
+    let local_path = app_dir.join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if file_exists(&local_path)? {
+        return Ok(Some(local_path));
+    }
+
+    let candidates = [entry_path.to_string()];
+    for redirect_path in redirect_files {
+        if let Some(path) = find_existing_redirect_asset(redirect_path, &candidates)? {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_manifest_redirect_files(
+    app_dir: &Path,
+    redirect_files: &[String],
+) -> io::Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    for redirect_file in redirect_files {
+        let redirect_file = redirect_file.trim();
+        if redirect_file.is_empty() {
+            continue;
+        }
+
+        let resolved_path = canonicalize_redirect_path(app_dir, redirect_file)?;
+        let metadata = std::fs::metadata(&resolved_path)?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(invalid_data(format!(
+                "app manifest redirect path {} must be a file or directory",
+                resolved_path.display()
+            )));
+        }
+        if !resolved.contains(&resolved_path) {
+            resolved.push(resolved_path);
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn canonicalize_redirect_path(app_dir: &Path, redirect_file: &str) -> io::Result<PathBuf> {
+    let candidate = Path::new(redirect_file);
+    let resolved_path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        app_dir.join(candidate)
+    };
+    std::fs::canonicalize(&resolved_path).map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            invalid_data(format!(
+                "app manifest redirect path {} does not exist",
+                resolved_path.display()
+            ))
+        } else {
+            err
+        }
+    })
 }
 
 fn cleaned_field(value: Option<String>) -> Option<String> {
@@ -435,15 +544,63 @@ fn app_local_request_candidates(
 
     let mut candidates = local_request_candidates(request_tail, trailing_slash);
     if let Some(entry_dir) = entry_parent_dir(entry_path) {
-        for candidate in local_request_candidates(request_tail, trailing_slash) {
-            let prefixed = format!("{entry_dir}/{candidate}");
-            if !candidates.contains(&prefixed) {
-                candidates.push(prefixed);
-            }
-        }
+        append_local_request_candidates_with_prefix(
+            &mut candidates,
+            &entry_dir,
+            request_tail,
+            trailing_slash,
+        );
     }
 
     candidates
+}
+
+fn append_local_request_candidates_with_prefix(
+    candidates: &mut Vec<String>,
+    prefix: &str,
+    request_tail: &str,
+    trailing_slash: bool,
+) {
+    for candidate in local_request_candidates(request_tail, trailing_slash) {
+        let prefixed = format!("{prefix}/{candidate}");
+        if !candidates.contains(&prefixed) {
+            candidates.push(prefixed);
+        }
+    }
+}
+
+fn find_existing_app_local_asset(
+    app_dir: &Path,
+    candidates: &[String],
+) -> io::Result<Option<PathBuf>> {
+    for candidate in candidates {
+        let full_path = app_dir.join(candidate.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if file_exists(&full_path)? {
+            return Ok(Some(full_path));
+        }
+    }
+    Ok(None)
+}
+
+fn find_existing_redirect_asset(
+    redirect_path: &Path,
+    candidates: &[String],
+) -> io::Result<Option<PathBuf>> {
+    if file_exists(redirect_path)? {
+        return Ok(Some(redirect_path.to_path_buf()));
+    }
+    if !directory_exists(redirect_path)? {
+        return Ok(None);
+    }
+
+    for candidate in candidates {
+        let full_path = redirect_path.join(candidate.replace('/', std::path::MAIN_SEPARATOR_STR));
+        if file_exists(&full_path)? {
+            return Ok(Some(full_path));
+        }
+    }
+
+    Ok(None)
 }
 
 fn local_request_candidates(path: &str, trailing_slash: bool) -> Vec<String> {
@@ -490,8 +647,20 @@ fn normalize_relative_asset_path(path: &str) -> Option<String> {
 
 fn local_asset_exists(wwwroot: &Path, relative_path: &str) -> io::Result<bool> {
     let full_path = wwwroot.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    match std::fs::metadata(full_path) {
+    file_exists(&full_path)
+}
+
+fn file_exists(path: &Path) -> io::Result<bool> {
+    match std::fs::metadata(path) {
         Ok(metadata) => Ok(metadata.is_file()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
+fn directory_exists(path: &Path) -> io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
@@ -1076,14 +1245,75 @@ mod tests {
         assert_eq!(
             root,
             Some(AppRequestTarget::LocalFile(
-                "apps/nested/dist/index.html".into()
+                app_dir.join("dist").join("index.html")
             ))
         );
         assert_eq!(
             asset,
             Some(AppRequestTarget::LocalFile(
-                "apps/nested/dist/assets/main.js".into()
+                app_dir.join("dist").join("assets").join("main.js")
             ))
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn resolve_app_request_uses_redirect_file_and_folder_after_local_candidates() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("fallback");
+        fs::create_dir_all(app_dir.join("dist").join("assets"))
+            .expect("dist assets directory should be created");
+        let shared_dir = state_dir.join("shared-assets");
+        fs::create_dir_all(shared_dir.join("assets"))
+            .expect("shared assets directory should be created");
+        let fallback_file = state_dir.join("fallback.html");
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            serde_json::to_string(&serde_json::json!({
+                "title": "Fallback",
+                "entry": "dist/index.html",
+                "redirect_files": [shared_dir.clone(), fallback_file.clone()],
+            }))
+            .expect("manifest JSON should serialize"),
+        )
+        .expect("manifest should be written");
+        fs::write(
+            app_dir.join("dist").join("index.html"),
+            "<html><head><title>Fallback App</title></head></html>",
+        )
+        .expect("entry should be written");
+        fs::write(
+            shared_dir.join("assets").join("main.js"),
+            "console.log('shared');",
+        )
+        .expect("shared asset should be written");
+        fs::write(&fallback_file, "<html><body>fallback</body></html>")
+            .expect("fallback file should be written");
+
+        let asset_uri: Uri = "/apps/fallback/assets/main.js"
+            .parse()
+            .expect("URI should parse");
+        let unmatched_uri: Uri = "/apps/fallback/missing/page"
+            .parse()
+            .expect("URI should parse");
+
+        let asset = resolve_app_request(&wwwroot, &asset_uri).expect("request should resolve");
+        let unmatched =
+            resolve_app_request(&wwwroot, &unmatched_uri).expect("request should resolve");
+        let expected_shared_asset = fs::canonicalize(shared_dir.join("assets").join("main.js"))
+            .expect("shared asset path should canonicalize");
+        let expected_fallback_file =
+            fs::canonicalize(&fallback_file).expect("fallback file path should canonicalize");
+
+        assert_eq!(
+            asset,
+            Some(AppRequestTarget::LocalFile(expected_shared_asset))
+        );
+        assert_eq!(
+            unmatched,
+            Some(AppRequestTarget::LocalFile(expected_fallback_file))
         );
 
         let _ = fs::remove_dir_all(state_dir);
@@ -1172,6 +1402,93 @@ mod tests {
                 "dist/assets/main.js/index.html".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_app_request_rejects_missing_redirect_files() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("invalid");
+        fs::create_dir_all(app_dir.join("dist")).expect("dist directory should be created");
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            r#"{
+                "title": "Invalid",
+                "entry": "dist/index.html",
+                "redirect_files": ["../../missing-folder"]
+            }"#,
+        )
+        .expect("manifest should be written");
+        fs::write(
+            app_dir.join("dist").join("index.html"),
+            "<html><head><title>Invalid</title></head></html>",
+        )
+        .expect("entry should be written");
+
+        let root_uri: Uri = "/apps/invalid/".parse().expect("URI should parse");
+        let err = resolve_app_request(&wwwroot, &root_uri).expect_err("request should fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("redirect path"));
+        assert!(err.to_string().contains("does not exist"));
+
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn discover_static_apps_allows_entry_from_redirect_dir_with_manifest_fields() {
+        let state_dir = temp_state_dir();
+        let wwwroot = state_dir.join("wwwroot");
+        let app_dir = wwwroot.join("apps").join("interview-markdown-viewer");
+        let notes_dir = state_dir.join("interview-notes");
+
+        fs::create_dir_all(&app_dir).expect("app directory should be created");
+        fs::create_dir_all(&notes_dir).expect("notes directory should be created");
+        fs::write(
+            notes_dir.join("index.html"),
+            "<html><head><title>Interview Notes</title></head><body>ok</body></html>",
+        )
+        .expect("redirected entry should be written");
+        fs::write(
+            app_dir.join(APP_MANIFEST_FILE),
+            serde_json::to_string(&serde_json::json!({
+                "entry": "index.html",
+                "title": "Interview Markdown Viewer",
+                "description": "A reusable Oly-hosted viewer for interview preparation notes and markdown knowledge packs.",
+                "redirect_files": [notes_dir.clone()],
+            }))
+            .expect("manifest JSON should serialize"),
+        )
+        .expect("manifest should be written");
+
+        let apps = discover_static_apps(&wwwroot).expect("apps should be discovered");
+        let root_uri: Uri = "/apps/interview-markdown-viewer/"
+            .parse()
+            .expect("URI should parse");
+        let resolved = resolve_app_request(&wwwroot, &root_uri).expect("request should resolve");
+
+        assert_eq!(
+            apps,
+            vec![StaticApp {
+                href: "/apps/interview-markdown-viewer/".into(),
+                title: "Interview Markdown Viewer".into(),
+                description: Some(
+                    "A reusable Oly-hosted viewer for interview preparation notes and markdown knowledge packs."
+                        .into(),
+                ),
+                icon_href: None,
+                app_type: StaticAppKind::SingleHtml,
+            }]
+        );
+        assert_eq!(
+            resolved,
+            Some(AppRequestTarget::LocalFile(
+                fs::canonicalize(notes_dir.join("index.html"))
+                    .expect("redirected entry should canonicalize")
+            ))
+        );
+
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]
