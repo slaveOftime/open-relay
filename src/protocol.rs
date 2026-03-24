@@ -513,6 +513,8 @@ pub struct SessionSummary {
     pub cwd: Option<String>,
     #[serde(default)]
     pub input_needed: bool,
+    #[serde(default)]
+    pub notifications_enabled: bool,
     pub node: Option<String>,
     pub total_bytes: u64,
 }

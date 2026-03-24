@@ -27,6 +27,7 @@ struct SessionFingerprint {
     status: String,
     pid: Option<u32>,
     input_needed: bool,
+    notifications_enabled: bool,
     last_output_at: Option<Instant>,
     last_total_bytes: u64,
 }
@@ -43,6 +44,7 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
             status: value.summary.status.clone(),
             pid: value.summary.pid,
             input_needed: value.summary.input_needed,
+            notifications_enabled: value.summary.notifications_enabled,
             last_output_at: value.last_output_at,
             last_total_bytes: value.summary.total_bytes,
         }
@@ -274,6 +276,7 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap(),
             cwd: Some("C:\\work".to_string()),
             input_needed: true,
+            notifications_enabled: false,
             node: None,
             total_bytes: 0,
         }

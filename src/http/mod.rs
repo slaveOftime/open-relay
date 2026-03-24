@@ -91,6 +91,10 @@ pub async fn serve(state: AppState) {
         .route("/api/sessions", get(sessions::list).post(sessions::create))
         .route("/api/sessions/events", get(sse::events_handler))
         .route("/api/sessions/{id}", get(sessions::get_session))
+        .route(
+            "/api/sessions/{id}/notifications",
+            post(sessions::set_session_notifications),
+        )
         .route("/api/sessions/{id}/stop", post(sessions::stop_session))
         .route("/api/sessions/{id}/kill", post(sessions::kill_session))
         .route("/api/sessions/{id}/input", post(sessions::send_input))

@@ -68,6 +68,7 @@ export interface SessionSummary {
   created_at: string // ISO 8601
   cwd: string | null
   input_needed: boolean
+  notifications_enabled: boolean
   node?: string | null
   total_bytes: number
 }

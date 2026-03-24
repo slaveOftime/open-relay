@@ -13,7 +13,7 @@ use crate::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
     session::{
-        SessionStore, StartSpec,
+        SessionLookupError, SessionStore, StartSpec,
         logs::{read_persisted_log_page, read_resize_events},
         persist::current_output_offset_by_id,
     },
@@ -536,6 +536,90 @@ pub async fn kill_session(
             Json(serde_json::json!({ "error": format!("session not found: {id}") })),
         )
             .into_response()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionNotificationsBody {
+    pub enabled: bool,
+}
+
+pub async fn set_session_notifications(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<NodeParams>,
+    Json(body): Json<SessionNotificationsBody>,
+) -> impl IntoResponse {
+    if let Some(ref node) = params.node {
+        let rpc = RpcRequest::NotifySet {
+            id: id.clone(),
+            enabled: body.enabled,
+        };
+        return match state.node_registry.proxy_rpc(node, &rpc).await {
+            Ok(RpcResponse::Ack) => Json(serde_json::json!({
+                "ok": true,
+                "notifications_enabled": body.enabled,
+            }))
+            .into_response(),
+            Ok(RpcResponse::Error { message }) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "unexpected response from node" })),
+            )
+                .into_response(),
+        };
+    }
+
+    match state
+        .store
+        .set_notifications_enabled(&id, body.enabled)
+        .await
+    {
+        Ok(()) => {
+            info!(
+                session_id = %id,
+                notifications_enabled = body.enabled,
+                "session notification setting updated"
+            );
+            Json(serde_json::json!({
+                "ok": true,
+                "notifications_enabled": body.enabled,
+            }))
+            .into_response()
+        }
+        Err(SessionLookupError::NotRunning) => {
+            warn!(session_id = %id, "notification toggle: session not running");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session not running: {id}") })),
+            )
+                .into_response()
+        }
+        Err(SessionLookupError::Evicted) => {
+            warn!(session_id = %id, "notification toggle: session evicted");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session evicted from memory: {id}") })),
+            )
+                .into_response()
+        }
+        Err(SessionLookupError::Busy) => {
+            warn!(session_id = %id, "notification toggle: session busy");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": format!("session busy: {id}") })),
+            )
+                .into_response()
+        }
     }
 }
 

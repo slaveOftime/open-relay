@@ -144,6 +144,21 @@ export function startSession(spec: CreateSessionSpec): Promise<{ session_id: str
   return req(`${BASE}/sessions`, { method: 'POST', body: JSON.stringify(spec) })
 }
 
+export function setSessionNotifications(
+  id: string,
+  enabled: boolean,
+  node?: string
+): Promise<{ ok: boolean; notifications_enabled: boolean }> {
+  const q = node ? `?node=${encodeURIComponent(node)}` : ''
+  return req<{ ok: boolean; notifications_enabled: boolean }>(
+    `${BASE}/sessions/${id}/notifications${q}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }
+  )
+}
+
 export function stopSession(
   id: string,
   grace_seconds?: number,

@@ -407,6 +407,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         created_at: meta.created_at,
         cwd: meta.cwd.clone(),
         input_needed,
+        notifications_enabled: false,
         node: None,
         total_bytes,
     }
