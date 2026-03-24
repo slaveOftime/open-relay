@@ -173,7 +173,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       cursorBlink: true,
       cursorStyle: 'block',
       customGlyphs: true,
-      scrollback: 2000,
+      scrollback: 1000,
       disableStdin: !onDataRef.current,
       macOptionClickForcesSelection: true,
     })
