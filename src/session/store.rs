@@ -49,7 +49,6 @@ struct SessionRuntimeSnapshot {
     last_output_at: Option<Instant>,
     mode_snapshot: ModeSnapshot,
     output_closed: bool,
-    notifications_enabled: bool,
     last_attach_activity_at: Option<Instant>,
     last_notified_at: Option<Instant>,
     notified_output_epoch: Option<Instant>,
@@ -73,13 +72,13 @@ impl SessionRuntimeSnapshot {
                 created_at: rt.meta.created_at,
                 cwd: rt.meta.cwd.clone(),
                 input_needed,
+                notifications_enabled: rt.notifications_enabled,
                 node: None,
                 total_bytes: rt.total_bytes,
             },
             last_output_at: rt.last_output_at,
             mode_snapshot: rt.mode_snapshot(),
             output_closed: rt.output_closed,
-            notifications_enabled: rt.notifications_enabled,
             last_attach_activity_at: rt.last_attach_activity_at,
             last_notified_at: rt.last_notified_at,
             notified_output_epoch: rt.notified_output_epoch,
@@ -1030,7 +1029,7 @@ impl SessionStore {
                     session_title: snapshot.summary.title.clone(),
                     raw_excerpt: excerpt,
                     output_epoch: last_output,
-                    notifications_enabled: snapshot.notifications_enabled,
+                    notifications_enabled: snapshot.summary.notifications_enabled,
                     last_total_bytes: snapshot.total_bytes,
                 })
             })
@@ -1400,7 +1399,7 @@ mod tests {
         let sessions = store.sessions.load();
         let handle = sessions.get("abc1234").expect("runtime should exist");
         let snapshot = handle.snapshot();
-        assert!(!snapshot.notifications_enabled);
+        assert!(!snapshot.summary.notifications_enabled);
 
         let rt = handle.runtime.lock().unwrap();
         assert!(!rt.notifications_enabled);

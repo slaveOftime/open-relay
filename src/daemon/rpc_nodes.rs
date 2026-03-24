@@ -284,6 +284,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
             | RpcRequest::List { .. }
             | RpcRequest::Start { .. }
             | RpcRequest::NotifySet { .. }
+            | RpcRequest::NotifySend { .. }
             | RpcRequest::AttachSubscribe { .. }
             | RpcRequest::AttachInput { .. }
             | RpcRequest::AttachResize { .. }
@@ -352,6 +353,16 @@ mod tests {
     fn proxied_detach_cleanup_is_supported() {
         assert!(is_supported_proxied_rpc(&RpcRequest::AttachDetach {
             id: "session-123".to_string(),
+        }));
+    }
+
+    #[test]
+    fn proxied_notify_send_is_supported() {
+        assert!(is_supported_proxied_rpc(&RpcRequest::NotifySend {
+            source: Some("session-123".to_string()),
+            title: "Deploy ready".to_string(),
+            description: Some("Build finished".to_string()),
+            body: Some("Open the session for details.".to_string()),
         }));
     }
 

@@ -16,6 +16,7 @@ import {
   fetchSessions,
   stopSession,
   killSession,
+  setSessionNotifications,
   subscribeEvents,
   startSession,
   fetchNodes,
@@ -239,6 +240,47 @@ function updateSparklineForNotification(notification: SessionNotificationData) {
   })
 }
 
+function SessionNotificationButton({
+  enabled,
+  disabled,
+  pending,
+  onToggle,
+}: {
+  enabled: boolean
+  disabled?: boolean
+  pending?: boolean
+  onToggle: () => void
+}) {
+  const label = disabled
+    ? 'Notifications unavailable after session exit'
+    : enabled
+      ? 'Turn notifications off'
+      : 'Turn notifications on'
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant={enabled ? 'link' : 'ghost'}
+          size="icon"
+          aria-label={label}
+          disabled={disabled || pending}
+          onClick={onToggle}
+          className={enabled ? 'text-amber-600 hover:text-amber-600' : undefined}
+        >
+          <span className="relative inline-flex h-4 w-4 items-center justify-center">
+            <BellIcon className="h-4 w-4" />
+            {!enabled && (
+              <span className="absolute h-[1.5px] w-5 -rotate-45 rounded-full bg-current" />
+            )}
+          </span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{pending ? 'Updating notifications…' : label}</TooltipContent>
+    </Tooltip>
+  )
+}
+
 // ── Skeleton loading ───────────────────────────────────────────────────────
 
 function SkeletonRow() {
@@ -299,7 +341,9 @@ function SessionRow({
   animateIn,
   onStop,
   onKill,
+  onToggleNotifications,
   onRunAgain,
+  notificationsPending,
   node,
 }: {
   session: SessionSummary
@@ -307,7 +351,9 @@ function SessionRow({
   animateIn?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
+  onToggleNotifications: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
+  notificationsPending?: boolean
   node?: string
 }) {
   const navigate = useNavigate()
@@ -442,6 +488,12 @@ function SessionRow({
                 </Tooltip>
               </>
             )}
+            <SessionNotificationButton
+              enabled={session.notifications_enabled}
+              disabled={!isRunning}
+              pending={notificationsPending}
+              onToggle={() => onToggleNotifications(session)}
+            />
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
@@ -484,7 +536,9 @@ function SessionCard({
   animateIn,
   onStop,
   onKill,
+  onToggleNotifications,
   onRunAgain,
+  notificationsPending,
   node,
 }: {
   session: SessionSummary
@@ -492,7 +546,9 @@ function SessionCard({
   animateIn?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
+  onToggleNotifications: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
+  notificationsPending?: boolean
   node?: string
 }) {
   const navigate = useNavigate()
@@ -618,6 +674,12 @@ function SessionCard({
               </Tooltip>
             </>
           )}
+          <SessionNotificationButton
+            enabled={session.notifications_enabled}
+            disabled={!isRunning}
+            pending={notificationsPending}
+            onToggle={() => onToggleNotifications(session)}
+          />
           <Button variant="ghost" size="sm" onClick={() => openSession('logs')}>
             <FileTextIcon className="h-4 w-4" />
             Logs
@@ -939,6 +1001,7 @@ export default function SessionsPage() {
   )
   const [seriesMap, setSeriesMap] = useState<Map<string, number[]>>(new Map())
   const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set())
+  const [notificationRequestIds, setNotificationRequestIds] = useState<Set<string>>(new Set())
   const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
   const [loadError, setLoadError] = useState<LoadErrorState | null>(null)
@@ -991,6 +1054,16 @@ export default function SessionsPage() {
       const index = prev.findIndex((item) => item.id === sessionId)
       if (index === -1) return prev
       return prev.filter((item) => item.id !== sessionId)
+    })
+  }, [])
+
+  const setLoadedSessionNotifications = useCallback((sessionId: string, enabled: boolean) => {
+    setSessions((prev) => {
+      const index = prev.findIndex((item) => item.id === sessionId)
+      if (index === -1 || prev[index]?.notifications_enabled === enabled) return prev
+      const next = prev.slice()
+      next[index] = { ...next[index], notifications_enabled: enabled }
+      return next
     })
   }, [])
 
@@ -1279,6 +1352,32 @@ export default function SessionsPage() {
   async function handleKill(id: string) {
     await killSession(id, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
+  }
+
+  async function handleToggleNotifications(session: SessionSummary) {
+    const isRunning =
+      session.status === 'running' || session.status === 'stopping' || session.status === 'created'
+    if (!isRunning) return
+
+    const nextEnabled = !session.notifications_enabled
+    setNotificationRequestIds((prev) => new Set(prev).add(session.id))
+    setLoadedSessionNotifications(session.id, nextEnabled)
+
+    try {
+      await setSessionNotifications(session.id, nextEnabled, selectedNode ?? undefined)
+    } catch (error) {
+      setLoadedSessionNotifications(session.id, session.notifications_enabled)
+      setLoadError({
+        title: nextEnabled ? 'Failed to enable notifications' : 'Failed to disable notifications',
+        message: getErrorMessage(error, 'Failed to update session notifications.'),
+      })
+    } finally {
+      setNotificationRequestIds((prev) => {
+        const next = new Set(prev)
+        next.delete(session.id)
+        return next
+      })
+    }
   }
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
@@ -1635,7 +1734,9 @@ export default function SessionsPage() {
                       animateIn={enteringIds.has(s.id)}
                       onStop={handleStop}
                       onKill={handleKill}
+                      onToggleNotifications={handleToggleNotifications}
                       onRunAgain={handleRunAgain}
+                      notificationsPending={notificationRequestIds.has(s.id)}
                       node={selectedNode ?? undefined}
                     />
                   ))}
@@ -1739,7 +1840,9 @@ export default function SessionsPage() {
                         animateIn={enteringIds.has(s.id)}
                         onStop={handleStop}
                         onKill={handleKill}
+                        onToggleNotifications={handleToggleNotifications}
                         onRunAgain={handleRunAgain}
+                        notificationsPending={notificationRequestIds.has(s.id)}
                         node={selectedNode ?? undefined}
                       />
                     ))}

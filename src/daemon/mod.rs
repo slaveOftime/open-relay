@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    notification::event::NotificationEvent,
+    notification::{dispatcher::Notifier, event::NotificationEvent},
     session::{SessionEvent, SessionStore},
 };
 
@@ -19,3 +19,4 @@ pub(crate) type JoinHandles =
     Arc<Mutex<HashMap<String, (tokio::task::AbortHandle, watch::Sender<bool>)>>>;
 pub(crate) type NotificationTx = tokio::sync::broadcast::Sender<NotificationEvent>;
 pub(crate) type SessionEventTx = tokio::sync::broadcast::Sender<SessionEvent>;
+pub(crate) type NotifierHandle = Arc<Notifier>;

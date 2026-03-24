@@ -1180,7 +1180,7 @@ export default function SessionDetailPage() {
           >
             <div
               ref={termContainerRef}
-              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 px-4`}
+              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-4 pr-1`}
             >
               <div className="h-full w-full overflow-x-auto">
                 <XTerm

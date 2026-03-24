@@ -16,12 +16,12 @@ use crate::{
     node::NodeRegistry,
     notification::event::NotificationEvent,
     protocol::{RpcRequest, RpcResponse},
-    session::{SessionEvent, SessionStore},
+    session::SessionStore,
     storage,
 };
 
 use super::{
-    JoinHandles,
+    JoinHandles, NotifierHandle,
     auth::{confirm_no_auth_risk, prompt_and_hash_password},
     rpc::handle_client,
 };
@@ -389,7 +389,8 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         info!(count, "join connectors initialized");
     }
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
-    let notifier = Arc::new(crate::notification::build_notifier(db.clone(), &config));
+    let notifier: NotifierHandle =
+        Arc::new(crate::notification::build_notifier(db.clone(), &config));
 
     let auth_state = auth_hash.map(AuthState::new);
     if !no_http {
@@ -447,18 +448,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         }
 
         let _ = notification_tx.send(event.clone());
-        let _ = event_tx.send(SessionEvent::SessionNotification {
-            kind: event.kind.as_str().to_string(),
-            title: event.title,
-            description: event.description,
-            body: event.body,
-            navigation_url: event.navigation_url,
-            session_ids: event.session_ids,
-            trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
-            trigger_detail: event.trigger_detail,
-            node: event.node,
-            last_total_bytes: 0,
-        });
+        let _ = event_tx.send(event.into_session_event(0));
     }
 
     let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
@@ -488,6 +478,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                         let handles_clone = join_handles.clone();
                         let event_tx_clone = event_tx.clone();
                         let notification_tx_clone = notification_tx.clone();
+                        let notifier_clone = notifier.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_client(
                                 stream,
@@ -499,6 +490,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                                 handles_clone,
                                 event_tx_clone,
                                 notification_tx_clone,
+                                notifier_clone,
                             ).await {
                                 error!(%err, "client handling error");
                             }

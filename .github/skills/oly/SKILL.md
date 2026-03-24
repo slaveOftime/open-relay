@@ -95,6 +95,23 @@ Notes:
 - Detach from an attached session with `Ctrl-]`, then `d`.
 - `oly ls --json` is preferred for scripts and agents.
 
+### 5) Notification
+
+Use `oly notify` to send a notification that may be delivered through any configured channel:
+
+```bash
+oly notify <ID> --title "Job complete" --description "The data processing task has finished." --body "Check the results at /path/to/results."
+```
+
+- `<ID>` is optional, use it when you want to mark this notifcation as the source of the specific session.
+
+You can also toggle a session's notifications on or off, this is useful when you want to supervise the session yourself and avoid redundant or distracting notifications:
+
+```bash
+oly notify enable <ID>
+oly notify disable <ID>
+```
+
 ## Help
 
 Use the built-in help when you need command details:
@@ -127,3 +144,23 @@ http://127.0.0.1:<OLY-PORT>/apps/<your-app-name>/
   - `%LOCALAPPDATA%\oly` on Windows
   - `$XDG_STATE_HOME/oly` or `~/.local/state/oly` on Linux
   - `~/Library/Application Support/oly` on macOS
+
+You can also add an `oly.app.config` file inside the app's folder with the following structure.
+
+```rust
+struct AppManifest {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    icon_href: Option<String>,
+    #[serde(default)]
+    app_type: Option<String>,
+    #[serde(default)]
+    redirect_files: Vec<String>,
+    entry: String,
+}
+```
+
+  Use `redirect_files` for static asset directories that live outside the app root so you do not need to copy them into place. `oly` serves those files with the correct content type when requested.

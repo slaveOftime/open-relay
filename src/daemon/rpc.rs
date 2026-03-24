@@ -1,7 +1,7 @@
 use interprocess::local_socket::tokio::Stream;
 use std::sync::Arc;
 use tokio::{io::BufReader, sync::mpsc};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     client,
@@ -18,7 +18,7 @@ use crate::{
     },
 };
 
-use super::{JoinHandles, NotificationTx, SessionEventTx, SessionStoreHandle};
+use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, SessionStoreHandle};
 use super::{
     rpc_attach::{
         handle_attach_detach, handle_attach_input, handle_attach_resize, handle_attach_subscribe,
@@ -39,6 +39,7 @@ pub(super) async fn handle_client(
     join_handles: JoinHandles,
     session_event_tx: SessionEventTx,
     notification_tx: NotificationTx,
+    notifier: NotifierHandle,
 ) -> Result<()> {
     // Peek at the request without consuming the stream so we can decide whether
     // it needs the bidirectional streaming path or the simple req/resp path.
@@ -79,6 +80,7 @@ pub(super) async fn handle_client(
         &join_handles,
         &session_event_tx,
         &notification_tx,
+        &notifier,
     )
     .await?;
     ipc::write_response_to_writer(&mut write_half, response).await
@@ -95,6 +97,7 @@ async fn dispatch_request(
     join_handles: &JoinHandles,
     session_event_tx: &SessionEventTx,
     notification_tx: &NotificationTx,
+    notifier: &NotifierHandle,
 ) -> Result<RpcResponse> {
     let response = match request {
         RpcRequest::Health => RpcResponse::Health {
@@ -128,6 +131,24 @@ async fn dispatch_request(
         }
         RpcRequest::NotifySet { id, enabled } => {
             handle_notify_set(id, enabled, session_store).await
+        }
+        RpcRequest::NotifySend {
+            source,
+            title,
+            description,
+            body,
+        } => {
+            handle_notify_send(
+                source,
+                title,
+                description,
+                body,
+                notifier,
+                notification_tx,
+                session_event_tx,
+                session_store,
+            )
+            .await
         }
         RpcRequest::AttachSubscribe { .. } => {
             // Handled before dispatch in handle_client; should not reach here.
@@ -274,6 +295,47 @@ async fn handle_notify_set(
             message: format!("session not found or not running: {id}"),
         },
     }
+}
+
+async fn handle_notify_send(
+    source: Option<String>,
+    title: String,
+    description: Option<String>,
+    body: Option<String>,
+    notifier: &NotifierHandle,
+    notification_tx: &NotificationTx,
+    session_event_tx: &SessionEventTx,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    if title.trim().is_empty() {
+        return RpcResponse::Error {
+            message: "notification title cannot be empty".to_string(),
+        };
+    }
+
+    if let Some(source_id) = source.as_deref()
+        && !session_store.is_running(source_id)
+    {
+        return RpcResponse::Error {
+            message: format!("Cannot use non-running session as source: {source_id}"),
+        };
+    }
+
+    let event =
+        crate::notification::event::NotificationEvent::manual(source, title, description, body);
+    let outcome = notifier.dispatch(&event).await;
+
+    if !outcome.any_delivered() {
+        warn!(
+            attempted = outcome.attempted,
+            failed_channels = ?outcome.failed_channels,
+            "manual notification delivery failed on all channels"
+        );
+    }
+
+    let _ = notification_tx.send(event.clone());
+    let _ = session_event_tx.send(event.into_session_event(0));
+    RpcResponse::Ack
 }
 
 async fn handle_logs_tail(

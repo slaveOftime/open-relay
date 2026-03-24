@@ -222,12 +222,32 @@ pub enum NotifyCommand {
     Disable(NotifyToggleArgs),
     /// Enable notifications for a running session.
     Enable(NotifyToggleArgs),
+    /// Send a notification, optionally associated with a session.
+    Send(NotifySendArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct NotifyToggleArgs {
     /// Session ID to update. If omitted, uses the most recently created session.
     pub id: Option<String>,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct NotifySendArgs {
+    /// Source session ID to associate with the notification.
+    pub source: Option<String>,
+    /// Notification title.
+    #[arg(long, short = 't')]
+    pub title: String,
+    /// Optional short notification description.
+    #[arg(long, short = 'd')]
+    pub description: Option<String>,
+    /// Optional notification body text.
+    #[arg(long, short = 'b')]
+    pub body: Option<String>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
@@ -458,6 +478,36 @@ mod tests {
             panic!("expected notify disable subcommand");
         };
         assert_eq!(args.id.as_deref(), Some("session-1"));
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn notify_send_parses_optional_source_and_payload() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "notify",
+            "send",
+            "session-1",
+            "--title",
+            "Deploy ready",
+            "--description",
+            "Build finished",
+            "--body",
+            "Review the deployment logs.",
+            "--node",
+            "worker-a",
+        ])
+        .unwrap();
+        let Commands::Notify(args) = cli.command else {
+            panic!("expected notify command");
+        };
+        let NotifyCommand::Send(args) = args.command else {
+            panic!("expected notify send subcommand");
+        };
+        assert_eq!(args.source.as_deref(), Some("session-1"));
+        assert_eq!(args.title, "Deploy ready");
+        assert_eq!(args.description.as_deref(), Some("Build finished"));
+        assert_eq!(args.body.as_deref(), Some("Review the deployment logs."));
         assert_eq!(args.node.as_deref(), Some("worker-a"));
     }
 }
