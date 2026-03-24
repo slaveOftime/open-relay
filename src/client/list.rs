@@ -261,7 +261,7 @@ mod tests {
 
         assert_eq!(value["created_at"], serde_json::json!(expected_created_at));
         assert_eq!(value["input_needed"], serde_json::json!(true));
-        assert_eq!(value["total_bytes"], serde_json::json!(4096));
+        assert_eq!(value["last_total_bytes"], serde_json::json!(4096));
     }
 
     #[test]
