@@ -228,35 +228,51 @@ async fn run() -> Result<()> {
             }
         }
 
-        Commands::Notify(notify_args) => {
-            let (id, enabled, node) = match notify_args.command {
-                NotifyCommand::Disable(args) => {
-                    let id =
-                        resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
-                    (id, false, args.node)
-                }
-                NotifyCommand::Enable(args) => {
-                    let id =
-                        resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
-                    (id, true, args.node)
-                }
-            };
-            let inner = RpcRequest::NotifySet {
-                id: id.clone(),
-                enabled,
-            };
-            match ipc::send_request_checked(&config, node_wrap(node, inner)).await? {
-                RpcResponse::Ack => {
-                    if enabled {
-                        println!("Notifications enabled for session {id}.");
-                    } else {
+        Commands::Notify(notify_args) => match notify_args.command {
+            NotifyCommand::Disable(args) => {
+                let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+                let inner = RpcRequest::NotifySet {
+                    id: id.clone(),
+                    enabled: false,
+                };
+                match ipc::send_request_checked(&config, node_wrap(args.node, inner)).await? {
+                    RpcResponse::Ack => {
                         println!("Notifications disabled for session {id}.");
+                        Ok(())
                     }
-                    Ok(())
+                    _ => Err(AppError::Protocol("unexpected response type".to_string())),
                 }
-                _ => Err(AppError::Protocol("unexpected response type".to_string())),
             }
-        }
+            NotifyCommand::Enable(args) => {
+                let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+                let inner = RpcRequest::NotifySet {
+                    id: id.clone(),
+                    enabled: true,
+                };
+                match ipc::send_request_checked(&config, node_wrap(args.node, inner)).await? {
+                    RpcResponse::Ack => {
+                        println!("Notifications enabled for session {id}.");
+                        Ok(())
+                    }
+                    _ => Err(AppError::Protocol("unexpected response type".to_string())),
+                }
+            }
+            NotifyCommand::Send(args) => {
+                let inner = RpcRequest::NotifySend {
+                    source: args.source,
+                    title: args.title,
+                    description: args.description,
+                    body: args.body,
+                };
+                match ipc::send_request_checked(&config, node_wrap(args.node, inner)).await? {
+                    RpcResponse::Ack => {
+                        println!("Notification sent.");
+                        Ok(())
+                    }
+                    _ => Err(AppError::Protocol("unexpected response type".to_string())),
+                }
+            }
+        },
 
         Commands::Stop(stop_args) => {
             let id =

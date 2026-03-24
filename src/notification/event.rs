@@ -2,6 +2,7 @@
 pub enum NotificationKind {
     InputNeeded,
     StartupRecovery,
+    Manual,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +39,7 @@ impl NotificationKind {
         match self {
             Self::InputNeeded => "input_needed",
             Self::StartupRecovery => "startup_recovery",
+            Self::Manual => "manual",
         }
     }
 }
@@ -131,6 +133,45 @@ impl NotificationEvent {
         }
     }
 
+    pub fn manual(
+        source_session_id: Option<String>,
+        title: String,
+        description: Option<String>,
+        body: Option<String>,
+    ) -> Self {
+        let session_ids = source_session_id.into_iter().collect::<Vec<_>>();
+        let navigation_url = session_ids
+            .first()
+            .map(|session_id| session_navigation_url(session_id));
+
+        Self {
+            kind: NotificationKind::Manual,
+            title: title.trim().to_string(),
+            description: normalize_optional_text(description),
+            body: normalize_optional_text(body),
+            navigation_url,
+            session_ids,
+            trigger_rule: None,
+            trigger_detail: None,
+            node: None,
+        }
+    }
+
+    pub fn into_session_event(self, last_total_bytes: u64) -> crate::session::SessionEvent {
+        crate::session::SessionEvent::SessionNotification {
+            kind: self.kind.as_str().to_string(),
+            title: self.title,
+            description: self.description,
+            body: self.body,
+            navigation_url: self.navigation_url,
+            session_ids: self.session_ids,
+            trigger_rule: self.trigger_rule.map(|rule| rule.as_str().to_string()),
+            trigger_detail: self.trigger_detail,
+            node: self.node,
+            last_total_bytes,
+        }
+    }
+
     pub fn rendered_body(&self) -> String {
         match (
             self.description.trim().is_empty(),
@@ -163,6 +204,13 @@ fn non_empty_or(value: String, fallback: String) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn normalize_optional_text(value: Option<String>) -> String {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -206,5 +254,25 @@ mod tests {
         };
 
         assert_eq!(event.rendered_body(), "Session needs attention.\nPassword:");
+    }
+
+    #[test]
+    fn manual_notification_uses_optional_source_session() {
+        let event = NotificationEvent::manual(
+            Some("session-123".to_string()),
+            "Deploy ready".to_string(),
+            Some("Build finished".to_string()),
+            Some("Open the session for details.".to_string()),
+        );
+
+        assert_eq!(event.kind.as_str(), "manual");
+        assert_eq!(event.title, "Deploy ready");
+        assert_eq!(event.description, "Build finished");
+        assert_eq!(event.body, "Open the session for details.");
+        assert_eq!(event.session_ids, vec!["session-123".to_string()]);
+        assert_eq!(
+            event.navigation_url.as_deref(),
+            Some("/session/session-123")
+        );
     }
 }

@@ -121,18 +121,7 @@ pub(super) async fn run_notification_monitor(
             // This is useful for supervisor agent to take over when to send notifications
             let _ = notification_tx.send(event.clone());
 
-            let _ = event_tx.send(SessionEvent::SessionNotification {
-                kind: event.kind.as_str().to_string(),
-                title: event.title,
-                description: event.description,
-                body: event.body,
-                navigation_url: event.navigation_url,
-                session_ids: event.session_ids,
-                trigger_rule: event.trigger_rule.map(|rule| rule.as_str().to_string()),
-                trigger_detail: event.trigger_detail,
-                node: event.node,
-                last_total_bytes: candidate.last_total_bytes,
-            });
+            let _ = event_tx.send(event.into_session_event(candidate.last_total_bytes));
 
             session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
         }

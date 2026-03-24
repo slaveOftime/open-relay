@@ -163,6 +163,12 @@ pub enum RpcRequest {
         id: String,
         enabled: bool,
     },
+    NotifySend {
+        source: Option<String>,
+        title: String,
+        description: Option<String>,
+        body: Option<String>,
+    },
     AttachSubscribe {
         id: String,
         from_byte_offset: Option<u64>,
@@ -246,6 +252,7 @@ impl RpcRequest {
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
             RpcRequest::NotifySet { .. } => "notify_set",
+            RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
             RpcRequest::AttachResize { .. } => "attach_resize",
