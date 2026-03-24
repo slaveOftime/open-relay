@@ -1,7 +1,6 @@
 use std::{
     io::{ErrorKind, Read, Write},
-    path::{Path, PathBuf},
-    sync::mpsc::{self as std_mpsc, RecvTimeoutError},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -79,157 +78,22 @@ pub struct SessionRuntime {
 }
 
 const PTY_WRITER_QUEUE_CAPACITY: usize = 256;
-const PTY_COALESCE_WINDOW: Duration = Duration::from_millis(15);
-const PTY_COALESCE_MAX_BYTES: usize = 20 * 1024;
-
-enum PtyOutputProcessorEvent {
-    Chunk(Bytes),
-    Close,
-}
-
-fn try_coalesce_pending_output(pending: &mut Vec<u8>, next: &[u8]) -> bool {
-    if pending.len().saturating_add(next.len()) <= PTY_COALESCE_MAX_BYTES {
-        pending.extend_from_slice(next);
-        return true;
-    }
-
-    false
-}
-
-fn flush_pending_output(
-    runtime: &Arc<Mutex<SessionRuntime>>,
-    dir: &Path,
-    session_id: &str,
-    broadcast_tx: &broadcast::Sender<Arc<Bytes>>,
-    pending: &mut Vec<u8>,
-) -> bool {
-    if pending.is_empty() {
-        return true;
-    }
-
-    let filtered_data = Bytes::copy_from_slice(pending.as_slice());
-    pending.clear();
-    flush_filtered_output(runtime, dir, session_id, broadcast_tx, filtered_data)
-}
-
-fn flush_filtered_output(
-    runtime: &Arc<Mutex<SessionRuntime>>,
-    dir: &Path,
-    session_id: &str,
-    broadcast_tx: &broadcast::Sender<Arc<Bytes>>,
-    filtered_data: Bytes,
-) -> bool {
-    match runtime.lock() {
-        Ok(mut rt) => rt.retain_filtered_output(filtered_data.clone()),
-        Err(_) => {
-            warn!(
-                session_id = %session_id,
-                "failed to lock runtime for coalesced PTY output flush"
-            );
-            return false;
-        }
-    }
-
-    if let Err(err) = append_output_raw(dir, &filtered_data) {
-        warn!(
-            session_id = %session_id,
-            %err,
-            "failed to persist coalesced PTY output chunk"
-        );
-    }
-
-    if let Ok(receiver_count) = broadcast_tx.send(Arc::new(filtered_data)) {
-        trace!(
-            session_id = %session_id,
-            receiver_count,
-            "broadcast coalesced PTY output chunk to live subscribers"
-        );
-    }
-
-    true
-}
-
-fn run_output_processor(
-    runtime: Arc<Mutex<SessionRuntime>>,
-    dir: PathBuf,
-    session_id: String,
-    broadcast_tx: broadcast::Sender<Arc<Bytes>>,
-    output_rx: std_mpsc::Receiver<PtyOutputProcessorEvent>,
-) {
-    let mut pending = Vec::new();
-
-    loop {
-        let event = if pending.is_empty() {
-            match output_rx.recv() {
-                Ok(event) => Some(event),
-                Err(_) => break,
-            }
-        } else {
-            match output_rx.recv_timeout(PTY_COALESCE_WINDOW) {
-                Ok(event) => Some(event),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => {
-                    if !flush_pending_output(
-                        &runtime,
-                        &dir,
-                        &session_id,
-                        &broadcast_tx,
-                        &mut pending,
-                    ) {
-                        break;
-                    }
-                    break;
-                }
-            }
-        };
-
-        match event {
-            Some(PtyOutputProcessorEvent::Chunk(filtered_data)) => {
-                if try_coalesce_pending_output(&mut pending, filtered_data.as_ref()) {
-                    trace!(
-                        session_id = %session_id,
-                        pending_bytes = pending.len(),
-                        "coalesced adjacent PTY output chunk"
-                    );
-                    continue;
-                }
-
-                if !flush_pending_output(&runtime, &dir, &session_id, &broadcast_tx, &mut pending) {
-                    break;
-                }
-
-                if !try_coalesce_pending_output(&mut pending, filtered_data.as_ref())
-                    && !flush_filtered_output(
-                        &runtime,
-                        &dir,
-                        &session_id,
-                        &broadcast_tx,
-                        filtered_data,
-                    )
-                {
-                    break;
-                }
-            }
-            Some(PtyOutputProcessorEvent::Close) => {
-                let _ =
-                    flush_pending_output(&runtime, &dir, &session_id, &broadcast_tx, &mut pending);
-                break;
-            }
-            None => {
-                if !flush_pending_output(&runtime, &dir, &session_id, &broadcast_tx, &mut pending) {
-                    break;
-                }
-            }
-        }
-    }
-}
 
 impl SessionRuntime {
-    /// Track terminal modes from the raw PTY stream and advance the visible-output
-    /// timestamp without mutating retained filtered output.
-    pub fn track_raw_output(
+    /// Current terminal mode snapshot (DECCKM, bracketed paste).
+    pub fn mode_snapshot(&self) -> ModeSnapshot {
+        self.mode_tracker.snapshot()
+    }
+
+    /// Push a filtered PTY chunk into the canonical retained stream, update mode
+    /// state from the matching raw chunk, and advance the silence clock for
+    /// visible content.
+    ///
+    /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
+    pub fn push_output(
         &mut self,
         raw_data: &Bytes,
+        filtered_data: Bytes,
         has_visible_output: bool,
     ) -> Option<ModeSnapshot> {
         // Track DEC private mode toggles via byte-level state machine.
@@ -248,36 +112,13 @@ impl SessionRuntime {
             self.last_output_at = Some(Instant::now());
         }
 
-        mode_change
-    }
-
-    /// Add canonical filtered bytes to the retained session stream.
-    pub fn retain_filtered_output(&mut self, filtered_data: Bytes) {
+        // Add the canonical filtered bytes to the in-memory ring. Fully stripped
+        // chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
             self.total_bytes = self.total_bytes.saturating_add(filtered_data.len() as u64);
             self.ring.push(filtered_data);
         }
-    }
 
-    /// Current terminal mode snapshot (DECCKM, bracketed paste).
-    pub fn mode_snapshot(&self) -> ModeSnapshot {
-        self.mode_tracker.snapshot()
-    }
-
-    /// Push a filtered PTY chunk into the canonical retained stream, update mode
-    /// state from the matching raw chunk, and advance the silence clock for
-    /// visible content.
-    ///
-    /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn push_output(
-        &mut self,
-        raw_data: &Bytes,
-        filtered_data: Bytes,
-        has_visible_output: bool,
-    ) -> Option<ModeSnapshot> {
-        let mode_change = self.track_raw_output(raw_data, has_visible_output);
-        self.retain_filtered_output(filtered_data);
         mode_change
     }
 
@@ -623,36 +464,10 @@ pub fn spawn_session(
         notifications_enabled,
     }));
 
-    // PTY output processor thread: waits briefly for short output bursts, then persists
-    // and broadcasts the canonical filtered output stream.
-    let (output_tx, output_rx) = std_mpsc::channel::<PtyOutputProcessorEvent>();
-    let runtime_output = runtime.clone();
-    let output_dir = reader_dir.clone();
-    let output_session_id = meta.id.clone();
-    let output_broadcast_tx = broadcast_tx.clone();
-    let output_processor = std::thread::spawn(move || {
-        debug!(
-            session_id = %output_session_id,
-            coalesce_window_ms = PTY_COALESCE_WINDOW.as_millis(),
-            coalesce_max_bytes = PTY_COALESCE_MAX_BYTES,
-            "PTY output processor thread started"
-        );
-        run_output_processor(
-            runtime_output,
-            output_dir,
-            output_session_id.clone(),
-            output_broadcast_tx,
-            output_rx,
-        );
-        debug!(
-            session_id = %output_session_id,
-            "PTY output processor thread stopped"
-        );
-    });
-
-    // PTY reader thread: reads raw bytes, answers shared terminal queries, and
-    // forwards canonical filtered output through the coalescing processor.
+    // PTY reader thread: reads raw bytes, derives one canonical filtered stream,
+    // and retains/broadcasts only that filtered stream.
     let runtime_reader = runtime.clone();
+    let broadcast_tx_reader = broadcast_tx;
     let reader_session_id = meta.id.clone();
     std::thread::spawn(move || {
         debug!(session_id = %reader_session_id, "PTY reader thread started");
@@ -664,10 +479,17 @@ pub fn spawn_session(
         let mut query_tail = Vec::new();
         let mut cursor_tracker = CursorTracker::new(rows, cols);
         let mut stream_filter = EscapeFilter::new();
-        let close_event = loop {
+        loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    break "pty reader reached EOF".to_string();
+                    if let Ok(mut rt) = runtime_reader.lock() {
+                        rt.output_closed = true;
+                    }
+                    debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
+                    if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
+                        warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
+                    }
+                    break;
                 }
                 Ok(n) => {
                     let data = Bytes::copy_from_slice(&buf[..n]);
@@ -701,12 +523,11 @@ pub fn spawn_session(
                     let has_visible_output = has_visible_content(&data);
                     let filtered_data = Bytes::from(stream_filter.filter(&data));
 
-                    // Update mode tracking and visible-output bookkeeping with a
-                    // brief lock, while leaving filtered-stream retention to the
-                    // output coalescer thread.
+                    // Update in-memory ring + mode tracking (brief lock).
                     match runtime_reader.lock() {
                         Ok(mut rt) => {
-                            let _mode_change = rt.track_raw_output(&data, has_visible_output);
+                            let _mode_change =
+                                rt.push_output(&data, filtered_data.clone(), has_visible_output);
                             // Sync cursor tracker to current PTY dimensions
                             // so CPR responses reflect the correct size.
                             if let Some((r, c)) = rt.pty_size {
@@ -715,20 +536,28 @@ pub fn spawn_session(
                         }
                         Err(_) => {
                             warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
-                            break "failed to lock runtime for PTY output processing".to_string();
+                            break;
                         }
                     }
 
+                    if !filtered_data.is_empty() {
+                        if let Err(err) = append_output_raw(&reader_dir, &filtered_data) {
+                            warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
+                        }
+                    }
+
+                    // Broadcast canonical filtered output to all live subscribers
+                    // (non-blocking; lagged receivers will re-sync from the ring
+                    // on the next tick).
                     if !filtered_data.is_empty()
-                        && output_tx
-                            .send(PtyOutputProcessorEvent::Chunk(filtered_data))
-                            .is_err()
+                        && let Ok(receiver_count) =
+                            broadcast_tx_reader.send(Arc::new(filtered_data))
                     {
-                        warn!(
+                        trace!(
                             session_id = %reader_session_id,
-                            "failed to queue PTY output chunk for coalescing"
+                            receiver_count,
+                            "broadcast filtered PTY output chunk to live subscribers"
                         );
-                        break "pty output processor closed".to_string();
                     }
                 }
                 Err(err)
@@ -738,30 +567,18 @@ pub fn spawn_session(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
+                    if let Ok(mut rt) = runtime_reader.lock() {
+                        rt.output_closed = true;
+                    }
                     warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
-                    break format!("pty reader error: {err}");
+                    if let Err(append_err) =
+                        append_event(&reader_dir, &format!("pty reader error: {err}"))
+                    {
+                        warn!(session_id = %reader_session_id, %append_err, "failed to persist PTY reader error event");
+                    }
+                    break;
                 }
             }
-        };
-
-        let _ = output_tx.send(PtyOutputProcessorEvent::Close);
-        drop(output_tx);
-        if output_processor.join().is_err() {
-            warn!(
-                session_id = %reader_session_id,
-                "PTY output processor thread panicked"
-            );
-        }
-        if let Ok(mut rt) = runtime_reader.lock() {
-            rt.output_closed = true;
-        }
-        debug!(session_id = %reader_session_id, event = %close_event, "PTY reader thread finished");
-        if let Err(err) = append_event(&reader_dir, &close_event) {
-            warn!(
-                session_id = %reader_session_id,
-                %err,
-                "failed to persist PTY reader completion event"
-            );
         }
         debug!(session_id = %reader_session_id, "PTY reader thread stopped");
     });
