@@ -109,6 +109,7 @@ async fn dispatch_request(
         RpcRequest::List { query } => handle_list(query, session_store, db).await?,
         RpcRequest::Start {
             title,
+            tags,
             cmd,
             args,
             cwd,
@@ -120,6 +121,7 @@ async fn dispatch_request(
                 config,
                 session_store,
                 title,
+                tags,
                 cmd,
                 args,
                 cwd,
@@ -219,6 +221,7 @@ async fn handle_start(
     config: &AppConfig,
     session_store: &SessionStoreHandle,
     title: Option<String>,
+    tags: Vec<String>,
     cmd: String,
     args: Vec<String>,
     cwd: Option<String>,
@@ -231,6 +234,7 @@ async fn handle_start(
         config,
         StartSpec {
             title: title.clone(),
+            tags,
             cmd: cmd.clone(),
             args: args.clone(),
             cwd: cwd.clone(),

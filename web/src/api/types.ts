@@ -60,6 +60,7 @@ export function isSessionStatusFilter(value: unknown): value is SessionStatusFil
 export interface SessionSummary {
   id: string
   title: string | null
+  tags: string[]
   command: string
   args: string[]
   pid: number | null
@@ -77,6 +78,7 @@ export interface CreateSessionSpec {
   cmd: string
   args?: string[]
   title?: string
+  tags?: string[]
   cwd?: string
   rows?: number
   cols?: number

@@ -151,6 +151,8 @@ pub enum RpcRequest {
     },
     Start {
         title: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
         cmd: String,
         args: Vec<String>,
         cwd: Option<String>,
@@ -503,6 +505,8 @@ mod tests {
 pub struct SessionSummary {
     pub id: String,
     pub title: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub command: String,
     pub args: Vec<String>,
     pub pid: Option<u32>,

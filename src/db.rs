@@ -49,6 +49,8 @@ impl Database {
             qb.push_bind(needle.clone());
             qb.push(" OR LOWER(COALESCE(title,'')) LIKE ");
             qb.push_bind(needle.clone());
+            qb.push(" OR LOWER(COALESCE(tags,'')) LIKE ");
+            qb.push_bind(needle.clone());
             qb.push(" OR LOWER(command) LIKE ");
             qb.push_bind(needle.clone());
             qb.push(" OR LOWER(args) LIKE ");
@@ -90,6 +92,7 @@ impl Database {
     /// The session directory is derived at runtime as `<sessions_dir>/<id>/`.
     pub async fn insert_session(&self, meta: &SessionMeta) -> Result<()> {
         let args = serde_json::to_string(&meta.args)?;
+        let tags = serde_json::to_string(&meta.tags)?;
         let status = meta.status.as_str();
         let created_at = meta.created_at.to_rfc3339();
         let started_at = meta.started_at.map(|t| t.to_rfc3339());
@@ -97,11 +100,12 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (id, title, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(&meta.id)
         .bind(&meta.title)
+        .bind(&tags)
         .bind(&meta.command)
         .bind(&args)
         .bind(&meta.cwd)
@@ -120,17 +124,19 @@ impl Database {
     /// Update mutable fields of an existing session row.
     pub async fn update_session(&self, meta: &SessionMeta) -> Result<()> {
         let args = serde_json::to_string(&meta.args)?;
+        let tags = serde_json::to_string(&meta.tags)?;
         let status = meta.status.as_str();
         let started_at = meta.started_at.map(|t| t.to_rfc3339());
         let ended_at = meta.ended_at.map(|t| t.to_rfc3339());
 
         sqlx::query(
             "UPDATE sessions \
-             SET title=?1, command=?2, args=?3, cwd=?4, status=?5, pid=?6, \
-                 exit_code=?7, started_at=?8, ended_at=?9 \
-             WHERE id=?10",
+             SET title=?1, tags=?2, command=?3, args=?4, cwd=?5, status=?6, pid=?7, \
+                 exit_code=?8, started_at=?9, ended_at=?10 \
+             WHERE id=?11",
         )
         .bind(&meta.title)
+        .bind(&tags)
         .bind(&meta.command)
         .bind(&args)
         .bind(&meta.cwd)
@@ -167,7 +173,7 @@ impl Database {
     /// Fetch a session's metadata. Returns `None` when the id is not found.
     pub async fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
         let row = sqlx::query(
-            "SELECT id, title, command, args, cwd, status, pid, exit_code, \
+            "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at \
              FROM sessions WHERE id=?1",
         )
@@ -195,7 +201,7 @@ impl Database {
         let offset = query.offset.max(0) as i64;
 
         let mut qb = sqlx::QueryBuilder::new(
-            "SELECT id, title, command, args, cwd, status, pid, exit_code, \
+            "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at \
              FROM sessions WHERE 1=1",
         );
@@ -240,7 +246,7 @@ impl Database {
         }
 
         let mut qb = sqlx::QueryBuilder::new(
-            "SELECT id, title, command, args, cwd, status, pid, exit_code, \
+            "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at \
              FROM sessions
              WHERE status IN (",
@@ -313,25 +319,27 @@ impl Database {
 }
 
 // ---------------------------------------------------------------------------
-// Row mapping helpers (columns 0-10: id…ended_at)
+// Row mapping helpers (columns 0-11: id…ended_at)
 // ---------------------------------------------------------------------------
 
 fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
     let id: String = r.get(0);
     let title: Option<String> = r.get(1);
-    let command: String = r.get(2);
-    let args_json: String = r.get(3);
-    let cwd: Option<String> = r.get(4);
-    let status_str: String = r.get(5);
-    let pid: Option<i64> = r.get(6);
-    let exit_code: Option<i64> = r.get(7);
-    let created_at_str: String = r.get(8);
-    let started_at_str: Option<String> = r.get(9);
-    let ended_at_str: Option<String> = r.get(10);
+    let tags_json: String = r.get(2);
+    let command: String = r.get(3);
+    let args_json: String = r.get(4);
+    let cwd: Option<String> = r.get(5);
+    let status_str: String = r.get(6);
+    let pid: Option<i64> = r.get(7);
+    let exit_code: Option<i64> = r.get(8);
+    let created_at_str: String = r.get(9);
+    let started_at_str: Option<String> = r.get(10);
+    let ended_at_str: Option<String> = r.get(11);
 
     build_meta(
         id,
         title,
+        tags_json,
         command,
         args_json,
         cwd,
@@ -348,6 +356,7 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
 fn build_meta(
     id: String,
     title: Option<String>,
+    tags_json: String,
     command: String,
     args_json: String,
     cwd: Option<String>,
@@ -358,6 +367,7 @@ fn build_meta(
     started_at_str: Option<String>,
     ended_at_str: Option<String>,
 ) -> SessionMeta {
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
     let created_at = parse_dt(&created_at_str).unwrap_or_else(Utc::now);
     let started_at = started_at_str.as_deref().and_then(parse_dt);
@@ -366,6 +376,7 @@ fn build_meta(
     SessionMeta {
         id,
         title,
+        tags,
         command,
         args,
         cwd,
@@ -399,6 +410,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
     SessionSummary {
         id: meta.id.clone(),
         title: meta.title.clone(),
+        tags: meta.tags.clone(),
         command: meta.command.clone(),
         args: meta.args.clone(),
         pid: meta.pid,

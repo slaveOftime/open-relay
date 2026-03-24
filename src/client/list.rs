@@ -140,6 +140,7 @@ fn session_json(session: &SessionSummary) -> Value {
     json!({
         "id": session.id,
         "title": session.title,
+        "tags": session.tags,
         "command": session.command,
         "args": session.args,
         "pid": session.pid,
@@ -243,6 +244,7 @@ mod tests {
         let session = SessionSummary {
             id: "sess-123".to_string(),
             title: Some("demo".to_string()),
+            tags: vec!["prod".to_string()],
             command: "cargo".to_string(),
             args: vec!["test".to_string()],
             pid: Some(42),

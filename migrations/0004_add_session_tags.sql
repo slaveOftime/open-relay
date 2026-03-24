@@ -1,0 +1,1 @@
+ALTER TABLE sessions ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';

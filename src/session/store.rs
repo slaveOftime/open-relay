@@ -18,7 +18,10 @@ use crate::{
     db::Database,
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
-    session::{SessionEvent, SessionEventTx, SessionLiveSummary, mode_tracker::ModeSnapshot},
+    session::{
+        SessionEvent, SessionEventTx, SessionLiveSummary, mode_tracker::ModeSnapshot,
+        normalize_session_tags,
+    },
 };
 
 use super::{
@@ -64,6 +67,7 @@ impl SessionRuntimeSnapshot {
             summary: SessionSummary {
                 id: rt.meta.id.clone(),
                 title: rt.meta.title.clone(),
+                tags: rt.meta.tags.clone(),
                 command: rt.meta.command.clone(),
                 args: rt.meta.args.clone(),
                 pid: rt.meta.pid,
@@ -274,10 +278,12 @@ impl SessionStore {
         let rows = spec.rows.unwrap_or(24).max(1);
         let cols = spec.cols.unwrap_or(80).max(1);
         let created_at = Utc::now();
+        let tags = normalize_session_tags(spec.tags);
 
         let meta = SessionMeta {
             id: id.clone(),
             title: spec.title,
+            tags,
             command: spec.cmd,
             args: spec.args,
             cwd: spec.cwd,
@@ -1096,6 +1102,7 @@ mod tests {
         let meta = SessionMeta {
             id: id.to_string(),
             title: None,
+            tags: vec![],
             command: "sh".to_string(),
             args: vec![],
             cwd: None,
@@ -1545,6 +1552,7 @@ mod tests {
         let meta = SessionMeta {
             id: id.to_string(),
             title: None,
+            tags: vec![],
             command: "sh".to_string(),
             args: vec![],
             cwd: None,
@@ -1634,6 +1642,7 @@ mod tests {
         // Try to start a 2nd session
         let spec = StartSpec {
             title: None,
+            tags: vec![],
             cmd: "echo".into(),
             args: vec![],
             cwd: None,
@@ -1661,6 +1670,7 @@ mod tests {
         let store = SessionStore::new(900, db.clone());
         let spec = StartSpec {
             title: None,
+            tags: vec![],
             cmd: "echo".into(),
             args: vec![],
             cwd: None,
@@ -1683,6 +1693,7 @@ mod tests {
                 &config,
                 StartSpec {
                     title: None,
+                    tags: vec![],
                     cmd: "echo".into(),
                     args: vec![],
                     cwd: None,

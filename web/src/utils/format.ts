@@ -93,6 +93,15 @@ export function sessionDisplayName(s: { command: string; args: string[] }): stri
   return [s.command, ...s.args].map(shellQuote).join(' ').slice(0, 64)
 }
 
+export function sessionPrimaryLabel(s: {
+  title?: string | null
+  command: string
+  args: string[]
+}): string {
+  const title = typeof s.title === 'string' ? s.title.trim() : ''
+  return title || sessionDisplayName(s)
+}
+
 export function commandBaseName(command: string): string {
   const base = command.split(/[/\\]/).pop() ?? command
   return base.replace(/\.(?:exe|cmd|bat|ps1)$/i, '')

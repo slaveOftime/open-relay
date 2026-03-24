@@ -183,6 +183,7 @@ async fn run() -> Result<()> {
         Commands::Start(start_args) => {
             let cli::StartArgs {
                 title,
+                tags,
                 detach,
                 disable_notifications,
                 cwd,
@@ -202,6 +203,7 @@ async fn run() -> Result<()> {
             };
             let inner = RpcRequest::Start {
                 title,
+                tags,
                 cmd,
                 args,
                 cwd,
