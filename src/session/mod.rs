@@ -10,6 +10,7 @@ mod store;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
@@ -45,6 +46,7 @@ impl SessionStatus {
 pub struct SessionMeta {
     pub id: String,
     pub title: Option<String>,
+    pub tags: Vec<String>,
     pub command: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -58,6 +60,7 @@ pub struct SessionMeta {
 
 pub struct StartSpec {
     pub title: Option<String>,
+    pub tags: Vec<String>,
     pub cmd: String,
     pub args: Vec<String>,
     pub cwd: Option<String>,
@@ -118,3 +121,19 @@ pub enum SessionEvent {
 }
 
 pub type SessionEventTx = broadcast::Sender<SessionEvent>;
+
+pub fn normalize_session_tags(tags: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let trimmed = tag.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            normalized.push(trimmed.to_string());
+        }
+    }
+    normalized
+}

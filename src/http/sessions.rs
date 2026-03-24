@@ -233,6 +233,8 @@ pub struct CreateSessionBody {
     pub cmd: String,
     pub args: Option<Vec<String>>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub cwd: Option<String>,
     pub rows: Option<u16>,
     pub cols: Option<u16>,
@@ -250,6 +252,7 @@ pub async fn create(
     if let Some(ref node) = body.node {
         let rpc = RpcRequest::Start {
             title: body.title.clone(),
+            tags: body.tags.clone(),
             cmd: body.cmd.clone(),
             args: body.args.clone().unwrap_or_default(),
             cwd: body.cwd.clone(),
@@ -291,6 +294,7 @@ pub async fn create(
 
     let spec = StartSpec {
         title: body.title.clone(),
+        tags: body.tags.clone(),
         cmd: body.cmd.clone(),
         args: body.args.clone().unwrap_or_default(),
         cwd: body.cwd.clone(),

@@ -145,7 +145,7 @@ export default function SessionDetailPage() {
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
-  const [replaySpeed, _] = useState(0.5)
+  const [replaySpeed] = useState(0.5)
   const [totalChunks, setTotalChunks] = useState(0)
   const [reloadTick, setReloadTick] = useState(0)
   const [isOnline, setIsOnline] = useState(
@@ -816,7 +816,7 @@ export default function SessionDetailPage() {
         return
       }
       const chunks = logChunksRef.current
-      let idx = logReplayStateRef.current.chunkCount
+      const idx = logReplayStateRef.current.chunkCount
       if (idx >= chunks.length) {
         if (nextOffsetRef.current < totalChunksRef.current) {
           if (!isFetchingMoreRef.current) fetchMoreLogsRef.current?.()
@@ -1133,22 +1133,18 @@ export default function SessionDetailPage() {
 
         {/* ── Info bar ── */}
         {session && (
-          <div className="flex items-center gap-x-4 gap-y-0.5 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-xs text-[hsl(var(--muted-foreground))] shrink-0 flex-wrap">
-            <span className="text-[hsl(var(--foreground))] font-mono truncate max-w-[50vw] sm:max-w-none">
-              <span className="inline-flex min-w-0 items-center gap-2">
-                <CommandLogo command={session.command} size={24} />
-                <span className="truncate">{sessionDisplayName(session)}</span>
-              </span>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-xs text-[hsl(var(--muted-foreground))] shrink-0 flex-wrap">
+            <span className="inline-flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))]">
+              <CommandLogo command={session.command} size={24} className='-ml-1.5' />
+              <span className="truncate">{sessionDisplayName(session)}</span>
             </span>
-            {session.cwd && (
-              <span className="hidden sm:inline">
-                CWD: <span className="text-[hsl(var(--foreground))] font-mono">{session.cwd}</span>
-              </span>
-            )}
             {session?.title && (
-              <span className="hidden sm:inline text-sm font-medium text-[hsl(var(--foreground))] truncate max-w-40 sm:max-w-xs">
+              <span className="text-[hsl(var(--foreground))] truncate">
                 {session.title}
               </span>
+            )}
+            {session.cwd && (
+              <span className="text-[hsl(var(--foreground))] truncate">{session.cwd}</span>
             )}
             <span>
               Started:{' '}
@@ -1160,7 +1156,7 @@ export default function SessionDetailPage() {
               </span>
             )}
             {session.pid != null && (
-              <span className="hidden sm:inline">
+              <span>
                 PID: <span className="text-[hsl(var(--foreground))]">{session.pid}</span>
               </span>
             )}

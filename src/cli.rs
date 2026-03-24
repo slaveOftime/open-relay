@@ -188,6 +188,9 @@ pub struct StartArgs {
     /// Title for the session.
     #[arg(long, short = 't')]
     pub title: Option<String>,
+    /// Tag for the session. Repeat to add multiple tags.
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
     /// Start the session detached (in the background).
     #[arg(long, short = 'd')]
     pub detach: bool,
@@ -509,5 +512,27 @@ mod tests {
         assert_eq!(args.description.as_deref(), Some("Build finished"));
         assert_eq!(args.body.as_deref(), Some("Review the deployment logs."));
         assert_eq!(args.node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn start_parses_repeatable_tags() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "start",
+            "--title",
+            "Deploy ready",
+            "--tag",
+            "prod",
+            "--tag",
+            "release",
+            "copilot",
+        ])
+        .unwrap();
+        let Commands::Start(args) = cli.command else {
+            panic!("expected start command");
+        };
+        assert_eq!(args.title.as_deref(), Some("Deploy ready"));
+        assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+        assert_eq!(args.cmd_and_args, vec!["copilot".to_string()]);
     }
 }

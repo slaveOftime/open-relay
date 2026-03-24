@@ -268,6 +268,7 @@ mod tests {
         SessionSummary {
             id: "sess-123".to_string(),
             title: Some("demo".to_string()),
+            tags: vec!["prod".to_string()],
             command: "cargo".to_string(),
             args: vec!["test".to_string()],
             pid: Some(42),

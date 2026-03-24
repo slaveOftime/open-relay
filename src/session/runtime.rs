@@ -661,6 +661,7 @@ mod tests {
         let meta = SessionMeta {
             id: "rt_tst01".to_string(),
             title: None,
+            tags: vec![],
             command: "sh".to_string(),
             args: vec![],
             cwd: None,
@@ -943,6 +944,7 @@ mod tests {
         let meta = SessionMeta {
             id: "rt_release".to_string(),
             title: None,
+            tags: vec![],
             command: "sh".to_string(),
             args: vec![],
             cwd: None,

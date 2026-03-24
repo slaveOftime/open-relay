@@ -88,7 +88,7 @@ const PAGE_SIZE = 15
 const sparklines = new SparklineStore()
 const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
 
-type GroupBy = 'none' | 'cwd' | 'command'
+type GroupBy = 'none' | 'cwd' | 'command' | 'tag'
 
 type SessionPrefs = {
   search: string
@@ -106,6 +106,21 @@ type LoadErrorState = {
 
 function normalizeStatusFilter(value: unknown): SessionStatusFilter {
   return isSessionStatusFilter(value) ? value : 'all'
+}
+
+function matchesStatusFilter(
+  statusFilter: SessionStatusFilter,
+  status: SessionSummary['status']
+): boolean {
+  return statusFilter === 'all' || status === statusFilter
+}
+
+function filterSessionsByStatus(
+  items: SessionSummary[],
+  statusFilter: SessionStatusFilter
+): SessionSummary[] {
+  if (statusFilter === 'all') return items
+  return items.filter((item) => matchesStatusFilter(statusFilter, item.status))
 }
 
 function isTerminalStatus(status: SessionSummary['status']): boolean {
@@ -145,7 +160,7 @@ function loadSessionPrefs(): SessionPrefs {
       search: typeof parsed.search === 'string' ? parsed.search : defaults.search,
       statusFilter: normalizeStatusFilter(parsed.statusFilter),
       groupBy:
-        groupBy === 'none' || groupBy === 'cwd' || groupBy === 'command'
+        groupBy === 'none' || groupBy === 'cwd' || groupBy === 'command' || groupBy === 'tag'
           ? groupBy
           : defaults.groupBy,
       node: normalizeStoredNode(node) ?? defaults.node,
@@ -240,6 +255,61 @@ function updateSparklineForNotification(notification: SessionNotificationData) {
   })
 }
 
+function normalizeSessionTags(tags: string[]): string[] {
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  for (const tag of tags) {
+    const trimmed = tag.trim()
+    if (trimmed === '') continue
+    const key = trimmed.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    normalized.push(trimmed)
+  }
+  return normalized
+}
+
+function parseSessionTagInput(input: string): string[] {
+  return normalizeSessionTags(input.split(/[,\n]/))
+}
+
+function formatSessionTagInput(tags: string[]): string {
+  return normalizeSessionTags(tags).join(', ')
+}
+
+function SessionTagList({
+  tags,
+  className = '',
+  emptyLabel = null,
+}: {
+  tags: string[]
+  className?: string
+  emptyLabel?: string | null
+}) {
+  const normalizedTags = normalizeSessionTags(tags)
+  if (normalizedTags.length === 0) {
+    if (emptyLabel === null) return null
+    return <span className="text-xs text-[hsl(var(--muted-foreground))]">{emptyLabel}</span>
+  }
+
+  return (
+    <div className={`flex min-w-0 flex-wrap items-center gap-1.5 ${className}`.trim()}>
+      {normalizedTags.map((tag) => (
+        <Badge
+          key={tag}
+          variant="outline"
+          className="max-w-full border-emerald-500/25 bg-emerald-500/10 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
+        >
+          <span className="text-[9px] font-bold leading-none text-emerald-500 dark:text-emerald-300">
+            #
+          </span>
+          <span className="truncate">{tag}</span>
+        </Badge>
+      ))}
+    </div>
+  )
+}
+
 function SessionNotificationButton({
   enabled,
   disabled,
@@ -323,6 +393,18 @@ function GroupHeaderLabel({
   keyLabel: string
   items: SessionSummary[]
 }) {
+  if (groupBy === 'tag') {
+    return keyLabel === '(untagged)' ? (
+      <>{keyLabel}</>
+    ) : (
+      <Badge
+        variant="outline"
+        className="border-[hsl(var(--border))] px-2 py-0 text-[10px] font-medium text-[hsl(var(--muted-foreground))]"
+      >
+        {keyLabel}
+      </Badge>
+    )
+  }
   if (groupBy !== 'command') return <>{keyLabel}</>
   const groupCommand = items[0]?.command ?? keyLabel
   return (
@@ -400,9 +482,14 @@ function SessionRow({
 
         {/* Title */}
         <TableCell className="px-3 py-2.5 truncate max-w-0">
-          <span className="text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            {session.title}
+          <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+            {session.title?.trim() || '—'}
           </span>
+        </TableCell>
+
+        {/* Tags */}
+        <TableCell className="px-3 py-2 max-w-0 align-middle">
+          <SessionTagList tags={session.tags} emptyLabel="—" />
         </TableCell>
 
         {/* CMD */}
@@ -588,30 +675,26 @@ function SessionCard({
           {/* Row 2: title */}
           <Button
             variant="ghost"
-            className="w-full text-left h-auto py-0.5 justify-start -mx-1 px-1"
+            className="w-full text-left h-auto py-0.5 justify-start -mx-1 px-1 overflow-hidden"
             onClick={() => openSession(isRunning ? 'attach' : 'logs')}
           >
-            <span className="flex flex-col items-start w-full">
+            <span className="flex flex-col gap-0.5 items-start w-full">
               {session.title && (
                 <span className={`block text-sm font-medium truncate leading-snug ${titleTone}`}>
                   {session.title}
                 </span>
               )}
               <span
-                className={`flex min-w-0 items-center gap-2 text-base font-medium leading-snug ${titleTone}`}
+                className={`flex min-w-0 items-center gap-2 text-base font-medium truncate ${titleTone}`}
               >
                 <CommandLogo command={session.command} size={24} />
-                <span className="truncate">
-                  {session.command} {session.args ? session.args.join(' ') : ''}
-                </span>
+                <span>{sessionDisplayName(session)}</span>
               </span>
             </span>
           </Button>
-
           {/* Row 3: cwd */}
           {session.cwd && (
             <div className="flex items-center gap-2">
-              <ArchiveIcon className="w-3.5 h-3.5 text-[hsl(var(--muted-foreground))] shrink-0" />
               <Tooltip>
                 <TooltipTrigger asChild>
                   <span className="text-sm text-[hsl(var(--muted-foreground))] font-mono truncate">
@@ -620,6 +703,15 @@ function SessionCard({
                 </TooltipTrigger>
                 <TooltipContent>{session.cwd}</TooltipContent>
               </Tooltip>
+            </div>
+          )}
+
+          {session.tags.length > 0 && (
+            <div className="flex items-start gap-2 rounded-lg border border-neutral-500/20 bg-neutral-500/8 px-2 py-1.5">
+              <span className="pt-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
+                Tags
+              </span>
+              <SessionTagList tags={session.tags} className="flex-1" />
             </div>
           )}
 
@@ -680,9 +772,8 @@ function SessionCard({
             pending={notificationsPending}
             onToggle={() => onToggleNotifications(session)}
           />
-          <Button variant="ghost" size="sm" onClick={() => openSession('logs')}>
+          <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
             <FileTextIcon className="h-4 w-4" />
-            Logs
           </Button>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -780,7 +871,13 @@ function ConfirmActionDialog({
 
 // ── New Session Dialog ─────────────────────────────────────────────────────
 
-type NewSessionInitialValues = { cmd: string; args: string; title: string; cwd: string }
+type NewSessionInitialValues = {
+  cmd: string
+  args: string
+  title: string
+  tags: string
+  cwd: string
+}
 
 function NewSessionDialog({
   open,
@@ -797,6 +894,7 @@ function NewSessionDialog({
   const [cmd, setCmd] = useState('')
   const [args, setArgs] = useState('')
   const [title, setTitle] = useState('')
+  const [tags, setTags] = useState('')
   const [cwd, setCwd] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -806,6 +904,7 @@ function NewSessionDialog({
       setCmd(initialValues.cmd)
       setArgs(initialValues.args)
       setTitle(initialValues.title)
+      setTags(initialValues.tags)
       setCwd(initialValues.cwd)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -824,6 +923,7 @@ function NewSessionDialog({
         cmd: cmd.trim(),
         args: argList,
         title: title.trim() || undefined,
+        tags: parseSessionTagInput(tags),
         cwd: cwd.trim() || undefined,
         node: node ?? undefined,
       })
@@ -840,6 +940,7 @@ function NewSessionDialog({
     setCmd('')
     setArgs('')
     setTitle('')
+    setTags('')
     setCwd('')
     setError(null)
   }
@@ -905,6 +1006,19 @@ function NewSessionDialog({
                 placeholder="Optional display name"
               />
             </Form.Control>
+          </Form.Field>
+          <Form.Field name="tags" className="flex flex-col gap-1.5">
+            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Tags</Form.Label>
+            <Form.Control asChild>
+              <Input
+                value={tags}
+                onChange={(e) => setTags(e.target.value)}
+                placeholder="prod, release"
+              />
+            </Form.Control>
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              Separate tags with commas.
+            </p>
           </Form.Field>
           <Form.Field name="cwd" className="flex flex-col gap-1.5">
             <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
@@ -1025,19 +1139,25 @@ export default function SessionsPage() {
     setSeriesMap((prev) => new Map(Array.from(prev.keys(), (id) => [id, sparklines.getSeries(id)])))
   }, [])
 
-  const applyLoadedSessionSnapshot = useCallback((items: SessionSummary[]) => {
-    const itemsById = new Map(items.map((session) => [session.id, session]))
-    setSessions((prev) => {
-      let changed = false
-      const next = prev.map((session) => {
-        const updated = itemsById.get(session.id)
-        if (!updated) return session
-        changed = true
-        return updated
+  const applyLoadedSessionSnapshot = useCallback(
+    (items: SessionSummary[]) => {
+      const filteredItems = filterSessionsByStatus(items, statusFilter)
+      const itemsById = new Map(filteredItems.map((session) => [session.id, session]))
+      setSessions((prev) => {
+        const next = prev
+          .filter((session) => itemsById.has(session.id))
+          .map((session) => itemsById.get(session.id) ?? session)
+        if (
+          next.length === prev.length &&
+          next.every((session, index) => session === prev[index])
+        ) {
+          return prev
+        }
+        return next
       })
-      return changed ? next : prev
-    })
-  }, [])
+    },
+    [statusFilter]
+  )
 
   const replaceLoadedSession = useCallback((session: SessionSummary) => {
     setSessions((prev) => {
@@ -1264,6 +1384,11 @@ export default function SessionsPage() {
         if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         updateSparklineForSession(ev.data)
         refreshRenderedSparklines()
+        if (!matchesStatusFilter(statusFilter, ev.data.status)) {
+          removeLoadedSession(ev.data.id)
+          void reloadSessions({ background: true })
+          return
+        }
         replaceLoadedSession(ev.data)
         return
       }
@@ -1295,6 +1420,7 @@ export default function SessionsPage() {
     reloadSessions,
     refreshRenderedSparklines,
     selectedNode,
+    statusFilter,
   ])
 
   const pagedSessions = sessions
@@ -1314,6 +1440,17 @@ export default function SessionsPage() {
         const k = cwdBasename(s.cwd) || '(no cwd)'
         if (!map.has(k)) map.set(k, [])
         map.get(k)!.push(s)
+      }
+      return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
+    }
+    if (groupBy === 'tag') {
+      const map = new Map<string, SessionSummary[]>()
+      for (const s of pagedSessions) {
+        const tags = s.tags.length > 0 ? s.tags : ['(untagged)']
+        for (const tag of tags) {
+          if (!map.has(tag)) map.set(tag, [])
+          map.get(tag)!.push(s)
+        }
       }
       return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
     }
@@ -1505,7 +1642,7 @@ export default function SessionsPage() {
               onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
-              <span className="truncate">{pageTitle}</span>
+              <span className="truncate uppercase">{pageTitle}</span>
             </div>
             <div className="flex-1 min-w-0" />
             <Button
@@ -1571,8 +1708,9 @@ export default function SessionsPage() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">No grouping</SelectItem>
-                    <SelectItem value="cwd">Group by CWD</SelectItem>
-                    <SelectItem value="command">Group by CMD</SelectItem>
+                    <SelectItem value="tag">Tag</SelectItem>
+                    <SelectItem value="command">Command</SelectItem>
+                    <SelectItem value="cwd">Current working directory</SelectItem>
                   </SelectContent>
                 </Select>
                 {statusFilterView}
@@ -1665,8 +1803,9 @@ export default function SessionsPage() {
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="none">No grouping</SelectItem>
-                <SelectItem value="cwd">Group by CWD</SelectItem>
-                <SelectItem value="command">Group by agent</SelectItem>
+                <SelectItem value="tag">Tag</SelectItem>
+                <SelectItem value="command">Command</SelectItem>
+                <SelectItem value="cwd">Current working directory</SelectItem>
               </SelectContent>
             </Select>
 
@@ -1764,14 +1903,15 @@ export default function SessionsPage() {
             <Table className="w-full border-collapse table-fixed">
               <colgroup>
                 <col style={{ width: '5rem' }} />
-                <col style={{ width: 'fit' }} />
-                <col style={{ width: 'fit' }} />
+                <col style={{ width: '12rem' }} />
+                <col style={{ width: '12rem' }} />
+                <col style={{ width: '14rem' }} />
                 <col style={{ width: 'auto' }} />
                 <col style={{ width: '8rem' }} />
                 <col style={{ width: '10rem' }} />
                 <col style={{ width: '6rem' }} />
-                <col style={{ width: '4rem' }} />
-                <col style={{ width: 'fit' }} />
+                <col style={{ width: '5rem' }} />
+                <col style={{ width: '11rem' }} />
               </colgroup>
               <TableHeader>
                 <TableRow>
@@ -1779,6 +1919,7 @@ export default function SessionsPage() {
                     [
                       { key: 'id', label: 'ID', sortField: SessionSortField.Id },
                       { key: 'title', label: 'Title', sortField: SessionSortField.Title },
+                      { key: 'tags', label: 'Tags', sortField: undefined },
                       {
                         key: 'command',
                         label: 'Command',
@@ -1825,7 +1966,7 @@ export default function SessionsPage() {
                     {groupBy !== 'none' && key && (
                       <TableRow>
                         <TableCell
-                          colSpan={8}
+                          colSpan={10}
                           className="px-3 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-[hsl(var(--border))]"
                         >
                           <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
@@ -1904,6 +2045,7 @@ export default function SessionsPage() {
                     .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
                     .join(' '),
                   title: rerunSession.title ?? '',
+                  tags: formatSessionTagInput(rerunSession.tags),
                   cwd: rerunSession.cwd ?? '',
                 }
               : undefined
