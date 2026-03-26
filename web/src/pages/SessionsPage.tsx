@@ -658,7 +658,7 @@ function SessionCard({
       <Card
         className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
-        <CardContent className="px-3 pt-3 pb-3 flex flex-col gap-2">
+        <CardContent className="px-3 pt-3 pb-3 flex flex-col gap-1">
           {/* Row 1: id, status, pid, created at */}
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold">
@@ -674,21 +674,21 @@ function SessionCard({
           {/* Row 2: title */}
           <Button
             variant="ghost"
-            className="w-full text-left h-auto py-0.5 justify-start -mx-1 px-1 overflow-hidden"
+            className="w-full text-left h-auto py-1 justify-start -mx-1 px-1 overflow-hidden"
             onClick={() => openSession(isRunning ? 'attach' : 'logs')}
           >
-            <span className="flex flex-col gap-0.5 items-start w-full">
-              {session.title && (
-                <span className={`block text-sm font-medium truncate leading-snug ${titleTone}`}>
-                  {session.title}
-                </span>
-              )}
+            <span className="flex flex-col gap-1 items-start w-full">
               <span
                 className={`flex min-w-0 items-center gap-2 text-base font-medium truncate ${titleTone}`}
               >
                 <CommandLogo command={session.command} size={24} />
                 <span>{sessionDisplayName(session)}</span>
               </span>
+              {session.title && (
+                <span className={`block text-sm font-medium truncate leading-snug ${titleTone}`}>
+                  {session.title}
+                </span>
+              )}
             </span>
           </Button>
           {/* Row 3: cwd */}
@@ -706,10 +706,7 @@ function SessionCard({
           )}
 
           {session.tags.length > 0 && (
-            <div className="flex items-start gap-2 rounded-lg border border-neutral-500/20 bg-neutral-500/8 px-2 py-1.5">
-              <span className="pt-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-[hsl(var(--muted-foreground))]">
-                Tags
-              </span>
+            <div className="flex items-start gap-2">
               <SessionTagList tags={session.tags} className="flex-1" />
             </div>
           )}
