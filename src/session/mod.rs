@@ -1,4 +1,5 @@
 pub(crate) mod cursor_tracker;
+pub(crate) mod file;
 pub mod logs;
 pub(crate) mod mode_tracker;
 pub(crate) mod persist;

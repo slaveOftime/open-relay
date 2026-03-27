@@ -7,7 +7,7 @@ pub mod ws;
 
 use axum::{
     Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -98,6 +98,10 @@ pub async fn serve(state: AppState) {
         .route("/api/sessions/{id}/stop", post(sessions::stop_session))
         .route("/api/sessions/{id}/kill", post(sessions::kill_session))
         .route("/api/sessions/{id}/input", post(sessions::send_input))
+        .route(
+            "/api/sessions/{id}/upload",
+            post(sessions::upload_file).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
         .route("/api/sessions/{id}/logs", get(sessions::get_logs))
         .route("/api/sessions/{id}/attach", get(ws::attach_handler))
         .route("/api/nodes", get(nodes::list_nodes))

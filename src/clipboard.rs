@@ -7,9 +7,12 @@ use std::{
 use crate::{
     config::AppConfig,
     error::{AppError, Result},
+    session::file::{
+        ensure_session_files_dir, unique_path, unique_path_for_name, write_session_upload_path,
+    },
 };
 
-pub fn collect_clipboard_paste(
+pub fn handle_clipboard_paste(
     config: &AppConfig,
     id: &str,
     ignore_text: bool,
@@ -18,7 +21,12 @@ pub fn collect_clipboard_paste(
         let files_dir = ensure_session_files_dir(config, id)?;
         let mut saved_paths = Vec::with_capacity(paths.len());
         for source_path in paths {
-            saved_paths.push(copy_clipboard_path_into_session(&source_path, &files_dir)?);
+            saved_paths.push(copy_clipboard_path_into_session(
+                config,
+                id,
+                &source_path,
+                &files_dir,
+            )?);
         }
 
         return Ok(Some(format_saved_paths(&saved_paths)));
@@ -35,6 +43,60 @@ pub fn collect_clipboard_paste(
     }
 
     read_clipboard_text()
+}
+
+pub enum RemoteClipboardTransfer {
+    Text(String),
+    Files(Vec<RemoteClipboardFile>),
+}
+
+pub struct RemoteClipboardFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
+pub fn collect_remote_clipboard_transfer(
+    ignore_text: bool,
+) -> Result<Option<RemoteClipboardTransfer>> {
+    if let Some(paths) = read_clipboard_files()? {
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            if path.is_dir() {
+                return Err(AppError::Protocol(format!(
+                    "remote clipboard directory paste is not supported yet: {}",
+                    path.display()
+                )));
+            }
+
+            let file_name = path.file_name().ok_or_else(|| {
+                AppError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("clipboard path has no file name: {}", path.display()),
+                ))
+            })?;
+            files.push(RemoteClipboardFile {
+                name: file_name.to_string_lossy().to_string(),
+                bytes: fs::read(&path)?,
+            });
+        }
+
+        return Ok(Some(RemoteClipboardTransfer::Files(files)));
+    }
+
+    if let Some(image) = read_clipboard_image()? {
+        return Ok(Some(RemoteClipboardTransfer::Files(vec![
+            RemoteClipboardFile {
+                name: format!("clipboard-image-{}.png", timestamp_millis()),
+                bytes: encode_clipboard_image_png(image)?,
+            },
+        ])));
+    }
+
+    if ignore_text {
+        return Ok(None);
+    }
+
+    Ok(read_clipboard_text()?.map(RemoteClipboardTransfer::Text))
 }
 
 fn read_clipboard_files() -> Result<Option<Vec<PathBuf>>> {
@@ -55,7 +117,7 @@ fn read_clipboard_files() -> Result<Option<Vec<PathBuf>>> {
     }
 }
 
-fn read_clipboard_text() -> Result<Option<String>> {
+pub fn read_clipboard_text() -> Result<Option<String>> {
     let Some(mut clipboard) = try_open_clipboard() else {
         return Ok(None);
     };
@@ -105,12 +167,6 @@ fn try_open_clipboard() -> Option<arboard::Clipboard> {
     arboard::Clipboard::new().ok()
 }
 
-fn ensure_session_files_dir(config: &AppConfig, id: &str) -> Result<PathBuf> {
-    let files_dir = config.sessions_dir.join(id).join("files");
-    fs::create_dir_all(&files_dir)?;
-    Ok(files_dir)
-}
-
 fn format_saved_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -121,41 +177,37 @@ fn format_saved_paths(paths: &[PathBuf]) -> String {
 
 fn save_clipboard_image(files_dir: &Path, image: ClipboardImage) -> Result<PathBuf> {
     let file_path = unique_path(files_dir, "clipboard-image", "png");
-    let Some(image_buffer) = image::RgbaImage::from_raw(image.width, image.height, image.bytes)
-    else {
-        return Err(AppError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "clipboard image buffer did not match reported dimensions",
-        )));
-    };
-
-    image_buffer
-        .save_with_format(&file_path, image::ImageFormat::Png)
-        .map_err(|err| {
-            AppError::Io(io::Error::other(format!(
-                "failed to save clipboard image: {err}"
-            )))
-        })?;
+    fs::write(&file_path, encode_clipboard_image_png(image)?)?;
 
     Ok(file_path)
 }
 
-fn copy_clipboard_path_into_session(source_path: &Path, files_dir: &Path) -> Result<PathBuf> {
+fn copy_clipboard_path_into_session(
+    config: &AppConfig,
+    id: &str,
+    source_path: &Path,
+    files_dir: &Path,
+) -> Result<PathBuf> {
     let file_name = source_path.file_name().ok_or_else(|| {
         AppError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("clipboard path has no file name: {}", source_path.display()),
         ))
     })?;
-    let target_path = unique_path_for_name(files_dir, file_name);
 
     if source_path.is_dir() {
+        let target_path = unique_path_for_name(files_dir, file_name);
         copy_dir_recursive(source_path, &target_path)?;
-    } else {
-        fs::copy(source_path, &target_path)?;
+        return Ok(target_path);
     }
 
-    Ok(target_path)
+    write_session_upload_path(
+        config,
+        id,
+        Path::new(file_name),
+        &fs::read(source_path)?,
+        true,
+    )
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
@@ -176,38 +228,34 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn unique_path(files_dir: &Path, stem: &str, extension: &str) -> PathBuf {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    unique_path_for_name(files_dir, format!("{stem}-{timestamp}.{extension}"))
+fn encode_clipboard_image_png(image: ClipboardImage) -> Result<Vec<u8>> {
+    let Some(image_buffer) = image::RgbaImage::from_raw(image.width, image.height, image.bytes)
+    else {
+        return Err(AppError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "clipboard image buffer did not match reported dimensions",
+        )));
+    };
+
+    let mut png_bytes = Vec::new();
+    image_buffer
+        .write_to(
+            &mut io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
+        .map_err(|err| {
+            AppError::Io(io::Error::other(format!(
+                "failed to save clipboard image: {err}"
+            )))
+        })?;
+    Ok(png_bytes)
 }
 
-fn unique_path_for_name(files_dir: &Path, file_name: impl AsRef<Path>) -> PathBuf {
-    let file_name = file_name.as_ref();
-    let stem = file_name
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("clipboard");
-    let extension = file_name.extension().and_then(|value| value.to_str());
-
-    let mut candidate = match extension {
-        Some(extension) => files_dir.join(format!("{stem}.{extension}")),
-        None => files_dir.join(stem),
-    };
-    let mut suffix = 1usize;
-
-    while candidate.exists() {
-        candidate = match extension {
-            Some(extension) => files_dir.join(format!("{stem}-{suffix}.{extension}")),
-            None => files_dir.join(format!("{stem}-{suffix}")),
-        };
-        suffix += 1;
-    }
-
-    candidate
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 struct ClipboardImage {

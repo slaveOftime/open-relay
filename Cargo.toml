@@ -23,7 +23,7 @@ opt-level = "z"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "net", "sync"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "net", "sync", "fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"
@@ -41,7 +41,7 @@ thiserror = "2.0"
 crossterm = "0.29"
 vt100 = "0.16.2"
 which = "8"
-axum = { version = "0.8", features = ["ws", "macros"] }
+axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "compression-br", "compression-gzip"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"

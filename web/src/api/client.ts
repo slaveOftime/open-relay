@@ -42,7 +42,10 @@ export function clearToken(): void {
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const token = getToken()
   const headers = new Headers(init?.headers)
-  headers.set('Content-Type', 'application/json')
+  const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData
+  if (!isFormData && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
   if (token) {
     headers.set('Authorization', `Bearer ${token}`)
   }
@@ -181,6 +184,26 @@ export function sendInput(id: string, data: string, node?: string): Promise<{ ok
   return req(`${BASE}/sessions/${id}/input${q}`, {
     method: 'POST',
     body: JSON.stringify({ data }),
+  })
+}
+
+export interface UploadSessionFileResponse {
+  ok: boolean
+  path: string
+  bytes: number
+}
+
+export function uploadSessionFile(
+  id: string,
+  file: File,
+  node?: string
+): Promise<UploadSessionFileResponse> {
+  const q = node ? `?node=${encodeURIComponent(node)}` : ''
+  const body = new FormData()
+  body.set('file', file, file.name)
+  return req<UploadSessionFileResponse>(`${BASE}/sessions/${id}/upload${q}`, {
+    method: 'POST',
+    body,
   })
 }
 

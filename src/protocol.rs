@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -180,6 +180,14 @@ pub enum RpcRequest {
         id: String,
         data: String,
     },
+    UploadFile {
+        id: String,
+        path: String,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+        #[serde(default)]
+        dedupe: bool,
+    },
     AttachResize {
         id: String,
         rows: u16,
@@ -258,6 +266,7 @@ impl RpcRequest {
             RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
+            RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
@@ -345,6 +354,10 @@ pub enum RpcResponse {
         total: usize,
         #[serde(default)]
         resizes: Vec<LogResize>,
+    },
+    UploadFile {
+        path: String,
+        bytes: usize,
     },
     Ack,
     Error {

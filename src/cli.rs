@@ -550,15 +550,7 @@ mod tests {
 
     #[test]
     fn list_parses_repeatable_tag_filters() {
-        let cli = Cli::try_parse_from([
-            "oly",
-            "ls",
-            "--tag",
-            "prod",
-            "--tag",
-            "release",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["oly", "ls", "--tag", "prod", "--tag", "release"]).unwrap();
         let Commands::List(args) = cli.command else {
             panic!("expected list command");
         };
