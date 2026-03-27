@@ -142,7 +142,7 @@ impl NotificationEvent {
         let session_ids = source_session_id.into_iter().collect::<Vec<_>>();
         let navigation_url = session_ids
             .first()
-            .map(|session_id| session_navigation_url(session_id));
+            .map(|session_id| format!("{}?mode=attach", session_navigation_url(&session_id)));
 
         Self {
             kind: NotificationKind::Manual,
