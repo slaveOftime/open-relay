@@ -25,7 +25,7 @@ opt-level = "z"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "net", "sync"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"
 interprocess = { version = "2.4", features = ["tokio"] }
 portable-pty = "0.9"
