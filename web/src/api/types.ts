@@ -71,7 +71,7 @@ export interface SessionSummary {
   input_needed: boolean
   notifications_enabled: boolean
   node?: string | null
-  total_bytes: number
+  last_total_bytes: number
 }
 
 export interface CreateSessionSpec {

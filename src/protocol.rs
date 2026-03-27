@@ -520,7 +520,8 @@ pub struct SessionSummary {
     #[serde(default)]
     pub notifications_enabled: bool,
     pub node: Option<String>,
-    pub total_bytes: u64,
+    pub last_total_bytes: u64,
+    pub last_output_epoch: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

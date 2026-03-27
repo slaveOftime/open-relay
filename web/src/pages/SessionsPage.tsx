@@ -235,7 +235,7 @@ function fetchSessionsOnce(params: ListParams) {
 
 function buildSeriesMap(items: SessionSummary[]) {
   items.forEach((session) => {
-    sparklines.recordTotal(session.id, session.total_bytes)
+    sparklines.recordTotal(session.id, session.last_total_bytes)
   })
   return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
 }
@@ -245,7 +245,7 @@ function syncSeriesMap(items: SessionSummary[]) {
 }
 
 function updateSparklineForSession(session: SessionSummary) {
-  sparklines.recordTotal(session.id, session.total_bytes)
+  sparklines.recordTotal(session.id, session.last_total_bytes)
 }
 
 function updateSparklineForNotification(notification: SessionNotificationData) {

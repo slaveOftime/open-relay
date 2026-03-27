@@ -421,7 +421,8 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         input_needed,
         notifications_enabled: false,
         node: None,
-        total_bytes,
+        last_total_bytes: total_bytes,
+        last_output_epoch: None,
     }
 }
 

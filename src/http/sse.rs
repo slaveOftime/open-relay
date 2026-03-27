@@ -46,7 +46,7 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
             input_needed: value.summary.input_needed,
             notifications_enabled: value.summary.notifications_enabled,
             last_output_at: value.last_output_at,
-            last_total_bytes: value.summary.total_bytes,
+            last_total_bytes: value.summary.last_total_bytes,
         }
     }
 }
@@ -279,7 +279,8 @@ mod tests {
             input_needed: true,
             notifications_enabled: false,
             node: None,
-            total_bytes: 0,
+            last_total_bytes: 0,
+            last_output_epoch: None,
         }
     }
 

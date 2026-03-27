@@ -272,7 +272,7 @@ mod tests {
         assert_eq!(event.session_ids, vec!["session-123".to_string()]);
         assert_eq!(
             event.navigation_url.as_deref(),
-            Some("/session/session-123")
+            Some("/session/session-123?mode=attach")
         );
     }
 }

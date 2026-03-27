@@ -129,7 +129,7 @@ fn print_session_row(
         .unwrap_or_else(|| "-".to_string());
     let created = format_created_at_local(session.created_at);
     let input = truncate_display_value(input_required_label(session.input_needed), input_width);
-    let output = &session.total_bytes.to_string();
+    let output = &session.last_total_bytes.to_string();
     println!(
         "{:<7} {:<9} {:<8} {:<12} {:<12} {:<6} {:<6} {:<21} {:<12} {}",
         session.id, session.status, input, output, command, age, pid, created, title, args
@@ -149,7 +149,7 @@ fn session_json(session: &SessionSummary) -> Value {
         "created_at": format_created_at_local(session.created_at),
         "cwd": session.cwd,
         "input_needed": session.input_needed,
-        "last_total_bytes": session.total_bytes,
+        "last_total_bytes": session.last_total_bytes,
     })
 }
 
@@ -255,7 +255,8 @@ mod tests {
             input_needed: true,
             notifications_enabled: false,
             node: None,
-            total_bytes: 4096,
+            last_total_bytes: 4096,
+            last_output_epoch: None,
         };
 
         let value = session_json(&session);
