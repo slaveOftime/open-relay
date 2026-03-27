@@ -82,7 +82,11 @@ pub enum Commands {
 }
 
 #[derive(Debug, Args)]
-pub struct SkillArgs {}
+pub struct SkillArgs {
+    /// Skill about how to create oly app.
+    #[arg(long)]
+    pub apps: bool,
+}
 
 #[derive(Debug, Args)]
 pub struct DaemonArgs {
