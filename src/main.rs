@@ -178,6 +178,7 @@ async fn run() -> Result<()> {
                 .await
             }
             DaemonCommand::Stop(stop_args) => daemon::stop(config, stop_args.grace).await,
+            DaemonCommand::Status => daemon::status(config).await,
         },
 
         Commands::List(list_args) => {

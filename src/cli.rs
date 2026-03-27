@@ -100,6 +100,8 @@ pub enum DaemonCommand {
     Start(DaemonStartArgs),
     /// Gracefully shut down the running daemon.
     Stop(DaemonStopArgs),
+    /// Status of the running daemon.
+    Status,
 }
 
 #[derive(Debug, Args)]

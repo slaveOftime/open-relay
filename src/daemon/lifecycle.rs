@@ -34,6 +34,14 @@ pub struct DaemonGuard {
     config: Arc<AppConfig>,
 }
 
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = storage::remove_file_if_exists(&self.config.lock_file);
+        let _ = storage::remove_file_if_exists(&self.config.info_file);
+        let _ = storage::remove_file_if_exists(&self.config.socket_file);
+    }
+}
+
 fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
     if let Ok(filter) = std::env::var("RUST_LOG") {
         return tracing_subscriber::EnvFilter::try_new(filter)
@@ -42,13 +50,6 @@ fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
 
     tracing_subscriber::EnvFilter::try_new(config.log_level.as_str())
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
-}
-
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        let _ = storage::remove_file_if_exists(&self.config.lock_file);
-        let _ = storage::remove_file_if_exists(&self.config.socket_file);
-    }
 }
 
 async fn daemon_is_healthy(config: &AppConfig) -> bool {
@@ -165,11 +166,39 @@ pub async fn start(
     if detach && !foreground_internal {
         spawn_detached(no_auth, no_http, auth_hash.as_deref(), config.http_port)?;
         wait_for_daemon_ready(&config, std::time::Duration::from_secs(60)).await?;
+
+        println!("Daemon started in background.");
         print_detached_start_summary(&config, no_http, no_auth);
         return Ok(());
     }
 
     run_foreground(config, auth_hash, no_http).await
+}
+
+pub async fn status(config: AppConfig) -> Result<()> {
+    if !daemon_is_healthy(&config).await {
+        eprintln!("Daemon is not running.");
+        return Ok(());
+    }
+    
+    println!("Daemon is running...");
+
+    let (no_http, no_auth, started_at) = storage::read_daemon_info(&config.info_file)?
+        .map(|i| (i.no_http, i.no_auth, Some(i.started_at)))
+        .unwrap_or((false, false, None));
+
+    if let Some(started_at) = started_at {
+        println!("Started at:   {}", format_status_timestamp(&started_at));
+    }
+
+    print_detached_start_summary(&config, no_http, no_auth);
+    Ok(())
+}
+
+fn format_status_timestamp(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
+        .unwrap_or_else(|_| value.to_string())
 }
 
 fn print_detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) {
@@ -178,16 +207,14 @@ fn print_detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool
 
 fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "Daemon started in background.");
-    let _ = writeln!(out);
 
     if no_http {
-        let _ = writeln!(out, "  HTTP:         disabled (--no-http)");
+        let _ = writeln!(out, "HTTP:         disabled (--no-http)");
     } else {
-        let _ = writeln!(out, "  Web UI/API:   http://127.0.0.1:{}", config.http_port);
+        let _ = writeln!(out, "HTTP:         http://127.0.0.1:{}", config.http_port);
         let _ = writeln!(
             out,
-            "  Auth:         {}",
+            "Auth:         {}",
             if no_auth {
                 "disabled (--no-auth)"
             } else {
@@ -196,17 +223,13 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
         );
     }
 
-    let _ = writeln!(out, "  Root:         {}", config.state_dir.display());
+    let _ = writeln!(out, "ROOT:         {}", config.state_dir.display());
     let _ = writeln!(
         out,
-        "  Logs:         {}",
+        "LOGS:         {}",
         config.state_dir.join("logs").display()
     );
-    let _ = writeln!(out, "  Sessions:     {}", config.sessions_dir.display());
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Tips:");
-    let _ = writeln!(out, "  Stop daemon:      oly daemon stop");
-    let _ = writeln!(out, "  Create a session: oly start --detach <cmd>");
+    let _ = writeln!(out, "SESSIONS:     {}", config.sessions_dir.display());
     out
 }
 
@@ -317,6 +340,16 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let lock = acquire_daemon_start_lock(&config).await?;
 
     storage::write_pid(&config.lock_file, std::process::id())?;
+
+    let no_auth = auth_hash.is_none();
+    storage::write_daemon_info(
+        &config.info_file,
+        &storage::DaemonInfo {
+            no_http,
+            no_auth,
+            started_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
 
     let _guard = DaemonGuard {
         _lock: lock,
@@ -512,7 +545,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 mod tests {
     use std::path::PathBuf;
 
-    use super::detached_start_summary;
+    use super::{detached_start_summary, format_status_timestamp};
     use crate::config::AppConfig;
 
     fn test_config() -> AppConfig {
@@ -530,6 +563,7 @@ mod tests {
             sessions_dir: state_dir.join("sessions"),
             db_file: state_dir.join("oly.db"),
             lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
             socket_name: "test.sock".to_string(),
             socket_file: state_dir.join("daemon.sock"),
             silence_seconds: 10,
@@ -544,17 +578,14 @@ mod tests {
         let config = test_config();
         let summary = detached_start_summary(&config, false, true);
 
-        assert!(summary.contains("Daemon started in background."));
-        assert!(summary.contains("Web UI/API:   http://127.0.0.1:15443"));
+        assert!(summary.contains("HTTP:         http://127.0.0.1:15443"));
         assert!(summary.contains("Auth:         disabled (--no-auth)"));
-        assert!(summary.contains(&format!("Root:         {}", config.state_dir.display())));
+        assert!(summary.contains(&format!("ROOT:         {}", config.state_dir.display())));
         assert!(summary.contains(&format!(
-            "Logs:         {}",
+            "LOGS:         {}",
             config.state_dir.join("logs").display()
         )));
-        assert!(summary.contains(&format!("Sessions:     {}", config.sessions_dir.display())));
-        assert!(summary.contains("Stop daemon:      oly daemon stop"));
-        assert!(summary.contains("Create a session: oly start --detach <cmd>"));
+        assert!(summary.contains(&format!("SESSIONS:     {}", config.sessions_dir.display())));
     }
 
     #[test]
@@ -563,8 +594,23 @@ mod tests {
         let summary = detached_start_summary(&config, true, false);
 
         assert!(summary.contains("HTTP:         disabled (--no-http)"));
-        assert!(!summary.contains("Web UI/API:"));
-        assert!(!summary.contains("Web root:"));
         assert!(!summary.contains("Auth:"));
+    }
+
+    #[test]
+    fn status_timestamp_is_rendered_in_local_time() {
+        let raw = "2026-03-27T12:34:56Z";
+        let expected = chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .to_rfc3339();
+
+        assert_eq!(format_status_timestamp(raw), expected);
+    }
+
+    #[test]
+    fn status_timestamp_falls_back_to_original_when_parse_fails() {
+        let raw = "not-a-timestamp";
+        assert_eq!(format_status_timestamp(raw), raw);
     }
 }
