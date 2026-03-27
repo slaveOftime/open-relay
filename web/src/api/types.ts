@@ -65,8 +65,9 @@ export interface SessionSummary {
   args: string[]
   pid: number | null
   status: SessionStatus
-  age: string
   created_at: string // ISO 8601
+  started_at: string | null // ISO 8601
+  ended_at: string | null // ISO 8601
   cwd: string | null
   input_needed: boolean
   notifications_enabled: boolean

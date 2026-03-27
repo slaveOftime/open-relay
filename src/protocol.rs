@@ -511,8 +511,9 @@ pub struct SessionSummary {
     pub args: Vec<String>,
     pub pid: Option<u32>,
     pub status: String,
-    pub age: String,
     pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]

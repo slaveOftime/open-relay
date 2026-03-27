@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import type { SessionSummary } from '@/api/types'
 import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from '@/api/client'
-import { formatAge, sessionDisplayName } from '@/utils/format'
+import { formatTimestamp, sessionDisplayName } from '@/utils/format'
 import {
   appendLogChunks,
   encodeLogChunks,
@@ -1136,19 +1136,14 @@ export default function SessionDetailPage() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-xs text-[hsl(var(--muted-foreground))] shrink-0 flex-wrap">
             <span className="inline-flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={24} />
-              <span className="truncate">{sessionDisplayName(session)}</span>
+              <span className="text-wrap">{sessionDisplayName(session)}</span>
+              {session?.title && <span>| {session.title}</span>}
             </span>
-            {session?.title && (
-              <span className="text-[hsl(var(--foreground))] truncate">
-                {session.title}
-              </span>
-            )}
             {session.cwd && (
-              <span className="text-[hsl(var(--foreground))] truncate">{session.cwd}</span>
+              <span className="text-[hsl(var(--foreground))] text-wrap">{session.cwd}</span>
             )}
-            <span>
-              Started:{' '}
-              <span className="text-[hsl(var(--foreground))]">{formatAge(session.created_at)}</span>
+            <span className="text-[hsl(var(--foreground))]">
+              {formatTimestamp(session.created_at)}
             </span>
             {exitCode !== undefined && (
               <span>

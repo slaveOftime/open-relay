@@ -117,7 +117,9 @@ impl SessionRuntime {
         // Add the canonical filtered bytes to the in-memory ring. Fully stripped
         // chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
-            self.last_total_bytes = self.last_total_bytes.saturating_add(filtered_data.len() as u64);
+            self.last_total_bytes = self
+                .last_total_bytes
+                .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
             self.ring.push(filtered_data);
         }

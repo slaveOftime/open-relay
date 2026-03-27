@@ -6,10 +6,7 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use crate::{
     error::Result,
     protocol::{ListQuery, PushSubscriptionInput, PushSubscriptionRecord, SessionSummary},
-    session::{
-        SessionMeta, SessionStatus,
-        persist::{current_output_offset_by_id, format_age},
-    },
+    session::{SessionMeta, SessionStatus, persist::current_output_offset_by_id},
 };
 
 // ---------------------------------------------------------------------------
@@ -415,8 +412,9 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         args: meta.args.clone(),
         pid: meta.pid,
         status: meta.status.as_str().to_string(),
-        age: format_age(meta.created_at, meta.started_at, meta.ended_at),
         created_at: meta.created_at,
+        started_at: meta.started_at,
+        ended_at: meta.ended_at,
         cwd: meta.cwd.clone(),
         input_needed,
         notifications_enabled: false,

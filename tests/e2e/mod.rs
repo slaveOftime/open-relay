@@ -70,6 +70,13 @@ pub fn make_tmp_dir(name: &str) -> PathBuf {
         NEXT_TMP_DIR.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&dir).expect("create temp dir");
+
+    fs::write(
+        dir.join("config.json"),
+        "{\"notification_hook\": \"echo done\"}",
+    )
+    .expect("write config.json");
+
     dir
 }
 

@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     SessionLookupError, SessionMeta, SessionStatus, StartSpec,
-    persist::{append_event, append_resize_event, current_output_offset, format_age},
+    persist::{append_event, append_resize_event, current_output_offset},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 
@@ -72,8 +72,9 @@ impl SessionRuntimeSnapshot {
                 args: rt.meta.args.clone(),
                 pid: rt.meta.pid,
                 status: rt.meta.status.as_str().to_string(),
-                age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
                 created_at: rt.meta.created_at,
+                started_at: rt.meta.started_at,
+                ended_at: rt.meta.ended_at,
                 cwd: rt.meta.cwd.clone(),
                 input_needed,
                 notifications_enabled: rt.notifications_enabled,
