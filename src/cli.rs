@@ -169,6 +169,9 @@ pub struct ListArgs {
     /// Filter by title or ID substring (case-insensitive).
     #[arg(long)]
     pub search: Option<String>,
+    /// Only show sessions containing these tags (repeatable).
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
     /// Print machine-readable JSON instead of the default table.
     #[arg(long)]
     pub json: bool,
@@ -260,6 +263,9 @@ pub struct NotifySendArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+    /// Url to open when the notification is clicked. Absolute or relative to oly http server. If omitted, defaults to the attach URL of the source session (if any).
+    #[arg(long)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -540,5 +546,22 @@ mod tests {
         assert_eq!(args.title.as_deref(), Some("Deploy ready"));
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
         assert_eq!(args.cmd_and_args, vec!["copilot".to_string()]);
+    }
+
+    #[test]
+    fn list_parses_repeatable_tag_filters() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "ls",
+            "--tag",
+            "prod",
+            "--tag",
+            "release",
+        ])
+        .unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
     }
 }

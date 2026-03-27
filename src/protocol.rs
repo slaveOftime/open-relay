@@ -170,6 +170,7 @@ pub enum RpcRequest {
         title: String,
         description: Option<String>,
         body: Option<String>,
+        url: Option<String>,
     },
     AttachSubscribe {
         id: String,
@@ -511,8 +512,9 @@ pub struct SessionSummary {
     pub args: Vec<String>,
     pub pid: Option<u32>,
     pub status: String,
-    pub age: String,
     pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub ended_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -520,7 +522,8 @@ pub struct SessionSummary {
     #[serde(default)]
     pub notifications_enabled: bool,
     pub node: Option<String>,
-    pub total_bytes: u64,
+    pub last_total_bytes: u64,
+    pub last_output_epoch: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,6 +583,7 @@ impl SortOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListQuery {
     pub search: Option<String>,
+    pub tags: Vec<String>,
     pub statuses: Vec<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,

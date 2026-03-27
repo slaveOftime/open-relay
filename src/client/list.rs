@@ -12,9 +12,7 @@ use crate::{
 
 pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<String>) -> Result<()> {
     const CMD_WIDTH: usize = 12;
-    const AGE_WIDTH: usize = 6;
     const INPUT_WIDTH: usize = 8;
-    const OUTPUT_WIDTH: usize = 12;
     const TITLE_WIDTH: usize = 12;
     const ARGS_WIDTH: usize = 12;
 
@@ -91,15 +89,7 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
     );
 
     for session in sessions {
-        print_session_row(
-            &session,
-            CMD_WIDTH,
-            AGE_WIDTH,
-            INPUT_WIDTH,
-            OUTPUT_WIDTH,
-            TITLE_WIDTH,
-            ARGS_WIDTH,
-        );
+        print_session_row(&session, CMD_WIDTH, INPUT_WIDTH, TITLE_WIDTH, ARGS_WIDTH);
     }
 
     Ok(())
@@ -108,9 +98,7 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
 fn print_session_row(
     session: &SessionSummary,
     cmd_width: usize,
-    age_width: usize,
     input_width: usize,
-    _output_width: usize,
     title_width: usize,
     args_width: usize,
 ) {
@@ -122,18 +110,46 @@ fn print_session_row(
         session.args.join(" ")
     };
     let args = truncate_display_value(&args_text, args_width);
-    let age = truncate_display_value(&session.age, age_width);
+
+    let age = if session.status == "running" {
+        format_age(session.created_at, session.started_at, session.ended_at)
+    } else {
+        "-".to_string()
+    };
+
     let pid = session
         .pid
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
     let created = format_created_at_local(session.created_at);
+
     let input = truncate_display_value(input_required_label(session.input_needed), input_width);
-    let output = &session.total_bytes.to_string();
+    let output = &session.last_total_bytes.to_string();
     println!(
         "{:<7} {:<9} {:<8} {:<12} {:<12} {:<6} {:<6} {:<21} {:<12} {}",
         session.id, session.status, input, output, command, age, pid, created, title, args
     );
+}
+
+pub fn format_age(
+    created_at: DateTime<Utc>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+) -> String {
+    let age = match (started_at, ended_at) {
+        (Some(started), Some(ended)) => ended - started,
+        (Some(started), None) => Utc::now() - started,
+        (None, Some(ended)) => ended - created_at,
+        (None, None) => Utc::now() - created_at,
+    };
+
+    if age.num_hours() > 0 {
+        format!("{}h", age.num_hours())
+    } else if age.num_minutes() > 0 {
+        format!("{}m", age.num_minutes())
+    } else {
+        format!("{}s", age.num_seconds().max(0))
+    }
 }
 
 fn session_json(session: &SessionSummary) -> Value {
@@ -142,14 +158,17 @@ fn session_json(session: &SessionSummary) -> Value {
         "title": session.title,
         "tags": session.tags,
         "command": session.command,
-        "args": session.args,
+        "arguments": session.args,
+        "current_working_directory": session.cwd,
         "pid": session.pid,
         "status": session.status,
-        "age": session.age,
-        "created_at": format_created_at_local(session.created_at),
-        "cwd": session.cwd,
+        "created_at": session.created_at.to_rfc3339() ,
+        "started_at": session.started_at.map(|dt| dt.to_rfc3339()),
+        "ended_at": session.ended_at.map(|dt| dt.to_rfc3339()),
         "input_needed": session.input_needed,
-        "last_total_bytes": session.total_bytes,
+        "last_total_bytes": session.last_total_bytes,
+        "last_output_epoch": session.last_output_epoch.map(|dt| dt.to_rfc3339()),
+        "notifications_enabled": session.notifications_enabled,
     })
 }
 
@@ -170,6 +189,13 @@ fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
 
     Ok(ListQuery {
         search: args.search.as_ref().map(|text| text.trim().to_string()),
+        tags: args
+            .tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
         statuses: args
             .status
             .iter()
@@ -215,7 +241,7 @@ pub fn truncate_display_value(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_query, format_created_at_local, input_required_label, session_json};
+    use super::{build_list_query, input_required_label, session_json};
     use crate::{cli::ListArgs, protocol::SessionSummary};
     use chrono::{TimeZone, Utc};
 
@@ -223,6 +249,7 @@ mod tests {
     fn build_list_query_preserves_json_flag_as_output_only_concern() {
         let args = ListArgs {
             search: Some("demo".to_string()),
+            tags: vec!["prod".to_string(), " release ".to_string(), " ".to_string()],
             json: true,
             status: vec![],
             since: None,
@@ -234,12 +261,13 @@ mod tests {
         let query = build_list_query(&args).expect("query should build");
 
         assert_eq!(query.search.as_deref(), Some("demo"));
+        assert_eq!(query.tags, vec!["prod".to_string(), "release".to_string()]);
         assert_eq!(query.limit, 25);
         assert!(query.statuses.is_empty());
     }
 
     #[test]
-    fn session_json_includes_formatted_time_and_input_required_fields() {
+    fn session_json_includes_iso_time_and_input_required_fields() {
         let created_at = Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap();
         let session = SessionSummary {
             id: "sess-123".to_string(),
@@ -249,19 +277,19 @@ mod tests {
             args: vec!["test".to_string()],
             pid: Some(42),
             status: "running".to_string(),
-            age: "5m".to_string(),
             created_at,
+            started_at: None,
+            ended_at: None,
             cwd: Some("C:/work".to_string()),
             input_needed: true,
             notifications_enabled: false,
             node: None,
-            total_bytes: 4096,
+            last_total_bytes: 4096,
+            last_output_epoch: None,
         };
 
         let value = session_json(&session);
-        let expected_created_at = format_created_at_local(created_at);
-
-        assert_eq!(value["created_at"], serde_json::json!(expected_created_at));
+        assert_eq!(value["created_at"], serde_json::json!(created_at.to_rfc3339()));
         assert_eq!(value["input_needed"], serde_json::json!(true));
         assert_eq!(value["last_total_bytes"], serde_json::json!(4096));
     }

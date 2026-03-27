@@ -46,7 +46,7 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
             input_needed: value.summary.input_needed,
             notifications_enabled: value.summary.notifications_enabled,
             last_output_at: value.last_output_at,
-            last_total_bytes: value.summary.total_bytes,
+            last_total_bytes: value.summary.last_total_bytes,
         }
     }
 }
@@ -212,6 +212,7 @@ pub async fn events_handler(
     let initial = {
         let q = ListQuery {
             search: None,
+            tags: vec![],
             statuses: vec![],
             since: None,
             until: None,
@@ -273,13 +274,15 @@ mod tests {
             args: vec!["test".to_string()],
             pid: Some(42),
             status: "running".to_string(),
-            age: "5m".to_string(),
             created_at: Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap(),
+            started_at: None,
+            ended_at: None,
             cwd: Some("C:\\work".to_string()),
             input_needed: true,
             notifications_enabled: false,
             node: None,
-            total_bytes: 0,
+            last_total_bytes: 0,
+            last_output_epoch: None,
         }
     }
 

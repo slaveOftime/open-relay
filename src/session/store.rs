@@ -7,7 +7,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     SessionLookupError, SessionMeta, SessionStatus, StartSpec,
-    persist::{append_event, append_resize_event, current_output_offset, format_age},
+    persist::{append_event, append_resize_event, current_output_offset},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 
@@ -63,7 +63,7 @@ impl SessionRuntimeSnapshot {
     fn from_runtime(rt: &SessionRuntime) -> Self {
         let input_needed = rt.input_needed();
         Self {
-            total_bytes: rt.total_bytes,
+            total_bytes: rt.last_total_bytes,
             summary: SessionSummary {
                 id: rt.meta.id.clone(),
                 title: rt.meta.title.clone(),
@@ -72,15 +72,17 @@ impl SessionRuntimeSnapshot {
                 args: rt.meta.args.clone(),
                 pid: rt.meta.pid,
                 status: rt.meta.status.as_str().to_string(),
-                age: format_age(rt.meta.created_at, rt.meta.started_at, rt.meta.ended_at),
                 created_at: rt.meta.created_at,
+                started_at: rt.meta.started_at,
+                ended_at: rt.meta.ended_at,
                 cwd: rt.meta.cwd.clone(),
                 input_needed,
                 notifications_enabled: rt.notifications_enabled,
                 node: None,
-                total_bytes: rt.total_bytes,
+                last_total_bytes: rt.last_total_bytes,
+                last_output_epoch: rt.last_output_epoch.and_then(instant_to_utc),
             },
-            last_output_at: rt.last_output_at,
+            last_output_at: rt.last_visible_output_at,
             mode_snapshot: rt.mode_snapshot(),
             output_closed: rt.output_closed,
             last_attach_activity_at: rt.last_attach_activity_at,
@@ -90,6 +92,11 @@ impl SessionRuntimeSnapshot {
             exit_code: rt.meta.exit_code,
         }
     }
+}
+
+fn instant_to_utc(instant: Instant) -> Option<DateTime<Utc>> {
+    let elapsed = chrono::TimeDelta::from_std(instant.elapsed()).ok()?;
+    Utc::now().checked_sub_signed(elapsed)
 }
 
 struct SessionHandle {
@@ -1000,7 +1007,7 @@ impl SessionStore {
                         // suppress notification and reset last_output_at to prevent repeated notifications
                         // for the same output epoch after attach activity.
                         let mut rt = runtime.runtime.lock().ok()?;
-                        rt.last_output_at = None;
+                        rt.last_visible_output_at = None;
                         return None;
                     }
                 }
@@ -1129,7 +1136,7 @@ mod tests {
             meta,
             dir,
             ring,
-            total_bytes: excerpt.as_bytes().len() as u64,
+            last_total_bytes: excerpt.as_bytes().len() as u64,
             broadcast_tx,
             resize_tx,
             pty: super::super::pty::PtyHandle {
@@ -1142,7 +1149,8 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_output_at,
+            last_visible_output_at: last_output_at,
+            last_output_epoch: last_output_at,
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
@@ -1331,7 +1339,7 @@ mod tests {
             let runtime = sessions.get("abc1234").unwrap();
             let mut rt = runtime.runtime.lock().unwrap();
             // A new epoch strictly later than the notified one.
-            rt.last_output_at = Some(Instant::now());
+            rt.last_visible_output_at = Some(Instant::now());
             // Move notification timestamp into the past so cooldown no longer blocks.
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(30));
             runtime.refresh_snapshot(&rt);
@@ -1496,7 +1504,7 @@ mod tests {
         let runtime = sessions.get("abc1234").unwrap();
         let locked = runtime.runtime.lock().unwrap();
         assert!(
-            locked.last_output_at.is_none(),
+            locked.last_visible_output_at.is_none(),
             "suppression path should no longer mutate output epoch during reads"
         );
     }
@@ -1571,7 +1579,7 @@ mod tests {
             meta,
             dir,
             ring: RingBuffer::new(4096),
-            total_bytes: 0,
+            last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: super::super::pty::PtyHandle {
@@ -1584,7 +1592,8 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_output_at: None,
+            last_visible_output_at: None,
+            last_output_epoch: None,
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
@@ -1596,6 +1605,17 @@ mod tests {
             notifications_enabled: true,
         }));
         (rt, writer_rx)
+    }
+
+    #[test]
+    fn instant_to_utc_reconstructs_recent_wall_clock_time() {
+        let before = Utc::now();
+        let instant = Instant::now() - Duration::from_secs(2);
+        let converted = instant_to_utc(instant).expect("conversion should succeed");
+        let after = Utc::now();
+
+        assert!(converted >= before - chrono::TimeDelta::seconds(3));
+        assert!(converted <= after - chrono::TimeDelta::seconds(1));
     }
 
     fn make_test_config(max_running_sessions: usize) -> AppConfig {

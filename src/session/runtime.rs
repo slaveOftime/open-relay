@@ -40,8 +40,6 @@ pub struct SessionRuntime {
     pub dir: PathBuf,
     /// Byte-limited ring buffer of canonical filtered PTY output.
     pub ring: RingBuffer,
-    /// Total length of canonical filtered PTY output bytes.
-    pub total_bytes: u64,
     /// Sends canonical filtered PTY output chunks to all live attach subscribers.
     pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
     /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
@@ -57,7 +55,11 @@ pub struct SessionRuntime {
     pub persisted: bool,
     pub requested_final_status: Option<SessionStatus>,
     /// Timestamp of the last visible output chunk; drives the notification engine.
-    pub last_output_at: Option<Instant>,
+    pub last_visible_output_at: Option<Instant>,
+    /// Total length of canonical filtered PTY output bytes.
+    pub last_total_bytes: u64,
+    /// Timestamp of the last output chunk.
+    pub last_output_epoch: Option<Instant>,
     /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last subscribe/attach action; coarse presence signal.
@@ -109,13 +111,16 @@ impl SessionRuntime {
 
         // Advance the silence clock only for chunks with visible content.
         if has_visible_output {
-            self.last_output_at = Some(Instant::now());
+            self.last_visible_output_at = Some(Instant::now());
         }
 
         // Add the canonical filtered bytes to the in-memory ring. Fully stripped
         // chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
-            self.total_bytes = self.total_bytes.saturating_add(filtered_data.len() as u64);
+            self.last_total_bytes = self
+                .last_total_bytes
+                .saturating_add(filtered_data.len() as u64);
+            self.last_output_epoch = Some(Instant::now());
             self.ring.push(filtered_data);
         }
 
@@ -164,7 +169,7 @@ impl SessionRuntime {
     pub fn input_needed(&self) -> bool {
         matches!(self.meta.status, SessionStatus::Running)
             && self.notified_output_epoch.is_some()
-            && self.notified_output_epoch == self.last_output_at
+            && self.notified_output_epoch == self.last_visible_output_at
     }
 
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
@@ -439,7 +444,7 @@ pub fn spawn_session(
         meta: meta.clone(),
         dir: full_dir,
         ring: RingBuffer::new(config.ring_buffer_bytes),
-        total_bytes: 0,
+        last_total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
         pty: pty_handle,
@@ -452,7 +457,8 @@ pub fn spawn_session(
         completed_at: None,
         persisted: false,
         requested_final_status: None,
-        last_output_at: None,
+        last_visible_output_at: None,
+        last_output_epoch: None,
         last_input_at: None,
         last_attach_presence_at: None,
         last_attach_activity_at: None,
@@ -679,7 +685,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             ring: RingBuffer::new(4096), // small capacity for tests
-            total_bytes: 0,
+            last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -692,7 +698,8 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_output_at: None,
+            last_visible_output_at: None,
+            last_output_epoch: None,
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,
@@ -816,14 +823,14 @@ mod tests {
     #[test]
     fn test_push_output_visible_content_advances_last_output_at() {
         let mut rt = new_runtime();
-        assert!(rt.last_output_at.is_none());
+        assert!(rt.last_visible_output_at.is_none());
         rt.push_output(
             &bytes::Bytes::from("hello world\n"),
             bytes::Bytes::from("hello world\n"),
             true,
         );
         assert!(
-            rt.last_output_at.is_some(),
+            rt.last_visible_output_at.is_some(),
             "visible output should set last_output_at"
         );
     }
@@ -837,7 +844,7 @@ mod tests {
             false,
         );
         assert!(
-            rt.last_output_at.is_none(),
+            rt.last_visible_output_at.is_none(),
             "pure ANSI sequences should not advance last_output_at"
         );
     }
@@ -864,7 +871,7 @@ mod tests {
 
         rt.push_output(&raw, filtered, true);
 
-        assert_eq!(rt.total_bytes, 11);
+        assert_eq!(rt.last_total_bytes, 11);
     }
 
     #[test]
@@ -877,7 +884,7 @@ mod tests {
         let (chunks, end_offset) = rt.ring.read_from(0);
         assert!(chunks.is_empty());
         assert_eq!(end_offset, 0);
-        assert_eq!(rt.total_bytes, 0);
+        assert_eq!(rt.last_total_bytes, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -962,7 +969,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
             ring: RingBuffer::new(4096),
-            total_bytes: 0,
+            last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -975,7 +982,8 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_output_at: None,
+            last_visible_output_at: None,
+            last_output_epoch: None,
             last_input_at: None,
             last_attach_presence_at: None,
             last_attach_activity_at: None,

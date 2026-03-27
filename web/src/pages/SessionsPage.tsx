@@ -182,7 +182,7 @@ function saveSessionPrefs(prefs: SessionPrefs) {
 
 function normalizeStoredNode(value: unknown): string | null {
   if (typeof value !== 'string') return null
-  const trimmed = value.trim()
+  const trimmed = value.trim().toUpperCase()
   return trimmed === '' ? null : trimmed
 }
 
@@ -235,7 +235,7 @@ function fetchSessionsOnce(params: ListParams) {
 
 function buildSeriesMap(items: SessionSummary[]) {
   items.forEach((session) => {
-    sparklines.recordTotal(session.id, session.total_bytes)
+    sparklines.recordTotal(session.id, session.last_total_bytes)
   })
   return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
 }
@@ -245,7 +245,7 @@ function syncSeriesMap(items: SessionSummary[]) {
 }
 
 function updateSparklineForSession(session: SessionSummary) {
-  sparklines.recordTotal(session.id, session.total_bytes)
+  sparklines.recordTotal(session.id, session.last_total_bytes)
 }
 
 function updateSparklineForNotification(notification: SessionNotificationData) {
@@ -292,7 +292,7 @@ function SessionTagList({
   }
 
   return (
-    <div className={`flex min-w-0 flex-wrap items-center gap-1.5 ${className}`.trim()}>
+    <div className={`flex min-w-0 items-center ${className}`.trim()}>
       {normalizedTags.map((tag) => (
         <Badge
           key={tag}
@@ -335,7 +335,6 @@ function SessionNotificationButton({
           aria-label={label}
           disabled={disabled || pending}
           onClick={onToggle}
-          className={enabled ? 'text-amber-600 hover:text-amber-600' : undefined}
         >
           <span className="relative inline-flex h-4 w-4 items-center justify-center">
             <BellIcon className="h-4 w-4" />
@@ -487,8 +486,8 @@ function SessionRow({
         </TableCell>
 
         {/* Tags */}
-        <TableCell className="px-3 py-2 max-w-0 align-middle">
-          <SessionTagList tags={session.tags} emptyLabel="—" />
+        <TableCell className="px-3 py-2 align-middle">
+          <SessionTagList tags={session.tags} emptyLabel="—" className="flex-wrap gap-1" />
         </TableCell>
 
         {/* CMD */}
@@ -572,14 +571,14 @@ function SessionRow({
                   </TooltipTrigger>
                   <TooltipContent>Kill</TooltipContent>
                 </Tooltip>
+                <SessionNotificationButton
+                  enabled={session.notifications_enabled}
+                  disabled={!isRunning}
+                  pending={notificationsPending}
+                  onToggle={() => onToggleNotifications(session)}
+                />
               </>
             )}
-            <SessionNotificationButton
-              enabled={session.notifications_enabled}
-              disabled={!isRunning}
-              pending={notificationsPending}
-              onToggle={() => onToggleNotifications(session)}
-            />
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
@@ -672,42 +671,26 @@ function SessionCard({
           </div>
 
           {/* Row 2: title */}
-          <Button
-            variant="ghost"
-            className="w-full text-left h-auto py-1 justify-start -mx-1 px-1 overflow-hidden"
-            onClick={() => openSession(isRunning ? 'attach' : 'logs')}
-          >
-            <span className="flex flex-col gap-1 items-start w-full">
-              <span
-                className={`flex min-w-0 items-center gap-2 text-base font-medium truncate ${titleTone}`}
-              >
-                <CommandLogo command={session.command} size={24} />
-                <span>{sessionDisplayName(session)}</span>
-              </span>
-              {session.title && (
-                <span className={`block text-sm font-medium truncate leading-snug ${titleTone}`}>
-                  {session.title}
-                </span>
-              )}
+          <div onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
+            <span
+              className={`flex min-w-0 items-center gap-2 text-base font-medium text-wrap ${titleTone}`}
+            >
+              <CommandLogo command={session.command} size={24} />
+              <span>{sessionDisplayName(session)}</span>
+              {session.title && <span>| {session.title}</span>}
             </span>
-          </Button>
+          </div>
+
           {/* Row 3: cwd */}
           {session.cwd && (
-            <div className="flex items-center gap-2">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="text-sm text-[hsl(var(--muted-foreground))] font-mono truncate">
-                    {session.cwd}
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent>{session.cwd}</TooltipContent>
-              </Tooltip>
+            <div className="text-sm text-[hsl(var(--muted-foreground))] font-mono text-wrap">
+              {session.cwd}
             </div>
           )}
 
           {session.tags.length > 0 && (
             <div className="flex items-start gap-2">
-              <SessionTagList tags={session.tags} className="flex-1" />
+              <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
             </div>
           )}
 
@@ -760,14 +743,15 @@ function SessionCard({
                 </TooltipTrigger>
                 <TooltipContent>Kill</TooltipContent>
               </Tooltip>
+              <SessionNotificationButton
+                enabled={session.notifications_enabled}
+                disabled={!isRunning}
+                pending={notificationsPending}
+                onToggle={() => onToggleNotifications(session)}
+              />
             </>
           )}
-          <SessionNotificationButton
-            enabled={session.notifications_enabled}
-            disabled={!isRunning}
-            pending={notificationsPending}
-            onToggle={() => onToggleNotifications(session)}
-          />
+          <div className="flex-1"></div>
           <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
             <FileTextIcon className="h-4 w-4" />
           </Button>
@@ -776,7 +760,7 @@ function SessionCard({
               <Button
                 variant="ghost"
                 size="icon"
-                className="ml-auto shrink-0"
+                className="shrink-0"
                 onClick={() => onRunAgain(session)}
               >
                 <CopyIcon className="h-4 w-4" />
@@ -1638,7 +1622,7 @@ export default function SessionsPage() {
               onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
-              <span className="truncate uppercase">{pageTitle}</span>
+              <span className="truncate">{pageTitle}</span>
             </div>
             <div className="flex-1 min-w-0" />
             <Button
@@ -1899,9 +1883,9 @@ export default function SessionsPage() {
             <Table className="w-full border-collapse table-fixed">
               <colgroup>
                 <col style={{ width: '5rem' }} />
-                <col style={{ width: '12rem' }} />
-                <col style={{ width: '12rem' }} />
-                <col style={{ width: '14rem' }} />
+                <col style={{ width: 'auto', minWidth: '6rem' }} />
+                <col style={{ width: 'auto', minWidth: '6rem' }} />
+                <col style={{ width: 'auto', minWidth: '6rem' }} />
                 <col style={{ width: 'auto' }} />
                 <col style={{ width: '8rem' }} />
                 <col style={{ width: '10rem' }} />

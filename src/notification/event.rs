@@ -138,11 +138,14 @@ impl NotificationEvent {
         title: String,
         description: Option<String>,
         body: Option<String>,
+        url: Option<String>,
     ) -> Self {
         let session_ids = source_session_id.into_iter().collect::<Vec<_>>();
-        let navigation_url = session_ids
-            .first()
-            .map(|session_id| format!("{}?mode=attach", session_navigation_url(&session_id)));
+        let navigation_url = url.or_else(|| {
+            session_ids
+                .first()
+                .map(|session_id| format!("{}?mode=attach", session_navigation_url(&session_id)))
+        });
 
         Self {
             kind: NotificationKind::Manual,
@@ -263,6 +266,7 @@ mod tests {
             "Deploy ready".to_string(),
             Some("Build finished".to_string()),
             Some("Open the session for details.".to_string()),
+            None,
         );
 
         assert_eq!(event.kind.as_str(), "manual");
@@ -272,7 +276,7 @@ mod tests {
         assert_eq!(event.session_ids, vec!["session-123".to_string()]);
         assert_eq!(
             event.navigation_url.as_deref(),
-            Some("/session/session-123")
+            Some("/session/session-123?mode=attach")
         );
     }
 }

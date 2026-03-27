@@ -6,10 +6,7 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use crate::{
     error::Result,
     protocol::{ListQuery, PushSubscriptionInput, PushSubscriptionRecord, SessionSummary},
-    session::{
-        SessionMeta, SessionStatus,
-        persist::{current_output_offset_by_id, format_age},
-    },
+    session::{SessionMeta, SessionStatus, persist::current_output_offset_by_id},
 };
 
 // ---------------------------------------------------------------------------
@@ -24,6 +21,12 @@ pub struct Database {
 
 impl Database {
     fn push_list_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, query: &ListQuery) {
+        for tag in &query.tags {
+            qb.push(" AND EXISTS (SELECT 1 FROM json_each(tags) WHERE LOWER(value) = ");
+            qb.push_bind(tag.to_ascii_lowercase());
+            qb.push(")");
+        }
+
         if !query.statuses.is_empty() {
             qb.push(" AND LOWER(status) IN (");
             let mut sep = qb.separated(", ");
@@ -415,13 +418,15 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         args: meta.args.clone(),
         pid: meta.pid,
         status: meta.status.as_str().to_string(),
-        age: format_age(meta.created_at, meta.started_at, meta.ended_at),
         created_at: meta.created_at,
+        started_at: meta.started_at,
+        ended_at: meta.ended_at,
         cwd: meta.cwd.clone(),
         input_needed,
         notifications_enabled: false,
         node: None,
-        total_bytes,
+        last_total_bytes: total_bytes,
+        last_output_epoch: None,
     }
 }
 

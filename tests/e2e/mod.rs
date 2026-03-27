@@ -69,7 +69,17 @@ pub fn make_tmp_dir(name: &str) -> PathBuf {
         std::process::id(),
         NEXT_TMP_DIR.fetch_add(1, Ordering::Relaxed)
     ));
+    let oly_dir = dir.join("oly");
+
     fs::create_dir_all(&dir).expect("create temp dir");
+    fs::create_dir_all(&oly_dir).expect("create oly subdir");
+
+    fs::write(
+        oly_dir.join("config.json"),
+        "{\"notification_hook\": \"echo done\"}",
+    )
+    .expect("write config.json");
+
     dir
 }
 

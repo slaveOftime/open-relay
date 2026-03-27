@@ -363,6 +363,7 @@ mod tests {
             title: "Deploy ready".to_string(),
             description: Some("Build finished".to_string()),
             body: Some("Open the session for details.".to_string()),
+            url: None,
         }));
     }
 
@@ -373,6 +374,7 @@ mod tests {
             inner: Box::new(RpcRequest::List {
                 query: ListQuery {
                     search: None,
+                    tags: Vec::new(),
                     statuses: Vec::new(),
                     since: None,
                     until: None,

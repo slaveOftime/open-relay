@@ -121,6 +121,8 @@ pub async fn unsubscribe_push(
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
     pub search: Option<String>,
+    /// Comma-separated tags; all listed tags must be present.
+    pub tag: Option<String>,
     /// Comma-separated status values: running,stopped,killed,failed,created,stopping
     pub status: Option<String>,
     pub limit: Option<usize>,
@@ -146,12 +148,23 @@ pub async fn list(
                 .collect()
         })
         .unwrap_or_default();
+    let tags: Vec<String> = params
+        .tag
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|tag| !tag.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let page_limit = params.limit.unwrap_or(20).max(1).min(200);
     let offset = params.offset.unwrap_or(0);
 
     let query = ListQuery {
         search: params.search,
+        tags,
         statuses,
         since: None,
         until: None,
@@ -351,6 +364,7 @@ pub async fn get_session(
         let rpc = RpcRequest::List {
             query: ListQuery {
                 search: Some(id.clone()),
+                tags: vec![],
                 statuses: vec![],
                 since: None,
                 until: None,

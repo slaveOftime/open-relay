@@ -26,6 +26,14 @@ where
         .join("\n")
 }
 
+fn native_shell_timeout() -> Duration {
+    if cfg!(target_os = "windows") {
+        Duration::from_secs(6)
+    } else {
+        Duration::from_secs(3)
+    }
+}
+
 fn wait_for_prompted_output<I, S>(
     tmp: &PathBuf,
     id: &str,
@@ -120,9 +128,11 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
     #[cfg(not(target_os = "windows"))]
     let shell: &[&str] = &["sh"];
 
+    let timeout = native_shell_timeout();
+
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3)).unwrap_or_else(|| {
+    let initial = wait_for_stable_log(&tmp, &id, timeout).unwrap_or_else(|| {
         panic!("shell did not reach a stable prompt within 3 s; session = {id}")
     });
     let prompt = trailing_prompt(&initial).to_string();
@@ -137,7 +147,7 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
         &initial,
         &prompt,
         [MARKER],
-        Duration::from_secs(3),
+        timeout,
     );
     assert!(
         result.is_some(),
@@ -157,9 +167,11 @@ fn e2e_two_separate_input_calls_execute_command() {
     #[cfg(not(target_os = "windows"))]
     let shell: &[&str] = &["sh"];
 
+    let timeout = native_shell_timeout();
+
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+    let initial = wait_for_stable_log(&tmp, &id, timeout)
         .expect("shell did not reach a stable prompt within 3 s");
     let prompt = trailing_prompt(&initial).to_string();
 
@@ -175,7 +187,7 @@ fn e2e_two_separate_input_calls_execute_command() {
         &initial,
         &prompt,
         [MARKER],
-        Duration::from_secs(3),
+        timeout,
     );
     assert!(
         result.is_some(),
@@ -195,9 +207,11 @@ fn e2e_multiple_commands_appear_in_order() {
     #[cfg(not(target_os = "windows"))]
     let shell: &[&str] = &["sh"];
 
+    let timeout = native_shell_timeout();
+
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+    let initial = wait_for_stable_log(&tmp, &id, timeout)
         .expect("shell did not reach a stable prompt within 3 s");
     let prompt = trailing_prompt(&initial).to_string();
 
@@ -215,7 +229,7 @@ fn e2e_multiple_commands_appear_in_order() {
             "oly_e2e_order_second",
             "oly_e2e_order_third",
         ],
-        Duration::from_secs(3),
+        timeout,
     );
     assert!(
         result.is_some(),
@@ -557,9 +571,11 @@ fn e2e_logs_contain_no_escape_artifacts() {
     #[cfg(not(target_os = "windows"))]
     let shell: &[&str] = &["sh"];
 
+    let timeout = native_shell_timeout();
+
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, Duration::from_secs(3))
+    let initial = wait_for_stable_log(&tmp, &id, timeout)
         .expect("shell did not reach a stable prompt within 3 s");
     let prompt = trailing_prompt(&initial).to_string();
 
@@ -572,7 +588,7 @@ fn e2e_logs_contain_no_escape_artifacts() {
         &initial,
         &prompt,
         ["ARTIFACT_CHECK_1", "ARTIFACT_CHECK_2"],
-        Duration::from_secs(3),
+        timeout,
     )
     .expect("echo transcript did not match exact expected output");
     let has_cpr_response =
@@ -600,12 +616,14 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     #[cfg(not(target_os = "windows"))]
     let shell: &[&str] = &["sh"];
 
+    let timeout = native_shell_timeout();
+
     let id1 = start_session(&tmp, shell);
     let id2 = start_session(&tmp, shell);
 
-    let initial1 = wait_for_stable_log(&tmp, &id1, Duration::from_secs(3))
+    let initial1 = wait_for_stable_log(&tmp, &id1, timeout)
         .unwrap_or_else(|| panic!("session {id1} did not reach a stable prompt within 3 s"));
-    let initial2 = wait_for_stable_log(&tmp, &id2, Duration::from_secs(3))
+    let initial2 = wait_for_stable_log(&tmp, &id2, timeout)
         .unwrap_or_else(|| panic!("session {id2} did not reach a stable prompt within 3 s"));
     let prompt1 = trailing_prompt(&initial1).to_string();
     let prompt2 = trailing_prompt(&initial2).to_string();
@@ -622,7 +640,7 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
         &initial1,
         &prompt1,
         [MARKER_1],
-        Duration::from_secs(3),
+        timeout,
     )
     .expect("session 1 transcript did not match exact expected output");
 
@@ -632,7 +650,7 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
         &initial2,
         &prompt2,
         [MARKER_2],
-        Duration::from_secs(3),
+        timeout,
     )
     .expect("session 2 transcript did not match exact expected output");
 

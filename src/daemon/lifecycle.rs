@@ -180,7 +180,7 @@ pub async fn status(config: AppConfig) -> Result<()> {
         eprintln!("Daemon is not running.");
         return Ok(());
     }
-    
+
     println!("Daemon is running...");
 
     let (no_http, no_auth, started_at) = storage::read_daemon_info(&config.info_file)?
