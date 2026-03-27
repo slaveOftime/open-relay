@@ -289,7 +289,10 @@ mod tests {
         };
 
         let value = session_json(&session);
-        assert_eq!(value["created_at"], serde_json::json!(created_at.to_rfc3339()));
+        assert_eq!(
+            value["created_at"],
+            serde_json::json!(created_at.to_rfc3339())
+        );
         assert_eq!(value["input_needed"], serde_json::json!(true));
         assert_eq!(value["last_total_bytes"], serde_json::json!(4096));
     }

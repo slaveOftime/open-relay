@@ -1,7 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import type { SessionSummary } from '@/api/types'
-import { fetchSession, fetchLogs, stopSession, killSession, AttachSocket } from '@/api/client'
+import {
+  fetchSession,
+  fetchLogs,
+  stopSession,
+  killSession,
+  uploadSessionFile,
+  AttachSocket,
+} from '@/api/client'
 import { formatTimestamp, sessionDisplayName } from '@/utils/format'
 import {
   appendLogChunks,
@@ -270,6 +277,16 @@ export default function SessionDetailPage() {
   const showKeyError = useCallback((message: string) => {
     termRef.current?.writeln(`\r\n\x1b[31mKey input error: ${message}\x1b[0m`)
   }, [])
+
+  const handleUploadFile = useCallback(
+    async (file: File) => {
+      if (!id) {
+        throw new Error('Session id is missing')
+      }
+      return await uploadSessionFile(id, file, node ?? undefined)
+    },
+    [id, node]
+  )
 
   useEffect(() => {
     return () => {
@@ -1267,8 +1284,12 @@ export default function SessionDetailPage() {
 
           {mode === 'attach' && (
             <>
-              <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90 sm:rounded-none">
-                <AttachPanel sendInput={sendInput} showKeyError={showKeyError} />
+              <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
+                <AttachPanel
+                  sendInput={sendInput}
+                  showKeyError={showKeyError}
+                  uploadFile={handleUploadFile}
+                />
               </div>
               <div className="sm:hidden flex items-center justify-center h-8">{attachedState}</div>
             </>

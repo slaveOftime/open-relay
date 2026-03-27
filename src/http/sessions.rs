@@ -1,10 +1,11 @@
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path as FsPath};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -14,6 +15,7 @@ use crate::{
     },
     session::{
         SessionLookupError, SessionStore, StartSpec,
+        file::{normalize_session_upload_relative_path, write_session_upload},
         logs::{read_persisted_log_page, read_resize_events},
         persist::current_output_offset_by_id,
     },
@@ -650,6 +652,161 @@ pub struct InputBody {
     pub data: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct UploadFileResponse {
+    pub ok: bool,
+    pub path: String,
+    pub bytes: usize,
+}
+
+fn sanitize_uploaded_filename(file_name: &str) -> Option<String> {
+    let file_name = FsPath::new(file_name).file_name()?;
+    let trimmed = file_name.to_string_lossy().trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+pub async fn upload_file(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<NodeParams>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut requested_path: Option<String> = None;
+    let mut uploaded_name: Option<String> = None;
+    let mut uploaded_bytes = None;
+
+    loop {
+        let next_field = match multipart.next_field().await {
+            Ok(field) => field,
+            Err(err) => {
+                warn!(session_id = %id, %err, "invalid multipart upload payload");
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+
+        let Some(field) = next_field else {
+            break;
+        };
+
+        match field.name() {
+            Some("path") => match field.text().await {
+                Ok(value) => requested_path = Some(value.trim().to_string()),
+                Err(err) => {
+                    warn!(session_id = %id, %err, "invalid upload path field");
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": err.to_string() })),
+                    )
+                        .into_response();
+                }
+            },
+            Some("file") => {
+                uploaded_name = field.file_name().and_then(sanitize_uploaded_filename);
+                match field.bytes().await {
+                    Ok(bytes) => uploaded_bytes = Some(bytes),
+                    Err(err) => {
+                        warn!(session_id = %id, %err, "failed to read uploaded file bytes");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": err.to_string() })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(bytes) = uploaded_bytes else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "missing file field" })),
+        )
+            .into_response();
+    };
+
+    let raw_target = requested_path
+        .filter(|value| !value.is_empty())
+        .or(uploaded_name)
+        .unwrap_or_default();
+
+    let Some(relative_path) = normalize_session_upload_relative_path(&raw_target) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid upload path" })),
+        )
+            .into_response();
+    };
+
+    if let Some(ref node) = params.node {
+        let rpc = RpcRequest::UploadFile {
+            id: id.clone(),
+            path: pathbuf_to_rpc_path(&relative_path),
+            bytes: bytes.to_vec(),
+            dedupe: false,
+        };
+        return match state.node_registry.proxy_rpc(node, &rpc).await {
+            Ok(RpcResponse::UploadFile { path, bytes }) => Json(UploadFileResponse {
+                ok: true,
+                path,
+                bytes,
+            })
+            .into_response(),
+            Ok(RpcResponse::Error { message }) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "unexpected response from node" })),
+            )
+                .into_response(),
+        };
+    }
+
+    match write_session_upload(&state.config, &id, &raw_target, &bytes, false) {
+        Ok(target_path) => Json(UploadFileResponse {
+            ok: true,
+            path: target_path.to_string_lossy().to_string(),
+            bytes: bytes.len(),
+        })
+        .into_response(),
+        Err(err) => {
+            error!(session_id = %id, %err, path = %relative_path.display(), "failed to write uploaded file");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn pathbuf_to_rpc_path(path: &FsPath) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 pub async fn send_input(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -694,6 +851,33 @@ pub async fn send_input(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::pathbuf_to_rpc_path;
+
+    #[test]
+    fn accepts_nested_relative_upload_path() {
+        let path = crate::session::file::normalize_session_upload_relative_path("subdir/file.txt")
+            .expect("path should parse");
+        assert_eq!(path.to_string_lossy().replace('\\', "/"), "subdir/file.txt");
+    }
+
+    #[test]
+    fn rejects_parent_segments_in_upload_path() {
+        assert!(
+            crate::session::file::normalize_session_upload_relative_path("../file.txt").is_none()
+        );
+    }
+
+    #[test]
+    fn rpc_upload_paths_use_forward_slashes() {
+        let path = PathBuf::from("subdir").join("file.txt");
+        assert_eq!(pathbuf_to_rpc_path(&path), "subdir/file.txt");
     }
 }
 

@@ -252,7 +252,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             node,
                             key,
                             child_bracketed_paste_mode,
-                        )? {
+                        )
+                        .await?
+                        {
                             pending_key_burst = None;
                             suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
                             ipc::write_request_to_writer(
@@ -606,20 +608,65 @@ fn paste_candidate_key_data(key: KeyEvent, app_cursor_keys: bool) -> Option<Stri
     }
 }
 
-fn maybe_collect_clipboard_paste(
+async fn maybe_collect_clipboard_paste(
     config: &AppConfig,
     id: &str,
     node: Option<&str>,
     key: KeyEvent,
     bracketed_paste_mode: bool,
 ) -> Result<Option<String>> {
-    if node.is_some() || !is_clipboard_paste_key(key) {
+    if !is_clipboard_paste_key(key) {
         return Ok(None);
     }
 
-    Ok(clipboard::collect_clipboard_paste(config, id, true)?
+    let data = match node {
+        Some(node) => handle_remote_clipboard_paste(config, id, node).await?,
+        None => clipboard::handle_clipboard_paste(config, id, true)?,
+    };
+
+    Ok(data
         .map(normalize_paste_text)
         .map(|data| wrap_paste_input(data, bracketed_paste_mode)))
+}
+
+async fn handle_remote_clipboard_paste(
+    config: &AppConfig,
+    id: &str,
+    node: &str,
+) -> Result<Option<String>> {
+    match clipboard::collect_remote_clipboard_transfer(true)? {
+        Some(clipboard::RemoteClipboardTransfer::Text(text)) => Ok(Some(text)),
+        Some(clipboard::RemoteClipboardTransfer::Files(files)) => {
+            let mut uploaded_paths = Vec::with_capacity(files.len());
+            for file in files {
+                uploaded_paths.push(upload_remote_clipboard_file(config, id, node, file).await?);
+            }
+            Ok(Some(uploaded_paths.join("\n")))
+        }
+        None => Ok(None),
+    }
+}
+
+async fn upload_remote_clipboard_file(
+    config: &AppConfig,
+    id: &str,
+    node: &str,
+    file: clipboard::RemoteClipboardFile,
+) -> Result<String> {
+    let request = RpcRequest::NodeProxy {
+        node: node.to_string(),
+        inner: Box::new(RpcRequest::UploadFile {
+            id: id.to_string(),
+            path: file.name,
+            bytes: file.bytes,
+            dedupe: true,
+        }),
+    };
+
+    match ipc::send_request_checked(config, request).await? {
+        RpcResponse::UploadFile { path, .. } => Ok(path),
+        _ => Err(AppError::Protocol("unexpected response type".to_string())),
+    }
 }
 
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {

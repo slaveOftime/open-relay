@@ -161,6 +161,12 @@ async fn dispatch_request(
             }
         }
         RpcRequest::AttachInput { id, data } => handle_attach_input(id, data, session_store).await,
+        RpcRequest::UploadFile {
+            id,
+            path,
+            bytes,
+            dedupe,
+        } => handle_upload_file(config, id, path, bytes, dedupe).await,
         RpcRequest::AttachResize { id, rows, cols } => {
             handle_attach_resize(id, rows, cols, session_store).await
         }
@@ -257,6 +263,24 @@ async fn handle_start(
     }
 }
 
+async fn handle_upload_file(
+    config: &AppConfig,
+    id: String,
+    path: String,
+    bytes: Vec<u8>,
+    dedupe: bool,
+) -> RpcResponse {
+    match crate::session::file::write_session_upload(config, &id, &path, &bytes, dedupe) {
+        Ok(saved_path) => RpcResponse::UploadFile {
+            path: saved_path.to_string_lossy().to_string(),
+            bytes: bytes.len(),
+        },
+        Err(err) => RpcResponse::Error {
+            message: err.to_string(),
+        },
+    }
+}
+
 async fn handle_stop(
     id: String,
     grace_seconds: u64,
@@ -328,8 +352,13 @@ async fn handle_notify_send(
         };
     }
 
-    let event =
-        crate::notification::event::NotificationEvent::manual(source, title, description, body, url);
+    let event = crate::notification::event::NotificationEvent::manual(
+        source,
+        title,
+        description,
+        body,
+        url,
+    );
     let outcome = notifier.dispatch(&event).await;
 
     if !outcome.any_delivered() {

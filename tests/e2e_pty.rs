@@ -141,14 +141,7 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
     let command = format!("echo {MARKER}");
     send_line(&tmp, &id, &command);
 
-    let result = wait_for_prompted_output(
-        &tmp,
-        &id,
-        &initial,
-        &prompt,
-        [MARKER],
-        timeout,
-    );
+    let result = wait_for_prompted_output(&tmp, &id, &initial, &prompt, [MARKER], timeout);
     assert!(
         result.is_some(),
         "marker '{MARKER}' did not appear in logs within 3 s.\nLogs:\n{}",
@@ -181,14 +174,7 @@ fn e2e_two_separate_input_calls_execute_command() {
     sleep(Duration::from_millis(100));
     send_key(&tmp, &id, "enter");
 
-    let result = wait_for_prompted_output(
-        &tmp,
-        &id,
-        &initial,
-        &prompt,
-        [MARKER],
-        timeout,
-    );
+    let result = wait_for_prompted_output(&tmp, &id, &initial, &prompt, [MARKER], timeout);
     assert!(
         result.is_some(),
         "marker '{MARKER}' not found after two separate inputs.\nLogs:\n{}",
@@ -634,25 +620,11 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     send_line(&tmp, &id1, &format!("echo {MARKER_1}"));
     send_line(&tmp, &id2, &format!("echo {MARKER_2}"));
 
-    let log1 = wait_for_prompted_output(
-        &tmp,
-        &id1,
-        &initial1,
-        &prompt1,
-        [MARKER_1],
-        timeout,
-    )
-    .expect("session 1 transcript did not match exact expected output");
+    let log1 = wait_for_prompted_output(&tmp, &id1, &initial1, &prompt1, [MARKER_1], timeout)
+        .expect("session 1 transcript did not match exact expected output");
 
-    let log2 = wait_for_prompted_output(
-        &tmp,
-        &id2,
-        &initial2,
-        &prompt2,
-        [MARKER_2],
-        timeout,
-    )
-    .expect("session 2 transcript did not match exact expected output");
+    let log2 = wait_for_prompted_output(&tmp, &id2, &initial2, &prompt2, [MARKER_2], timeout)
+        .expect("session 2 transcript did not match exact expected output");
 
     assert!(
         !log1.contains(MARKER_2),

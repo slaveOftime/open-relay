@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Button } from '@/components/ui/button'
+import { FileDropZone } from './ui/file-drop-zone'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { ArrowLeftIcon, ArrowRightIcon, SendIcon } from 'lucide-react'
+import { ArrowLeftIcon, ArrowRightIcon, PaperclipIcon, SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
 import {
   ArrowDownIcon,
@@ -10,6 +11,7 @@ import {
   DoubleArrowDownIcon,
   DoubleArrowUpIcon,
 } from '@radix-ui/react-icons'
+import type { UploadSessionFileResponse } from '@/api/client'
 
 // ── Input history ─────────────────────────────────────────────────────────────
 const INPUT_HISTORY_KEY = 'open-relay:input-history'
@@ -48,6 +50,7 @@ function saveInputHistory(text: string): void {
 interface AttachPanelProps {
   sendInput: (data: string) => void
   showKeyError: (message: string) => void
+  uploadFile?: (file: File) => Promise<UploadSessionFileResponse>
 }
 
 const popularKeys = [
@@ -76,11 +79,17 @@ const popularKeys = [
   { key: 'ins', label: 'ins', instant: true },
 ]
 
-export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProps) {
+export default function AttachPanel({
+  sendInput,
+  showKeyError,
+  uploadFile,
+}: AttachPanelProps) {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [customInput, setCustomInput] = useState('')
   const [customKeys, setCustomKeys] = useState('')
+  const [isUploading, setIsUploading] = useState(false)
   const customInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
 
   function resizeCustomInput() {
@@ -177,6 +186,44 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
     handleCustomSend(true)
   }
 
+  function handleUploadButtonClick() {
+    if (!uploadFile || isUploading) return
+    fileInputRef.current?.click()
+  }
+
+  async function uploadSelectedFile(file: File) {
+    if (!uploadFile) return
+
+    setIsUploading(true)
+    try {
+      const response = await uploadFile(file)
+      if (response.ok) {
+        setCustomInput((prev) => {
+          if (prev.trim()) {
+            return prev + ' ' + response.path
+          }
+          return response.path
+        })
+      }
+    } catch (error) {
+      showKeyError(error instanceof Error ? error.message : 'file upload failed')
+    } finally {
+      setIsUploading(false)
+    }
+  }
+
+  async function handleUploadDrop(file: File) {
+    await uploadSelectedFile(file)
+  }
+
+  async function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || !uploadFile) return
+
+    await uploadSelectedFile(file)
+  }
+
   return (
     <div>
       <div
@@ -191,10 +238,16 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
               <textarea
                 ref={customInputRef}
                 className="flex min-h-[72px] w-full rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--secondary))] px-3 py-2 pr-12 text-sm text-[hsl(var(--foreground))] placeholder:text-[hsl(var(--muted-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 transition-colors resize-none"
-                placeholder="Type text here. Enter adds a new line."
+                placeholder="Type text here. Enter adds a new line. ctrl+enter to send."
                 rows={3}
                 value={customInput}
                 onChange={(e) => setCustomInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.ctrlKey) {
+                    e.preventDefault()
+                    handleCustomSend(true)
+                  }
+                }}
               />
               <Tooltip>
                 <TooltipContent>
@@ -270,6 +323,45 @@ export default function AttachPanel({ sendInput, showKeyError }: AttachPanelProp
               />
             </div>
           </div>
+          <div>
+            <FileDropZone
+              className="hidden sm:flex flex-col gap-2 rounded-md border border-dashed border-[hsl(var(--border))] bg-[hsl(var(--muted))]/20 px-3 py-3 transition-colors data-[disabled=true]:bg-[hsl(var(--muted))]/30 data-[disabled=true]:opacity-70 data-[drag-active=true]:border-[hsl(var(--primary))] data-[drag-active=true]:bg-[hsl(var(--primary))]/10"
+              disabled={!uploadFile || isUploading}
+              onFileDrop={handleUploadDrop}
+            >
+              <p className="text-center text-xs text-[hsl(var(--muted-foreground))]">
+                Drop a file here to upload on desktop.
+              </p>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="gap-2 w-full"
+                disabled={!uploadFile || isUploading}
+                onClick={handleUploadButtonClick}
+              >
+                <PaperclipIcon className="h-4 w-4" />
+                {isUploading ? 'Uploading...' : 'Upload file'}
+              </Button>
+            </FileDropZone>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="gap-2 w-full sm:hidden"
+              disabled={!uploadFile || isUploading}
+              onClick={handleUploadButtonClick}
+            >
+              <PaperclipIcon className="h-4 w-4" />
+              {isUploading ? 'Uploading...' : 'Upload file'}
+            </Button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              onChange={handleFileInputChange}
+            />
+          </div>        
         </div>
       </div>
       <div className="sm:hidden w-full h-10 flex justify-between items-center">

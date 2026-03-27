@@ -287,6 +287,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
             | RpcRequest::NotifySend { .. }
             | RpcRequest::AttachSubscribe { .. }
             | RpcRequest::AttachInput { .. }
+            | RpcRequest::UploadFile { .. }
             | RpcRequest::AttachResize { .. }
             | RpcRequest::AttachDetach { .. }
             | RpcRequest::Stop { .. }
