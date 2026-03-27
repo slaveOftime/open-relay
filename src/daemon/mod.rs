@@ -12,7 +12,7 @@ use crate::{
     session::{SessionEvent, SessionStore},
 };
 
-pub use lifecycle::{start, stop};
+pub use lifecycle::{start, status, stop};
 
 pub(crate) type SessionStoreHandle = Arc<SessionStore>;
 pub(crate) type JoinHandles =

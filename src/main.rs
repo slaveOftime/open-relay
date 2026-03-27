@@ -30,7 +30,8 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const OLY_START_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly/SKILL.md");
+const OLY_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly/SKILL.md");
+const OLY_APPS_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly-apps/SKILL.md");
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -151,8 +152,12 @@ async fn run() -> Result<()> {
     let config = config::AppConfig::load()?;
 
     match cli.command {
-        Commands::Skill(_) => {
-            print!("{}", OLY_START_SKILL_MARKDOWN);
+        Commands::Skill(args) => {
+            if args.apps {
+                print!("{}", OLY_APPS_SKILL_MARKDOWN);
+            } else {
+                print!("{}", OLY_SKILL_MARKDOWN);
+            }
             Ok(())
         }
 
@@ -173,6 +178,7 @@ async fn run() -> Result<()> {
                 .await
             }
             DaemonCommand::Stop(stop_args) => daemon::stop(config, stop_args.grace).await,
+            DaemonCommand::Status => daemon::status(config).await,
         },
 
         Commands::List(list_args) => {

@@ -3,164 +3,85 @@ name: oly
 description: "Use when starting a long-running or interactive CLI command with oly, especially when it may need later input, should be detachable, or should keep durable logs for supervision and resume."
 ---
 
-Use `oly` when a command should keep running outside the current terminal, may need later input, or should produce durable logs that another human or agent can inspect.
+## When to use
 
-## When to use this skill
+Use `oly start` instead of a direct terminal invocation when ANY of these apply:
 
-Prefer `oly start` instead of launching the command directly when:
+- The command may prompt for input later.
+- The session must survive terminal closes, disconnects, or agent handoff.
+- Logs, replay, or auditability matter.
+- Another human or agent may need to resume or inspect the work.
 
-- the command may ask for input later
-- the session should survive terminal closes, disconnects, or agent handoff
-- logs, replay, or auditability matter
-- you want to supervise the task without attaching immediately
-- another human or agent may need to resume or inspect the work later
+Do **not** use `oly` for short, non-interactive commands — a normal terminal is simpler.
 
-Do **not** reach for `oly` by default for short, non-interactive commands where a normal terminal invocation is simpler.
+## Principles
 
-## Agent operating principles
+- **Supervisor mindset.** Start the job, monitor it, intervene only when needed.
+- **Small tails first.** Use `--tail 40`; expand only when context is insufficient.
+- **Fewer polls, longer waits.** Set `--timeout` to match the expected next checkpoint — reduces churn and token cost.
+- **Machine-readable listing.** Use `oly ls --json --status running` for scripting or structured decisions.
 
-- Think like a supervisor, not a shell typist. Start the job, monitor it, and intervene only when needed.
-- Prefer short log tails over full transcripts. Start with `--tail 40` and only ask for more when necessary.
-- Prefer longer waits with fewer polls. Choose a timeout that matches the expected next checkpoint to reduce churn and token use.
-- Use `oly ls --json` when you need machine-readable status for scripting or structured decisions.
+## Workflow
 
-## Recommended workflow
-
-### 1) Start the session
-
-Start the command detached so you get the session ID immediately:
+### 1) Start
 
 ```bash
-oly start --title "task 1" --cwd /path/to/working/directory --detach the_cmd --cmd-arg1 --cmd-arg2
+oly start --title "task 1" --cwd /path/to/dir --detach the_cmd --arg1 --arg2
 ```
 
-Useful options:
+| Flag | Purpose |
+|---|---|
+| `--detach` | Return immediately with the session ID. |
+| `--disable-notifications` | Suppress notifications when you will supervise yourself. |
+| `--node <name>` | Run on a connected secondary node. |
 
-- `--detach` returns immediately with the session ID.
-- `--disable-notifications` is useful when you plan to supervise the session yourself.
-- `--node <name>` runs the command on a connected secondary node.
-
-### 2) Monitor progress
-
-Use `oly logs` to inspect the latest output or wait for an interactive checkpoint:
+### 2) Monitor
 
 ```bash
 oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 ```
 
-Guidance:
+- `--wait-for-prompt` — blocks until the session likely needs input or timeout expires.
+- `--timeout` — accepts `250ms`, `10s`, `5m`, `1h` (default `5m`). Shorten for fast tasks; lengthen for slow ones.
+- Start with `--tail 40`; increase only when recent context is insufficient.
 
-- `--wait-for-prompt` blocks until the session likely needs input or the timeout expires.
-- `--timeout` accepts plain milliseconds or units such as `250ms`, `10s`, `5m`, and `1h`. The default is `5m`.
-- `oly logs` can omit the ID and target the most recently created session.
-- If the task should finish soon, reduce `--timeout` so you do not wait longer than necessary.
-- If the task is expected to run for a while, increase `--timeout` to avoid unnecessary polling.
-- Start with a small tail and only expand when the recent context is insufficient.
-
-### 3) Send input without attaching
-
-Send text or key events directly into the session:
+### 3) Send input
 
 ```bash
 oly send <ID> "hello world!" key:enter
 ```
 
-Rules:
+- Arguments are sent left-to-right. Plain text is literal; special keys use `key:` prefix.
+- Keys: `key:enter`, `key:ctrl+c`, `key:alt+x`, `key:shift+tab`, `key:up`, `key:down`.
+- Raw hex: `key:hex:...`. Piped stdin is supported when no positional chunks are given.
 
-- Arguments are sent left to right.
-- Plain arguments send literal text.
-- Special keys use `key:...`, for example `key:enter`, `key:ctrl+c`, `key:alt+x`, `key:shift+tab`.
-- Raw hex bytes use `key:hex:...`.
-- `oly send` can omit the ID and target the most recently created session.
-- Piped stdin is supported when you do not pass positional chunks.
+**Input strategy:**
 
-Input strategy:
+| Scenario | Action |
+|---|---|
+| Menu / TUI selection | Navigate with `key:up` / `key:down` / `key:enter`. |
+| Freeform text prompt | Send text + `key:enter`. |
+| Stuck / needs interrupt | `key:ctrl+c` (or relevant control sequence like `key:esc`). |
 
-- If the program is showing menu choices or a TUI selection, prefer navigation keys such as `key:up`, `key:down`, and `key:enter` instead of sending plain text.
-- If the program is prompting for freeform text, send the instruction as text and include `key:enter` when appropriate.
-- If a command is stuck or needs to be interrupted, send the relevant control key sequence such as `key:ctrl+c`.
-
-### 4) Attach, list, or stop
-
-Use these commands when you need direct control or lifecycle management:
+### 4) Lifecycle
 
 ```bash
-oly attach <ID>
+oly attach <ID>      # Detach: Ctrl-], then d
 oly stop <ID>
-oly ls
+oly ls                # oly ls --json for agents
 ```
 
-Notes:
-
-- Detach from an attached session with `Ctrl-]`, then `d`.
-- `oly ls --json` is preferred for scripts and agents.
-
-### 5) Notification
-
-Use `oly notify` to send a notification that may be delivered through any configured channel:
+### 5) Notify
 
 ```bash
-oly notify <ID> --title "Job complete" --description "The data processing task has finished." --body "Check the results at /path/to/results."
+oly notify <ID> --title "Done" --description "Summary." --body "Details."
 ```
 
-- `<ID>` is optional, use it when you want to mark this notifcation as the source of the specific session.
+- `<ID>` is optional — include it to link the notification to a specific session.
+- Toggle per-session notifications: `oly notify enable <ID>` / `oly notify disable <ID>`.
 
-You can also toggle a session's notifications on or off, this is useful when you want to supervise the session yourself and avoid redundant or distracting notifications:
+### Help
 
 ```bash
-oly notify enable <ID>
-oly notify disable <ID>
+oly --help            # or: oly <command> --help
 ```
-
-## Help
-
-Use the built-in help when you need command details:
-
-```bash
-oly --help
-oly notify --help
-oly <command> --help
-```
-
-## Presenting rich output with HTML
-
-When you want to show rich output to the user, publish it as either:
-
-- a single HTML page
-- a single-page application bundle
-
-Place each app in its own child folder under `<OLY-ROOT>/wwwroot/apps`, and make sure that folder contains an `index.html` entry point.
-
-For SPAs, use relative asset paths and set the base href to `./` so the app works correctly when served from its discovered route.
-
-Users can then open the app at:
-
-```text
-http://127.0.0.1:<OLY-PORT>/apps/<your-app-name>/
-```
-
-- `<OLY-PORT>` is the `oly` HTTP port, `15443` by default.
-- `<OLY-ROOT>` is the state directory root:
-  - `%LOCALAPPDATA%\oly` on Windows
-  - `$XDG_STATE_HOME/oly` or `~/.local/state/oly` on Linux
-  - `~/Library/Application Support/oly` on macOS
-
-You can also add an `oly.app.config` file inside the app's folder with the following structure.
-
-```rust
-struct AppManifest {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    icon_href: Option<String>,
-    #[serde(default)]
-    app_type: Option<String>,
-    #[serde(default)]
-    redirect_files: Vec<String>,
-    entry: String,
-}
-```
-
-  Use `redirect_files` for static asset directories that live outside the app root so you do not need to copy them into place. `oly` serves those files with the correct content type when requested.

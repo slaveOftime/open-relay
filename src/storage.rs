@@ -5,7 +5,41 @@ use std::{
     path::PathBuf,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{AppError, Result};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    pub no_http: bool,
+    pub no_auth: bool,
+    pub started_at: String,
+}
+
+pub fn write_daemon_info(path: &PathBuf, info: &DaemonInfo) -> Result<()> {
+    let json = serde_json::to_string(info).map_err(|e| AppError::Protocol(e.to_string()))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+pub fn read_daemon_info(path: &PathBuf) -> Result<Option<DaemonInfo>> {
+    let mut file = match OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    let info: DaemonInfo =
+        serde_json::from_str(&content).map_err(|e| AppError::Protocol(e.to_string()))?;
+    Ok(Some(info))
+}
 
 pub fn resolve_state_dir() -> PathBuf {
     // Direct override — used by tests to guarantee full isolation.

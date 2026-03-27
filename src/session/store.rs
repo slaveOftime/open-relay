@@ -1616,6 +1616,7 @@ mod tests {
             db_file: PathBuf::from("."),
             socket_name: "test.sock".into(),
             socket_file: PathBuf::from("."),
+            info_file: PathBuf::from("."),
             lock_file: PathBuf::from("."),
             max_running_sessions,
             notification_hook: None,

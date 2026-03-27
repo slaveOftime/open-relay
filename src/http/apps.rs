@@ -1059,6 +1059,7 @@ mod tests {
             sessions_dir: state_dir.join("sessions"),
             db_file: state_dir.join("oly.db"),
             lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
             socket_name: "test.sock".into(),
             socket_file: state_dir.join("daemon.sock"),
             silence_seconds: 10,
