@@ -271,6 +271,7 @@ async fn run() -> Result<()> {
                     title: args.title,
                     description: args.description,
                     body: args.body,
+                    url: args.url,
                 };
                 match ipc::send_request_checked(&config, node_wrap(args.node, inner)).await? {
                     RpcResponse::Ack => {

@@ -170,6 +170,7 @@ pub enum RpcRequest {
         title: String,
         description: Option<String>,
         body: Option<String>,
+        url: Option<String>,
     },
     AttachSubscribe {
         id: String,

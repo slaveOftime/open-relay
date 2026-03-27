@@ -363,6 +363,7 @@ mod tests {
             title: "Deploy ready".to_string(),
             description: Some("Build finished".to_string()),
             body: Some("Open the session for details.".to_string()),
+            url: None,
         }));
     }
 

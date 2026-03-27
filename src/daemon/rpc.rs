@@ -139,12 +139,14 @@ async fn dispatch_request(
             title,
             description,
             body,
+            url,
         } => {
             handle_notify_send(
                 source,
                 title,
                 description,
                 body,
+                url,
                 notifier,
                 notification_tx,
                 session_event_tx,
@@ -306,6 +308,7 @@ async fn handle_notify_send(
     title: String,
     description: Option<String>,
     body: Option<String>,
+    url: Option<String>,
     notifier: &NotifierHandle,
     notification_tx: &NotificationTx,
     session_event_tx: &SessionEventTx,
@@ -326,7 +329,7 @@ async fn handle_notify_send(
     }
 
     let event =
-        crate::notification::event::NotificationEvent::manual(source, title, description, body);
+        crate::notification::event::NotificationEvent::manual(source, title, description, body, url);
     let outcome = notifier.dispatch(&event).await;
 
     if !outcome.any_delivered() {

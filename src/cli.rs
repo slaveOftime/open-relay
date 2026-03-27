@@ -260,6 +260,9 @@ pub struct NotifySendArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+    /// Url to open when the notification is clicked. Absolute or relative to oly http server. If omitted, defaults to the attach URL of the source session (if any).
+    #[arg(long)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Args)]
