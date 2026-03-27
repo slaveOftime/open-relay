@@ -374,6 +374,7 @@ mod tests {
             inner: Box::new(RpcRequest::List {
                 query: ListQuery {
                     search: None,
+                    tags: Vec::new(),
                     statuses: Vec::new(),
                     since: None,
                     until: None,

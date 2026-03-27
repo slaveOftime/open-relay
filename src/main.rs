@@ -116,6 +116,7 @@ async fn resolve_session_id(
 
     let query = ListQuery {
         search: None,
+        tags: vec![],
         statuses: vec![],
         since: None,
         until: None,

@@ -189,6 +189,13 @@ fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
 
     Ok(ListQuery {
         search: args.search.as_ref().map(|text| text.trim().to_string()),
+        tags: args
+            .tags
+            .iter()
+            .map(|tag| tag.trim())
+            .filter(|tag| !tag.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
         statuses: args
             .status
             .iter()
@@ -242,6 +249,7 @@ mod tests {
     fn build_list_query_preserves_json_flag_as_output_only_concern() {
         let args = ListArgs {
             search: Some("demo".to_string()),
+            tags: vec!["prod".to_string(), " release ".to_string(), " ".to_string()],
             json: true,
             status: vec![],
             since: None,
@@ -253,6 +261,7 @@ mod tests {
         let query = build_list_query(&args).expect("query should build");
 
         assert_eq!(query.search.as_deref(), Some("demo"));
+        assert_eq!(query.tags, vec!["prod".to_string(), "release".to_string()]);
         assert_eq!(query.limit, 25);
         assert!(query.statuses.is_empty());
     }

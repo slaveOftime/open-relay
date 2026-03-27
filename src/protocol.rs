@@ -583,6 +583,7 @@ impl SortOrder {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListQuery {
     pub search: Option<String>,
+    pub tags: Vec<String>,
     pub statuses: Vec<String>,
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,

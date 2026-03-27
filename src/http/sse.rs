@@ -212,6 +212,7 @@ pub async fn events_handler(
     let initial = {
         let q = ListQuery {
             search: None,
+            tags: vec![],
             statuses: vec![],
             since: None,
             until: None,
