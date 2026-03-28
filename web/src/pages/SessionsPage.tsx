@@ -478,6 +478,12 @@ function SessionRow({
             <TooltipContent>{`${session.id} — click to copy`}</TooltipContent>
           </Tooltip>
         </TableCell>
+        
+        <TableCell className="px-3 py-2.5 truncate max-w-0">
+          <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+            {formatByteSize(session.last_total_bytes)}
+          </span>
+        </TableCell>
 
         {/* Title */}
         <TableCell className="px-3 py-2.5 truncate max-w-0">
@@ -1902,6 +1908,7 @@ export default function SessionsPage() {
             <Table className="w-full border-collapse table-fixed">
               <colgroup>
                 <col style={{ width: '5rem' }} />
+                <col style={{ width: '6rem' }} />
                 <col style={{ width: 'auto', minWidth: '6rem' }} />
                 <col style={{ width: 'auto', minWidth: '6rem' }} />
                 <col style={{ width: 'auto', minWidth: '6rem' }} />
@@ -1917,6 +1924,7 @@ export default function SessionsPage() {
                   {(
                     [
                       { key: 'id', label: 'ID', sortField: SessionSortField.Id },
+                      { key: 'output', label: 'Output', sortField: undefined },
                       { key: 'title', label: 'Title', sortField: SessionSortField.Title },
                       { key: 'tags', label: 'Tags', sortField: undefined },
                       {
