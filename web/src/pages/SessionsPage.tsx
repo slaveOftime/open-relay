@@ -25,6 +25,7 @@ import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
   cwdBasename,
+  formatByteSize,
   formatTimestamp,
   sessionDisplayName,
   parseArgString,
@@ -522,7 +523,12 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg series={series} enableAnimation={isRunning} />
+          <div className="space-y-1">
+            <SparklineSvg series={series} enableAnimation={isRunning} />
+            <div className="text-[hsl(var(--muted-foreground))] text-xs font-mono whitespace-nowrap">
+              {formatByteSize(session.last_total_bytes)}
+            </div>
+          </div>
         </TableCell>
 
         {/* PID */}
@@ -670,29 +676,42 @@ function SessionCard({
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
           </div>
 
-          {/* Row 2: title */}
+          {/* Row 2: command + title */}
           <div onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
-            <span
-              className={`flex min-w-0 items-center gap-2 text-base font-medium text-wrap ${titleTone}`}
-            >
-              <CommandLogo command={session.command} size={24} />
-              <span>{sessionDisplayName(session)}</span>
-              {session.title && <span>| {session.title}</span>}
-            </span>
+            <div className={`flex min-w-0 items-center gap-2 ${titleTone}`}>
+              <div className="shrink-0 pt-0.5">
+                <CommandLogo command={session.command} size={36} />
+              </div>
+              <div className="min-w-0 flex-1">
+                {session.title?.trim() && (
+                  <div className="text-[hsl(var(--primary))] break-all">
+                    {session.title.trim()}
+                  </div>
+                )}
+                <div className="text-base font-medium break-all">
+                  {sessionDisplayName(session)}
+                </div>
+              </div>
+            </div>
           </div>
 
           {/* Row 3: cwd */}
           {session.cwd && (
-            <div className="text-sm text-[hsl(var(--muted-foreground))] font-mono text-wrap">
+            <div className="text-sm leading-snug text-[hsl(var(--muted-foreground))] font-mono break-all">
               {session.cwd}
             </div>
           )}
 
-          {session.tags.length > 0 && (
-            <div className="flex items-start gap-2">
-              <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
+          <div className='flex flex-wrap items-center gap-2'>
+            <div className="text-[hsl(var(--muted-foreground))] font-semibold">
+              {formatByteSize(session.last_total_bytes)}
             </div>
-          )}
+            {session.tags.length > 0 && (
+              <div className="flex items-start gap-2">
+                <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
+              </div>
+            )}
+          </div>
 
           {/* Row 4: activity sparkline */}
           {session.status === 'running' && (

@@ -23,6 +23,19 @@ export function formatTimestamp(iso: string): string {
   })
 }
 
+export function formatByteSize(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0b'
+  const units = ['b', 'kb', 'mb', 'gb', 'tb']
+  let scaled = value
+  let unitIndex = 0
+  while (scaled >= 1024 && unitIndex < units.length - 1) {
+    scaled /= 1024
+    unitIndex += 1
+  }
+  const digits = scaled >= 100 || unitIndex === 0 ? 0 : scaled >= 10 ? 1 : 2
+  return `${scaled.toFixed(digits)}${units[unitIndex]}`
+}
+
 // ---------------------------------------------------------------------------
 // Status helpers
 // ---------------------------------------------------------------------------
