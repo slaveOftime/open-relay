@@ -1,8 +1,7 @@
 use axum::{
     Json,
-    body::Body,
     extract::State,
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::Uri,
     response::{IntoResponse, Response},
 };
 use reqwest::Url;
@@ -10,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     io,
     path::{Component, Path, PathBuf},
-    sync::OnceLock,
 };
 use tracing::{error, info};
 
@@ -20,26 +18,6 @@ use super::AppState;
 
 const DEFAULT_WWWROOT_INDEX: &str = include_str!("apps-index.html");
 const APP_MANIFEST_FILE: &str = "oly.app.json";
-const FORWARDED_REQUEST_HEADERS: [&str; 6] = [
-    "accept",
-    "accept-language",
-    "cache-control",
-    "if-modified-since",
-    "if-none-match",
-    "user-agent",
-];
-const PROXIED_RESPONSE_HEADERS: [&str; 8] = [
-    "content-type",
-    "cache-control",
-    "content-disposition",
-    "accept-ranges",
-    "content-range",
-    "etag",
-    "last-modified",
-    "location",
-];
-
-static APP_PROXY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -171,81 +149,6 @@ pub(super) fn find_existing_local_asset(
         }
     }
     Ok(None)
-}
-
-pub(super) async fn proxy_app_request(
-    request_method: &Method,
-    headers: &HeaderMap,
-    target_urls: &[Url],
-) -> Response {
-    if target_urls.is_empty() {
-        error!("proxied app request was missing upstream targets");
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
-
-    let method = match reqwest::Method::from_bytes(request_method.as_str().as_bytes()) {
-        Ok(method) => method,
-        Err(err) => {
-            error!(%err, method = %request_method, "invalid proxied app method");
-            return StatusCode::BAD_GATEWAY.into_response();
-        }
-    };
-
-    let mut last_not_found = None;
-    for target_url in target_urls {
-        let mut upstream = app_proxy_client().request(method.clone(), target_url.clone());
-        for header_name in FORWARDED_REQUEST_HEADERS {
-            if let Some(value) = headers.get(header_name) {
-                upstream = upstream.header(header_name, value.clone());
-            }
-        }
-
-        let upstream = match upstream.send().await {
-            Ok(response) => response,
-            Err(err) => {
-                error!(%err, url = %target_url, "failed to proxy app request");
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
-        };
-
-        let status =
-            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let mut builder = axum::http::Response::builder().status(status);
-        for header_name in PROXIED_RESPONSE_HEADERS {
-            if let Some(value) = upstream.headers().get(header_name) {
-                builder = builder.header(header_name, value.clone());
-            }
-        }
-
-        if status == StatusCode::NOT_FOUND {
-            last_not_found = Some(
-                builder
-                    .body(Body::empty())
-                    .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response()),
-            );
-            continue;
-        }
-
-        if *request_method == Method::HEAD {
-            return builder
-                .body(Body::empty())
-                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-        }
-
-        let body = match upstream.bytes().await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%err, url = %target_url, "failed to read proxied app response body");
-                return StatusCode::BAD_GATEWAY.into_response();
-            }
-        };
-
-        return builder
-            .body(Body::from(body))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-    }
-
-    last_not_found.unwrap_or_else(|| StatusCode::BAD_GATEWAY.into_response())
 }
 
 fn discover_static_apps(wwwroot: &Path) -> io::Result<Vec<StaticApp>> {
@@ -745,10 +648,6 @@ fn filtered_proxy_query(query: Option<&str>) -> Option<String> {
     } else {
         Some(filtered.join("&"))
     }
-}
-
-fn app_proxy_client() -> &'static reqwest::Client {
-    APP_PROXY_CLIENT.get_or_init(reqwest::Client::new)
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {

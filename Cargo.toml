@@ -45,7 +45,7 @@ axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "compression-br", "compression-gzip"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
 rust-embed = "8"
 mime_guess = "2"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
