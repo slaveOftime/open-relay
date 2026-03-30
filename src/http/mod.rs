@@ -116,7 +116,7 @@ pub async fn serve(state: AppState) {
         .merge(protected_router)
         .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
-        .fallback(serve_static)
+        .fallback(serve_static_or_proxy)
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -139,17 +139,13 @@ pub async fn serve(state: AppState) {
     }
 }
 
-async fn serve_static(
+async fn serve_static_or_proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     method: Method,
     uri: Uri,
 ) -> Response {
-    if method != Method::GET && method != Method::HEAD {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
     let wwwroot_dir = state.config.wwwroot_dir();
     let auth_token = auth::extract_request_token_parts(&headers, uri.query());
     let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
