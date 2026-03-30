@@ -156,7 +156,7 @@ pub(super) fn resolve_app_request(
             Ok(None)
         }
         AppEntry::Proxy { entry_url } => Ok(Some(AppRequestTarget::Proxy(
-            build_proxy_target_urls(&entry_url, uri.path(), &request_tail, uri.query())?,
+            build_proxy_target_urls(&entry_url, &request_tail, uri.query())?,
         ))),
     }
 }
@@ -668,7 +668,6 @@ fn directory_exists(path: &Path) -> io::Result<bool> {
 
 fn build_proxy_target_urls(
     entry_url: &Url,
-    request_path: &str,
     request_tail: &str,
     query: Option<&str>,
 ) -> io::Result<Vec<Url>> {
@@ -696,10 +695,10 @@ fn build_proxy_target_urls(
         }
 
         let public_path_relative = origin_root_url(entry_url)
-            .join(request_path.trim_start_matches('/'))
+            .join(request_tail.trim_start_matches('/'))
             .map_err(|err| {
                 invalid_data(format!(
-                    "failed to build public-path proxied app URL {entry_url} with {request_path}: {err}"
+                    "failed to build public-path proxied app URL {entry_url} with {request_tail}: {err}"
                 ))
             })?;
         let public_path_relative = with_proxy_query(public_path_relative, query);
@@ -1348,8 +1347,6 @@ mod tests {
                     .expect("proxy URL should parse"),
                 Url::parse("https://example.com/assets/main.js?theme=dark")
                     .expect("root fallback proxy URL should parse"),
-                Url::parse("https://example.com/apps/remote/assets/main.js?theme=dark")
-                    .expect("public-path fallback proxy URL should parse"),
             ]))
         );
 
@@ -1382,8 +1379,6 @@ mod tests {
             Some(AppRequestTarget::Proxy(vec![
                 Url::parse("http://127.0.0.1:5173/@vite/client")
                     .expect("entry-relative vite URL should parse"),
-                Url::parse("http://127.0.0.1:5173/apps/demo2/@vite/client")
-                    .expect("public-path vite URL should parse"),
             ]))
         );
 
