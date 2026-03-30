@@ -1150,17 +1150,17 @@ export default function SessionDetailPage() {
 
         {/* ── Info bar ── */}
         {session && (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-xs text-[hsl(var(--muted-foreground))] shrink-0">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-sm text-[hsl(var(--muted-foreground))] shrink-0">
             <span className="inline-flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={28} />
               <div>
                 {session?.title && <span className='mr-2 break-all text-[hsl(var(--primary))]'>{session.title}</span>}
                 <span className="break-all">{sessionDisplayName(session)}</span>
+                {session.cwd && (
+                  <span className="text-[hsl(var(--foreground))] break-all pl-2">{session.cwd}</span>
+                )}
               </div>
             </span>
-            {session.cwd && (
-              <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
-            )}
             <span className="text-[hsl(var(--foreground))]">
               {formatTimestamp(session.created_at)}
             </span>
@@ -1170,7 +1170,7 @@ export default function SessionDetailPage() {
               </span>
             )}
             <span>
-              OUTPUT: <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
+              <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
             </span>
             {session.pid != null && (
               <span>

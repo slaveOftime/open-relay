@@ -529,12 +529,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <div className="space-y-1">
             <SparklineSvg series={series} enableAnimation={isRunning} />
-            <div className="text-[hsl(var(--muted-foreground))] text-xs font-mono whitespace-nowrap">
-              {formatByteSize(session.last_total_bytes)}
-            </div>
-          </div>
         </TableCell>
 
         {/* PID */}
