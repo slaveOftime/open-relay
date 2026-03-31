@@ -181,7 +181,6 @@ fn e2e_two_separate_input_calls_execute_command() {
     const MARKER: &str = "oly_e2e_two_inputs_marker";
     let command = format!("echo {MARKER}");
     send_text_only(&tmp, &id, &command);
-    sleep(Duration::from_millis(100));
     send_key(&tmp, &id, "enter");
 
     let result = wait_for_prompted_output(&tmp, &id, &initial, &prompt, [MARKER], timeout);
