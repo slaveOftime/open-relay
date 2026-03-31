@@ -1,6 +1,6 @@
 [package]
 name = "oly"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 description = "Run interactive CLIs and AI agents like managed services with persistent PTY sessions."
 license = "MIT"
