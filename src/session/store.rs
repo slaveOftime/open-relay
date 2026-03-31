@@ -620,16 +620,11 @@ impl SessionStore {
             "attach input forwarded"
         );
 
-        if self
+        let _ = self
             .wait_for_output_change(id, &runtime, initial_total_bytes)
-            .await
-        {
-            Ok(())
-        } else {
-            Err(SessionError::ProcessFailure(
-                "no output change observed after sending the input".to_string(),
-            ))
-        }
+            .await;
+
+        Ok(())
     }
 
     async fn wait_for_output_change(

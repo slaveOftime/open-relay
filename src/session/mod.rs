@@ -75,7 +75,6 @@ pub enum SessionError {
     Evicted,
     NotRunning,
     Busy,
-    ProcessFailure(String),
 }
 
 impl SessionError {
@@ -84,9 +83,6 @@ impl SessionError {
             Self::Evicted => format!("session evicted from memory: {id}"),
             Self::NotRunning => format!("session not running: {id}"),
             Self::Busy => format!("session input queue is full: {id}"),
-            Self::ProcessFailure(reason) => {
-                format!("session process failure: {id}, reason: {reason}")
-            }
         }
     }
 }
