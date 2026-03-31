@@ -476,6 +476,47 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         fetch_logs_node(&primary_tmp, "worker1", &session_id)
     );
 
+    const REMOTE_FILE_MARKER: &str = "oly_federation_remote_file_marker";
+    let upload_source = primary_tmp.join("remote-send-source.txt");
+    fs::write(&upload_source, REMOTE_FILE_MARKER).expect("write remote send source file");
+
+    #[cfg(target_os = "windows")]
+    let remote_cat_prefix = "type ";
+    #[cfg(not(target_os = "windows"))]
+    let remote_cat_prefix = "cat ";
+
+    let upload_chunk = format!("oly-content:{}", upload_source.display());
+    let file_input = oly_cmd(&primary_tmp)
+        .args([
+            "send",
+            &session_id,
+            "--node",
+            "worker1",
+            remote_cat_prefix,
+            &upload_chunk,
+            "key:enter",
+        ])
+        .output()
+        .expect("`oly send --node oly-content:<file>` failed to execute");
+    assert!(
+        file_input.status.success(),
+        "`oly send --node oly-content:<file>` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&file_input.stderr)
+    );
+
+    let uploaded_file_seen = wait_for_log_node(
+        &primary_tmp,
+        "worker1",
+        &session_id,
+        |log| log.contains(REMOTE_FILE_MARKER),
+        Duration::from_secs(5),
+    );
+    assert!(
+        uploaded_file_seen.is_some(),
+        "remote uploaded-file marker not found in node-proxied logs.\nLogs:\n{}",
+        fetch_logs_node(&primary_tmp, "worker1", &session_id)
+    );
+
     let stop = oly_cmd(&primary_tmp)
         .args(["stop", &session_id, "--node", "worker1"])
         .output()

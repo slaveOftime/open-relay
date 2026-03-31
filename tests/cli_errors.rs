@@ -211,6 +211,29 @@ fn input_without_daemon_exits_nonzero() {
     );
 }
 
+#[test]
+fn input_missing_oly_content_file_exits_nonzero() {
+    let tmp = make_tmp_dir("input_missing_oly_content_file");
+    let missing_file = tmp.join("does-not-exist.txt");
+    let chunk = format!("oly-content:{}", missing_file.display());
+    let output = oly_cmd(&tmp)
+        .args(["send", "abc1234", &chunk])
+        .output()
+        .expect("failed to run oly send");
+
+    assert!(
+        !output.status.success(),
+        "`oly send {chunk}` should exit non-zero when the source file is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not exist")
+            || stderr.contains("not found")
+            || stderr.contains("error"),
+        "expected missing-file message, got: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // oly logs – session not found on disk
 // ---------------------------------------------------------------------------
