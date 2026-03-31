@@ -213,6 +213,37 @@ jobs:
           npm version "$VERSION" --no-git-tag-version
         working-directory: npm
 
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Bundle release binaries into npm package
+        run: |
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          LINUX_ZIP="$(find dist -type f -name 'oly-linux-amd64.zip' -print -quit)"
+          MACOS_ZIP="$(find dist -type f -name 'oly-macos-arm64.zip' -print -quit)"
+          WINDOWS_ZIP="$(find dist -type f -name 'oly-windows-amd64.zip' -print -quit)"
+
+          test -n "$LINUX_ZIP"
+          test -n "$MACOS_ZIP"
+          test -n "$WINDOWS_ZIP"
+
+          unzip -j "$LINUX_ZIP" oly -d "$TMP_DIR"
+          mv "$TMP_DIR/oly" npm/bin/oly-linux-x64
+          unzip -j "$MACOS_ZIP" oly -d "$TMP_DIR"
+          mv "$TMP_DIR/oly" npm/bin/oly-darwin-arm64
+          unzip -j "$WINDOWS_ZIP" oly.exe -d "$TMP_DIR"
+          mv "$TMP_DIR/oly.exe" npm/bin/oly-win32-x64.exe
+          chmod +x npm/bin/oly-linux-x64 npm/bin/oly-darwin-arm64
+
+          test -f npm/bin/oly.js
+          test -f npm/bin/oly-linux-x64
+          test -f npm/bin/oly-darwin-arm64
+          test -f npm/bin/oly-win32-x64.exe
+
       - name: Copy README to npm package
         run: cp README.md npm/README.md
 

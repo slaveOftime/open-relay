@@ -6,4 +6,8 @@ node_modules
 /target-tests
 /web/dist
 /web/dev-dist
+/npm/README.md
+/npm/bin/oly-linux-x64
+/npm/bin/oly-darwin-arm64
+/npm/bin/oly-win32-x64.exe
 test-results
