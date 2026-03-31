@@ -44,7 +44,7 @@ For deep implementation details, see [ARCHITECTURE.md](./ARCHITECTURE.md), [ARCH
 npm i -g @slaveoftime/oly
 ```
 
-The published npm package bundles the supported platform binaries directly, so install does not need to download a GitHub release asset during `npm install`.
+The published npm package bundles the supported platform binaries directly, so users do not need to download a GitHub release asset during `npm install`.
 
 ### Cargo
 
