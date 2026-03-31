@@ -1,14 +1,16 @@
 mod apps;
 pub mod auth;
 pub mod nodes;
+mod reverse_proxy;
 pub mod sessions;
 pub mod sse;
 pub mod ws;
 
 use axum::{
     Router,
-    extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    extract::ws::rejection::WebSocketUpgradeRejection,
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State, WebSocketUpgrade},
+    http::{StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -142,10 +144,12 @@ pub async fn serve(state: AppState) {
 async fn serve_static_or_proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: HeaderMap,
-    method: Method,
-    uri: Uri,
+    ws_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+    request: Request,
 ) -> Response {
+    let (parts, body) = request.into_parts();
+    let uri = parts.uri.clone();
+    let headers = parts.headers.clone();
     let wwwroot_dir = state.config.wwwroot_dir();
     let auth_token = auth::extract_request_token_parts(&headers, uri.query());
     let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
@@ -174,7 +178,12 @@ async fn serve_static_or_proxy(
             {
                 return response;
             }
-            return apps::proxy_app_request(&method, &headers, &target_urls).await;
+            return reverse_proxy::proxy(
+                Request::from_parts(parts, body),
+                ws_upgrade.ok(),
+                &target_urls,
+            )
+            .await;
         }
         Ok(None) => {}
         Err(err) => {
