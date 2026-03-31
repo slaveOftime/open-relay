@@ -70,19 +70,23 @@ pub struct StartSpec {
     pub notifications_enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum SessionLookupError {
+#[derive(Debug, Clone)]
+pub enum SessionError {
     Evicted,
     NotRunning,
     Busy,
+    ProcessFailure(String),
 }
 
-impl SessionLookupError {
-    pub fn message(self, id: &str) -> String {
+impl SessionError {
+    pub fn message(&self, id: &str) -> String {
         match self {
             Self::Evicted => format!("session evicted from memory: {id}"),
             Self::NotRunning => format!("session not running: {id}"),
             Self::Busy => format!("session input queue is full: {id}"),
+            Self::ProcessFailure(reason) => {
+                format!("session process failure: {id}, reason: {reason}")
+            }
         }
     }
 }

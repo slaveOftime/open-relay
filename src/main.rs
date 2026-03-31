@@ -330,12 +330,7 @@ async fn run() -> Result<()> {
         Commands::Send(send_args) => {
             let id =
                 resolve_session_id(&config, send_args.id.clone(), send_args.node.as_ref()).await?;
-            let node = send_args.node.clone();
-            let send_args = cli::SendArgs {
-                id: Some(id),
-                ..send_args
-            };
-            client::run_send(&config, send_args, node).await
+            client::run_send(&config, &id, send_args.node, send_args.chunks).await
         }
 
         // ── API key management (primary side) ────────────────────────────────

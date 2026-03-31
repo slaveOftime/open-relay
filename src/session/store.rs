@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    SessionLookupError, SessionMeta, SessionStatus, StartSpec,
+    SessionError, SessionMeta, SessionStatus, StartSpec,
     persist::{append_event, append_resize_event, current_output_offset},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
@@ -37,6 +37,11 @@ const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']];
 const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
 const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(5_000);
+#[cfg(test)]
+const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
+const ATTACH_INPUT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 type SessionMap = HashMap<String, Arc<SessionHandle>>;
 
@@ -432,7 +437,7 @@ impl SessionStore {
     pub async fn attach_stream_status(
         &self,
         id: &str,
-    ) -> std::result::Result<(bool, bool, Option<i32>), SessionLookupError> {
+    ) -> std::result::Result<(bool, bool, Option<i32>), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
         let snapshot = runtime.snapshot();
         Ok((snapshot.running, snapshot.output_closed, snapshot.exit_code))
@@ -464,11 +469,11 @@ impl SessionStore {
             bool,
             bool,
         ),
-        SessionLookupError,
+        SessionError,
     > {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(rt) = runtime.runtime.lock() else {
-            return Err(SessionLookupError::Evicted);
+            return Err(SessionError::Evicted);
         };
         let offset = from_byte_offset.unwrap_or(0);
         let (chunks, end_offset) = rt.ring.read_from(offset);
@@ -503,10 +508,10 @@ impl SessionStore {
         Some((rt.resize_tx.subscribe(), rt.pty_size))
     }
 
-    pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionLookupError> {
+    pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionLookupError::Evicted);
+            return Err(SessionError::Evicted);
         };
         rt.detach_attach_client();
         runtime.refresh_snapshot(&rt);
@@ -518,13 +523,13 @@ impl SessionStore {
         &self,
         id: &str,
         enabled: bool,
-    ) -> std::result::Result<(), SessionLookupError> {
+    ) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionLookupError::Evicted);
+            return Err(SessionError::Evicted);
         };
         if rt.is_completed() {
-            return Err(SessionLookupError::NotRunning);
+            return Err(SessionError::NotRunning);
         }
         rt.set_notifications_enabled(enabled);
         runtime.refresh_snapshot(&rt);
@@ -540,69 +545,134 @@ impl SessionStore {
         &self,
         id: &str,
         data: &str,
-    ) -> std::result::Result<(), SessionLookupError> {
+    ) -> std::result::Result<(), SessionError> {
         // Avoid sending lose focus escape sequence which will cause other clients not able to input anything
         if data == "\x1b[O" {
             return Ok(());
         }
 
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionLookupError::Evicted);
-        };
-        // When the child process has enabled DECCKM (application cursor key
-        // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
-        // instead of `\x1b[`.  Transform transparently here so both
-        // `oly attach` and `oly send` always work, regardless of whether the
-        // caller tracks DECCKM state itself.
-        let modes = rt.mode_snapshot();
-        let cooked;
-        let transformed = modes.app_cursor_keys
-            && (data.contains("\x1b[A")
-                || data.contains("\x1b[B")
-                || data.contains("\x1b[C")
-                || data.contains("\x1b[D"));
-        let bytes = if transformed {
-            cooked = data
-                .replace("\x1b[A", "\x1bOA")
-                .replace("\x1b[B", "\x1bOB")
-                .replace("\x1b[C", "\x1bOC")
-                .replace("\x1b[D", "\x1bOD");
-            cooked.into_bytes()
+        let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
+            let Ok(mut rt) = runtime.runtime.lock() else {
+                return Err(SessionError::Evicted);
+            };
+            let initial_total_bytes = rt.last_total_bytes;
+            // When the child process has enabled DECCKM (application cursor key
+            // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
+            // instead of `\x1b[`. Transform transparently here so both
+            // `oly attach` and `oly send` always work, regardless of whether the
+            // caller tracks DECCKM state itself.
+            let modes = rt.mode_snapshot();
+            let cooked;
+            let transformed = modes.app_cursor_keys
+                && (data.contains("\x1b[A")
+                    || data.contains("\x1b[B")
+                    || data.contains("\x1b[C")
+                    || data.contains("\x1b[D"));
+            let bytes = if transformed {
+                cooked = data
+                    .replace("\x1b[A", "\x1bOA")
+                    .replace("\x1b[B", "\x1bOB")
+                    .replace("\x1b[C", "\x1bOC")
+                    .replace("\x1b[D", "\x1bOD");
+                cooked.into_bytes()
+            } else {
+                data.as_bytes().to_vec()
+            };
+
+            let byte_len = bytes.len();
+            match rt.pty.try_write_input(bytes) {
+                Ok(()) => {
+                    rt.mark_attach_activity();
+                    rt.last_input_at = Some(Instant::now());
+                    runtime.refresh_snapshot(&rt);
+                    Ok((
+                        initial_total_bytes,
+                        byte_len,
+                        transformed,
+                        modes.app_cursor_keys,
+                    ))
+                }
+                Err(TrySendError::Full(_)) => {
+                    debug!(
+                        session_id = id,
+                        bytes = byte_len,
+                        "attach input backpressured by full PTY writer queue"
+                    );
+                    Err(SessionError::Busy)
+                }
+                Err(TrySendError::Closed(_)) => {
+                    debug!(
+                        session_id = id,
+                        bytes = byte_len,
+                        "attach input failed while writing to PTY"
+                    );
+                    Err(SessionError::Evicted)
+                }
+            }
+        }?;
+
+        debug!(
+            session_id = id,
+            bytes = byte_len,
+            transformed,
+            app_cursor_keys,
+            "attach input forwarded"
+        );
+
+        if self
+            .wait_for_output_change(id, &runtime, initial_total_bytes)
+            .await
+        {
+            Ok(())
         } else {
-            data.as_bytes().to_vec()
-        };
-        let byte_len = bytes.len();
-        match rt.pty.try_write_input(bytes) {
-            Ok(()) => {
-                rt.mark_attach_activity();
-                rt.last_input_at = Some(Instant::now());
-                runtime.refresh_snapshot(&rt);
+            Err(SessionError::ProcessFailure(
+                "no output change observed after sending the input".to_string(),
+            ))
+        }
+    }
+
+    async fn wait_for_output_change(
+        &self,
+        id: &str,
+        runtime: &Arc<SessionHandle>,
+        initial_total_bytes: u64,
+    ) -> bool {
+        let started = Instant::now();
+        loop {
+            let current_total_bytes = {
+                let Ok(rt) = runtime.runtime.lock() else {
+                    debug!(
+                        session_id = id,
+                        "attach input output wait stopped because runtime lock was lost"
+                    );
+                    return false;
+                };
+                rt.last_total_bytes
+            };
+
+            if current_total_bytes != initial_total_bytes {
                 debug!(
                     session_id = id,
-                    bytes = byte_len,
-                    transformed,
-                    app_cursor_keys = modes.app_cursor_keys,
-                    "attach input forwarded"
+                    initial_total_bytes,
+                    current_total_bytes,
+                    waited_ms = started.elapsed().as_millis(),
+                    "attach input observed output change"
                 );
-                Ok(())
+                return true;
             }
-            Err(TrySendError::Full(_)) => {
+
+            if started.elapsed() >= ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT {
                 debug!(
                     session_id = id,
-                    bytes = byte_len,
-                    "attach input backpressured by full PTY writer queue"
+                    last_total_bytes = initial_total_bytes,
+                    waited_ms = started.elapsed().as_millis(),
+                    "attach input timed out waiting for output change"
                 );
-                Err(SessionLookupError::Busy)
+                return false;
             }
-            Err(TrySendError::Closed(_)) => {
-                debug!(
-                    session_id = id,
-                    bytes = byte_len,
-                    "attach input failed while writing to PTY"
-                );
-                Err(SessionLookupError::Evicted)
-            }
+
+            tokio::time::sleep(ATTACH_INPUT_OUTPUT_POLL_INTERVAL).await;
         }
     }
 
@@ -611,10 +681,10 @@ impl SessionStore {
         id: &str,
         rows: u16,
         cols: u16,
-    ) -> std::result::Result<(), SessionLookupError> {
+    ) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
         let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionLookupError::Evicted);
+            return Err(SessionError::Evicted);
         };
         rt.mark_attach_activity();
         let resized = rt.resize_pty(rows, cols);
@@ -628,7 +698,7 @@ impl SessionStore {
             let _ = append_resize_event(&rt.dir, offset, rows, cols);
             Ok(())
         } else {
-            Err(SessionLookupError::Evicted)
+            Err(SessionError::Evicted)
         }
     }
 
@@ -886,7 +956,7 @@ impl SessionStore {
     async fn lookup_runtime(
         &self,
         id: &str,
-    ) -> std::result::Result<Arc<SessionHandle>, SessionLookupError> {
+    ) -> std::result::Result<Arc<SessionHandle>, SessionError> {
         let sessions = self.sessions.load();
         if let Some(runtime) = sessions.get(id) {
             trace!(
@@ -901,11 +971,11 @@ impl SessionStore {
                 session_id = id,
                 "session runtime lookup hit evicted tombstone"
             );
-            return Err(SessionLookupError::Evicted);
+            return Err(SessionError::Evicted);
         }
 
         debug!(session_id = id, "session runtime lookup missed");
-        Err(SessionLookupError::NotRunning)
+        Err(SessionError::NotRunning)
     }
 
     async fn prune_evicted_sessions(&self) {
@@ -1424,7 +1494,7 @@ mod tests {
     async fn test_set_notifications_enabled_unknown_id_returns_error() {
         let store = SessionStore::new(900, make_test_db().await);
         let result = store.set_notifications_enabled("missing", false).await;
-        assert!(matches!(result, Err(SessionLookupError::NotRunning)));
+        assert!(matches!(result, Err(SessionError::NotRunning)));
     }
 
     #[tokio::test]
@@ -1438,7 +1508,7 @@ mod tests {
         let store = store_with(vec![runtime], make_test_db().await);
 
         let result = store.set_notifications_enabled("done123", false).await;
-        assert!(matches!(result, Err(SessionLookupError::NotRunning)));
+        assert!(matches!(result, Err(SessionError::NotRunning)));
     }
 
     #[tokio::test]
@@ -1866,8 +1936,51 @@ mod tests {
 
         let result = store.attach_input("inpbusy1", "second").await;
         assert!(
-            matches!(result, Err(SessionLookupError::Busy)),
+            matches!(result, Err(SessionError::Busy)),
             "expected bounded writer queue saturation to surface SessionLookupError::Busy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_input_returns_early_when_output_changes() {
+        let (rt, _writer_rx) = make_runtime_writable("inpwait1", SessionStatus::Running);
+        let rt_clone = rt.clone();
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let updater = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut locked = rt_clone.lock().unwrap();
+            locked.last_total_bytes += 1;
+            locked.last_output_epoch = Some(Instant::now());
+        });
+
+        let started = Instant::now();
+        store
+            .attach_input("inpwait1", "x")
+            .await
+            .expect("attach_input should succeed");
+        updater.await.expect("output updater should complete");
+
+        assert!(
+            started.elapsed() < ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT,
+            "attach_input should return before the timeout once output advances"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_input_waits_for_timeout_without_output_change() {
+        let (rt, _writer_rx) = make_runtime_writable("inpwait2", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let started = Instant::now();
+        store
+            .attach_input("inpwait2", "x")
+            .await
+            .expect("attach_input should succeed");
+
+        assert!(
+            started.elapsed() >= ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT,
+            "attach_input should wait through the timeout when output does not advance"
         );
     }
 

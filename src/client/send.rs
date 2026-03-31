@@ -1,7 +1,6 @@
-use std::{fs, io, io::Read, path::Path};
+use std::{fs, io, io::IsTerminal, io::Read, path::Path};
 
 use crate::{
-    cli::SendArgs,
     clipboard,
     config::AppConfig,
     error::{AppError, Result},
@@ -9,13 +8,13 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
 };
 
-pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<String>) -> Result<()> {
-    use std::io::IsTerminal;
-
-    let id = send_args
-        .id
-        .expect("session ID must be resolved before run_send");
-    let has_chunks = !send_args.chunks.is_empty();
+pub async fn run_send(
+    config: &AppConfig,
+    id: &str,
+    node: Option<String>,
+    chunks: Vec<String>,
+) -> Result<()> {
+    let has_chunks = !chunks.is_empty();
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     if !has_chunks && stdin_is_terminal {
@@ -28,14 +27,10 @@ pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<Stri
     let mut sent_any = false;
 
     // Process ordered chunks left to right
-    for (index, chunk) in send_args.chunks.iter().enumerate() {
+    for chunk in chunks.iter() {
         let data = resolve_chunk(config, &id, chunk, node.as_deref()).await?;
         send_data(config, &id, data, node.as_deref()).await?;
         sent_any = true;
-        // Small delay between chunks to let PTY respond and avoid overwhelming it
-        if index + 1 < send_args.chunks.len() {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
     }
 
     // Piped stdin (only when no explicit chunks were given)
