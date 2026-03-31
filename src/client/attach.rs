@@ -330,6 +330,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             )
                             .await?;
                         }
+                        if should_handle_mouse_locally(mouse) {
+                            continue;
+                        }
                         let data = map_mouse_to_sgr_input(mouse);
                         ipc::write_request_to_writer(
                             &mut write_half,
@@ -760,6 +763,14 @@ fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
     format!("\x1b[<{cb};{cx};{cy}{suffix}")
 }
 
+fn should_handle_mouse_locally(mouse: MouseEvent) -> bool {
+    mouse.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        )
+}
+
 fn is_ctrl_d(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
@@ -1144,6 +1155,34 @@ mod tests {
     fn test_mouse_scroll_down() {
         let ev = mouse_event(MouseEventKind::ScrollDown, 20, 15);
         assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<65;21;16M");
+    }
+
+    #[test]
+    fn test_ctrl_wheel_up_is_handled_locally() {
+        let ev = mouse_event_with_mods(
+            MouseEventKind::ScrollUp,
+            20,
+            15,
+            KeyModifiers::CONTROL,
+        );
+        assert!(should_handle_mouse_locally(ev));
+    }
+
+    #[test]
+    fn test_ctrl_wheel_down_is_handled_locally() {
+        let ev = mouse_event_with_mods(
+            MouseEventKind::ScrollDown,
+            20,
+            15,
+            KeyModifiers::CONTROL,
+        );
+        assert!(should_handle_mouse_locally(ev));
+    }
+
+    #[test]
+    fn test_plain_wheel_up_is_forwarded_to_attached_app() {
+        let ev = mouse_event(MouseEventKind::ScrollUp, 20, 15);
+        assert!(!should_handle_mouse_locally(ev));
     }
 
     #[test]
