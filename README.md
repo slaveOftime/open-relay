@@ -7,9 +7,7 @@
 [![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-[![Watch the demo](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.png)](https://raw.githubusercontent.com/slaveoftime/open-relay/main/assets/oly-full-demo.mp4)
-
-<p align="center"><a href="./assets/oly-full-demo.mp4">Open or download the full demo video</a></p>
+https://github.com/user-attachments/assets/bd52a474-d9c4-48a7-824b-8df328a9d5a7
 
 > Run interactive CLIs and AI agents like managed services.
 
