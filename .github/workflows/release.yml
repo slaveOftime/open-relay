@@ -110,8 +110,8 @@ jobs:
           files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
           generate_release_notes: false
 
-  update-homebrew-formula:
-    name: update-homebrew-formula
+  update-homebrew-formula-and-cargo-toml:
+    name: update-homebrew-formula-and-cargo-toml
     needs: build-release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
@@ -138,6 +138,8 @@ jobs:
           ruby <<'RUBY'
           formula_path = "Formula/oly.rb"
           formula = File.read(formula_path)
+          cargo_toml_path = "Cargo.toml"
+          cargo_toml = File.read(cargo_toml_path)
           version = ENV.fetch("VERSION")
           macos_sha = ENV.fetch("MACOS_SHA")
           linux_sha = ENV.fetch("LINUX_SHA")
@@ -145,8 +147,10 @@ jobs:
           formula.sub!(/^  version "[^"]+"/, %(  version "#{version}"))
           formula.sub!(/(on_macos do.*?sha256 ")([^"]+)(")/m, "\\1#{macos_sha}\\3")
           formula.sub!(/(on_linux do.*?sha256 ")([^"]+)(")/m, "\\1#{linux_sha}\\3")
+          cargo_toml.sub!(/^version = "[^"]+"/, %(version = "#{version}"))
 
           File.write(formula_path, formula)
+          File.write(cargo_toml_path, cargo_toml)
           RUBY
 
       - name: Commit updated formula
@@ -154,15 +158,15 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           VERSION="${VERSION#v}"
-          if git diff --quiet -- Formula/oly.rb; then
-            echo "Formula already up to date"
+          if git diff --quiet -- Cargo.toml Formula/oly.rb; then
+            echo "Release metadata already up to date"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/oly.rb
-          git commit -m "chore(formula): update Homebrew release metadata for ${VERSION}"
+          git add Cargo.toml Formula/oly.rb
+          git commit -m "chore(release): sync release metadata for ${VERSION}"
           git push origin HEAD:${{ github.event.repository.default_branch }}
 
   publish-crates:
