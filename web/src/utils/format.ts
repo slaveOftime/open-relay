@@ -103,7 +103,7 @@ function shellQuote(token: string): string {
 }
 
 export function sessionDisplayName(s: { command: string; args: string[] }): string {
-  return [s.command, ...s.args].map(shellQuote).join(' ').slice(0, 64)
+  return [s.command, ...s.args].map(shellQuote).join(' ')
 }
 
 export function sessionPrimaryLabel(s: {
