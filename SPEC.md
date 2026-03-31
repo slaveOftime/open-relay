@@ -185,8 +185,8 @@ The implemented top-level commands are:
 - Positional chunks are processed left to right.
 - Plain chunks send literal text.
 - `key:<spec>` sends terminal key sequences.
-- `oly-content:clipboard` sends clipboard text or uploads clipboard files and sends their saved paths.
-- `oly-content:<local-file-path>` uploads a local file and sends the saved daemon/session-side path where it was stored.
+- `oly-clipboard` sends clipboard text or uploads clipboard files and sends their saved paths.
+- `oly-file:<local-file-path>` uploads a local file and sends the saved daemon/session-side path where it was stored.
 - When no chunks are provided and stdin is piped, `oly` reads all stdin and sends it as input.
 
 Supported key forms include:

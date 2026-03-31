@@ -49,11 +49,14 @@ oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 
 ```bash
 oly send <ID> "hello world!" key:enter
+oly send <ID> oly-clipboard
+oly send <ID> "cat " oly-file:/path/to/file key:enter
 ```
 
 - Arguments are sent left-to-right. Plain text is literal; special keys use `key:` prefix.
 - Keys: `key:enter`, `key:ctrl+c`, `key:alt+x`, `key:shift+tab`, `key:up`, `key:down`.
 - Raw hex: `key:hex:...`. Piped stdin is supported when no positional chunks are given.
+- Clipboard content uses `oly-clipboard`. Local file upload uses `oly-file:<path>`. This is normally used for remote node sessions.
 
 **Input strategy:**
 

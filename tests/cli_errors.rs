@@ -212,10 +212,10 @@ fn input_without_daemon_exits_nonzero() {
 }
 
 #[test]
-fn input_missing_oly_content_file_exits_nonzero() {
-    let tmp = make_tmp_dir("input_missing_oly_content_file");
+fn input_missing_oly_file_exits_nonzero() {
+    let tmp = make_tmp_dir("input_missing_oly_file");
     let missing_file = tmp.join("does-not-exist.txt");
-    let chunk = format!("oly-content:{}", missing_file.display());
+    let chunk = format!("oly-file:{}", missing_file.display());
     let output = oly_cmd(&tmp)
         .args(["send", "abc1234", &chunk])
         .output()

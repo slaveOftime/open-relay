@@ -58,8 +58,8 @@ pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<Stri
 
 /// Resolve a single CLI chunk into the bytes to send.
 /// - `key:<spec>` → special key sequence
-/// - `oly-content:clipboard` → clipboard text or uploaded clipboard file paths
-/// - `oly-content:<local-file-path>` → uploaded file path
+/// - `oly-clipboard` → clipboard text or uploaded clipboard file paths
+/// - `oly-file:<local-file-path>` → uploaded file path
 /// - anything else → literal text
 async fn resolve_chunk(
     config: &AppConfig,
@@ -69,7 +69,8 @@ async fn resolve_chunk(
 ) -> Result<String> {
     match parse_chunk(chunk) {
         Chunk::Key(spec) => parse_key_spec(spec),
-        Chunk::Content(spec) => resolve_content_chunk(config, id, spec, node).await,
+        Chunk::Clipboard => resolve_clipboard_chunk(config, id, node).await,
+        Chunk::File(path) => upload_local_file(config, id, Path::new(path), node).await,
         Chunk::Literal(text) => Ok(text.to_string()),
     }
 }
@@ -78,43 +79,35 @@ async fn resolve_chunk(
 enum Chunk<'a> {
     Literal(&'a str),
     Key(&'a str),
-    Content(&'a str),
+    Clipboard,
+    File(&'a str),
 }
 
 fn parse_chunk(chunk: &str) -> Chunk<'_> {
     if let Some(spec) = chunk.strip_prefix("key:") {
         Chunk::Key(spec)
-    } else if let Some(spec) = chunk.strip_prefix("oly-content:") {
-        Chunk::Content(spec)
+    } else if chunk.eq_ignore_ascii_case("oly-clipboard") {
+        Chunk::Clipboard
+    } else if let Some(path) = chunk.strip_prefix("oly-file:") {
+        Chunk::File(path)
     } else {
         Chunk::Literal(chunk)
     }
 }
 
-async fn resolve_content_chunk(
+async fn resolve_clipboard_chunk(
     config: &AppConfig,
     id: &str,
-    spec: &str,
     node: Option<&str>,
 ) -> Result<String> {
-    if spec.trim().is_empty() {
-        return Err(AppError::Protocol(
-            "empty oly-content source is not allowed".to_string(),
-        ));
+    match node {
+        Some(node) => resolve_remote_clipboard_content(config, id, node).await,
+        None => clipboard::handle_clipboard_paste(config, id, false)?.ok_or_else(|| {
+            AppError::Protocol(
+                "clipboard did not contain any text, files, or image data".to_string(),
+            )
+        }),
     }
-
-    if spec.eq_ignore_ascii_case("clipboard") {
-        return match node {
-            Some(node) => resolve_remote_clipboard_content(config, id, node).await,
-            None => clipboard::handle_clipboard_paste(config, id, false)?.ok_or_else(|| {
-                AppError::Protocol(
-                    "clipboard did not contain any text, files, or image data".to_string(),
-                )
-            }),
-        };
-    }
-
-    upload_local_file(config, id, Path::new(spec), node).await
 }
 
 async fn resolve_remote_clipboard_content(
@@ -144,10 +137,16 @@ async fn upload_local_file(
     path: &Path,
     node: Option<&str>,
 ) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        return Err(AppError::Protocol(
+            "empty oly-file path is not allowed".to_string(),
+        ));
+    }
+
     if !path.exists() {
         return Err(AppError::Io(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("oly-content file does not exist: {}", path.display()),
+            format!("oly-file source does not exist: {}", path.display()),
         )));
     }
 
@@ -155,7 +154,7 @@ async fn upload_local_file(
         return Err(AppError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "oly-content only supports files; directories are not supported: {}",
+                "oly-file only supports files; directories are not supported: {}",
                 path.display()
             ),
         )));
@@ -164,7 +163,7 @@ async fn upload_local_file(
     let file_name = path.file_name().ok_or_else(|| {
         AppError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("oly-content path has no file name: {}", path.display()),
+            format!("oly-file path has no file name: {}", path.display()),
         ))
     })?;
 
@@ -371,13 +370,11 @@ mod tests {
 
     #[test]
     fn content_chunk_detected() {
+        assert_eq!(parse_chunk("oly-clipboard"), Chunk::Clipboard);
+        assert_eq!(parse_chunk("OLY-CLIPBOARD"), Chunk::Clipboard);
         assert_eq!(
-            parse_chunk("oly-content:clipboard"),
-            Chunk::Content("clipboard")
-        );
-        assert_eq!(
-            parse_chunk("oly-content:/tmp/demo.txt"),
-            Chunk::Content("/tmp/demo.txt")
+            parse_chunk("oly-file:/tmp/demo.txt"),
+            Chunk::File("/tmp/demo.txt")
         );
     }
 

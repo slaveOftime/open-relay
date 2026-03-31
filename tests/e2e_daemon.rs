@@ -485,7 +485,7 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     #[cfg(not(target_os = "windows"))]
     let remote_cat_prefix = "cat ";
 
-    let upload_chunk = format!("oly-content:{}", upload_source.display());
+    let upload_chunk = format!("oly-file:{}", upload_source.display());
     let file_input = oly_cmd(&primary_tmp)
         .args([
             "send",
@@ -497,10 +497,10 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
             "key:enter",
         ])
         .output()
-        .expect("`oly send --node oly-content:<file>` failed to execute");
+        .expect("`oly send --node oly-file:<file>` failed to execute");
     assert!(
         file_input.status.success(),
-        "`oly send --node oly-content:<file>` exited non-zero.\nstderr: {}",
+        "`oly send --node oly-file:<file>` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&file_input.stderr)
     );
 
