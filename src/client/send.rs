@@ -1,20 +1,20 @@
-use std::io::Read;
+use std::{fs, io, io::IsTerminal, io::Read, path::Path};
 
 use crate::{
-    cli::SendArgs,
+    clipboard,
     config::AppConfig,
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
 };
 
-pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<String>) -> Result<()> {
-    use std::io::IsTerminal;
-
-    let id = send_args
-        .id
-        .expect("session ID must be resolved before run_send");
-    let has_chunks = !send_args.chunks.is_empty();
+pub async fn run_send(
+    config: &AppConfig,
+    id: &str,
+    node: Option<String>,
+    chunks: Vec<String>,
+) -> Result<()> {
+    let has_chunks = !chunks.is_empty();
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     if !has_chunks && stdin_is_terminal {
@@ -27,14 +27,10 @@ pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<Stri
     let mut sent_any = false;
 
     // Process ordered chunks left to right
-    for (index, chunk) in send_args.chunks.iter().enumerate() {
-        let data = resolve_chunk(chunk)?;
+    for chunk in chunks.iter() {
+        let data = resolve_chunk(config, &id, chunk, node.as_deref()).await?;
         send_data(config, &id, data, node.as_deref()).await?;
         sent_any = true;
-        // Small delay between chunks to let PTY respond and avoid overwhelming it
-        if index + 1 < send_args.chunks.len() {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
     }
 
     // Piped stdin (only when no explicit chunks were given)
@@ -57,12 +53,151 @@ pub async fn run_send(config: &AppConfig, send_args: SendArgs, node: Option<Stri
 
 /// Resolve a single CLI chunk into the bytes to send.
 /// - `key:<spec>` → special key sequence
+/// - `oly-clipboard` → clipboard text or uploaded clipboard file paths
+/// - `oly-file:<local-file-path>` → uploaded file path
 /// - anything else → literal text
-fn resolve_chunk(chunk: &str) -> Result<String> {
+async fn resolve_chunk(
+    config: &AppConfig,
+    id: &str,
+    chunk: &str,
+    node: Option<&str>,
+) -> Result<String> {
+    match parse_chunk(chunk) {
+        Chunk::Key(spec) => parse_key_spec(spec),
+        Chunk::Clipboard => resolve_clipboard_chunk(config, id, node).await,
+        Chunk::File(path) => upload_local_file(config, id, Path::new(path), node).await,
+        Chunk::Literal(text) => Ok(text.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chunk<'a> {
+    Literal(&'a str),
+    Key(&'a str),
+    Clipboard,
+    File(&'a str),
+}
+
+fn parse_chunk(chunk: &str) -> Chunk<'_> {
     if let Some(spec) = chunk.strip_prefix("key:") {
-        parse_key_spec(spec)
+        Chunk::Key(spec)
+    } else if chunk.eq_ignore_ascii_case("oly-clipboard") {
+        Chunk::Clipboard
+    } else if let Some(path) = chunk.strip_prefix("oly-file:") {
+        Chunk::File(path)
     } else {
-        Ok(chunk.to_string())
+        Chunk::Literal(chunk)
+    }
+}
+
+async fn resolve_clipboard_chunk(
+    config: &AppConfig,
+    id: &str,
+    node: Option<&str>,
+) -> Result<String> {
+    match node {
+        Some(node) => resolve_remote_clipboard_content(config, id, node).await,
+        None => clipboard::handle_clipboard_paste(config, id, false)?.ok_or_else(|| {
+            AppError::Protocol(
+                "clipboard did not contain any text, files, or image data".to_string(),
+            )
+        }),
+    }
+}
+
+async fn resolve_remote_clipboard_content(
+    config: &AppConfig,
+    id: &str,
+    node: &str,
+) -> Result<String> {
+    match clipboard::collect_remote_clipboard_transfer(false)? {
+        Some(clipboard::RemoteClipboardTransfer::Text(text)) => Ok(text),
+        Some(clipboard::RemoteClipboardTransfer::Files(files)) => {
+            let mut uploaded_paths = Vec::with_capacity(files.len());
+            for file in files {
+                uploaded_paths
+                    .push(upload_file(config, id, file.name, file.bytes, Some(node)).await?);
+            }
+            Ok(uploaded_paths.join("\n"))
+        }
+        None => Err(AppError::Protocol(
+            "clipboard did not contain any text, files, or image data".to_string(),
+        )),
+    }
+}
+
+async fn upload_local_file(
+    config: &AppConfig,
+    id: &str,
+    path: &Path,
+    node: Option<&str>,
+) -> Result<String> {
+    if path.as_os_str().is_empty() {
+        return Err(AppError::Protocol(
+            "empty oly-file path is not allowed".to_string(),
+        ));
+    }
+
+    if !path.exists() {
+        return Err(AppError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("oly-file source does not exist: {}", path.display()),
+        )));
+    }
+
+    if !path.is_file() {
+        return Err(AppError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "oly-file only supports files; directories are not supported: {}",
+                path.display()
+            ),
+        )));
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        AppError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("oly-file path has no file name: {}", path.display()),
+        ))
+    })?;
+
+    upload_file(
+        config,
+        id,
+        file_name.to_string_lossy().to_string(),
+        fs::read(path)?,
+        node,
+    )
+    .await
+}
+
+async fn upload_file(
+    config: &AppConfig,
+    id: &str,
+    file_name: String,
+    bytes: Vec<u8>,
+    node: Option<&str>,
+) -> Result<String> {
+    use crate::protocol::RpcRequest as R;
+
+    let inner = RpcRequest::UploadFile {
+        id: id.to_string(),
+        path: file_name,
+        bytes,
+        dedupe: true,
+    };
+    let request = match node {
+        Some(node) => R::NodeProxy {
+            node: node.to_string(),
+            inner: Box::new(inner),
+        },
+        None => inner,
+    };
+
+    match ipc::send_request_checked(config, request).await? {
+        RpcResponse::UploadFile { path, .. } => Ok(path),
+        _ => Err(AppError::Protocol("unexpected response type".to_string())),
     }
 }
 
@@ -218,14 +353,24 @@ mod tests {
 
     #[test]
     fn text_chunk_passes_through() {
-        assert_eq!(resolve_chunk("hello").unwrap(), "hello");
-        assert_eq!(resolve_chunk("git status").unwrap(), "git status");
+        assert_eq!(parse_chunk("hello"), Chunk::Literal("hello"));
+        assert_eq!(parse_chunk("git status"), Chunk::Literal("git status"));
     }
 
     #[test]
     fn key_chunk_parsed() {
-        assert_eq!(resolve_chunk("key:enter").unwrap(), "\r");
-        assert_eq!(resolve_chunk("key:ctrl+c").unwrap().as_bytes(), &[3]);
+        assert_eq!(parse_chunk("key:enter"), Chunk::Key("enter"));
+        assert_eq!(parse_chunk("key:ctrl+c"), Chunk::Key("ctrl+c"));
+    }
+
+    #[test]
+    fn content_chunk_detected() {
+        assert_eq!(parse_chunk("oly-clipboard"), Chunk::Clipboard);
+        assert_eq!(parse_chunk("OLY-CLIPBOARD"), Chunk::Clipboard);
+        assert_eq!(
+            parse_chunk("oly-file:/tmp/demo.txt"),
+            Chunk::File("/tmp/demo.txt")
+        );
     }
 
     // -----------------------------------------------------------------------

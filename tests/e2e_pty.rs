@@ -34,6 +34,14 @@ fn native_shell_timeout() -> Duration {
     }
 }
 
+fn bash_shell_timeout() -> Duration {
+    if cfg!(target_os = "windows") {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
 fn wait_for_prompted_output<I, S>(
     tmp: &PathBuf,
     id: &str,
@@ -88,10 +96,12 @@ fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
         return None;
     }
 
+    let timeout = bash_shell_timeout();
     let id = start_session(tmp, &["bash", "--noprofile", "--norc"]);
-    let baseline = wait_for_stable_log(tmp, &id, Duration::from_secs(5)).unwrap_or_else(|| {
+    let baseline = wait_for_stable_log(tmp, &id, timeout).unwrap_or_else(|| {
         panic!(
-            "bash did not reach a stable prompt within 5 s.\nLogs:\n{}",
+            "bash did not reach a stable prompt within {} s.\nLogs:\n{}",
+            timeout.as_secs(),
             fetch_logs(tmp, &id)
         )
     });
@@ -106,7 +116,7 @@ fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
         &baseline,
         &prompt,
         [ready_marker.as_str()],
-        Duration::from_secs(5),
+        timeout,
     );
     assert!(
         ready.is_some(),
@@ -171,7 +181,6 @@ fn e2e_two_separate_input_calls_execute_command() {
     const MARKER: &str = "oly_e2e_two_inputs_marker";
     let command = format!("echo {MARKER}");
     send_text_only(&tmp, &id, &command);
-    sleep(Duration::from_millis(100));
     send_key(&tmp, &id, "enter");
 
     let result = wait_for_prompted_output(&tmp, &id, &initial, &prompt, [MARKER], timeout);
@@ -237,7 +246,8 @@ fn e2e_bash_repeated_send_echo_commands_accumulate_in_logs() {
         return;
     };
 
-    let mut baseline = wait_for_stable_log(&tmp, &id, Duration::from_secs(5))
+    let timeout = bash_shell_timeout();
+    let mut baseline = wait_for_stable_log(&tmp, &id, timeout)
         .expect("bash did not return to a stable prompt after readiness check");
     let mut expected_markers = Vec::new();
     for round in 1..=4 {
@@ -253,7 +263,7 @@ fn e2e_bash_repeated_send_echo_commands_accumulate_in_logs() {
             &baseline,
             &prompt,
             [expected_markers.last().expect("marker just pushed").as_str()],
-            Duration::from_secs(5),
+            timeout,
         )
         .unwrap_or_else(|| {
             panic!(
@@ -275,7 +285,8 @@ fn e2e_bash_repeated_loop_scripts_appear_fully_in_logs() {
         return;
     };
 
-    let mut baseline = wait_for_stable_log(&tmp, &id, Duration::from_secs(5))
+    let timeout = bash_shell_timeout();
+    let mut baseline = wait_for_stable_log(&tmp, &id, timeout)
         .expect("bash did not return to a stable prompt after readiness check");
     let mut expected_markers = Vec::new();
     for round in 1..=3 {
@@ -296,7 +307,7 @@ fn e2e_bash_repeated_loop_scripts_appear_fully_in_logs() {
             &baseline,
             &prompt,
             round_markers.iter().map(String::as_str),
-            Duration::from_secs(5),
+            timeout,
         )
         .unwrap_or_else(|| {
             panic!(

@@ -14,7 +14,7 @@ use crate::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
     session::{
-        SessionLookupError, SessionStore, StartSpec,
+        SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
         logs::{read_persisted_log_page, read_resize_events},
         persist::current_output_offset_by_id,
@@ -616,7 +616,7 @@ pub async fn set_session_notifications(
             }))
             .into_response()
         }
-        Err(SessionLookupError::NotRunning) => {
+        Err(SessionError::NotRunning) => {
             warn!(session_id = %id, "notification toggle: session not running");
             (
                 StatusCode::NOT_FOUND,
@@ -624,7 +624,7 @@ pub async fn set_session_notifications(
             )
                 .into_response()
         }
-        Err(SessionLookupError::Evicted) => {
+        Err(SessionError::Evicted) => {
             warn!(session_id = %id, "notification toggle: session evicted");
             (
                 StatusCode::NOT_FOUND,
@@ -632,7 +632,7 @@ pub async fn set_session_notifications(
             )
                 .into_response()
         }
-        Err(SessionLookupError::Busy) => {
+        Err(SessionError::Busy) => {
             warn!(session_id = %id, "notification toggle: session busy");
             (
                 StatusCode::CONFLICT,

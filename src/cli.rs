@@ -324,6 +324,8 @@ pub struct SendArgs {
     pub id: Option<String>,
     /// Input chunks, processed left to right. Plain text is sent literally.
     /// Prefix with key: for special keys, e.g. key:enter, key:ctrl+c, key:up.
+    /// Use oly-clipboard to send clipboard text or uploaded clipboard files.
+    /// Prefix with oly-file:<path> to upload a local file and send the saved session path.
     /// Supported keys: enter, tab, esc, backspace, up/down/left/right, home/end,
     /// pgup/pgdn, del/ins, ctrl+<char>, alt+<char|key>, shift+tab, hex:<bytes>.
     #[arg(
