@@ -181,7 +181,7 @@ async fn upload_local_file(
 async fn upload_file(
     config: &AppConfig,
     id: &str,
-    path: String,
+    file_name: String,
     bytes: Vec<u8>,
     node: Option<&str>,
 ) -> Result<String> {
@@ -189,7 +189,7 @@ async fn upload_file(
 
     let inner = RpcRequest::UploadFile {
         id: id.to_string(),
-        path,
+        path: file_name,
         bytes,
         dedupe: true,
     };
