@@ -15,6 +15,7 @@ import type { UploadSessionFileResponse } from '@/api/client'
 
 // ── Input history ─────────────────────────────────────────────────────────────
 const INPUT_HISTORY_KEY = 'open-relay:input-history'
+const SESSION_INPUT_DRAFT_KEY_PREFIX = 'open-relay:session-input-draft:'
 
 interface InputHistoryEntry {
   text: string
@@ -46,8 +47,38 @@ function saveInputHistory(text: string): void {
   }
 }
 
+function getSessionInputDraftKey(sessionId: string): string | null {
+  const trimmed = sessionId.trim()
+  return trimmed ? `${SESSION_INPUT_DRAFT_KEY_PREFIX}${trimmed}` : null
+}
+
+function loadSessionInputDraft(sessionId: string): string {
+  const storageKey = getSessionInputDraftKey(sessionId)
+  if (!storageKey) return ''
+  try {
+    return localStorage.getItem(storageKey) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function saveSessionInputDraft(sessionId: string, text: string): void {
+  const storageKey = getSessionInputDraftKey(sessionId)
+  if (!storageKey) return
+  try {
+    if (text.length === 0) {
+      localStorage.removeItem(storageKey)
+      return
+    }
+    localStorage.setItem(storageKey, text)
+  } catch {
+    /* ignore */
+  }
+}
+
 // ── AttachPanel ───────────────────────────────────────────────────────────────
 interface AttachPanelProps {
+  sessionId: string
   sendInput: (data: string) => void
   showKeyError: (message: string) => void
   uploadFile?: (file: File) => Promise<UploadSessionFileResponse>
@@ -80,6 +111,7 @@ const popularKeys = [
 ]
 
 export default function AttachPanel({
+  sessionId,
   sendInput,
   showKeyError,
   uploadFile,
@@ -91,6 +123,7 @@ export default function AttachPanel({
   const customInputRef = useRef<HTMLTextAreaElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
+  const shouldPersistDraftRef = useRef(false)
 
   function resizeCustomInput() {
     const textarea = customInputRef.current
@@ -115,6 +148,19 @@ export default function AttachPanel({
   useEffect(() => {
     resizeCustomInput()
   }, [customInput])
+
+  useEffect(() => {
+    shouldPersistDraftRef.current = false
+    setCustomInput(loadSessionInputDraft(sessionId))
+  }, [sessionId])
+
+  useEffect(() => {
+    if (!shouldPersistDraftRef.current) {
+      shouldPersistDraftRef.current = true
+      return
+    }
+    saveSessionInputDraft(sessionId, customInput)
+  }, [customInput, sessionId])
 
   useEffect(() => {
     return () => {
