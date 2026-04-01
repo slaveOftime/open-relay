@@ -167,6 +167,7 @@ export type WsServerMessage =
 
 export type WsClientMessage =
   | { type: 'input'; data: string; waitForChange: boolean }
+  | { type: 'busy' }
   | { type: 'resize'; rows: number; cols: number }
   | { type: 'detach' }
 
