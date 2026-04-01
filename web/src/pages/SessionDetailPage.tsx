@@ -1291,6 +1291,7 @@ export default function SessionDetailPage() {
             <>
               <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
                 <AttachPanel
+                  sessionId={id ?? ''}
                   sendInput={(x) => sendInput(x, true)}
                   showKeyError={showKeyError}
                   uploadFile={handleUploadFile}
