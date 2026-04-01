@@ -493,8 +493,8 @@ export class AttachSocket {
     }
   }
 
-  sendInput(data: string) {
-    this.send({ type: 'input', data })
+  sendInput(data: string, waitForChange: boolean) {
+    this.send({ type: 'input', data, waitForChange })
   }
   sendResize(rows: number, cols: number) {
     this.send({ type: 'resize', rows, cols })

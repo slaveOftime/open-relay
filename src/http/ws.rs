@@ -69,8 +69,15 @@ enum ServerMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
-    Input { data: String },
-    Resize { rows: u16, cols: u16 },
+    Input {
+        data: String,
+        #[serde(rename = "waitForChange")]
+        wait_for_change: bool,
+    },
+    Resize {
+        rows: u16,
+        cols: u16,
+    },
     Detach,
     Ping,
 }
@@ -414,9 +421,9 @@ async fn handle_ws_streaming(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Input { data }) => {
+                            Ok(ClientMessage::Input { data, wait_for_change }) => {
                                 debug!(session_id = %id, bytes = data.len(), "WS input received");
-                                if let Err(err) = state.store.attach_input(&id, &data).await {
+                                if let Err(err) = state.store.attach_input(&id, &data, wait_for_change).await {
                                     let _ = send_server_message(&mut socket, &ServerMessage::Error {
                                         message: err.message(&id),
                                     }).await;
@@ -635,11 +642,12 @@ async fn handle_ws_proxied_streaming(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Input { data }) => {
+                            Ok(ClientMessage::Input { data, wait_for_change }) => {
                                 debug!(session_id = %id, node = %node, bytes = data.len(), "proxied WebSocket input received");
                                 let rpc = RpcRequest::AttachInput {
                                     id: id.to_string(),
                                     data,
+                                    wait_for_change,
                                 };
                                 if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket input");
