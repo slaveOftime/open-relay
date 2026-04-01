@@ -1121,14 +1121,20 @@ export default function SessionsPage() {
   const [loadError, setLoadError] = useState<LoadErrorState | null>(null)
 
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const delayedReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
+  const loadedSessionIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
   const pushStateRef = useRef<PushSetupState>('idle')
 
   useEffect(() => {
     pushStateRef.current = pushState
   }, [pushState])
+
+  useEffect(() => {
+    loadedSessionIdsRef.current = new Set(sessions.map((session) => session.id))
+  }, [sessions])
 
   const applySessionItems = useCallback((items: SessionSummary[]) => {
     setSessions(items)
@@ -1290,6 +1296,15 @@ export default function SessionsPage() {
     [loadLocal, loadRemote, selectedNode]
   )
 
+  const scheduleDelayedReload = useCallback(() => {
+    if (delayedReloadTimerRef.current) return
+    delayedReloadTimerRef.current = setTimeout(() => {
+      delayedReloadTimerRef.current = null
+      if (!isMounted.current) return
+      void reloadSessions({ background: true })
+    }, 5_000)
+  }, [reloadSessions])
+
   useEffect(() => {
     const nextIds = new Set(sessions.map((s) => s.id))
     const prevIds = prevIdsRef.current
@@ -1389,6 +1404,10 @@ export default function SessionsPage() {
           void reloadSessions({ background: true })
           return
         }
+        if (!loadedSessionIdsRef.current.has(ev.data.id)) {
+          scheduleDelayedReload()
+          return
+        }
         replaceLoadedSession(ev.data)
         return
       }
@@ -1412,6 +1431,7 @@ export default function SessionsPage() {
     return () => {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
+      if (delayedReloadTimerRef.current) clearTimeout(delayedReloadTimerRef.current)
     }
   }, [
     applyLoadedSessionSnapshot,
@@ -1419,6 +1439,7 @@ export default function SessionsPage() {
     replaceLoadedSession,
     reloadSessions,
     refreshRenderedSparklines,
+    scheduleDelayedReload,
     selectedNode,
     statusFilter,
   ])
