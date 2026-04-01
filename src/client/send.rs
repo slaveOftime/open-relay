@@ -206,6 +206,7 @@ async fn send_data(config: &AppConfig, id: &str, data: String, node: Option<&str
     let inner = RpcRequest::AttachInput {
         id: id.to_string(),
         data,
+        wait_for_change: true,
     };
     let req = match node {
         None => inner,

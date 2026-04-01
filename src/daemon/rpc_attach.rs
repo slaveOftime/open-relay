@@ -165,9 +165,9 @@ pub(super) async fn handle_attach_subscribe(
                             warn!(session_id = %id, %err, "IPC client request read failed");
                             break;
                         }
-                        Some(Ok(RpcRequest::AttachInput { id: req_id, data })) if req_id == id => {
+                        Some(Ok(RpcRequest::AttachInput { id: req_id, data, wait_for_change })) if req_id == id => {
                             trace!(session_id = %id, bytes = data.len(), "IPC client input received");
-                            if session_store.attach_input(&req_id, &data).await.is_err() {
+                            if session_store.attach_input(&req_id, &data, wait_for_change).await.is_err() {
                                 warn!(session_id = %id, "IPC client input forwarding failed");
                                 break;
                             }
@@ -314,9 +314,13 @@ pub(super) async fn handle_attach_input(
     id: String,
     data: String,
     session_store: &SessionStoreHandle,
+    wait_for_change: bool,
 ) -> RpcResponse {
     debug!(session_id = %id, bytes = data.len(), "handling one-shot IPC input request");
-    match session_store.attach_input(&id, &data).await {
+    match session_store
+        .attach_input(&id, &data, wait_for_change)
+        .await
+    {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),

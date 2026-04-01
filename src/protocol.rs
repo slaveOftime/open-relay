@@ -179,6 +179,7 @@ pub enum RpcRequest {
     AttachInput {
         id: String,
         data: String,
+        wait_for_change: bool,
     },
     UploadFile {
         id: String,

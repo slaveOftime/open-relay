@@ -270,8 +270,8 @@ export default function SessionDetailPage() {
     [pushConnectTrace]
   )
 
-  const sendInput = useCallback((data: string) => {
-    socketRef.current?.sendInput(data)
+  const sendInput = useCallback((data: string, waitForChange: boolean) => {
+    socketRef.current?.sendInput(data, waitForChange)
   }, [])
 
   const showKeyError = useCallback((message: string) => {
@@ -1200,7 +1200,7 @@ export default function SessionDetailPage() {
                   key={mode}
                   ref={termRef}
                   autoFit={mode === 'attach'}
-                  onData={mode === 'attach' ? sendInput : undefined}
+                  onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
                   onResize={mode === 'attach' ? handleTermResize : undefined}
                   className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
                 />
@@ -1291,7 +1291,7 @@ export default function SessionDetailPage() {
             <>
               <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
                 <AttachPanel
-                  sendInput={sendInput}
+                  sendInput={(x) => sendInput(x, true)}
                   showKeyError={showKeyError}
                   uploadFile={handleUploadFile}
                 />

@@ -177,6 +177,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: false,
                                 },
                             )
                             .await?;
@@ -197,6 +198,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: false,
                                 },
                             )
                             .await?;
@@ -210,6 +212,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                     normalize_paste_text(data),
                                     child_bracketed_paste_mode,
                                 ),
+                                wait_for_change: false,
                             },
                         )
                         .await?
@@ -221,6 +224,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: false,
                                 },
                             )
                             .await?;
@@ -262,6 +266,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: true,
                                 },
                             )
                             .await?;
@@ -280,6 +285,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                     RpcRequest::AttachInput {
                                         id: id_owned.clone(),
                                         data,
+                                        wait_for_change: true,
                                     },
                                 )
                                 .await?;
@@ -303,6 +309,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: false,
                                 },
                             )
                             .await?;
@@ -314,6 +321,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: false,
                                 },
                             )
                             .await?;
@@ -326,6 +334,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 RpcRequest::AttachInput {
                                     id: id_owned.clone(),
                                     data,
+                                    wait_for_change: false,
                                 },
                             )
                             .await?;
@@ -336,6 +345,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             RpcRequest::AttachInput {
                                 id: id_owned.clone(),
                                 data,
+                                wait_for_change: false,
                             },
                         )
                         .await?;

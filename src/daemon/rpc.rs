@@ -160,7 +160,11 @@ async fn dispatch_request(
                 message: "AttachSubscribe must be handled on the streaming path".into(),
             }
         }
-        RpcRequest::AttachInput { id, data } => handle_attach_input(id, data, session_store).await,
+        RpcRequest::AttachInput {
+            id,
+            data,
+            wait_for_change,
+        } => handle_attach_input(id, data, session_store, wait_for_change).await,
         RpcRequest::UploadFile {
             id,
             path,

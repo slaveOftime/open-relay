@@ -38,7 +38,7 @@ const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
 const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
-const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(5_000);
+const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(3_000);
 #[cfg(test)]
 const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const ATTACH_INPUT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -545,6 +545,7 @@ impl SessionStore {
         &self,
         id: &str,
         data: &str,
+        wait_for_change: bool,
     ) -> std::result::Result<(), SessionError> {
         // Avoid sending lose focus escape sequence which will cause other clients not able to input anything
         if data == "\x1b[O" {
@@ -620,9 +621,11 @@ impl SessionStore {
             "attach input forwarded"
         );
 
-        let _ = self
-            .wait_for_output_change(id, &runtime, initial_total_bytes)
-            .await;
+        if wait_for_change {
+            let _ = self
+                .wait_for_output_change(id, &runtime, initial_total_bytes)
+                .await;
+        }
 
         Ok(())
     }
@@ -1815,7 +1818,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0001", "hello\r")
+            .attach_input("inp0001", "hello\r", true)
             .await
             .expect("attach_input should succeed");
 
@@ -1833,7 +1836,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0002", "x")
+            .attach_input("inp0002", "x", true)
             .await
             .expect("attach_input should succeed");
 
@@ -1855,7 +1858,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0003", "\x1b[A")
+            .attach_input("inp0003", "\x1b[A", true)
             .await
             .expect("attach_input should succeed");
 
@@ -1877,7 +1880,7 @@ mod tests {
 
         // Send all four arrow sequences at once.
         store
-            .attach_input("inp0004", "\x1b[A\x1b[B\x1b[C\x1b[D")
+            .attach_input("inp0004", "\x1b[A\x1b[B\x1b[C\x1b[D", true)
             .await
             .expect("attach_input should succeed");
 
@@ -1895,7 +1898,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0005", "\x1b[A\x1b[B")
+            .attach_input("inp0005", "\x1b[A\x1b[B", true)
             .await
             .expect("attach_input should succeed");
 
@@ -1909,7 +1912,7 @@ mod tests {
     #[tokio::test]
     async fn test_attach_input_not_found_for_unknown_session() {
         let store = SessionStore::new(900, make_test_db().await);
-        let result = store.attach_input("no_such_id", "data").await;
+        let result = store.attach_input("no_such_id", "data", true).await;
         assert!(
             result.is_err(),
             "attach_input to unknown session should return an error"
@@ -1929,7 +1932,7 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let result = store.attach_input("inpbusy1", "second").await;
+        let result = store.attach_input("inpbusy1", "second", true).await;
         assert!(
             matches!(result, Err(SessionError::Busy)),
             "expected bounded writer queue saturation to surface SessionLookupError::Busy"
@@ -1951,7 +1954,7 @@ mod tests {
 
         let started = Instant::now();
         store
-            .attach_input("inpwait1", "x")
+            .attach_input("inpwait1", "x", true)
             .await
             .expect("attach_input should succeed");
         updater.await.expect("output updater should complete");
@@ -1969,7 +1972,7 @@ mod tests {
 
         let started = Instant::now();
         store
-            .attach_input("inpwait2", "x")
+            .attach_input("inpwait2", "x", true)
             .await
             .expect("attach_input should succeed");
 

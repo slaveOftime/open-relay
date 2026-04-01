@@ -648,8 +648,10 @@ pub async fn set_session_notifications(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct InputBody {
     pub data: String,
+    pub wait_for_change: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -817,6 +819,7 @@ pub async fn send_input(
         let rpc = RpcRequest::AttachInput {
             id: id.clone(),
             data: body.data.clone(),
+            wait_for_change: body.wait_for_change,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::Ack) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -838,7 +841,11 @@ pub async fn send_input(
         };
     }
 
-    match state.store.attach_input(&id, &body.data).await {
+    match state
+        .store
+        .attach_input(&id, &body.data, body.wait_for_change)
+        .await
+    {
         Ok(()) => {
             debug!(session_id = %id, bytes = body.data.len(), "input forwarded");
             Json(serde_json::json!({ "ok": true })).into_response()
