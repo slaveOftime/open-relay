@@ -328,6 +328,19 @@ pub(super) async fn handle_attach_input(
     }
 }
 
+pub(super) async fn handle_attach_busy(
+    id: String,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    debug!(session_id = %id, "handling one-shot IPC attach busy request");
+    match session_store.attach_busy(&id).await {
+        Ok(()) => RpcResponse::Ack,
+        Err(err) => RpcResponse::Error {
+            message: err.message(&id),
+        },
+    }
+}
+
 pub(super) async fn handle_attach_resize(
     id: String,
     rows: u16,

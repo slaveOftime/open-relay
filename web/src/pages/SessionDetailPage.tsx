@@ -274,6 +274,10 @@ export default function SessionDetailPage() {
     socketRef.current?.sendInput(data, waitForChange)
   }, [])
 
+  const sendBusy = useCallback(() => {
+    socketRef.current?.sendBusy()
+  }, [])
+
   const showKeyError = useCallback((message: string) => {
     termRef.current?.writeln(`\r\n\x1b[31mKey input error: ${message}\x1b[0m`)
   }, [])
@@ -1293,6 +1297,7 @@ export default function SessionDetailPage() {
                 <AttachPanel
                   sessionId={id ?? ''}
                   sendInput={(x) => sendInput(x, true)}
+                  sendBusy={sendBusy}
                   showKeyError={showKeyError}
                   uploadFile={handleUploadFile}
                 />

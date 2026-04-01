@@ -16,6 +16,7 @@ import type { UploadSessionFileResponse } from '@/api/client'
 // ── Input history ─────────────────────────────────────────────────────────────
 const INPUT_HISTORY_KEY = 'open-relay:input-history'
 const SESSION_INPUT_DRAFT_KEY_PREFIX = 'open-relay:session-input-draft:'
+const ATTACH_BUSY_INTERVAL_MS = 2000
 
 interface InputHistoryEntry {
   text: string
@@ -80,6 +81,7 @@ function saveSessionInputDraft(sessionId: string, text: string): void {
 interface AttachPanelProps {
   sessionId: string
   sendInput: (data: string) => void
+  sendBusy: () => void
   showKeyError: (message: string) => void
   uploadFile?: (file: File) => Promise<UploadSessionFileResponse>
 }
@@ -113,6 +115,7 @@ const popularKeys = [
 export default function AttachPanel({
   sessionId,
   sendInput,
+  sendBusy,
   showKeyError,
   uploadFile,
 }: AttachPanelProps) {
@@ -124,6 +127,7 @@ export default function AttachPanel({
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
   const shouldPersistDraftRef = useRef(false)
+  const busyIntervalRef = useRef<number | null>(null)
 
   function resizeCustomInput() {
     const textarea = customInputRef.current
@@ -167,8 +171,18 @@ export default function AttachPanel({
       if (sendClickTimeoutRef.current !== null) {
         window.clearTimeout(sendClickTimeoutRef.current)
       }
+      if (busyIntervalRef.current !== null) {
+        window.clearInterval(busyIntervalRef.current)
+      }
     }
   }, [])
+
+  useEffect(() => {
+    if (busyIntervalRef.current !== null) {
+      window.clearInterval(busyIntervalRef.current)
+      busyIntervalRef.current = null
+    }
+  }, [sessionId])
 
   function handleCustomSend(sendEnter = false) {
     if (!customInput.trim()) return
@@ -232,6 +246,23 @@ export default function AttachPanel({
     handleCustomSend(true)
   }
 
+  function startBusyHeartbeat() {
+    sendBusy()
+    if (busyIntervalRef.current !== null) {
+      window.clearInterval(busyIntervalRef.current)
+    }
+    busyIntervalRef.current = window.setInterval(() => {
+      sendBusy()
+    }, ATTACH_BUSY_INTERVAL_MS)
+  }
+
+  function stopBusyHeartbeat() {
+    if (busyIntervalRef.current !== null) {
+      window.clearInterval(busyIntervalRef.current)
+      busyIntervalRef.current = null
+    }
+  }
+
   function handleUploadButtonClick() {
     if (!uploadFile || isUploading) return
     fileInputRef.current?.click()
@@ -288,9 +319,13 @@ export default function AttachPanel({
                 rows={3}
                 value={customInput}
                 onChange={(e) => setCustomInput(e.target.value)}
+                onFocus={startBusyHeartbeat}
+                onBlur={stopBusyHeartbeat}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && e.ctrlKey) {
                     e.preventDefault()
+                    // blur to stop busy heartbeat, otherwise it will keep sending busy signals every 2 seconds
+                    e.currentTarget.blur()
                     handleCustomSend(true)
                   }
                 }}

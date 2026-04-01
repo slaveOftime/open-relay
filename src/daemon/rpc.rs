@@ -21,7 +21,8 @@ use crate::{
 use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, SessionStoreHandle};
 use super::{
     rpc_attach::{
-        handle_attach_detach, handle_attach_input, handle_attach_resize, handle_attach_subscribe,
+        handle_attach_busy, handle_attach_detach, handle_attach_input, handle_attach_resize,
+        handle_attach_subscribe,
     },
     rpc_nodes::{
         handle_node_list, handle_node_proxy, handle_node_proxy_streaming, spawn_join_connector,
@@ -165,6 +166,7 @@ async fn dispatch_request(
             data,
             wait_for_change,
         } => handle_attach_input(id, data, session_store, wait_for_change).await,
+        RpcRequest::AttachBusy { id } => handle_attach_busy(id, session_store).await,
         RpcRequest::UploadFile {
             id,
             path,

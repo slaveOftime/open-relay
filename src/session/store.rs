@@ -630,6 +630,23 @@ impl SessionStore {
         Ok(())
     }
 
+    pub async fn attach_busy(&self, id: &str) -> std::result::Result<(), SessionError> {
+        let runtime = self.lookup_runtime(id).await?;
+        let summary = {
+            let Ok(mut rt) = runtime.runtime.lock() else {
+                return Err(SessionError::Evicted);
+            };
+            rt.mark_attach_activity();
+            rt.last_output_epoch = Some(Instant::now());
+            runtime.refresh_snapshot(&rt);
+            runtime.snapshot().summary.clone()
+        };
+
+        let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
+        debug!(session_id = id, "attach busy heartbeat recorded");
+        Ok(())
+    }
+
     async fn wait_for_output_change(
         &self,
         id: &str,
@@ -1979,6 +1996,32 @@ mod tests {
         assert!(
             started.elapsed() >= ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT,
             "attach_input should wait through the timeout when output does not advance"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_busy_advances_output_epoch_and_bytes() {
+        let (rt, _writer_rx) = make_runtime_writable("busy0001", SessionStatus::Running);
+        let rt_clone = rt.clone();
+        let store = store_with(vec![rt], make_test_db().await);
+
+        store
+            .attach_busy("busy0001")
+            .await
+            .expect("attach_busy should succeed");
+
+        let locked = rt_clone.lock().unwrap();
+        assert_eq!(
+            locked.last_total_bytes, 0,
+            "attach_busy should advance the session byte counter"
+        );
+        assert!(
+            locked.last_output_epoch.is_some(),
+            "attach_busy should stamp a fresh output epoch"
+        );
+        assert!(
+            locked.last_attach_activity_at.is_some(),
+            "attach_busy should count as interactive attach activity"
         );
     }
 

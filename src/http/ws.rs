@@ -74,6 +74,7 @@ enum ClientMessage {
         #[serde(rename = "waitForChange")]
         wait_for_change: bool,
     },
+    Busy,
     Resize {
         rows: u16,
         cols: u16,
@@ -431,6 +432,16 @@ async fn handle_ws_streaming(
                                     return;
                                 }
                             }
+                            Ok(ClientMessage::Busy) => {
+                                trace!(session_id = %id, "WS attach busy received");
+                                if let Err(err) = state.store.attach_busy(&id).await {
+                                    let _ = send_server_message(&mut socket, &ServerMessage::Error {
+                                        message: err.message(&id),
+                                    }).await;
+                                    let _ = state.store.attach_detach(&id).await;
+                                    return;
+                                }
+                            }
                             Ok(ClientMessage::Resize { rows, cols }) => {
                                 debug!(session_id = %id, rows, cols, "WS resize received");
                                 resize_sub.mark_sent(rows, cols);
@@ -651,6 +662,13 @@ async fn handle_ws_proxied_streaming(
                                 };
                                 if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket input");
+                                }
+                            }
+                            Ok(ClientMessage::Busy) => {
+                                trace!(session_id = %id, node = %node, "proxied WebSocket attach busy received");
+                                let rpc = RpcRequest::AttachBusy { id: id.to_string() };
+                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket attach busy");
                                 }
                             }
                             Ok(ClientMessage::Resize { rows, cols }) => {

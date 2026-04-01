@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -181,6 +181,9 @@ pub enum RpcRequest {
         data: String,
         wait_for_change: bool,
     },
+    AttachBusy {
+        id: String,
+    },
     UploadFile {
         id: String,
         path: String,
@@ -267,6 +270,7 @@ impl RpcRequest {
             RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
+            RpcRequest::AttachBusy { .. } => "attach_busy",
             RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",

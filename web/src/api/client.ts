@@ -496,6 +496,9 @@ export class AttachSocket {
   sendInput(data: string, waitForChange: boolean) {
     this.send({ type: 'input', data, waitForChange })
   }
+  sendBusy() {
+    this.send({ type: 'busy' })
+  }
   sendResize(rows: number, cols: number) {
     this.send({ type: 'resize', rows, cols })
   }
