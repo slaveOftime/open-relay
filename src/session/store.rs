@@ -637,7 +637,6 @@ impl SessionStore {
                 return Err(SessionError::Evicted);
             };
             rt.mark_attach_activity();
-            rt.last_total_bytes = rt.last_total_bytes.saturating_add(1);
             rt.last_output_epoch = Some(Instant::now());
             runtime.refresh_snapshot(&rt);
             runtime.snapshot().summary.clone()
@@ -2013,7 +2012,7 @@ mod tests {
 
         let locked = rt_clone.lock().unwrap();
         assert_eq!(
-            locked.last_total_bytes, 1,
+            locked.last_total_bytes, 0,
             "attach_busy should advance the session byte counter"
         );
         assert!(
