@@ -13,12 +13,19 @@ function notificationNavigationPath(payload) {
 
 function normalizedNotificationTarget(payload) {
   const url = new URL(notificationNavigationPath(payload), self.location.origin)
-  if (url.origin !== self.location.origin) return '/'
+  if (url.origin !== self.location.origin) return null
   return `${url.pathname}${url.search}${url.hash}`
 }
 
 function notificationNavigationUrl(payload) {
-  return new URL(normalizedNotificationTarget(payload), self.location.origin).toString()
+  return new URL(notificationNavigationPath(payload), self.location.origin).toString()
+}
+
+function usesInAppLaunch(payload) {
+  const target = normalizedNotificationTarget(payload)
+  if (!target) return false
+  const url = new URL(target, self.location.origin)
+  return url.pathname === '/' || url.pathname.startsWith('/session/')
 }
 
 function notificationLaunchUrl(payload) {
@@ -27,14 +34,19 @@ function notificationLaunchUrl(payload) {
       ? payload.launch_url.trim()
       : ''
   if (launch) return new URL(launch, self.location.origin).toString()
-  const target = normalizedNotificationTarget(payload)
-  if (target === '/') return new URL('/', self.location.origin).toString()
+  const target = notificationNavigationPath(payload)
+  const normalizedTarget = normalizedNotificationTarget(payload)
+  if (!normalizedTarget || !usesInAppLaunch(payload)) {
+    return new URL(target, self.location.origin).toString()
+  }
+  if (normalizedTarget === '/') return new URL('/', self.location.origin).toString()
   const launchUrl = new URL('/', self.location.origin)
-  launchUrl.searchParams.set(NOTIFICATION_TARGET_PARAM, target)
+  launchUrl.searchParams.set(NOTIFICATION_TARGET_PARAM, normalizedTarget)
   return launchUrl.toString()
 }
 
 function notificationMessage(payload) {
+  if (!usesInAppLaunch(payload)) return null
   return {
     type: 'open-relay:notification-click',
     target: notificationNavigationUrl(payload),
@@ -81,7 +93,6 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close()
 
   const payload = event.notification?.data || {}
-  const targetUrl = notificationNavigationUrl(payload)
   const launchUrl = notificationLaunchUrl(payload)
   const clickMessage = notificationMessage(payload)
 
@@ -103,8 +114,10 @@ self.addEventListener('notificationclick', (event) => {
         }
 
         try {
-          client.postMessage(clickMessage)
-          if (client.focus) return client.focus()
+          if (clickMessage) {
+            client.postMessage(clickMessage)
+            if (client.focus) return client.focus()
+          }
         } catch {
           // Fall back to opening a new app window if this client refuses messaging too.
         }

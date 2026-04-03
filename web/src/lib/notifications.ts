@@ -33,12 +33,18 @@ function notificationNavigationPath(
 }
 
 function notificationLaunchPath(
-  payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>
+  payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>,
+  origin?: string
 ): string {
   const targetPath = notificationNavigationPath(payload)
-  if (!targetPath.startsWith('/')) return targetPath
-  if (targetPath === '/') return '/'
-  return `/?${NOTIFICATION_TARGET_PARAM}=${encodeURIComponent(targetPath)}`
+  const normalizedTarget = normalizeNotificationTarget(targetPath, origin)
+  if (!normalizedTarget) return targetPath
+  const normalizedUrl = new URL(normalizedTarget, notificationBaseOrigin(origin))
+  const usesInAppLaunch =
+    normalizedUrl.pathname === '/' || normalizedUrl.pathname.startsWith('/session/')
+  if (!usesInAppLaunch) return targetPath
+  if (normalizedTarget === '/') return '/'
+  return `/?${NOTIFICATION_TARGET_PARAM}=${encodeURIComponent(normalizedTarget)}`
 }
 
 function notificationBaseOrigin(origin?: string): string {
@@ -66,7 +72,7 @@ export function notificationLaunchUrl(
   payload: Pick<SessionNotificationData, 'navigation_url' | 'node'>,
   origin?: string
 ): string {
-  const path = notificationLaunchPath(payload)
+  const path = notificationLaunchPath(payload, origin)
   return origin ? new URL(path, origin).toString() : path
 }
 
