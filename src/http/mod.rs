@@ -10,7 +10,7 @@ use axum::{
     Router,
     extract::ws::rejection::WebSocketUpgradeRejection,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State, WebSocketUpgrade},
-    http::{StatusCode, Uri},
+    http::{HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -112,12 +112,36 @@ pub async fn serve(state: AppState) {
             auth::require_auth,
         ));
 
+    let cors = CorsLayer::new()
+        .allow_origin([
+            format!("http://127.0.0.1:{port}")
+                .parse::<HeaderValue>()
+                .unwrap(),
+            format!("http://localhost:{port}")
+                .parse::<HeaderValue>()
+                .unwrap(),
+        ])
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+        ])
+        .allow_credentials(true);
+
     let router = Router::new()
         .route("/api/nodes/join", get(nodes::join_handler))
         .route("/api/static/apps", get(apps::list_static_apps))
         .merge(protected_router)
         .layer(CompressionLayer::new())
-        .layer(CorsLayer::permissive())
+        .layer(cors)
+        .layer(axum::middleware::from_fn(security_headers))
         .fallback(serve_static_or_proxy)
         .with_state(state);
 
@@ -298,6 +322,28 @@ fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::respons
         bytes,
     )
         .into_response()
+}
+
+/// Middleware that injects standard security response headers on every reply.
+async fn security_headers(request: Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        "referrer-policy",
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:",
+        ),
+    );
+    response
 }
 
 #[cfg(test)]

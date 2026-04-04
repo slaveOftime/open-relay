@@ -3,8 +3,9 @@ use std::{collections::HashMap, sync::Arc};
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     Json,
-    extract::{State, WebSocketUpgrade},
-    response::Response,
+    extract::{ConnectInfo, State, WebSocketUpgrade},
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, mpsc};
@@ -40,11 +41,32 @@ pub async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeSummary>>
 // GET /api/nodes/join  (WebSocket upgrade)
 // ---------------------------------------------------------------------------
 
-pub async fn join_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(|socket| handle_join(socket, state))
+pub async fn join_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    // Rate-limit join attempts per IP to prevent brute-force API key guessing.
+    let client_ip = peer.ip();
+    if let Some(ref auth) = state.auth {
+        if let Some(locked_until) = auth.locked_until(client_ip).await {
+            let secs = locked_until
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs();
+            warn!(ip = %client_ip, "node join: rate limited (locked for ~{}s)", secs);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(axum::http::header::RETRY_AFTER, secs.to_string())],
+                "too many failed attempts",
+            )
+                .into_response();
+        }
+    }
+
+    ws.on_upgrade(move |socket| handle_join(socket, state, client_ip))
 }
 
-async fn handle_join(socket: WebSocket, state: AppState) {
+async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::IpAddr) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // ── Step 1: read handshake ────────────────────────────────────────────
@@ -78,7 +100,19 @@ async fn handle_join(socket: WebSocket, state: AppState) {
         }
     };
 
-    if hashes.is_empty() || !hashes.iter().any(|h| verify_api_key(&key, h)) {
+    // Run Argon2 verification on a blocking thread to avoid starving the
+    // async runtime with CPU-intensive work.
+    let key_clone = key.clone();
+    let verified = tokio::task::spawn_blocking(move || {
+        !hashes.is_empty() && hashes.iter().any(|h| verify_api_key(&key_clone, h))
+    })
+    .await
+    .unwrap_or(false);
+
+    if !verified {
+        if let Some(ref auth) = state.auth {
+            auth.record_failure(client_ip).await;
+        }
         send_error(&mut ws_tx, "unauthorized").await;
         return;
     }

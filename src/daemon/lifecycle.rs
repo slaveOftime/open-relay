@@ -150,7 +150,15 @@ pub async fn start(
     }
 
     let auth_hash: Option<String> = if foreground_internal {
-        auth_hash_internal
+        // Prefer the env var (new, secure), fall back to the CLI arg (legacy).
+        auth_hash_internal.or_else(|| {
+            std::env::var("OLY_AUTH_HASH_INTERNAL").ok().and_then(|v| {
+                // Clear immediately after reading to minimise exposure window.
+                // SAFETY: We are the only thread reading this variable at startup.
+                unsafe { std::env::remove_var("OLY_AUTH_HASH_INTERNAL") };
+                if v.is_empty() { None } else { Some(v) }
+            })
+        })
     } else if !no_http {
         if no_auth {
             confirm_no_auth_risk()?;
@@ -286,7 +294,10 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u
     if no_auth {
         cmd.arg("--no-auth");
     } else if let Some(hash) = auth_hash {
-        cmd.arg("--auth-hash-internal").arg(hash);
+        // Pass the Argon2 hash via an environment variable instead of a CLI
+        // argument.  CLI args are visible to all local users via `ps aux` /
+        // `/proc/<pid>/cmdline`, which would leak the PHC hash.
+        cmd.env("OLY_AUTH_HASH_INTERNAL", hash);
     }
     if no_http {
         cmd.arg("--no-http");

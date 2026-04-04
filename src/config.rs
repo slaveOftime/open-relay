@@ -211,7 +211,19 @@ pub fn ensure_config_file(state_dir: &Path) {
     });
     match serde_json::to_string_pretty(&contents) {
         Ok(json) => match std::fs::write(&path, json) {
-            Ok(()) => eprintln!("info: generated default config at {}", path.display()),
+            Ok(()) => {
+                // Restrict permissions to owner-only since the file contains
+                // the VAPID private key.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &path,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+                eprintln!("info: generated default config at {}", path.display());
+            }
             Err(err) => eprintln!("warning: could not write config.json: {err}"),
         },
         Err(err) => eprintln!("warning: could not serialise default config: {err}"),

@@ -84,16 +84,32 @@ impl LocalOsNotificationChannel {
         };
 
         let substitute = |s: String| -> String {
-            s.replace("{kind}", event.kind.as_str())
-                .replace("{title}", &event.title)
-                .replace("{summary}", &event.title)
-                .replace("{description}", &event.description)
-                .replace("{body}", &event.body)
-                .replace("{navigation_url}", &navigation_url)
-                .replace("{node}", &node)
-                .replace("{session_ids}", &session_ids)
-                .replace("{trigger_rule}", &trigger_rule)
-                .replace("{trigger_detail}", &trigger_detail)
+            // Shell-escape substituted values to prevent injection when the
+            // hook command is `sh -c '...'`.  Each value is wrapped in single
+            // quotes with internal single quotes escaped as `'\''`.
+            let esc = |v: &str| -> String {
+                let mut out = String::with_capacity(v.len() + 2);
+                out.push('\'');
+                for ch in v.chars() {
+                    if ch == '\'' {
+                        out.push_str("'\\''");
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('\'');
+                out
+            };
+            s.replace("{kind}", &esc(event.kind.as_str()))
+                .replace("{title}", &esc(&event.title))
+                .replace("{summary}", &esc(&event.title))
+                .replace("{description}", &esc(&event.description))
+                .replace("{body}", &esc(&event.body))
+                .replace("{navigation_url}", &esc(&navigation_url))
+                .replace("{node}", &esc(&node))
+                .replace("{session_ids}", &esc(&session_ids))
+                .replace("{trigger_rule}", &esc(&trigger_rule))
+                .replace("{trigger_detail}", &esc(&trigger_detail))
         };
 
         let mut iter = tokens.into_iter().map(substitute);
