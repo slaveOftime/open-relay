@@ -8,6 +8,7 @@ pub(crate) mod resize;
 pub(crate) mod ring;
 mod runtime;
 mod store;
+pub(crate) mod vt100;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

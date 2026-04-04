@@ -388,7 +388,7 @@ const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
 const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
 
 export interface AttachOptions {
-  /** Called with decoded raw PTY bytes from the initial ring-buffer replay. */
+  /** Called with decoded terminal bytes that recreate the current visible session state. */
   onInit: (data: Uint8Array, appCursorKeys: boolean, bracketedPasteMode: boolean) => void
   /** Called with decoded raw PTY bytes for each incremental output chunk. */
   onData: (data: Uint8Array) => void

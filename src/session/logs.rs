@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::vt100::safe_resize_parser;
 use crate::{error::Result, protocol::LogResize};
 
 // ---------------------------------------------------------------------------
@@ -882,7 +883,7 @@ fn process_bytes_with_resizes(
             parser.process(&bytes[processed..resize_offset]);
             processed = resize_offset;
         }
-        parser.screen_mut().set_size(resize.rows, resize.cols);
+        safe_resize_parser(parser, resize.rows, resize.cols);
     }
 
     if processed < bytes.len() {

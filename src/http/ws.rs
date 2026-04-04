@@ -205,10 +205,21 @@ async fn handle_ws_streaming(
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
-    // Subscribe to broadcast + get ring replay, all under one lock.
-    let subscribe_result = { state.store.attach_subscribe_init(&id, None).await };
+    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols)
+        && rows > 0
+        && cols > 0
+    {
+        match state.store.attach_resize(&id, rows, cols).await {
+            Ok(()) => debug!(session_id = %id, rows, cols, "PTY pre-resized before WS init"),
+            Err(err) => {
+                warn!(session_id = %id, rows, cols, error = err.message(&id), "PTY pre-resize before WS init failed")
+            }
+        }
+    }
 
-    let (replay_chunks, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
+    let subscribe_result = { state.store.attach_snapshot_init(&id).await };
+
+    let (snapshot_bytes, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
         match subscribe_result {
             Ok(t) => t,
             Err(err) => {
@@ -224,11 +235,8 @@ async fn handle_ws_streaming(
             }
         };
 
-    let replay_bytes = collect_chunk_bytes(&replay_chunks);
-    let replay_bytes_len = replay_bytes.len();
-
     let init_msg = ServerMessage::Init {
-        data: replay_bytes,
+        data: snapshot_bytes,
         app_cursor_keys,
         bracketed_paste_mode,
     };
@@ -245,26 +253,12 @@ async fn handle_ws_streaming(
 
     debug!(
         session_id = %id,
-        replay_chunks = replay_chunks.len(),
-        replay_bytes = replay_bytes_len,
+        snapshot_bytes = init_msg_data_len(&init_msg),
         end_offset,
         app_cursor_keys,
         bracketed_paste_mode,
         "local WebSocket stream initialized"
     );
-
-    // Resize PTY to browser dimensions AFTER init is sent.
-    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
-        if rows > 0 && cols > 0 {
-            resize_sub.mark_sent(rows, cols);
-            match state.store.attach_resize(&id, rows, cols).await {
-                Ok(()) => debug!(session_id = %id, rows, cols, "PTY resized after WS init"),
-                Err(err) => {
-                    warn!(session_id = %id, rows, cols, error = err.message(&id), "PTY resize after WS init failed")
-                }
-            }
-        }
-    }
 
     // Track last known mode state to detect changes.
     let mut last_modes = ModeSnapshot {
@@ -506,27 +500,12 @@ async fn handle_ws_proxied_streaming(
 ) {
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
-    // Resize PTY via node proxy before subscribing.
-    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
-        if rows > 0 && cols > 0 {
-            let rpc = RpcRequest::AttachResize {
-                id: id.to_string(),
-                rows,
-                cols,
-            };
-            if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
-                warn!(session_id = %id, node = %node, rows, cols, %err, "proxied WebSocket pre-resize failed");
-            } else {
-                debug!(session_id = %id, node = %node, rows, cols, "PTY pre-resized via node proxy");
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
     // Open streaming subscription via node proxy.
     let rpc = RpcRequest::AttachSubscribe {
         id: id.to_string(),
         from_byte_offset: None,
+        rows: initial_rows.filter(|rows| *rows > 0),
+        cols: initial_cols.filter(|cols| *cols > 0),
     };
     let (stream_rpc_id, mut stream_rx) = match state
         .node_registry
@@ -576,7 +555,7 @@ async fn handle_ws_proxied_streaming(
                                 debug!(
                                     session_id = %id,
                                     node = %node,
-                                    replay_bytes,
+                                    snapshot_bytes = replay_bytes,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                     "proxied WebSocket init frame received"
@@ -720,4 +699,11 @@ async fn handle_ws_proxied_streaming(
         .remove_pending(&node, &stream_rpc_id)
         .await;
     debug!(session_id = %id, node = %node, "proxied WebSocket stream cleanup complete");
+}
+
+fn init_msg_data_len(msg: &ServerMessage) -> usize {
+    match msg {
+        ServerMessage::Init { data, .. } => data.len(),
+        _ => 0,
+    }
 }

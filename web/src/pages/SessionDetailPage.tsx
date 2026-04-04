@@ -184,6 +184,7 @@ export default function SessionDetailPage() {
   const connectAttemptStartedAtRef = useRef(0)
   const outputBufferRef = useRef<Uint8Array[]>([])
   const outputFlushRafRef = useRef<number | null>(null)
+  const outputWriteInFlightRef = useRef(false)
   const pendingResetRef = useRef(false)
   const resizeDebounceRef = useRef<number | null>(null)
   const pendingResizeRef = useRef<{ cols: number; rows: number } | null>(null)
@@ -194,31 +195,47 @@ export default function SessionDetailPage() {
   const replayCommittedIdxRef = useRef(0)
 
   const flushTerminalOutput = useCallback(() => {
-    outputFlushRafRef.current = null
+    if (outputWriteInFlightRef.current) {
+      return
+    }
     const term = termRef.current
     if (!term) {
       outputBufferRef.current = []
       pendingResetRef.current = false
+      outputWriteInFlightRef.current = false
       return
     }
     if (pendingResetRef.current) {
       term.reset()
       pendingResetRef.current = false
     }
-    if (outputBufferRef.current.length > 0) {
-      const chunks = outputBufferRef.current
-      outputBufferRef.current = []
-      let total = 0
-      for (const c of chunks) total += c.length
-      const merged = new Uint8Array(total)
-      let off = 0
-      for (const c of chunks) {
-        merged.set(c, off)
-        off += c.length
-      }
-      term.write(merged)
+    if (outputBufferRef.current.length === 0) {
+      return
     }
-    term.scrollToBottom()
+    const chunks = outputBufferRef.current
+    outputBufferRef.current = []
+    let total = 0
+    for (const c of chunks) total += c.length
+    const merged = new Uint8Array(total)
+    let off = 0
+    for (const c of chunks) {
+      merged.set(c, off)
+      off += c.length
+    }
+    outputWriteInFlightRef.current = true
+    term.write(merged, () => {
+      outputWriteInFlightRef.current = false
+      term.scrollToBottom()
+      if (
+        (pendingResetRef.current || outputBufferRef.current.length > 0) &&
+        outputFlushRafRef.current === null
+      ) {
+        outputFlushRafRef.current = requestAnimationFrame(() => {
+          outputFlushRafRef.current = null
+          flushTerminalOutput()
+        })
+      }
+    })
   }, [])
 
   const enqueueTerminalOutput = useCallback(
@@ -231,8 +248,11 @@ export default function SessionDetailPage() {
       if (chunks.length > 0) {
         outputBufferRef.current.push(...chunks)
       }
-      if (outputFlushRafRef.current === null) {
-        outputFlushRafRef.current = requestAnimationFrame(flushTerminalOutput)
+      if (outputFlushRafRef.current === null && !outputWriteInFlightRef.current) {
+        outputFlushRafRef.current = requestAnimationFrame(() => {
+          outputFlushRafRef.current = null
+          flushTerminalOutput()
+        })
       }
     },
     [flushTerminalOutput]
@@ -640,6 +660,7 @@ export default function SessionDetailPage() {
         cancelAnimationFrame(outputFlushRafRef.current)
         outputFlushRafRef.current = null
       }
+      outputWriteInFlightRef.current = false
       outputBufferRef.current = []
       pendingResetRef.current = false
       pushConnectTrace('teardown current websocket')

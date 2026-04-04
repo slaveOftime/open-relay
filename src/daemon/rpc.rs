@@ -51,10 +51,20 @@ pub(super) async fn handle_client(
     if let RpcRequest::AttachSubscribe {
         id,
         from_byte_offset,
+        rows,
+        cols,
     } = request
     {
-        return handle_attach_subscribe(id, from_byte_offset, reader, write_half, &session_store)
-            .await;
+        return handle_attach_subscribe(
+            id,
+            from_byte_offset,
+            rows,
+            cols,
+            reader,
+            write_half,
+            &session_store,
+        )
+        .await;
     }
 
     // Node-proxied streaming attach: unwrap the proxy envelope and relay

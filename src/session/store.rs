@@ -496,6 +496,40 @@ impl SessionStore {
         ))
     }
 
+    /// Initialise an attach stream from the current rendered terminal state
+    /// instead of replaying raw retained PTY history from byte offset 0.
+    pub async fn attach_snapshot_init(
+        &self,
+        id: &str,
+    ) -> std::result::Result<
+        (Vec<u8>, u64, broadcast::Receiver<Arc<Bytes>>, bool, bool),
+        SessionError,
+    > {
+        let runtime = self.lookup_runtime(id).await?;
+        let Ok(rt) = runtime.runtime.lock() else {
+            return Err(SessionError::Evicted);
+        };
+        let snapshot = rt.attach_snapshot_bytes();
+        let end_offset = rt.ring.end_offset();
+        let rx = rt.broadcast_tx.subscribe();
+        let modes = rt.mode_snapshot();
+        debug!(
+            session_id = id,
+            snapshot_bytes = snapshot.len(),
+            end_offset,
+            bracketed_paste_mode = modes.bracketed_paste_mode,
+            app_cursor_keys = modes.app_cursor_keys,
+            "attach snapshot init"
+        );
+        Ok((
+            snapshot,
+            end_offset,
+            rx,
+            modes.bracketed_paste_mode,
+            modes.app_cursor_keys,
+        ))
+    }
+
     /// Subscribe to resize notifications for a session.
     /// Returns a broadcast receiver for (rows, cols) events and the current PTY size.
     pub fn subscribe_resize(
@@ -1243,6 +1277,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         }))
@@ -1686,6 +1721,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         }));

@@ -28,6 +28,7 @@ use super::{
     mode_tracker::{ModeSnapshot, ModeTracker},
     persist::{append_event, append_output_raw, append_resize_event},
     ring::RingBuffer,
+    vt100::safe_resize_parser,
 };
 
 // ---------------------------------------------------------------------------
@@ -74,6 +75,8 @@ pub struct SessionRuntime {
     pub notified_output_epoch: Option<Instant>,
     /// Byte-level state machine for DEC private mode tracking.
     pub mode_tracker: ModeTracker,
+    /// Live rendered terminal state for attach snapshot restoration.
+    pub screen_parser: vt100::Parser,
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
     pub notifications_enabled: bool,
@@ -121,10 +124,15 @@ impl SessionRuntime {
                 .last_total_bytes
                 .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
+            self.screen_parser.process(filtered_data.as_ref());
             self.ring.push(filtered_data);
         }
 
         mode_change
+    }
+
+    pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
+        self.screen_parser.screen().state_formatted()
     }
 
     pub fn register_attach_client(&mut self) {
@@ -298,6 +306,7 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
+            safe_resize_parser(&mut self.screen_parser, rows, cols);
             self.resize_history.push(LogResize {
                 offset: self.ring.end_offset(),
                 rows,
@@ -466,6 +475,7 @@ pub fn spawn_session(
         notified_output_epoch: None,
         last_notified_at: None,
         mode_tracker: ModeTracker::new(),
+        screen_parser: vt100::Parser::new(rows, cols, 0),
         output_closed: false,
         notifications_enabled,
     }));
@@ -707,6 +717,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: ModeTracker::new(),
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         }
@@ -991,6 +1002,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: ModeTracker::new(),
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         };

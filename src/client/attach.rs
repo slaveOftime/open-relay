@@ -44,6 +44,12 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     let stream = ipc::connect(config).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
+    let interactive = can_use_interactive_terminal();
+    let initial_size = if interactive {
+        terminal::size().ok()
+    } else {
+        None
+    };
 
     // Pre-allocate once — avoids 7+ repeated heap allocations of the same id.
     let id_owned = id.to_string();
@@ -56,6 +62,8 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             RpcRequest::AttachSubscribe {
                 id: id_owned.clone(),
                 from_byte_offset: None,
+                rows: initial_size.map(|(_, rows)| rows),
+                cols: initial_size.map(|(cols, _)| cols),
             },
         ),
     )
@@ -77,7 +85,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
     // When stdio is piped, interactive terminal control fails across platforms,
     // so fall back to a plain stream replay instead of raw-mode attach.
-    if !can_use_interactive_terminal() {
+    if !interactive {
         write_bytes_to_stdout(&initial_data)?;
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
@@ -101,36 +109,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     {
         let _raw_mode = crate::terminal_guards::RawModeGuard::new()?;
 
-        // Initial resize + render.
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        // Render the current terminal snapshot. The subscribe handshake already
+        // asked the daemon to resize to the current terminal size when needed.
+        let (cols, rows) = initial_size.unwrap_or_else(|| terminal::size().unwrap_or((80, 24)));
         let mut last_sent_size = (cols, rows);
-        ipc::write_request_to_writer(
-            &mut write_half,
-            RpcRequest::AttachResize {
-                id: id_owned.clone(),
-                rows,
-                cols,
-            },
-        )
-        .await?;
 
         // Clear the visible screen and home the cursor before writing
-        // replay data.  The replay contains filtered PTY output whose cursor
-        // positioning (absolute and relative) was calculated from row 1,
-        // col 1.  Without this clear, the replay starts from wherever the
-        // terminal cursor happens to be, offsetting all subsequent cursor
-        // operations and causing line-editing (backspace, arrow keys) in
-        // REPLs to target the wrong screen position.
-        //
-        // Most modern terminals push the visible content into scrollback
-        // on ED 2, so previous history remains scrollable.
+        // snapshot data so the restored screen starts from a known state.
         write_bytes_to_stdout(b"\x1b[H\x1b[2J")?;
 
-        // Write the initial replay bytes directly — the daemon has already
-        // stripped CPR/DSR responses via EscapeFilter, so no further
-        // processing is needed.  Writing raw bytes preserves all cursor-
-        // positioning, color, and alternate-screen sequences that TUIs emit,
-        // which is required for correct reattach rendering.
+        // Write the initial terminal-state snapshot directly.
         write_bytes_to_stdout(&initial_data)?;
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 

@@ -15,6 +15,8 @@ use super::SessionStoreHandle;
 pub(super) async fn handle_attach_subscribe(
     id: String,
     from_byte_offset: Option<u64>,
+    initial_rows: Option<u16>,
+    initial_cols: Option<u16>,
     mut reader: BufReader<tokio::io::ReadHalf<Stream>>,
     mut writer: tokio::io::WriteHalf<Stream>,
     session_store: &SessionStoreHandle,
@@ -24,32 +26,60 @@ pub(super) async fn handle_attach_subscribe(
     debug!(
         session_id = %id,
         from_byte_offset,
+        initial_rows,
+        initial_cols,
         "starting IPC streaming session relay"
     );
 
-    let (replay_chunks, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) = {
-        match session_store
-            .attach_subscribe_init(&id, from_byte_offset)
-            .await
-        {
-            Ok(t) => t,
-            Err(err) => {
-                debug!(session_id = %id, error = err.message(&id), "IPC stream init failed");
-                let resp = RpcResponse::Error {
-                    message: err.message(&id),
-                };
-                return ipc::write_response_to_writer(&mut writer, resp).await;
-            }
-        }
-    };
+    if from_byte_offset.is_none()
+        && let (Some(rows), Some(cols)) = (initial_rows, initial_cols)
+        && rows > 0
+        && cols > 0
+        && let Err(err) = session_store.attach_resize(&id, rows, cols).await
+    {
+        warn!(
+            session_id = %id,
+            rows,
+            cols,
+            error = err.message(&id),
+            "IPC stream pre-snapshot resize failed"
+        );
+    }
 
-    let data = collect_chunk_bytes(&replay_chunks);
+    let (data, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
+        match from_byte_offset {
+            None => match session_store.attach_snapshot_init(&id).await {
+                Ok(t) => t,
+                Err(err) => {
+                    debug!(session_id = %id, error = err.message(&id), "IPC snapshot init failed");
+                    let resp = RpcResponse::Error {
+                        message: err.message(&id),
+                    };
+                    return ipc::write_response_to_writer(&mut writer, resp).await;
+                }
+            },
+            Some(offset) => match session_store.attach_subscribe_init(&id, Some(offset)).await {
+                Ok((chunks, end_offset, rx, bracketed_paste_mode, app_cursor_keys)) => (
+                    collect_chunk_bytes(&chunks),
+                    end_offset,
+                    rx,
+                    bracketed_paste_mode,
+                    app_cursor_keys,
+                ),
+                Err(err) => {
+                    debug!(session_id = %id, error = err.message(&id), "IPC stream init failed");
+                    let resp = RpcResponse::Error {
+                        message: err.message(&id),
+                    };
+                    return ipc::write_response_to_writer(&mut writer, resp).await;
+                }
+            },
+        };
 
     let running = session_store.is_running(&id);
     debug!(
         session_id = %id,
-        replay_chunks = replay_chunks.len(),
-        replay_bytes = data.len(),
+        snapshot_bytes = data.len(),
         end_offset,
         running,
         app_cursor_keys,
