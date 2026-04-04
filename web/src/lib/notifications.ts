@@ -4,6 +4,8 @@ const DEFAULT_NOTIFICATION_TITLE = 'Open Relay notification'
 const DEFAULT_NOTIFICATION_TAG = 'open-relay-session-notification'
 export const NOTIFICATION_TARGET_PARAM = 'open-relay-target'
 export const NOTIFICATION_CLICK_MESSAGE = 'open-relay:notification-click'
+const NOTIFICATION_TARGET_CACHE = 'open-relay-notification-target-v1'
+const NOTIFICATION_TARGET_CACHE_KEY = '/__push__/pending-notification-target'
 
 export function notificationTitle(payload: Pick<SessionNotificationData, 'title'>): string {
   return payload.title.trim() || DEFAULT_NOTIFICATION_TITLE
@@ -82,6 +84,44 @@ export function notificationLaunchTargetFromUrl(currentUrl: string): string | nu
   const target = url.searchParams.get(NOTIFICATION_TARGET_PARAM)?.trim()
   if (!target) return null
   return normalizeNotificationTarget(target, baseOrigin)
+}
+
+function canUseNotificationTargetCache(): boolean {
+  return typeof caches !== 'undefined'
+}
+
+export async function storePendingNotificationTarget(
+  target: string,
+  origin?: string
+): Promise<void> {
+  const normalizedTarget = normalizeNotificationTarget(target, origin)
+  if (!normalizedTarget || !canUseNotificationTargetCache()) return
+
+  const cache = await caches.open(NOTIFICATION_TARGET_CACHE)
+  await cache.put(
+    NOTIFICATION_TARGET_CACHE_KEY,
+    new Response(JSON.stringify({ target: normalizedTarget }), {
+      headers: { 'content-type': 'application/json' },
+    })
+  )
+}
+
+export async function consumePendingNotificationTarget(origin?: string): Promise<string | null> {
+  if (!canUseNotificationTargetCache()) return null
+
+  const cache = await caches.open(NOTIFICATION_TARGET_CACHE)
+  const response = await cache.match(NOTIFICATION_TARGET_CACHE_KEY)
+  if (!response) return null
+
+  await cache.delete(NOTIFICATION_TARGET_CACHE_KEY)
+
+  try {
+    const payload = (await response.json()) as { target?: unknown }
+    if (typeof payload.target !== 'string') return null
+    return normalizeNotificationTarget(payload.target, origin)
+  } catch {
+    return null
+  }
 }
 
 function readNotificationClickTarget(data: unknown): string | null {

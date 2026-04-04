@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   NOTIFICATION_CLICK_MESSAGE,
+  consumePendingNotificationTarget,
   notificationBody,
   notificationClickMessageTarget,
   notificationLaunchTargetFromUrl,
@@ -10,9 +11,54 @@ import {
   notificationNavigationUrl,
   notificationTag,
   notificationTitle,
+  storePendingNotificationTarget,
 } from './notifications'
 
+class TestResponse {
+  private readonly body: string
+
+  constructor(body: string) {
+    this.body = body
+  }
+
+  async json(): Promise<unknown> {
+    return JSON.parse(this.body)
+  }
+}
+
 describe('notifications helpers', () => {
+  it('stores and consumes pending notification targets via Cache Storage', async () => {
+    const entries = new Map<string, TestResponse>()
+    const cache = {
+      put: async (key: string, value: TestResponse) => {
+        entries.set(key, value)
+      },
+      match: async (key: string) => entries.get(key) ?? null,
+      delete: async (key: string) => entries.delete(key),
+    }
+
+    Object.defineProperty(globalThis, 'Response', {
+      configurable: true,
+      value: TestResponse,
+    })
+    Object.defineProperty(globalThis, 'caches', {
+      configurable: true,
+      value: {
+        open: async () => cache,
+      },
+    })
+
+    await storePendingNotificationTarget(
+      'https://relay.test/session/session-123?mode=attach',
+      'https://relay.test'
+    )
+
+    await expect(consumePendingNotificationTarget('https://relay.test')).resolves.toBe(
+      '/session/session-123?mode=attach'
+    )
+    await expect(consumePendingNotificationTarget('https://relay.test')).resolves.toBeNull()
+  })
+
   it('combines description and body for display', () => {
     expect(
       notificationBody({

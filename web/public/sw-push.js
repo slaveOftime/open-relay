@@ -1,4 +1,6 @@
 const NOTIFICATION_TARGET_PARAM = 'open-relay-target'
+const NOTIFICATION_TARGET_CACHE = 'open-relay-notification-target-v1'
+const NOTIFICATION_TARGET_CACHE_KEY = '/__push__/pending-notification-target'
 
 function notificationNavigationPath(payload) {
   const base =
@@ -53,6 +55,19 @@ function notificationMessage(payload) {
   }
 }
 
+async function storePendingNotificationTarget(payload) {
+  const target = normalizedNotificationTarget(payload)
+  if (!target) return
+
+  const cache = await self.caches.open(NOTIFICATION_TARGET_CACHE)
+  await cache.put(
+    NOTIFICATION_TARGET_CACHE_KEY,
+    new Response(JSON.stringify({ target }), {
+      headers: { 'content-type': 'application/json' },
+    })
+  )
+}
+
 function clientPriority(client) {
   let priority = 0
   if (client.visibilityState === 'visible') priority += 1
@@ -93,11 +108,15 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close()
 
   const payload = event.notification?.data || {}
+  const navigationUrl = notificationNavigationUrl(payload)
   const launchUrl = notificationLaunchUrl(payload)
   const clickMessage = notificationMessage(payload)
 
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async (clients) => {
+    Promise.resolve()
+      .then(() => storePendingNotificationTarget(payload))
+      .then(() => self.clients.matchAll({ type: 'window', includeUncontrolled: true }))
+      .then(async (clients) => {
       const sortedClients = [...clients].sort(
         (left, right) => clientPriority(right) - clientPriority(left)
       )
@@ -105,9 +124,21 @@ self.addEventListener('notificationclick', (event) => {
       for (const client of sortedClients) {
         if ('navigate' in client) {
           try {
-            const navigated = await client.navigate(launchUrl)
-            if (navigated?.focus) return navigated.focus()
-            if (client.focus) return client.focus()
+            const navigated = await client.navigate(navigationUrl)
+            const activeClient = navigated || client
+            if (activeClient.focus) {
+              await activeClient.focus()
+            } else if (client.focus) {
+              await client.focus()
+            }
+            if (clickMessage) {
+              try {
+                activeClient.postMessage(clickMessage)
+              } catch {
+                // A successful navigation is still enough; the app can restore from launchUrl.
+              }
+            }
+            return
           } catch {
             // Fall back to messaging if this client refuses a full navigation.
           }
@@ -115,8 +146,11 @@ self.addEventListener('notificationclick', (event) => {
 
         try {
           if (clickMessage) {
+            if (client.focus) {
+              await client.focus()
+            }
             client.postMessage(clickMessage)
-            if (client.focus) return client.focus()
+            return
           }
         } catch {
           // Fall back to opening a new app window if this client refuses messaging too.
