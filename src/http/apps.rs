@@ -947,7 +947,6 @@ mod tests {
         AppConfig {
             http_port: 0,
             log_level: "info".into(),
-            ring_buffer_bytes: 1_024,
             stop_grace_seconds: 5,
             prompt_patterns: vec![],
             web_push_subject: None,

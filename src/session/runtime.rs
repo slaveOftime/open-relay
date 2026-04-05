@@ -12,7 +12,6 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::AppConfig,
     error::{AppError, Result},
     protocol::LogResize,
     session::persist::append_output,
@@ -27,7 +26,6 @@ use super::{
     cursor_tracker::CursorTracker,
     mode_tracker::{ModeSnapshot, ModeTracker},
     persist::{append_event, append_output_raw, append_resize_event},
-    ring::RingBuffer,
     vt100::safe_resize_parser,
 };
 
@@ -39,8 +37,6 @@ pub struct SessionRuntime {
     pub meta: SessionMeta,
     /// Absolute path to the session's working directory (`sessions/<id>/`).
     pub dir: PathBuf,
-    /// Byte-limited ring buffer of canonical filtered PTY output.
-    pub ring: RingBuffer,
     /// Sends canonical filtered PTY output chunks to all live attach subscribers.
     pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
     /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
@@ -117,15 +113,14 @@ impl SessionRuntime {
             self.last_visible_output_at = Some(Instant::now());
         }
 
-        // Add the canonical filtered bytes to the in-memory ring. Fully stripped
-        // chunks do not advance replay offsets.
+        // Add the canonical filtered bytes to the retained terminal state.
+        // Fully stripped chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
             self.last_total_bytes = self
                 .last_total_bytes
                 .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
             self.screen_parser.process(filtered_data.as_ref());
-            self.ring.push(filtered_data);
         }
 
         mode_change
@@ -308,7 +303,7 @@ impl SessionRuntime {
             self.pty_size = Some((rows, cols));
             safe_resize_parser(&mut self.screen_parser, rows, cols);
             self.resize_history.push(LogResize {
-                offset: self.ring.end_offset(),
+                offset: self.last_total_bytes,
                 rows,
                 cols,
             });
@@ -342,7 +337,6 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
 pub fn spawn_session(
-    config: &AppConfig,
     meta: &mut SessionMeta,
     session_dir: PathBuf,
     rows: u16,
@@ -452,7 +446,6 @@ pub fn spawn_session(
     let runtime = Arc::new(Mutex::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
-        ring: RingBuffer::new(config.ring_buffer_bytes),
         last_total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
@@ -602,7 +595,6 @@ pub fn spawn_session(
     info!(
         session_id = %meta.id,
         pid = ?meta.pid,
-        ring_buffer_bytes = config.ring_buffer_bytes,
         writer_queue_capacity = PTY_WRITER_QUEUE_CAPACITY,
         "PTY session runtime spawned"
     );
@@ -694,7 +686,6 @@ mod tests {
         SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
-            ring: RingBuffer::new(4096), // small capacity for tests
             last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
@@ -809,25 +800,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // push_output — ring buffer eviction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_push_output_ring_evicts_oldest_when_over_capacity() {
-        let mut rt = new_runtime(); // capacity = 4096 bytes
-        // Push chunks that together exceed 4096 bytes so oldest are evicted.
-        let chunk = bytes::Bytes::from(vec![b'x'; 1500]);
-        rt.push_output(&chunk, chunk.clone(), true);
-        rt.push_output(&chunk, chunk.clone(), true);
-        rt.push_output(&chunk, chunk.clone(), true); // total so far: 4500 — first evicted
-        // start_offset must have advanced past 0
-        assert!(
-            rt.ring.start_offset() > 0,
-            "oldest chunks should be evicted once capacity is exceeded"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // push_output — last_output_at tracking
     // -----------------------------------------------------------------------
 
@@ -861,17 +833,18 @@ mod tests {
     }
 
     #[test]
-    fn test_push_output_uses_filtered_bytes_for_ring_and_offsets() {
+    fn test_push_output_uses_filtered_bytes_for_snapshot_and_offsets() {
         let mut rt = new_runtime();
         let raw = bytes::Bytes::from_static(b"before\x1b[6nafter");
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(&raw, filtered, true);
+        rt.push_output(&raw, filtered.clone(), true);
 
-        let (chunks, end_offset) = rt.ring.read_from(0);
-        let combined: Vec<u8> = chunks.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-        assert_eq!(combined, b"beforeafter");
-        assert_eq!(end_offset, 11);
+        assert_eq!(
+            rt.screen_parser.screen().contents().trim_end(),
+            "beforeafter"
+        );
+        assert_eq!(rt.last_total_bytes, 11);
     }
 
     #[test]
@@ -886,15 +859,13 @@ mod tests {
     }
 
     #[test]
-    fn test_push_output_drops_fully_stripped_chunks_from_ring() {
+    fn test_push_output_drops_fully_stripped_chunks_from_snapshot() {
         let mut rt = new_runtime();
         let raw = bytes::Bytes::from_static(b"\x1b[6n");
 
         rt.push_output(&raw, bytes::Bytes::new(), false);
 
-        let (chunks, end_offset) = rt.ring.read_from(0);
-        assert!(chunks.is_empty());
-        assert_eq!(end_offset, 0);
+        assert!(rt.screen_parser.screen().contents().trim().is_empty());
         assert_eq!(rt.last_total_bytes, 0);
     }
 
@@ -979,7 +950,6 @@ mod tests {
         let mut rt = SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
-            ring: RingBuffer::new(4096),
             last_total_bytes: 0,
             broadcast_tx,
             resize_tx,

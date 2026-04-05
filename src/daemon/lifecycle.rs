@@ -553,7 +553,6 @@ mod tests {
         AppConfig {
             http_port: 15443,
             log_level: "info".to_string(),
-            ring_buffer_bytes: 1_048_576,
             stop_grace_seconds: 5,
             prompt_patterns: Vec::new(),
             web_push_subject: None,

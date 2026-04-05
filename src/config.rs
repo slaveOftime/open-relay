@@ -46,7 +46,6 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
 pub struct AppConfig {
     pub http_port: u16,
     pub log_level: String,
-    pub ring_buffer_bytes: usize,
     pub stop_grace_seconds: u64,
     pub prompt_patterns: Vec<String>,
     pub web_push_subject: Option<String>,
@@ -121,7 +120,6 @@ impl AppConfig {
 
         Ok(Self {
             log_level,
-            ring_buffer_bytes: 1024 * 128, // 128 KB per session
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds,

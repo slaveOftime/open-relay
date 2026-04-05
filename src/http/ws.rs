@@ -32,7 +32,7 @@ pub struct AttachParams {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    /// Initial ring-buffer replay. `data` contains filtered stream bytes.
+    /// Initial terminal snapshot. `data` contains filtered stream bytes.
     Init {
         data: Vec<u8>,
         #[serde(rename = "appCursorKeys")]
@@ -362,9 +362,9 @@ async fn handle_ws_streaming(
                             session_id = %id,
                             skipped,
                             current_offset,
-                            "local WebSocket lagged behind broadcast output; replaying from ring"
+                            "local WebSocket lagged behind broadcast output; replaying from persisted output"
                         );
-                        // Re-sync from ring.
+                        // Re-sync from persisted output.
                         let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
                         match resync {
                             Ok((chunks, new_end, rx, bpm, ack)) => {

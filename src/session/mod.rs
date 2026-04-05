@@ -5,7 +5,6 @@ pub(crate) mod mode_tracker;
 pub(crate) mod persist;
 pub mod pty;
 pub(crate) mod resize;
-pub(crate) mod ring;
 mod runtime;
 mod store;
 pub(crate) mod vt100;

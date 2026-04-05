@@ -26,7 +26,7 @@ use crate::{
 
 use super::{
     SessionError, SessionMeta, SessionStatus, StartSpec,
-    persist::{append_event, append_resize_event, current_output_offset},
+    persist::{append_event, append_resize_event, current_output_offset, read_output_from},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 
@@ -234,14 +234,8 @@ impl SessionStore {
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
-        let runtime = match spawn_session(
-            config,
-            &mut meta,
-            session_dir,
-            rows,
-            cols,
-            notifications_enabled,
-        ) {
+        let runtime = match spawn_session(&mut meta, session_dir, rows, cols, notifications_enabled)
+        {
             Ok(runtime) => runtime,
             Err(err) => {
                 let _ = store_handle.abort_started_session(&session_id).await;
@@ -453,8 +447,8 @@ impl SessionStore {
         }
     }
 
-    /// Initialise a streaming subscription: return the canonical filtered ring
-    /// content since `from_byte_offset` (or all content if `None`), the current
+    /// Initialise a streaming subscription: return persisted canonical output
+    /// since `from_byte_offset` (or all content if `None`), the current
     /// filtered-stream end offset, a live broadcast receiver, and the current
     /// terminal mode flags.
     pub async fn attach_subscribe_init(
@@ -472,13 +466,26 @@ impl SessionStore {
         SessionError,
     > {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
+        let (dir, rx, modes) = {
+            let Ok(rt) = runtime.runtime.lock() else {
+                return Err(SessionError::Evicted);
+            };
+            (
+                rt.dir.clone(),
+                rt.broadcast_tx.subscribe(),
+                rt.mode_snapshot(),
+            )
         };
         let offset = from_byte_offset.unwrap_or(0);
-        let (chunks, end_offset) = rt.ring.read_from(offset);
-        let rx = rt.broadcast_tx.subscribe();
-        let modes = rt.mode_snapshot();
+        let (data, end_offset) = read_output_from(&dir, offset).map_err(|err| {
+            warn!(session_id = id, %err, "failed to read persisted attach output");
+            SessionError::Evicted
+        })?;
+        let chunks = if data.is_empty() {
+            Vec::new()
+        } else {
+            vec![(offset, Bytes::from(data))]
+        };
         debug!(
             session_id = id,
             chunks = chunks.len(),
@@ -497,7 +504,7 @@ impl SessionStore {
     }
 
     /// Initialise an attach stream from the current rendered terminal state
-    /// instead of replaying raw retained PTY history from byte offset 0.
+    /// instead of replaying persisted PTY history from byte offset 0.
     pub async fn attach_snapshot_init(
         &self,
         id: &str,
@@ -510,7 +517,7 @@ impl SessionStore {
             return Err(SessionError::Evicted);
         };
         let snapshot = rt.attach_snapshot_bytes();
-        let end_offset = rt.ring.end_offset();
+        let end_offset = current_output_offset(&rt.dir);
         let rx = rt.broadcast_tx.subscribe();
         let modes = rt.mode_snapshot();
         debug!(
@@ -1148,13 +1155,7 @@ impl SessionStore {
                 }
 
                 let rt = runtime.runtime.lock().ok()?;
-                let limit = 20u16;
-                let mut parser = vt100::Parser::new(limit, 2000, 0);
-                let chunks: Vec<_> = rt.ring.all_chunks().collect();
-                for chunk in chunks.iter().rev().take(limit as usize).rev() {
-                    parser.process(chunk);
-                }
-                let excerpt = parser.screen().contents();
+                let excerpt = rt.screen_parser.screen().contents();
 
                 Some(SilentCandidate {
                     session_id: snapshot.summary.id.clone(),
@@ -1209,7 +1210,7 @@ fn build_soft_stop_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionMeta, SessionStatus};
+    use crate::session::{SessionMeta, SessionStatus, pty::collect_chunk_bytes};
     use chrono::Utc;
     use std::sync::{Arc, Mutex};
 
@@ -1219,11 +1220,15 @@ mod tests {
         excerpt: &str,
         last_output_ago: Option<Duration>,
     ) -> Arc<Mutex<super::super::runtime::SessionRuntime>> {
-        use crate::session::ring::RingBuffer;
-        use bytes::Bytes;
         use tokio::sync::{broadcast, mpsc};
 
-        let dir = std::env::temp_dir().join(format!("oly_store_test_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("oly_store_test_{id}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create runtime test dir");
+        if !excerpt.is_empty() {
+            crate::session::persist::append_output_raw(&dir, excerpt.as_bytes())
+                .expect("persist runtime excerpt");
+        }
 
         let meta = SessionMeta {
             id: id.to_string(),
@@ -1241,10 +1246,9 @@ mod tests {
         };
 
         let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
-
-        let mut ring = RingBuffer::new(4096);
+        let mut screen_parser = vt100::Parser::new(24, 80, 0);
         if !excerpt.is_empty() {
-            ring.push(Bytes::from(excerpt.to_string()));
+            screen_parser.process(excerpt.as_bytes());
         }
 
         let (broadcast_tx, _rx) = broadcast::channel(4);
@@ -1254,7 +1258,6 @@ mod tests {
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            ring,
             last_total_bytes: excerpt.as_bytes().len() as u64,
             broadcast_tx,
             resize_tx,
@@ -1277,7 +1280,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             mode_tracker: super::super::mode_tracker::ModeTracker::new(),
-            screen_parser: vt100::Parser::new(24, 80, 0),
+            screen_parser,
             output_closed: false,
             notifications_enabled: true,
         }))
@@ -1400,6 +1403,25 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_attach_subscribe_init_reads_persisted_output_from_offset() {
+        let runtime = make_runtime(
+            "attach123",
+            SessionStatus::Running,
+            "hello world",
+            Some(Duration::from_secs(1)),
+        );
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let (chunks, end_offset, _rx, _bpm, _ack) = store
+            .attach_subscribe_init("attach123", Some(6))
+            .await
+            .expect("attach subscribe init");
+
+        assert_eq!(end_offset, 11);
+        assert_eq!(collect_chunk_bytes(&chunks), b"world");
     }
 
     // -----------------------------------------------------------------------
@@ -1673,10 +1695,10 @@ mod tests {
         Arc<Mutex<super::super::runtime::SessionRuntime>>,
         tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        use crate::session::ring::RingBuffer;
         use tokio::sync::{broadcast, mpsc};
 
-        let dir = std::env::temp_dir().join(format!("oly_store_writable_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("oly_store_writable_{id}_{}", uuid::Uuid::new_v4()));
         let meta = SessionMeta {
             id: id.to_string(),
             title: None,
@@ -1698,7 +1720,6 @@ mod tests {
         let rt = Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            ring: RingBuffer::new(4096),
             last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
@@ -1742,7 +1763,6 @@ mod tests {
     fn make_test_config(max_running_sessions: usize) -> AppConfig {
         use std::path::PathBuf;
         AppConfig {
-            ring_buffer_bytes: 4_194_304,
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds: 15,

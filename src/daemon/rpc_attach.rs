@@ -266,7 +266,7 @@ pub(super) async fn handle_attach_subscribe(
                                 session_id = %id,
                                 skipped,
                                 from_offset = current_offset,
-                                "IPC stream lagged behind broadcast output; resyncing from ring"
+                                "IPC stream lagged behind broadcast output; resyncing from persisted output"
                             );
                             let (chunks, new_end) = {
                                 match session_store.attach_subscribe_init(&id, Some(current_offset)).await {
