@@ -69,6 +69,8 @@ pub struct SessionRuntime {
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
+    /// Canonical filtered-stream offset already folded into `notification_excerpt`.
+    pub notification_excerpt_end_offset: u64,
     /// Byte-level state machine for DEC private mode tracking.
     pub mode_tracker: ModeTracker,
     /// Live rendered terminal state for attach snapshot restoration.
@@ -467,6 +469,7 @@ pub fn spawn_session(
         attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
+        notification_excerpt_end_offset: 0,
         mode_tracker: ModeTracker::new(),
         screen_parser: vt100::Parser::new(rows, cols, 0),
         output_closed: false,
@@ -707,6 +710,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            notification_excerpt_end_offset: 0,
             mode_tracker: ModeTracker::new(),
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
@@ -971,6 +975,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            notification_excerpt_end_offset: 0,
             mode_tracker: ModeTracker::new(),
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
