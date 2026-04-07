@@ -5,9 +5,10 @@ use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     response::IntoResponse,
 };
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::session::mode_tracker::ModeSnapshot;
@@ -104,7 +105,41 @@ pub async fn attach_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     debug!(session_id = %id, "WebSocket upgrade requested");
-    ws.on_upgrade(move |socket| handle_ws(socket, state, id, params.node, params.rows, params.cols))
+    ws.on_upgrade(move |socket| async move {
+        let panic_session_id = id.clone();
+        let panic_node = params.node.clone();
+        let result = std::panic::AssertUnwindSafe(handle_ws(
+            socket,
+            state,
+            id,
+            params.node,
+            params.rows,
+            params.cols,
+        ))
+        .catch_unwind()
+        .await;
+
+        if let Err(payload) = result {
+            error!(
+                session_id = %panic_session_id,
+                node = ?panic_node,
+                panic = %panic_payload_message(payload.as_ref()),
+                "attach WebSocket handler panicked"
+            );
+        }
+    })
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return message;
+    }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.as_str();
+    }
+
+    "non-string panic payload"
 }
 
 fn mode_flags(app_cursor_keys: bool, bracketed_paste_mode: bool) -> u8 {
@@ -705,5 +740,31 @@ fn init_msg_data_len(msg: &ServerMessage) -> usize {
     match msg {
         ServerMessage::Init { data, .. } => data.len(),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_payload_message;
+
+    #[test]
+    fn panic_payload_message_formats_static_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("attach panic");
+        assert_eq!(panic_payload_message(payload.as_ref()), "attach panic");
+    }
+
+    #[test]
+    fn panic_payload_message_formats_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("attach panic"));
+        assert_eq!(panic_payload_message(payload.as_ref()), "attach panic");
+    }
+
+    #[test]
+    fn panic_payload_message_handles_unknown_payloads() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_u8);
+        assert_eq!(
+            panic_payload_message(payload.as_ref()),
+            "non-string panic payload"
+        );
     }
 }

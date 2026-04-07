@@ -17,7 +17,7 @@ path = "src/main.rs"
 [profile.release]
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 opt-level = "z"
 
