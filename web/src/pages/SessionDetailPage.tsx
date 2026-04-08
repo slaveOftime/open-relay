@@ -1208,7 +1208,7 @@ export default function SessionDetailPage() {
         {/* ── Main body ── */}
         <div
           id="main-container"
-          className="sm:flex overflow-y-auto sm:overflow-hidden flex-1 min-h-0"
+          className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
         >
           {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
 
