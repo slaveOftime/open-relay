@@ -123,7 +123,7 @@ pub(super) async fn handle_attach_subscribe(
     let mut completion_check = tokio::time::interval(std::time::Duration::from_millis(100));
     completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    let mut last_modes = crate::session::mode_tracker::ModeSnapshot {
+    let mut last_modes = crate::session::ModeSnapshot {
         app_cursor_keys,
         bracketed_paste_mode,
     };

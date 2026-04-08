@@ -1,7 +1,5 @@
-pub(crate) mod cursor_tracker;
 pub(crate) mod file;
 pub mod logs;
-pub(crate) mod mode_tracker;
 pub(crate) mod persist;
 pub mod pty;
 pub(crate) mod resize;
@@ -16,6 +14,7 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 
 use crate::protocol::SessionSummary;
+pub(crate) use runtime::ModeSnapshot;
 pub use store::SessionStore;
 pub use store::SilentCandidate;
 

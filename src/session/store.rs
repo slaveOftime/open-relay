@@ -19,8 +19,7 @@ use crate::{
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
     session::{
-        SessionEvent, SessionEventTx, SessionLiveSummary, mode_tracker::ModeSnapshot,
-        normalize_session_tags,
+        ModeSnapshot, SessionEvent, SessionEventTx, SessionLiveSummary, normalize_session_tags,
     },
 };
 
@@ -493,10 +492,7 @@ impl SessionStore {
     }
 
     /// Returns the current terminal mode snapshot for the session, if available.
-    pub fn get_mode_snapshot(
-        &self,
-        id: &str,
-    ) -> Option<crate::session::mode_tracker::ModeSnapshot> {
+    pub fn get_mode_snapshot(&self, id: &str) -> Option<crate::session::ModeSnapshot> {
         let sessions = self.sessions.load();
         sessions
             .get(id)
@@ -1368,7 +1364,6 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             notification_excerpt_end_offset: 0,
-            mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             screen_parser,
             output_closed: false,
             notifications_enabled: true,
@@ -1881,7 +1876,6 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             notification_excerpt_end_offset: 0,
-            mode_tracker: super::super::mode_tracker::ModeTracker::new(),
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
@@ -2066,7 +2060,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
-            locked.mode_tracker.process(b"\x1b[?1h");
+            locked.screen_parser.process(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
 
@@ -2087,7 +2081,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
-            locked.mode_tracker.process(b"\x1b[?1h");
+            locked.screen_parser.process(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
 

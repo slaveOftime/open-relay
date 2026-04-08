@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
-use crate::session::mode_tracker::ModeSnapshot;
+use crate::session::ModeSnapshot;
 use crate::session::pty::collect_chunk_bytes;
 use crate::session::resize::ResizeSubscriber;
 
