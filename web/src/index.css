@@ -209,11 +209,3 @@
     transform: translateY(0);
   }
 }
-
-/* make the scrollbar always visible in small screen */
-@media (max-width: 40rem) {
-  .xterm .xterm-scrollable-element > .invisible {
-    opacity: 0.4 !important;
-    visibility: visible !important;
-  }
-}
