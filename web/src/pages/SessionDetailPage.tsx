@@ -1174,48 +1174,49 @@ export default function SessionDetailPage() {
           </div>
         </header>
 
+        {/* ── Info bar ── */}
+        {session && (
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-[hsl(var(--muted-foreground))] shrink-0 overflow-y-auto h-[38px]">
+            <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
+              <CommandLogo command={session.command} size={24} />
+              <div className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`} onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}>
+                {session?.title && <span className='break-all text-[hsl(var(--primary))]'>{session.title}</span>}
+                <span className="break-all">{sessionDisplayName(session)}</span>
+                {session.cwd && (
+                  <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
+                )}
+                <span className="text-[hsl(var(--foreground))]">
+                  {formatTimestamp(session.created_at)}
+                </span>
+                {exitCode !== undefined && (
+                  <span>
+                    Exit: <span className="text-[hsl(var(--foreground))]">{exitCode ?? '?'}</span>
+                  </span>
+                )}
+                <span>
+                  <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
+                </span>
+                {session.pid != null && (
+                  <span>
+                    PID: <span className="text-[hsl(var(--foreground))]">{session.pid}</span>
+                  </span>
+                )}
+              </div>
+            </span>
+          </div>
+        )}
+
+        {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
+
         {/* ── Main body ── */}
         <div
           id="main-container"
           className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
         >
-          {/* ── Info bar ── */}
-          {session && (
-            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-[hsl(var(--muted-foreground))] shrink-0 overflow-y-auto h-[38px]">
-              <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
-                <CommandLogo command={session.command} size={24} />
-                <div className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`} onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}>
-                  {session?.title && <span className='break-all text-[hsl(var(--primary))]'>{session.title}</span>}
-                  <span className="break-all">{sessionDisplayName(session)}</span>
-                  {session.cwd && (
-                    <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
-                  )}
-                  <span className="text-[hsl(var(--foreground))]">
-                    {formatTimestamp(session.created_at)}
-                  </span>
-                  {exitCode !== undefined && (
-                    <span>
-                      Exit: <span className="text-[hsl(var(--foreground))]">{exitCode ?? '?'}</span>
-                    </span>
-                  )}
-                  <span>
-                    <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
-                  </span>
-                  {session.pid != null && (
-                    <span>
-                      PID: <span className="text-[hsl(var(--foreground))]">{session.pid}</span>
-                    </span>
-                  )}
-                </div>
-              </span>
-            </div>
-          )}
-
-          {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
 
           {/* Terminal area */}
           <div
-            className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-110px)] sm:h-full'}`}
+            className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
           >
             <div
               ref={termContainerRef}
