@@ -183,7 +183,7 @@ function saveSessionPrefs(prefs: SessionPrefs) {
 
 function normalizeStoredNode(value: unknown): string | null {
   if (typeof value !== 'string') return null
-  const trimmed = value.trim().toUpperCase()
+  const trimmed = value.trim()
   return trimmed === '' ? null : trimmed
 }
 
@@ -1962,7 +1962,7 @@ export default function SessionsPage() {
                   ).map((col) => (
                     <TableHead
                       key={col.key}
-                      className={`px-3 py-2.5 text-left text-xs font-medium uppercase tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
+                      className={`px-3 py-2.5 text-left text-xs font-medium tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
                         col.sortField
                           ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
                           : 'text-[hsl(var(--muted-foreground))]'
