@@ -196,7 +196,7 @@ function matchesSelectedNode(
 
 function sessionPageTitle(selectedNode: string | null): string {
   const normalized = normalizeStoredNode(selectedNode)
-  if (!normalized || normalized.toLowerCase() === 'local') return 'Open Relay'
+  if (!normalized || normalized.toLowerCase() === 'local') return 'oly'
   return normalized
 }
 
@@ -1805,7 +1805,7 @@ export default function SessionsPage() {
               onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
-              <span>Open Relay</span>
+              <span>oly</span>
             </div>
 
             <Input

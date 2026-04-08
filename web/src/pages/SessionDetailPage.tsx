@@ -1038,7 +1038,7 @@ export default function SessionDetailPage() {
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
-              <span className="hidden sm:inline">Open Relay</span>
+              <span className="hidden sm:inline">oly</span>
             </div>
           </Link>
           <div className="flex items-center gap-3 min-w-0 flex-1">
