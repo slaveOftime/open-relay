@@ -209,12 +209,16 @@ export function uploadSessionFile(
 
 export function fetchLogs(
   id: string,
-  opts: { offset?: number; limit?: number } = {},
+  opts: { offset?: number; limit?: number; tail?: number } = {},
   node?: string
 ): Promise<LogsResponse> {
   const q = new URLSearchParams()
-  if (opts.offset !== undefined) q.set('offset', String(opts.offset))
-  if (opts.limit !== undefined) q.set('limit', String(opts.limit))
+  if (opts.tail !== undefined) {
+    q.set('tail', String(opts.tail))
+  } else {
+    if (opts.offset !== undefined) q.set('offset', String(opts.offset))
+    if (opts.limit !== undefined) q.set('limit', String(opts.limit))
+  }
   if (node) q.set('node', node)
   const qs = q.toString()
   return req<LogsResponse>(`${BASE}/sessions/${id}/logs${qs ? `?${qs}` : ''}`)

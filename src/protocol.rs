@@ -219,8 +219,10 @@ pub enum RpcRequest {
     },
     LogsPagination {
         id: String,
-        offset: usize,
+        offset: Option<usize>,
         limit: usize,
+        #[serde(default)]
+        tail: bool,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
     /// times out), then return a snapshot.  Response is `LogsTail`.
@@ -360,6 +362,7 @@ pub enum RpcResponse {
         resizes: Vec<LogResize>,
     },
     LogsPagination {
+        offset: usize,
         lines: Vec<String>,
         total: usize,
         #[serde(default)]

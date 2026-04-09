@@ -4,6 +4,7 @@
 //! persisted `output.log` files from disk.  This module consolidates that logic
 //! so every consumer shares the same code path.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -147,6 +148,29 @@ pub fn read_persisted_log_page(
     Some(page.finish())
 }
 
+/// Read the last `limit` records from a persisted `output.log`.
+///
+/// Returns `(records, total_record_count, start_offset)` where `start_offset`
+/// is the absolute record index of the first returned record.
+pub fn read_persisted_log_tail_page(
+    session_dir: &Path,
+    limit: usize,
+) -> Option<(Vec<String>, usize, usize)> {
+    let log_path = session_dir.join("output.log");
+    if let Ok(index) = sync_persisted_log_index(&log_path) {
+        let total = index.total_records();
+        let offset = total.saturating_sub(limit);
+        if let Ok(records) = read_persisted_log_page_from_index(&log_path, &index, offset, limit) {
+            return Some((records, total, offset));
+        }
+    }
+
+    let file = File::open(log_path).ok()?;
+    let mut page = TailPaginatedLogRecords::new(limit);
+    scan_persisted_log_records(file, |record| page.push(record)).ok()?;
+    Some(page.finish())
+}
+
 pub fn refresh_persisted_log_index(session_dir: &Path) -> Result<()> {
     let log_path = session_dir.join("output.log");
     let Ok(_) = fs::metadata(&log_path) else {
@@ -198,6 +222,46 @@ impl PaginatedLogRecords {
 
     fn finish(self) -> (Vec<String>, usize) {
         (self.records, self.total)
+    }
+}
+
+struct TailPaginatedLogRecords {
+    limit: usize,
+    total: usize,
+    records: VecDeque<String>,
+}
+
+impl TailPaginatedLogRecords {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            total: 0,
+            records: VecDeque::with_capacity(limit),
+        }
+    }
+
+    fn push(&mut self, record: &[u8]) {
+        if record.is_empty() {
+            return;
+        }
+
+        if self.limit > 0 {
+            if self.records.len() == self.limit {
+                self.records.pop_front();
+            }
+            self.records
+                .push_back(String::from_utf8_lossy(record).into_owned());
+        }
+        self.total += 1;
+    }
+
+    fn finish(self) -> (Vec<String>, usize, usize) {
+        let count = self.records.len();
+        (
+            self.records.into_iter().collect(),
+            self.total,
+            self.total.saturating_sub(count),
+        )
     }
 }
 
@@ -1168,8 +1232,8 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 mod tests {
     use super::{
         ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
-        read_persisted_log_page, read_relevant_resize_events, read_resize_events,
-        refresh_persisted_log_index, render_log_bytes, render_log_file,
+        read_persisted_log_page, read_persisted_log_tail_page, read_relevant_resize_events,
+        read_resize_events, refresh_persisted_log_index, render_log_bytes, render_log_file,
         split_persisted_log_records,
     };
     use crate::protocol::LogResize;
@@ -1544,6 +1608,25 @@ mod tests {
             read_persisted_log_page(&temp_dir, 1, 10).expect("read trailing page");
         assert_eq!(tail_lines, vec!["gamma".to_string()]);
         assert_eq!(tail_total, 2);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn reads_tail_page_with_absolute_offset() {
+        let temp_dir = temp_session_dir("oly-log-tail");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let log_path = temp_dir.join("output.log");
+        fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
+        refresh_persisted_log_index(&temp_dir).expect("index output log");
+
+        let (lines, total, offset) =
+            read_persisted_log_tail_page(&temp_dir, 2).expect("read tail page");
+
+        assert_eq!(lines, vec!["three\n".to_string(), "four\n".to_string()]);
+        assert_eq!(total, 4);
+        assert_eq!(offset, 2);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
