@@ -164,12 +164,11 @@ async fn run() -> Result<()> {
 
         Commands::Daemon(args) => match args.command {
             DaemonCommand::Start(start_args) => {
-                let http_port = start_args.port.unwrap_or(config.http_port);
                 daemon::start(
-                    AppConfig {
-                        http_port,
-                        ..config
-                    },
+                    config.with_runtime_overrides(
+                        start_args.port,
+                        start_args.notification_hook.clone(),
+                    ),
                     start_args.detach,
                     start_args.foreground_internal,
                     start_args.no_auth,

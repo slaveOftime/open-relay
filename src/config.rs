@@ -140,6 +140,20 @@ impl AppConfig {
         })
     }
 
+    pub fn with_runtime_overrides(
+        mut self,
+        http_port: Option<u16>,
+        notification_hook: Option<String>,
+    ) -> Self {
+        if let Some(http_port) = http_port {
+            self.http_port = http_port;
+        }
+        if let Some(notification_hook) = notification_hook.and_then(normalize_optional_string) {
+            self.notification_hook = Some(notification_hook);
+        }
+        self
+    }
+
     pub fn wwwroot_dir(&self) -> PathBuf {
         self.state_dir.join("wwwroot")
     }
@@ -231,5 +245,56 @@ fn normalize_optional_string(value: String) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::AppConfig;
+
+    fn test_config() -> AppConfig {
+        let state_dir = PathBuf::from("test-state");
+        AppConfig {
+            http_port: 15443,
+            log_level: "info".to_string(),
+            stop_grace_seconds: 5,
+            prompt_patterns: Vec::new(),
+            web_push_subject: None,
+            web_push_vapid_public_key: None,
+            web_push_vapid_private_key: None,
+            state_dir: state_dir.clone(),
+            sessions_dir: state_dir.join("sessions"),
+            db_file: state_dir.join("oly.db"),
+            lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
+            socket_name: "test.sock".to_string(),
+            socket_file: state_dir.join("daemon.sock"),
+            silence_seconds: 10,
+            session_eviction_seconds: 15,
+            max_running_sessions: 50,
+            notification_hook: Some("config-hook".to_string()),
+        }
+    }
+
+    #[test]
+    fn runtime_overrides_replace_port_and_notification_hook() {
+        let config = test_config()
+            .with_runtime_overrides(Some(17000), Some("  C:/tools/notify.exe  ".to_string()));
+
+        assert_eq!(config.http_port, 17000);
+        assert_eq!(
+            config.notification_hook.as_deref(),
+            Some("C:/tools/notify.exe")
+        );
+    }
+
+    #[test]
+    fn runtime_overrides_leave_config_values_when_not_provided() {
+        let config = test_config().with_runtime_overrides(None, None);
+
+        assert_eq!(config.http_port, 15443);
+        assert_eq!(config.notification_hook.as_deref(), Some("config-hook"));
     }
 }

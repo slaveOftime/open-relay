@@ -112,6 +112,9 @@ pub struct DaemonStartArgs {
     /// Override default HTTP port.
     #[arg(long, short = 'p')]
     pub port: Option<u16>,
+    /// Override the configured local notification hook for this daemon run.
+    #[arg(long, value_name = "PATH")]
+    pub notification_hook: Option<String>,
     /// Disable HTTP authentication. You will be asked to confirm the security risk.
     #[arg(long)]
     pub no_auth: bool,
@@ -438,7 +441,7 @@ pub struct JoinListArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, NotifyCommand, parse_timeout_ms};
+    use super::{Cli, Commands, DaemonCommand, NotifyCommand, parse_timeout_ms};
     use clap::Parser;
 
     #[test]
@@ -557,5 +560,27 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+    }
+
+    #[test]
+    fn daemon_start_parses_notification_hook_override() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "daemon",
+            "start",
+            "--notification-hook",
+            "C:/tools/notify.exe",
+        ])
+        .unwrap();
+        let Commands::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        let DaemonCommand::Start(args) = args.command else {
+            panic!("expected daemon start subcommand");
+        };
+        assert_eq!(
+            args.notification_hook.as_deref(),
+            Some("C:/tools/notify.exe")
+        );
     }
 }

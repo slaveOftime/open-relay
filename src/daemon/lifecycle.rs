@@ -164,7 +164,13 @@ pub async fn start(
     };
 
     if detach && !foreground_internal {
-        spawn_detached(no_auth, no_http, auth_hash.as_deref(), config.http_port)?;
+        spawn_detached(
+            no_auth,
+            no_http,
+            auth_hash.as_deref(),
+            config.http_port,
+            config.notification_hook.as_deref(),
+        )?;
         wait_for_daemon_ready(&config, std::time::Duration::from_secs(60)).await?;
 
         println!("Daemon started in background.");
@@ -272,7 +278,13 @@ async fn wait_for_daemon_ready(config: &AppConfig, timeout: std::time::Duration)
     ))
 }
 
-fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u16) -> Result<()> {
+fn spawn_detached(
+    no_auth: bool,
+    no_http: bool,
+    auth_hash: Option<&str>,
+    port: u16,
+    notification_hook: Option<&str>,
+) -> Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
@@ -290,6 +302,9 @@ fn spawn_detached(no_auth: bool, no_http: bool, auth_hash: Option<&str>, port: u
     }
     if no_http {
         cmd.arg("--no-http");
+    }
+    if let Some(notification_hook) = notification_hook {
+        cmd.arg("--notification-hook").arg(notification_hook);
     }
     // On Windows the spawned process must be placed in its own process group
     // and detached from the parent console.  Without these flags the daemon
