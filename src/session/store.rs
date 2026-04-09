@@ -25,6 +25,7 @@ use crate::{
 
 use super::{
     SessionError, SessionMeta, SessionStatus, StartSpec,
+    logs::split_rendered_log_output,
     persist::{append_event, append_resize_event, current_output_offset, read_output_from},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
@@ -537,6 +538,44 @@ impl SessionStore {
             rt.render_logs(tail, keep_color, term_cols),
             rt.resize_history.clone(),
         ))
+    }
+
+    pub async fn read_live_log_tail_page(
+        &self,
+        id: &str,
+        tail: usize,
+    ) -> std::result::Result<
+        (Vec<String>, usize, usize, Vec<crate::protocol::LogResize>),
+        SessionError,
+    > {
+        let runtime = self.lookup_runtime(id).await?;
+        let mut rt = runtime.lock_runtime();
+        let completed = rt.refresh_status();
+        if completed {
+            runtime.refresh_snapshot(&rt);
+        }
+        if rt.is_completed() || rt.output_closed {
+            return Err(SessionError::NotRunning);
+        }
+
+        let term_cols = rt
+            .pty_size
+            .map(|(_, cols)| cols)
+            .or_else(|| rt.resize_history.last().map(|resize| resize.cols))
+            .filter(|cols| *cols > 0)
+            .unwrap_or(80);
+        let chunks = split_rendered_log_output(&rt.render_logs(tail, true, term_cols));
+        let total = chunks.len();
+
+        Ok((chunks, total, 0, rt.resize_history.clone()))
+    }
+
+    pub async fn read_live_log_chunk_count(
+        &self,
+        id: &str,
+    ) -> std::result::Result<usize, SessionError> {
+        let (_, total, _, _) = self.read_live_log_tail_page(id, usize::MAX).await?;
+        Ok(total)
     }
 
     pub async fn attach_stream_status(
@@ -1759,6 +1798,63 @@ mod tests {
             .expect_err("completed session should not render live logs");
 
         assert!(matches!(err, SessionError::NotRunning));
+    }
+
+    #[tokio::test]
+    async fn read_live_log_tail_page_returns_runtime_chunks() {
+        let runtime = make_runtime(
+            "live-page123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            rt.screen_parser = vt100::Parser::new(24, 80, 0);
+            rt.screen_parser
+                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let (chunks, total, offset, resizes) = store
+            .read_live_log_tail_page("live-page123", 2)
+            .await
+            .expect("read live tail page");
+
+        assert_eq!(
+            chunks,
+            vec![
+                "screen two\x1b[0m\n".to_string(),
+                "screen three\x1b[0m\n".to_string()
+            ]
+        );
+        assert_eq!(total, 2);
+        assert_eq!(offset, 0);
+        assert!(resizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_live_log_chunk_count_returns_visible_row_count() {
+        let runtime = make_runtime(
+            "live-count123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            rt.screen_parser = vt100::Parser::new(24, 80, 0);
+            rt.screen_parser
+                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let total = store
+            .read_live_log_chunk_count("live-count123")
+            .await
+            .expect("read live chunk count");
+
+        assert_eq!(total, 3);
     }
 
     #[tokio::test]

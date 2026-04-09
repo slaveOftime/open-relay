@@ -34,6 +34,7 @@ const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 
 const LOG_INDEX_OFFSETS_FILE: &str = "output.log.idx";
 const LOG_INDEX_META_FILE: &str = "output.log.idx.meta";
+const OUTPUT_COLOR_RESET_SUFFIX: &[u8] = b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ViewportSize {
@@ -169,6 +170,46 @@ pub fn read_persisted_log_tail_page(
     let mut page = TailPaginatedLogRecords::new(limit);
     scan_persisted_log_records(file, |record| page.push(record)).ok()?;
     Some(page.finish())
+}
+
+pub fn merge_live_log_tail_page(
+    session_dir: &Path,
+    live_chunks: Vec<String>,
+    limit: usize,
+) -> (Vec<String>, usize, usize) {
+    let live_count = live_chunks.len();
+    let persisted_limit = limit.saturating_sub(live_chunks.len());
+    let (mut lines, persisted_total, offset) =
+        read_persisted_log_tail_page(session_dir, persisted_limit)
+            .unwrap_or_else(|| (Vec::new(), 0, 0));
+    lines.extend(live_chunks);
+    (lines, persisted_total + live_count, offset)
+}
+
+pub fn split_rendered_log_output(output: &[u8]) -> Vec<String> {
+    let output = output
+        .strip_suffix(OUTPUT_COLOR_RESET_SUFFIX)
+        .unwrap_or(output);
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+
+    for (index, &byte) in output.iter().enumerate() {
+        if byte == b'\n' {
+            chunks.push(String::from_utf8_lossy(&output[start..=index]).into_owned());
+            start = index + 1;
+        }
+    }
+
+    if start < output.len() {
+        if let Some(last) = chunks.last_mut() {
+            last.push_str(&String::from_utf8_lossy(&output[start..]));
+        } else {
+            chunks.push(String::from_utf8_lossy(&output[start..]).into_owned());
+        }
+    }
+
+    chunks
 }
 
 pub fn refresh_persisted_log_index(session_dir: &Path) -> Result<()> {
@@ -1197,7 +1238,7 @@ fn content_bounds(rows: &[Vec<u8>]) -> Option<(usize, usize)> {
 
 fn append_color_reset(out: &mut Vec<u8>, keep_color: bool) {
     if keep_color {
-        out.extend_from_slice(b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h");
+        out.extend_from_slice(OUTPUT_COLOR_RESET_SUFFIX);
     }
 }
 
@@ -1256,10 +1297,11 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
-        read_persisted_log_page, read_persisted_log_tail_page, read_relevant_resize_events,
-        read_resize_events, refresh_persisted_log_index, render_log_bytes, render_log_file,
-        render_screen, split_persisted_log_records,
+        ViewportReplayPlan, ViewportSize, merge_live_log_tail_page, parse_resize_event,
+        parser_cols, parser_rows, read_persisted_log_page, read_persisted_log_tail_page,
+        read_relevant_resize_events, read_resize_events, refresh_persisted_log_index,
+        render_log_bytes, render_log_file, render_screen, split_persisted_log_records,
+        split_rendered_log_output,
     };
     use crate::protocol::LogResize;
     use std::fs;
@@ -1662,6 +1704,67 @@ mod tests {
         assert_eq!(lines, vec!["three\n".to_string(), "four\n".to_string()]);
         assert_eq!(total, 4);
         assert_eq!(offset, 2);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn split_rendered_log_output_drops_final_reset_suffix() {
+        let output = b"alpha\x1b[0m\nbeta\x1b[0m\n\x1b[0m\x1b[39m\x1b[49m\x1b[?25h";
+
+        assert_eq!(
+            split_rendered_log_output(output),
+            vec!["alpha\x1b[0m\n".to_string(), "beta\x1b[0m\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_persisted_log_total_counts_indexed_records() {
+        let temp_dir = temp_session_dir("oly-log-total");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let log_path = temp_dir.join("output.log");
+        fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
+        refresh_persisted_log_index(&temp_dir).expect("index output log");
+
+        assert_eq!(
+            read_persisted_log_tail_page(&temp_dir, 0)
+                .expect("read total")
+                .1,
+            4
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn merge_live_log_tail_page_keeps_persisted_history_addressable() {
+        let temp_dir = temp_session_dir("oly-log-merge-live");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let log_path = temp_dir.join("output.log");
+        fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
+        refresh_persisted_log_index(&temp_dir).expect("index output log");
+
+        let (lines, total, offset) = merge_live_log_tail_page(
+            &temp_dir,
+            vec![
+                "live one\x1b[0m\n".to_string(),
+                "live two\x1b[0m\n".to_string(),
+            ],
+            3,
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "four\n".to_string(),
+                "live one\x1b[0m\n".to_string(),
+                "live two\x1b[0m\n".to_string(),
+            ]
+        );
+        assert_eq!(total, 6);
+        assert_eq!(offset, 3);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

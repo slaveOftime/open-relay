@@ -16,7 +16,10 @@ use crate::{
     session::{
         SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
-        logs::{read_persisted_log_page, read_persisted_log_tail_page, read_resize_events},
+        logs::{
+            merge_live_log_tail_page, read_persisted_log_page, read_persisted_log_tail_page,
+            read_resize_events,
+        },
         persist::current_output_offset_by_id,
     },
 };
@@ -980,6 +983,19 @@ pub async fn get_logs(
         }
     };
 
+    if let Some(tail) = tail
+        && let Ok((live_lines, _, _, resizes)) =
+            state.store.read_live_log_tail_page(&id, tail).await
+    {
+        let (lines, total, offset) = merge_live_log_tail_page(&session_dir, live_lines, tail);
+        return logs_response(LogsResponseBody {
+            offset,
+            chunks: lines,
+            total,
+            resizes,
+        });
+    }
+
     let page = if let Some(tail) = tail {
         read_persisted_log_tail_page(&session_dir, tail)
     } else {
@@ -988,7 +1004,10 @@ pub async fn get_logs(
     };
 
     match page {
-        Some((lines, total, offset)) => {
+        Some((lines, mut total, offset)) => {
+            if let Ok(live_total) = state.store.read_live_log_chunk_count(&id).await {
+                total += live_total;
+            }
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             logs_response(LogsResponseBody {
                 offset,

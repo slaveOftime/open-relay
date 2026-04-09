@@ -14,7 +14,9 @@ use crate::{
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
-        logs::{read_persisted_log_page, read_resize_events, render_log_file},
+        logs::{
+            merge_live_log_tail_page, read_persisted_log_page, read_resize_events, render_log_file,
+        },
     },
 };
 
@@ -214,7 +216,7 @@ async fn dispatch_request(
             offset,
             limit,
             tail,
-        } => handle_logs_pagination(id, offset, limit, tail, db).await,
+        } => handle_logs_pagination(id, offset, limit, tail, session_store, db).await,
         RpcRequest::LogsWait { id, timeout_ms } => {
             handle_logs_wait(id, timeout_ms, session_store, notification_tx, db).await
         }
@@ -546,6 +548,7 @@ async fn handle_logs_pagination(
     offset: Option<usize>,
     limit: usize,
     tail: bool,
+    session_store: &SessionStoreHandle,
     db: &Arc<Database>,
 ) -> RpcResponse {
     let session_dir = match db.get_session_dir(&id).await {
@@ -562,6 +565,19 @@ async fn handle_logs_pagination(
         }
     };
 
+    if tail
+        && let Ok((live_lines, _, _, resizes)) =
+            session_store.read_live_log_tail_page(&id, limit).await
+    {
+        let (lines, total, offset) = merge_live_log_tail_page(&session_dir, live_lines, limit);
+        return RpcResponse::LogsPagination {
+            offset,
+            lines,
+            total,
+            resizes,
+        };
+    }
+
     let page = if tail {
         crate::session::logs::read_persisted_log_tail_page(&session_dir, limit)
             .map(|(lines, total, offset)| (lines, total, offset))
@@ -571,7 +587,10 @@ async fn handle_logs_pagination(
     };
 
     match page {
-        Some((lines, total, offset)) => {
+        Some((lines, mut total, offset)) => {
+            if let Ok(live_total) = session_store.read_live_log_chunk_count(&id).await {
+                total += live_total;
+            }
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             RpcResponse::LogsPagination {
                 offset,
