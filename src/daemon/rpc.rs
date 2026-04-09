@@ -51,10 +51,20 @@ pub(super) async fn handle_client(
     if let RpcRequest::AttachSubscribe {
         id,
         from_byte_offset,
+        rows,
+        cols,
     } = request
     {
-        return handle_attach_subscribe(id, from_byte_offset, reader, write_half, &session_store)
-            .await;
+        return handle_attach_subscribe(
+            id,
+            from_byte_offset,
+            rows,
+            cols,
+            reader,
+            write_half,
+            &session_store,
+        )
+        .await;
     }
 
     // Node-proxied streaming attach: unwrap the proxy envelope and relay
@@ -187,9 +197,12 @@ async fn dispatch_request(
             term_cols,
             keep_color,
         } => handle_logs_tail(id, tail, term_cols, keep_color, db).await,
-        RpcRequest::LogsPagination { id, offset, limit } => {
-            handle_logs_pagination(id, offset, limit, db).await
-        }
+        RpcRequest::LogsPagination {
+            id,
+            offset,
+            limit,
+            tail,
+        } => handle_logs_pagination(id, offset, limit, tail, db).await,
         RpcRequest::LogsWait { id, timeout_ms } => {
             handle_logs_wait(id, timeout_ms, session_store, notification_tx, db).await
         }
@@ -428,8 +441,9 @@ async fn handle_logs_tail(
 
 async fn handle_logs_pagination(
     id: String,
-    offset: usize,
+    offset: Option<usize>,
     limit: usize,
+    tail: bool,
     db: &Arc<Database>,
 ) -> RpcResponse {
     let session_dir = match db.get_session_dir(&id).await {
@@ -446,10 +460,19 @@ async fn handle_logs_pagination(
         }
     };
 
-    match read_persisted_log_page(&session_dir, offset, limit) {
-        Some((lines, total)) => {
+    let page = if tail {
+        crate::session::logs::read_persisted_log_tail_page(&session_dir, limit)
+            .map(|(lines, total, offset)| (lines, total, offset))
+    } else {
+        read_persisted_log_page(&session_dir, offset.unwrap_or(0), limit)
+            .map(|(lines, total)| (lines, total, offset.unwrap_or(0)))
+    };
+
+    match page {
+        Some((lines, total, offset)) => {
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             RpcResponse::LogsPagination {
+                offset,
                 lines,
                 total,
                 resizes,

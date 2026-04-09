@@ -1,4 +1,6 @@
 const NOTIFICATION_TARGET_PARAM = 'open-relay-target'
+const NOTIFICATION_TARGET_CACHE = 'open-relay-notification-target-v1'
+const NOTIFICATION_TARGET_CACHE_KEY = '/__push__/pending-notification-target'
 
 function notificationNavigationPath(payload) {
   const base =
@@ -13,12 +15,19 @@ function notificationNavigationPath(payload) {
 
 function normalizedNotificationTarget(payload) {
   const url = new URL(notificationNavigationPath(payload), self.location.origin)
-  if (url.origin !== self.location.origin) return '/'
+  if (url.origin !== self.location.origin) return null
   return `${url.pathname}${url.search}${url.hash}`
 }
 
 function notificationNavigationUrl(payload) {
-  return new URL(normalizedNotificationTarget(payload), self.location.origin).toString()
+  return new URL(notificationNavigationPath(payload), self.location.origin).toString()
+}
+
+function usesInAppLaunch(payload) {
+  const target = normalizedNotificationTarget(payload)
+  if (!target) return false
+  const url = new URL(target, self.location.origin)
+  return url.pathname === '/' || url.pathname.startsWith('/session/')
 }
 
 function notificationLaunchUrl(payload) {
@@ -27,18 +36,36 @@ function notificationLaunchUrl(payload) {
       ? payload.launch_url.trim()
       : ''
   if (launch) return new URL(launch, self.location.origin).toString()
-  const target = normalizedNotificationTarget(payload)
-  if (target === '/') return new URL('/', self.location.origin).toString()
+  const target = notificationNavigationPath(payload)
+  const normalizedTarget = normalizedNotificationTarget(payload)
+  if (!normalizedTarget || !usesInAppLaunch(payload)) {
+    return new URL(target, self.location.origin).toString()
+  }
+  if (normalizedTarget === '/') return new URL('/', self.location.origin).toString()
   const launchUrl = new URL('/', self.location.origin)
-  launchUrl.searchParams.set(NOTIFICATION_TARGET_PARAM, target)
+  launchUrl.searchParams.set(NOTIFICATION_TARGET_PARAM, normalizedTarget)
   return launchUrl.toString()
 }
 
 function notificationMessage(payload) {
+  if (!usesInAppLaunch(payload)) return null
   return {
     type: 'open-relay:notification-click',
     target: notificationNavigationUrl(payload),
   }
+}
+
+async function storePendingNotificationTarget(payload) {
+  const target = normalizedNotificationTarget(payload)
+  if (!target) return
+
+  const cache = await self.caches.open(NOTIFICATION_TARGET_CACHE)
+  await cache.put(
+    NOTIFICATION_TARGET_CACHE_KEY,
+    new Response(JSON.stringify({ target }), {
+      headers: { 'content-type': 'application/json' },
+    })
+  )
 }
 
 function clientPriority(client) {
@@ -81,12 +108,15 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close()
 
   const payload = event.notification?.data || {}
-  const targetUrl = notificationNavigationUrl(payload)
+  const navigationUrl = notificationNavigationUrl(payload)
   const launchUrl = notificationLaunchUrl(payload)
   const clickMessage = notificationMessage(payload)
 
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(async (clients) => {
+    Promise.resolve()
+      .then(() => storePendingNotificationTarget(payload))
+      .then(() => self.clients.matchAll({ type: 'window', includeUncontrolled: true }))
+      .then(async (clients) => {
       const sortedClients = [...clients].sort(
         (left, right) => clientPriority(right) - clientPriority(left)
       )
@@ -94,17 +124,34 @@ self.addEventListener('notificationclick', (event) => {
       for (const client of sortedClients) {
         if ('navigate' in client) {
           try {
-            const navigated = await client.navigate(launchUrl)
-            if (navigated?.focus) return navigated.focus()
-            if (client.focus) return client.focus()
+            const navigated = await client.navigate(navigationUrl)
+            const activeClient = navigated || client
+            if (activeClient.focus) {
+              await activeClient.focus()
+            } else if (client.focus) {
+              await client.focus()
+            }
+            if (clickMessage) {
+              try {
+                activeClient.postMessage(clickMessage)
+              } catch {
+                // A successful navigation is still enough; the app can restore from launchUrl.
+              }
+            }
+            return
           } catch {
             // Fall back to messaging if this client refuses a full navigation.
           }
         }
 
         try {
-          client.postMessage(clickMessage)
-          if (client.focus) return client.focus()
+          if (clickMessage) {
+            if (client.focus) {
+              await client.focus()
+            }
+            client.postMessage(clickMessage)
+            return
+          }
         } catch {
           // Fall back to opening a new app window if this client refuses messaging too.
         }

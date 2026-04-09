@@ -65,10 +65,10 @@ regardless.
 ### EC-3: Resize Before Initial Data Race (Blank Screen on Reattach)
 
 **Problem**: A newly attaching client sends `AttachResize` to inform the daemon
-of its terminal size.  If this resize arrives before the ring-buffer replay is
+of its terminal size.  If this resize arrives before the initial terminal snapshot is
 delivered, the child emits `\x1b[2J\x1b[H` (clear screen, cursor home)
 followed by a full repaint.  Those bytes arrive as `AttachData` frames **ahead
-of** or **mixed with** the ring replay, resulting in a blank or corrupted
+of** or **mixed with** the initial replay, resulting in a blank or corrupted
 initial display.
 
 **Root cause**: Resize and initial data were not sequenced — the client

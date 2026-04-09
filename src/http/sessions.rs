@@ -16,7 +16,7 @@ use crate::{
     session::{
         SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
-        logs::{read_persisted_log_page, read_resize_events},
+        logs::{read_persisted_log_page, read_persisted_log_tail_page, read_resize_events},
         persist::current_output_offset_by_id,
     },
 };
@@ -896,12 +896,14 @@ mod tests {
 pub struct LogsParams {
     pub offset: Option<usize>,
     pub limit: Option<usize>,
+    pub tail: Option<usize>,
     /// If set, proxy the logs request to this connected secondary node.
     pub node: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct LogsResponseBody {
+    offset: usize,
     chunks: Vec<String>,
     total: usize,
     resizes: Vec<crate::protocol::LogResize>,
@@ -918,20 +920,24 @@ pub async fn get_logs(
 ) -> impl IntoResponse {
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(200).clamp(1, 5000);
+    let tail = params.tail.map(|tail| tail.clamp(1, 5000));
 
     // Proxy to remote node via the paginated logs RPC.
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::LogsPagination {
             id: id.clone(),
-            offset,
-            limit,
+            offset: tail.is_none().then_some(offset),
+            limit: tail.unwrap_or(limit),
+            tail: tail.is_some(),
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::LogsPagination {
+                offset,
                 lines,
                 total,
                 resizes,
             }) => logs_response(LogsResponseBody {
+                offset,
                 chunks: lines,
                 total,
                 resizes,
@@ -974,10 +980,18 @@ pub async fn get_logs(
         }
     };
 
-    match read_persisted_log_page(&session_dir, offset, limit) {
-        Some((lines, total)) => {
+    let page = if let Some(tail) = tail {
+        read_persisted_log_tail_page(&session_dir, tail)
+    } else {
+        read_persisted_log_page(&session_dir, offset, limit)
+            .map(|(lines, total)| (lines, total, offset))
+    };
+
+    match page {
+        Some((lines, total, offset)) => {
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             logs_response(LogsResponseBody {
+                offset,
                 chunks: lines,
                 total,
                 resizes,

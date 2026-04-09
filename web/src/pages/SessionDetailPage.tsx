@@ -11,7 +11,6 @@ import {
 } from '@/api/client'
 import { formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
 import {
-  appendLogChunks,
   encodeLogChunks,
   initialLogReplayState,
   playNextBatch,
@@ -64,6 +63,8 @@ function isSessionRunning(session: SessionSummary | null): boolean {
     ? session.status === 'running' || session.status === 'stopping' || session.status === 'created'
     : false
 }
+
+const DEFAULT_LOG_TAIL = 200
 
 // ── Confirm Action Dialog ────────────────────────────────────────────────────
 function ConfirmActionDialog({
@@ -158,6 +159,7 @@ export default function SessionDetailPage() {
   const [isOnline, setIsOnline] = useState(
     typeof navigator === 'undefined' ? true : navigator.onLine
   )
+  const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -173,7 +175,7 @@ export default function SessionDetailPage() {
   const totalChunksRef = useRef(0)
   const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
   const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
-  const nextOffsetRef = useRef(0)
+  const loadedStartOffsetRef = useRef(0)
   const isFetchingMoreRef = useRef(false)
   const termContainerRef = useRef<HTMLDivElement>(null)
   const isMounted = useRef(true)
@@ -184,6 +186,7 @@ export default function SessionDetailPage() {
   const connectAttemptStartedAtRef = useRef(0)
   const outputBufferRef = useRef<Uint8Array[]>([])
   const outputFlushRafRef = useRef<number | null>(null)
+  const outputWriteInFlightRef = useRef(false)
   const pendingResetRef = useRef(false)
   const resizeDebounceRef = useRef<number | null>(null)
   const pendingResizeRef = useRef<{ cols: number; rows: number } | null>(null)
@@ -194,31 +197,47 @@ export default function SessionDetailPage() {
   const replayCommittedIdxRef = useRef(0)
 
   const flushTerminalOutput = useCallback(() => {
-    outputFlushRafRef.current = null
+    if (outputWriteInFlightRef.current) {
+      return
+    }
     const term = termRef.current
     if (!term) {
       outputBufferRef.current = []
       pendingResetRef.current = false
+      outputWriteInFlightRef.current = false
       return
     }
     if (pendingResetRef.current) {
       term.reset()
       pendingResetRef.current = false
     }
-    if (outputBufferRef.current.length > 0) {
-      const chunks = outputBufferRef.current
-      outputBufferRef.current = []
-      let total = 0
-      for (const c of chunks) total += c.length
-      const merged = new Uint8Array(total)
-      let off = 0
-      for (const c of chunks) {
-        merged.set(c, off)
-        off += c.length
-      }
-      term.write(merged)
+    if (outputBufferRef.current.length === 0) {
+      return
     }
-    term.scrollToBottom()
+    const chunks = outputBufferRef.current
+    outputBufferRef.current = []
+    let total = 0
+    for (const c of chunks) total += c.length
+    const merged = new Uint8Array(total)
+    let off = 0
+    for (const c of chunks) {
+      merged.set(c, off)
+      off += c.length
+    }
+    outputWriteInFlightRef.current = true
+    term.write(merged, () => {
+      outputWriteInFlightRef.current = false
+      term.scrollToBottom()
+      if (
+        (pendingResetRef.current || outputBufferRef.current.length > 0) &&
+        outputFlushRafRef.current === null
+      ) {
+        outputFlushRafRef.current = requestAnimationFrame(() => {
+          outputFlushRafRef.current = null
+          flushTerminalOutput()
+        })
+      }
+    })
   }, [])
 
   const enqueueTerminalOutput = useCallback(
@@ -231,8 +250,11 @@ export default function SessionDetailPage() {
       if (chunks.length > 0) {
         outputBufferRef.current.push(...chunks)
       }
-      if (outputFlushRafRef.current === null) {
-        outputFlushRafRef.current = requestAnimationFrame(flushTerminalOutput)
+      if (outputFlushRafRef.current === null && !outputWriteInFlightRef.current) {
+        outputFlushRafRef.current = requestAnimationFrame(() => {
+          outputFlushRafRef.current = null
+          flushTerminalOutput()
+        })
       }
     },
     [flushTerminalOutput]
@@ -352,43 +374,49 @@ export default function SessionDetailPage() {
 
   const fetchMoreLogs = useCallback(async () => {
     if (!id || isFetchingMoreRef.current) return
-    if (totalChunksRef.current > 0 && nextOffsetRef.current >= totalChunksRef.current) return
+    if (loadedStartOffsetRef.current <= 0) return
     isFetchingMoreRef.current = true
     try {
-      const requestOffset = nextOffsetRef.current
-      const res = await fetchLogs(id, { offset: requestOffset, limit: 1000 }, node ?? undefined)
+      const currentStartOffset = loadedStartOffsetRef.current
+      const requestOffset = Math.max(0, currentStartOffset - DEFAULT_LOG_TAIL)
+      const requestLimit = currentStartOffset - requestOffset
+      const res = await fetchLogs(
+        id,
+        { offset: requestOffset, limit: requestLimit },
+        node ?? undefined
+      )
       if (!isMounted.current) return
       logResizesRef.current = res.resizes
       const encodedChunks = encodeLogChunks(res.chunks)
       if (res.chunks.length > 0) {
-        const next = [...logChunksRef.current, ...encodedChunks]
+        const nextReplayIdx = replayIdxRef.current + encodedChunks.length
+        const next = [...encodedChunks, ...logChunksRef.current]
         logChunksRef.current = next
         setScrubberMax(next.length)
-        if (!isReplayingRef.current) {
-          if (termRef.current) {
-            logReplayStateRef.current = appendLogChunks(
-              termRef.current,
-              encodedChunks,
-              res.resizes,
-              logReplayStateRef.current
-            )
-            termRef.current.scrollToBottom()
-          }
-          commitReplayIdx(next.length, { force: true })
+        if (termRef.current) {
+          logReplayStateRef.current = replayLogChunks(
+            termRef.current,
+            next,
+            res.resizes,
+            nextReplayIdx,
+            { scrollToBottom: false }
+          )
         }
-      } else if (!isReplayingRef.current && termRef.current) {
-        logReplayStateRef.current = appendLogChunks(
+        commitReplayIdx(nextReplayIdx, { force: true })
+      } else if (termRef.current) {
+        logReplayStateRef.current = replayLogChunks(
           termRef.current,
-          [],
+          logChunksRef.current,
           res.resizes,
-          logReplayStateRef.current
+          replayIdxRef.current,
+          { scrollToBottom: false }
         )
       }
       if (res.total !== totalChunksRef.current) {
         totalChunksRef.current = res.total
         setTotalChunks(res.total)
       }
-      nextOffsetRef.current = Math.min(res.total, requestOffset + res.chunks.length)
+      loadedStartOffsetRef.current = res.offset
     } catch {
       /* ignore */
     } finally {
@@ -406,9 +434,10 @@ export default function SessionDetailPage() {
     if (!el || mode !== 'logs') return
     const handleWheel = (e: WheelEvent) => {
       if (
-        e.deltaY > 0 &&
+        e.deltaY < 0 &&
         !isFetchingMoreRef.current &&
-        nextOffsetRef.current < totalChunksRef.current
+        replayIdxRef.current === 0 &&
+        loadedStartOffsetRef.current > 0
       ) {
         fetchMoreLogsRef.current?.()
       } else if (e.deltaY < 0 && replayIdxRef.current > 0) {
@@ -424,9 +453,10 @@ export default function SessionDetailPage() {
     if (mode !== 'logs') return
     const handleKeyUp = (e: KeyboardEvent) => {
       if (
-        (e.key === 'PageDown' || e.key === 'ArrowDown' || e.key === 'ArrowRight') &&
+        (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'ArrowLeft') &&
         !isFetchingMoreRef.current &&
-        nextOffsetRef.current < totalChunksRef.current
+        replayIdxRef.current === 0 &&
+        loadedStartOffsetRef.current > 0
       ) {
         e.preventDefault()
         fetchMoreLogsRef.current?.()
@@ -640,6 +670,7 @@ export default function SessionDetailPage() {
         cancelAnimationFrame(outputFlushRafRef.current)
         outputFlushRafRef.current = null
       }
+      outputWriteInFlightRef.current = false
       outputBufferRef.current = []
       pendingResetRef.current = false
       pushConnectTrace('teardown current websocket')
@@ -736,7 +767,7 @@ export default function SessionDetailPage() {
     totalChunksRef.current = 0
     logReplayStateRef.current = initialLogReplayState()
     logResizesRef.current = []
-    nextOffsetRef.current = 0
+    loadedStartOffsetRef.current = 0
     isFetchingMoreRef.current = false
     setTotalChunks(0)
 
@@ -744,7 +775,7 @@ export default function SessionDetailPage() {
     // Defer to avoid StrictMode double-fetch.
     const raf = requestAnimationFrame(() => {
       if (cancelled) return
-      fetchLogs(id!, { offset: 0, limit: 1000 }, node ?? undefined)
+      fetchLogs(id!, { tail: DEFAULT_LOG_TAIL }, node ?? undefined)
         .then((res) => {
           if (cancelled || !isMounted.current) return
           const encodedChunks = encodeLogChunks(res.chunks)
@@ -752,7 +783,7 @@ export default function SessionDetailPage() {
           logResizesRef.current = res.resizes
           totalChunksRef.current = res.total
           setTotalChunks(res.total)
-          nextOffsetRef.current = Math.min(res.total, res.chunks.length)
+          loadedStartOffsetRef.current = res.offset
           setScrubberMax(res.chunks.length)
           if (termRef.current) {
             logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
@@ -799,9 +830,9 @@ export default function SessionDetailPage() {
       )
     }
     if (
-      val >= logChunksRef.current.length - 1 &&
+      val === 0 &&
       !isFetchingMoreRef.current &&
-      nextOffsetRef.current < totalChunksRef.current
+      loadedStartOffsetRef.current > 0
     ) {
       fetchMoreLogsRef.current?.()
     }
@@ -839,11 +870,6 @@ export default function SessionDetailPage() {
       const chunks = logChunksRef.current
       const idx = logReplayStateRef.current.chunkCount
       if (idx >= chunks.length) {
-        if (nextOffsetRef.current < totalChunksRef.current) {
-          if (!isFetchingMoreRef.current) fetchMoreLogsRef.current?.()
-          replayTimerRef.current = window.setTimeout(step, 10)
-          return
-        }
         replayTimerRef.current = null
         isReplayingRef.current = false
         setIsReplaying(false)
@@ -900,7 +926,7 @@ export default function SessionDetailPage() {
   }
 
   async function handleLoadPageAndReplay() {
-    if (nextOffsetRef.current < totalChunksRef.current) {
+    if (loadedStartOffsetRef.current > 0) {
       await fetchMoreLogsRef.current?.()
     }
   }
@@ -1016,7 +1042,7 @@ export default function SessionDetailPage() {
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
-              <span className="hidden sm:inline">Open Relay</span>
+              <span className="hidden sm:inline">oly</span>
             </div>
           </Link>
           <div className="flex items-center gap-3 min-w-0 flex-1">
@@ -1154,42 +1180,43 @@ export default function SessionDetailPage() {
 
         {/* ── Info bar ── */}
         {session && (
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-sm text-[hsl(var(--muted-foreground))] shrink-0">
-            <span className="inline-flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))]">
-              <CommandLogo command={session.command} size={28} />
-              <div>
-                {session?.title && <span className='mr-2 break-all text-[hsl(var(--primary))]'>{session.title}</span>}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-[hsl(var(--muted-foreground))] shrink-0 overflow-y-auto h-[38px]">
+            <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
+              <CommandLogo command={session.command} size={24} />
+              <div className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`} onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}>
+                {session?.title && <span className='break-all text-[hsl(var(--primary))]'>{session.title}</span>}
                 <span className="break-all">{sessionDisplayName(session)}</span>
                 {session.cwd && (
-                  <span className="text-[hsl(var(--foreground))] break-all pl-2">{session.cwd}</span>
+                  <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
+                )}
+                <span className="text-[hsl(var(--foreground))]">
+                  {formatTimestamp(session.created_at)}
+                </span>
+                {exitCode !== undefined && (
+                  <span>
+                    Exit: <span className="text-[hsl(var(--foreground))]">{exitCode ?? '?'}</span>
+                  </span>
+                )}
+                <span>
+                  <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
+                </span>
+                {session.pid != null && (
+                  <span>
+                    PID: <span className="text-[hsl(var(--foreground))]">{session.pid}</span>
+                  </span>
                 )}
               </div>
             </span>
-            <span className="text-[hsl(var(--foreground))]">
-              {formatTimestamp(session.created_at)}
-            </span>
-            {exitCode !== undefined && (
-              <span>
-                Exit: <span className="text-[hsl(var(--foreground))]">{exitCode ?? '?'}</span>
-              </span>
-            )}
-            <span>
-              <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
-            </span>
-            {session.pid != null && (
-              <span>
-                PID: <span className="text-[hsl(var(--foreground))]">{session.pid}</span>
-              </span>
-            )}
           </div>
         )}
+
+        {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
 
         {/* ── Main body ── */}
         <div
           id="main-container"
-          className="sm:flex overflow-y-auto sm:overflow-hidden flex-1 min-h-0"
+          className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
         >
-          {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
 
           {/* Terminal area */}
           <div
@@ -1197,18 +1224,16 @@ export default function SessionDetailPage() {
           >
             <div
               ref={termContainerRef}
-              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-4 pr-1`}
+              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-1 h-full w-full overflow-x-auto`}
             >
-              <div className="h-full w-full overflow-x-auto">
-                <XTerm
-                  key={mode}
-                  ref={termRef}
-                  autoFit={mode === 'attach'}
-                  onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
-                  onResize={mode === 'attach' ? handleTermResize : undefined}
-                  className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
-                />
-              </div>
+              <XTerm
+                key={mode}
+                ref={termRef}
+                autoFit={mode === 'attach'}
+                onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
+                onResize={mode === 'attach' ? handleTermResize : undefined}
+                className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
+              />
             </div>
 
             {/* Scrubber (logs mode) */}
@@ -1250,7 +1275,7 @@ export default function SessionDetailPage() {
                           <ChevronRightIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>Load next page</TooltipContent>
+                      <TooltipContent>Load older page</TooltipContent>
                     </Tooltip>
                   )}
                   <div className="flex items-center gap-1 ml-auto">

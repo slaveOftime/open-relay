@@ -123,11 +123,34 @@ export default function AttachPanel({
   const [customInput, setCustomInput] = useState('')
   const [customKeys, setCustomKeys] = useState('')
   const [isUploading, setIsUploading] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const customInputRef = useRef<HTMLTextAreaElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
   const shouldPersistDraftRef = useRef(false)
   const busyIntervalRef = useRef<number | null>(null)
+  const drawerScrollTimeoutsRef = useRef<number[]>([])
+
+  function findScrollContainer(node: HTMLElement | null): HTMLElement | null {
+    let current = node?.parentElement ?? null
+    while (current) {
+      const style = window.getComputedStyle(current)
+      const overflowY = style.overflowY
+      const canScroll = (overflowY === 'auto' || overflowY === 'scroll') && current.scrollHeight > current.clientHeight
+      if (canScroll) {
+        return current
+      }
+      current = current.parentElement
+    }
+
+    return document.scrollingElement instanceof HTMLElement ? document.scrollingElement : document.documentElement
+  }
+
+  function scrollDrawerIntoView() {
+    const target = findScrollContainer(rootRef.current)
+    if (!target) return
+    target.scrollTo({ top: target.scrollHeight, behavior: 'auto' })
+  }
 
   function resizeCustomInput() {
     const textarea = customInputRef.current
@@ -174,6 +197,10 @@ export default function AttachPanel({
       if (busyIntervalRef.current !== null) {
         window.clearInterval(busyIntervalRef.current)
       }
+      for (const timeoutId of drawerScrollTimeoutsRef.current) {
+        window.clearTimeout(timeoutId)
+      }
+      drawerScrollTimeoutsRef.current = []
     }
   }, [])
 
@@ -217,13 +244,22 @@ export default function AttachPanel({
   }
 
   function toggleDrawer() {
-    setDrawerOpen(!drawerOpen)
-    setTimeout(() => {
-      const container = document.getElementById('main-container')
-      if (container) {
-        container.scrollTop = container.scrollHeight
-      }
-    }, 0)
+    const nextOpen = !drawerOpen
+    setDrawerOpen(nextOpen)
+
+    for (const timeoutId of drawerScrollTimeoutsRef.current) {
+      window.clearTimeout(timeoutId)
+    }
+    drawerScrollTimeoutsRef.current = []
+
+    if (!nextOpen) return
+
+    for (const delay of [0, 160, 320]) {
+      const timeoutId = window.setTimeout(() => {
+        scrollDrawerIntoView()
+      }, delay)
+      drawerScrollTimeoutsRef.current.push(timeoutId)
+    }
   }
 
   function clearPendingSingleClick() {
@@ -302,7 +338,7 @@ export default function AttachPanel({
   }
 
   return (
-    <div>
+    <div ref={rootRef}>
       <div
         className={`${drawerOpen ? '' : 'h-0 sm:h-full sm:visible sm:w-[200px] md:w-[300px]'} overflow-hidden transition-all`}
       >

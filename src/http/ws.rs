@@ -5,12 +5,13 @@ use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     response::IntoResponse,
 };
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
-use crate::session::mode_tracker::ModeSnapshot;
+use crate::session::ModeSnapshot;
 use crate::session::pty::collect_chunk_bytes;
 use crate::session::resize::ResizeSubscriber;
 
@@ -32,7 +33,7 @@ pub struct AttachParams {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    /// Initial ring-buffer replay. `data` contains filtered stream bytes.
+    /// Initial terminal snapshot. `data` contains filtered stream bytes.
     Init {
         data: Vec<u8>,
         #[serde(rename = "appCursorKeys")]
@@ -104,7 +105,41 @@ pub async fn attach_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     debug!(session_id = %id, "WebSocket upgrade requested");
-    ws.on_upgrade(move |socket| handle_ws(socket, state, id, params.node, params.rows, params.cols))
+    ws.on_upgrade(move |socket| async move {
+        let panic_session_id = id.clone();
+        let panic_node = params.node.clone();
+        let result = std::panic::AssertUnwindSafe(handle_ws(
+            socket,
+            state,
+            id,
+            params.node,
+            params.rows,
+            params.cols,
+        ))
+        .catch_unwind()
+        .await;
+
+        if let Err(payload) = result {
+            error!(
+                session_id = %panic_session_id,
+                node = ?panic_node,
+                panic = %panic_payload_message(payload.as_ref()),
+                "attach WebSocket handler panicked"
+            );
+        }
+    })
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return message;
+    }
+
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.as_str();
+    }
+
+    "non-string panic payload"
 }
 
 fn mode_flags(app_cursor_keys: bool, bracketed_paste_mode: bool) -> u8 {
@@ -205,10 +240,21 @@ async fn handle_ws_streaming(
 ) {
     use tokio::sync::broadcast::error::RecvError;
 
-    // Subscribe to broadcast + get ring replay, all under one lock.
-    let subscribe_result = { state.store.attach_subscribe_init(&id, None).await };
+    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols)
+        && rows > 0
+        && cols > 0
+    {
+        match state.store.attach_resize(&id, rows, cols).await {
+            Ok(()) => debug!(session_id = %id, rows, cols, "PTY pre-resized before WS init"),
+            Err(err) => {
+                warn!(session_id = %id, rows, cols, error = err.message(&id), "PTY pre-resize before WS init failed")
+            }
+        }
+    }
 
-    let (replay_chunks, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
+    let subscribe_result = { state.store.attach_snapshot_init(&id).await };
+
+    let (snapshot_bytes, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
         match subscribe_result {
             Ok(t) => t,
             Err(err) => {
@@ -224,11 +270,8 @@ async fn handle_ws_streaming(
             }
         };
 
-    let replay_bytes = collect_chunk_bytes(&replay_chunks);
-    let replay_bytes_len = replay_bytes.len();
-
     let init_msg = ServerMessage::Init {
-        data: replay_bytes,
+        data: snapshot_bytes,
         app_cursor_keys,
         bracketed_paste_mode,
     };
@@ -245,26 +288,12 @@ async fn handle_ws_streaming(
 
     debug!(
         session_id = %id,
-        replay_chunks = replay_chunks.len(),
-        replay_bytes = replay_bytes_len,
+        snapshot_bytes = init_msg_data_len(&init_msg),
         end_offset,
         app_cursor_keys,
         bracketed_paste_mode,
         "local WebSocket stream initialized"
     );
-
-    // Resize PTY to browser dimensions AFTER init is sent.
-    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
-        if rows > 0 && cols > 0 {
-            resize_sub.mark_sent(rows, cols);
-            match state.store.attach_resize(&id, rows, cols).await {
-                Ok(()) => debug!(session_id = %id, rows, cols, "PTY resized after WS init"),
-                Err(err) => {
-                    warn!(session_id = %id, rows, cols, error = err.message(&id), "PTY resize after WS init failed")
-                }
-            }
-        }
-    }
 
     // Track last known mode state to detect changes.
     let mut last_modes = ModeSnapshot {
@@ -368,9 +397,9 @@ async fn handle_ws_streaming(
                             session_id = %id,
                             skipped,
                             current_offset,
-                            "local WebSocket lagged behind broadcast output; replaying from ring"
+                            "local WebSocket lagged behind broadcast output; replaying from persisted output"
                         );
-                        // Re-sync from ring.
+                        // Re-sync from persisted output.
                         let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
                         match resync {
                             Ok((chunks, new_end, rx, bpm, ack)) => {
@@ -506,27 +535,12 @@ async fn handle_ws_proxied_streaming(
 ) {
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
-    // Resize PTY via node proxy before subscribing.
-    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols) {
-        if rows > 0 && cols > 0 {
-            let rpc = RpcRequest::AttachResize {
-                id: id.to_string(),
-                rows,
-                cols,
-            };
-            if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
-                warn!(session_id = %id, node = %node, rows, cols, %err, "proxied WebSocket pre-resize failed");
-            } else {
-                debug!(session_id = %id, node = %node, rows, cols, "PTY pre-resized via node proxy");
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
-
     // Open streaming subscription via node proxy.
     let rpc = RpcRequest::AttachSubscribe {
         id: id.to_string(),
         from_byte_offset: None,
+        rows: initial_rows.filter(|rows| *rows > 0),
+        cols: initial_cols.filter(|cols| *cols > 0),
     };
     let (stream_rpc_id, mut stream_rx) = match state
         .node_registry
@@ -576,7 +590,7 @@ async fn handle_ws_proxied_streaming(
                                 debug!(
                                     session_id = %id,
                                     node = %node,
-                                    replay_bytes,
+                                    snapshot_bytes = replay_bytes,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                     "proxied WebSocket init frame received"
@@ -720,4 +734,37 @@ async fn handle_ws_proxied_streaming(
         .remove_pending(&node, &stream_rpc_id)
         .await;
     debug!(session_id = %id, node = %node, "proxied WebSocket stream cleanup complete");
+}
+
+fn init_msg_data_len(msg: &ServerMessage) -> usize {
+    match msg {
+        ServerMessage::Init { data, .. } => data.len(),
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::panic_payload_message;
+
+    #[test]
+    fn panic_payload_message_formats_static_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("attach panic");
+        assert_eq!(panic_payload_message(payload.as_ref()), "attach panic");
+    }
+
+    #[test]
+    fn panic_payload_message_formats_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("attach panic"));
+        assert_eq!(panic_payload_message(payload.as_ref()), "attach panic");
+    }
+
+    #[test]
+    fn panic_payload_message_handles_unknown_payloads() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_u8);
+        assert_eq!(
+            panic_payload_message(payload.as_ref()),
+            "non-string panic payload"
+        );
+    }
 }

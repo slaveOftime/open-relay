@@ -17,7 +17,7 @@
 3. [Module Layout](#3-module-layout)
 4. [PtyHandle — Ownership Boundary](#4-ptyhandle--ownership-boundary)
 5. [Reader & Writer Threads](#5-reader--writer-threads)
-6. [Ring Buffer & Replay](#6-ring-buffer--replay)
+6. [Snapshot & Replay](#6-snapshot--replay)
 7. [Mode Tracking (ModeTracker)](#7-mode-tracking-modetracker)
 8. [Escape Sequence Pipeline](#8-escape-sequence-pipeline)
 9. [Streaming Attach Protocol](#9-streaming-attach-protocol)
@@ -222,7 +222,7 @@ IPC or WebSocket client.
 
 ---
 
-## 6) Ring Buffer & Replay
+## 6) Snapshot & Replay
 
 The ring buffer (`src/session/ring.rs`) is a fixed-capacity circular byte
 buffer (default 1 MiB) that stores the most recent PTY output.
@@ -367,7 +367,7 @@ byte boundaries.
 `SessionRuntime` keeps raw PTY bytes only long enough to answer terminal
 queries, track modes, and update cursor state.  After that, a single long-lived
 `EscapeFilter` instance produces the canonical filtered stream used for:
-- ring-buffer replay
+- terminal snapshot updates
 - live broadcast fan-out
 - persisted `output.log`
 - log snapshot and polling reads

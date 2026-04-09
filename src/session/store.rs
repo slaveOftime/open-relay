@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -19,14 +19,13 @@ use crate::{
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
     session::{
-        SessionEvent, SessionEventTx, SessionLiveSummary, mode_tracker::ModeSnapshot,
-        normalize_session_tags,
+        ModeSnapshot, SessionEvent, SessionEventTx, SessionLiveSummary, normalize_session_tags,
     },
 };
 
 use super::{
     SessionError, SessionMeta, SessionStatus, StartSpec,
-    persist::{append_event, append_resize_event, current_output_offset},
+    persist::{append_event, append_resize_event, current_output_offset, read_output_from},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 
@@ -129,6 +128,98 @@ impl SessionHandle {
         self.snapshot
             .store(Arc::new(SessionRuntimeSnapshot::from_runtime(rt)));
     }
+
+    fn lock_runtime(&self) -> MutexGuard<'_, SessionRuntime> {
+        lock_runtime_recover(&self.runtime)
+    }
+}
+
+fn lock_runtime_recover(runtime: &Mutex<SessionRuntime>) -> MutexGuard<'_, SessionRuntime> {
+    match runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                session_id = %poisoned.get_ref().meta.id,
+                "session runtime lock poisoned; recovering"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn visible_screen_excerpt(parser: &vt100::Parser) -> String {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let mut lines: Vec<String> = screen
+        .rows(0, cols)
+        .take(rows as usize)
+        .map(|row| row.trim_end().to_string())
+        .collect();
+
+    while matches!(lines.last(), Some(line) if line.is_empty()) {
+        lines.pop();
+    }
+
+    lines.join("\n")
+}
+
+fn notification_excerpt_window_bytes(parser: &vt100::Parser) -> u64 {
+    let (rows, cols) = parser.screen().size();
+    ((rows as u64).saturating_mul(cols as u64).saturating_mul(8)).max(4096)
+}
+
+struct NotificationExcerptPlan {
+    session_id: String,
+    dir: PathBuf,
+    rows: u16,
+    cols: u16,
+    start_offset: u64,
+    end_offset: u64,
+    cached_end_offset: u64,
+}
+
+fn build_notification_excerpt_plan(rt: &SessionRuntime) -> NotificationExcerptPlan {
+    let (rows, cols) = rt.screen_parser.screen().size();
+    let end_offset = rt.last_total_bytes;
+    let start_offset = rt
+        .notification_excerpt_end_offset
+        .min(end_offset)
+        .max(end_offset.saturating_sub(notification_excerpt_window_bytes(&rt.screen_parser)));
+    NotificationExcerptPlan {
+        session_id: rt.meta.id.clone(),
+        dir: rt.dir.clone(),
+        rows,
+        cols,
+        start_offset,
+        end_offset,
+        cached_end_offset: rt.notification_excerpt_end_offset,
+    }
+}
+
+fn recent_notification_excerpt(plan: &NotificationExcerptPlan) -> Option<String> {
+    if plan.start_offset == plan.cached_end_offset && plan.start_offset == plan.end_offset {
+        return None;
+    }
+
+    let (bytes, _actual_end_offset) = match read_output_from(&plan.dir, plan.start_offset) {
+        Ok(result) => result,
+        Err(err) => {
+            warn!(
+                session_id = %plan.session_id,
+                %err,
+                start_offset = plan.start_offset,
+                "failed to refresh recent notification excerpt"
+            );
+            return None;
+        }
+    };
+
+    let mut parser = vt100::Parser::new(plan.rows, plan.cols, 0);
+    if !bytes.is_empty() {
+        parser.process(&bytes);
+    }
+
+    Some(visible_screen_excerpt(&parser))
 }
 
 pub struct SessionStore {
@@ -234,14 +325,8 @@ impl SessionStore {
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
-        let runtime = match spawn_session(
-            config,
-            &mut meta,
-            session_dir,
-            rows,
-            cols,
-            notifications_enabled,
-        ) {
+        let runtime = match spawn_session(&mut meta, session_dir, rows, cols, notifications_enabled)
+        {
             Ok(runtime) => runtime,
             Err(err) => {
                 let _ = store_handle.abort_started_session(&session_id).await;
@@ -253,7 +338,8 @@ impl SessionStore {
         let result = store_handle.commit_started_session(meta, runtime).await;
 
         if result.is_err() {
-            if let Ok(mut rt) = cleanup_runtime.lock() {
+            {
+                let mut rt = lock_runtime_recover(&cleanup_runtime);
                 let _ = rt.pty.kill();
                 rt.mark_completed(SessionStatus::Failed, None);
             }
@@ -424,10 +510,7 @@ impl SessionStore {
     }
 
     /// Returns the current terminal mode snapshot for the session, if available.
-    pub fn get_mode_snapshot(
-        &self,
-        id: &str,
-    ) -> Option<crate::session::mode_tracker::ModeSnapshot> {
+    pub fn get_mode_snapshot(&self, id: &str) -> Option<crate::session::ModeSnapshot> {
         let sessions = self.sessions.load();
         sessions
             .get(id)
@@ -446,15 +529,14 @@ impl SessionStore {
     pub async fn register_attach_client(&self, id: &str) {
         let sessions = self.sessions.load();
         if let Some(handle) = sessions.get(id).cloned() {
-            if let Ok(mut rt) = handle.runtime.lock() {
-                rt.register_attach_client();
-                handle.refresh_snapshot(&rt);
-            }
+            let mut rt = handle.lock_runtime();
+            rt.register_attach_client();
+            handle.refresh_snapshot(&rt);
         }
     }
 
-    /// Initialise a streaming subscription: return the canonical filtered ring
-    /// content since `from_byte_offset` (or all content if `None`), the current
+    /// Initialise a streaming subscription: return persisted canonical output
+    /// since `from_byte_offset` (or all content if `None`), the current
     /// filtered-stream end offset, a live broadcast receiver, and the current
     /// terminal mode flags.
     pub async fn attach_subscribe_init(
@@ -472,13 +554,24 @@ impl SessionStore {
         SessionError,
     > {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
+        let (dir, rx, modes) = {
+            let rt = runtime.lock_runtime();
+            (
+                rt.dir.clone(),
+                rt.broadcast_tx.subscribe(),
+                rt.mode_snapshot(),
+            )
         };
         let offset = from_byte_offset.unwrap_or(0);
-        let (chunks, end_offset) = rt.ring.read_from(offset);
-        let rx = rt.broadcast_tx.subscribe();
-        let modes = rt.mode_snapshot();
+        let (data, end_offset) = read_output_from(&dir, offset).map_err(|err| {
+            warn!(session_id = id, %err, "failed to read persisted attach output");
+            SessionError::Evicted
+        })?;
+        let chunks = if data.is_empty() {
+            Vec::new()
+        } else {
+            vec![(offset, Bytes::from(data))]
+        };
         debug!(
             session_id = id,
             chunks = chunks.len(),
@@ -496,6 +589,38 @@ impl SessionStore {
         ))
     }
 
+    /// Initialise an attach stream from the current rendered terminal state
+    /// instead of replaying persisted PTY history from byte offset 0.
+    pub async fn attach_snapshot_init(
+        &self,
+        id: &str,
+    ) -> std::result::Result<
+        (Vec<u8>, u64, broadcast::Receiver<Arc<Bytes>>, bool, bool),
+        SessionError,
+    > {
+        let runtime = self.lookup_runtime(id).await?;
+        let rt = runtime.lock_runtime();
+        let snapshot = rt.attach_snapshot_bytes();
+        let end_offset = current_output_offset(&rt.dir);
+        let rx = rt.broadcast_tx.subscribe();
+        let modes = rt.mode_snapshot();
+        debug!(
+            session_id = id,
+            snapshot_bytes = snapshot.len(),
+            end_offset,
+            bracketed_paste_mode = modes.bracketed_paste_mode,
+            app_cursor_keys = modes.app_cursor_keys,
+            "attach snapshot init"
+        );
+        Ok((
+            snapshot,
+            end_offset,
+            rx,
+            modes.bracketed_paste_mode,
+            modes.app_cursor_keys,
+        ))
+    }
+
     /// Subscribe to resize notifications for a session.
     /// Returns a broadcast receiver for (rows, cols) events and the current PTY size.
     pub fn subscribe_resize(
@@ -504,15 +629,13 @@ impl SessionStore {
     ) -> Option<(broadcast::Receiver<(u16, u16)>, Option<(u16, u16)>)> {
         let sessions = self.sessions.load();
         let handle = sessions.get(id)?;
-        let rt = handle.runtime.lock().ok()?;
+        let rt = handle.lock_runtime();
         Some((rt.resize_tx.subscribe(), rt.pty_size))
     }
 
     pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let mut rt = runtime.lock_runtime();
         rt.detach_attach_client();
         runtime.refresh_snapshot(&rt);
         debug!(session_id = id, "attach detach acknowledged");
@@ -525,9 +648,7 @@ impl SessionStore {
         enabled: bool,
     ) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let mut rt = runtime.lock_runtime();
         if rt.is_completed() {
             return Err(SessionError::NotRunning);
         }
@@ -554,9 +675,7 @@ impl SessionStore {
 
         let runtime = self.lookup_runtime(id).await?;
         let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                return Err(SessionError::Evicted);
-            };
+            let mut rt = runtime.lock_runtime();
             let initial_total_bytes = rt.last_total_bytes;
             // When the child process has enabled DECCKM (application cursor key
             // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
@@ -633,9 +752,7 @@ impl SessionStore {
     pub async fn attach_busy(&self, id: &str) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
         let summary = {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                return Err(SessionError::Evicted);
-            };
+            let mut rt = runtime.lock_runtime();
             rt.mark_attach_activity();
             rt.last_output_epoch = Some(Instant::now());
             runtime.refresh_snapshot(&rt);
@@ -656,13 +773,7 @@ impl SessionStore {
         let started = Instant::now();
         loop {
             let current_total_bytes = {
-                let Ok(rt) = runtime.runtime.lock() else {
-                    debug!(
-                        session_id = id,
-                        "attach input output wait stopped because runtime lock was lost"
-                    );
-                    return false;
-                };
+                let rt = runtime.lock_runtime();
                 rt.last_total_bytes
             };
 
@@ -698,9 +809,7 @@ impl SessionStore {
         cols: u16,
     ) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let mut rt = runtime.lock_runtime();
         rt.mark_attach_activity();
         let resized = rt.resize_pty(rows, cols);
         runtime.refresh_snapshot(&rt);
@@ -780,13 +889,7 @@ impl SessionStore {
         // Begin a soft-stop sequence and let the child exit on its own before
         // escalating to a forced kill when the grace window expires.
         {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                warn!(
-                    session_id = %session_id,
-                    "failed to lock session runtime before termination"
-                );
-                return false;
-            };
+            let mut rt = runtime.lock_runtime();
             if rt.refresh_status() {
                 runtime.refresh_snapshot(&rt);
                 debug!(
@@ -836,13 +939,7 @@ impl SessionStore {
 
         while Instant::now() < deadline {
             {
-                let Ok(mut rt) = runtime.runtime.lock() else {
-                    warn!(
-                        session_id = %session_id,
-                        "failed to lock session runtime while waiting for termination"
-                    );
-                    return true;
-                };
+                let mut rt = runtime.lock_runtime();
                 if rt.refresh_status() {
                     runtime.refresh_snapshot(&rt);
                     debug!(
@@ -897,13 +994,7 @@ impl SessionStore {
             tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            warn!(
-                session_id = %session_id,
-                "failed to lock session runtime before forced termination"
-            );
-            return false;
-        };
+        let mut rt = runtime.lock_runtime();
         if rt.refresh_status() {
             runtime.refresh_snapshot(&rt);
             info!(
@@ -1000,9 +1091,7 @@ impl SessionStore {
         let sessions = self.sessions.load_full();
 
         for (id, runtime) in sessions.iter() {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                continue;
-            };
+            let mut rt = runtime.lock_runtime();
             rt.refresh_status();
 
             if rt.is_completed() && !rt.persisted {
@@ -1091,7 +1180,7 @@ impl SessionStore {
                     if now.duration_since(last_attach_activity) < attach_suppression_window {
                         // suppress notification and reset last_output_at to prevent repeated notifications
                         // for the same output epoch after attach activity.
-                        let mut rt = runtime.runtime.lock().ok()?;
+                        let mut rt = runtime.lock_runtime();
                         rt.last_visible_output_at = None;
                         return None;
                     }
@@ -1113,14 +1202,21 @@ impl SessionStore {
                     return None;
                 }
 
-                let rt = runtime.runtime.lock().ok()?;
-                let limit = 20u16;
-                let mut parser = vt100::Parser::new(limit, 2000, 0);
-                let chunks: Vec<_> = rt.ring.all_chunks().collect();
-                for chunk in chunks.iter().rev().take(limit as usize).rev() {
-                    parser.process(chunk);
-                }
-                let excerpt = parser.screen().contents();
+                let plan = {
+                    let rt = runtime.lock_runtime();
+                    build_notification_excerpt_plan(&rt)
+                };
+                let excerpt = if let Some(excerpt) = recent_notification_excerpt(&plan) {
+                    let mut rt = runtime.lock_runtime();
+                    if rt.last_total_bytes == plan.end_offset
+                        && rt.notification_excerpt_end_offset <= plan.start_offset
+                    {
+                        rt.notification_excerpt_end_offset = plan.end_offset;
+                    }
+                    excerpt
+                } else {
+                    String::new()
+                };
 
                 Some(SilentCandidate {
                     session_id: snapshot.summary.id.clone(),
@@ -1139,11 +1235,10 @@ impl SessionStore {
     pub fn mark_notified(&self, session_id: &str, output_epoch: Instant, notified_at: Instant) {
         let sessions = self.sessions.load();
         if let Some(runtime) = sessions.get(session_id) {
-            if let Ok(mut rt) = runtime.runtime.lock() {
-                rt.notified_output_epoch = Some(output_epoch);
-                rt.last_notified_at = Some(notified_at);
-                runtime.refresh_snapshot(&rt);
-            }
+            let mut rt = runtime.lock_runtime();
+            rt.notified_output_epoch = Some(output_epoch);
+            rt.last_notified_at = Some(notified_at);
+            runtime.refresh_snapshot(&rt);
         }
     }
 }
@@ -1175,7 +1270,7 @@ fn build_soft_stop_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{SessionMeta, SessionStatus};
+    use crate::session::{SessionMeta, SessionStatus, pty::collect_chunk_bytes};
     use chrono::Utc;
     use std::sync::{Arc, Mutex};
 
@@ -1185,11 +1280,15 @@ mod tests {
         excerpt: &str,
         last_output_ago: Option<Duration>,
     ) -> Arc<Mutex<super::super::runtime::SessionRuntime>> {
-        use crate::session::ring::RingBuffer;
-        use bytes::Bytes;
         use tokio::sync::{broadcast, mpsc};
 
-        let dir = std::env::temp_dir().join(format!("oly_store_test_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("oly_store_test_{id}_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create runtime test dir");
+        if !excerpt.is_empty() {
+            crate::session::persist::append_output_raw(&dir, excerpt.as_bytes())
+                .expect("persist runtime excerpt");
+        }
 
         let meta = SessionMeta {
             id: id.to_string(),
@@ -1207,10 +1306,9 @@ mod tests {
         };
 
         let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
-
-        let mut ring = RingBuffer::new(4096);
+        let mut screen_parser = vt100::Parser::new(24, 80, 0);
         if !excerpt.is_empty() {
-            ring.push(Bytes::from(excerpt.to_string()));
+            screen_parser.process(excerpt.as_bytes());
         }
 
         let (broadcast_tx, _rx) = broadcast::channel(4);
@@ -1220,7 +1318,6 @@ mod tests {
         Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            ring,
             last_total_bytes: excerpt.as_bytes().len() as u64,
             broadcast_tx,
             resize_tx,
@@ -1242,7 +1339,8 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            mode_tracker: super::super::mode_tracker::ModeTracker::new(),
+            notification_excerpt_end_offset: 0,
+            screen_parser,
             output_closed: false,
             notifications_enabled: true,
         }))
@@ -1365,6 +1463,75 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_keeps_silence_candidate_without_new_excerpt_bytes() {
+        let silence = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(10)),
+        );
+        {
+            let mut locked = rt.lock().unwrap();
+            locked.notification_excerpt_end_offset = locked.last_total_bytes;
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(silence, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "abc1234");
+        assert!(candidates[0].raw_excerpt.is_empty());
+    }
+
+    #[test]
+    fn test_visible_screen_excerpt_stays_within_parser_viewport() {
+        let mut parser = vt100::Parser::new(2, 10, 0);
+        parser.process(b"line1\nline2\nline3\nprompt> ");
+
+        let excerpt = visible_screen_excerpt(&parser);
+
+        assert!(excerpt.lines().count() <= 2);
+        assert!(excerpt.lines().all(|line| line.chars().count() <= 10));
+    }
+
+    #[test]
+    fn test_recent_notification_excerpt_only_uses_bytes_since_last_check() {
+        let runtime = make_runtime("recent001", SessionStatus::Running, "old output\n", None);
+        let mut rt = runtime.lock().unwrap();
+        rt.notification_excerpt_end_offset = rt.last_total_bytes;
+        crate::session::persist::append_output_raw(&rt.dir, b"prompt> ").expect("append output");
+        rt.last_total_bytes += b"prompt> ".len() as u64;
+        rt.screen_parser.process(b"prompt> ");
+
+        let plan = build_notification_excerpt_plan(&rt);
+        let excerpt = recent_notification_excerpt(&plan).expect("excerpt should refresh");
+
+        assert!(excerpt.contains("prompt"));
+        assert!(!excerpt.contains("old output"));
+    }
+
+    #[tokio::test]
+    async fn test_attach_subscribe_init_reads_persisted_output_from_offset() {
+        let runtime = make_runtime(
+            "attach123",
+            SessionStatus::Running,
+            "hello world",
+            Some(Duration::from_secs(1)),
+        );
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let (chunks, end_offset, _rx, _bpm, _ack) = store
+            .attach_subscribe_init("attach123", Some(6))
+            .await
+            .expect("attach subscribe init");
+
+        assert_eq!(end_offset, 11);
+        assert_eq!(collect_chunk_bytes(&chunks), b"world");
     }
 
     // -----------------------------------------------------------------------
@@ -1638,10 +1805,10 @@ mod tests {
         Arc<Mutex<super::super::runtime::SessionRuntime>>,
         tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
-        use crate::session::ring::RingBuffer;
         use tokio::sync::{broadcast, mpsc};
 
-        let dir = std::env::temp_dir().join(format!("oly_store_writable_{id}"));
+        let dir =
+            std::env::temp_dir().join(format!("oly_store_writable_{id}_{}", uuid::Uuid::new_v4()));
         let meta = SessionMeta {
             id: id.to_string(),
             title: None,
@@ -1663,7 +1830,6 @@ mod tests {
         let rt = Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
-            ring: RingBuffer::new(4096),
             last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
@@ -1685,7 +1851,8 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            mode_tracker: super::super::mode_tracker::ModeTracker::new(),
+            notification_excerpt_end_offset: 0,
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         }));
@@ -1706,7 +1873,6 @@ mod tests {
     fn make_test_config(max_running_sessions: usize) -> AppConfig {
         use std::path::PathBuf;
         AppConfig {
-            ring_buffer_bytes: 4_194_304,
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds: 15,
@@ -1870,7 +2036,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
-            locked.mode_tracker.process(b"\x1b[?1h");
+            locked.screen_parser.process(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
 
@@ -1891,7 +2057,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
         {
             let mut locked = rt.lock().unwrap();
-            locked.mode_tracker.process(b"\x1b[?1h");
+            locked.screen_parser.process(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
 
@@ -2074,6 +2240,38 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "completed sessions should not receive synthetic input during kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kill_session_recovers_from_poisoned_runtime_lock() {
+        let (rt, _writer_rx) = make_runtime_writable("kilpoison", SessionStatus::Running);
+        let rt_clone = rt.clone();
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let poison_result = std::panic::catch_unwind(|| {
+            let _guard = rt_clone.lock().unwrap();
+            panic!("poison session runtime lock");
+        });
+        assert!(poison_result.is_err(), "runtime lock should be poisoned");
+
+        assert!(
+            store.kill_session("kilpoison").await,
+            "kill should recover from a poisoned runtime lock"
+        );
+
+        let sessions = store.sessions.load();
+        let handle = sessions
+            .get("kilpoison")
+            .expect("runtime should remain addressable");
+        let snapshot = handle.snapshot();
+        assert!(matches!(
+            snapshot.summary.status.as_str(),
+            "killed" | "failed"
+        ));
+        assert!(
+            !snapshot.running,
+            "killed session should no longer be marked running"
         );
     }
 

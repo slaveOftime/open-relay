@@ -12,7 +12,6 @@ use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::AppConfig,
     error::{AppError, Result},
     protocol::LogResize,
     session::persist::append_output,
@@ -24,22 +23,24 @@ use super::pty::{
 
 use super::{
     SessionMeta, SessionStatus,
-    cursor_tracker::CursorTracker,
-    mode_tracker::{ModeSnapshot, ModeTracker},
     persist::{append_event, append_output_raw, append_resize_event},
-    ring::RingBuffer,
+    vt100::safe_resize_parser,
 };
 
 // ---------------------------------------------------------------------------
 // SessionRuntime
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeSnapshot {
+    pub app_cursor_keys: bool,
+    pub bracketed_paste_mode: bool,
+}
+
 pub struct SessionRuntime {
     pub meta: SessionMeta,
     /// Absolute path to the session's working directory (`sessions/<id>/`).
     pub dir: PathBuf,
-    /// Byte-limited ring buffer of canonical filtered PTY output.
-    pub ring: RingBuffer,
     /// Sends canonical filtered PTY output chunks to all live attach subscribers.
     pub broadcast_tx: broadcast::Sender<Arc<Bytes>>,
     /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
@@ -72,8 +73,10 @@ pub struct SessionRuntime {
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
-    /// Byte-level state machine for DEC private mode tracking.
-    pub mode_tracker: ModeTracker,
+    /// Canonical filtered-stream offset already folded into `notification_excerpt`.
+    pub notification_excerpt_end_offset: u64,
+    /// Live rendered terminal state for attach snapshot restoration.
+    pub screen_parser: vt100::Parser,
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
     pub notifications_enabled: bool,
@@ -84,47 +87,36 @@ const PTY_WRITER_QUEUE_CAPACITY: usize = 256;
 impl SessionRuntime {
     /// Current terminal mode snapshot (DECCKM, bracketed paste).
     pub fn mode_snapshot(&self) -> ModeSnapshot {
-        self.mode_tracker.snapshot()
+        let screen = self.screen_parser.screen();
+        ModeSnapshot {
+            app_cursor_keys: screen.application_cursor(),
+            bracketed_paste_mode: screen.bracketed_paste(),
+        }
     }
 
-    /// Push a filtered PTY chunk into the canonical retained stream, update mode
-    /// state from the matching raw chunk, and advance the silence clock for
-    /// visible content.
+    /// Push a filtered PTY chunk into the canonical retained stream and advance
+    /// the silence clock for visible content.
     ///
     /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
-    pub fn push_output(
-        &mut self,
-        raw_data: &Bytes,
-        filtered_data: Bytes,
-        has_visible_output: bool,
-    ) -> Option<ModeSnapshot> {
-        // Track DEC private mode toggles via byte-level state machine.
-        let mode_change = self.mode_tracker.process(raw_data);
-        if let Some(ref snap) = mode_change {
-            debug!(
-                session_id = %self.meta.id,
-                app_cursor_keys = snap.app_cursor_keys,
-                bracketed_paste_mode = snap.bracketed_paste_mode,
-                "terminal mode changed"
-            );
-        }
-
+    pub fn push_output(&mut self, filtered_data: Bytes, has_visible_output: bool) {
         // Advance the silence clock only for chunks with visible content.
         if has_visible_output {
             self.last_visible_output_at = Some(Instant::now());
         }
 
-        // Add the canonical filtered bytes to the in-memory ring. Fully stripped
-        // chunks do not advance replay offsets.
+        // Add the canonical filtered bytes to the retained terminal state.
+        // Fully stripped chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
             self.last_total_bytes = self
                 .last_total_bytes
                 .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
-            self.ring.push(filtered_data);
+            self.screen_parser.process(filtered_data.as_ref());
         }
+    }
 
-        mode_change
+    pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
+        self.screen_parser.screen().state_formatted()
     }
 
     pub fn register_attach_client(&mut self) {
@@ -298,8 +290,9 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
+            safe_resize_parser(&mut self.screen_parser, rows, cols);
             self.resize_history.push(LogResize {
-                offset: self.ring.end_offset(),
+                offset: self.last_total_bytes,
                 rows,
                 cols,
             });
@@ -333,7 +326,6 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
 pub fn spawn_session(
-    config: &AppConfig,
     meta: &mut SessionMeta,
     session_dir: PathBuf,
     rows: u16,
@@ -443,7 +435,6 @@ pub fn spawn_session(
     let runtime = Arc::new(Mutex::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
-        ring: RingBuffer::new(config.ring_buffer_bytes),
         last_total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
@@ -465,7 +456,8 @@ pub fn spawn_session(
         attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
-        mode_tracker: ModeTracker::new(),
+        notification_excerpt_end_offset: 0,
+        screen_parser: vt100::Parser::new(rows, cols, (rows * 50) as usize),
         output_closed: false,
         notifications_enabled,
     }));
@@ -483,7 +475,6 @@ pub fn spawn_session(
         let mut buf = [0u8; 4096];
         let mut reader = reader;
         let mut query_tail = Vec::new();
-        let mut cursor_tracker = CursorTracker::new(rows, cols);
         let mut stream_filter = EscapeFilter::new();
         loop {
             match reader.read(&mut buf) {
@@ -501,44 +492,13 @@ pub fn spawn_session(
                     let data = Bytes::copy_from_slice(&buf[..n]);
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
-                    // Update cursor position tracking before answering queries
-                    // so CPR responses reflect the actual cursor position.
-                    cursor_tracker.process(&data);
-
-                    // Always let the daemon answer terminal queries that need
-                    // a shared, session-global answer (currently CPR/DSR).
-                    for resp in extract_query_responses_no_client(
-                        &data,
-                        &mut query_tail,
-                        cursor_tracker.position(),
-                    ) {
-                        trace!(
-                            session_id = %reader_session_id,
-                            bytes = resp.len(),
-                            "responding to detached terminal capability query"
-                        );
-                        if writer_tx.blocking_send(resp).is_err() {
-                            warn!(
-                                session_id = %reader_session_id,
-                                "failed to queue detached terminal query response because PTY writer closed"
-                            );
-                            break;
-                        }
-                    }
-
                     let has_visible_output = has_visible_content(&data);
                     let filtered_data = Bytes::from(stream_filter.filter(&data));
 
                     // Update in-memory ring + mode tracking (brief lock).
                     match runtime_reader.lock() {
                         Ok(mut rt) => {
-                            let _mode_change =
-                                rt.push_output(&data, filtered_data.clone(), has_visible_output);
-                            // Sync cursor tracker to current PTY dimensions
-                            // so CPR responses reflect the correct size.
-                            if let Some((r, c)) = rt.pty_size {
-                                cursor_tracker.set_size(r, c);
-                            }
+                            rt.push_output(filtered_data.clone(), has_visible_output);
                         }
                         Err(_) => {
                             warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
@@ -564,6 +524,30 @@ pub fn spawn_session(
                             receiver_count,
                             "broadcast filtered PTY output chunk to live subscribers"
                         );
+                    }
+
+                    let cursor_position = {
+                        let rt = runtime_reader.lock().unwrap();
+                        rt.screen_parser.screen().cursor_position()
+                    };
+
+                    // Always let the daemon answer terminal queries that need
+                    // a shared, session-global answer (currently CPR/DSR).
+                    for resp in
+                        extract_query_responses_no_client(&data, &mut query_tail, cursor_position)
+                    {
+                        trace!(
+                            session_id = %reader_session_id,
+                            bytes = resp.len(),
+                            "responding to detached terminal capability query"
+                        );
+                        if writer_tx.blocking_send(resp).is_err() {
+                            warn!(
+                                session_id = %reader_session_id,
+                                "failed to queue detached terminal query response because PTY writer closed"
+                            );
+                            break;
+                        }
                     }
                 }
                 Err(err)
@@ -592,7 +576,6 @@ pub fn spawn_session(
     info!(
         session_id = %meta.id,
         pid = ?meta.pid,
-        ring_buffer_bytes = config.ring_buffer_bytes,
         writer_queue_capacity = PTY_WRITER_QUEUE_CAPACITY,
         "PTY session runtime spawned"
     );
@@ -684,7 +667,6 @@ mod tests {
         SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
-            ring: RingBuffer::new(4096), // small capacity for tests
             last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
@@ -706,7 +688,8 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            mode_tracker: ModeTracker::new(),
+            notification_excerpt_end_offset: 0,
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         }
@@ -731,10 +714,13 @@ mod tests {
     fn test_push_output_enables_bracketed_paste() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(
-            &bytes::Bytes::from("text \x1b[?2004h more"),
-            bytes::Bytes::from("text \x1b[?2004h more"),
-            true,
+        rt.push_output(bytes::Bytes::from("text \x1b[?2004h more"), true);
+        assert_eq!(
+            rt.mode_snapshot(),
+            ModeSnapshot {
+                app_cursor_keys: false,
+                bracketed_paste_mode: true,
+            }
         );
         assert!(
             rt.mode_snapshot().bracketed_paste_mode,
@@ -745,16 +731,15 @@ mod tests {
     #[test]
     fn test_push_output_disables_bracketed_paste() {
         let mut rt = new_runtime();
-        rt.push_output(
-            &bytes::Bytes::from("\x1b[?2004h"),
-            bytes::Bytes::from("\x1b[?2004h"),
-            false,
-        );
+        rt.push_output(bytes::Bytes::from("\x1b[?2004h"), false);
         assert!(rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(
-            &bytes::Bytes::from("\x1b[?2004l"),
-            bytes::Bytes::from("\x1b[?2004l"),
-            false,
+        rt.push_output(bytes::Bytes::from("\x1b[?2004l"), false);
+        assert_eq!(
+            rt.mode_snapshot(),
+            ModeSnapshot {
+                app_cursor_keys: false,
+                bracketed_paste_mode: false,
+            }
         );
         assert!(
             !rt.mode_snapshot().bracketed_paste_mode,
@@ -766,10 +751,13 @@ mod tests {
     fn test_push_output_enables_app_cursor_keys() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(
-            &bytes::Bytes::from("\x1b[?1h"),
-            bytes::Bytes::from("\x1b[?1h"),
-            false,
+        rt.push_output(bytes::Bytes::from("\x1b[?1h"), false);
+        assert_eq!(
+            rt.mode_snapshot(),
+            ModeSnapshot {
+                app_cursor_keys: true,
+                bracketed_paste_mode: false,
+            }
         );
         assert!(
             rt.mode_snapshot().app_cursor_keys,
@@ -780,39 +768,19 @@ mod tests {
     #[test]
     fn test_push_output_disables_app_cursor_keys() {
         let mut rt = new_runtime();
-        rt.push_output(
-            &bytes::Bytes::from("\x1b[?1h"),
-            bytes::Bytes::from("\x1b[?1h"),
-            false,
-        );
+        rt.push_output(bytes::Bytes::from("\x1b[?1h"), false);
         assert!(rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(
-            &bytes::Bytes::from("\x1b[?1l"),
-            bytes::Bytes::from("\x1b[?1l"),
-            false,
+        rt.push_output(bytes::Bytes::from("\x1b[?1l"), false);
+        assert_eq!(
+            rt.mode_snapshot(),
+            ModeSnapshot {
+                app_cursor_keys: false,
+                bracketed_paste_mode: false,
+            }
         );
         assert!(
             !rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be cleared after DECCKM disable"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // push_output — ring buffer eviction
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_push_output_ring_evicts_oldest_when_over_capacity() {
-        let mut rt = new_runtime(); // capacity = 4096 bytes
-        // Push chunks that together exceed 4096 bytes so oldest are evicted.
-        let chunk = bytes::Bytes::from(vec![b'x'; 1500]);
-        rt.push_output(&chunk, chunk.clone(), true);
-        rt.push_output(&chunk, chunk.clone(), true);
-        rt.push_output(&chunk, chunk.clone(), true); // total so far: 4500 — first evicted
-        // start_offset must have advanced past 0
-        assert!(
-            rt.ring.start_offset() > 0,
-            "oldest chunks should be evicted once capacity is exceeded"
         );
     }
 
@@ -824,11 +792,7 @@ mod tests {
     fn test_push_output_visible_content_advances_last_output_at() {
         let mut rt = new_runtime();
         assert!(rt.last_visible_output_at.is_none());
-        rt.push_output(
-            &bytes::Bytes::from("hello world\n"),
-            bytes::Bytes::from("hello world\n"),
-            true,
-        );
+        rt.push_output(bytes::Bytes::from("hello world\n"), true);
         assert!(
             rt.last_visible_output_at.is_some(),
             "visible output should set last_output_at"
@@ -838,11 +802,7 @@ mod tests {
     #[test]
     fn test_push_output_pure_ansi_does_not_advance_last_output_at() {
         let mut rt = new_runtime();
-        rt.push_output(
-            &bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"),
-            bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"),
-            false,
-        );
+        rt.push_output(bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"), false);
         assert!(
             rt.last_visible_output_at.is_none(),
             "pure ANSI sequences should not advance last_output_at"
@@ -850,40 +810,35 @@ mod tests {
     }
 
     #[test]
-    fn test_push_output_uses_filtered_bytes_for_ring_and_offsets() {
+    fn test_push_output_uses_filtered_bytes_for_snapshot_and_offsets() {
         let mut rt = new_runtime();
-        let raw = bytes::Bytes::from_static(b"before\x1b[6nafter");
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(&raw, filtered, true);
+        rt.push_output(filtered.clone(), true);
 
-        let (chunks, end_offset) = rt.ring.read_from(0);
-        let combined: Vec<u8> = chunks.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-        assert_eq!(combined, b"beforeafter");
-        assert_eq!(end_offset, 11);
+        assert_eq!(
+            rt.screen_parser.screen().contents().trim_end(),
+            "beforeafter"
+        );
+        assert_eq!(rt.last_total_bytes, 11);
     }
 
     #[test]
     fn test_push_output_tracks_total_bytes_from_filtered_stream() {
         let mut rt = new_runtime();
-        let raw = bytes::Bytes::from_static(b"before\x1b[6nafter");
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(&raw, filtered, true);
+        rt.push_output(filtered, true);
 
         assert_eq!(rt.last_total_bytes, 11);
     }
 
     #[test]
-    fn test_push_output_drops_fully_stripped_chunks_from_ring() {
+    fn test_push_output_drops_fully_stripped_chunks_from_snapshot() {
         let mut rt = new_runtime();
-        let raw = bytes::Bytes::from_static(b"\x1b[6n");
+        rt.push_output(bytes::Bytes::new(), false);
 
-        rt.push_output(&raw, bytes::Bytes::new(), false);
-
-        let (chunks, end_offset) = rt.ring.read_from(0);
-        assert!(chunks.is_empty());
-        assert_eq!(end_offset, 0);
+        assert!(rt.screen_parser.screen().contents().trim().is_empty());
         assert_eq!(rt.last_total_bytes, 0);
     }
 
@@ -968,7 +923,6 @@ mod tests {
         let mut rt = SessionRuntime {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
-            ring: RingBuffer::new(4096),
             last_total_bytes: 0,
             broadcast_tx,
             resize_tx,
@@ -990,7 +944,8 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            mode_tracker: ModeTracker::new(),
+            notification_excerpt_end_offset: 0,
+            screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
         };

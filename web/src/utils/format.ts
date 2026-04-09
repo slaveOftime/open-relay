@@ -154,6 +154,10 @@ export function cwdBasename(cwd: string | null): string {
 // ── Shell arg parser ─────────────────────────────────────────────────────────
 // Handles single/double quotes and backslash escapes, e.g.:
 //   --model "claude 3.5" --flag 'hello world' --path C:\\foo
+function isEscapableArgChar(ch: string | undefined): boolean {
+  return ch !== undefined && /[\s"'\\]/.test(ch)
+}
+
 export function parseArgString(input: string): string[] {
   const args: string[] = []
   let current = ''
@@ -171,7 +175,7 @@ export function parseArgString(input: string): string[] {
     } else if (inDouble) {
       if (ch === '"') {
         inDouble = false
-      } else if (ch === '\\' && i + 1 < input.length) {
+      } else if (ch === '\\' && (input[i + 1] === '"' || input[i + 1] === '\\')) {
         i++
         current += input[i]
       } else {
@@ -181,7 +185,7 @@ export function parseArgString(input: string): string[] {
       inSingle = true
     } else if (ch === '"') {
       inDouble = true
-    } else if (ch === '\\' && i + 1 < input.length) {
+    } else if (ch === '\\' && isEscapableArgChar(input[i + 1])) {
       i++
       current += input[i]
     } else if (/\s/.test(ch)) {

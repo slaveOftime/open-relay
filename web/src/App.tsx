@@ -2,7 +2,11 @@ import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import LoginDialog from './components/LoginDialog'
 import { getAuthStatus, getToken } from './api/client'
-import { notificationClickMessageTarget } from '@/lib/notifications'
+import {
+  consumePendingNotificationTarget,
+  notificationClickMessageTarget,
+  notificationLaunchTargetFromUrl,
+} from '@/lib/notifications'
 
 const SessionsPage = lazy(() => import('./pages/SessionsPage'))
 const SessionDetailPage = lazy(() => import('./pages/SessionDetailPage'))
@@ -21,7 +25,60 @@ function LastRoutePersistence() {
 }
 
 function NotificationClickRouting() {
+  const location = useLocation()
   const navigate = useNavigate()
+
+  const applyTarget = useCallback(
+    (target: string) => {
+      const current = `${location.pathname}${location.search}${location.hash}`
+      if (current === target) return
+      navigate(target, { replace: true })
+      window.focus()
+    },
+    [location.pathname, location.search, location.hash, navigate]
+  )
+
+  useEffect(() => {
+    const target = notificationLaunchTargetFromUrl(window.location.href)
+    if (!target) return
+    applyTarget(target)
+  }, [applyTarget, location.key])
+
+  useEffect(() => {
+    let cancelled = false
+
+    async function applyPendingTarget() {
+      const target = await consumePendingNotificationTarget(window.location.origin)
+      if (cancelled || !target) return
+      applyTarget(target)
+    }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === 'visible') {
+        void applyPendingTarget()
+      }
+    }
+
+    function onFocus() {
+      void applyPendingTarget()
+    }
+
+    function onPageShow() {
+      void applyPendingTarget()
+    }
+
+    void applyPendingTarget()
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('pageshow', onPageShow)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      cancelled = true
+      window.removeEventListener('focus', onFocus)
+      window.removeEventListener('pageshow', onPageShow)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [applyTarget])
 
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return
@@ -29,13 +86,12 @@ function NotificationClickRouting() {
     function onMessage(event: MessageEvent) {
       const target = notificationClickMessageTarget(event.data, window.location.origin)
       if (!target) return
-      navigate(target)
-      window.focus()
+      applyTarget(target)
     }
 
     navigator.serviceWorker.addEventListener('message', onMessage)
     return () => navigator.serviceWorker.removeEventListener('message', onMessage)
-  }, [navigate])
+  }, [applyTarget])
 
   return null
 }

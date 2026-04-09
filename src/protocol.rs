@@ -175,6 +175,10 @@ pub enum RpcRequest {
     AttachSubscribe {
         id: String,
         from_byte_offset: Option<u64>,
+        #[serde(default)]
+        rows: Option<u16>,
+        #[serde(default)]
+        cols: Option<u16>,
     },
     AttachInput {
         id: String,
@@ -215,8 +219,10 @@ pub enum RpcRequest {
     },
     LogsPagination {
         id: String,
-        offset: usize,
+        offset: Option<usize>,
         limit: usize,
+        #[serde(default)]
+        tail: bool,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
     /// times out), then return a snapshot.  Response is `LogsTail`.
@@ -308,13 +314,14 @@ pub enum RpcResponse {
     Start {
         session_id: String,
     },
-    /// Sent once after AttachSubscribe: ring tail replay from the canonical
-    /// filtered session stream + terminal mode flags.
+    /// Sent once after AttachSubscribe: a terminal-state snapshot describing the
+    /// current visible screen, followed by terminal mode flags.
     AttachStreamInit {
-        /// Filtered session-stream bytes, ready to write directly to the terminal.
+        /// Terminal bytes that recreate the current visible session state when
+        /// written into a fresh terminal instance.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
-        /// Canonical filtered-stream offset immediately after the replay bytes.
+        /// Canonical filtered-stream offset immediately after the snapshot point.
         end_offset: u64,
         running: bool,
         bracketed_paste_mode: bool,
@@ -355,6 +362,7 @@ pub enum RpcResponse {
         resizes: Vec<LogResize>,
     },
     LogsPagination {
+        offset: usize,
         lines: Vec<String>,
         total: usize,
         #[serde(default)]

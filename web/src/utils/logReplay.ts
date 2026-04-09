@@ -168,7 +168,8 @@ export function replayLogChunks(
   target: LogReplayTarget,
   chunks: LogReplayChunk[],
   resizes: LogResizeEvent[],
-  chunkCount = chunks.length
+  chunkCount = chunks.length,
+  options?: { scrollToBottom?: boolean }
 ): LogReplayState {
   const safeChunkCount = Math.max(0, Math.min(chunkCount, chunks.length))
   target.reset()
@@ -180,7 +181,9 @@ export function replayLogChunks(
     0,
     safeChunkCount
   )
-  target.scrollToBottom()
+  if (options?.scrollToBottom !== false) {
+    target.scrollToBottom()
+  }
   return state
 }
 
@@ -194,7 +197,9 @@ export function seekLogChunks(
 ): LogReplayState {
   const safeChunkCount = Math.max(0, Math.min(chunkCount, chunks.length))
   if (safeChunkCount <= state.chunkCount) {
-    const next = replayLogChunks(target, chunks, resizes, safeChunkCount)
+    const next = replayLogChunks(target, chunks, resizes, safeChunkCount, {
+      scrollToBottom: options?.scrollToBottom,
+    })
     if (options?.callback) options.callback()
     return next
   }

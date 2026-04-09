@@ -1,6 +1,10 @@
 use super::logs::refresh_persisted_log_index;
 use crate::error::Result;
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+};
 
 #[allow(dead_code)]
 pub fn append_output(dir: &Path, chunk: &str) -> Result<()> {
@@ -56,6 +60,23 @@ pub fn current_output_offset(dir: &Path) -> u64 {
     fs::metadata(dir.join("output.log"))
         .map(|meta| meta.len())
         .unwrap_or(0)
+}
+
+pub fn read_output_from(dir: &Path, from_offset: u64) -> Result<(Vec<u8>, u64)> {
+    let path = dir.join("output.log");
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(err) => return Err(err.into()),
+    };
+    let end_offset = file.seek(SeekFrom::End(0))?;
+    if from_offset >= end_offset {
+        return Ok((Vec::new(), end_offset));
+    }
+    file.seek(SeekFrom::Start(from_offset))?;
+    let mut bytes = Vec::with_capacity((end_offset - from_offset) as usize);
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, end_offset))
 }
 
 pub fn current_output_offset_by_id(dir: &Path, session_id: &str) -> u64 {

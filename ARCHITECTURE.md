@@ -354,9 +354,9 @@ Browser                           Daemon
 
 ### Edge Cases
 
-**Broadcast lag recovery**: If the broadcast channel overflows (subscriber too slow), the WS handler drops the lagged receiver, re-reads a fresh ring snapshot, sends a new `init` frame (resync), and resubscribes.  The client sees a seamless replay.
+**Broadcast lag recovery**: If the broadcast channel overflows (subscriber too slow), the WS handler drops the lagged receiver, re-reads the missing bytes from persisted output, sends a new `init` frame (resync), and resubscribes.  The client sees a seamless replay.
 
-**Resize ordering**: The client MUST NOT send `resize` before it receives `init`.  Sending resize first causes the child to emit a full-screen repaint (`\x1b[2J` + cursor home) that races with and blanks the ring-buffer replay.
+**Resize ordering**: The client MUST NOT send `resize` before it receives `init`.  Sending resize first causes the child to emit a full-screen repaint (`\x1b[2J` + cursor home) that races with and blanks the initial terminal snapshot.
 
 **CPR/OSC filtering**: `EscapeFilter` now runs once in the PTY reader before bytes enter the ring buffer, broadcast stream, or persisted log. Attach handlers forward the already-filtered canonical stream directly.
 
@@ -379,7 +379,7 @@ Browser                           Daemon
 
 **Requirements**:
 - The user's terminal is placed in raw mode.
-- The ring-buffer snapshot is replayed so the user sees recent output.
+- The current terminal snapshot is replayed so the user sees recent output.
 - After replay, live output streams in real time.
 - Terminal size (rows × cols) is communicated to the child.
 - On detach (Ctrl-D or configured escape sequence), the terminal is fully restored.
