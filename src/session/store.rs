@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -127,6 +127,23 @@ impl SessionHandle {
     fn refresh_snapshot(&self, rt: &SessionRuntime) {
         self.snapshot
             .store(Arc::new(SessionRuntimeSnapshot::from_runtime(rt)));
+    }
+
+    fn lock_runtime(&self) -> MutexGuard<'_, SessionRuntime> {
+        lock_runtime_recover(&self.runtime)
+    }
+}
+
+fn lock_runtime_recover(runtime: &Mutex<SessionRuntime>) -> MutexGuard<'_, SessionRuntime> {
+    match runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(
+                session_id = %poisoned.get_ref().meta.id,
+                "session runtime lock poisoned; recovering"
+            );
+            poisoned.into_inner()
+        }
     }
 }
 
@@ -321,7 +338,8 @@ impl SessionStore {
         let result = store_handle.commit_started_session(meta, runtime).await;
 
         if result.is_err() {
-            if let Ok(mut rt) = cleanup_runtime.lock() {
+            {
+                let mut rt = lock_runtime_recover(&cleanup_runtime);
                 let _ = rt.pty.kill();
                 rt.mark_completed(SessionStatus::Failed, None);
             }
@@ -511,10 +529,9 @@ impl SessionStore {
     pub async fn register_attach_client(&self, id: &str) {
         let sessions = self.sessions.load();
         if let Some(handle) = sessions.get(id).cloned() {
-            if let Ok(mut rt) = handle.runtime.lock() {
-                rt.register_attach_client();
-                handle.refresh_snapshot(&rt);
-            }
+            let mut rt = handle.lock_runtime();
+            rt.register_attach_client();
+            handle.refresh_snapshot(&rt);
         }
     }
 
@@ -538,9 +555,7 @@ impl SessionStore {
     > {
         let runtime = self.lookup_runtime(id).await?;
         let (dir, rx, modes) = {
-            let Ok(rt) = runtime.runtime.lock() else {
-                return Err(SessionError::Evicted);
-            };
+            let rt = runtime.lock_runtime();
             (
                 rt.dir.clone(),
                 rt.broadcast_tx.subscribe(),
@@ -584,9 +599,7 @@ impl SessionStore {
         SessionError,
     > {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let rt = runtime.lock_runtime();
         let snapshot = rt.attach_snapshot_bytes();
         let end_offset = current_output_offset(&rt.dir);
         let rx = rt.broadcast_tx.subscribe();
@@ -616,15 +629,13 @@ impl SessionStore {
     ) -> Option<(broadcast::Receiver<(u16, u16)>, Option<(u16, u16)>)> {
         let sessions = self.sessions.load();
         let handle = sessions.get(id)?;
-        let rt = handle.runtime.lock().ok()?;
+        let rt = handle.lock_runtime();
         Some((rt.resize_tx.subscribe(), rt.pty_size))
     }
 
     pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let mut rt = runtime.lock_runtime();
         rt.detach_attach_client();
         runtime.refresh_snapshot(&rt);
         debug!(session_id = id, "attach detach acknowledged");
@@ -637,9 +648,7 @@ impl SessionStore {
         enabled: bool,
     ) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let mut rt = runtime.lock_runtime();
         if rt.is_completed() {
             return Err(SessionError::NotRunning);
         }
@@ -666,9 +675,7 @@ impl SessionStore {
 
         let runtime = self.lookup_runtime(id).await?;
         let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                return Err(SessionError::Evicted);
-            };
+            let mut rt = runtime.lock_runtime();
             let initial_total_bytes = rt.last_total_bytes;
             // When the child process has enabled DECCKM (application cursor key
             // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
@@ -745,9 +752,7 @@ impl SessionStore {
     pub async fn attach_busy(&self, id: &str) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
         let summary = {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                return Err(SessionError::Evicted);
-            };
+            let mut rt = runtime.lock_runtime();
             rt.mark_attach_activity();
             rt.last_output_epoch = Some(Instant::now());
             runtime.refresh_snapshot(&rt);
@@ -768,13 +773,7 @@ impl SessionStore {
         let started = Instant::now();
         loop {
             let current_total_bytes = {
-                let Ok(rt) = runtime.runtime.lock() else {
-                    debug!(
-                        session_id = id,
-                        "attach input output wait stopped because runtime lock was lost"
-                    );
-                    return false;
-                };
+                let rt = runtime.lock_runtime();
                 rt.last_total_bytes
             };
 
@@ -810,9 +809,7 @@ impl SessionStore {
         cols: u16,
     ) -> std::result::Result<(), SessionError> {
         let runtime = self.lookup_runtime(id).await?;
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            return Err(SessionError::Evicted);
-        };
+        let mut rt = runtime.lock_runtime();
         rt.mark_attach_activity();
         let resized = rt.resize_pty(rows, cols);
         runtime.refresh_snapshot(&rt);
@@ -892,13 +889,7 @@ impl SessionStore {
         // Begin a soft-stop sequence and let the child exit on its own before
         // escalating to a forced kill when the grace window expires.
         {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                warn!(
-                    session_id = %session_id,
-                    "failed to lock session runtime before termination"
-                );
-                return false;
-            };
+            let mut rt = runtime.lock_runtime();
             if rt.refresh_status() {
                 runtime.refresh_snapshot(&rt);
                 debug!(
@@ -948,13 +939,7 @@ impl SessionStore {
 
         while Instant::now() < deadline {
             {
-                let Ok(mut rt) = runtime.runtime.lock() else {
-                    warn!(
-                        session_id = %session_id,
-                        "failed to lock session runtime while waiting for termination"
-                    );
-                    return true;
-                };
+                let mut rt = runtime.lock_runtime();
                 if rt.refresh_status() {
                     runtime.refresh_snapshot(&rt);
                     debug!(
@@ -1009,13 +994,7 @@ impl SessionStore {
             tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
-        let Ok(mut rt) = runtime.runtime.lock() else {
-            warn!(
-                session_id = %session_id,
-                "failed to lock session runtime before forced termination"
-            );
-            return false;
-        };
+        let mut rt = runtime.lock_runtime();
         if rt.refresh_status() {
             runtime.refresh_snapshot(&rt);
             info!(
@@ -1112,9 +1091,7 @@ impl SessionStore {
         let sessions = self.sessions.load_full();
 
         for (id, runtime) in sessions.iter() {
-            let Ok(mut rt) = runtime.runtime.lock() else {
-                continue;
-            };
+            let mut rt = runtime.lock_runtime();
             rt.refresh_status();
 
             if rt.is_completed() && !rt.persisted {
@@ -1203,7 +1180,7 @@ impl SessionStore {
                     if now.duration_since(last_attach_activity) < attach_suppression_window {
                         // suppress notification and reset last_output_at to prevent repeated notifications
                         // for the same output epoch after attach activity.
-                        let mut rt = runtime.runtime.lock().ok()?;
+                        let mut rt = runtime.lock_runtime();
                         rt.last_visible_output_at = None;
                         return None;
                     }
@@ -1226,12 +1203,12 @@ impl SessionStore {
                 }
 
                 let plan = {
-                    let rt = runtime.runtime.lock().ok()?;
+                    let rt = runtime.lock_runtime();
                     build_notification_excerpt_plan(&rt)
                 };
                 let excerpt = if let Some(excerpt) = recent_notification_excerpt(&plan) {
-                    if let Ok(mut rt) = runtime.runtime.lock()
-                        && rt.last_total_bytes == plan.end_offset
+                    let mut rt = runtime.lock_runtime();
+                    if rt.last_total_bytes == plan.end_offset
                         && rt.notification_excerpt_end_offset <= plan.start_offset
                     {
                         rt.notification_excerpt_end_offset = plan.end_offset;
@@ -1258,11 +1235,10 @@ impl SessionStore {
     pub fn mark_notified(&self, session_id: &str, output_epoch: Instant, notified_at: Instant) {
         let sessions = self.sessions.load();
         if let Some(runtime) = sessions.get(session_id) {
-            if let Ok(mut rt) = runtime.runtime.lock() {
-                rt.notified_output_epoch = Some(output_epoch);
-                rt.last_notified_at = Some(notified_at);
-                runtime.refresh_snapshot(&rt);
-            }
+            let mut rt = runtime.lock_runtime();
+            rt.notified_output_epoch = Some(output_epoch);
+            rt.last_notified_at = Some(notified_at);
+            runtime.refresh_snapshot(&rt);
         }
     }
 }
@@ -2264,6 +2240,38 @@ mod tests {
         assert!(
             writer_rx.try_recv().is_err(),
             "completed sessions should not receive synthetic input during kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_kill_session_recovers_from_poisoned_runtime_lock() {
+        let (rt, _writer_rx) = make_runtime_writable("kilpoison", SessionStatus::Running);
+        let rt_clone = rt.clone();
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let poison_result = std::panic::catch_unwind(|| {
+            let _guard = rt_clone.lock().unwrap();
+            panic!("poison session runtime lock");
+        });
+        assert!(poison_result.is_err(), "runtime lock should be poisoned");
+
+        assert!(
+            store.kill_session("kilpoison").await,
+            "kill should recover from a poisoned runtime lock"
+        );
+
+        let sessions = store.sessions.load();
+        let handle = sessions
+            .get("kilpoison")
+            .expect("runtime should remain addressable");
+        let snapshot = handle.snapshot();
+        assert!(matches!(
+            snapshot.summary.status.as_str(),
+            "killed" | "failed"
+        ));
+        assert!(
+            !snapshot.running,
+            "killed session should no longer be marked running"
         );
     }
 
