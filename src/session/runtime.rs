@@ -98,7 +98,7 @@ impl SessionRuntime {
     /// the silence clock for visible content.
     ///
     /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
-    pub fn push_output(&mut self, filtered_data: Bytes, has_visible_output: bool) {
+    pub fn push_output(&mut self, filtered_data: &[u8], has_visible_output: bool) {
         // Advance the silence clock only for chunks with visible content.
         if has_visible_output {
             self.last_visible_output_at = Some(Instant::now());
@@ -111,12 +111,16 @@ impl SessionRuntime {
                 .last_total_bytes
                 .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
-            self.screen_parser.process(filtered_data.as_ref());
+            self.screen_parser.process(filtered_data);
         }
     }
 
     pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
         self.screen_parser.screen().state_formatted()
+    }
+
+    pub fn render_logs(&self, tail: usize, keep_color: bool, term_cols: u16) -> Vec<u8> {
+        super::logs::render_screen(&self.screen_parser, tail, keep_color, term_cols)
     }
 
     pub fn register_attach_client(&mut self) {
@@ -457,7 +461,7 @@ pub fn spawn_session(
         notified_output_epoch: None,
         last_notified_at: None,
         notification_excerpt_end_offset: 0,
-        screen_parser: vt100::Parser::new(rows, cols, (rows * 50) as usize),
+        screen_parser: vt100::Parser::new(rows, cols, 0),
         output_closed: false,
         notifications_enabled,
     }));
@@ -498,7 +502,7 @@ pub fn spawn_session(
                     // Update in-memory ring + mode tracking (brief lock).
                     match runtime_reader.lock() {
                         Ok(mut rt) => {
-                            rt.push_output(filtered_data.clone(), has_visible_output);
+                            rt.push_output(&filtered_data, has_visible_output);
                         }
                         Err(_) => {
                             warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
@@ -714,7 +718,7 @@ mod tests {
     fn test_push_output_enables_bracketed_paste() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(bytes::Bytes::from("text \x1b[?2004h more"), true);
+        rt.push_output(b"text \x1b[?2004h more", true);
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -731,9 +735,9 @@ mod tests {
     #[test]
     fn test_push_output_disables_bracketed_paste() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::from("\x1b[?2004h"), false);
+        rt.push_output(b"\x1b[?2004h", false);
         assert!(rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(bytes::Bytes::from("\x1b[?2004l"), false);
+        rt.push_output(b"\x1b[?2004l", false);
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -751,7 +755,7 @@ mod tests {
     fn test_push_output_enables_app_cursor_keys() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(bytes::Bytes::from("\x1b[?1h"), false);
+        rt.push_output(b"\x1b[?1h", false);
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -768,9 +772,9 @@ mod tests {
     #[test]
     fn test_push_output_disables_app_cursor_keys() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::from("\x1b[?1h"), false);
+        rt.push_output(b"\x1b[?1h", false);
         assert!(rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(bytes::Bytes::from("\x1b[?1l"), false);
+        rt.push_output(b"\x1b[?1l", false);
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -792,7 +796,7 @@ mod tests {
     fn test_push_output_visible_content_advances_last_output_at() {
         let mut rt = new_runtime();
         assert!(rt.last_visible_output_at.is_none());
-        rt.push_output(bytes::Bytes::from("hello world\n"), true);
+        rt.push_output(b"hello world\n", true);
         assert!(
             rt.last_visible_output_at.is_some(),
             "visible output should set last_output_at"
@@ -802,7 +806,7 @@ mod tests {
     #[test]
     fn test_push_output_pure_ansi_does_not_advance_last_output_at() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"), false);
+        rt.push_output(b"\x1b[1A\x1b[2K\x1b[H", false);
         assert!(
             rt.last_visible_output_at.is_none(),
             "pure ANSI sequences should not advance last_output_at"
@@ -814,7 +818,7 @@ mod tests {
         let mut rt = new_runtime();
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(filtered.clone(), true);
+        rt.push_output(filtered.as_ref(), true);
 
         assert_eq!(
             rt.screen_parser.screen().contents().trim_end(),
@@ -828,7 +832,7 @@ mod tests {
         let mut rt = new_runtime();
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(filtered, true);
+        rt.push_output(filtered.as_ref(), true);
 
         assert_eq!(rt.last_total_bytes, 11);
     }
@@ -836,7 +840,7 @@ mod tests {
     #[test]
     fn test_push_output_drops_fully_stripped_chunks_from_snapshot() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::new(), false);
+        rt.push_output(&[], false);
 
         assert!(rt.screen_parser.screen().contents().trim().is_empty());
         assert_eq!(rt.last_total_bytes, 0);

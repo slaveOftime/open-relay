@@ -698,6 +698,31 @@ pub fn render_log_file(
     ))
 }
 
+pub fn render_screen(
+    parser: &vt100::Parser,
+    tail: usize,
+    keep_color: bool,
+    term_cols: u16,
+) -> Vec<u8> {
+    let screen = parser.screen();
+    let content_rows: Vec<Vec<u8>> = if keep_color {
+        screen.rows_formatted(0, term_cols).collect()
+    } else {
+        screen
+            .rows(0, term_cols)
+            .map(|row| row.into_bytes())
+            .collect()
+    };
+    let rows = if let Some((first, last)) = content_bounds(&content_rows) {
+        let visible_rows = &content_rows[first..=last];
+        let skip = visible_rows.len().saturating_sub(tail);
+        visible_rows[skip..].to_vec()
+    } else {
+        Vec::new()
+    };
+    format_rows_for_output(&rows, keep_color)
+}
+
 /// Seek near the end of the log file and read enough bytes to cover `tail * 2`
 /// lines (using a generous per-line estimate), returning the raw bytes.
 ///
@@ -1234,7 +1259,7 @@ mod tests {
         ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
         read_persisted_log_page, read_persisted_log_tail_page, read_relevant_resize_events,
         read_resize_events, refresh_persisted_log_index, render_log_bytes, render_log_file,
-        split_persisted_log_records,
+        render_screen, split_persisted_log_records,
     };
     use crate::protocol::LogResize;
     use std::fs;
@@ -1360,6 +1385,16 @@ mod tests {
         assert!(rendered.contains("Search"));
         assert!(rendered.contains("Option 1"));
         assert!(rendered.contains("Option 2"));
+    }
+
+    #[test]
+    fn render_screen_respects_tail_limit() {
+        let mut parser = vt100::Parser::new(4, 80, 0);
+        parser.process(b"\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour");
+
+        let output = render_screen(&parser, 2, false, 80);
+
+        assert_eq!(String::from_utf8_lossy(&output), "three\nfour\n");
     }
 
     #[test]

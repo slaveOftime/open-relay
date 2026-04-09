@@ -517,6 +517,28 @@ impl SessionStore {
             .map(|handle| handle.snapshot().mode_snapshot)
     }
 
+    pub async fn render_live_logs(
+        &self,
+        id: &str,
+        tail: usize,
+        keep_color: bool,
+        term_cols: u16,
+    ) -> std::result::Result<(Vec<u8>, Vec<crate::protocol::LogResize>), SessionError> {
+        let runtime = self.lookup_runtime(id).await?;
+        let mut rt = runtime.lock_runtime();
+        let completed = rt.refresh_status();
+        if completed {
+            runtime.refresh_snapshot(&rt);
+        }
+        if rt.is_completed() || rt.output_closed {
+            return Err(SessionError::NotRunning);
+        }
+        Ok((
+            rt.render_logs(tail, keep_color, term_cols),
+            rt.resize_history.clone(),
+        ))
+    }
+
     pub async fn attach_stream_status(
         &self,
         id: &str,
@@ -1691,6 +1713,52 @@ mod tests {
 
         let result = store.set_notifications_enabled("done123", false).await;
         assert!(matches!(result, Err(SessionError::NotRunning)));
+    }
+
+    #[tokio::test]
+    async fn render_live_logs_uses_runtime_screen_tail() {
+        let runtime = make_runtime(
+            "live123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.lock().unwrap_or_else(|p| p.into_inner());
+            rt.screen_parser = vt100::Parser::new(24, 80, 0);
+            rt.screen_parser
+                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let (output, resizes) = store
+            .render_live_logs("live123", 2, false, 80)
+            .await
+            .expect("render live logs");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output),
+            "screen two\nscreen three\n"
+        );
+        assert!(resizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn render_live_logs_rejects_completed_sessions() {
+        let runtime = make_runtime(
+            "stopped123",
+            SessionStatus::Stopped,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let err = store
+            .render_live_logs("stopped123", 10, false, 80)
+            .await
+            .expect_err("completed session should not render live logs");
+
+        assert!(matches!(err, SessionError::NotRunning));
     }
 
     #[tokio::test]

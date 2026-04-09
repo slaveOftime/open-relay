@@ -15,6 +15,7 @@ pub async fn run_logs(
     id: &str,
     tail: Option<usize>,
     keep_color: bool,
+    from_file: bool,
     no_truncate: bool,
     node: Option<String>,
     wait_for_prompt: bool,
@@ -57,6 +58,7 @@ pub async fn run_logs(
             tail,
             keep_color,
             term_cols,
+            from_file,
         };
         let req = RpcRequest::NodeProxy {
             node: node_name,
@@ -68,7 +70,7 @@ pub async fn run_logs(
         };
     }
 
-    run_logs_local(config, id, tail, keep_color, term_cols).await
+    run_logs_local(config, id, tail, keep_color, term_cols, from_file).await
 }
 
 async fn run_logs_local(
@@ -77,7 +79,30 @@ async fn run_logs_local(
     tail: usize,
     keep_color: bool,
     term_cols: u16,
+    from_file: bool,
 ) -> Result<()> {
+    if !from_file {
+        match ipc::send_request_checked(
+            config,
+            RpcRequest::LogsTail {
+                id: id.to_string(),
+                tail,
+                keep_color,
+                term_cols,
+                from_file: false,
+            },
+        )
+        .await
+        {
+            Ok(RpcResponse::LogsTail { output, .. }) => {
+                return print_log_output(output, keep_color);
+            }
+            Ok(_) => return Err(AppError::Protocol("unexpected response type".to_string())),
+            Err(AppError::DaemonUnavailable(_)) => {}
+            Err(err) => return Err(err),
+        }
+    }
+
     let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
     let session_dir = match db.get_session_dir(id).await? {
         Some(dir) => dir,

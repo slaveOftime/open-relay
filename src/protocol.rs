@@ -216,6 +216,8 @@ pub enum RpcRequest {
         tail: usize,
         keep_color: bool,
         term_cols: u16,
+        #[serde(default)]
+        from_file: bool,
     },
     LogsPagination {
         id: String,

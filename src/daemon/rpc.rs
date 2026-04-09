@@ -196,7 +196,19 @@ async fn dispatch_request(
             tail,
             term_cols,
             keep_color,
-        } => handle_logs_tail(id, tail, term_cols, keep_color, db).await,
+            from_file,
+        } => {
+            handle_logs_tail(
+                id,
+                tail,
+                term_cols,
+                keep_color,
+                from_file,
+                session_store,
+                db,
+            )
+            .await
+        }
         RpcRequest::LogsPagination {
             id,
             offset,
@@ -398,8 +410,18 @@ async fn handle_logs_tail(
     tail: usize,
     term_cols: u16,
     keep_color: bool,
+    from_file: bool,
+    session_store: &SessionStoreHandle,
     db: &Arc<Database>,
 ) -> RpcResponse {
+    if !from_file
+        && let Ok((output, resizes)) = session_store
+            .render_live_logs(&id, tail, keep_color, term_cols)
+            .await
+    {
+        return RpcResponse::LogsTail { output, resizes };
+    }
+
     let session_dir = match db.get_session_dir(&id).await {
         Ok(Some(dir)) => dir,
         Ok(None) => {
@@ -436,6 +458,86 @@ async fn handle_logs_tail(
     RpcResponse::LogsTail {
         output: lines,
         resizes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_logs_tail;
+    use crate::{
+        db::Database,
+        protocol::RpcResponse,
+        session::{SessionMeta, SessionStatus, SessionStore},
+    };
+    use chrono::Utc;
+    use std::{
+        path::PathBuf,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}.{suffix}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    #[tokio::test]
+    async fn logs_tail_falls_back_to_persisted_file_for_stopped_sessions() {
+        let db_path = temp_path("oly-logs-tail", "db");
+        let sessions_dir = temp_path("oly-logs-tail-sessions", "dir");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+
+        let db = Arc::new(
+            Database::open(&db_path, sessions_dir.clone())
+                .await
+                .expect("open test db"),
+        );
+        let store = Arc::new(SessionStore::new(60, db.clone()));
+
+        let meta = SessionMeta {
+            id: "stopped123".to_string(),
+            title: None,
+            tags: vec![],
+            command: "cmd".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code: Some(0),
+        };
+        db.insert_session(&meta).await.expect("insert session");
+
+        let session_dir = sessions_dir.join(&meta.id);
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+        std::fs::write(
+            session_dir.join("output.log"),
+            b"\x1b[1;1Hpersisted one\x1b[2;1Hpersisted two",
+        )
+        .expect("write output log");
+
+        let response = handle_logs_tail(meta.id.clone(), 10, 80, false, false, &store, &db).await;
+
+        match response {
+            RpcResponse::LogsTail { output, .. } => {
+                assert_eq!(
+                    String::from_utf8_lossy(&output),
+                    "persisted one\npersisted two\n"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&sessions_dir);
     }
 }
 
