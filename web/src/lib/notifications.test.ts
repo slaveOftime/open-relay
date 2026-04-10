@@ -111,17 +111,15 @@ describe('notifications helpers', () => {
     expect(notificationLaunchUrl({ navigation_url: '/apps/todo' }, 'https://relay.test')).toBe(
       'https://relay.test/apps/todo'
     )
-    expect(notificationLaunchUrl({ navigation_url: 'https://bing.com' }, 'https://relay.test')).toBe(
-      'https://bing.com/'
-    )
+    expect(
+      notificationLaunchUrl({ navigation_url: 'https://bing.com' }, 'https://relay.test')
+    ).toBe('https://bing.com/')
     expect(
       notificationLaunchUrl(
         { navigation_url: 'https://relay.test/session/session-123?mode=attach' },
         'https://relay.test'
       )
-    ).toBe(
-      'https://relay.test/?open-relay-target=%2Fsession%2Fsession-123%3Fmode%3Dattach'
-    )
+    ).toBe('https://relay.test/?open-relay-target=%2Fsession%2Fsession-123%3Fmode%3Dattach')
   })
 
   it('extracts wrapped notification launch targets during app startup', () => {

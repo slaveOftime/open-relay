@@ -228,8 +228,6 @@ pub enum RpcRequest {
         id: String,
         offset: Option<usize>,
         limit: usize,
-        #[serde(default)]
-        tail: bool,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
     /// times out), then return a snapshot.  Response is `LogsTail`.

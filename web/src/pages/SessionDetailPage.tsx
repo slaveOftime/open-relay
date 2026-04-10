@@ -156,11 +156,20 @@ function ConfirmActionDialog({
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function SessionDetailPage() {
+  const [searchParams] = useSearchParams()
+  const reloadKey = searchParams.toString()
+
+  return <SessionDetailPageContent key={reloadKey} />
+}
+
+function SessionDetailPageContent() {
   const { id } = useParams<{ id: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
 
   const mode = (searchParams.get('mode') ?? 'logs') as 'attach' | 'logs'
+  const logsView = searchParams.get('view') === 'replay' ? 'replay' : 'tail'
+  const isTailMode = logsView === 'tail'
   const node = searchParams.get('node')
 
   const [session, setSession] = useState<SessionSummary | null>(null)
@@ -184,8 +193,8 @@ export default function SessionDetailPage() {
     typeof navigator === 'undefined' ? true : navigator.onLine
   )
   const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
-  const [isTailMode, setIsTailMode] = useState(true)
   const [tailLimit, setTailLimit] = useState<number | null>(null)
+  const [tailLimitInput, setTailLimitInput] = useState('40')
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -720,6 +729,11 @@ export default function SessionDetailPage() {
     if (mode !== 'attach') setWsConnecting(false)
   }, [mode])
 
+  useEffect(() => {
+    if (mode !== 'logs' || !isTailMode) return
+    setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
+  }, [mode, logsView, isTailMode, tailLimit])
+
   // iOS PWA: reconnect the WebSocket immediately when the app returns from
   // background. iOS can resume with a stale "connected" socket state before
   // onclose arrives, so force a reconnect on foreground transitions.
@@ -886,11 +900,7 @@ export default function SessionDetailPage() {
         val
       )
     }
-    if (
-      val === 0 &&
-      !isFetchingMoreRef.current &&
-      loadedStartOffsetRef.current > 0
-    ) {
+    if (val === 0 && !isFetchingMoreRef.current && loadedStartOffsetRef.current > 0) {
       fetchMoreLogsRef.current?.()
     }
   }
@@ -1003,10 +1013,20 @@ export default function SessionDetailPage() {
     }
   }
 
+  function setLogsView(view: 'tail' | 'replay') {
+    const next = new URLSearchParams(searchParams)
+    if (view === 'replay') {
+      next.set('view', 'replay')
+    } else {
+      next.delete('view')
+    }
+    setSearchParams(next)
+  }
+
   function handleReplayButton() {
     if (isTailMode) {
       // Switch from tail mode to replay mode and start from beginning.
-      setIsTailMode(false)
+      setLogsView('replay')
       return
     }
     if (!isReplaying) {
@@ -1034,7 +1054,17 @@ export default function SessionDetailPage() {
     setIsReplaying(false)
     setIsPaused(false)
     isPausedRef.current = false
-    setIsTailMode(true)
+    setLogsView('tail')
+  }
+
+  function commitTailLimit(value: string) {
+    const next = parseInt(value, 10)
+    if (!isNaN(next) && next > 0) {
+      setTailLimit(next)
+      setTailLimitInput(String(next))
+      return
+    }
+    setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
   }
 
   async function handleStop() {
@@ -1257,8 +1287,13 @@ export default function SessionDetailPage() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-[hsl(var(--muted-foreground))] shrink-0 overflow-y-auto h-[38px]">
             <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={24} />
-              <div className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`} onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}>
-                {session?.title && <span className='break-all text-[hsl(var(--primary))]'>{session.title}</span>}
+              <div
+                className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
+                onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}
+              >
+                {session?.title && (
+                  <span className="break-all text-[hsl(var(--primary))]">{session.title}</span>
+                )}
                 <span className="break-all">{sessionDisplayName(session)}</span>
                 {session.cwd && (
                   <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
@@ -1272,7 +1307,9 @@ export default function SessionDetailPage() {
                   </span>
                 )}
                 <span>
-                  <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
+                  <span className="text-[hsl(var(--foreground))]">
+                    {formatByteSize(session.last_total_bytes)}
+                  </span>
                 </span>
                 {session.pid != null && (
                   <span>
@@ -1291,7 +1328,6 @@ export default function SessionDetailPage() {
           id="main-container"
           className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
         >
-
           {/* Terminal area */}
           <div
             className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
@@ -1301,30 +1337,31 @@ export default function SessionDetailPage() {
               className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-1 h-full w-full overflow-x-auto`}
             >
               <XTerm
-                key={mode}
+                key={mode === 'logs' ? `logs-${logsView}` : mode}
                 ref={termRef}
-                autoFit={mode === 'attach'}
+                autoFit={mode === 'attach' || isTailMode}
                 onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
                 onResize={mode === 'attach' ? handleTermResize : undefined}
-                className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-250'}`}
+                className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
               />
             </div>
 
             {/* Tail mode controls */}
             {mode === 'logs' && isTailMode && (
               <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
-                <span className="text-xs text-[hsl(var(--muted-foreground))]">
-                  Tail
-                </span>
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">Tail</span>
                 <input
                   type="number"
                   className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
-                  value={tailLimit ?? termRef.current?.getSize()?.rows ?? 40}
+                  value={tailLimitInput}
                   min={1}
                   max={5000}
-                  onChange={(e) => {
-                    const v = parseInt(e.target.value, 10)
-                    if (!isNaN(v) && v > 0) setTailLimit(v)
+                  onChange={(e) => setTailLimitInput(e.target.value)}
+                  onBlur={() => commitTailLimit(tailLimitInput)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      commitTailLimit(tailLimitInput)
+                    }
                   }}
                   aria-label="Tail line limit"
                 />

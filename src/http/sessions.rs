@@ -926,7 +926,6 @@ pub async fn get_logs(
             id: id.clone(),
             offset: Some(offset),
             limit,
-            tail: false,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::LogsPagination {

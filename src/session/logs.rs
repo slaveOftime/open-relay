@@ -4,7 +4,6 @@
 //! persisted `output.log` files from disk.  This module consolidates that logic
 //! so every consumer shares the same code path.
 
-use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -149,43 +148,6 @@ pub fn read_persisted_log_page(
     Some(page.finish())
 }
 
-/// Read the last `limit` records from a persisted `output.log`.
-///
-/// Returns `(records, total_record_count, start_offset)` where `start_offset`
-/// is the absolute record index of the first returned record.
-pub fn read_persisted_log_tail_page(
-    session_dir: &Path,
-    limit: usize,
-) -> Option<(Vec<String>, usize, usize)> {
-    let log_path = session_dir.join("output.log");
-    if let Ok(index) = sync_persisted_log_index(&log_path) {
-        let total = index.total_records();
-        let offset = total.saturating_sub(limit);
-        if let Ok(records) = read_persisted_log_page_from_index(&log_path, &index, offset, limit) {
-            return Some((records, total, offset));
-        }
-    }
-
-    let file = File::open(log_path).ok()?;
-    let mut page = TailPaginatedLogRecords::new(limit);
-    scan_persisted_log_records(file, |record| page.push(record)).ok()?;
-    Some(page.finish())
-}
-
-pub fn merge_live_log_tail_page(
-    session_dir: &Path,
-    live_chunks: Vec<String>,
-    limit: usize,
-) -> (Vec<String>, usize, usize) {
-    let live_count = live_chunks.len();
-    let persisted_limit = limit.saturating_sub(live_chunks.len());
-    let (mut lines, persisted_total, offset) =
-        read_persisted_log_tail_page(session_dir, persisted_limit)
-            .unwrap_or_else(|| (Vec::new(), 0, 0));
-    lines.extend(live_chunks);
-    (lines, persisted_total + live_count, offset)
-}
-
 pub fn split_rendered_log_output(output: &[u8]) -> Vec<String> {
     let output = output
         .strip_suffix(OUTPUT_COLOR_RESET_SUFFIX)
@@ -263,46 +225,6 @@ impl PaginatedLogRecords {
 
     fn finish(self) -> (Vec<String>, usize) {
         (self.records, self.total)
-    }
-}
-
-struct TailPaginatedLogRecords {
-    limit: usize,
-    total: usize,
-    records: VecDeque<String>,
-}
-
-impl TailPaginatedLogRecords {
-    fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            total: 0,
-            records: VecDeque::with_capacity(limit),
-        }
-    }
-
-    fn push(&mut self, record: &[u8]) {
-        if record.is_empty() {
-            return;
-        }
-
-        if self.limit > 0 {
-            if self.records.len() == self.limit {
-                self.records.pop_front();
-            }
-            self.records
-                .push_back(String::from_utf8_lossy(record).into_owned());
-        }
-        self.total += 1;
-    }
-
-    fn finish(self) -> (Vec<String>, usize, usize) {
-        let count = self.records.len();
-        (
-            self.records.into_iter().collect(),
-            self.total,
-            self.total.saturating_sub(count),
-        )
     }
 }
 
@@ -1279,35 +1201,7 @@ fn trim_repeated_trailing_suffix(
 }
 
 fn row_is_blank(row: &[u8]) -> bool {
-    if row.is_empty() {
-        return true;
-    }
-    // Skip ANSI escape sequences so that rows containing only formatting
-    // codes (e.g. "\x1b[0m") are still considered blank.
-    let mut i = 0;
-    while i < row.len() {
-        if row[i] == 0x1b {
-            i += 1;
-            if i < row.len() && row[i] == b'[' {
-                // CSI sequence: skip parameter/intermediate bytes then final byte
-                i += 1;
-                while i < row.len() && row[i] < 0x40 {
-                    i += 1;
-                }
-                if i < row.len() {
-                    i += 1;
-                }
-            } else if i < row.len() {
-                // Two-byte escape (e.g. \x1b( )
-                i += 1;
-            }
-        } else if row[i].is_ascii_whitespace() {
-            i += 1;
-        } else {
-            return false;
-        }
-    }
-    true
+    row.is_empty() || row.iter().all(|byte| byte.is_ascii_whitespace())
 }
 
 fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
@@ -1325,11 +1219,10 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ViewportReplayPlan, ViewportSize, merge_live_log_tail_page, parse_resize_event,
-        parser_cols, parser_rows, read_persisted_log_page, read_persisted_log_tail_page,
-        read_relevant_resize_events, read_resize_events, refresh_persisted_log_index,
-        render_log_bytes, render_log_file, render_screen, split_persisted_log_records,
-        split_rendered_log_output,
+        ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
+        read_persisted_log_page, read_relevant_resize_events, read_resize_events,
+        refresh_persisted_log_index, render_log_bytes, render_log_file, render_screen,
+        split_persisted_log_records, split_rendered_log_output,
     };
     use crate::protocol::LogResize;
     use std::fs;
@@ -1718,25 +1611,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_tail_page_with_absolute_offset() {
-        let temp_dir = temp_session_dir("oly-log-tail");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-        let log_path = temp_dir.join("output.log");
-        fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
-        refresh_persisted_log_index(&temp_dir).expect("index output log");
-
-        let (lines, total, offset) =
-            read_persisted_log_tail_page(&temp_dir, 2).expect("read tail page");
-
-        assert_eq!(lines, vec!["three\n".to_string(), "four\n".to_string()]);
-        assert_eq!(total, 4);
-        assert_eq!(offset, 2);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
     fn split_rendered_log_output_drops_final_reset_suffix() {
         let output = b"alpha\x1b[0m\nbeta\x1b[0m\n\x1b[0m\x1b[39m\x1b[49m\x1b[?25h";
 
@@ -1754,45 +1628,12 @@ mod tests {
         let log_path = temp_dir.join("output.log");
         fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
         refresh_persisted_log_index(&temp_dir).expect("index output log");
-
         assert_eq!(
-            read_persisted_log_tail_page(&temp_dir, 0)
+            read_persisted_log_page(&temp_dir, 0, 1)
                 .expect("read total")
                 .1,
             4
         );
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn merge_live_log_tail_page_keeps_persisted_history_addressable() {
-        let temp_dir = temp_session_dir("oly-log-merge-live");
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-        let log_path = temp_dir.join("output.log");
-        fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
-        refresh_persisted_log_index(&temp_dir).expect("index output log");
-
-        let (lines, total, offset) = merge_live_log_tail_page(
-            &temp_dir,
-            vec![
-                "live one\x1b[0m\n".to_string(),
-                "live two\x1b[0m\n".to_string(),
-            ],
-            3,
-        );
-
-        assert_eq!(
-            lines,
-            vec![
-                "four\n".to_string(),
-                "live one\x1b[0m\n".to_string(),
-                "live two\x1b[0m\n".to_string(),
-            ]
-        );
-        assert_eq!(total, 6);
-        assert_eq!(offset, 3);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

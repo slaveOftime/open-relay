@@ -117,46 +117,46 @@ self.addEventListener('notificationclick', (event) => {
       .then(() => storePendingNotificationTarget(payload))
       .then(() => self.clients.matchAll({ type: 'window', includeUncontrolled: true }))
       .then(async (clients) => {
-      const sortedClients = [...clients].sort(
-        (left, right) => clientPriority(right) - clientPriority(left)
-      )
+        const sortedClients = [...clients].sort(
+          (left, right) => clientPriority(right) - clientPriority(left)
+        )
 
-      for (const client of sortedClients) {
-        if ('navigate' in client) {
-          try {
-            const navigated = await client.navigate(navigationUrl)
-            const activeClient = navigated || client
-            if (activeClient.focus) {
-              await activeClient.focus()
-            } else if (client.focus) {
-              await client.focus()
-            }
-            if (clickMessage) {
-              try {
-                activeClient.postMessage(clickMessage)
-              } catch {
-                // A successful navigation is still enough; the app can restore from launchUrl.
+        for (const client of sortedClients) {
+          if ('navigate' in client) {
+            try {
+              const navigated = await client.navigate(navigationUrl)
+              const activeClient = navigated || client
+              if (activeClient.focus) {
+                await activeClient.focus()
+              } else if (client.focus) {
+                await client.focus()
               }
+              if (clickMessage) {
+                try {
+                  activeClient.postMessage(clickMessage)
+                } catch {
+                  // A successful navigation is still enough; the app can restore from launchUrl.
+                }
+              }
+              return
+            } catch {
+              // Fall back to messaging if this client refuses a full navigation.
             }
-            return
-          } catch {
-            // Fall back to messaging if this client refuses a full navigation.
           }
-        }
 
-        try {
-          if (clickMessage) {
-            if (client.focus) {
-              await client.focus()
+          try {
+            if (clickMessage) {
+              if (client.focus) {
+                await client.focus()
+              }
+              client.postMessage(clickMessage)
+              return
             }
-            client.postMessage(clickMessage)
-            return
+          } catch {
+            // Fall back to opening a new app window if this client refuses messaging too.
           }
-        } catch {
-          // Fall back to opening a new app window if this client refuses messaging too.
         }
-      }
-      return self.clients.openWindow(launchUrl)
-    })
+        return self.clients.openWindow(launchUrl)
+      })
   )
 })

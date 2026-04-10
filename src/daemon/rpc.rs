@@ -14,9 +14,7 @@ use crate::{
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
-        logs::{
-            merge_live_log_tail_page, read_persisted_log_page, read_resize_events, render_log_file,
-        },
+        logs::{read_persisted_log_page, read_resize_events, render_log_file},
     },
 };
 
@@ -211,12 +209,9 @@ async fn dispatch_request(
             )
             .await
         }
-        RpcRequest::LogsPagination {
-            id,
-            offset,
-            limit,
-            tail,
-        } => handle_logs_pagination(id, offset, limit, tail, session_store, db).await,
+        RpcRequest::LogsPagination { id, offset, limit } => {
+            handle_logs_pagination(id, offset, limit, session_store, db).await
+        }
         RpcRequest::LogsWait { id, timeout_ms } => {
             handle_logs_wait(id, timeout_ms, session_store, notification_tx, db).await
         }
@@ -547,7 +542,6 @@ async fn handle_logs_pagination(
     id: String,
     offset: Option<usize>,
     limit: usize,
-    tail: bool,
     session_store: &SessionStoreHandle,
     db: &Arc<Database>,
 ) -> RpcResponse {
@@ -565,26 +559,8 @@ async fn handle_logs_pagination(
         }
     };
 
-    if tail
-        && let Ok((live_lines, _, _, resizes)) =
-            session_store.read_live_log_tail_page(&id, limit).await
-    {
-        let (lines, total, offset) = merge_live_log_tail_page(&session_dir, live_lines, limit);
-        return RpcResponse::LogsPagination {
-            offset,
-            lines,
-            total,
-            resizes,
-        };
-    }
-
-    let page = if tail {
-        crate::session::logs::read_persisted_log_tail_page(&session_dir, limit)
-            .map(|(lines, total, offset)| (lines, total, offset))
-    } else {
-        read_persisted_log_page(&session_dir, offset.unwrap_or(0), limit)
-            .map(|(lines, total)| (lines, total, offset.unwrap_or(0)))
-    };
+    let page = read_persisted_log_page(&session_dir, offset.unwrap_or(0), limit)
+        .map(|(lines, total)| (lines, total, offset.unwrap_or(0)));
 
     match page {
         Some((lines, mut total, offset)) => {
