@@ -217,10 +217,14 @@ pub fn ensure_config_file(state_dir: &Path) {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
+                    if let Err(err) = std::fs::set_permissions(
                         &path,
                         std::fs::Permissions::from_mode(0o600),
-                    );
+                    ) {
+                        eprintln!(
+                            "warning: could not restrict config.json permissions to 0o600: {err}"
+                        );
+                    }
                 }
                 eprintln!("info: generated default config at {}", path.display());
             }
