@@ -1,7 +1,7 @@
 use interprocess::local_socket::tokio::Stream;
 use std::sync::Arc;
 use tokio::{io::BufReader, sync::mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     client,
@@ -637,7 +637,7 @@ async fn handle_logs_wait(
             biased;
             _ = &mut deadline_sleep => break 'wait,
             _ = state_poll.tick() => {
-                if !session_store.is_running(&id) {
+                if !session_store.is_running(&id) || session_store.is_silent_for(&id, std::time::Duration::from_secs(5)) {
                     break 'wait;
                 }
             }
@@ -649,6 +649,7 @@ async fn handle_logs_wait(
                         {
                             break 'wait;
                         }
+                        debug!(event = ?event.kind, "other event or session received");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
