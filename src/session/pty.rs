@@ -3,6 +3,8 @@
 // ---------------------------------------------------------------------------
 
 use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, trace, warn};
@@ -20,8 +22,10 @@ pub struct PtyHandle {
     pub(crate) child: RuntimeChild,
     /// Channel to the dedicated pseudo-terminal writer thread.
     pub(crate) writer_tx: mpsc::Sender<Vec<u8>>,
-    /// Kept alive so the master file descriptor stays open; resize goes through this.
-    pub(crate) pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    /// Kept alive so the master file descriptor stays open; resize goes through
+    /// this.  Wrapped in a `parking_lot::Mutex` so that `PtyHandle` is `Sync`,
+    /// which lets the outer `SessionRuntime` live behind a `parking_lot::RwLock`.
+    pub(crate) pty_master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
 }
 
 impl PtyHandle {
@@ -38,8 +42,9 @@ impl PtyHandle {
     }
 
     /// Resize the pseudo-terminal. Returns `true` on success.
-    pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
-        let Some(master) = self.pty_master.as_mut() else {
+    pub fn resize(&self, rows: u16, cols: u16) -> bool {
+        let mut guard = self.pty_master.lock();
+        let Some(master) = guard.as_mut() else {
             debug!(
                 rows,
                 cols, "PTY resize skipped because master handle is unavailable"
@@ -64,7 +69,7 @@ impl PtyHandle {
     /// sender with a permanently closed channel so future writes fail fast.
     pub fn release_resources(&mut self) {
         debug!("releasing PTY resources");
-        self.pty_master.take();
+        self.pty_master.lock().take();
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let previous_tx = std::mem::replace(&mut self.writer_tx, closed_tx);

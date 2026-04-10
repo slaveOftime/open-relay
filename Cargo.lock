@@ -2375,6 +2375,7 @@ dependencies = [
  "mime_guess",
  "notify-rust",
  "p256",
+ "parking_lot",
  "portable-pty",
  "rand 0.8.5",
  "regex",

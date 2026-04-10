@@ -1,11 +1,13 @@
 use std::{
     io::{ErrorKind, Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, trace, warn};
@@ -13,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, Result},
-    protocol::LogResize,
+    protocol::{LogResize, SessionSummary},
     session::persist::append_output,
 };
 
@@ -95,10 +97,9 @@ impl SessionRuntime {
     }
 
     /// Push a filtered PTY chunk into the canonical retained stream and advance
-    /// the silence clock for visible content.
-    ///
-    /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
-    pub fn push_output(&mut self, filtered_data: &[u8], has_visible_output: bool) {
+    /// the silence clock for visible content. Returns the current cursor
+    /// position so the caller can answer terminal queries without re-locking.
+    pub fn push_output(&mut self, filtered_data: &[u8], has_visible_output: bool) -> (u16, u16) {
         // Advance the silence clock only for chunks with visible content.
         if has_visible_output {
             self.last_visible_output_at = Some(Instant::now());
@@ -112,6 +113,30 @@ impl SessionRuntime {
                 .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
             self.screen_parser.process(filtered_data);
+        }
+
+        self.screen_parser.screen().cursor_position()
+    }
+
+    /// Build a `SessionSummary` snapshot from the current runtime state.
+    pub fn to_summary(&self) -> SessionSummary {
+        SessionSummary {
+            id: self.meta.id.clone(),
+            title: self.meta.title.clone(),
+            tags: self.meta.tags.clone(),
+            command: self.meta.command.clone(),
+            args: self.meta.args.clone(),
+            pid: self.meta.pid,
+            status: self.meta.status.as_str().to_string(),
+            created_at: self.meta.created_at,
+            started_at: self.meta.started_at,
+            ended_at: self.meta.ended_at,
+            cwd: self.meta.cwd.clone(),
+            input_needed: self.input_needed(),
+            notifications_enabled: self.notifications_enabled,
+            node: None,
+            last_total_bytes: self.last_total_bytes,
+            last_output_epoch: self.last_output_epoch.and_then(instant_to_utc),
         }
     }
 
@@ -325,7 +350,7 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 // PTY spawning
 // ---------------------------------------------------------------------------
 
-/// Spawns a PTY-backed child process and returns an `Arc<Mutex<SessionRuntime>>`.
+/// Spawns a PTY-backed child process and returns an `Arc<RwLock<SessionRuntime>>`.
 /// Reader and writer threads are started automatically and share ownership via the Arc.
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
@@ -335,7 +360,7 @@ pub fn spawn_session(
     rows: u16,
     cols: u16,
     notifications_enabled: bool,
-) -> Result<Arc<Mutex<SessionRuntime>>> {
+) -> Result<Arc<RwLock<SessionRuntime>>> {
     let full_dir = session_dir;
     let reader_dir = full_dir.clone();
     info!(
@@ -433,10 +458,10 @@ pub fn spawn_session(
     let pty_handle = PtyHandle {
         child: runtime_child,
         writer_tx: writer_tx.clone(),
-        pty_master: Some(master),
+        pty_master: parking_lot::Mutex::new(Some(master)),
     };
 
-    let runtime = Arc::new(Mutex::new(SessionRuntime {
+    let runtime = Arc::new(RwLock::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
         last_total_bytes: 0,
@@ -483,9 +508,7 @@ pub fn spawn_session(
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    if let Ok(mut rt) = runtime_reader.lock() {
-                        rt.output_closed = true;
-                    }
+                    runtime_reader.write().output_closed = true;
                     debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
                     if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
@@ -493,22 +516,18 @@ pub fn spawn_session(
                     break;
                 }
                 Ok(n) => {
-                    let data = Bytes::copy_from_slice(&buf[..n]);
+                    let data = &buf[..n];
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
                     let has_visible_output = has_visible_content(&data);
                     let filtered_data = Bytes::from(stream_filter.filter(&data));
 
-                    // Update in-memory ring + mode tracking (brief lock).
-                    match runtime_reader.lock() {
-                        Ok(mut rt) => {
-                            rt.push_output(&filtered_data, has_visible_output);
-                        }
-                        Err(_) => {
-                            warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
-                            break;
-                        }
-                    }
+                    // Single write lock: push output into vt100 parser and read
+                    // cursor position for terminal query responses.
+                    let cursor_position = {
+                        let mut rt = runtime_reader.write();
+                        rt.push_output(&filtered_data, has_visible_output)
+                    };
 
                     if !filtered_data.is_empty() {
                         if let Err(err) = append_output_raw(&reader_dir, &filtered_data) {
@@ -529,11 +548,6 @@ pub fn spawn_session(
                             "broadcast filtered PTY output chunk to live subscribers"
                         );
                     }
-
-                    let cursor_position = {
-                        let rt = runtime_reader.lock().unwrap();
-                        rt.screen_parser.screen().cursor_position()
-                    };
 
                     // Always let the daemon answer terminal queries that need
                     // a shared, session-global answer (currently CPR/DSR).
@@ -561,9 +575,7 @@ pub fn spawn_session(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    if let Ok(mut rt) = runtime_reader.lock() {
-                        rt.output_closed = true;
-                    }
+                    runtime_reader.write().output_closed = true;
                     warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
                     if let Err(append_err) =
                         append_event(&reader_dir, &format!("pty reader error: {err}"))
@@ -587,8 +599,13 @@ pub fn spawn_session(
 }
 
 // ---------------------------------------------------------------------------
-// Private helpers
+// Helpers
 // ---------------------------------------------------------------------------
+
+pub(crate) fn instant_to_utc(instant: Instant) -> Option<DateTime<Utc>> {
+    let elapsed = chrono::TimeDelta::from_std(instant.elapsed()).ok()?;
+    Utc::now().checked_sub_signed(elapsed)
+}
 
 fn format_command_for_display(command: &str, args: &[String]) -> String {
     if args.is_empty() {
@@ -677,7 +694,7 @@ mod tests {
             pty: PtyHandle {
                 child: make_test_child_with_exit_code(exit_code),
                 writer_tx,
-                pty_master: None,
+                pty_master: parking_lot::Mutex::new(None),
             },
             pty_size: None,
             resize_history: Vec::new(),
@@ -933,7 +950,7 @@ mod tests {
             pty: PtyHandle {
                 child: make_test_child_with_exit_code(0),
                 writer_tx,
-                pty_master: None,
+                pty_master: parking_lot::Mutex::new(None),
             },
             pty_size: None,
             resize_history: Vec::new(),
