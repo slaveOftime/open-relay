@@ -136,14 +136,18 @@ export default function AttachPanel({
     while (current) {
       const style = window.getComputedStyle(current)
       const overflowY = style.overflowY
-      const canScroll = (overflowY === 'auto' || overflowY === 'scroll') && current.scrollHeight > current.clientHeight
+      const canScroll =
+        (overflowY === 'auto' || overflowY === 'scroll') &&
+        current.scrollHeight > current.clientHeight
       if (canScroll) {
         return current
       }
       current = current.parentElement
     }
 
-    return document.scrollingElement instanceof HTMLElement ? document.scrollingElement : document.documentElement
+    return document.scrollingElement instanceof HTMLElement
+      ? document.scrollingElement
+      : document.documentElement
   }
 
   function scrollDrawerIntoView() {
@@ -478,7 +482,7 @@ export default function AttachPanel({
               className="hidden"
               onChange={handleFileInputChange}
             />
-          </div>        
+          </div>
         </div>
       </div>
       <div className="sm:hidden w-full h-10 flex justify-between items-center">

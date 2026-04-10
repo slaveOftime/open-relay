@@ -5,11 +5,10 @@ type FileDropZoneRenderState = {
   isDragOver: boolean
 }
 
-export interface FileDropZoneProps
-  extends Omit<
-    React.HTMLAttributes<HTMLDivElement>,
-    'children' | 'onDrop' | 'onDragEnter' | 'onDragLeave' | 'onDragOver'
-  > {
+export interface FileDropZoneProps extends Omit<
+  React.HTMLAttributes<HTMLDivElement>,
+  'children' | 'onDrop' | 'onDragEnter' | 'onDragLeave' | 'onDragOver'
+> {
   disabled?: boolean
   onFileDrop?: (file: File, files: FileList) => void | Promise<void>
   children: React.ReactNode | ((state: FileDropZoneRenderState) => React.ReactNode)

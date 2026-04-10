@@ -69,7 +69,7 @@ pub enum Commands {
     Stop(StopArgs),
     /// Attach to a running session.
     Attach(AttachArgs),
-    /// Show session logs.
+    /// Show session logs. Use runtime screen state if session is running, or `--from-file` to render from the persisted output.log file instead.
     Logs(LogsArgs),
     /// Send text or keys to a session. Example: `oly send <id> "hello" key:enter`.
     Send(SendArgs),
@@ -302,6 +302,9 @@ pub struct LogsArgs {
     /// Keep ANSI color codes in output.
     #[arg(long = "keep-color")]
     pub keep_color: bool,
+    /// Force rendering from the persisted output.log file instead of live screen state.
+    #[arg(long = "from-file")]
+    pub from_file: bool,
     /// Do not truncate columns.
     #[arg(long = "no-truncate")]
     pub no_truncate: bool,

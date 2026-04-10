@@ -30,8 +30,8 @@ pub(super) async fn run_notification_monitor(
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
 ) {
     let silence = std::time::Duration::from_secs(config.silence_seconds);
-    let attach_suppression_window = std::time::Duration::from_secs(3);
-    let min_notification_interval = std::time::Duration::from_secs(5);
+    let suppression_window = std::time::Duration::from_secs(5);
+    let min_notification_interval = std::time::Duration::from_secs(10);
     let patterns = compile_prompt_patterns(&config.prompt_patterns);
 
     info!(
@@ -45,7 +45,7 @@ pub(super) async fn run_notification_monitor(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
         let candidates: Vec<SilentCandidate> =
-            session_store.silent_candidates(attach_suppression_window, min_notification_interval);
+            session_store.silent_candidates(suppression_window, min_notification_interval);
 
         if !candidates.is_empty() {
             debug!(count = candidates.len(), "notification candidates detected");
@@ -53,7 +53,7 @@ pub(super) async fn run_notification_monitor(
 
         for candidate in candidates {
             let session_id = candidate.session_id.clone();
-            let excerpt = candidate.raw_excerpt.clone();
+            let excerpt = candidate.excerpt.clone();
             let output_epoch = candidate.output_epoch;
 
             debug!(session_id, "evaluating notification triggers for candidate");
@@ -64,8 +64,6 @@ pub(super) async fn run_notification_monitor(
                 "evaluating notification triggers for candidate in detail"
             );
 
-            let clean = strip_ansi_for_body(&excerpt);
-
             let (trigger_rule, trigger_detail) =
                 if let Some(pattern) = find_prompt_match(&excerpt, &patterns) {
                     info!(
@@ -75,7 +73,7 @@ pub(super) async fn run_notification_monitor(
                         "notification triggered"
                     );
                     (NotificationTriggerRule::RegexPattern, Some(pattern.clone()))
-                } else if let Some(llm_detail) = evaluate_llm_direct_trigger(&clean) {
+                } else if let Some(llm_detail) = evaluate_llm_direct_trigger(&excerpt) {
                     info!(
                         session_id,
                         trigger_rule = NotificationTriggerRule::LlmCheck.as_str(),

@@ -1,11 +1,13 @@
 use std::{
     io::{ErrorKind, Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, trace, warn};
@@ -13,13 +15,11 @@ use uuid::Uuid;
 
 use crate::{
     error::{AppError, Result},
-    protocol::LogResize,
+    protocol::{LogResize, SessionSummary},
     session::persist::append_output,
 };
 
-use super::pty::{
-    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content,
-};
+use super::pty::{EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client};
 
 use super::{
     SessionMeta, SessionStatus,
@@ -55,16 +55,12 @@ pub struct SessionRuntime {
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
     pub requested_final_status: Option<SessionStatus>,
-    /// Timestamp of the last visible output chunk; drives the notification engine.
-    pub last_visible_output_at: Option<Instant>,
     /// Total length of canonical filtered PTY output bytes.
     pub last_total_bytes: u64,
     /// Timestamp of the last output chunk.
     pub last_output_epoch: Option<Instant>,
     /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
-    /// Timestamp of the last subscribe/attach action; coarse presence signal.
-    pub last_attach_presence_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
     /// Number of currently connected local clients for this session.
@@ -73,8 +69,6 @@ pub struct SessionRuntime {
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
-    /// Canonical filtered-stream offset already folded into `notification_excerpt`.
-    pub notification_excerpt_end_offset: u64,
     /// Live rendered terminal state for attach snapshot restoration.
     pub screen_parser: vt100::Parser,
     /// Set once the PTY reader has reached EOF or a terminal read error.
@@ -94,16 +88,10 @@ impl SessionRuntime {
         }
     }
 
-    /// Push a filtered PTY chunk into the canonical retained stream and advance
-    /// the silence clock for visible content.
-    ///
-    /// Returns `Some(ModeSnapshot)` if tracked terminal modes changed.
-    pub fn push_output(&mut self, filtered_data: Bytes, has_visible_output: bool) {
-        // Advance the silence clock only for chunks with visible content.
-        if has_visible_output {
-            self.last_visible_output_at = Some(Instant::now());
-        }
-
+    /// Push a filtered PTY chunk into the canonical retained stream.
+    /// Returns the current cursor position so the caller can answer terminal
+    /// queries without re-locking.
+    pub fn push_output(&mut self, filtered_data: &[u8]) -> (u16, u16) {
         // Add the canonical filtered bytes to the retained terminal state.
         // Fully stripped chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
@@ -111,12 +99,40 @@ impl SessionRuntime {
                 .last_total_bytes
                 .saturating_add(filtered_data.len() as u64);
             self.last_output_epoch = Some(Instant::now());
-            self.screen_parser.process(filtered_data.as_ref());
+            self.screen_parser.process(filtered_data);
+        }
+
+        self.screen_parser.screen().cursor_position()
+    }
+
+    /// Build a `SessionSummary` snapshot from the current runtime state.
+    pub fn to_summary(&self) -> SessionSummary {
+        SessionSummary {
+            id: self.meta.id.clone(),
+            title: self.meta.title.clone(),
+            tags: self.meta.tags.clone(),
+            command: self.meta.command.clone(),
+            args: self.meta.args.clone(),
+            pid: self.meta.pid,
+            status: self.meta.status.as_str().to_string(),
+            created_at: self.meta.created_at,
+            started_at: self.meta.started_at,
+            ended_at: self.meta.ended_at,
+            cwd: self.meta.cwd.clone(),
+            input_needed: self.input_needed(),
+            notifications_enabled: self.notifications_enabled,
+            node: None,
+            last_total_bytes: self.last_total_bytes,
+            last_output_epoch: self.last_output_epoch.and_then(instant_to_utc),
         }
     }
 
     pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
         self.screen_parser.screen().state_formatted()
+    }
+
+    pub fn render_logs(&self, tail: usize, keep_color: bool, term_cols: u16) -> Vec<u8> {
+        super::logs::render_screen(&self.screen_parser, tail, keep_color, term_cols)
     }
 
     pub fn register_attach_client(&mut self) {
@@ -126,11 +142,9 @@ impl SessionRuntime {
             attach_count = self.attach_count,
             "attach client registered"
         );
-        self.last_attach_presence_at = Some(Instant::now());
     }
 
     pub fn mark_attach_activity(&mut self) {
-        self.last_attach_presence_at = Some(Instant::now());
         debug!(
             session_id = %self.meta.id,
             attach_count = self.attach_count,
@@ -152,16 +166,15 @@ impl SessionRuntime {
     }
 
     pub fn clear_attach_state(&mut self) {
-        debug!(session_id = %self.meta.id, "attach presence/activity cleared");
+        debug!(session_id = %self.meta.id, "attach activity cleared");
         self.attach_count = 0;
-        self.last_attach_presence_at = None;
         self.last_attach_activity_at = None;
     }
 
     pub fn input_needed(&self) -> bool {
         matches!(self.meta.status, SessionStatus::Running)
             && self.notified_output_epoch.is_some()
-            && self.notified_output_epoch == self.last_visible_output_at
+            && self.notified_output_epoch == self.last_output_epoch
     }
 
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
@@ -321,7 +334,7 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 // PTY spawning
 // ---------------------------------------------------------------------------
 
-/// Spawns a PTY-backed child process and returns an `Arc<Mutex<SessionRuntime>>`.
+/// Spawns a PTY-backed child process and returns an `Arc<RwLock<SessionRuntime>>`.
 /// Reader and writer threads are started automatically and share ownership via the Arc.
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
@@ -331,7 +344,7 @@ pub fn spawn_session(
     rows: u16,
     cols: u16,
     notifications_enabled: bool,
-) -> Result<Arc<Mutex<SessionRuntime>>> {
+) -> Result<Arc<RwLock<SessionRuntime>>> {
     let full_dir = session_dir;
     let reader_dir = full_dir.clone();
     info!(
@@ -429,10 +442,10 @@ pub fn spawn_session(
     let pty_handle = PtyHandle {
         child: runtime_child,
         writer_tx: writer_tx.clone(),
-        pty_master: Some(master),
+        pty_master: parking_lot::Mutex::new(Some(master)),
     };
 
-    let runtime = Arc::new(Mutex::new(SessionRuntime {
+    let runtime = Arc::new(RwLock::new(SessionRuntime {
         meta: meta.clone(),
         dir: full_dir,
         last_total_bytes: 0,
@@ -448,16 +461,13 @@ pub fn spawn_session(
         completed_at: None,
         persisted: false,
         requested_final_status: None,
-        last_visible_output_at: None,
         last_output_epoch: None,
         last_input_at: None,
-        last_attach_presence_at: None,
         last_attach_activity_at: None,
         attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
-        notification_excerpt_end_offset: 0,
-        screen_parser: vt100::Parser::new(rows, cols, (rows * 50) as usize),
+        screen_parser: vt100::Parser::new(rows, cols, 0),
         output_closed: false,
         notifications_enabled,
     }));
@@ -479,9 +489,7 @@ pub fn spawn_session(
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    if let Ok(mut rt) = runtime_reader.lock() {
-                        rt.output_closed = true;
-                    }
+                    runtime_reader.write().output_closed = true;
                     debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
                     if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
@@ -489,22 +497,17 @@ pub fn spawn_session(
                     break;
                 }
                 Ok(n) => {
-                    let data = Bytes::copy_from_slice(&buf[..n]);
+                    let data = &buf[..n];
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
-                    let has_visible_output = has_visible_content(&data);
                     let filtered_data = Bytes::from(stream_filter.filter(&data));
 
-                    // Update in-memory ring + mode tracking (brief lock).
-                    match runtime_reader.lock() {
-                        Ok(mut rt) => {
-                            rt.push_output(filtered_data.clone(), has_visible_output);
-                        }
-                        Err(_) => {
-                            warn!(session_id = %reader_session_id, "failed to lock runtime for PTY output processing");
-                            break;
-                        }
-                    }
+                    // Single write lock: push output into vt100 parser and read
+                    // cursor position for terminal query responses.
+                    let cursor_position = {
+                        let mut rt = runtime_reader.write();
+                        rt.push_output(&filtered_data)
+                    };
 
                     if !filtered_data.is_empty() {
                         if let Err(err) = append_output_raw(&reader_dir, &filtered_data) {
@@ -525,11 +528,6 @@ pub fn spawn_session(
                             "broadcast filtered PTY output chunk to live subscribers"
                         );
                     }
-
-                    let cursor_position = {
-                        let rt = runtime_reader.lock().unwrap();
-                        rt.screen_parser.screen().cursor_position()
-                    };
 
                     // Always let the daemon answer terminal queries that need
                     // a shared, session-global answer (currently CPR/DSR).
@@ -557,9 +555,7 @@ pub fn spawn_session(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    if let Ok(mut rt) = runtime_reader.lock() {
-                        rt.output_closed = true;
-                    }
+                    runtime_reader.write().output_closed = true;
                     warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
                     if let Err(append_err) =
                         append_event(&reader_dir, &format!("pty reader error: {err}"))
@@ -583,8 +579,13 @@ pub fn spawn_session(
 }
 
 // ---------------------------------------------------------------------------
-// Private helpers
+// Helpers
 // ---------------------------------------------------------------------------
+
+pub(crate) fn instant_to_utc(instant: Instant) -> Option<DateTime<Utc>> {
+    let elapsed = chrono::TimeDelta::from_std(instant.elapsed()).ok()?;
+    Utc::now().checked_sub_signed(elapsed)
+}
 
 fn format_command_for_display(command: &str, args: &[String]) -> String {
     if args.is_empty() {
@@ -673,22 +674,19 @@ mod tests {
             pty: PtyHandle {
                 child: make_test_child_with_exit_code(exit_code),
                 writer_tx,
-                pty_master: None,
+                pty_master: parking_lot::Mutex::new(None),
             },
             pty_size: None,
             resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: None,
             last_output_epoch: None,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
@@ -714,7 +712,7 @@ mod tests {
     fn test_push_output_enables_bracketed_paste() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(bytes::Bytes::from("text \x1b[?2004h more"), true);
+        rt.push_output(b"text \x1b[?2004h more");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -731,9 +729,9 @@ mod tests {
     #[test]
     fn test_push_output_disables_bracketed_paste() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::from("\x1b[?2004h"), false);
+        rt.push_output(b"\x1b[?2004h");
         assert!(rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(bytes::Bytes::from("\x1b[?2004l"), false);
+        rt.push_output(b"\x1b[?2004l");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -751,7 +749,7 @@ mod tests {
     fn test_push_output_enables_app_cursor_keys() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(bytes::Bytes::from("\x1b[?1h"), false);
+        rt.push_output(b"\x1b[?1h");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -768,9 +766,9 @@ mod tests {
     #[test]
     fn test_push_output_disables_app_cursor_keys() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::from("\x1b[?1h"), false);
+        rt.push_output(b"\x1b[?1h");
         assert!(rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(bytes::Bytes::from("\x1b[?1l"), false);
+        rt.push_output(b"\x1b[?1l");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -785,27 +783,27 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // push_output — last_output_at tracking
+    // push_output — last_output_epoch tracking
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_push_output_visible_content_advances_last_output_at() {
+    fn test_push_output_non_empty_advances_last_output_epoch() {
         let mut rt = new_runtime();
-        assert!(rt.last_visible_output_at.is_none());
-        rt.push_output(bytes::Bytes::from("hello world\n"), true);
+        assert!(rt.last_output_epoch.is_none());
+        rt.push_output(b"hello world\n");
         assert!(
-            rt.last_visible_output_at.is_some(),
-            "visible output should set last_output_at"
+            rt.last_output_epoch.is_some(),
+            "non-empty output should set last_output_epoch"
         );
     }
 
     #[test]
-    fn test_push_output_pure_ansi_does_not_advance_last_output_at() {
+    fn test_push_output_empty_does_not_advance_last_output_epoch() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::from("\x1b[1A\x1b[2K\x1b[H"), false);
+        rt.push_output(b"");
         assert!(
-            rt.last_visible_output_at.is_none(),
-            "pure ANSI sequences should not advance last_output_at"
+            rt.last_output_epoch.is_none(),
+            "empty output should not advance last_output_epoch"
         );
     }
 
@@ -814,7 +812,7 @@ mod tests {
         let mut rt = new_runtime();
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(filtered.clone(), true);
+        rt.push_output(filtered.as_ref());
 
         assert_eq!(
             rt.screen_parser.screen().contents().trim_end(),
@@ -828,7 +826,7 @@ mod tests {
         let mut rt = new_runtime();
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(filtered, true);
+        rt.push_output(filtered.as_ref());
 
         assert_eq!(rt.last_total_bytes, 11);
     }
@@ -836,7 +834,7 @@ mod tests {
     #[test]
     fn test_push_output_drops_fully_stripped_chunks_from_snapshot() {
         let mut rt = new_runtime();
-        rt.push_output(bytes::Bytes::new(), false);
+        rt.push_output(&[]);
 
         assert!(rt.screen_parser.screen().contents().trim().is_empty());
         assert_eq!(rt.last_total_bytes, 0);
@@ -929,22 +927,19 @@ mod tests {
             pty: PtyHandle {
                 child: make_test_child_with_exit_code(0),
                 writer_tx,
-                pty_master: None,
+                pty_master: parking_lot::Mutex::new(None),
             },
             pty_size: None,
             resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: None,
             last_output_epoch: None,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,

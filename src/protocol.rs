@@ -221,13 +221,13 @@ pub enum RpcRequest {
         tail: usize,
         keep_color: bool,
         term_cols: u16,
+        #[serde(default)]
+        from_file: bool,
     },
     LogsPagination {
         id: String,
         offset: Option<usize>,
         limit: usize,
-        #[serde(default)]
-        tail: bool,
     },
     /// Block until the session emits an `InputNeeded` notification (or exits /
     /// times out), then return a snapshot.  Response is `LogsTail`.

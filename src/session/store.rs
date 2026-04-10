@@ -1,14 +1,15 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures_util::future::join_all;
+use parking_lot::RwLock;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, info, trace, warn};
@@ -18,13 +19,12 @@ use crate::{
     db::Database,
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
-    session::{
-        ModeSnapshot, SessionEvent, SessionEventTx, SessionLiveSummary, normalize_session_tags,
-    },
+    session::{SessionEvent, SessionEventTx, SessionLiveSummary, normalize_session_tags},
 };
 
 use super::{
     SessionError, SessionMeta, SessionStatus, StartSpec,
+    logs::split_rendered_log_output,
     persist::{append_event, append_resize_event, current_output_offset, read_output_from},
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
@@ -49,177 +49,22 @@ struct StoreMutableState {
     evicted_sessions: HashMap<String, Instant>,
 }
 
-#[derive(Debug, Clone)]
-struct SessionRuntimeSnapshot {
-    total_bytes: u64,
-    summary: SessionSummary,
-    last_output_at: Option<Instant>,
-    mode_snapshot: ModeSnapshot,
-    output_closed: bool,
-    last_attach_activity_at: Option<Instant>,
-    last_notified_at: Option<Instant>,
-    notified_output_epoch: Option<Instant>,
-    running: bool,
-    exit_code: Option<i32>,
-}
-
-impl SessionRuntimeSnapshot {
-    fn from_runtime(rt: &SessionRuntime) -> Self {
-        let input_needed = rt.input_needed();
-        Self {
-            total_bytes: rt.last_total_bytes,
-            summary: SessionSummary {
-                id: rt.meta.id.clone(),
-                title: rt.meta.title.clone(),
-                tags: rt.meta.tags.clone(),
-                command: rt.meta.command.clone(),
-                args: rt.meta.args.clone(),
-                pid: rt.meta.pid,
-                status: rt.meta.status.as_str().to_string(),
-                created_at: rt.meta.created_at,
-                started_at: rt.meta.started_at,
-                ended_at: rt.meta.ended_at,
-                cwd: rt.meta.cwd.clone(),
-                input_needed,
-                notifications_enabled: rt.notifications_enabled,
-                node: None,
-                last_total_bytes: rt.last_total_bytes,
-                last_output_epoch: rt.last_output_epoch.and_then(instant_to_utc),
-            },
-            last_output_at: rt.last_visible_output_at,
-            mode_snapshot: rt.mode_snapshot(),
-            output_closed: rt.output_closed,
-            last_attach_activity_at: rt.last_attach_activity_at,
-            last_notified_at: rt.last_notified_at,
-            notified_output_epoch: rt.notified_output_epoch,
-            running: !rt.is_completed(),
-            exit_code: rt.meta.exit_code,
-        }
-    }
-}
-
-fn instant_to_utc(instant: Instant) -> Option<DateTime<Utc>> {
-    let elapsed = chrono::TimeDelta::from_std(instant.elapsed()).ok()?;
-    Utc::now().checked_sub_signed(elapsed)
-}
-
 struct SessionHandle {
-    runtime: Arc<Mutex<SessionRuntime>>,
-    snapshot: ArcSwap<SessionRuntimeSnapshot>,
+    runtime: Arc<RwLock<SessionRuntime>>,
 }
 
 impl SessionHandle {
-    fn new(runtime: Arc<Mutex<SessionRuntime>>) -> Self {
-        let initial = runtime
-            .lock()
-            .map(|rt| SessionRuntimeSnapshot::from_runtime(&rt))
-            .unwrap_or_else(|poisoned| SessionRuntimeSnapshot::from_runtime(poisoned.get_ref()));
-        Self {
-            runtime,
-            snapshot: ArcSwap::from_pointee(initial),
-        }
+    fn new(runtime: Arc<RwLock<SessionRuntime>>) -> Self {
+        Self { runtime }
     }
 
-    fn snapshot(&self) -> Arc<SessionRuntimeSnapshot> {
-        self.snapshot.load_full()
+    fn read(&self) -> parking_lot::RwLockReadGuard<'_, SessionRuntime> {
+        self.runtime.read()
     }
 
-    fn refresh_snapshot(&self, rt: &SessionRuntime) {
-        self.snapshot
-            .store(Arc::new(SessionRuntimeSnapshot::from_runtime(rt)));
+    fn write(&self) -> parking_lot::RwLockWriteGuard<'_, SessionRuntime> {
+        self.runtime.write()
     }
-
-    fn lock_runtime(&self) -> MutexGuard<'_, SessionRuntime> {
-        lock_runtime_recover(&self.runtime)
-    }
-}
-
-fn lock_runtime_recover(runtime: &Mutex<SessionRuntime>) -> MutexGuard<'_, SessionRuntime> {
-    match runtime.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            warn!(
-                session_id = %poisoned.get_ref().meta.id,
-                "session runtime lock poisoned; recovering"
-            );
-            poisoned.into_inner()
-        }
-    }
-}
-
-fn visible_screen_excerpt(parser: &vt100::Parser) -> String {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let mut lines: Vec<String> = screen
-        .rows(0, cols)
-        .take(rows as usize)
-        .map(|row| row.trim_end().to_string())
-        .collect();
-
-    while matches!(lines.last(), Some(line) if line.is_empty()) {
-        lines.pop();
-    }
-
-    lines.join("\n")
-}
-
-fn notification_excerpt_window_bytes(parser: &vt100::Parser) -> u64 {
-    let (rows, cols) = parser.screen().size();
-    ((rows as u64).saturating_mul(cols as u64).saturating_mul(8)).max(4096)
-}
-
-struct NotificationExcerptPlan {
-    session_id: String,
-    dir: PathBuf,
-    rows: u16,
-    cols: u16,
-    start_offset: u64,
-    end_offset: u64,
-    cached_end_offset: u64,
-}
-
-fn build_notification_excerpt_plan(rt: &SessionRuntime) -> NotificationExcerptPlan {
-    let (rows, cols) = rt.screen_parser.screen().size();
-    let end_offset = rt.last_total_bytes;
-    let start_offset = rt
-        .notification_excerpt_end_offset
-        .min(end_offset)
-        .max(end_offset.saturating_sub(notification_excerpt_window_bytes(&rt.screen_parser)));
-    NotificationExcerptPlan {
-        session_id: rt.meta.id.clone(),
-        dir: rt.dir.clone(),
-        rows,
-        cols,
-        start_offset,
-        end_offset,
-        cached_end_offset: rt.notification_excerpt_end_offset,
-    }
-}
-
-fn recent_notification_excerpt(plan: &NotificationExcerptPlan) -> Option<String> {
-    if plan.start_offset == plan.cached_end_offset && plan.start_offset == plan.end_offset {
-        return None;
-    }
-
-    let (bytes, _actual_end_offset) = match read_output_from(&plan.dir, plan.start_offset) {
-        Ok(result) => result,
-        Err(err) => {
-            warn!(
-                session_id = %plan.session_id,
-                %err,
-                start_offset = plan.start_offset,
-                "failed to refresh recent notification excerpt"
-            );
-            return None;
-        }
-    };
-
-    let mut parser = vt100::Parser::new(plan.rows, plan.cols, 0);
-    if !bytes.is_empty() {
-        parser.process(&bytes);
-    }
-
-    Some(visible_screen_excerpt(&parser))
 }
 
 pub struct SessionStore {
@@ -234,7 +79,7 @@ pub struct SessionStore {
 pub struct SilentCandidate {
     pub session_id: String,
     pub session_title: Option<String>,
-    pub raw_excerpt: String,
+    pub excerpt: String,
     pub output_epoch: Instant,
     pub notifications_enabled: bool,
     pub last_total_bytes: u64,
@@ -339,7 +184,7 @@ impl SessionStore {
 
         if result.is_err() {
             {
-                let mut rt = lock_runtime_recover(&cleanup_runtime);
+                let mut rt = cleanup_runtime.write();
                 let _ = rt.pty.kill();
                 rt.mark_completed(SessionStatus::Failed, None);
             }
@@ -361,7 +206,7 @@ impl SessionStore {
         let sessions = self.sessions.load();
         let running_count = sessions
             .values()
-            .filter(|handle| handle.snapshot().running)
+            .filter(|handle| !handle.read().is_completed())
             .count();
 
         let mut state = self.mutable.lock().await;
@@ -413,7 +258,7 @@ impl SessionStore {
     async fn commit_started_session(
         &self,
         meta: SessionMeta,
-        runtime: Arc<Mutex<SessionRuntime>>,
+        runtime: Arc<RwLock<SessionRuntime>>,
     ) -> Result<String> {
         let id = meta.id.clone();
         let update_result = self.db.update_session(&meta).await;
@@ -439,7 +284,7 @@ impl SessionStore {
         let live_sessions = self.sessions.load();
         for session in &mut sessions {
             if let Some(handle) = live_sessions.get(&session.id) {
-                *session = handle.snapshot().summary.clone();
+                *session = handle.read().to_summary();
             }
         }
 
@@ -448,9 +293,7 @@ impl SessionStore {
 
     pub fn get_summary(&self, id: &str) -> Option<SessionSummary> {
         let sessions = self.sessions.load();
-        sessions
-            .get(id)
-            .map(|handle| handle.snapshot().summary.clone())
+        sessions.get(id).map(|handle| handle.read().to_summary())
     }
 
     /// Returns summaries for all sessions that are currently held in memory
@@ -461,10 +304,10 @@ impl SessionStore {
         sessions
             .values()
             .map(|handle| {
-                let snapshot = handle.snapshot();
+                let rt = handle.read();
                 SessionLiveSummary {
-                    last_output_at: snapshot.last_output_at,
-                    summary: snapshot.summary.clone(),
+                    last_output_at: rt.last_output_epoch,
+                    summary: rt.to_summary(),
                 }
             })
             .collect()
@@ -474,14 +317,14 @@ impl SessionStore {
         let sessions = self.sessions.load();
         sessions
             .get(id)
-            .and_then(|handle| handle.snapshot().exit_code)
+            .and_then(|handle| handle.read().meta.exit_code)
     }
 
     pub fn is_running(&self, id: &str) -> bool {
         let sessions = self.sessions.load();
         sessions
             .get(id)
-            .map(|handle| handle.snapshot().running)
+            .map(|handle| !handle.read().is_completed())
             .unwrap_or(false)
     }
 
@@ -489,7 +332,7 @@ impl SessionStore {
         let sessions = self.sessions.load();
         sessions
             .get(id)
-            .map(|handle| handle.snapshot().summary.input_needed)
+            .map(|handle| handle.read().input_needed())
             .unwrap_or(false)
     }
 
@@ -499,8 +342,8 @@ impl SessionStore {
             .get(id)
             .map(|handle| {
                 handle
-                    .snapshot()
-                    .last_output_at
+                    .read()
+                    .last_output_epoch
                     .map(|last_output| {
                         std::time::Instant::now().duration_since(last_output) >= duration
                     })
@@ -512,26 +355,74 @@ impl SessionStore {
     /// Returns the current terminal mode snapshot for the session, if available.
     pub fn get_mode_snapshot(&self, id: &str) -> Option<crate::session::ModeSnapshot> {
         let sessions = self.sessions.load();
-        sessions
-            .get(id)
-            .map(|handle| handle.snapshot().mode_snapshot)
+        sessions.get(id).map(|handle| handle.read().mode_snapshot())
+    }
+
+    pub async fn render_live_logs(
+        &self,
+        id: &str,
+        tail: usize,
+        keep_color: bool,
+        term_cols: u16,
+    ) -> std::result::Result<(Vec<u8>, Vec<crate::protocol::LogResize>), SessionError> {
+        let handle = self.lookup_runtime(id).await?;
+        let rt = handle.read();
+        if rt.is_completed() || rt.output_closed {
+            return Err(SessionError::NotRunning);
+        }
+        Ok((
+            rt.render_logs(tail, keep_color, term_cols),
+            rt.resize_history.clone(),
+        ))
+    }
+
+    pub async fn read_live_log_tail_page(
+        &self,
+        id: &str,
+        tail: usize,
+    ) -> std::result::Result<
+        (Vec<String>, usize, usize, Vec<crate::protocol::LogResize>),
+        SessionError,
+    > {
+        let handle = self.lookup_runtime(id).await?;
+        let rt = handle.read();
+        if rt.is_completed() || rt.output_closed {
+            return Err(SessionError::NotRunning);
+        }
+
+        let term_cols = rt
+            .pty_size
+            .map(|(_, cols)| cols)
+            .or_else(|| rt.resize_history.last().map(|resize| resize.cols))
+            .filter(|cols| *cols > 0)
+            .unwrap_or(80);
+        let chunks = split_rendered_log_output(&rt.render_logs(tail, true, term_cols));
+        let total = chunks.len();
+
+        Ok((chunks, total, 0, rt.resize_history.clone()))
+    }
+
+    pub async fn read_live_log_chunk_count(
+        &self,
+        id: &str,
+    ) -> std::result::Result<usize, SessionError> {
+        let (_, total, _, _) = self.read_live_log_tail_page(id, usize::MAX).await?;
+        Ok(total)
     }
 
     pub async fn attach_stream_status(
         &self,
         id: &str,
     ) -> std::result::Result<(bool, bool, Option<i32>), SessionError> {
-        let runtime = self.lookup_runtime(id).await?;
-        let snapshot = runtime.snapshot();
-        Ok((snapshot.running, snapshot.output_closed, snapshot.exit_code))
+        let handle = self.lookup_runtime(id).await?;
+        let rt = handle.read();
+        Ok((!rt.is_completed(), rt.output_closed, rt.meta.exit_code))
     }
 
     pub async fn register_attach_client(&self, id: &str) {
         let sessions = self.sessions.load();
         if let Some(handle) = sessions.get(id).cloned() {
-            let mut rt = handle.lock_runtime();
-            rt.register_attach_client();
-            handle.refresh_snapshot(&rt);
+            handle.write().register_attach_client();
         }
     }
 
@@ -553,9 +444,9 @@ impl SessionStore {
         ),
         SessionError,
     > {
-        let runtime = self.lookup_runtime(id).await?;
+        let handle = self.lookup_runtime(id).await?;
         let (dir, rx, modes) = {
-            let rt = runtime.lock_runtime();
+            let rt = handle.read();
             (
                 rt.dir.clone(),
                 rt.broadcast_tx.subscribe(),
@@ -598,8 +489,8 @@ impl SessionStore {
         (Vec<u8>, u64, broadcast::Receiver<Arc<Bytes>>, bool, bool),
         SessionError,
     > {
-        let runtime = self.lookup_runtime(id).await?;
-        let rt = runtime.lock_runtime();
+        let handle = self.lookup_runtime(id).await?;
+        let rt = handle.read();
         let snapshot = rt.attach_snapshot_bytes();
         let end_offset = current_output_offset(&rt.dir);
         let rx = rt.broadcast_tx.subscribe();
@@ -629,15 +520,13 @@ impl SessionStore {
     ) -> Option<(broadcast::Receiver<(u16, u16)>, Option<(u16, u16)>)> {
         let sessions = self.sessions.load();
         let handle = sessions.get(id)?;
-        let rt = handle.lock_runtime();
+        let rt = handle.read();
         Some((rt.resize_tx.subscribe(), rt.pty_size))
     }
 
     pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionError> {
-        let runtime = self.lookup_runtime(id).await?;
-        let mut rt = runtime.lock_runtime();
-        rt.detach_attach_client();
-        runtime.refresh_snapshot(&rt);
+        let handle = self.lookup_runtime(id).await?;
+        handle.write().detach_attach_client();
         debug!(session_id = id, "attach detach acknowledged");
         Ok(())
     }
@@ -647,13 +536,12 @@ impl SessionStore {
         id: &str,
         enabled: bool,
     ) -> std::result::Result<(), SessionError> {
-        let runtime = self.lookup_runtime(id).await?;
-        let mut rt = runtime.lock_runtime();
+        let handle = self.lookup_runtime(id).await?;
+        let mut rt = handle.write();
         if rt.is_completed() {
             return Err(SessionError::NotRunning);
         }
         rt.set_notifications_enabled(enabled);
-        runtime.refresh_snapshot(&rt);
         debug!(
             session_id = id,
             notifications_enabled = enabled,
@@ -673,15 +561,13 @@ impl SessionStore {
             return Ok(());
         }
 
-        let runtime = self.lookup_runtime(id).await?;
+        let handle = self.lookup_runtime(id).await?;
+
+        // Read lock: gather mode flags, transform input, send to PTY channel.
+        // try_write_input() is a non-blocking channel send that only needs &self.
         let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
-            let mut rt = runtime.lock_runtime();
+            let rt = handle.read();
             let initial_total_bytes = rt.last_total_bytes;
-            // When the child process has enabled DECCKM (application cursor key
-            // mode via `\x1b[?1h`), arrow key sequences must use `\x1bO` prefix
-            // instead of `\x1b[`. Transform transparently here so both
-            // `oly attach` and `oly send` always work, regardless of whether the
-            // caller tracks DECCKM state itself.
             let modes = rt.mode_snapshot();
             let cooked;
             let transformed = modes.app_cursor_keys
@@ -702,17 +588,12 @@ impl SessionStore {
 
             let byte_len = bytes.len();
             match rt.pty.try_write_input(bytes) {
-                Ok(()) => {
-                    rt.mark_attach_activity();
-                    rt.last_input_at = Some(Instant::now());
-                    runtime.refresh_snapshot(&rt);
-                    Ok((
-                        initial_total_bytes,
-                        byte_len,
-                        transformed,
-                        modes.app_cursor_keys,
-                    ))
-                }
+                Ok(()) => Ok((
+                    initial_total_bytes,
+                    byte_len,
+                    transformed,
+                    modes.app_cursor_keys,
+                )),
                 Err(TrySendError::Full(_)) => {
                     debug!(
                         session_id = id,
@@ -732,6 +613,13 @@ impl SessionStore {
             }
         }?;
 
+        // Brief write lock: only touch the two timestamp fields.
+        {
+            let mut rt = handle.write();
+            rt.mark_attach_activity();
+            rt.last_input_at = Some(Instant::now());
+        }
+
         debug!(
             session_id = id,
             bytes = byte_len,
@@ -742,7 +630,7 @@ impl SessionStore {
 
         if wait_for_change {
             let _ = self
-                .wait_for_output_change(id, &runtime, initial_total_bytes)
+                .wait_for_output_change(id, &handle, initial_total_bytes)
                 .await;
         }
 
@@ -750,13 +638,12 @@ impl SessionStore {
     }
 
     pub async fn attach_busy(&self, id: &str) -> std::result::Result<(), SessionError> {
-        let runtime = self.lookup_runtime(id).await?;
+        let handle = self.lookup_runtime(id).await?;
         let summary = {
-            let mut rt = runtime.lock_runtime();
+            let mut rt = handle.write();
             rt.mark_attach_activity();
             rt.last_output_epoch = Some(Instant::now());
-            runtime.refresh_snapshot(&rt);
-            runtime.snapshot().summary.clone()
+            rt.to_summary()
         };
 
         let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
@@ -767,15 +654,12 @@ impl SessionStore {
     async fn wait_for_output_change(
         &self,
         id: &str,
-        runtime: &Arc<SessionHandle>,
+        handle: &Arc<SessionHandle>,
         initial_total_bytes: u64,
     ) -> bool {
         let started = Instant::now();
         loop {
-            let current_total_bytes = {
-                let rt = runtime.lock_runtime();
-                rt.last_total_bytes
-            };
+            let current_total_bytes = handle.read().last_total_bytes;
 
             if current_total_bytes != initial_total_bytes {
                 debug!(
@@ -808,16 +692,19 @@ impl SessionStore {
         rows: u16,
         cols: u16,
     ) -> std::result::Result<(), SessionError> {
-        let runtime = self.lookup_runtime(id).await?;
-        let mut rt = runtime.lock_runtime();
-        rt.mark_attach_activity();
-        let resized = rt.resize_pty(rows, cols);
-        runtime.refresh_snapshot(&rt);
+        let handle = self.lookup_runtime(id).await?;
+        let resized = {
+            let mut rt = handle.write();
+            rt.mark_attach_activity();
+            rt.resize_pty(rows, cols)
+        };
+
         debug!(
             session_id = id,
             rows, cols, resized, "attach resize requested"
         );
         if resized {
+            let rt = handle.read();
             let offset = current_output_offset(&rt.dir);
             let _ = append_resize_event(&rt.dir, offset, rows, cols);
             Ok(())
@@ -869,7 +756,7 @@ impl SessionStore {
 
     async fn terminate_runtime(
         session_id: String,
-        runtime: Arc<SessionHandle>,
+        handle: Arc<SessionHandle>,
         grace_seconds: u64,
         requested_final_status: SessionStatus,
     ) -> bool {
@@ -889,9 +776,9 @@ impl SessionStore {
         // Begin a soft-stop sequence and let the child exit on its own before
         // escalating to a forced kill when the grace window expires.
         {
-            let mut rt = runtime.lock_runtime();
+            // Brief write lock: check/update status.
+            let mut rt = handle.write();
             if rt.refresh_status() {
-                runtime.refresh_snapshot(&rt);
                 debug!(
                     session_id = %session_id,
                     status = rt.meta.status.as_str(),
@@ -902,46 +789,26 @@ impl SessionStore {
             }
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
-            runtime.refresh_snapshot(&rt);
-            if let Some((_, input)) = soft_stop_schedule.first() {
-                match rt.pty.try_write_input((*input).to_vec()) {
-                    Ok(()) => {
-                        debug!(
-                            session_id = %session_id,
-                            stage = 1,
-                            total_stages = soft_stop_schedule.len(),
-                            bytes = input.len(),
-                            "sent soft-stop input"
-                        );
-                    }
-                    Err(TrySendError::Full(_)) => {
-                        warn!(
-                            session_id = %session_id,
-                            stage = 1,
-                            total_stages = soft_stop_schedule.len(),
-                            bytes = input.len(),
-                            "soft-stop input dropped because PTY writer queue is full"
-                        );
-                    }
-                    Err(TrySendError::Closed(_)) => {
-                        warn!(
-                            session_id = %session_id,
-                            stage = 1,
-                            total_stages = soft_stop_schedule.len(),
-                            bytes = input.len(),
-                            "soft-stop input failed because PTY writer is closed"
-                        );
-                    }
-                }
-                next_soft_stop_index = 1;
-            }
+        }
+        // Read lock: send first soft-stop input (channel send is &self).
+        if let Some((_, input)) = soft_stop_schedule.first() {
+            let rt = handle.read();
+            log_soft_stop_send(
+                &rt.pty,
+                &session_id,
+                1,
+                soft_stop_schedule.len(),
+                input,
+                &start,
+            );
+            next_soft_stop_index = 1;
         }
 
         while Instant::now() < deadline {
             {
-                let mut rt = runtime.lock_runtime();
+                // Brief write lock: poll child exit status.
+                let mut rt = handle.write();
                 if rt.refresh_status() {
-                    runtime.refresh_snapshot(&rt);
                     debug!(
                         session_id = %session_id,
                         elapsed_ms = start.elapsed().as_millis(),
@@ -951,52 +818,30 @@ impl SessionStore {
                     );
                     return true;
                 }
-                while let Some((_, input)) = soft_stop_schedule.get(next_soft_stop_index) {
-                    if Instant::now() < soft_stop_schedule[next_soft_stop_index].0 {
+            }
+            // Read lock: send any due staged soft-stop inputs.
+            {
+                let rt = handle.read();
+                while let Some((at, input)) = soft_stop_schedule.get(next_soft_stop_index) {
+                    if Instant::now() < *at {
                         break;
                     }
-                    match rt.pty.try_write_input((*input).to_vec()) {
-                        Ok(()) => {
-                            debug!(
-                                session_id = %session_id,
-                                stage = next_soft_stop_index + 1,
-                                total_stages = soft_stop_schedule.len(),
-                                bytes = input.len(),
-                                elapsed_ms = start.elapsed().as_millis(),
-                                "sent staged soft-stop input"
-                            );
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            warn!(
-                                session_id = %session_id,
-                                stage = next_soft_stop_index + 1,
-                                total_stages = soft_stop_schedule.len(),
-                                bytes = input.len(),
-                                elapsed_ms = start.elapsed().as_millis(),
-                                "staged soft-stop input dropped because PTY writer queue is full"
-                            );
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            warn!(
-                                session_id = %session_id,
-                                stage = next_soft_stop_index + 1,
-                                total_stages = soft_stop_schedule.len(),
-                                bytes = input.len(),
-                                elapsed_ms = start.elapsed().as_millis(),
-                                "staged soft-stop input failed because PTY writer is closed"
-                            );
-                        }
-                    }
+                    log_soft_stop_send(
+                        &rt.pty,
+                        &session_id,
+                        next_soft_stop_index + 1,
+                        soft_stop_schedule.len(),
+                        input,
+                        &start,
+                    );
                     next_soft_stop_index += 1;
                 }
-                runtime.refresh_snapshot(&rt);
             }
             tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
         }
 
-        let mut rt = runtime.lock_runtime();
+        let mut rt = handle.write();
         if rt.refresh_status() {
-            runtime.refresh_snapshot(&rt);
             info!(
                 session_id = %session_id,
                 elapsed_ms = start.elapsed().as_millis(),
@@ -1014,7 +859,6 @@ impl SessionStore {
         );
         if rt.pty.kill().is_ok() {
             let _ = rt.refresh_status();
-            runtime.refresh_snapshot(&rt);
             info!(
                 session_id = %session_id,
                 status = rt.meta.status.as_str(),
@@ -1090,8 +934,8 @@ impl SessionStore {
         let mut evicted_ids: Vec<String> = Vec::new();
         let sessions = self.sessions.load_full();
 
-        for (id, runtime) in sessions.iter() {
-            let mut rt = runtime.lock_runtime();
+        for (id, handle) in sessions.iter() {
+            let mut rt = handle.write();
             rt.refresh_status();
 
             if rt.is_completed() && !rt.persisted {
@@ -1102,7 +946,6 @@ impl SessionStore {
             if rt.is_completed() {
                 let Some(completed_at) = rt.completed_at else {
                     rt.completed_at = Some(now);
-                    runtime.refresh_snapshot(&rt);
                     continue;
                 };
                 if now.duration_since(completed_at) >= self.eviction_ttl {
@@ -1115,8 +958,6 @@ impl SessionStore {
                     evicted_ids.push(id.clone());
                 }
             }
-
-            runtime.refresh_snapshot(&rt);
         }
 
         // Persist completed sessions outside the borrow of `self.sessions`.
@@ -1167,64 +1008,63 @@ impl SessionStore {
         let sessions = self.sessions.load();
         sessions
             .values()
-            .filter_map(|runtime| {
-                let snapshot = runtime.snapshot();
-                if !snapshot.running {
+            .filter_map(|handle| {
+                let rt = handle.read();
+                if rt.is_completed() {
                     return None;
                 }
 
-                // Suppress notification until output advances
-                // if there was attach activity in recent supression window.
-                // Because normally every input may cause some output, which should not be notified in short time.
-                if let Some(last_attach_activity) = snapshot.last_attach_activity_at {
+                // If attach just happend, there is not need to notify in supression window, treat it as notified
+                if let Some(last_attach_activity) = rt.last_attach_activity_at {
                     if now.duration_since(last_attach_activity) < attach_suppression_window {
-                        // suppress notification and reset last_output_at to prevent repeated notifications
-                        // for the same output epoch after attach activity.
-                        let mut rt = runtime.lock_runtime();
-                        rt.last_visible_output_at = None;
+                        trace!("silent becase recent attach activity");
+                        drop(rt);
+                        let mut rt = handle.write();
+                        rt.last_notified_at = rt.last_output_epoch;
                         return None;
                     }
                 }
 
-                // Silence condition: no visible output for `silence` duration.
-                let last_output = snapshot.last_output_at?;
-
-                // Drop short-age candidates to prevent repeated alerts in a
-                // short interval even when monitor ticks every second.
-                if let Some(last_notified_at) = snapshot.last_notified_at {
-                    if now.duration_since(last_notified_at) < min_notification_interval {
-                        return None;
-                    }
-                }
-                // Already notified for this exact output epoch.
-                // Suppress until new visible output advances the epoch.
-                if snapshot.notified_output_epoch == Some(last_output) {
+                // If output just happend, there is not need to notify in supression window, treat it as notified
+                let last_output = rt.last_output_epoch?;
+                if now.duration_since(last_output) < attach_suppression_window {
+                    trace!("silent becase recent output activity");
                     return None;
                 }
 
-                let plan = {
-                    let rt = runtime.lock_runtime();
-                    build_notification_excerpt_plan(&rt)
-                };
-                let excerpt = if let Some(excerpt) = recent_notification_excerpt(&plan) {
-                    let mut rt = runtime.lock_runtime();
-                    if rt.last_total_bytes == plan.end_offset
-                        && rt.notification_excerpt_end_offset <= plan.start_offset
-                    {
-                        rt.notification_excerpt_end_offset = plan.end_offset;
+                // If just notified in short time, the there is no need notify again
+                if let Some(last_notified_at) = rt.last_notified_at {
+                    if last_output - last_notified_at < min_notification_interval {
+                        trace!("silent becase just notified since last output");
+                        return None;
                     }
-                    excerpt
-                } else {
-                    String::new()
-                };
+                }
 
+                if rt.notified_output_epoch == Some(last_output) {
+                    trace!("silent becase no changed since last nofification");
+                    return None;
+                }
+
+                debug!(
+                    session_id = rt.meta.id.as_str(),
+                    last_input_at = ?rt.last_input_at,
+                    last_attach_activity_at = ?rt.last_attach_activity_at,
+                    last_output_epoch = ?rt.last_output_epoch,
+                    last_notified_at = ?rt.last_notified_at,
+                    "silent candidate ready"
+                );
+
+                // As this is most for matching some pattern from coding agent cli, most of them have input box under the bottom.
+                // And most of them are using alt screen, it is more accurate to just use the live tail logs.
+                // Silent can still be a fallback, just need to wait a little bit longer for the notification.
+                let excerpt = rt.render_logs(15, false, u16::MAX);
                 Some(SilentCandidate {
-                    session_id: snapshot.summary.id.clone(),
-                    session_title: snapshot.summary.title.clone(),
-                    raw_excerpt: excerpt,
+                    session_id: rt.meta.id.clone(),
+                    session_title: rt.meta.title.clone(),
+                    excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
                     output_epoch: last_output,
-                    notifications_enabled: snapshot.summary.notifications_enabled,
-                    last_total_bytes: snapshot.total_bytes,
+                    notifications_enabled: rt.notifications_enabled,
+                    last_total_bytes: rt.last_total_bytes,
                 })
             })
             .collect()
@@ -1234,11 +1074,53 @@ impl SessionStore {
     /// Re-notification is suppressed until output advances to a new epoch.
     pub fn mark_notified(&self, session_id: &str, output_epoch: Instant, notified_at: Instant) {
         let sessions = self.sessions.load();
-        if let Some(runtime) = sessions.get(session_id) {
-            let mut rt = runtime.lock_runtime();
+        if let Some(handle) = sessions.get(session_id) {
+            let mut rt = handle.write();
             rt.notified_output_epoch = Some(output_epoch);
             rt.last_notified_at = Some(notified_at);
-            runtime.refresh_snapshot(&rt);
+        }
+    }
+}
+
+/// Send a soft-stop input to the PTY and log the result.
+fn log_soft_stop_send(
+    pty: &super::pty::PtyHandle,
+    session_id: &str,
+    stage: usize,
+    total_stages: usize,
+    input: &[u8],
+    start: &Instant,
+) {
+    match pty.try_write_input(input.to_vec()) {
+        Ok(()) => {
+            debug!(
+                session_id,
+                stage,
+                total_stages,
+                bytes = input.len(),
+                elapsed_ms = start.elapsed().as_millis(),
+                "sent soft-stop input"
+            );
+        }
+        Err(TrySendError::Full(_)) => {
+            warn!(
+                session_id,
+                stage,
+                total_stages,
+                bytes = input.len(),
+                elapsed_ms = start.elapsed().as_millis(),
+                "soft-stop input dropped because PTY writer queue is full"
+            );
+        }
+        Err(TrySendError::Closed(_)) => {
+            warn!(
+                session_id,
+                stage,
+                total_stages,
+                bytes = input.len(),
+                elapsed_ms = start.elapsed().as_millis(),
+                "soft-stop input failed because PTY writer is closed"
+            );
         }
     }
 }
@@ -1272,14 +1154,14 @@ mod tests {
     use super::*;
     use crate::session::{SessionMeta, SessionStatus, pty::collect_chunk_bytes};
     use chrono::Utc;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn make_runtime(
         id: &str,
         status: SessionStatus,
         excerpt: &str,
         last_output_ago: Option<Duration>,
-    ) -> Arc<Mutex<super::super::runtime::SessionRuntime>> {
+    ) -> Arc<RwLock<super::super::runtime::SessionRuntime>> {
         use tokio::sync::{broadcast, mpsc};
 
         let dir =
@@ -1315,7 +1197,7 @@ mod tests {
         let (resize_tx, _resize_rx) = broadcast::channel(4);
         let (writer_tx, _writer_rx) = mpsc::channel(8);
         let (child, pty_master) = make_dummy_child();
-        Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
+        Arc::new(RwLock::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
             last_total_bytes: excerpt.as_bytes().len() as u64,
@@ -1324,22 +1206,19 @@ mod tests {
             pty: super::super::pty::PtyHandle {
                 child,
                 writer_tx,
-                pty_master: Some(pty_master),
+                pty_master: parking_lot::Mutex::new(Some(pty_master)),
             },
             pty_size: None,
             resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: last_output_at,
             last_output_epoch: last_output_at,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser,
             output_closed: false,
             notifications_enabled: true,
@@ -1386,12 +1265,12 @@ mod tests {
     }
 
     fn store_with(
-        runtimes: Vec<Arc<Mutex<super::super::runtime::SessionRuntime>>>,
+        runtimes: Vec<Arc<RwLock<super::super::runtime::SessionRuntime>>>,
         db: Arc<Database>,
     ) -> SessionStore {
         let store = SessionStore::new(900, db);
         for rt in runtimes {
-            let id = rt.lock().unwrap().meta.id.clone();
+            let id = rt.read().meta.id.clone();
             let handle = Arc::new(SessionHandle::new(rt));
             store.sessions.rcu(|current| {
                 let mut next = (**current).clone();
@@ -1424,10 +1303,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_candidates_allows_recent_output_when_not_suppressed() {
+    async fn test_silent_candidates_suppresses_recent_output_within_attach_window() {
         let silence = Duration::from_secs(5);
         let min_interval = Duration::from_secs(10);
-        // Current implementation only requires an output epoch to exist.
         let rt = make_runtime(
             "abc1234",
             SessionStatus::Running,
@@ -1436,8 +1314,31 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].session_id, "abc1234");
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_respects_min_notification_interval() {
+        let silence = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        let store = store_with(vec![rt], make_test_db().await);
+
+        {
+            let sessions = store.sessions.load();
+            let handle = sessions.get("abc1234").unwrap();
+            let mut rt = handle.write();
+            rt.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
+            rt.notified_output_epoch = None;
+        }
+
+        let candidates = store.silent_candidates(silence, min_interval);
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]
@@ -1466,7 +1367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_candidates_keeps_silence_candidate_without_new_excerpt_bytes() {
+    async fn test_silent_candidates_includes_screen_excerpt() {
         let silence = Duration::from_secs(5);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -1475,44 +1376,16 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(10)),
         );
-        {
-            let mut locked = rt.lock().unwrap();
-            locked.notification_excerpt_end_offset = locked.last_total_bytes;
-        }
         let store = store_with(vec![rt], make_test_db().await);
 
         let candidates = store.silent_candidates(silence, min_interval);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
-        assert!(candidates[0].raw_excerpt.is_empty());
-    }
-
-    #[test]
-    fn test_visible_screen_excerpt_stays_within_parser_viewport() {
-        let mut parser = vt100::Parser::new(2, 10, 0);
-        parser.process(b"line1\nline2\nline3\nprompt> ");
-
-        let excerpt = visible_screen_excerpt(&parser);
-
-        assert!(excerpt.lines().count() <= 2);
-        assert!(excerpt.lines().all(|line| line.chars().count() <= 10));
-    }
-
-    #[test]
-    fn test_recent_notification_excerpt_only_uses_bytes_since_last_check() {
-        let runtime = make_runtime("recent001", SessionStatus::Running, "old output\n", None);
-        let mut rt = runtime.lock().unwrap();
-        rt.notification_excerpt_end_offset = rt.last_total_bytes;
-        crate::session::persist::append_output_raw(&rt.dir, b"prompt> ").expect("append output");
-        rt.last_total_bytes += b"prompt> ".len() as u64;
-        rt.screen_parser.process(b"prompt> ");
-
-        let plan = build_notification_excerpt_plan(&rt);
-        let excerpt = recent_notification_excerpt(&plan).expect("excerpt should refresh");
-
-        assert!(excerpt.contains("prompt"));
-        assert!(!excerpt.contains("old output"));
+        assert!(
+            candidates[0].excerpt.contains("prompt>"),
+            "excerpt should contain rendered screen content"
+        );
     }
 
     #[tokio::test]
@@ -1588,13 +1461,13 @@ mod tests {
         // Simulate new output by advancing last_output_at on the runtime.
         {
             let sessions = store.sessions.load();
-            let runtime = sessions.get("abc1234").unwrap();
-            let mut rt = runtime.runtime.lock().unwrap();
-            // A new epoch strictly later than the notified one.
-            rt.last_visible_output_at = Some(Instant::now());
+            let handle = sessions.get("abc1234").unwrap();
+            let mut rt = handle.write();
+            // A new epoch strictly later than the notified one, but old enough
+            // to be outside the attach suppression window.
+            rt.last_output_epoch = Some(Instant::now() - Duration::from_secs(2));
             // Move notification timestamp into the past so cooldown no longer blocks.
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(30));
-            runtime.refresh_snapshot(&rt);
         }
 
         // New output epoch + expired notification cooldown should re-qualify.
@@ -1627,10 +1500,9 @@ mod tests {
         // Simulate time passing without any new output.
         {
             let sessions = store.sessions.load();
-            let runtime = sessions.get("abc1234").unwrap();
-            let mut rt = runtime.runtime.lock().unwrap();
+            let handle = sessions.get("abc1234").unwrap();
+            let mut rt = handle.write();
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(31));
-            runtime.refresh_snapshot(&rt);
         }
 
         let still_suppressed = store.silent_candidates(silence, min_interval);
@@ -1665,10 +1537,8 @@ mod tests {
 
         let sessions = store.sessions.load();
         let handle = sessions.get("abc1234").expect("runtime should exist");
-        let snapshot = handle.snapshot();
-        assert!(!snapshot.summary.notifications_enabled);
-
-        let rt = handle.runtime.lock().unwrap();
+        let rt = handle.read();
+        assert!(!rt.to_summary().notifications_enabled);
         assert!(!rt.notifications_enabled);
     }
 
@@ -1694,10 +1564,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn render_live_logs_uses_runtime_screen_tail() {
+        let runtime = make_runtime(
+            "live123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.screen_parser = vt100::Parser::new(24, 80, 0);
+            rt.screen_parser
+                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let (output, resizes) = store
+            .render_live_logs("live123", 2, false, 80)
+            .await
+            .expect("render live logs");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output),
+            "screen two\nscreen three\n"
+        );
+        assert!(resizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn render_live_logs_rejects_completed_sessions() {
+        let runtime = make_runtime(
+            "stopped123",
+            SessionStatus::Stopped,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let err = store
+            .render_live_logs("stopped123", 10, false, 80)
+            .await
+            .expect_err("completed session should not render live logs");
+
+        assert!(matches!(err, SessionError::NotRunning));
+    }
+
+    #[tokio::test]
+    async fn read_live_log_tail_page_returns_runtime_chunks() {
+        let runtime = make_runtime(
+            "live-page123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.screen_parser = vt100::Parser::new(24, 80, 0);
+            rt.screen_parser
+                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let (chunks, total, offset, resizes) = store
+            .read_live_log_tail_page("live-page123", 2)
+            .await
+            .expect("read live tail page");
+
+        assert_eq!(
+            chunks,
+            vec![
+                "screen two\x1b[0m\n".to_string(),
+                "screen three\x1b[0m\n".to_string()
+            ]
+        );
+        assert_eq!(total, 2);
+        assert_eq!(offset, 0);
+        assert!(resizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_live_log_chunk_count_returns_visible_row_count() {
+        let runtime = make_runtime(
+            "live-count123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.screen_parser = vt100::Parser::new(24, 80, 0);
+            rt.screen_parser
+                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let total = store
+            .read_live_log_chunk_count("live-count123")
+            .await
+            .expect("read live chunk count");
+
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
     async fn test_run_maintenance_evicts_completed_session_after_ttl() {
         let rt = make_runtime("evict001", SessionStatus::Stopped, "", None);
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.meta.exit_code = Some(0);
             locked.meta.ended_at = Some(Utc::now());
             locked.completed_at = Some(Instant::now() - Duration::from_secs(2));
@@ -1742,7 +1715,7 @@ mod tests {
         );
         // Recent attach activity should suppress notifications without mutating runtime state.
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.last_attach_activity_at = Some(Instant::now());
         }
         let store = store_with(vec![rt], make_test_db().await);
@@ -1753,11 +1726,11 @@ mod tests {
         );
 
         let sessions = store.sessions.load();
-        let runtime = sessions.get("abc1234").unwrap();
-        let locked = runtime.runtime.lock().unwrap();
+        let handle = sessions.get("abc1234").unwrap();
+        let locked = handle.read();
         assert!(
-            locked.last_visible_output_at.is_none(),
-            "suppression path should no longer mutate output epoch during reads"
+            locked.last_output_epoch.is_some(),
+            "suppression path should not mutate output epoch — it must remain intact"
         );
     }
 
@@ -1772,7 +1745,7 @@ mod tests {
             Some(Duration::from_secs(5)),
         );
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
         let store = store_with(vec![rt], make_test_db().await);
@@ -1791,7 +1764,7 @@ mod tests {
         id: &str,
         status: SessionStatus,
     ) -> (
-        Arc<Mutex<super::super::runtime::SessionRuntime>>,
+        Arc<RwLock<super::super::runtime::SessionRuntime>>,
         tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         make_runtime_writable_with_capacity(id, status, 8)
@@ -1802,7 +1775,7 @@ mod tests {
         status: SessionStatus,
         capacity: usize,
     ) -> (
-        Arc<Mutex<super::super::runtime::SessionRuntime>>,
+        Arc<RwLock<super::super::runtime::SessionRuntime>>,
         tokio::sync::mpsc::Receiver<Vec<u8>>,
     ) {
         use tokio::sync::{broadcast, mpsc};
@@ -1827,7 +1800,7 @@ mod tests {
         let (resize_tx, _resize_rx) = broadcast::channel(4);
         let (writer_tx, writer_rx) = mpsc::channel(capacity.max(1));
         let (child, pty_master) = make_dummy_child();
-        let rt = Arc::new(Mutex::new(super::super::runtime::SessionRuntime {
+        let rt = Arc::new(RwLock::new(super::super::runtime::SessionRuntime {
             meta,
             dir,
             last_total_bytes: 0,
@@ -1836,22 +1809,19 @@ mod tests {
             pty: super::super::pty::PtyHandle {
                 child,
                 writer_tx,
-                pty_master: Some(pty_master),
+                pty_master: parking_lot::Mutex::new(Some(pty_master)),
             },
             pty_size: None,
             resize_history: Vec::new(),
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: None,
             last_output_epoch: None,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
@@ -1861,6 +1831,7 @@ mod tests {
 
     #[test]
     fn instant_to_utc_reconstructs_recent_wall_clock_time() {
+        use super::super::runtime::instant_to_utc;
         let before = Utc::now();
         let instant = Instant::now() - Duration::from_secs(2);
         let converted = instant_to_utc(instant).expect("conversion should succeed");
@@ -2023,7 +1994,7 @@ mod tests {
             .await
             .expect("attach_input should succeed");
 
-        let locked = rt_clone.lock().unwrap();
+        let locked = rt_clone.read();
         assert!(
             locked.last_input_at.is_some(),
             "last_input_at should be set after input"
@@ -2035,7 +2006,7 @@ mod tests {
         // When app_cursor_keys = true, \x1b[A → \x1bOA (DECCKM mode).
         let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.screen_parser.process(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
@@ -2056,7 +2027,7 @@ mod tests {
     async fn test_attach_input_decckm_transforms_all_arrows() {
         let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.screen_parser.process(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
@@ -2107,7 +2078,7 @@ mod tests {
         let (rt, _writer_rx) =
             make_runtime_writable_with_capacity("inpbusy1", SessionStatus::Running, 1);
         {
-            let locked = rt.lock().unwrap();
+            let locked = rt.read();
             locked
                 .pty
                 .try_write_input(b"first".to_vec())
@@ -2130,7 +2101,7 @@ mod tests {
 
         let updater = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let mut locked = rt_clone.lock().unwrap();
+            let mut locked = rt_clone.write();
             locked.last_total_bytes += 1;
             locked.last_output_epoch = Some(Instant::now());
         });
@@ -2176,7 +2147,7 @@ mod tests {
             .await
             .expect("attach_busy should succeed");
 
-        let locked = rt_clone.lock().unwrap();
+        let locked = rt_clone.read();
         assert_eq!(
             locked.last_total_bytes, 0,
             "attach_busy should advance the session byte counter"
@@ -2196,7 +2167,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("stp0001", SessionStatus::Failed);
         let rt_clone = rt.clone();
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.meta.exit_code = Some(42);
             locked.meta.ended_at = Some(Utc::now());
             locked.completed_at = Some(Instant::now());
@@ -2208,7 +2179,7 @@ mod tests {
             "completed session should still be treated as found"
         );
 
-        let locked = rt_clone.lock().unwrap();
+        let locked = rt_clone.read();
         assert!(matches!(locked.meta.status, SessionStatus::Failed));
         assert_eq!(locked.meta.exit_code, Some(42));
         assert!(
@@ -2222,7 +2193,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("kil0001", SessionStatus::Failed);
         let rt_clone = rt.clone();
         {
-            let mut locked = rt.lock().unwrap();
+            let mut locked = rt.write();
             locked.meta.exit_code = Some(99);
             locked.meta.ended_at = Some(Utc::now());
             locked.completed_at = Some(Instant::now());
@@ -2234,7 +2205,7 @@ mod tests {
             "completed session should still be treated as found"
         );
 
-        let locked = rt_clone.lock().unwrap();
+        let locked = rt_clone.read();
         assert!(matches!(locked.meta.status, SessionStatus::Failed));
         assert_eq!(locked.meta.exit_code, Some(99));
         assert!(
@@ -2244,34 +2215,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_kill_session_recovers_from_poisoned_runtime_lock() {
-        let (rt, _writer_rx) = make_runtime_writable("kilpoison", SessionStatus::Running);
-        let rt_clone = rt.clone();
+    async fn test_kill_session_terminates_running_session() {
+        let (rt, _writer_rx) = make_runtime_writable("kilbasic", SessionStatus::Running);
         let store = store_with(vec![rt], make_test_db().await);
 
-        let poison_result = std::panic::catch_unwind(|| {
-            let _guard = rt_clone.lock().unwrap();
-            panic!("poison session runtime lock");
-        });
-        assert!(poison_result.is_err(), "runtime lock should be poisoned");
-
         assert!(
-            store.kill_session("kilpoison").await,
-            "kill should recover from a poisoned runtime lock"
+            store.kill_session("kilbasic").await,
+            "kill should succeed for a running session"
         );
 
         let sessions = store.sessions.load();
         let handle = sessions
-            .get("kilpoison")
+            .get("kilbasic")
             .expect("runtime should remain addressable");
-        let snapshot = handle.snapshot();
+        let rt = handle.read();
         assert!(matches!(
-            snapshot.summary.status.as_str(),
-            "killed" | "failed"
+            rt.meta.status,
+            SessionStatus::Killed | SessionStatus::Failed
         ));
         assert!(
-            !snapshot.running,
-            "killed session should no longer be marked running"
+            rt.is_completed(),
+            "killed session should be marked completed"
         );
     }
 
@@ -2324,7 +2288,7 @@ mod tests {
 
         store.register_attach_client("detach001").await;
         {
-            let mut locked = rt_clone.lock().unwrap();
+            let mut locked = rt_clone.write();
             locked.mark_attach_activity();
         }
 
@@ -2333,11 +2297,7 @@ mod tests {
             .await
             .expect("detach should succeed");
 
-        let locked = rt_clone.lock().unwrap();
-        assert!(
-            locked.last_attach_presence_at.is_none(),
-            "detach should clear attach presence"
-        );
+        let locked = rt_clone.read();
         assert!(
             locked.last_attach_activity_at.is_none(),
             "detach should clear attach activity"
@@ -2353,7 +2313,7 @@ mod tests {
         store.register_attach_client("detach002").await;
         store.register_attach_client("detach002").await;
         {
-            let mut locked = rt_clone.lock().unwrap();
+            let mut locked = rt_clone.write();
             locked.mark_attach_activity();
         }
 
@@ -2363,14 +2323,10 @@ mod tests {
             .expect("first detach should succeed");
 
         {
-            let locked = rt_clone.lock().unwrap();
+            let locked = rt_clone.read();
             assert_eq!(
                 locked.attach_count, 1,
                 "one client should still remain registered"
-            );
-            assert!(
-                locked.last_attach_presence_at.is_some(),
-                "presence should remain while one client is still connected"
             );
             assert!(
                 locked.last_attach_activity_at.is_some(),
@@ -2383,12 +2339,8 @@ mod tests {
             .await
             .expect("second detach should succeed");
 
-        let locked = rt_clone.lock().unwrap();
+        let locked = rt_clone.read();
         assert_eq!(locked.attach_count, 0, "all clients should be disconnected");
-        assert!(
-            locked.last_attach_presence_at.is_none(),
-            "final detach should clear attach presence"
-        );
         assert!(
             locked.last_attach_activity_at.is_none(),
             "final detach should clear attach activity"

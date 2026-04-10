@@ -478,7 +478,7 @@ function SessionRow({
             <TooltipContent>{`${session.id} — click to copy`}</TooltipContent>
           </Tooltip>
         </TableCell>
-        
+
         <TableCell className="px-3 py-2.5 truncate max-w-0">
           <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
             {formatByteSize(session.last_total_bytes)}
@@ -529,7 +529,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-            <SparklineSvg series={series} enableAnimation={isRunning} />
+          <SparklineSvg series={series} enableAnimation={isRunning} />
         </TableCell>
 
         {/* PID */}
@@ -685,13 +685,9 @@ function SessionCard({
               </div>
               <div className="min-w-0 flex-1">
                 {session.title?.trim() && (
-                  <div className="text-[hsl(var(--primary))] break-all">
-                    {session.title.trim()}
-                  </div>
+                  <div className="text-[hsl(var(--primary))] break-all">{session.title.trim()}</div>
                 )}
-                <div className="text-base font-medium break-all">
-                  {sessionDisplayName(session)}
-                </div>
+                <div className="text-base font-medium break-all">{sessionDisplayName(session)}</div>
               </div>
             </div>
           </div>
@@ -703,7 +699,7 @@ function SessionCard({
             </div>
           )}
 
-          <div className='flex flex-wrap items-center gap-2'>
+          <div className="flex flex-wrap items-center gap-2">
             <div className="text-[hsl(var(--muted-foreground))] font-semibold">
               {formatByteSize(session.last_total_bytes)}
             </div>

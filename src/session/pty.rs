@@ -3,6 +3,8 @@
 // ---------------------------------------------------------------------------
 
 use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, trace, warn};
@@ -20,8 +22,10 @@ pub struct PtyHandle {
     pub(crate) child: RuntimeChild,
     /// Channel to the dedicated pseudo-terminal writer thread.
     pub(crate) writer_tx: mpsc::Sender<Vec<u8>>,
-    /// Kept alive so the master file descriptor stays open; resize goes through this.
-    pub(crate) pty_master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    /// Kept alive so the master file descriptor stays open; resize goes through
+    /// this.  Wrapped in a `parking_lot::Mutex` so that `PtyHandle` is `Sync`,
+    /// which lets the outer `SessionRuntime` live behind a `parking_lot::RwLock`.
+    pub(crate) pty_master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
 }
 
 impl PtyHandle {
@@ -38,8 +42,9 @@ impl PtyHandle {
     }
 
     /// Resize the pseudo-terminal. Returns `true` on success.
-    pub fn resize(&mut self, rows: u16, cols: u16) -> bool {
-        let Some(master) = self.pty_master.as_mut() else {
+    pub fn resize(&self, rows: u16, cols: u16) -> bool {
+        let mut guard = self.pty_master.lock();
+        let Some(master) = guard.as_mut() else {
             debug!(
                 rows,
                 cols, "PTY resize skipped because master handle is unavailable"
@@ -64,7 +69,7 @@ impl PtyHandle {
     /// sender with a permanently closed channel so future writes fail fast.
     pub fn release_resources(&mut self) {
         debug!("releasing PTY resources");
-        self.pty_master.take();
+        self.pty_master.lock().take();
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let previous_tx = std::mem::replace(&mut self.writer_tx, closed_tx);
@@ -942,72 +947,6 @@ fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .rposition(|window| window == needle)
 }
 
-// ---------------------------------------------------------------------------
-// has_visible_content
-// ---------------------------------------------------------------------------
-
-/// Return `true` when `data` contains at least one visibly rendered byte,
-/// rather than only whitespace, control characters, or ANSI/VT escape
-/// sequences.
-///
-/// This is used to avoid advancing the silence clock on chunks that contain
-/// only cursor movement, redraw operations, or other control traffic.
-///
-/// The check is byte-oriented: any byte above 0x20 (except DEL 0x7f) that
-/// is outside a recognized escape sequence counts as visible.  Bytes >= 0x80
-/// are treated as visible because they are UTF-8 continuation/leader bytes
-/// for printable characters.
-pub(crate) fn has_visible_content(data: &[u8]) -> bool {
-    let mut i = 0;
-    while i < data.len() {
-        let b = data[i];
-        if b == 0x1b {
-            i += 1;
-            if i >= data.len() {
-                break;
-            }
-            match data[i] {
-                // CSI sequence — skip parameter bytes until final byte.
-                b'[' => {
-                    i += 1;
-                    while i < data.len() {
-                        let c = data[i];
-                        i += 1;
-                        if (0x40..=0x7e).contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC (\x1b]), APC (\x1b_), DCS (\x1bP), PM (\x1b^)
-                // All terminated by ST (\x1b\\) or BEL (\x07).
-                b']' | b'_' | b'P' | b'^' => {
-                    i += 1;
-                    let mut prev = 0u8;
-                    while i < data.len() {
-                        let c = data[i];
-                        i += 1;
-                        if c == 0x07 {
-                            break;
-                        }
-                        if prev == 0x1b && c == b'\\' {
-                            break;
-                        }
-                        prev = c;
-                    }
-                }
-                _ => {
-                    i += 1;
-                }
-            }
-        } else if b > 0x20 && b != 0x7f {
-            return true;
-        } else {
-            i += 1;
-        }
-    }
-    false
-}
-
 /// Concatenate replay chunks into a single byte buffer.
 ///
 /// Replay chunks already reflect the canonical filtered stream retained by the
@@ -1023,46 +962,6 @@ pub fn collect_chunk_bytes(chunks: &[(u64, bytes::Bytes)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // has_visible_content
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_has_visible_content_plain_text() {
-        assert!(has_visible_content(b"hello"));
-        assert!(has_visible_content(b"$ "));
-        assert!(has_visible_content(b"Do you want to continue?"));
-    }
-
-    #[test]
-    fn test_has_visible_content_empty_and_whitespace() {
-        assert!(!has_visible_content(b""));
-        assert!(!has_visible_content(b"   "));
-        assert!(!has_visible_content(b"\t\n\r"));
-    }
-
-    #[test]
-    fn test_has_visible_content_pure_ansi_csi() {
-        // Cursor movement escape sequences — no visible characters.
-        assert!(!has_visible_content(b"\x1b[2J"));
-        assert!(!has_visible_content(b"\x1b[1A\x1b[1A\x1b[2K"));
-        assert!(!has_visible_content(b"\x1b[H\x1b[2J\x1b[?25l"));
-    }
-
-    #[test]
-    fn test_has_visible_content_ansi_with_text() {
-        // ANSI wrapping around visible text → true.
-        assert!(has_visible_content(b"\x1b[32mOK\x1b[0m"));
-        assert!(has_visible_content(b"\x1b[1;31mError\x1b[0m"));
-    }
-
-    #[test]
-    fn test_has_visible_content_osc_sequences() {
-        // OSC title sequence — no visible characters.
-        assert!(!has_visible_content(b"\x1b]0;my title\x07"));
-        assert!(!has_visible_content(b"\x1b]2;Terminal\x1b\\"));
-    }
 
     // -----------------------------------------------------------------------
     // Terminal query / escape filter tests (from utils.rs)
@@ -1441,26 +1340,6 @@ mod tests {
         let text2 = " 388\x1b\\world";
         assert_eq!(filter_text_chunk(&mut pending, text2), "world");
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn test_has_visible_content_apc_sequence() {
-        // APC sequence should not count as visible content.
-        assert!(!has_visible_content(b"\x1b_Gi=31337;OK\x1b\\"));
-        assert!(!has_visible_content(
-            b"\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
-        ));
-    }
-
-    #[test]
-    fn test_has_visible_content_dcs_sequence() {
-        assert!(!has_visible_content(b"\x1bP>|xterm 388\x1b\\"));
-    }
-
-    #[test]
-    fn test_has_visible_content_apc_with_surrounding_text() {
-        assert!(has_visible_content(b"hello\x1b_Gi=31337;OK\x1b\\"));
-        assert!(has_visible_content(b"\x1b_Gi=31337;OK\x1b\\world"));
     }
 
     // -----------------------------------------------------------------------

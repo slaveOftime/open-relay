@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "oly"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "aes-gcm",
  "arboard",
@@ -2375,6 +2375,7 @@ dependencies = [
  "mime_guess",
  "notify-rust",
  "p256",
+ "parking_lot",
  "portable-pty",
  "rand 0.8.5",
  "regex",

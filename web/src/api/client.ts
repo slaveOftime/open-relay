@@ -209,19 +209,53 @@ export function uploadSessionFile(
 
 export function fetchLogs(
   id: string,
-  opts: { offset?: number; limit?: number; tail?: number } = {},
+  opts: { offset?: number; limit?: number } = {},
   node?: string
 ): Promise<LogsResponse> {
   const q = new URLSearchParams()
-  if (opts.tail !== undefined) {
-    q.set('tail', String(opts.tail))
-  } else {
-    if (opts.offset !== undefined) q.set('offset', String(opts.offset))
-    if (opts.limit !== undefined) q.set('limit', String(opts.limit))
-  }
+  if (opts.offset !== undefined) q.set('offset', String(opts.offset))
+  if (opts.limit !== undefined) q.set('limit', String(opts.limit))
   if (node) q.set('node', node)
   const qs = q.toString()
   return req<LogsResponse>(`${BASE}/sessions/${id}/logs${qs ? `?${qs}` : ''}`)
+}
+
+export interface LogsTailResponse {
+  output: Uint8Array
+  resizes: { offset: number; rows: number; cols: number }[]
+}
+
+export async function fetchLogsTail(
+  id: string,
+  tail: number,
+  cols: number,
+  node?: string
+): Promise<LogsTailResponse> {
+  const q = new URLSearchParams()
+  q.set('tail', String(tail))
+  q.set('cols', String(cols))
+  if (node) q.set('node', node)
+  const qs = q.toString()
+
+  const token = getToken()
+  const headers = new Headers()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+
+  const res = await fetch(`${BASE}/sessions/${id}/logs/tail?${qs}`, { headers })
+  if (res.status === 401) {
+    clearToken()
+    window.dispatchEvent(new CustomEvent('oly:auth-required'))
+    throw new AuthRequiredError()
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body?.error ?? `HTTP ${res.status}`)
+  }
+
+  const resizesHeader = res.headers.get('x-log-resizes')
+  const resizes = resizesHeader ? JSON.parse(resizesHeader) : []
+  const buf = await res.arrayBuffer()
+  return { output: new Uint8Array(buf), resizes }
 }
 
 // ---------------------------------------------------------------------------

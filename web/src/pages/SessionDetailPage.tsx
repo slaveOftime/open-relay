@@ -4,6 +4,7 @@ import type { SessionSummary } from '@/api/types'
 import {
   fetchSession,
   fetchLogs,
+  fetchLogsTail,
   stopSession,
   killSession,
   uploadSessionFile,
@@ -62,6 +63,29 @@ function isSessionRunning(session: SessionSummary | null): boolean {
   return session
     ? session.status === 'running' || session.status === 'stopping' || session.status === 'created'
     : false
+}
+
+function normalizeSnapshotOutputForXterm(output: Uint8Array): Uint8Array {
+  let extra = 0
+  for (let i = 0; i < output.length; i += 1) {
+    if (output[i] === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
+      extra += 1
+    }
+  }
+  if (extra === 0) return output
+
+  const normalized = new Uint8Array(output.length + extra)
+  let writeIndex = 0
+  for (let i = 0; i < output.length; i += 1) {
+    const byte = output[i]
+    if (byte === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
+      normalized[writeIndex] = 0x0d
+      writeIndex += 1
+    }
+    normalized[writeIndex] = byte
+    writeIndex += 1
+  }
+  return normalized
 }
 
 const DEFAULT_LOG_TAIL = 200
@@ -132,11 +156,20 @@ function ConfirmActionDialog({
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function SessionDetailPage() {
+  const [searchParams] = useSearchParams()
+  const reloadKey = searchParams.toString()
+
+  return <SessionDetailPageContent key={reloadKey} />
+}
+
+function SessionDetailPageContent() {
   const { id } = useParams<{ id: string }>()
   const [searchParams, setSearchParams] = useSearchParams()
   const navigate = useNavigate()
 
   const mode = (searchParams.get('mode') ?? 'logs') as 'attach' | 'logs'
+  const logsView = searchParams.get('view') === 'replay' ? 'replay' : 'tail'
+  const isTailMode = logsView === 'tail'
   const node = searchParams.get('node')
 
   const [session, setSession] = useState<SessionSummary | null>(null)
@@ -160,6 +193,8 @@ export default function SessionDetailPage() {
     typeof navigator === 'undefined' ? true : navigator.onLine
   )
   const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
+  const [tailLimit, setTailLimit] = useState<number | null>(null)
+  const [tailLimitInput, setTailLimitInput] = useState('40')
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -694,6 +729,11 @@ export default function SessionDetailPage() {
     if (mode !== 'attach') setWsConnecting(false)
   }, [mode])
 
+  useEffect(() => {
+    if (mode !== 'logs' || !isTailMode) return
+    setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
+  }, [mode, logsView, isTailMode, tailLimit])
+
   // iOS PWA: reconnect the WebSocket immediately when the app returns from
   // background. iOS can resume with a stale "connected" socket state before
   // onclose arrives, so force a reconnect on foreground transitions.
@@ -756,6 +796,8 @@ export default function SessionDetailPage() {
 
   useEffect(() => {
     if (mode !== 'logs' || !id) return
+
+    // Reset common state.
     termRef.current?.reset()
     commitReplayIdx(0, { force: true })
     isReplayingRef.current = false
@@ -772,10 +814,39 @@ export default function SessionDetailPage() {
     setTotalChunks(0)
 
     let cancelled = false
-    // Defer to avoid StrictMode double-fetch.
+
+    if (isTailMode) {
+      // Tail mode: fetch raw bytes and write directly to xterm.
+      const raf = requestAnimationFrame(() => {
+        if (cancelled) return
+        const rows = tailLimit ?? termRef.current?.getSize()?.rows ?? 40
+        const cols = termRef.current?.getSize()?.cols ?? 80
+        fetchLogsTail(id!, rows, cols, node ?? undefined)
+          .then((res) => {
+            if (cancelled || !isMounted.current) return
+            if (res.output.length > 0) {
+              termRef.current?.write(normalizeSnapshotOutputForXterm(res.output), () => {
+                termRef.current?.scrollToBottom()
+              })
+            }
+            fetchSession(id!, node ?? undefined)
+              .then((s) => {
+                if (!cancelled && isMounted.current) setSession(s)
+              })
+              .catch(() => {})
+          })
+          .catch(() => {})
+      })
+      return () => {
+        cancelled = true
+        cancelAnimationFrame(raf)
+      }
+    }
+
+    // Replay mode: fetch paginated chunks.
     const raf = requestAnimationFrame(() => {
       if (cancelled) return
-      fetchLogs(id!, { tail: DEFAULT_LOG_TAIL }, node ?? undefined)
+      fetchLogs(id!, { limit: DEFAULT_LOG_TAIL }, node ?? undefined)
         .then((res) => {
           if (cancelled || !isMounted.current) return
           const encodedChunks = encodeLogChunks(res.chunks)
@@ -802,7 +873,7 @@ export default function SessionDetailPage() {
       cancelled = true
       cancelAnimationFrame(raf)
     }
-  }, [mode, id, node, reloadTick, commitReplayIdx])
+  }, [mode, id, node, reloadTick, commitReplayIdx, isTailMode, tailLimit])
 
   const isScrubbingRef = useRef(false)
   const wasPlayingBeforeScrubRef = useRef(false)
@@ -829,11 +900,7 @@ export default function SessionDetailPage() {
         val
       )
     }
-    if (
-      val === 0 &&
-      !isFetchingMoreRef.current &&
-      loadedStartOffsetRef.current > 0
-    ) {
+    if (val === 0 && !isFetchingMoreRef.current && loadedStartOffsetRef.current > 0) {
       fetchMoreLogsRef.current?.()
     }
   }
@@ -946,7 +1013,22 @@ export default function SessionDetailPage() {
     }
   }
 
+  function setLogsView(view: 'tail' | 'replay') {
+    const next = new URLSearchParams(searchParams)
+    if (view === 'replay') {
+      next.set('view', 'replay')
+    } else {
+      next.delete('view')
+    }
+    setSearchParams(next)
+  }
+
   function handleReplayButton() {
+    if (isTailMode) {
+      // Switch from tail mode to replay mode and start from beginning.
+      setLogsView('replay')
+      return
+    }
     if (!isReplaying) {
       startReplay(0)
     } else if (!isPaused) {
@@ -961,6 +1043,28 @@ export default function SessionDetailPage() {
       isPausedRef.current = false
       startReplay(replayIdx)
     }
+  }
+
+  function handleSwitchToTail() {
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
+    }
+    isReplayingRef.current = false
+    setIsReplaying(false)
+    setIsPaused(false)
+    isPausedRef.current = false
+    setLogsView('tail')
+  }
+
+  function commitTailLimit(value: string) {
+    const next = parseInt(value, 10)
+    if (!isNaN(next) && next > 0) {
+      setTailLimit(next)
+      setTailLimitInput(String(next))
+      return
+    }
+    setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
   }
 
   async function handleStop() {
@@ -1183,8 +1287,13 @@ export default function SessionDetailPage() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-3 sm:px-4 py-1.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--card))]/60 text-[hsl(var(--muted-foreground))] shrink-0 overflow-y-auto h-[38px]">
             <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={24} />
-              <div className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`} onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}>
-                {session?.title && <span className='break-all text-[hsl(var(--primary))]'>{session.title}</span>}
+              <div
+                className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
+                onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}
+              >
+                {session?.title && (
+                  <span className="break-all text-[hsl(var(--primary))]">{session.title}</span>
+                )}
                 <span className="break-all">{sessionDisplayName(session)}</span>
                 {session.cwd && (
                   <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
@@ -1198,7 +1307,9 @@ export default function SessionDetailPage() {
                   </span>
                 )}
                 <span>
-                  <span className="text-[hsl(var(--foreground))]">{formatByteSize(session.last_total_bytes)}</span>
+                  <span className="text-[hsl(var(--foreground))]">
+                    {formatByteSize(session.last_total_bytes)}
+                  </span>
                 </span>
                 {session.pid != null && (
                   <span>
@@ -1217,7 +1328,6 @@ export default function SessionDetailPage() {
           id="main-container"
           className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
         >
-
           {/* Terminal area */}
           <div
             className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
@@ -1227,17 +1337,49 @@ export default function SessionDetailPage() {
               className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-1 h-full w-full overflow-x-auto`}
             >
               <XTerm
-                key={mode}
+                key={mode === 'logs' ? `logs-${logsView}` : mode}
                 ref={termRef}
-                autoFit={mode === 'attach'}
+                autoFit={mode === 'attach' || isTailMode}
                 onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
                 onResize={mode === 'attach' ? handleTermResize : undefined}
-                className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
+                className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
               />
             </div>
 
-            {/* Scrubber (logs mode) */}
-            {mode === 'logs' && scrubberMax > 0 && (
+            {/* Tail mode controls */}
+            {mode === 'logs' && isTailMode && (
+              <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">Tail</span>
+                <input
+                  type="number"
+                  className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  value={tailLimitInput}
+                  min={1}
+                  max={5000}
+                  onChange={(e) => setTailLimitInput(e.target.value)}
+                  onBlur={() => commitTailLimit(tailLimitInput)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      commitTailLimit(tailLimitInput)
+                    }
+                  }}
+                  aria-label="Tail line limit"
+                />
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">lines</span>
+                <div className="flex-1" />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="secondary" size="icon" onClick={handleReplayButton}>
+                      <PlayIcon className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Replay from start</TooltipContent>
+                </Tooltip>
+              </div>
+            )}
+
+            {/* Scrubber (replay mode) */}
+            {mode === 'logs' && !isTailMode && scrubberMax > 0 && (
               <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
                 <div className="flex flex-1 items-center gap-2">
                   <Slider
@@ -1295,21 +1437,15 @@ export default function SessionDetailPage() {
                         {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
                       </TooltipContent>
                     </Tooltip>
-                    {/* <Select
-                      value={String(replaySpeed)}
-                      onValueChange={(v) => setReplaySpeed(Number(v))}
-                    >
-                      <SelectTrigger className="h-8 w-15 text-sm px-2">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="0.5">0.5×</SelectItem>
-                        <SelectItem value="1">1×</SelectItem>
-                        <SelectItem value="2">2×</SelectItem>
-                        <SelectItem value="5">5×</SelectItem>
-                        <SelectItem value="10">10×</SelectItem>
-                      </SelectContent>
-                    </Select> */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button variant="secondary" size="sm" onClick={handleSwitchToTail}>
+                          <TrackNextIcon className="h-4 w-4" />
+                          Tail
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Switch to tail view</TooltipContent>
+                    </Tooltip>
                   </div>
                 </div>
               </div>

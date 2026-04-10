@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use crate::{
     session::{
         SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
-        logs::{read_persisted_log_page, read_persisted_log_tail_page, read_resize_events},
+        logs::{read_persisted_log_page, read_resize_events, render_log_file},
         persist::current_output_offset_by_id,
     },
 };
@@ -896,7 +896,6 @@ mod tests {
 pub struct LogsParams {
     pub offset: Option<usize>,
     pub limit: Option<usize>,
-    pub tail: Option<usize>,
     /// If set, proxy the logs request to this connected secondary node.
     pub node: Option<String>,
 }
@@ -920,15 +919,13 @@ pub async fn get_logs(
 ) -> impl IntoResponse {
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(200).clamp(1, 5000);
-    let tail = params.tail.map(|tail| tail.clamp(1, 5000));
 
     // Proxy to remote node via the paginated logs RPC.
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::LogsPagination {
             id: id.clone(),
-            offset: tail.is_none().then_some(offset),
-            limit: tail.unwrap_or(limit),
-            tail: tail.is_some(),
+            offset: Some(offset),
+            limit,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::LogsPagination {
@@ -980,15 +977,11 @@ pub async fn get_logs(
         }
     };
 
-    let page = if let Some(tail) = tail {
-        read_persisted_log_tail_page(&session_dir, tail)
-    } else {
-        read_persisted_log_page(&session_dir, offset, limit)
-            .map(|(lines, total)| (lines, total, offset))
-    };
-
-    match page {
-        Some((lines, total, offset)) => {
+    match read_persisted_log_page(&session_dir, offset, limit) {
+        Some((lines, mut total)) => {
+            if let Ok(live_total) = state.store.read_live_log_chunk_count(&id).await {
+                total += live_total;
+            }
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             logs_response(LogsResponseBody {
                 offset,
@@ -1006,4 +999,117 @@ pub async fn get_logs(
                 .into_response()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Logs tail (raw bytes, same output as CLI)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct LogsTailParams {
+    pub tail: Option<usize>,
+    pub cols: Option<u16>,
+    pub node: Option<String>,
+}
+
+pub async fn get_logs_tail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<LogsTailParams>,
+) -> impl IntoResponse {
+    let tail = params.tail.unwrap_or(40).clamp(1, 5000);
+    let term_cols = params.cols.unwrap_or(80).max(1);
+
+    // Proxy to remote node via RPC LogsTail.
+    if let Some(ref node) = params.node {
+        let rpc = RpcRequest::LogsTail {
+            id: id.clone(),
+            tail,
+            keep_color: true,
+            term_cols,
+            from_file: false,
+        };
+        return match state.node_registry.proxy_rpc(node, &rpc).await {
+            Ok(RpcResponse::LogsTail { output, resizes }) => {
+                logs_tail_binary_response(output, &resizes)
+            }
+            Ok(RpcResponse::Error { message }) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "unexpected response from node" })),
+            )
+                .into_response(),
+        };
+    }
+
+    let session_dir = match state.db.get_session_dir(&id).await {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            debug!(session_id = %id, "session not found for logs tail");
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session not found: {id}") })),
+            )
+                .into_response();
+        }
+        Err(err) => {
+            error!(session_id = %id, %err, "failed to resolve session dir from DB");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    // Try live render first (running sessions).
+    if let Ok(output) = state
+        .store
+        .render_live_logs(&id, tail, true, term_cols)
+        .await
+    {
+        return logs_tail_binary_response(output.0, &output.1);
+    }
+
+    // Fall back to persisted log file.
+    let log_path = session_dir.join("output.log");
+    match render_log_file(&log_path, tail, true, term_cols, None) {
+        Ok(output) => {
+            let resizes = read_resize_events(&session_dir).unwrap_or_default();
+            logs_tail_binary_response(output, &resizes)
+        }
+        Err(err) => {
+            debug!(session_id = %id, %err, "failed to render log file for tail");
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("log not available: {id}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn logs_tail_binary_response(
+    output: Vec<u8>,
+    resizes: &[crate::protocol::LogResize],
+) -> axum::response::Response {
+    let resizes_json = serde_json::to_string(resizes).unwrap_or_else(|_| "[]".to_string());
+    let mut response = (StatusCode::OK, output).into_response();
+    response.headers_mut().insert(
+        "content-type",
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(val) = HeaderValue::from_str(&resizes_json) {
+        response.headers_mut().insert("x-log-resizes", val);
+    }
+    response
 }

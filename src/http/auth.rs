@@ -262,12 +262,18 @@ pub async fn login(
     if verified.is_some() {
         auth.lockout.lock().await.remove(&client_ip);
         let token = uuid::Uuid::new_v4().to_string();
-        auth.tokens.lock().await.insert(token.clone(), Instant::now());
+        auth.tokens
+            .lock()
+            .await
+            .insert(token.clone(), Instant::now());
         info!(ip = %client_ip, "auth: login success — token issued");
         let secure = request_is_tls(&headers);
         return (
             StatusCode::OK,
-            [(axum::http::header::SET_COOKIE, build_auth_cookie(&token, secure))],
+            [(
+                axum::http::header::SET_COOKIE,
+                build_auth_cookie(&token, secure),
+            )],
             Json(LoginResponse { token }),
         )
             .into_response();
