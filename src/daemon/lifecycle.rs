@@ -172,14 +172,14 @@ pub async fn start(
     };
 
     if detach && !foreground_internal {
-        spawn_detached(
+        let child_pid = spawn_detached(
             no_auth,
             no_http,
             auth_hash.as_deref(),
             config.http_port,
             config.notification_hook.as_deref(),
         )?;
-        wait_for_daemon_ready(&config, std::time::Duration::from_secs(60)).await?;
+        wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
 
         println!("Daemon started in background.");
         print_detached_start_summary(&config, no_http, no_auth);
@@ -261,15 +261,21 @@ pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
     }
 }
 
-async fn wait_for_daemon_ready(config: &AppConfig, timeout: std::time::Duration) -> Result<()> {
+async fn wait_for_daemon_ready(
+    config: &AppConfig,
+    expected_pid: Option<u32>,
+    timeout: std::time::Duration,
+) -> Result<()> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if daemon_is_healthy(config).await {
             return Ok(());
         }
 
-        // If the child already exited, stop waiting and surface a helpful message.
-        if let Some(pid) = storage::read_pid(&config.lock_file)? {
+        // For detached start, track the actual spawned child PID rather than the
+        // lockfile PID, which may still contain a stale value until the new daemon
+        // acquires the startup lock and writes its own PID.
+        if let Some(pid) = expected_pid {
             if !process_is_running(pid) {
                 return Err(AppError::DaemonUnavailable(format!(
                     "daemon process exited before becoming ready. Check logs under {}",
@@ -292,7 +298,7 @@ fn spawn_detached(
     auth_hash: Option<&str>,
     port: u16,
     notification_hook: Option<&str>,
-) -> Result<()> {
+) -> Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("daemon")
@@ -346,8 +352,8 @@ fn spawn_detached(
             });
         }
     }
-    cmd.spawn()?;
-    Ok(())
+    let child = cmd.spawn()?;
+    Ok(child.id())
 }
 
 async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: bool) -> Result<()> {
