@@ -1279,7 +1279,35 @@ fn trim_repeated_trailing_suffix(
 }
 
 fn row_is_blank(row: &[u8]) -> bool {
-    row.is_empty() || row.iter().all(|byte| byte.is_ascii_whitespace())
+    if row.is_empty() {
+        return true;
+    }
+    // Skip ANSI escape sequences so that rows containing only formatting
+    // codes (e.g. "\x1b[0m") are still considered blank.
+    let mut i = 0;
+    while i < row.len() {
+        if row[i] == 0x1b {
+            i += 1;
+            if i < row.len() && row[i] == b'[' {
+                // CSI sequence: skip parameter/intermediate bytes then final byte
+                i += 1;
+                while i < row.len() && row[i] < 0x40 {
+                    i += 1;
+                }
+                if i < row.len() {
+                    i += 1;
+                }
+            } else if i < row.len() {
+                // Two-byte escape (e.g. \x1b( )
+                i += 1;
+            }
+        } else if row[i].is_ascii_whitespace() {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {

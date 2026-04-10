@@ -4,6 +4,7 @@ import type { SessionSummary } from '@/api/types'
 import {
   fetchSession,
   fetchLogs,
+  fetchLogsTail,
   stopSession,
   killSession,
   uploadSessionFile,
@@ -62,6 +63,29 @@ function isSessionRunning(session: SessionSummary | null): boolean {
   return session
     ? session.status === 'running' || session.status === 'stopping' || session.status === 'created'
     : false
+}
+
+function normalizeSnapshotOutputForXterm(output: Uint8Array): Uint8Array {
+  let extra = 0
+  for (let i = 0; i < output.length; i += 1) {
+    if (output[i] === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
+      extra += 1
+    }
+  }
+  if (extra === 0) return output
+
+  const normalized = new Uint8Array(output.length + extra)
+  let writeIndex = 0
+  for (let i = 0; i < output.length; i += 1) {
+    const byte = output[i]
+    if (byte === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
+      normalized[writeIndex] = 0x0d
+      writeIndex += 1
+    }
+    normalized[writeIndex] = byte
+    writeIndex += 1
+  }
+  return normalized
 }
 
 const DEFAULT_LOG_TAIL = 200
@@ -160,6 +184,8 @@ export default function SessionDetailPage() {
     typeof navigator === 'undefined' ? true : navigator.onLine
   )
   const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
+  const [isTailMode, setIsTailMode] = useState(true)
+  const [tailLimit, setTailLimit] = useState<number | null>(null)
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -756,6 +782,8 @@ export default function SessionDetailPage() {
 
   useEffect(() => {
     if (mode !== 'logs' || !id) return
+
+    // Reset common state.
     termRef.current?.reset()
     commitReplayIdx(0, { force: true })
     isReplayingRef.current = false
@@ -772,10 +800,39 @@ export default function SessionDetailPage() {
     setTotalChunks(0)
 
     let cancelled = false
-    // Defer to avoid StrictMode double-fetch.
+
+    if (isTailMode) {
+      // Tail mode: fetch raw bytes and write directly to xterm.
+      const raf = requestAnimationFrame(() => {
+        if (cancelled) return
+        const rows = tailLimit ?? termRef.current?.getSize()?.rows ?? 40
+        const cols = termRef.current?.getSize()?.cols ?? 80
+        fetchLogsTail(id!, rows, cols, node ?? undefined)
+          .then((res) => {
+            if (cancelled || !isMounted.current) return
+            if (res.output.length > 0) {
+              termRef.current?.write(normalizeSnapshotOutputForXterm(res.output), () => {
+                termRef.current?.scrollToBottom()
+              })
+            }
+            fetchSession(id!, node ?? undefined)
+              .then((s) => {
+                if (!cancelled && isMounted.current) setSession(s)
+              })
+              .catch(() => {})
+          })
+          .catch(() => {})
+      })
+      return () => {
+        cancelled = true
+        cancelAnimationFrame(raf)
+      }
+    }
+
+    // Replay mode: fetch paginated chunks.
     const raf = requestAnimationFrame(() => {
       if (cancelled) return
-      fetchLogs(id!, { tail: DEFAULT_LOG_TAIL }, node ?? undefined)
+      fetchLogs(id!, { limit: DEFAULT_LOG_TAIL }, node ?? undefined)
         .then((res) => {
           if (cancelled || !isMounted.current) return
           const encodedChunks = encodeLogChunks(res.chunks)
@@ -802,7 +859,7 @@ export default function SessionDetailPage() {
       cancelled = true
       cancelAnimationFrame(raf)
     }
-  }, [mode, id, node, reloadTick, commitReplayIdx])
+  }, [mode, id, node, reloadTick, commitReplayIdx, isTailMode, tailLimit])
 
   const isScrubbingRef = useRef(false)
   const wasPlayingBeforeScrubRef = useRef(false)
@@ -947,6 +1004,11 @@ export default function SessionDetailPage() {
   }
 
   function handleReplayButton() {
+    if (isTailMode) {
+      // Switch from tail mode to replay mode and start from beginning.
+      setIsTailMode(false)
+      return
+    }
     if (!isReplaying) {
       startReplay(0)
     } else if (!isPaused) {
@@ -961,6 +1023,18 @@ export default function SessionDetailPage() {
       isPausedRef.current = false
       startReplay(replayIdx)
     }
+  }
+
+  function handleSwitchToTail() {
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
+    }
+    isReplayingRef.current = false
+    setIsReplaying(false)
+    setIsPaused(false)
+    isPausedRef.current = false
+    setIsTailMode(true)
   }
 
   async function handleStop() {
@@ -1232,12 +1306,43 @@ export default function SessionDetailPage() {
                 autoFit={mode === 'attach'}
                 onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
                 onResize={mode === 'attach' ? handleTermResize : undefined}
-                className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-fit'}`}
+                className={`h-full ${mode === 'attach' ? 'min-w-full' : 'w-250'}`}
               />
             </div>
 
-            {/* Scrubber (logs mode) */}
-            {mode === 'logs' && scrubberMax > 0 && (
+            {/* Tail mode controls */}
+            {mode === 'logs' && isTailMode && (
+              <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Tail
+                </span>
+                <input
+                  type="number"
+                  className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  value={tailLimit ?? termRef.current?.getSize()?.rows ?? 40}
+                  min={1}
+                  max={5000}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10)
+                    if (!isNaN(v) && v > 0) setTailLimit(v)
+                  }}
+                  aria-label="Tail line limit"
+                />
+                <span className="text-xs text-[hsl(var(--muted-foreground))]">lines</span>
+                <div className="flex-1" />
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="secondary" size="icon" onClick={handleReplayButton}>
+                      <PlayIcon className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Replay from start</TooltipContent>
+                </Tooltip>
+              </div>
+            )}
+
+            {/* Scrubber (replay mode) */}
+            {mode === 'logs' && !isTailMode && scrubberMax > 0 && (
               <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
                 <div className="flex flex-1 items-center gap-2">
                   <Slider
@@ -1295,21 +1400,15 @@ export default function SessionDetailPage() {
                         {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
                       </TooltipContent>
                     </Tooltip>
-                    {/* <Select
-                      value={String(replaySpeed)}
-                      onValueChange={(v) => setReplaySpeed(Number(v))}
-                    >
-                      <SelectTrigger className="h-8 w-15 text-sm px-2">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="0.5">0.5×</SelectItem>
-                        <SelectItem value="1">1×</SelectItem>
-                        <SelectItem value="2">2×</SelectItem>
-                        <SelectItem value="5">5×</SelectItem>
-                        <SelectItem value="10">10×</SelectItem>
-                      </SelectContent>
-                    </Select> */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button variant="secondary" size="sm" onClick={handleSwitchToTail}>
+                          <TrackNextIcon className="h-4 w-4" />
+                          Tail
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Switch to tail view</TooltipContent>
+                    </Tooltip>
                   </div>
                 </div>
               </div>

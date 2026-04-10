@@ -105,6 +105,7 @@ pub async fn serve(state: AppState) {
             post(sessions::upload_file).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/api/sessions/{id}/logs", get(sessions::get_logs))
+        .route("/api/sessions/{id}/logs/tail", get(sessions::get_logs_tail))
         .route("/api/sessions/{id}/attach", get(ws::attach_handler))
         .route("/api/nodes", get(nodes::list_nodes))
         .layer(axum::middleware::from_fn_with_state(
