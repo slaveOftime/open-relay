@@ -99,14 +99,19 @@ pub fn encode_node_ws_payload(message: &NodeWsMessage) -> std::io::Result<Vec<u8
     Ok(payload)
 }
 
+/// Hard cap on decompressed node WebSocket payload size (64 MB).
+/// Prevents gzip-bomb attacks from malicious secondary nodes.
+const MAX_NODE_WS_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> {
     let start = Instant::now();
     let payload_len = payload.len();
     let compressed = payload.starts_with(NODE_WS_BINARY_MAGIC);
     let json = if compressed {
-        let mut decoder = GzDecoder::new(&payload[NODE_WS_BINARY_MAGIC.len()..]);
+        let decoder = GzDecoder::new(&payload[NODE_WS_BINARY_MAGIC.len()..]);
+        let mut limited = decoder.take(MAX_NODE_WS_DECOMPRESSED_BYTES);
         let mut json = Vec::new();
-        decoder.read_to_end(&mut json)?;
+        limited.read_to_end(&mut json)?;
         json
     } else {
         payload.to_vec()

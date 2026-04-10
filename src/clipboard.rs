@@ -218,7 +218,14 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         let entry_path = entry.path();
         let target_path = target.join(entry.file_name());
 
-        if entry.file_type()?.is_dir() {
+        // Skip symbolic links to prevent copying unintended files (e.g. a
+        // symlink pointing at /etc/shadow).
+        let ft = entry_path.symlink_metadata()?.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+
+        if ft.is_dir() {
             copy_dir_recursive(&entry_path, &target_path)?;
         } else {
             fs::copy(&entry_path, &target_path)?;

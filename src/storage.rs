@@ -86,6 +86,13 @@ pub fn ensure_state_dirs(state_dir: &PathBuf, sessions_dir: &PathBuf) -> Result<
     fs::create_dir_all(state_dir)?;
     fs::create_dir_all(sessions_dir)?;
     fs::create_dir_all(state_dir.join("logs"))?;
+    // Restrict the state directory to owner-only; it contains sensitive files
+    // such as the SQLite database, daemon lock, config with VAPID keys, etc.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700));
+    }
     Ok(())
 }
 
