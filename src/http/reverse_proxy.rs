@@ -62,8 +62,12 @@ async fn proxy_request(request: Request, target_urls: &[Url]) -> Response {
 
     let request_headers = parts.headers;
     let forwarded_request_connection_headers = connection_header_tokens(&request_headers);
+    // Cap buffered request body at 10 MB to prevent memory-exhaustion DoS
+    // when proxying to multiple upstream targets.
+    const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
+
     let (buffered_body, mut streaming_body) = if target_urls.len() > 1 {
-        let buffered_body = match to_bytes(body, usize::MAX).await {
+        let buffered_body = match to_bytes(body, MAX_PROXY_BODY_BYTES).await {
             Ok(bytes) => bytes,
             Err(err) => {
                 error!(%err, method = %request_method, "failed to buffer proxied app request body");

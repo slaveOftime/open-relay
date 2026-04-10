@@ -287,6 +287,13 @@ fn resolve_manifest_entry(
                     "app manifest redirect files require a local entry",
                 ));
             }
+            // Block proxying to private LAN / link-local addresses to
+            // prevent SSRF via crafted oly.app.json manifests.
+            if is_private_proxy_target(&url) {
+                return Err(invalid_data(
+                    "app manifest proxy entry must not target private or link-local addresses",
+                ));
+            }
             return Ok(AppEntry::Proxy { entry_url: url });
         }
     }
@@ -652,6 +659,44 @@ fn filtered_proxy_query(query: Option<&str>) -> Option<String> {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Returns `true` if the proxy target URL resolves to a private LAN,
+/// link-local, or unspecified address.  Loopback (127.0.0.0/8, ::1) is
+/// intentionally allowed because the primary use-case for proxy entries is
+/// forwarding to local dev servers (e.g. Vite on 127.0.0.1:5173).
+fn is_private_proxy_target(url: &Url) -> bool {
+    use std::net::IpAddr;
+
+    let host = match url.host_str() {
+        Some(h) => h,
+        None => return true, // No host → reject
+    };
+
+    // Try to parse as IP directly first.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return is_ssrf_dangerous_ip(&ip);
+    }
+
+    false
+}
+
+/// Returns `true` for IPs that are SSRF-dangerous: private LAN ranges,
+/// link-local (cloud metadata), and unspecified.  Loopback is allowed.
+fn is_ssrf_dangerous_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+                || v4.is_link_local()  // 169.254.0.0/16 (cloud metadata)
+                || v4.is_unspecified() // 0.0.0.0
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_unspecified() // ::
+                || v6.to_ipv4_mapped().is_some_and(|v4| {
+                    v4.is_private() || v4.is_link_local()
+                })
+        }
+    }
 }
 
 fn extract_title(html: &str) -> Option<String> {

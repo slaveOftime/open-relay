@@ -12,6 +12,47 @@ use crate::{
     protocol::{PROTOCOL_VERSION, RpcEnvelope, RpcRequest, RpcResponse},
 };
 
+/// Maximum size of a single IPC message line (10 MB).
+/// Prevents OOM from malicious clients sending data without a newline.
+const MAX_IPC_LINE_BYTES: usize = 10 * 1024 * 1024;
+
+/// Read a newline-terminated line from a buffered reader, returning an error
+/// if the accumulated data exceeds [`MAX_IPC_LINE_BYTES`] before a newline is
+/// found.  This prevents a malicious local client from exhausting memory by
+/// sending an infinitely long line without a terminator.
+async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut String,
+) -> io::Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(total);
+        }
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let used = match newline_pos {
+            Some(pos) => pos + 1,
+            None => available.len(),
+        };
+        total += used;
+        if total > MAX_IPC_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("IPC message exceeds {MAX_IPC_LINE_BYTES} byte limit"),
+            ));
+        }
+        let chunk = &available[..used];
+        let s = std::str::from_utf8(chunk)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        buf.push_str(s);
+        reader.consume(used);
+        if newline_pos.is_some() {
+            return Ok(total);
+        }
+    }
+}
+
 pub async fn connect(config: &AppConfig) -> Result<Stream> {
     let stream = if GenericNamespaced::is_supported() {
         let name = config
@@ -42,12 +83,22 @@ pub fn bind(config: &AppConfig) -> io::Result<Listener> {
     } else {
         let socket_file = config.socket_file.to_string_lossy().to_string();
         let name = socket_file.as_str().to_fs_name::<GenericFilePath>()?;
-        ListenerOptions::new()
+        let listener = ListenerOptions::new()
             .name(name)
             .reclaim_name(true)
             .try_overwrite(true)
             .max_spin_time(Duration::from_millis(250))
-            .create_tokio()
+            .create_tokio()?;
+
+        // Restrict socket file to owner-only access.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&socket_file, perms)?;
+        }
+
+        Ok(listener)
     }
 }
 
@@ -77,7 +128,7 @@ pub async fn send_request_on_stream(
 
     let mut reader = BufReader::new(&mut stream);
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
+    let read = read_line_bounded(&mut reader, &mut line).await?;
     if read == 0 {
         return Err(AppError::Protocol(
             "daemon closed the connection".to_string(),
@@ -106,7 +157,7 @@ pub fn ensure_success_response(response: RpcResponse) -> Result<RpcResponse> {
 pub async fn read_request(stream: &mut Stream) -> Result<RpcRequest> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
+    let read = read_line_bounded(&mut reader, &mut line).await?;
     if read == 0 {
         return Err(AppError::Protocol(
             "client disconnected before request".to_string(),
@@ -144,7 +195,7 @@ pub async fn read_request_from_reader(
     reader: &mut BufReader<ReadHalf<Stream>>,
 ) -> Result<RpcRequest> {
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
+    let read = read_line_bounded(reader, &mut line).await?;
     if read == 0 {
         return Err(AppError::Protocol("client disconnected".to_string()));
     }
@@ -179,7 +230,7 @@ pub async fn read_response_from_reader(
     reader: &mut BufReader<ReadHalf<Stream>>,
 ) -> Result<RpcResponse> {
     let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
+    let read = read_line_bounded(reader, &mut line).await?;
     if read == 0 {
         return Err(AppError::Protocol(
             "daemon closed the connection".to_string(),

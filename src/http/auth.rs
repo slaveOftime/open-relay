@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
@@ -21,13 +21,16 @@ const MAX_FAILED_ATTEMPTS: u32 = 3;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60); // 15 minutes
 /// How often the background task sweeps the lockout table for expired entries.
 const LOCKOUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
+/// Session tokens expire after this duration. Stolen tokens have limited utility.
+const TOKEN_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 const AUTH_COOKIE_NAME: &str = "oly_auth_token";
 
 // ── AuthState ────────────────────────────────────────────────────────────────
 
 pub struct AuthState {
     password_hash: String,
-    tokens: Mutex<HashSet<String>>,
+    /// Maps token → creation time so expired tokens can be evicted.
+    tokens: Mutex<HashMap<String, Instant>>,
     /// Per-IP lockout table. Each client is tracked independently so that a
     /// brute-force attempt from one IP cannot lock out legitimate users.
     lockout: Mutex<HashMap<IpAddr, LockoutRecord>>,
@@ -39,7 +42,7 @@ struct LockoutRecord {
     locked_until: Option<Instant>,
 }
 
-enum FailureOutcome {
+pub(crate) enum FailureOutcome {
     LockedOut { until: Instant },
     AttemptsRemaining(u32),
 }
@@ -48,7 +51,7 @@ impl AuthState {
     pub fn new(password_hash: String) -> Arc<Self> {
         let state = Arc::new(Self {
             password_hash,
-            tokens: Mutex::new(HashSet::new()),
+            tokens: Mutex::new(HashMap::new()),
             lockout: Mutex::new(HashMap::new()),
         });
         state.spawn_cleanup_task();
@@ -79,17 +82,36 @@ impl AuthState {
                         "auth: background cleanup evicted expired lockout records"
                     );
                 }
+                // Also evict expired session tokens.
+                let mut tokens = state.tokens.lock().await;
+                let token_before = tokens.len();
+                tokens.retain(|_, created| created.elapsed() < TOKEN_MAX_AGE);
+                let token_removed = token_before - tokens.len();
+                if token_removed > 0 {
+                    debug!(
+                        removed = token_removed,
+                        "auth: background cleanup evicted expired session tokens"
+                    );
+                }
             }
         });
     }
 
     pub async fn is_valid_token(&self, token: &str) -> bool {
-        self.tokens.lock().await.contains(token)
+        let mut tokens = self.tokens.lock().await;
+        if let Some(&created) = tokens.get(token) {
+            if created.elapsed() < TOKEN_MAX_AGE {
+                return true;
+            }
+            // Token expired — evict it.
+            tokens.remove(token);
+        }
+        false
     }
 
     /// Returns `Some(locked_until)` if the IP is currently locked out.
     /// Evicts the record and returns `None` if the lockout has expired.
-    async fn locked_until(&self, ip: IpAddr) -> Option<Instant> {
+    pub(crate) async fn locked_until(&self, ip: IpAddr) -> Option<Instant> {
         let mut lockout = self.lockout.lock().await;
         let record = lockout.get(&ip)?;
         let t = record.locked_until?;
@@ -103,7 +125,7 @@ impl AuthState {
 
     /// Record a failed login attempt. Returns whether the IP is now locked out
     /// or how many attempts remain before lockout.
-    async fn record_failure(&self, ip: IpAddr) -> FailureOutcome {
+    pub(crate) async fn record_failure(&self, ip: IpAddr) -> FailureOutcome {
         let mut lockout = self.lockout.lock().await;
         let record = lockout.entry(ip).or_default();
         record.failed_attempts += 1;
@@ -150,10 +172,15 @@ pub struct LoginResponse {
 
 /// Return the effective client IP from headers + peer socket address.
 ///
-/// Checks `X-Real-IP` first (nginx single-proxy style), then the first entry
-/// of `X-Forwarded-For`, then falls back to the direct peer IP. Allows correct
-/// per-client lockout when the daemon is exposed through a reverse-proxy tunnel.
+/// Only trusts `X-Real-IP` / `X-Forwarded-For` when the direct peer address
+/// is a loopback IP (i.e. the request came through a local reverse proxy).
+/// This prevents remote attackers from spoofing arbitrary client IPs by
+/// setting these headers directly.
 pub(super) fn effective_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+
     headers
         .get("x-real-ip")
         .and_then(|v| v.to_str().ok())
@@ -235,11 +262,12 @@ pub async fn login(
     if verified.is_some() {
         auth.lockout.lock().await.remove(&client_ip);
         let token = uuid::Uuid::new_v4().to_string();
-        auth.tokens.lock().await.insert(token.clone());
+        auth.tokens.lock().await.insert(token.clone(), Instant::now());
         info!(ip = %client_ip, "auth: login success — token issued");
+        let secure = request_is_tls(&headers);
         return (
             StatusCode::OK,
-            [(axum::http::header::SET_COOKIE, build_auth_cookie(&token))],
+            [(axum::http::header::SET_COOKIE, build_auth_cookie(&token, secure))],
             Json(LoginResponse { token }),
         )
             .into_response();
@@ -296,7 +324,7 @@ pub async fn logout(
 
     if let Some(token) = extract_request_token_parts(&headers, None) {
         let removed = auth.tokens.lock().await.remove(&token);
-        if removed {
+        if removed.is_some() {
             info!(ip = %client_ip, "auth: logout — token revoked");
         } else {
             debug!(ip = %client_ip, "auth: logout — token not found (already expired?)");
@@ -325,7 +353,15 @@ pub async fn require_auth(
         return next.run(request).await;
     }
 
-    let token = extract_request_token(&request);
+    // Only allow query-string tokens for WebSocket/SSE upgrade endpoints
+    // where browser APIs cannot send Authorization headers or cookies.
+    let is_upgrade_path = path.ends_with("/attach") || path == "/api/sessions/events";
+    let query = if is_upgrade_path {
+        request.uri().query()
+    } else {
+        None
+    };
+    let token = extract_request_token_parts(request.headers(), query);
     let client_ip = extract_request_client_ip(&request);
     if let Some(response) = authorize_request(&state, &path, token, client_ip).await {
         return response;
@@ -362,10 +398,6 @@ pub(super) async fn authorize_request(
         )
             .into_response(),
     )
-}
-
-pub(super) fn extract_request_token(request: &Request) -> Option<String> {
-    extract_request_token_parts(request.headers(), request.uri().query())
 }
 
 pub(super) fn extract_request_client_ip(request: &Request) -> Option<String> {
@@ -411,12 +443,22 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
         })
 }
 
-fn build_auth_cookie(token: &str) -> String {
-    format!("{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax")
+fn build_auth_cookie(token: &str, secure: bool) -> String {
+    let secure_flag = if secure { "; Secure" } else { "" };
+    format!("{AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax{secure_flag}")
 }
 
 fn clear_auth_cookie() -> String {
     format!("{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+/// Returns true when the request appears to have arrived over TLS
+/// (via a reverse proxy that sets `X-Forwarded-Proto: https`).
+fn request_is_tls(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"))
 }
 
 #[cfg(test)]
@@ -462,11 +504,14 @@ mod tests {
 
     #[test]
     fn auth_cookie_headers_include_browser_scope() {
-        let set_cookie = build_auth_cookie("abc123");
+        let set_cookie = build_auth_cookie("abc123", false);
+        let secure_cookie = build_auth_cookie("abc123", true);
         let clear_cookie = clear_auth_cookie();
 
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(!set_cookie.contains("Secure"));
+        assert!(secure_cookie.contains("; Secure"));
         assert!(clear_cookie.contains("Max-Age=0"));
     }
 }
