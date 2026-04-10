@@ -1215,7 +1215,6 @@ mod tests {
             requested_final_status: None,
             last_output_epoch: last_output_at,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
@@ -1304,10 +1303,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_candidates_allows_recent_output_when_not_suppressed() {
+    async fn test_silent_candidates_suppresses_recent_output_within_attach_window() {
         let silence = Duration::from_secs(5);
         let min_interval = Duration::from_secs(10);
-        // Current implementation only requires an output epoch to exist.
         let rt = make_runtime(
             "abc1234",
             SessionStatus::Running,
@@ -1316,8 +1314,31 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].session_id, "abc1234");
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_respects_min_notification_interval() {
+        let silence = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        let store = store_with(vec![rt], make_test_db().await);
+
+        {
+            let sessions = store.sessions.load();
+            let handle = sessions.get("abc1234").unwrap();
+            let mut rt = handle.write();
+            rt.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
+            rt.notified_output_epoch = None;
+        }
+
+        let candidates = store.silent_candidates(silence, min_interval);
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]
@@ -1442,8 +1463,9 @@ mod tests {
             let sessions = store.sessions.load();
             let handle = sessions.get("abc1234").unwrap();
             let mut rt = handle.write();
-            // A new epoch strictly later than the notified one.
-            rt.last_output_epoch = Some(Instant::now());
+            // A new epoch strictly later than the notified one, but old enough
+            // to be outside the attach suppression window.
+            rt.last_output_epoch = Some(Instant::now() - Duration::from_secs(2));
             // Move notification timestamp into the past so cooldown no longer blocks.
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(30));
         }
@@ -1796,7 +1818,6 @@ mod tests {
             requested_final_status: None,
             last_output_epoch: None,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
@@ -2278,10 +2299,6 @@ mod tests {
 
         let locked = rt_clone.read();
         assert!(
-            locked.last_attach_presence_at.is_none(),
-            "detach should clear attach presence"
-        );
-        assert!(
             locked.last_attach_activity_at.is_none(),
             "detach should clear attach activity"
         );
@@ -2312,10 +2329,6 @@ mod tests {
                 "one client should still remain registered"
             );
             assert!(
-                locked.last_attach_presence_at.is_some(),
-                "presence should remain while one client is still connected"
-            );
-            assert!(
                 locked.last_attach_activity_at.is_some(),
                 "activity timestamp should remain until the last client disconnects"
             );
@@ -2328,10 +2341,6 @@ mod tests {
 
         let locked = rt_clone.read();
         assert_eq!(locked.attach_count, 0, "all clients should be disconnected");
-        assert!(
-            locked.last_attach_presence_at.is_none(),
-            "final detach should clear attach presence"
-        );
         assert!(
             locked.last_attach_activity_at.is_none(),
             "final detach should clear attach activity"

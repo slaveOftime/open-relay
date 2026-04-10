@@ -22,6 +22,7 @@ use crate::error::Result;
 const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
     // Shell / REPL prompt characters at end of line
     r"[>❯›\$#%]\s*$",
+    r"❯\s+",
     // `> text` at start of line (e.g. Gemini CLI input field)
     r"^\s*>\s+\S",
     // Python REPL
@@ -227,10 +228,9 @@ pub fn ensure_config_file(state_dir: &Path) {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Err(err) = std::fs::set_permissions(
-                        &path,
-                        std::fs::Permissions::from_mode(0o600),
-                    ) {
+                    if let Err(err) =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    {
                         eprintln!(
                             "warning: could not restrict config.json permissions to 0o600: {err}"
                         );

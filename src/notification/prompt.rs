@@ -252,6 +252,18 @@ mod tests {
     }
 
     #[test]
+    fn test_defaults_match_copilot_cli_input_prompt() {
+        let p = default_patterns();
+        assert!(matches_prompt(
+            "────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  Type @ to mention files, # for issues/PRs, / for commands, or ? for shortcuts
+────────────────────────────────────────────────────────────────────────────────────────────────────────
+ shift+tab switch mode",
+            &p,
+        ));
+    }
+
+    #[test]
     fn test_defaults_no_false_positives() {
         let p = default_patterns();
         assert!(!matches_prompt("hello world", &p));

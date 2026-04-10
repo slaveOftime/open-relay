@@ -61,8 +61,6 @@ pub struct SessionRuntime {
     pub last_output_epoch: Option<Instant>,
     /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
-    /// Timestamp of the last subscribe/attach action; coarse presence signal.
-    pub last_attach_presence_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
     /// Number of currently connected local clients for this session.
@@ -144,11 +142,9 @@ impl SessionRuntime {
             attach_count = self.attach_count,
             "attach client registered"
         );
-        self.last_attach_presence_at = Some(Instant::now());
     }
 
     pub fn mark_attach_activity(&mut self) {
-        self.last_attach_presence_at = Some(Instant::now());
         debug!(
             session_id = %self.meta.id,
             attach_count = self.attach_count,
@@ -170,9 +166,8 @@ impl SessionRuntime {
     }
 
     pub fn clear_attach_state(&mut self) {
-        debug!(session_id = %self.meta.id, "attach presence/activity cleared");
+        debug!(session_id = %self.meta.id, "attach activity cleared");
         self.attach_count = 0;
-        self.last_attach_presence_at = None;
         self.last_attach_activity_at = None;
     }
 
@@ -468,7 +463,6 @@ pub fn spawn_session(
         requested_final_status: None,
         last_output_epoch: None,
         last_input_at: None,
-        last_attach_presence_at: None,
         last_attach_activity_at: None,
         attach_count: 0,
         notified_output_epoch: None,
@@ -689,7 +683,6 @@ mod tests {
             requested_final_status: None,
             last_output_epoch: None,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
@@ -943,7 +936,6 @@ mod tests {
             requested_final_status: None,
             last_output_epoch: None,
             last_input_at: None,
-            last_attach_presence_at: None,
             last_attach_activity_at: None,
             attach_count: 0,
             last_notified_at: None,
