@@ -1084,9 +1084,10 @@ impl SessionStore {
         sessions
             .values()
             .filter_map(|handle| {
-                // Fast read-lock check: skip completed sessions and apply
-                // cooldown / epoch filters before taking a write lock.
-                let (last_output, plan) = {
+                // Single read lock: gather all fields needed for filtering and
+                // build the excerpt plan.  Captures everything so we never need
+                // to re-read these fields under a separate lock.
+                let (plan, mut candidate) = {
                     let rt = handle.read();
                     if rt.is_completed() {
                         return None;
@@ -1096,7 +1097,6 @@ impl SessionStore {
                     if let Some(last_attach_activity) = rt.last_attach_activity_at {
                         if now.duration_since(last_attach_activity) < attach_suppression_window {
                             drop(rt);
-                            // Brief write lock to reset output epoch.
                             handle.write().last_visible_output_at = None;
                             return None;
                         }
@@ -1114,30 +1114,28 @@ impl SessionStore {
                     }
 
                     let plan = build_notification_excerpt_plan(&rt);
-                    (last_output, plan)
+                    let candidate = SilentCandidate {
+                        session_id: rt.meta.id.clone(),
+                        session_title: rt.meta.title.clone(),
+                        raw_excerpt: String::new(),
+                        output_epoch: last_output,
+                        notifications_enabled: rt.notifications_enabled,
+                        last_total_bytes: rt.last_total_bytes,
+                    };
+                    (plan, candidate)
                 };
 
-                let excerpt = if let Some(excerpt) = recent_notification_excerpt(&plan) {
+                // File I/O happens outside any lock.
+                if let Some(excerpt) = recent_notification_excerpt(&plan) {
                     let mut rt = handle.write();
                     if rt.last_total_bytes == plan.end_offset
                         && rt.notification_excerpt_end_offset <= plan.start_offset
                     {
                         rt.notification_excerpt_end_offset = plan.end_offset;
                     }
-                    excerpt
-                } else {
-                    String::new()
-                };
-
-                let rt = handle.read();
-                Some(SilentCandidate {
-                    session_id: rt.meta.id.clone(),
-                    session_title: rt.meta.title.clone(),
-                    raw_excerpt: excerpt,
-                    output_epoch: last_output,
-                    notifications_enabled: rt.notifications_enabled,
-                    last_total_bytes: rt.last_total_bytes,
-                })
+                    candidate.raw_excerpt = excerpt;
+                }
+                Some(candidate)
             })
             .collect()
     }
