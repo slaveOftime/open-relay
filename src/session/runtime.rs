@@ -19,9 +19,7 @@ use crate::{
     session::persist::append_output,
 };
 
-use super::pty::{
-    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client, has_visible_content,
-};
+use super::pty::{EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client};
 
 use super::{
     SessionMeta, SessionStatus,
@@ -57,8 +55,6 @@ pub struct SessionRuntime {
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
     pub requested_final_status: Option<SessionStatus>,
-    /// Timestamp of the last visible output chunk; drives the notification engine.
-    pub last_visible_output_at: Option<Instant>,
     /// Total length of canonical filtered PTY output bytes.
     pub last_total_bytes: u64,
     /// Timestamp of the last output chunk.
@@ -75,8 +71,6 @@ pub struct SessionRuntime {
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
-    /// Canonical filtered-stream offset already folded into `notification_excerpt`.
-    pub notification_excerpt_end_offset: u64,
     /// Live rendered terminal state for attach snapshot restoration.
     pub screen_parser: vt100::Parser,
     /// Set once the PTY reader has reached EOF or a terminal read error.
@@ -96,15 +90,10 @@ impl SessionRuntime {
         }
     }
 
-    /// Push a filtered PTY chunk into the canonical retained stream and advance
-    /// the silence clock for visible content. Returns the current cursor
-    /// position so the caller can answer terminal queries without re-locking.
-    pub fn push_output(&mut self, filtered_data: &[u8], has_visible_output: bool) -> (u16, u16) {
-        // Advance the silence clock only for chunks with visible content.
-        if has_visible_output {
-            self.last_visible_output_at = Some(Instant::now());
-        }
-
+    /// Push a filtered PTY chunk into the canonical retained stream.
+    /// Returns the current cursor position so the caller can answer terminal
+    /// queries without re-locking.
+    pub fn push_output(&mut self, filtered_data: &[u8]) -> (u16, u16) {
         // Add the canonical filtered bytes to the retained terminal state.
         // Fully stripped chunks do not advance replay offsets.
         if !filtered_data.is_empty() {
@@ -190,7 +179,7 @@ impl SessionRuntime {
     pub fn input_needed(&self) -> bool {
         matches!(self.meta.status, SessionStatus::Running)
             && self.notified_output_epoch.is_some()
-            && self.notified_output_epoch == self.last_visible_output_at
+            && self.notified_output_epoch == self.last_output_epoch
     }
 
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
@@ -477,7 +466,6 @@ pub fn spawn_session(
         completed_at: None,
         persisted: false,
         requested_final_status: None,
-        last_visible_output_at: None,
         last_output_epoch: None,
         last_input_at: None,
         last_attach_presence_at: None,
@@ -485,7 +473,6 @@ pub fn spawn_session(
         attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
-        notification_excerpt_end_offset: 0,
         screen_parser: vt100::Parser::new(rows, cols, 0),
         output_closed: false,
         notifications_enabled,
@@ -519,14 +506,13 @@ pub fn spawn_session(
                     let data = &buf[..n];
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
-                    let has_visible_output = has_visible_content(&data);
                     let filtered_data = Bytes::from(stream_filter.filter(&data));
 
                     // Single write lock: push output into vt100 parser and read
                     // cursor position for terminal query responses.
                     let cursor_position = {
                         let mut rt = runtime_reader.write();
-                        rt.push_output(&filtered_data, has_visible_output)
+                        rt.push_output(&filtered_data)
                     };
 
                     if !filtered_data.is_empty() {
@@ -701,7 +687,6 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: None,
             last_output_epoch: None,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -709,7 +694,6 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
@@ -735,7 +719,7 @@ mod tests {
     fn test_push_output_enables_bracketed_paste() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(b"text \x1b[?2004h more", true);
+        rt.push_output(b"text \x1b[?2004h more");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -752,9 +736,9 @@ mod tests {
     #[test]
     fn test_push_output_disables_bracketed_paste() {
         let mut rt = new_runtime();
-        rt.push_output(b"\x1b[?2004h", false);
+        rt.push_output(b"\x1b[?2004h");
         assert!(rt.mode_snapshot().bracketed_paste_mode);
-        rt.push_output(b"\x1b[?2004l", false);
+        rt.push_output(b"\x1b[?2004l");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -772,7 +756,7 @@ mod tests {
     fn test_push_output_enables_app_cursor_keys() {
         let mut rt = new_runtime();
         assert!(!rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(b"\x1b[?1h", false);
+        rt.push_output(b"\x1b[?1h");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -789,9 +773,9 @@ mod tests {
     #[test]
     fn test_push_output_disables_app_cursor_keys() {
         let mut rt = new_runtime();
-        rt.push_output(b"\x1b[?1h", false);
+        rt.push_output(b"\x1b[?1h");
         assert!(rt.mode_snapshot().app_cursor_keys);
-        rt.push_output(b"\x1b[?1l", false);
+        rt.push_output(b"\x1b[?1l");
         assert_eq!(
             rt.mode_snapshot(),
             ModeSnapshot {
@@ -806,27 +790,27 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // push_output — last_output_at tracking
+    // push_output — last_output_epoch tracking
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_push_output_visible_content_advances_last_output_at() {
+    fn test_push_output_non_empty_advances_last_output_epoch() {
         let mut rt = new_runtime();
-        assert!(rt.last_visible_output_at.is_none());
-        rt.push_output(b"hello world\n", true);
+        assert!(rt.last_output_epoch.is_none());
+        rt.push_output(b"hello world\n");
         assert!(
-            rt.last_visible_output_at.is_some(),
-            "visible output should set last_output_at"
+            rt.last_output_epoch.is_some(),
+            "non-empty output should set last_output_epoch"
         );
     }
 
     #[test]
-    fn test_push_output_pure_ansi_does_not_advance_last_output_at() {
+    fn test_push_output_empty_does_not_advance_last_output_epoch() {
         let mut rt = new_runtime();
-        rt.push_output(b"\x1b[1A\x1b[2K\x1b[H", false);
+        rt.push_output(b"");
         assert!(
-            rt.last_visible_output_at.is_none(),
-            "pure ANSI sequences should not advance last_output_at"
+            rt.last_output_epoch.is_none(),
+            "empty output should not advance last_output_epoch"
         );
     }
 
@@ -835,7 +819,7 @@ mod tests {
         let mut rt = new_runtime();
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(filtered.as_ref(), true);
+        rt.push_output(filtered.as_ref());
 
         assert_eq!(
             rt.screen_parser.screen().contents().trim_end(),
@@ -849,7 +833,7 @@ mod tests {
         let mut rt = new_runtime();
         let filtered = bytes::Bytes::from_static(b"beforeafter");
 
-        rt.push_output(filtered.as_ref(), true);
+        rt.push_output(filtered.as_ref());
 
         assert_eq!(rt.last_total_bytes, 11);
     }
@@ -857,7 +841,7 @@ mod tests {
     #[test]
     fn test_push_output_drops_fully_stripped_chunks_from_snapshot() {
         let mut rt = new_runtime();
-        rt.push_output(&[], false);
+        rt.push_output(&[]);
 
         assert!(rt.screen_parser.screen().contents().trim().is_empty());
         assert_eq!(rt.last_total_bytes, 0);
@@ -957,7 +941,6 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: None,
             last_output_epoch: None,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -965,7 +948,6 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,

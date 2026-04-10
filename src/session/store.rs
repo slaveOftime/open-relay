@@ -67,81 +67,6 @@ impl SessionHandle {
     }
 }
 
-fn visible_screen_excerpt(parser: &vt100::Parser) -> String {
-    let screen = parser.screen();
-    let (rows, cols) = screen.size();
-    let mut lines: Vec<String> = screen
-        .rows(0, cols)
-        .take(rows as usize)
-        .map(|row| row.trim_end().to_string())
-        .collect();
-
-    while matches!(lines.last(), Some(line) if line.is_empty()) {
-        lines.pop();
-    }
-
-    lines.join("\n")
-}
-
-fn notification_excerpt_window_bytes(parser: &vt100::Parser) -> u64 {
-    let (rows, cols) = parser.screen().size();
-    ((rows as u64).saturating_mul(cols as u64).saturating_mul(8)).max(4096)
-}
-
-struct NotificationExcerptPlan {
-    session_id: String,
-    dir: PathBuf,
-    rows: u16,
-    cols: u16,
-    start_offset: u64,
-    end_offset: u64,
-    cached_end_offset: u64,
-}
-
-fn build_notification_excerpt_plan(rt: &SessionRuntime) -> NotificationExcerptPlan {
-    let (rows, cols) = rt.screen_parser.screen().size();
-    let end_offset = rt.last_total_bytes;
-    let start_offset = rt
-        .notification_excerpt_end_offset
-        .min(end_offset)
-        .max(end_offset.saturating_sub(notification_excerpt_window_bytes(&rt.screen_parser)));
-    NotificationExcerptPlan {
-        session_id: rt.meta.id.clone(),
-        dir: rt.dir.clone(),
-        rows,
-        cols,
-        start_offset,
-        end_offset,
-        cached_end_offset: rt.notification_excerpt_end_offset,
-    }
-}
-
-fn recent_notification_excerpt(plan: &NotificationExcerptPlan) -> Option<String> {
-    if plan.start_offset == plan.cached_end_offset && plan.start_offset == plan.end_offset {
-        return None;
-    }
-
-    let (bytes, _actual_end_offset) = match read_output_from(&plan.dir, plan.start_offset) {
-        Ok(result) => result,
-        Err(err) => {
-            warn!(
-                session_id = %plan.session_id,
-                %err,
-                start_offset = plan.start_offset,
-                "failed to refresh recent notification excerpt"
-            );
-            return None;
-        }
-    };
-
-    let mut parser = vt100::Parser::new(plan.rows, plan.cols, 0);
-    if !bytes.is_empty() {
-        parser.process(&bytes);
-    }
-
-    Some(visible_screen_excerpt(&parser))
-}
-
 pub struct SessionStore {
     sessions: ArcSwap<SessionMap>,
     mutable: TokioMutex<StoreMutableState>,
@@ -154,7 +79,7 @@ pub struct SessionStore {
 pub struct SilentCandidate {
     pub session_id: String,
     pub session_title: Option<String>,
-    pub raw_excerpt: String,
+    pub excerpt: String,
     pub output_epoch: Instant,
     pub notifications_enabled: bool,
     pub last_total_bytes: u64,
@@ -381,7 +306,7 @@ impl SessionStore {
             .map(|handle| {
                 let rt = handle.read();
                 SessionLiveSummary {
-                    last_output_at: rt.last_visible_output_at,
+                    last_output_at: rt.last_output_epoch,
                     summary: rt.to_summary(),
                 }
             })
@@ -418,7 +343,7 @@ impl SessionStore {
             .map(|handle| {
                 handle
                     .read()
-                    .last_visible_output_at
+                    .last_output_epoch
                     .map(|last_output| {
                         std::time::Instant::now().duration_since(last_output) >= duration
                     })
@@ -1084,58 +1009,63 @@ impl SessionStore {
         sessions
             .values()
             .filter_map(|handle| {
-                // Single read lock: gather all fields needed for filtering and
-                // build the excerpt plan.  Captures everything so we never need
-                // to re-read these fields under a separate lock.
-                let (plan, mut candidate) = {
-                    let rt = handle.read();
-                    if rt.is_completed() {
-                        return None;
-                    }
-
-                    // Check attach activity suppression window.
-                    if let Some(last_attach_activity) = rt.last_attach_activity_at {
-                        if now.duration_since(last_attach_activity) < attach_suppression_window {
-                            drop(rt);
-                            handle.write().last_visible_output_at = None;
-                            return None;
-                        }
-                    }
-
-                    let last_output = rt.last_visible_output_at?;
-
-                    if let Some(last_notified_at) = rt.last_notified_at {
-                        if now.duration_since(last_notified_at) < min_notification_interval {
-                            return None;
-                        }
-                    }
-                    if rt.notified_output_epoch == Some(last_output) {
-                        return None;
-                    }
-
-                    let plan = build_notification_excerpt_plan(&rt);
-                    let candidate = SilentCandidate {
-                        session_id: rt.meta.id.clone(),
-                        session_title: rt.meta.title.clone(),
-                        raw_excerpt: String::new(),
-                        output_epoch: last_output,
-                        notifications_enabled: rt.notifications_enabled,
-                        last_total_bytes: rt.last_total_bytes,
-                    };
-                    (plan, candidate)
-                };
-
-                // File I/O happens outside any lock.
-                if let Some(excerpt) = recent_notification_excerpt(&plan) {
-                    let mut rt = handle.write();
-                    if rt.last_total_bytes == plan.end_offset
-                        && rt.notification_excerpt_end_offset <= plan.start_offset
-                    {
-                        rt.notification_excerpt_end_offset = plan.end_offset;
-                    }
-                    candidate.raw_excerpt = excerpt;
+                let rt = handle.read();
+                if rt.is_completed() {
+                    return None;
                 }
-                Some(candidate)
+
+                // If attach just happend, there is not need to notify in supression window, treat it as notified
+                if let Some(last_attach_activity) = rt.last_attach_activity_at {
+                    if now.duration_since(last_attach_activity) < attach_suppression_window {
+                        trace!("silent becase recent attach activity");
+                        drop(rt);
+                        let mut rt = handle.write();
+                        rt.last_notified_at = rt.last_output_epoch;
+                        return None;
+                    }
+                }
+
+                // If output just happend, there is not need to notify in supression window, treat it as notified
+                let last_output = rt.last_output_epoch?;
+                if now.duration_since(last_output) < attach_suppression_window {
+                    trace!("silent becase recent output activity");
+                    return None;
+                }
+
+                // If just notified in short time, the there is no need notify again
+                if let Some(last_notified_at) = rt.last_notified_at {
+                    if last_output - last_notified_at < min_notification_interval {
+                        trace!("silent becase just notified since last output");
+                        return None;
+                    }
+                }
+
+                if rt.notified_output_epoch == Some(last_output) {
+                    trace!("silent becase no changed since last nofification");
+                    return None;
+                }
+
+                debug!(
+                    session_id = rt.meta.id.as_str(),
+                    last_input_at = ?rt.last_input_at,
+                    last_attach_activity_at = ?rt.last_attach_activity_at,
+                    last_output_epoch = ?rt.last_output_epoch,
+                    last_notified_at = ?rt.last_notified_at,
+                    "silent candidate ready"
+                );
+
+                // As this is most for matching some pattern from coding agent cli, most of them have input box under the bottom.
+                // And most of them are using alt screen, it is more accurate to just use the live tail logs.
+                // Silent can still be a fallback, just need to wait a little bit longer for the notification.
+                let excerpt = rt.render_logs(15, false, u16::MAX);
+                Some(SilentCandidate {
+                    session_id: rt.meta.id.clone(),
+                    session_title: rt.meta.title.clone(),
+                    excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
+                    output_epoch: last_output,
+                    notifications_enabled: rt.notifications_enabled,
+                    last_total_bytes: rt.last_total_bytes,
+                })
             })
             .collect()
     }
@@ -1283,7 +1213,6 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: last_output_at,
             last_output_epoch: last_output_at,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -1291,7 +1220,6 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser,
             output_closed: false,
             notifications_enabled: true,
@@ -1418,7 +1346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_candidates_keeps_silence_candidate_without_new_excerpt_bytes() {
+    async fn test_silent_candidates_includes_screen_excerpt() {
         let silence = Duration::from_secs(5);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime(
@@ -1427,44 +1355,16 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(10)),
         );
-        {
-            let mut locked = rt.write();
-            locked.notification_excerpt_end_offset = locked.last_total_bytes;
-        }
         let store = store_with(vec![rt], make_test_db().await);
 
         let candidates = store.silent_candidates(silence, min_interval);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
-        assert!(candidates[0].raw_excerpt.is_empty());
-    }
-
-    #[test]
-    fn test_visible_screen_excerpt_stays_within_parser_viewport() {
-        let mut parser = vt100::Parser::new(2, 10, 0);
-        parser.process(b"line1\nline2\nline3\nprompt> ");
-
-        let excerpt = visible_screen_excerpt(&parser);
-
-        assert!(excerpt.lines().count() <= 2);
-        assert!(excerpt.lines().all(|line| line.chars().count() <= 10));
-    }
-
-    #[test]
-    fn test_recent_notification_excerpt_only_uses_bytes_since_last_check() {
-        let runtime = make_runtime("recent001", SessionStatus::Running, "old output\n", None);
-        let mut rt = runtime.write();
-        rt.notification_excerpt_end_offset = rt.last_total_bytes;
-        crate::session::persist::append_output_raw(&rt.dir, b"prompt> ").expect("append output");
-        rt.last_total_bytes += b"prompt> ".len() as u64;
-        rt.screen_parser.process(b"prompt> ");
-
-        let plan = build_notification_excerpt_plan(&rt);
-        let excerpt = recent_notification_excerpt(&plan).expect("excerpt should refresh");
-
-        assert!(excerpt.contains("prompt"));
-        assert!(!excerpt.contains("old output"));
+        assert!(
+            candidates[0].excerpt.contains("prompt>"),
+            "excerpt should contain rendered screen content"
+        );
     }
 
     #[tokio::test]
@@ -1543,7 +1443,7 @@ mod tests {
             let handle = sessions.get("abc1234").unwrap();
             let mut rt = handle.write();
             // A new epoch strictly later than the notified one.
-            rt.last_visible_output_at = Some(Instant::now());
+            rt.last_output_epoch = Some(Instant::now());
             // Move notification timestamp into the past so cooldown no longer blocks.
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(30));
         }
@@ -1807,8 +1707,8 @@ mod tests {
         let handle = sessions.get("abc1234").unwrap();
         let locked = handle.read();
         assert!(
-            locked.last_visible_output_at.is_none(),
-            "suppression path should no longer mutate output epoch during reads"
+            locked.last_output_epoch.is_some(),
+            "suppression path should not mutate output epoch — it must remain intact"
         );
     }
 
@@ -1894,7 +1794,6 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
-            last_visible_output_at: None,
             last_output_epoch: None,
             last_input_at: None,
             last_attach_presence_at: None,
@@ -1902,7 +1801,6 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            notification_excerpt_end_offset: 0,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,

@@ -4,41 +4,39 @@ use serde::Deserialize;
 
 use crate::error::Result;
 
+/// Default prompt patterns used to detect interactive prompts in terminal output.
+/// These are intentionally broad to cover common shells, REPLs, and CLI tools.
+///
+/// To override, set `prompt_patterns` in your config file
+/// (`~/.local/share/oly/config.json` on Linux/macOS, `%LOCALAPPDATA%\oly\config.json` on Windows):
+///
+/// ```json
+/// {
+///     "prompt_patterns": [
+///         ">\\s*$",
+///         "(?i)password:",
+///         "… your own patterns here"
+///     ]
+/// }
+/// ```
 const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
-    // ── universal shell / REPL prompts ───────────────────────────────────
-    // Shell/REPL > prompt — bash, zsh, Claude Code input, OpenCode, generic REPLs
-    r">\s*$",
-    // Shell/REPL >>> prompt — python REPLs
+    // Shell / REPL prompt characters at end of line
+    r"[>❯›\$#%]\s*$",
+    // `> text` at start of line (e.g. Gemini CLI input field)
+    r"^\s*>\s+\S",
+    // Python REPL
     r">>>\s*$",
-    // bash/sh $ prompt
-    r"\$\s*$",
-    // ── confirmation dialogs ─────────────────────────────────────────────
-    // (y/n) / (Y/N) inline style
-    r"(?i)\(y/n\)",
-    // [Y/n] / [y/N] bracket style — used by many CLIs including Copilot, Gemini
-    r"(?i)\[y/n\]",
-    // [yes/no] bracket style
-    r"(?i)\[yes/no\]",
-    // ── credential / secret prompts ──────────────────────────────────────
-    // "Enter password:" / "Password:"
-    r"(?i)password:",
-    // API key / token / secret prompts — Gemini CLI, Copilot setup, OpenCode auth
-    r"(?i)(?:api[_ ]?key|token|secret)\s*:",
-    // ── AI coding tool prompts ───────────────────────────────────────────
-    // "? " prefix — GitHub Copilot CLI and all inquirer.js / @clack/prompts CLIs
+    // Confirmation dialogs: (y/n), [y/n], [yes/no]
+    r"(?i)[\(\[](y/n|yes/no)[\)\]]",
+    // Credential / secret prompts
+    r"(?i)(?:password|api[_ ]?key|token|secret)\s*:",
+    // Inquirer-style "? " prefix
     r"^\?\s",
-    // "Do you want to proceed?" — Claude Code, Gemini CLI, OpenCode confirmations
-    r"(?i)do you want",
-    // "Allow this action?" / "Allow tool use?" — Claude Code permission prompts
-    r"(?i)allow\b.{0,60}\?",
-    // "Continue?" at end of line — many AI agents before a destructive step
+    // Natural-language questions ending with "?"
+    r"(?i)(?:do you|are you sure|allow\b).{0,80}\?",
+    // "Continue?" at end of line
     r"(?i)continue\?\s*$",
-    // "Are you sure?" — generic destructive-action confirmation
-    r"(?i)are you sure",
-    // Trust confirmation prompts (e.g., VS Code: "Do you trust the files in this folder?")
-    r"(?i)do you \b.{0,120}\?",
-    // ── wait-for-keystroke ───────────────────────────────────────────────
-    // "Press ENTER to continue" / "Press any key"
+    // Press key to continue
     r"(?i)press (?:enter|return|any key)",
 ];
 

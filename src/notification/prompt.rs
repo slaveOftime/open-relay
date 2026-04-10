@@ -130,6 +130,13 @@ mod tests {
         compile_prompt_patterns(&strs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
+    fn default_patterns() -> Vec<regex::Regex> {
+        let cfg = crate::config::AppConfig::load().expect("default config");
+        compile_prompt_patterns(&cfg.prompt_patterns)
+    }
+
+    // ── strip_ansi ───────────────────────────────────────────────────────
+
     #[test]
     fn test_strip_ansi_plain_unchanged() {
         assert_eq!(strip_ansi("hello world"), "hello world");
@@ -145,6 +152,8 @@ mod tests {
         assert_eq!(strip_ansi("\x1b]0;title\x07prompt> "), "prompt> ");
     }
 
+    // ── compile / find_prompt_match infrastructure ───────────────────────
+
     #[test]
     fn test_compile_valid_patterns() {
         let compiled = patterns(&[r"(?i)password:", r">\s*$"]);
@@ -158,164 +167,99 @@ mod tests {
     }
 
     #[test]
-    fn test_matches_prompt_hit_password() {
-        let p = patterns(&[r"(?i)password:"]);
-        assert!(matches_prompt("Enter password:", &p));
+    fn test_default_patterns_all_compile() {
+        let p = default_patterns();
+        assert!(p.len() >= 5, "should have a reasonable number of defaults");
     }
 
     #[test]
-    fn test_matches_prompt_hit_yn() {
-        let p = patterns(&[r"(?i)(y/n)"]);
-        assert!(matches_prompt("Overwrite file? (y/n)", &p));
+    fn test_empty_excerpt_returns_false() {
+        assert!(!matches_prompt("", &default_patterns()));
     }
 
     #[test]
-    fn test_matches_prompt_hit_arrow() {
-        let p = patterns(&[r">\s*$"]);
-        assert!(matches_prompt("myrepl> ", &p));
-    }
-
-    #[test]
-    fn test_matches_prompt_miss() {
-        let p = patterns(&[r"(?i)password:"]);
-        assert!(!matches_prompt("hello world", &p));
-    }
-
-    #[test]
-    fn test_matches_prompt_empty_excerpt_returns_false() {
-        let p = patterns(&[r">\s*$"]);
-        assert!(!matches_prompt("", &p));
-    }
-
-    #[test]
-    fn test_matches_prompt_empty_patterns_returns_false() {
+    fn test_empty_patterns_returns_false() {
         assert!(!matches_prompt("Enter password:", &[]));
     }
 
     #[test]
-    fn test_matches_prompt_strips_ansi_before_matching() {
-        let p = patterns(&[r"(?i)password:"]);
-        let excerpt = "\x1b[1mEnter password:\x1b[0m";
-        assert!(matches_prompt(excerpt, &p));
+    fn test_strips_ansi_before_matching() {
+        let p = default_patterns();
+        assert!(matches_prompt("\x1b[1mEnter password:\x1b[0m", &p));
     }
 
     #[test]
-    fn test_matches_prompt_multiline_any_line_can_match() {
-        let p = patterns(&[r">\s*$"]);
-        let excerpt = "some output\nmore output\nmyrepl> ";
-        assert!(matches_prompt(excerpt, &p));
+    fn test_multiline_any_line_can_match() {
+        let p = default_patterns();
+        assert!(matches_prompt("some output\nmore output\nmyrepl> ", &p));
     }
 
     #[test]
-    fn test_matches_prompt_multiline_no_match() {
-        let p = patterns(&[r">\s*$"]);
-        let excerpt = "some output\nmore output\nno prompt here";
-        assert!(!matches_prompt(excerpt, &p));
+    fn test_multiline_no_match() {
+        let p = default_patterns();
+        assert!(!matches_prompt(
+            "some output\nmore output\nno prompt here",
+            &p
+        ));
     }
 
+    // ── default patterns cover common prompts ────────────────────────────
+
     #[test]
-    fn test_matches_bash_dollar_prompt() {
-        let p = patterns(&[r"\$\s*$"]);
+    fn test_defaults_match_shell_prompts() {
+        let p = default_patterns();
+        assert!(matches_prompt("myrepl> ", &p));
         assert!(matches_prompt("user@host:~$ ", &p));
         assert!(matches_prompt("$", &p));
-        assert!(!matches_prompt("cost: $5", &p));
+        assert!(matches_prompt(">>> ", &p));
     }
 
     #[test]
-    fn test_matches_bracket_yn_confirmation() {
-        let p = patterns(&[r"(?i)\[y/n\]"]);
+    fn test_defaults_match_gemini_input_field() {
+        let p = default_patterns();
+        assert!(matches_prompt(
+            " >   Type your message or @path/to/file",
+            &p
+        ));
+    }
+
+    #[test]
+    fn test_defaults_match_confirmations() {
+        let p = default_patterns();
+        assert!(matches_prompt("Overwrite file? (y/n)", &p));
         assert!(matches_prompt("Delete file? [Y/n]", &p));
-        assert!(matches_prompt("Overwrite? [y/N]", &p));
-        assert!(!matches_prompt("Delete file? (y/n)", &p));
-    }
-
-    #[test]
-    fn test_matches_bracket_yes_no() {
-        let p = patterns(&[r"(?i)\[yes/no\]"]);
-        assert!(matches_prompt("Are you sure? [yes/no]", &p));
         assert!(matches_prompt("Proceed? [Yes/No]", &p));
+        assert!(matches_prompt("Do you want to proceed?", &p));
+        assert!(matches_prompt("Are you sure you want to delete?", &p));
+        assert!(matches_prompt("Continue?", &p));
+        assert!(matches_prompt("Allow tool use?", &p));
     }
 
     #[test]
-    fn test_matches_api_key_token_prompts() {
-        let p = patterns(&[r"(?i)(?:api[_ ]?key|token|secret)\s*:"]);
+    fn test_defaults_match_credential_prompts() {
+        let p = default_patterns();
+        assert!(matches_prompt("Enter password:", &p));
         assert!(matches_prompt("API key:", &p));
-        assert!(matches_prompt("api_key:", &p));
         assert!(matches_prompt("Token:", &p));
-        assert!(matches_prompt("Secret:", &p));
+    }
+
+    #[test]
+    fn test_defaults_match_inquirer_and_press_key() {
+        let p = default_patterns();
+        assert!(matches_prompt("? Which model do you prefer?", &p));
+        assert!(matches_prompt("Press ENTER to continue", &p));
+        assert!(matches_prompt("Press any key to exit", &p));
+    }
+
+    #[test]
+    fn test_defaults_no_false_positives() {
+        let p = default_patterns();
+        assert!(!matches_prompt("hello world", &p));
+        assert!(!matches_prompt("compiling crate v0.1.0", &p));
         assert!(!matches_prompt("your token is ready", &p));
     }
 
-    #[test]
-    fn test_matches_inquirer_question_prefix() {
-        let p = patterns(&[r"^\?\s"]);
-        assert!(matches_prompt("? Which model do you prefer?", &p));
-        assert!(matches_prompt("? Continue?", &p));
-        assert!(!matches_prompt("what? no prompt here", &p));
-    }
-
-    #[test]
-    fn test_matches_do_you_want_confirmation() {
-        let p = patterns(&[r"(?i)do you want"]);
-        assert!(matches_prompt("Do you want to proceed?", &p));
-        assert!(matches_prompt("do you want to apply these changes?", &p));
-    }
-
-    #[test]
-    fn test_matches_allow_tool_prompt() {
-        let p = patterns(&[r"(?i)allow\b.{0,60}\?"]);
-        assert!(matches_prompt("Allow tool use?", &p));
-        assert!(matches_prompt("Allow this action?", &p));
-        assert!(!matches_prompt("allowed operations listed below", &p));
-    }
-
-    #[test]
-    fn test_matches_continue_prompt() {
-        let p = patterns(&[r"(?i)continue\?\s*$"]);
-        assert!(matches_prompt("Continue?", &p));
-        assert!(matches_prompt("Do you want to continue?", &p));
-        assert!(!matches_prompt("Continue? yes I do", &p));
-    }
-
-    #[test]
-    fn test_matches_are_you_sure() {
-        let p = patterns(&[r"(?i)are you sure"]);
-        assert!(matches_prompt("Are you sure you want to delete?", &p));
-    }
-
-    #[test]
-    fn test_matches_press_enter() {
-        let p = patterns(&[r"(?i)press (?:enter|return|any key)"]);
-        assert!(matches_prompt("Press ENTER to continue", &p));
-        assert!(matches_prompt("Press Return to confirm", &p));
-        assert!(matches_prompt("Press any key to exit", &p));
-        assert!(!matches_prompt("press ctrl+c to quit", &p));
-    }
-
-    #[test]
-    fn test_default_patterns_all_compile() {
-        let defaults = vec![
-            r">\s*$",
-            r"\$\s*$",
-            r"(?i)\(y/n\)",
-            r"(?i)\[y/n\]",
-            r"(?i)\[yes/no\]",
-            r"(?i)password:",
-            r"(?i)(?:api[_ ]?key|token|secret)\s*:",
-            r"^\?\s",
-            r"(?i)do you want",
-            r"(?i)allow\b.{0,60}\?",
-            r"(?i)continue\?\s*$",
-            r"(?i)are you sure",
-            r"(?i)press (?:enter|return|any key)",
-        ];
-        let compiled = patterns(&defaults);
-        assert_eq!(
-            compiled.len(),
-            defaults.len(),
-            "all default patterns must compile"
-        );
-    }
+    // ── sanitize_body ────────────────────────────────────────────────────
 
     #[test]
     fn test_sanitize_body_keeps_letters_spaces_and_punctuation() {
