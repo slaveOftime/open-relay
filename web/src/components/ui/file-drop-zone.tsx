@@ -1,5 +1,6 @@
 import * as React from 'react'
 import { cn } from '@/lib/utils'
+import { getFirstTransferredFile, hasTransferredFiles } from './file-transfer'
 
 type FileDropZoneRenderState = {
   isDragOver: boolean
@@ -14,10 +15,6 @@ export interface FileDropZoneProps extends Omit<
   children: React.ReactNode | ((state: FileDropZoneRenderState) => React.ReactNode)
 }
 
-function hasDraggedFiles(event: React.DragEvent<HTMLDivElement>) {
-  return Array.from(event.dataTransfer.types).includes('Files')
-}
-
 export const FileDropZone = React.forwardRef<HTMLDivElement, FileDropZoneProps>(
   ({ className, disabled = false, onFileDrop, children, ...props }, ref) => {
     const [isDragOver, setIsDragOver] = React.useState(false)
@@ -30,20 +27,20 @@ export const FileDropZone = React.forwardRef<HTMLDivElement, FileDropZoneProps>(
     }, [disabled])
 
     function handleDragEnter(event: React.DragEvent<HTMLDivElement>) {
-      if (disabled || !hasDraggedFiles(event)) return
+      if (disabled || !hasTransferredFiles(event.dataTransfer)) return
       event.preventDefault()
       dragDepthRef.current += 1
       setIsDragOver(true)
     }
 
     function handleDragOver(event: React.DragEvent<HTMLDivElement>) {
-      if (disabled || !hasDraggedFiles(event)) return
+      if (disabled || !hasTransferredFiles(event.dataTransfer)) return
       event.preventDefault()
       event.dataTransfer.dropEffect = 'copy'
     }
 
     function handleDragLeave(event: React.DragEvent<HTMLDivElement>) {
-      if (disabled || !hasDraggedFiles(event)) return
+      if (disabled || !hasTransferredFiles(event.dataTransfer)) return
       event.preventDefault()
       dragDepthRef.current = Math.max(dragDepthRef.current - 1, 0)
       if (dragDepthRef.current === 0) {
@@ -52,13 +49,13 @@ export const FileDropZone = React.forwardRef<HTMLDivElement, FileDropZoneProps>(
     }
 
     function handleDrop(event: React.DragEvent<HTMLDivElement>) {
-      if (disabled || !hasDraggedFiles(event)) return
+      if (disabled || !hasTransferredFiles(event.dataTransfer)) return
       event.preventDefault()
       dragDepthRef.current = 0
       setIsDragOver(false)
 
       const files = event.dataTransfer.files
-      const file = files?.[0]
+      const file = getFirstTransferredFile(event.dataTransfer)
       if (!file || !onFileDrop) return
       void onFileDrop(file, files)
     }

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Button } from '@/components/ui/button'
 import { FileDropZone } from './ui/file-drop-zone'
+import { getFirstTransferredFile } from './ui/file-transfer'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { ArrowLeftIcon, ArrowRightIcon, PaperclipIcon, SendIcon } from 'lucide-react'
@@ -308,26 +309,46 @@ export default function AttachPanel({
     fileInputRef.current?.click()
   }
 
-  async function uploadSelectedFile(file: File) {
+  const uploadSelectedFile = useCallback(
+    async (file: File) => {
+      if (!uploadFile) return
+
+      setIsUploading(true)
+      try {
+        const response = await uploadFile(file)
+        if (response.ok) {
+          setCustomInput((prev) => {
+            if (prev.trim()) {
+              return prev + ' ' + response.path
+            }
+            return response.path
+          })
+        }
+      } catch (error) {
+        showKeyError(error instanceof Error ? error.message : 'file upload failed')
+      } finally {
+        setIsUploading(false)
+      }
+    },
+    [showKeyError, uploadFile]
+  )
+
+  useEffect(() => {
     if (!uploadFile) return
 
-    setIsUploading(true)
-    try {
-      const response = await uploadFile(file)
-      if (response.ok) {
-        setCustomInput((prev) => {
-          if (prev.trim()) {
-            return prev + ' ' + response.path
-          }
-          return response.path
-        })
-      }
-    } catch (error) {
-      showKeyError(error instanceof Error ? error.message : 'file upload failed')
-    } finally {
-      setIsUploading(false)
+    function handlePaste(event: ClipboardEvent) {
+      if (isUploading) return
+      const file = getFirstTransferredFile(event.clipboardData)
+      if (!file) return
+      event.preventDefault()
+      void uploadSelectedFile(file)
     }
-  }
+
+    window.addEventListener('paste', handlePaste)
+    return () => {
+      window.removeEventListener('paste', handlePaste)
+    }
+  }, [isUploading, uploadFile, uploadSelectedFile])
 
   async function handleUploadDrop(file: File) {
     await uploadSelectedFile(file)
@@ -451,7 +472,7 @@ export default function AttachPanel({
               onFileDrop={handleUploadDrop}
             >
               <p className="text-center text-xs text-[hsl(var(--muted-foreground))]">
-                Drop a file here to upload on desktop.
+                Drop or paste a file here to upload on desktop.
               </p>
               <Button
                 type="button"
