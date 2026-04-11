@@ -1020,10 +1020,6 @@ function SessionDetailPageContent() {
     replayTimerRef.current = window.setTimeout(step, 0)
   }
 
-  function handleLoadPageAndReplay() {
-    void fetchMoreLogsRef.current?.()
-  }
-
   function handleSliderChange(val: number[]) {
     if (!isScrubbingRef.current) {
       wasPlayingBeforeScrubRef.current = isReplayingRef.current && !isPausedRef.current
@@ -1446,16 +1442,6 @@ function SessionDetailPageContent() {
                     </TooltipTrigger>
                     <TooltipContent>Forward 10 chunks</TooltipContent>
                   </Tooltip>
-                  {totalChunks > scrubberMax && (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button variant="secondary" size="sm" onClick={handleLoadPageAndReplay}>
-                          Load next page
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>Load the next chunk page into replay</TooltipContent>
-                    </Tooltip>
-                  )}
                   <div className="flex items-center gap-1 ml-auto">
                     <Tooltip>
                       <TooltipTrigger asChild>
