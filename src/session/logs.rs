@@ -174,16 +174,6 @@ pub fn split_rendered_log_output(output: &[u8]) -> Vec<String> {
     chunks
 }
 
-pub fn refresh_persisted_log_index(session_dir: &Path) -> Result<()> {
-    let log_path = session_dir.join("output.log");
-    let Ok(_) = fs::metadata(&log_path) else {
-        return Ok(());
-    };
-
-    sync_persisted_log_index(&log_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 fn split_persisted_log_records(bytes: &[u8]) -> Vec<String> {
     let mut records = Vec::new();
@@ -557,7 +547,23 @@ fn write_log_index_meta(log_path: &Path, meta: &PersistedLogIndexMeta) -> std::i
     let bytes = serde_json::to_vec(meta)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     fs::write(&temp_path, bytes)?;
-    fs::rename(temp_path, path)
+    match fs::rename(&temp_path, &path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&path);
+            match fs::rename(&temp_path, &path) {
+                Ok(()) => Ok(()),
+                Err(rename_err) => {
+                    let _ = fs::remove_file(&temp_path);
+                    Err(rename_err)
+                }
+            }
+        }
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(err)
+        }
+    }
 }
 
 fn log_index_offsets_path(log_path: &Path) -> PathBuf {
@@ -1220,11 +1226,12 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 mod tests {
     use super::{
         ViewportReplayPlan, ViewportSize, parse_resize_event, parser_cols, parser_rows,
-        read_persisted_log_page, read_relevant_resize_events, read_resize_events,
-        refresh_persisted_log_index, render_log_bytes, render_log_file, render_screen,
-        split_persisted_log_records, split_rendered_log_output,
+        read_persisted_log_page, read_relevant_resize_events, read_resize_events, render_log_bytes,
+        render_log_file, render_screen, split_persisted_log_records, split_rendered_log_output,
+        sync_persisted_log_index,
     };
     use crate::protocol::LogResize;
+    use crate::session::persist::append_output_raw;
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
@@ -1582,7 +1589,7 @@ mod tests {
 
         let log_path = temp_dir.join("output.log");
         fs::write(&log_path, b"alpha").expect("write initial output log");
-        refresh_persisted_log_index(&temp_dir).expect("index initial output log");
+        sync_persisted_log_index(&log_path).expect("index initial output log");
 
         let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial page");
         assert_eq!(lines, vec!["alpha".to_string()]);
@@ -1596,7 +1603,7 @@ mod tests {
             .expect("append output log continuation");
         file.flush().expect("flush appended output log");
 
-        refresh_persisted_log_index(&temp_dir).expect("extend persisted log index");
+        sync_persisted_log_index(&log_path).expect("extend persisted log index");
 
         let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended page");
         assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
@@ -1606,6 +1613,26 @@ mod tests {
             read_persisted_log_page(&temp_dir, 1, 10).expect("read trailing page");
         assert_eq!(tail_lines, vec!["gamma".to_string()]);
         assert_eq!(tail_total, 2);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn persisted_log_page_rebuilds_index_after_append_output_raw() {
+        let temp_dir = temp_session_dir("oly-log-index-lazy");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        append_output_raw(&temp_dir, b"alpha").expect("write initial raw output");
+        let (lines, total) =
+            read_persisted_log_page(&temp_dir, 0, 10).expect("read initial raw page");
+        assert_eq!(lines, vec!["alpha".to_string()]);
+        assert_eq!(total, 1);
+
+        append_output_raw(&temp_dir, b" beta\ngamma").expect("append raw output continuation");
+        let (lines, total) =
+            read_persisted_log_page(&temp_dir, 0, 10).expect("read extended raw page");
+        assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
+        assert_eq!(total, 2);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -1627,7 +1654,7 @@ mod tests {
 
         let log_path = temp_dir.join("output.log");
         fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
-        refresh_persisted_log_index(&temp_dir).expect("index output log");
+        sync_persisted_log_index(&log_path).expect("index output log");
         assert_eq!(
             read_persisted_log_page(&temp_dir, 0, 1)
                 .expect("read total")
