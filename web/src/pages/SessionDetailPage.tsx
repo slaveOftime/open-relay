@@ -210,7 +210,7 @@ function SessionDetailPageContent() {
   const totalChunksRef = useRef(0)
   const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
   const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
-  const loadedStartOffsetRef = useRef(0)
+  const loadedLogCountRef = useRef(0)
   const isFetchingMoreRef = useRef(false)
   const termContainerRef = useRef<HTMLDivElement>(null)
   const isMounted = useRef(true)
@@ -408,76 +408,79 @@ function SessionDetailPageContent() {
   }, [])
 
   const fetchMoreLogs = useCallback(async () => {
-    if (!id || isFetchingMoreRef.current) return
-    if (loadedStartOffsetRef.current <= 0) return
+    if (!id || isFetchingMoreRef.current) return false
+    const requestOffset = loadedLogCountRef.current
+    if (requestOffset >= totalChunksRef.current && totalChunksRef.current !== 0) return false
     isFetchingMoreRef.current = true
     try {
-      const currentStartOffset = loadedStartOffsetRef.current
-      const requestOffset = Math.max(0, currentStartOffset - DEFAULT_LOG_TAIL)
-      const requestLimit = currentStartOffset - requestOffset
       const res = await fetchLogs(
         id,
-        { offset: requestOffset, limit: requestLimit },
+        { offset: requestOffset, limit: DEFAULT_LOG_TAIL },
         node ?? undefined
       )
-      if (!isMounted.current) return
+      if (!isMounted.current) return false
       logResizesRef.current = res.resizes
       const encodedChunks = encodeLogChunks(res.chunks)
       if (res.chunks.length > 0) {
-        const nextReplayIdx = replayIdxRef.current + encodedChunks.length
-        const next = [...encodedChunks, ...logChunksRef.current]
+        const next = [...logChunksRef.current, ...encodedChunks]
         logChunksRef.current = next
+        loadedLogCountRef.current = res.offset + encodedChunks.length
         setScrubberMax(next.length)
-        if (termRef.current) {
-          logReplayStateRef.current = replayLogChunks(
-            termRef.current,
-            next,
-            res.resizes,
-            nextReplayIdx,
-            { scrollToBottom: false }
-          )
-        }
-        commitReplayIdx(nextReplayIdx, { force: true })
-      } else if (termRef.current) {
-        logReplayStateRef.current = replayLogChunks(
-          termRef.current,
-          logChunksRef.current,
-          res.resizes,
-          replayIdxRef.current,
-          { scrollToBottom: false }
-        )
+      } else {
+        loadedLogCountRef.current = res.offset
       }
       if (res.total !== totalChunksRef.current) {
         totalChunksRef.current = res.total
         setTotalChunks(res.total)
       }
-      loadedStartOffsetRef.current = res.offset
+      return encodedChunks.length > 0
     } catch {
-      /* ignore */
+      return false
     } finally {
       isFetchingMoreRef.current = false
     }
-  }, [id, node, commitReplayIdx])
+  }, [id, node])
 
-  const fetchMoreLogsRef = useRef<(() => Promise<void>) | null>(null)
+  const fetchMoreLogsRef = useRef<(() => Promise<boolean>) | null>(null)
   useEffect(() => {
     fetchMoreLogsRef.current = fetchMoreLogs
   }, [fetchMoreLogs])
+
+  const stepReplayRef = useRef<((delta: number) => Promise<void>) | null>(null)
+  const stepReplay = useCallback(async (delta: number) => {
+    if (delta === 0) return
+
+    const currentIdx = replayIdxRef.current
+    if (delta < 0) {
+      handleScrubRef.current?.(Math.max(0, currentIdx + delta))
+      return
+    }
+
+    const targetIdx = currentIdx + delta
+    if (targetIdx <= logChunksRef.current.length) {
+      handleScrubRef.current?.(targetIdx)
+      return
+    }
+
+    const loaded = await fetchMoreLogsRef.current?.()
+    handleScrubRef.current?.(
+      Math.min(targetIdx, loaded ? logChunksRef.current.length : currentIdx)
+    )
+  }, [])
+  useEffect(() => {
+    stepReplayRef.current = stepReplay
+  }, [stepReplay])
 
   useEffect(() => {
     const el = termContainerRef.current
     if (!el || mode !== 'logs') return
     const handleWheel = (e: WheelEvent) => {
-      if (
-        e.deltaY < 0 &&
-        !isFetchingMoreRef.current &&
-        replayIdxRef.current === 0 &&
-        loadedStartOffsetRef.current > 0
-      ) {
-        fetchMoreLogsRef.current?.()
-      } else if (e.deltaY < 0 && replayIdxRef.current > 0) {
+      if (e.deltaY < 0 && replayIdxRef.current > 0) {
         const step = e.shiftKey ? 50 : 10
-        handleScrubRef.current?.(Math.max(0, replayIdxRef.current - step))
+        void stepReplayRef.current?.(-step)
+      } else if (e.deltaY > 0) {
+        const step = e.shiftKey ? 50 : 10
+        void stepReplayRef.current?.(step)
       }
     }
     el.addEventListener('wheel', handleWheel, { capture: true, passive: true })
@@ -487,20 +490,16 @@ function SessionDetailPageContent() {
   useEffect(() => {
     if (mode !== 'logs') return
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (
-        (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'ArrowLeft') &&
-        !isFetchingMoreRef.current &&
-        replayIdxRef.current === 0 &&
-        loadedStartOffsetRef.current > 0
-      ) {
-        e.preventDefault()
-        fetchMoreLogsRef.current?.()
-      } else if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+      if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
         if (replayIdxRef.current > 0) {
           e.preventDefault()
           const step = e.key === 'PageUp' ? 50 : 10
-          handleScrubRef.current?.(Math.max(0, replayIdxRef.current - step))
+          void stepReplayRef.current?.(-step)
         }
+      } else if (e.key === 'PageDown' || e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+        e.preventDefault()
+        const step = e.key === 'PageDown' ? 50 : 10
+        void stepReplayRef.current?.(step)
       }
     }
     window.addEventListener('keyup', handleKeyUp)
@@ -647,10 +646,7 @@ function SessionDetailPageContent() {
             // If the PTY was resized to dimensions that don't match our
             // viewport (e.g. a CLI client resized), push our actual size
             // back so the PTY adapts to the web client.
-            const size = termRef.current?.getSize()
-            if (size && (size.cols !== cols || size.rows !== rows)) {
-              sock.sendResize(size.rows, size.cols)
-            }
+            termRef.current?.resize(cols, rows)
           },
           onSessionEnded: (code) => {
             ended = true
@@ -800,16 +796,21 @@ function SessionDetailPageContent() {
     // Reset common state.
     termRef.current?.reset()
     commitReplayIdx(0, { force: true })
+    replayCommittedIdxRef.current = 0
     isReplayingRef.current = false
     setIsReplaying(false)
     setIsPaused(false)
     isPausedRef.current = false
+    if (replayTimerRef.current !== null) {
+      clearTimeout(replayTimerRef.current)
+      replayTimerRef.current = null
+    }
     logChunksRef.current = []
     setScrubberMax(0)
+    loadedLogCountRef.current = 0
     totalChunksRef.current = 0
     logReplayStateRef.current = initialLogReplayState()
     logResizesRef.current = []
-    loadedStartOffsetRef.current = 0
     isFetchingMoreRef.current = false
     setTotalChunks(0)
 
@@ -851,10 +852,10 @@ function SessionDetailPageContent() {
           if (cancelled || !isMounted.current) return
           const encodedChunks = encodeLogChunks(res.chunks)
           logChunksRef.current = encodedChunks
+          loadedLogCountRef.current = res.offset + encodedChunks.length
           logResizesRef.current = res.resizes
           totalChunksRef.current = res.total
           setTotalChunks(res.total)
-          loadedStartOffsetRef.current = res.offset
           setScrubberMax(res.chunks.length)
           if (termRef.current) {
             logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
@@ -900,9 +901,6 @@ function SessionDetailPageContent() {
         val
       )
     }
-    if (val === 0 && !isFetchingMoreRef.current && loadedStartOffsetRef.current > 0) {
-      fetchMoreLogsRef.current?.()
-    }
   }
   handleScrubRef.current = handleScrub
 
@@ -937,6 +935,33 @@ function SessionDetailPageContent() {
       const chunks = logChunksRef.current
       const idx = logReplayStateRef.current.chunkCount
       if (idx >= chunks.length) {
+        if (chunks.length < totalChunksRef.current) {
+          if (isFetchingMoreRef.current) {
+            replayTimerRef.current = window.setTimeout(step, 30)
+            return
+          }
+          const fetchMoreLogs = fetchMoreLogsRef.current
+          if (!fetchMoreLogs) {
+            replayTimerRef.current = null
+            isReplayingRef.current = false
+            setIsReplaying(false)
+            setIsPaused(false)
+            isPausedRef.current = false
+            return
+          }
+          void fetchMoreLogs().then((loaded) => {
+            if (!loaded || isPausedRef.current || !isReplayingRef.current) {
+              replayTimerRef.current = null
+              isReplayingRef.current = false
+              setIsReplaying(false)
+              setIsPaused(false)
+              isPausedRef.current = false
+              return
+            }
+            replayTimerRef.current = window.setTimeout(step, 0)
+          })
+          return
+        }
         replayTimerRef.current = null
         isReplayingRef.current = false
         setIsReplaying(false)
@@ -992,12 +1017,6 @@ function SessionDetailPageContent() {
     replayTimerRef.current = window.setTimeout(step, 0)
   }
 
-  async function handleLoadPageAndReplay() {
-    if (loadedStartOffsetRef.current > 0) {
-      await fetchMoreLogsRef.current?.()
-    }
-  }
-
   function handleSliderChange(val: number[]) {
     if (!isScrubbingRef.current) {
       wasPlayingBeforeScrubRef.current = isReplayingRef.current && !isPausedRef.current
@@ -1015,11 +1034,13 @@ function SessionDetailPageContent() {
 
   function setLogsView(view: 'tail' | 'replay') {
     const next = new URLSearchParams(searchParams)
+    next.set('mode', 'logs')
     if (view === 'replay') {
       next.set('view', 'replay')
     } else {
       next.delete('view')
     }
+    next.set('reload', String(Date.now()))
     setSearchParams(next)
   }
 
@@ -1392,7 +1413,9 @@ function SessionDetailPageContent() {
                     aria-label="Replay scrubber"
                   />
                   <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
-                    {totalChunks > scrubberMax ? `${scrubberMax}/${totalChunks}` : scrubberMax}
+                    {totalChunks > scrubberMax
+                      ? `${replayIdx}/${scrubberMax} loaded (${totalChunks} total)`
+                      : `${replayIdx}/${scrubberMax}`}
                   </span>
                 </div>
                 <div className="flex items-center gap-1.5">
@@ -1401,25 +1424,21 @@ function SessionDetailPageContent() {
                       <Button
                         variant="secondary"
                         size="icon"
-                        onClick={() =>
-                          handleScrubRef.current?.(Math.max(0, replayIdxRef.current - 10))
-                        }
+                        onClick={() => void stepReplayRef.current?.(-10)}
                       >
                         <ChevronLeftIcon className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>Back 10 chunks</TooltipContent>
                   </Tooltip>
-                  {totalChunks > scrubberMax && (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button variant="secondary" size="icon" onClick={handleLoadPageAndReplay}>
-                          <ChevronRightIcon className="h-4 w-4" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>Load older page</TooltipContent>
-                    </Tooltip>
-                  )}
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button variant="secondary" size="icon" onClick={() => void stepReplayRef.current?.(10)}>
+                        <ChevronRightIcon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Forward 10 chunks</TooltipContent>
+                  </Tooltip>
                   <div className="flex items-center gap-1 ml-auto">
                     <Tooltip>
                       <TooltipTrigger asChild>

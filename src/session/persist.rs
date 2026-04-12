@@ -1,4 +1,3 @@
-use super::logs::refresh_persisted_log_index;
 use crate::error::Result;
 use std::{
     fs,
@@ -6,7 +5,6 @@ use std::{
     path::Path,
 };
 
-#[allow(dead_code)]
 pub fn append_output(dir: &Path, chunk: &str) -> Result<()> {
     let path = dir.join("output.log");
     let mut file = fs::OpenOptions::new()
@@ -15,7 +13,6 @@ pub fn append_output(dir: &Path, chunk: &str) -> Result<()> {
         .open(path)?;
     file.write_all(chunk.as_bytes())?;
     file.flush()?;
-    refresh_persisted_log_index(dir)?;
     Ok(())
 }
 
@@ -29,7 +26,6 @@ pub fn append_output_raw(dir: &Path, data: &[u8]) -> Result<()> {
         .open(path)?;
     file.write_all(data)?;
     file.flush()?;
-    refresh_persisted_log_index(dir)?;
     Ok(())
 }
 
