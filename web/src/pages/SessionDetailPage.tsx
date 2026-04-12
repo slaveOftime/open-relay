@@ -646,10 +646,7 @@ function SessionDetailPageContent() {
             // If the PTY was resized to dimensions that don't match our
             // viewport (e.g. a CLI client resized), push our actual size
             // back so the PTY adapts to the web client.
-            const size = termRef.current?.getSize()
-            if (size && (size.cols !== cols || size.rows !== rows)) {
-              sock.sendResize(size.rows, size.cols)
-            }
+            termRef.current?.resize(cols, rows)
           },
           onSessionEnded: (code) => {
             ended = true
