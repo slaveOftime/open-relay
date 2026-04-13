@@ -25,6 +25,7 @@ import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { getTransferredFiles } from '@/components/ui/file-transfer'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import {
   DropdownMenu,
@@ -347,6 +348,42 @@ function SessionDetailPageContent() {
       return await uploadSessionFile(id, file, node ?? undefined)
     },
     [id, node]
+  )
+
+  const handleTerminalPaste = useCallback(
+    async (event: ClipboardEvent) => {
+      if (mode !== 'attach') return
+
+      const clipboardData = event.clipboardData
+      if (!clipboardData) return
+
+      const files = getTransferredFiles(clipboardData)
+      if (files.length > 0) {
+        event.preventDefault()
+        try {
+          const uploadedPaths: string[] = []
+          for (const file of files) {
+            const response = await handleUploadFile(file)
+            if (response.ok) {
+              uploadedPaths.push(response.path)
+            }
+          }
+          if (uploadedPaths.length > 0) {
+            sendInput(uploadedPaths.join(' '), false)
+          }
+        } catch (error) {
+          showKeyError(error instanceof Error ? error.message : 'file upload failed')
+        }
+        return
+      }
+
+      const text = clipboardData.getData('text/plain')
+      if (!text) return
+
+      event.preventDefault()
+      sendInput(text, false)
+    },
+    [handleUploadFile, mode, sendInput, showKeyError]
   )
 
   useEffect(() => {
@@ -1362,6 +1399,7 @@ function SessionDetailPageContent() {
                 ref={termRef}
                 autoFit={mode === 'attach' || isTailMode}
                 onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
+                onPaste={mode === 'attach' ? handleTerminalPaste : undefined}
                 onResize={mode === 'attach' ? handleTermResize : undefined}
                 className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
               />
