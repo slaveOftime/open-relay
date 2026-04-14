@@ -90,6 +90,7 @@ function normalizeSnapshotOutputForXterm(output: Uint8Array): Uint8Array {
 }
 
 const DEFAULT_LOG_TAIL = 200
+const ATTACH_IDLE_BORDER_DELAY_MS = 10_000
 
 // ── Confirm Action Dialog ────────────────────────────────────────────────────
 function ConfirmActionDialog({
@@ -196,6 +197,7 @@ function SessionDetailPageContent() {
   const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
   const [tailLimit, setTailLimit] = useState<number | null>(null)
   const [tailLimitInput, setTailLimitInput] = useState('40')
+  const [isAttachViewportIdle, setIsAttachViewportIdle] = useState(false)
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -231,6 +233,66 @@ function SessionDetailPageContent() {
   const lastWsFrameAtRef = useRef(0)
   const replayUiLastCommitAtRef = useRef(0)
   const replayCommittedIdxRef = useRef(0)
+  const attachIdleTimerRef = useRef<number | null>(null)
+  const attachIdleCountdownArmedRef = useRef(false)
+
+  const clearAttachIdleTimer = useCallback(() => {
+    if (attachIdleTimerRef.current !== null) {
+      clearTimeout(attachIdleTimerRef.current)
+      attachIdleTimerRef.current = null
+    }
+  }, [])
+
+  const stopAttachIdleAnimation = useCallback(() => {
+    clearAttachIdleTimer()
+    if (isMounted.current) {
+      setIsAttachViewportIdle(false)
+    }
+  }, [clearAttachIdleTimer])
+
+  const disarmAttachIdleAnimation = useCallback(() => {
+    attachIdleCountdownArmedRef.current = false
+    stopAttachIdleAnimation()
+  }, [stopAttachIdleAnimation])
+
+  const scheduleAttachIdleAnimation = useCallback(() => {
+    clearAttachIdleTimer()
+    if (
+      !attachIdleCountdownArmedRef.current ||
+      modeRef.current !== 'attach' ||
+      !wsConnectedRef.current
+    ) {
+      if (isMounted.current) {
+        setIsAttachViewportIdle(false)
+      }
+      return
+    }
+
+    attachIdleTimerRef.current = window.setTimeout(() => {
+      attachIdleTimerRef.current = null
+      if (
+        !isMounted.current ||
+        modeRef.current !== 'attach' ||
+        !wsConnectedRef.current ||
+        !attachIdleCountdownArmedRef.current
+      ) {
+        return
+      }
+      setIsAttachViewportIdle(true)
+    }, ATTACH_IDLE_BORDER_DELAY_MS)
+  }, [clearAttachIdleTimer])
+
+  const noteAttachInboundData = useCallback(() => {
+    if (!isMounted.current) return
+
+    attachIdleCountdownArmedRef.current = true
+    setIsAttachViewportIdle(false)
+    scheduleAttachIdleAnimation()
+  }, [scheduleAttachIdleAnimation])
+
+  const noteAttachUserActivity = useCallback(() => {
+    disarmAttachIdleAnimation()
+  }, [disarmAttachIdleAnimation])
 
   const flushTerminalOutput = useCallback(() => {
     if (outputWriteInFlightRef.current) {
@@ -394,8 +456,9 @@ function SessionDetailPageContent() {
       if (resizeDebounceRef.current !== null) {
         clearTimeout(resizeDebounceRef.current)
       }
+      clearAttachIdleTimer()
     }
-  }, [])
+  }, [clearAttachIdleTimer])
 
   useEffect(() => {
     replaySpeedRef.current = replaySpeed
@@ -415,6 +478,12 @@ function SessionDetailPageContent() {
   useEffect(() => {
     modeRef.current = mode
   }, [mode])
+
+  useEffect(() => {
+    if (mode !== 'attach' || !wsConnected) {
+      disarmAttachIdleAnimation()
+    }
+  }, [disarmAttachIdleAnimation, mode, wsConnected])
 
   const commitReplayIdx = useCallback((idx: number, opts?: { force?: boolean }) => {
     replayIdxRef.current = idx
@@ -661,6 +730,7 @@ function SessionDetailPageContent() {
               reconnectTimerRef.current = null
             }
             if (isMounted.current) setWsConnected(true)
+            disarmAttachIdleAnimation()
           },
           onInit: (data) => {
             if (!gotSnapshot) {
@@ -672,6 +742,7 @@ function SessionDetailPageContent() {
           },
           onData: (data) => {
             lastWsFrameAtRef.current = Date.now()
+            noteAttachInboundData()
             enqueueTerminalOutput([data])
           },
           onModeChanged: () => {
@@ -688,6 +759,7 @@ function SessionDetailPageContent() {
           onSessionEnded: (code) => {
             ended = true
             lastWsFrameAtRef.current = Date.now()
+            disarmAttachIdleAnimation()
             pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
             if (!isMounted.current) return
             const exitMsg = code != null ? ` (exit code: ${code})` : ''
@@ -703,12 +775,14 @@ function SessionDetailPageContent() {
           },
           onError: (msg) => {
             lastWsFrameAtRef.current = Date.now()
+            noteAttachInboundData()
             pushConnectTrace(`server error frame: ${msg}`)
             if (!isMounted.current) return
             termRef.current?.writeln(`\r\n\x1b[31mError: ${msg}\x1b[0m`)
             setWsError(`Server error: ${msg}`)
           },
           onClose: (code, reason) => {
+            disarmAttachIdleAnimation()
             pushConnectTrace(`websocket close (code=${code}${reason ? ` reason=${reason}` : ''})`)
             if (isMounted.current) setWsConnected(false)
             // iOS PWA kills WebSocket connections when the app goes to background.
@@ -741,6 +815,7 @@ function SessionDetailPageContent() {
       outputWriteInFlightRef.current = false
       outputBufferRef.current = []
       pendingResetRef.current = false
+      disarmAttachIdleAnimation()
       pushConnectTrace('teardown current websocket')
       socketRef.current?.close()
       socketRef.current = null
@@ -756,6 +831,8 @@ function SessionDetailPageContent() {
     setSearchParams,
     wsReconnectKey,
     enqueueTerminalOutput,
+    noteAttachInboundData,
+    disarmAttachIdleAnimation,
   ])
 
   useEffect(() => {
@@ -770,6 +847,34 @@ function SessionDetailPageContent() {
   // iOS PWA: reconnect the WebSocket immediately when the app returns from
   // background. iOS can resume with a stale "connected" socket state before
   // onclose arrives, so force a reconnect on foreground transitions.
+  useEffect(() => {
+    if (mode !== 'attach') return
+
+    const handleUserActivity = () => {
+      noteAttachUserActivity()
+    }
+
+    const handleVisibilityState = () => {
+      if (document.visibilityState === 'visible') {
+        noteAttachUserActivity()
+      }
+    }
+
+    window.addEventListener('focus', handleUserActivity)
+    window.addEventListener('pointerdown', handleUserActivity, true)
+    window.addEventListener('keydown', handleUserActivity, true)
+    document.addEventListener('focusin', handleUserActivity)
+    document.addEventListener('visibilitychange', handleVisibilityState)
+
+    return () => {
+      window.removeEventListener('focus', handleUserActivity)
+      window.removeEventListener('pointerdown', handleUserActivity, true)
+      window.removeEventListener('keydown', handleUserActivity, true)
+      document.removeEventListener('focusin', handleUserActivity)
+      document.removeEventListener('visibilitychange', handleVisibilityState)
+    }
+  }, [mode, noteAttachUserActivity])
+
   useEffect(() => {
     if (mode !== 'attach') return
     const triggerReconnect = (source: string) => {
@@ -1392,8 +1497,12 @@ function SessionDetailPageContent() {
           >
             <div
               ref={termContainerRef}
-              className={`relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-1 h-full w-full overflow-x-auto`}
+              className="relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-1 h-full w-full overflow-x-auto"
             >
+              <div
+                aria-hidden="true"
+                className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
+              />
               <XTerm
                 key={mode === 'logs' ? `logs-${logsView}` : mode}
                 ref={termRef}
