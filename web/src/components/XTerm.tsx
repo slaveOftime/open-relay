@@ -1,6 +1,7 @@
 import { useRef, useEffect, useImperativeHandle, forwardRef } from 'react'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { hasTransferredFiles } from './ui/file-transfer'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 
@@ -244,18 +245,24 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       if (onDataRef.current) term.focus()
     }
     const handlePaste = (event: ClipboardEvent) => {
-      onPasteRef.current?.(event)
+      const clipboardData = event.clipboardData
+      if (!onPasteRef.current || !clipboardData) return
+
+      if (hasTransferredFiles(clipboardData)) {
+        event.stopPropagation()
+        onPasteRef.current(event)
+        return
+      }
+
+      if (clipboardData.getData('text/plain')) {
+        return
+      }
+
+      event.stopPropagation()
+      onPasteRef.current(event)
     }
     container.addEventListener('touchend', handleTouchEnd, { passive: true })
-    term.attachCustomKeyEventHandler((event) => {
-      // Check for Ctrl + V (or Cmd + V on Mac)
-      if ((event.ctrlKey || event.metaKey) && event.key === 'v') {
-        // Return false to let the browser handle the paste event
-        return false;
-      }
-      return true;
-    });
-    term.textarea?.addEventListener('paste', handlePaste)
+    term.textarea?.addEventListener('paste', handlePaste, true)
 
     return () => {
       // Null refs immediately so any in-flight callbacks become no-ops
