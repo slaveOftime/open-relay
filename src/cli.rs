@@ -118,6 +118,9 @@ pub struct DaemonStartArgs {
     /// Disable HTTP authentication. You will be asked to confirm the security risk.
     #[arg(long)]
     pub no_auth: bool,
+    /// Disable HTTP authentication without asking for confirmation. Implies --no-auth.
+    #[arg(long)]
+    pub no_auth_without_ask: bool,
     /// Disable the HTTP API and web frontend entirely.
     #[arg(long)]
     pub no_http: bool,

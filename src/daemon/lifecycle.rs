@@ -142,12 +142,15 @@ pub async fn start(
     detach: bool,
     foreground_internal: bool,
     no_auth: bool,
+    no_auth_without_ask: bool,
     no_http: bool,
     auth_hash_internal: Option<String>,
 ) -> Result<()> {
     if daemon_is_healthy(&config).await {
         return Err(AppError::DaemonAlreadyRunning);
     }
+
+    let no_auth = no_auth || no_auth_without_ask;
 
     let auth_hash: Option<String> = if foreground_internal {
         // Prefer the env var (new, secure), fall back to the CLI arg (legacy).
@@ -161,7 +164,13 @@ pub async fn start(
         })
     } else if !no_http {
         if no_auth {
-            confirm_no_auth_risk()?;
+            if no_auth_without_ask {
+                warn!(
+                    "HTTP authentication disabled without confirmation. Make sure you understand the security implications."
+                );
+            } else {
+                confirm_no_auth_risk()?;
+            }
             None
         } else {
             let hash = prompt_and_hash_password()?;
