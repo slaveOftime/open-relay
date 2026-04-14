@@ -23,6 +23,7 @@ import StatusBadge from '@/components/StatusBadge'
 import CommandLogo from '@/components/CommandLogo'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
+import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { getTransferredFiles } from '@/components/ui/file-transfer'
@@ -45,6 +46,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  CopyIcon,
   Cross2Icon,
   CrossCircledIcon,
   DotsVerticalIcon,
@@ -198,6 +200,7 @@ function SessionDetailPageContent() {
   const [tailLimit, setTailLimit] = useState<number | null>(null)
   const [tailLimitInput, setTailLimitInput] = useState('40')
   const [isAttachViewportIdle, setIsAttachViewportIdle] = useState(false)
+  const [showNewSessionDialog, setShowNewSessionDialog] = useState(false)
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -1365,6 +1368,12 @@ function SessionDetailPageContent() {
                 </Button>
               </>
             )}
+            {session && (
+              <Button size="sm" variant="ghost" onClick={() => setShowNewSessionDialog(true)}>
+                <CopyIcon className="h-4 w-4" />
+                Run Again
+              </Button>
+            )}
             {mode === 'logs' && isRunning && (
               <Button
                 size="sm"
@@ -1391,6 +1400,12 @@ function SessionDetailPageContent() {
                   <ReloadIcon className="w-4 h-4" />
                   Refresh
                 </DropdownMenuItem>
+                {session && (
+                  <DropdownMenuItem onClick={() => setShowNewSessionDialog(true)}>
+                    <CopyIcon className="w-4 h-4" />
+                    Run Again
+                  </DropdownMenuItem>
+                )}
                 {(mode === 'attach' || isRunning) && (
                   <>
                     {mode === 'attach' && (
@@ -1655,6 +1670,12 @@ function SessionDetailPageContent() {
             else void handleKill()
           }}
           onClose={() => setPendingAction(null)}
+        />
+        <NewSessionDialog
+          open={showNewSessionDialog}
+          onClose={() => setShowNewSessionDialog(false)}
+          initialValues={session ? buildNewSessionInitialValues(session) : undefined}
+          node={node ?? undefined}
         />
         {/* 
         <Dialog

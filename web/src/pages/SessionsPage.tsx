@@ -18,9 +18,9 @@ import {
   killSession,
   setSessionNotifications,
   subscribeEvents,
-  startSession,
   fetchNodes,
 } from '@/api/client'
+import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -28,7 +28,6 @@ import {
   formatByteSize,
   formatTimestamp,
   sessionDisplayName,
-  parseArgString,
 } from '@/utils/format'
 import Logo from '@/components/Logo'
 import CommandLogo from '@/components/CommandLogo'
@@ -56,7 +55,6 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import * as Form from '@radix-ui/react-form'
 import {
   BellIcon,
   CaretSortIcon,
@@ -271,14 +269,6 @@ function normalizeSessionTags(tags: string[]): string[] {
     normalized.push(trimmed)
   }
   return normalized
-}
-
-function parseSessionTagInput(input: string): string[] {
-  return normalizeSessionTags(input.split(/[,\n]/))
-}
-
-function formatSessionTagInput(tags: string[]): string {
-  return normalizeSessionTags(tags).join(', ')
 }
 
 function SessionTagList({
@@ -872,184 +862,6 @@ function ConfirmActionDialog({
             Yes
           </Button>
         </div>
-      </DialogContent>
-    </Dialog>
-  )
-}
-
-// ── New Session Dialog ─────────────────────────────────────────────────────
-
-type NewSessionInitialValues = {
-  cmd: string
-  args: string
-  title: string
-  tags: string
-  cwd: string
-}
-
-function NewSessionDialog({
-  open,
-  onClose,
-  initialValues,
-  node,
-}: {
-  open: boolean
-  onClose: () => void
-  initialValues?: NewSessionInitialValues
-  node?: string
-}) {
-  void useNavigate
-  const [cmd, setCmd] = useState('')
-  const [args, setArgs] = useState('')
-  const [title, setTitle] = useState('')
-  const [tags, setTags] = useState('')
-  const [cwd, setCwd] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (open && initialValues) {
-      setCmd(initialValues.cmd)
-      setArgs(initialValues.args)
-      setTitle(initialValues.title)
-      setTags(initialValues.tags)
-      setCwd(initialValues.cwd)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
-
-  async function handleSubmit() {
-    if (!cmd.trim()) {
-      setError('Command is required')
-      return
-    }
-    setLoading(true)
-    setError(null)
-    try {
-      const argList = args.trim() ? parseArgString(args.trim()) : []
-      await startSession({
-        cmd: cmd.trim(),
-        args: argList,
-        title: title.trim() || undefined,
-        tags: parseSessionTagInput(tags),
-        cwd: cwd.trim() || undefined,
-        node: node ?? undefined,
-      })
-      onClose()
-      resetForm()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start session')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  function resetForm() {
-    setCmd('')
-    setArgs('')
-    setTitle('')
-    setTags('')
-    setCwd('')
-    setError(null)
-  }
-
-  function handleClose() {
-    resetForm()
-    onClose()
-  }
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(open) => {
-        if (!open) handleClose()
-      }}
-    >
-      <DialogContent className="max-w-md">
-        <DialogHeader>
-          <DialogTitle>New Session</DialogTitle>
-        </DialogHeader>
-        <Form.Root
-          onSubmit={(e) => {
-            e.preventDefault()
-            void handleSubmit()
-          }}
-          className="flex flex-col gap-3 mt-1"
-        >
-          <Form.Field name="command" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
-              Command <span className="text-red-500">*</span>
-            </Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={cmd}
-                onChange={(e) => setCmd(e.target.value)}
-                placeholder="claude, bash, python…"
-                required
-                autoFocus
-              />
-            </Form.Control>
-            <Form.Message match="valueMissing" className="text-red-500 text-xs">
-              Command is required
-            </Form.Message>
-          </Form.Field>
-          <Form.Field name="arguments" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
-              Arguments
-            </Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={args}
-                onChange={(e) => setArgs(e.target.value)}
-                placeholder="--model sonnet-3.7 (space-separated)"
-              />
-            </Form.Control>
-          </Form.Field>
-          <Form.Field name="title" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Title</Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="Optional display name"
-              />
-            </Form.Control>
-          </Form.Field>
-          <Form.Field name="tags" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Tags</Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={tags}
-                onChange={(e) => setTags(e.target.value)}
-                placeholder="prod, release"
-              />
-            </Form.Control>
-            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-              Separate tags with commas.
-            </p>
-          </Form.Field>
-          <Form.Field name="cwd" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
-              Working Directory
-            </Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={cwd}
-                onChange={(e) => setCwd(e.target.value)}
-                placeholder="/path/to/project"
-              />
-            </Form.Control>
-          </Form.Field>
-          {error && <p className="text-red-500 text-xs">{error}</p>}
-          <div className="flex justify-end gap-2 pt-1">
-            <Button type="button" variant="ghost" size="sm" onClick={handleClose}>
-              Cancel
-            </Button>
-            <Button type="submit" size="sm" disabled={loading}>
-              {loading ? 'Starting…' : 'Start Session'}
-            </Button>
-          </div>
-        </Form.Root>
       </DialogContent>
     </Dialog>
   )
@@ -2068,19 +1880,7 @@ export default function SessionsPage() {
             setRerunSession(null)
             void reloadSessions({ background: true })
           }}
-          initialValues={
-            rerunSession
-              ? {
-                  cmd: rerunSession.command,
-                  args: rerunSession.args
-                    .map((a) => (/\s/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a))
-                    .join(' '),
-                  title: rerunSession.title ?? '',
-                  tags: formatSessionTagInput(rerunSession.tags),
-                  cwd: rerunSession.cwd ?? '',
-                }
-              : undefined
-          }
+          initialValues={rerunSession ? buildNewSessionInitialValues(rerunSession) : undefined}
           node={selectedNode ?? undefined}
         />
       </div>
