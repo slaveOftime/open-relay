@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
 import { startSession } from '@/api/client'
 import type { SessionSummary } from '@/api/types'
@@ -69,9 +69,12 @@ export default function NewSessionDialog({
   const [cwd, setCwd] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const wasOpenRef = useRef(false)
 
   useEffect(() => {
-    if (!open) return
+    const wasOpen = wasOpenRef.current
+    wasOpenRef.current = open
+    if (!open || wasOpen) return
     setCmd(initialValues?.cmd ?? '')
     setArgs(initialValues?.args ?? '')
     setTitle(initialValues?.title ?? '')
