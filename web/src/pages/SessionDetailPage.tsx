@@ -1310,11 +1310,11 @@ function SessionDetailPageContent() {
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
-              <span className="hidden sm:inline">oly</span>
+              <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
           <div className="flex items-center gap-3 min-w-0 flex-1">
-            <span className="font-mono text-sm text-[hsl(var(--muted-foreground))] font-semibold truncate">
+            <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold truncate">
               {session?.id}
             </span>
             {session && <StatusBadge status={session.status} inputNeeded={session.input_needed} />}
@@ -1510,7 +1510,7 @@ function SessionDetailPageContent() {
           >
             <div
               ref={termContainerRef}
-              className="relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-1 h-full w-full overflow-x-auto"
+              className="relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-0 h-full w-full overflow-x-auto"
             >
               <div
                 aria-hidden="true"

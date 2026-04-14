@@ -172,6 +172,7 @@ async fn run() -> Result<()> {
                     start_args.detach,
                     start_args.foreground_internal,
                     start_args.no_auth,
+                    start_args.no_auth_without_ask,
                     start_args.no_http,
                     start_args.auth_hash_internal,
                 )
