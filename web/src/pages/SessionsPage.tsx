@@ -194,7 +194,7 @@ function matchesSelectedNode(
 
 function sessionPageTitle(selectedNode: string | null): string {
   const normalized = normalizeStoredNode(selectedNode)
-  if (!normalized || normalized.toLowerCase() === 'local') return 'oly'
+  if (!normalized || normalized.toLowerCase() === 'local') return ''
   return normalized
 }
 
@@ -287,17 +287,17 @@ function SessionTagList({
   }
 
   return (
-    <div className={`flex min-w-0 items-center ${className}`.trim()}>
+    <div className={`flex min-w-0 max-w-full items-center ${className}`.trim()}>
       {normalizedTags.map((tag) => (
         <Badge
           key={tag}
           variant="outline"
-          className="max-w-full border-emerald-500/25 bg-emerald-500/10 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
+          className="min-w-0 max-w-full border-emerald-500/25 bg-emerald-500/10 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
         >
           <span className="text-[9px] font-bold leading-none text-emerald-500 dark:text-emerald-300">
             #
           </span>
-          <span className="truncate">{tag}</span>
+          <span className="min-w-0 truncate">{tag}</span>
         </Badge>
       ))}
     </div>
@@ -702,7 +702,7 @@ function SessionCard({
               {formatByteSize(session.last_total_bytes)}
             </div>
             {session.tags.length > 0 && (
-              <div className="flex items-start gap-2">
+              <div className="min-w-0 flex-1">
                 <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
               </div>
             )}
@@ -1625,7 +1625,7 @@ export default function SessionsPage() {
               onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
-              <span>oly</span>
+              <span>Open Relay</span>
             </div>
 
             <Input
