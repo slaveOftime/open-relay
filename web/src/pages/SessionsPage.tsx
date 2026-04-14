@@ -200,6 +200,10 @@ function sessionPageTitle(selectedNode: string | null): string {
   return normalized
 }
 
+function buildSessionHref(sessionId: string, mode: 'attach' | 'logs', node?: string) {
+  return `/session/${sessionId}?mode=${mode}${node ? `&node=${encodeURIComponent(node)}` : ''}`
+}
+
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
     const message = error.message.trim()
@@ -441,6 +445,8 @@ function SessionRow({
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const isRunning =
     session.status === 'running' || session.status === 'stopping' || session.status === 'created'
+  const attachHref = buildSessionHref(session.id, 'attach', node)
+  const logsHref = buildSessionHref(session.id, 'logs', node)
 
   const accentClass = session.input_needed
     ? '[box-shadow:inset_2px_0_0_0_rgb(245_158_11/0.8)] bg-amber-50 dark:bg-amber-950/10'
@@ -452,9 +458,7 @@ function SessionRow({
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
 
   function openSession(mode: 'attach' | 'logs') {
-    navigate(
-      `/session/${session.id}?mode=${mode}${node ? `&node=${encodeURIComponent(node)}` : ''}`
-    )
+    navigate(buildSessionHref(session.id, mode, node))
   }
 
   return (
@@ -543,8 +547,10 @@ function SessionRow({
             {isRunning && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="link" size="icon" onClick={() => openSession('attach')}>
-                    <Link2Icon className="h-4 w-4" />
+                  <Button asChild variant="link" size="icon">
+                    <a href={attachHref} aria-label="Attach">
+                      <Link2Icon className="h-4 w-4" />
+                    </a>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Attach</TooltipContent>
@@ -588,8 +594,10 @@ function SessionRow({
             )}
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
-                  <FileTextIcon className="h-4 w-4" />
+                <Button asChild variant="ghost" size="icon">
+                  <a href={logsHref} aria-label="Logs">
+                    <FileTextIcon className="h-4 w-4" />
+                  </a>
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Logs</TooltipContent>
@@ -647,6 +655,8 @@ function SessionCard({
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
   const isRunning =
     session.status === 'running' || session.status === 'stopping' || session.status === 'created'
+  const attachHref = buildSessionHref(session.id, 'attach', node)
+  const logsHref = buildSessionHref(session.id, 'logs', node)
 
   const titleTone = isTerminalStatus(session.status)
     ? 'text-[hsl(var(--foreground))]/70'
@@ -654,9 +664,7 @@ function SessionCard({
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
 
   function openSession(mode: 'attach' | 'logs') {
-    navigate(
-      `/session/${session.id}?mode=${mode}${node ? `&node=${encodeURIComponent(node)}` : ''}`
-    )
+    navigate(buildSessionHref(session.id, mode, node))
   }
 
   return (
@@ -732,13 +740,15 @@ function SessionCard({
         >
           {isRunning && (
             <Button
+              asChild
               variant="outline"
               className="border-[hsl(var(--primary))] text-[hsl(var(--primary))]"
               size="sm"
-              onClick={() => openSession('attach')}
             >
-              <Link2Icon className="h-4 w-4" />
-              Attach
+              <a href={attachHref}>
+                <Link2Icon className="h-4 w-4" />
+                Attach
+              </a>
             </Button>
           )}
           {isRunning && (
@@ -768,8 +778,10 @@ function SessionCard({
             </>
           )}
           <div className="flex-1"></div>
-          <Button variant="ghost" size="icon" onClick={() => openSession('logs')}>
-            <FileTextIcon className="h-4 w-4" />
+          <Button asChild variant="ghost" size="icon">
+            <a href={logsHref} aria-label="Logs">
+              <FileTextIcon className="h-4 w-4" />
+            </a>
           </Button>
           <Tooltip>
             <TooltipTrigger asChild>
