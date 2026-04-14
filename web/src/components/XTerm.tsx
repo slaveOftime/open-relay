@@ -1,6 +1,7 @@
 import { useRef, useEffect, useImperativeHandle, forwardRef } from 'react'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { hasTransferredFiles } from './ui/file-transfer'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 
@@ -74,19 +75,22 @@ interface Props {
   autoFit: boolean
   /** Called with raw keyboard data from xterm (use for WebSocket sendInput) */
   onData?: (data: string) => void
+  /** Called when clipboard paste targets the terminal. */
+  onPaste?: (event: ClipboardEvent) => void
   /** Called when the terminal is resized by FitAddon (cols, rows) */
   onResize?: (cols: number, rows: number) => void
   className?: string
 }
 
 const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
-  { autoFit, onData, onResize, className },
+  { autoFit, onData, onPaste, onResize, className },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const onDataRef = useRef(onData)
+  const onPasteRef = useRef(onPaste)
   const onResizeRef = useRef(onResize)
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null)
 
@@ -94,6 +98,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   useEffect(() => {
     onDataRef.current = onData
   }, [onData])
+  useEffect(() => {
+    onPasteRef.current = onPaste
+  }, [onPaste])
   useEffect(() => {
     onResizeRef.current = onResize
   }, [onResize])
@@ -237,7 +244,25 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     const handleTouchEnd = () => {
       if (onDataRef.current) term.focus()
     }
+    const handlePaste = (event: ClipboardEvent) => {
+      const clipboardData = event.clipboardData
+      if (!onPasteRef.current || !clipboardData) return
+
+      if (hasTransferredFiles(clipboardData)) {
+        event.stopPropagation()
+        onPasteRef.current(event)
+        return
+      }
+
+      if (clipboardData.getData('text/plain')) {
+        return
+      }
+
+      event.stopPropagation()
+      onPasteRef.current(event)
+    }
     container.addEventListener('touchend', handleTouchEnd, { passive: true })
+    term.textarea?.addEventListener('paste', handlePaste, true)
 
     return () => {
       // Null refs immediately so any in-flight callbacks become no-ops
@@ -250,11 +275,12 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       dataDisposable.dispose()
       ro.disconnect()
       container.removeEventListener('touchend', handleTouchEnd)
+      term.textarea?.removeEventListener('paste', handlePaste)
       // Defer dispose by TWO frames so xterm's own internally-scheduled
       // RAFs can fully drain before _renderService is torn down.
       requestAnimationFrame(() => requestAnimationFrame(() => term.dispose()))
     }
-  }, []) // mount only
+  }, [autoFit]) // mount only
 
   // Update terminal theme when OS color scheme changes
   useEffect(() => {

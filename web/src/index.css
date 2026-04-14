@@ -188,6 +188,75 @@
   .animate-row-slide-in {
     animation: row-slide-in 0.25s ease-out forwards;
   }
+  .terminal-viewport-idle-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity 180ms ease,
+      visibility 180ms ease;
+    contain: paint;
+    will-change: opacity;
+    z-index: 1;
+  }
+  .terminal-viewport-idle-overlay.is-active {
+    opacity: 1;
+    visibility: visible;
+  }
+  .terminal-viewport-idle-overlay::before,
+  .terminal-viewport-idle-overlay::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  .terminal-viewport-idle-overlay::before {
+    --terminal-idle-angle: 0deg;
+    padding: 2px;
+    background: conic-gradient(
+      from var(--terminal-idle-angle),
+      hsl(160 84% 39% / 0.98),
+      hsl(195 100% 55% / 0.98),
+      hsl(42 96% 58% / 0.98),
+      hsl(332 86% 63% / 0.98),
+      hsl(254 89% 70% / 0.98),
+      hsl(160 84% 39% / 0.98)
+    );
+    box-shadow:
+      0 0 0 1px hsl(var(--foreground) / 0.05),
+      0 0 24px hsl(195 100% 55% / 0.18),
+      0 0 36px hsl(332 86% 63% / 0.12);
+    opacity: 0.96;
+    animation: terminal-idle-border-colors 2.8s linear infinite;
+    -webkit-mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#fff 0 0) content-box,
+      linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+  }
+  .terminal-viewport-idle-overlay::after {
+    inset: 10px;
+    background: linear-gradient(
+      135deg,
+      hsl(160 84% 39% / 0.18),
+      hsl(195 100% 55% / 0.08),
+      hsl(332 86% 63% / 0.16)
+    );
+    filter: blur(12px);
+    opacity: 0.78;
+    animation: terminal-idle-border-pulse 1.9s ease-in-out infinite alternate;
+  }
+}
+
+@property --terminal-idle-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
 }
 
 @keyframes shimmer {
@@ -207,5 +276,32 @@
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes terminal-idle-border-colors {
+  from {
+    --terminal-idle-angle: 0deg;
+  }
+  to {
+    --terminal-idle-angle: 360deg;
+  }
+}
+
+@keyframes terminal-idle-border-pulse {
+  from {
+    opacity: 0.35;
+    transform: scale(0.992);
+  }
+  to {
+    opacity: 0.9;
+    transform: scale(1.01);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-viewport-idle-overlay::before,
+  .terminal-viewport-idle-overlay::after {
+    animation: none;
   }
 }

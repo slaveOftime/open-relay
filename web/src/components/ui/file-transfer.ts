@@ -15,17 +15,24 @@ export function hasTransferredFiles(data: Pick<FileTransferDataLike, 'types'> | 
   return Array.from(types).includes('Files')
 }
 
-export function getFirstTransferredFile(
+export function getTransferredFiles(
   data: Pick<FileTransferDataLike, 'files' | 'items'> | null | undefined
-): File | null {
-  const directFile = data?.files?.[0]
-  if (directFile) return directFile
+): File[] {
+  const directFiles = Array.from(data?.files ?? []).filter((file): file is File => Boolean(file))
+  if (directFiles.length > 0) return directFiles
 
+  const files: File[] = []
   for (const item of Array.from(data?.items ?? [])) {
     if (item.kind !== 'file') continue
     const file = item.getAsFile?.()
-    if (file) return file
+    if (file) files.push(file)
   }
 
-  return null
+  return files
+}
+
+export function getFirstTransferredFile(
+  data: Pick<FileTransferDataLike, 'files' | 'items'> | null | undefined
+): File | null {
+  return getTransferredFiles(data)[0] ?? null
 }
