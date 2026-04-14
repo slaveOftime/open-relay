@@ -187,7 +187,9 @@ export default function NewSessionDialog({
                 placeholder="prod, release"
               />
             </Form.Control>
-            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">Separate tags with commas.</p>
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              Separate tags with commas.
+            </p>
           </Form.Field>
           <Form.Field name="cwd" className="flex flex-col gap-1.5">
             <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">

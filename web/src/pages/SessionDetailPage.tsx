@@ -572,9 +572,7 @@ function SessionDetailPageContent() {
     }
 
     const loaded = await fetchMoreLogsRef.current?.()
-    handleScrubRef.current?.(
-      Math.min(targetIdx, loaded ? logChunksRef.current.length : currentIdx)
-    )
+    handleScrubRef.current?.(Math.min(targetIdx, loaded ? logChunksRef.current.length : currentIdx))
   }, [])
   useEffect(() => {
     stepReplayRef.current = stepReplay
@@ -1595,7 +1593,11 @@ function SessionDetailPageContent() {
                   </Tooltip>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button variant="secondary" size="icon" onClick={() => void stepReplayRef.current?.(10)}>
+                      <Button
+                        variant="secondary"
+                        size="icon"
+                        onClick={() => void stepReplayRef.current?.(10)}
+                      >
                         <ChevronRightIcon className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
