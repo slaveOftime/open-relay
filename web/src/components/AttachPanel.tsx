@@ -506,49 +506,59 @@ export default function AttachPanel({
           </div>
         </div>
       </div>
-      <div className="sm:hidden w-full h-10 flex justify-between items-center">
-        <Button
-          variant={'ghost'}
-          className="text-[hsl(var(--primary))]"
-          onClick={() => handleSendKeySpec('left')}
-          aria-label="Left"
-        >
-          <ArrowLeftIcon className="w-6 h-6" />
-        </Button>
-        <Button
-          variant={'ghost'}
-          className="text-[hsl(var(--primary))]"
-          onClick={() => handleSendKeySpec('up')}
-          aria-label="Up"
-        >
-          <ArrowUpIcon className="w-6 h-6" />
-        </Button>
-        <Button
-          variant={'ghost'}
-          className="text-[hsl(var(--primary))]"
-          onClick={() => handleSendKeySpec('down')}
-          aria-label="Down"
-        >
-          <ArrowDownIcon className="w-6 h-6" />
-        </Button>
-        <Button
-          variant={'ghost'}
-          className="text-[hsl(var(--primary))]"
-          onClick={() => handleSendKeySpec('right')}
-          aria-label="Right"
-        >
-          <ArrowRightIcon className="w-6 h-6" />
-        </Button>
-        <Button
-          variant={'ghost'}
-          className="text-[hsl(var(--primary))]"
-          onClick={() => handleSendKeySpec('enter')}
-          aria-label="Enter"
-        >
-          Enter
-        </Button>
-        <div className="flex-1 h-full" onClick={toggleDrawer}></div>
-        <Button variant="ghost" onClick={toggleDrawer} aria-label="Open input panel">
+      <div className="sm:hidden w-full h-10 flex items-center gap-1 justify-between overflow-hidden">
+        <div className="sm:hidden w-full h-10 flex items-center overflow-y-hidden overflow-x-auto">
+
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            onClick={() => handleSendKeySpec('left')}
+            aria-label="Left"
+          >
+            <ArrowLeftIcon className="w-6 h-6" />
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            onClick={() => handleSendKeySpec('up')}
+            aria-label="Up"
+          >
+            <ArrowUpIcon className="w-6 h-6" />
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            onClick={() => handleSendKeySpec('down')}
+            aria-label="Down"
+          >
+            <ArrowDownIcon className="w-6 h-6" />
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            onClick={() => handleSendKeySpec('right')}
+            aria-label="Right"
+          >
+            <ArrowRightIcon className="w-6 h-6" />
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            onClick={() => handleSendKeySpec('tab')}
+            aria-label="Tab"
+          >
+            Tab
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            onClick={() => handleSendKeySpec('enter')}
+            aria-label="Enter"
+          >
+            Enter
+          </Button>
+        </div>
+        <Button variant="ghost" className="shrink-0" onClick={toggleDrawer} aria-label="Open input panel">
           {drawerOpen ? (
             <DoubleArrowDownIcon className="w-6 h-6" />
           ) : (
