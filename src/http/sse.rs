@@ -51,57 +51,6 @@ impl From<&SessionLiveSummary> for SessionFingerprint {
     }
 }
 
-fn merge_node(existing: &Option<String>, node: Option<&str>) -> Option<String> {
-    existing.clone().or_else(|| node.map(str::to_string))
-}
-
-pub(crate) fn session_summary_for_delivery(
-    summary: &SessionSummary,
-    node: Option<&str>,
-) -> SessionSummary {
-    let mut summary = summary.clone();
-    summary.node = merge_node(&summary.node, node);
-    summary
-}
-
-pub(crate) fn session_event_for_delivery(event: &SessionEvent, node: Option<&str>) -> SessionEvent {
-    match event {
-        SessionEvent::SessionCreated(summary) => {
-            SessionEvent::SessionCreated(session_summary_for_delivery(summary, node))
-        }
-        SessionEvent::SessionUpdated(summary) => {
-            SessionEvent::SessionUpdated(session_summary_for_delivery(summary, node))
-        }
-        SessionEvent::SessionDeleted { id, node: existing } => SessionEvent::SessionDeleted {
-            id: id.clone(),
-            node: merge_node(existing, node),
-        },
-        SessionEvent::SessionNotification {
-            kind,
-            title,
-            description,
-            body,
-            navigation_url,
-            session_ids,
-            trigger_rule,
-            trigger_detail,
-            node: existing,
-            last_total_bytes,
-        } => SessionEvent::SessionNotification {
-            kind: kind.clone(),
-            title: title.clone(),
-            description: description.clone(),
-            body: body.clone(),
-            navigation_url: navigation_url.clone(),
-            session_ids: session_ids.clone(),
-            trigger_rule: trigger_rule.clone(),
-            trigger_detail: trigger_detail.clone(),
-            node: merge_node(existing, node),
-            last_total_bytes: last_total_bytes.clone(),
-        },
-    }
-}
-
 pub(crate) fn encode_session_event(event: &SessionEvent) -> EncodedSessionEvent {
     match event {
         SessionEvent::SessionCreated(summary) => EncodedSessionEvent {
@@ -227,8 +176,8 @@ pub async fn events_handler(
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|summary| session_summary_for_delivery(&summary, None))
-            .collect::<Vec<_>>()
+            .map(|summary| summary.for_delivery(None))
+            .collect::<Vec<SessionSummary>>()
     };
 
     debug!(snapshot_count = initial.len(), "SSE client connected");
@@ -244,7 +193,8 @@ pub async fn events_handler(
     let live_stream = BroadcastStream::new(rx).filter_map(|msg| async move {
         match msg {
             Ok(ev) => {
-                let encoded = encode_session_event(&session_event_for_delivery(&ev, None));
+                let delivered = ev.for_delivery(None);
+                let encoded = encode_session_event(&delivered);
                 Some(Ok(Event::default()
                     .event(encoded.event_name)
                     .data(encoded.data)))
@@ -261,7 +211,7 @@ pub async fn events_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_session_event, session_event_for_delivery};
+    use super::encode_session_event;
     use crate::{protocol::SessionSummary, session::SessionEvent};
     use chrono::{TimeZone, Utc};
 
@@ -289,7 +239,7 @@ mod tests {
     #[test]
     fn delivery_helper_applies_node_to_summary_events() {
         let event = SessionEvent::SessionUpdated(sample_summary());
-        let delivered = session_event_for_delivery(&event, Some("worker-a"));
+        let delivered = event.for_delivery(Some("worker-a"));
 
         let SessionEvent::SessionUpdated(summary) = delivered else {
             panic!("expected session_updated");
@@ -312,7 +262,7 @@ mod tests {
             last_total_bytes: 0,
         };
 
-        let delivered = session_event_for_delivery(&event, Some("worker-a"));
+        let delivered = event.for_delivery(Some("worker-a"));
         let encoded = encode_session_event(&delivered);
 
         assert_eq!(encoded.event_name, "session_notification");

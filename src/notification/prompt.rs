@@ -1,3 +1,8 @@
+use crate::{
+    protocol::{NodeWsMessage, SessionSummary},
+    session::SessionEvent,
+};
+
 /// Compiles a list of pattern strings into `Regex` objects.
 /// Invalid patterns are skipped with a warning.
 pub fn compile_prompt_patterns(patterns: &[String]) -> Vec<regex::Regex> {
@@ -83,6 +88,99 @@ pub fn sanitize_body(s: &str) -> String {
     out.trim().to_string()
 }
 
+fn merge_node(existing: &Option<String>, node: Option<&str>) -> Option<String> {
+    existing.clone().or_else(|| node.map(str::to_string))
+}
+
+impl SessionSummary {
+    pub fn for_delivery(&self, node: Option<&str>) -> Self {
+        let mut summary = self.clone();
+        summary.node = merge_node(&summary.node, node);
+        summary
+    }
+}
+
+impl SessionEvent {
+    pub fn for_delivery(&self, node: Option<&str>) -> Self {
+        match self {
+            SessionEvent::SessionCreated(summary) => {
+                SessionEvent::SessionCreated(summary.for_delivery(node))
+            }
+            SessionEvent::SessionUpdated(summary) => {
+                SessionEvent::SessionUpdated(summary.for_delivery(node))
+            }
+            SessionEvent::SessionDeleted { id, node: existing } => SessionEvent::SessionDeleted {
+                id: id.clone(),
+                node: merge_node(existing, node),
+            },
+            SessionEvent::SessionNotification {
+                kind,
+                title,
+                description,
+                body,
+                navigation_url,
+                session_ids,
+                trigger_rule,
+                trigger_detail,
+                node: existing,
+                last_total_bytes,
+            } => SessionEvent::SessionNotification {
+                kind: kind.clone(),
+                title: title.clone(),
+                description: description.clone(),
+                body: body.clone(),
+                navigation_url: navigation_url.clone(),
+                session_ids: session_ids.clone(),
+                trigger_rule: trigger_rule.clone(),
+                trigger_detail: trigger_detail.clone(),
+                node: merge_node(existing, node),
+                last_total_bytes: *last_total_bytes,
+            },
+        }
+    }
+}
+
+impl NodeWsMessage {
+    pub fn from_session_event(event: &SessionEvent, node: Option<&str>) -> Self {
+        match event {
+            SessionEvent::SessionCreated(summary) => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::SessionCreated(summary.for_delivery(node)),
+            },
+            SessionEvent::SessionUpdated(summary) => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::SessionUpdated(summary.for_delivery(node)),
+            },
+            SessionEvent::SessionDeleted { id, node: existing } => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::SessionDeleted {
+                    id: id.clone(),
+                    node: merge_node(existing, node),
+                },
+            },
+            SessionEvent::SessionNotification {
+                kind,
+                title,
+                description,
+                body,
+                navigation_url,
+                session_ids,
+                trigger_rule,
+                trigger_detail,
+                last_total_bytes,
+                ..
+            } => NodeWsMessage::Notification {
+                kind: kind.clone(),
+                title: title.clone(),
+                description: description.clone(),
+                body: body.clone(),
+                navigation_url: navigation_url.clone(),
+                session_ids: session_ids.clone(),
+                trigger_rule: trigger_rule.clone(),
+                trigger_detail: trigger_detail.clone(),
+                last_total_bytes: *last_total_bytes,
+            },
+        }
+    }
+}
+
 /// Strips common ANSI/VT100 escape sequences from `input`.
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
@@ -125,6 +223,8 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::SessionSummary;
+    use chrono::{TimeZone, Utc};
 
     fn patterns(strs: &[&str]) -> Vec<regex::Regex> {
         compile_prompt_patterns(&strs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -133,6 +233,27 @@ mod tests {
     fn default_patterns() -> Vec<regex::Regex> {
         let cfg = crate::config::AppConfig::load().expect("default config");
         compile_prompt_patterns(&cfg.prompt_patterns)
+    }
+
+    fn sample_summary() -> SessionSummary {
+        SessionSummary {
+            id: "sess-123".to_string(),
+            title: Some("demo".to_string()),
+            tags: vec!["prod".to_string()],
+            command: "cargo".to_string(),
+            args: vec!["test".to_string()],
+            pid: Some(42),
+            status: "running".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap(),
+            started_at: None,
+            ended_at: None,
+            cwd: Some("C:\\work".to_string()),
+            input_needed: true,
+            notifications_enabled: false,
+            node: None,
+            last_total_bytes: 0,
+            last_output_epoch: None,
+        }
     }
 
     // ── strip_ansi ───────────────────────────────────────────────────────
@@ -283,5 +404,55 @@ mod tests {
     fn test_sanitize_body_drops_emoji_and_symbols() {
         let input = "Ready ✅ @ 42% -> go🚀";
         assert_eq!(sanitize_body(input), "Ready @ 42% -> go");
+    }
+
+    #[test]
+    fn session_summary_delivery_from_applies_node() {
+        let delivered = sample_summary().for_delivery(Some("worker-a"));
+        assert_eq!(delivered.node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn session_event_for_delivery_applies_node_to_notifications() {
+        let event = SessionEvent::SessionNotification {
+            kind: "input_needed".to_string(),
+            title: "Input required".to_string(),
+            description: "Waiting".to_string(),
+            body: "Password:".to_string(),
+            navigation_url: Some("/session/sess-123?mode=attach".to_string()),
+            session_ids: vec!["sess-123".to_string()],
+            trigger_rule: Some("regex_pattern".to_string()),
+            trigger_detail: None,
+            node: None,
+            last_total_bytes: 0,
+        };
+
+        let delivered = event.for_delivery(Some("worker-a"));
+        let SessionEvent::SessionNotification { node, .. } = delivered else {
+            panic!("expected session_notification");
+        };
+
+        assert_eq!(node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn node_ws_message_from_converts_notification_events() {
+        let event = SessionEvent::SessionNotification {
+            kind: "input_needed".to_string(),
+            title: "Input required".to_string(),
+            description: "Waiting".to_string(),
+            body: "Password:".to_string(),
+            navigation_url: Some("/session/sess-123?mode=attach".to_string()),
+            session_ids: vec!["sess-123".to_string()],
+            trigger_rule: Some("regex_pattern".to_string()),
+            trigger_detail: None,
+            node: None,
+            last_total_bytes: 0,
+        };
+
+        let relay = NodeWsMessage::from_session_event(&event, Some("worker-a"));
+        let NodeWsMessage::Notification { .. } = relay else {
+            panic!("expected node notification");
+        };
     }
 }

@@ -304,7 +304,7 @@ async fn handle_forwarded_session_event(
     payload: SessionEvent,
     send_to_channels: bool,
 ) {
-    let delivered = crate::http::sse::session_event_for_delivery(&payload, Some(node_name));
+    let delivered = payload.for_delivery(Some(node_name));
 
     if let SessionEvent::SessionNotification {
         kind,
