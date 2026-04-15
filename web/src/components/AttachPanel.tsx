@@ -508,7 +508,6 @@ export default function AttachPanel({
       </div>
       <div className="sm:hidden w-full h-10 flex items-center gap-1 justify-between overflow-hidden">
         <div className="sm:hidden w-full h-10 flex items-center overflow-y-hidden overflow-x-auto">
-
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2"
@@ -558,7 +557,12 @@ export default function AttachPanel({
             Enter
           </Button>
         </div>
-        <Button variant="ghost" className="shrink-0" onClick={toggleDrawer} aria-label="Open input panel">
+        <Button
+          variant="ghost"
+          className="shrink-0"
+          onClick={toggleDrawer}
+          aria-label="Open input panel"
+        >
           {drawerOpen ? (
             <DoubleArrowDownIcon className="w-6 h-6" />
           ) : (
