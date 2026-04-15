@@ -398,7 +398,7 @@ async fn handle_notify_send(
     }
 
     let _ = notification_tx.send(event.clone());
-    let _ = session_event_tx.send(event.into_session_event(0));
+    let _ = session_event_tx.send(event.into_session_event(0, true));
     RpcResponse::Ack
 }
 

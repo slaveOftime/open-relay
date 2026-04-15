@@ -124,6 +124,7 @@ impl SessionEvent {
                 trigger_detail,
                 node: existing,
                 last_total_bytes,
+                enabled_for_channels,
             } => SessionEvent::SessionNotification {
                 kind: kind.clone(),
                 title: title.clone(),
@@ -135,6 +136,7 @@ impl SessionEvent {
                 trigger_detail: trigger_detail.clone(),
                 node: merge_node(existing, node),
                 last_total_bytes: *last_total_bytes,
+                enabled_for_channels: *enabled_for_channels,
             },
         }
     }
@@ -165,6 +167,7 @@ impl NodeWsMessage {
                 trigger_rule,
                 trigger_detail,
                 last_total_bytes,
+                enabled_for_channels,
                 ..
             } => NodeWsMessage::Notification {
                 kind: kind.clone(),
@@ -176,6 +179,7 @@ impl NodeWsMessage {
                 trigger_rule: trigger_rule.clone(),
                 trigger_detail: trigger_detail.clone(),
                 last_total_bytes: *last_total_bytes,
+                enabled_for_channels: *enabled_for_channels,
             },
         }
     }
@@ -425,6 +429,7 @@ mod tests {
             trigger_detail: None,
             node: None,
             last_total_bytes: 0,
+            enabled_for_channels: false,
         };
 
         let delivered = event.for_delivery(Some("worker-a"));
@@ -448,6 +453,7 @@ mod tests {
             trigger_detail: None,
             node: None,
             last_total_bytes: 0,
+            enabled_for_channels: false,
         };
 
         let relay = NodeWsMessage::from_session_event(&event, Some("worker-a"));

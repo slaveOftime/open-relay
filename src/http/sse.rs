@@ -80,6 +80,7 @@ pub(crate) fn encode_session_event(event: &SessionEvent) -> EncodedSessionEvent 
             trigger_detail,
             node,
             last_total_bytes,
+            ..
         } => EncodedSessionEvent {
             event_name: "session_notification",
             data: serde_json::to_string(&serde_json::json!({
@@ -260,6 +261,7 @@ mod tests {
             trigger_detail: None,
             node: None,
             last_total_bytes: 0,
+            enabled_for_channels: false,
         };
 
         let delivered = event.for_delivery(Some("worker-a"));

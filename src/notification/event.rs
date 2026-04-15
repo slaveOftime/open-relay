@@ -160,7 +160,11 @@ impl NotificationEvent {
         }
     }
 
-    pub fn into_session_event(self, last_total_bytes: u64) -> crate::session::SessionEvent {
+    pub fn into_session_event(
+        self,
+        last_total_bytes: u64,
+        enabled_for_channels: bool,
+    ) -> crate::session::SessionEvent {
         crate::session::SessionEvent::SessionNotification {
             kind: self.kind.as_str().to_string(),
             title: self.title,
@@ -172,6 +176,7 @@ impl NotificationEvent {
             trigger_detail: self.trigger_detail,
             node: self.node,
             last_total_bytes,
+            enabled_for_channels,
         }
     }
 
