@@ -7,13 +7,12 @@ use tokio::{
 
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     client::join::JoinConfig,
     config::AppConfig,
     error::Result,
-    http::sse::session_event_for_delivery,
     ipc,
     node::NodeRegistry,
     protocol::{
@@ -233,9 +232,8 @@ async fn connect_and_relay(
             session_event = session_event_rx.recv() => {
                 match session_event {
                     Ok(event) => {
-                        let relay = NodeWsMessage::SessionEvent {
-                            payload: session_event_for_delivery(&event, Some(join.name.as_str())),
-                        };
+                        let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
+                        debug!(node = %join.name, event = ?event, "relaying session event to primary");
                         if !send_node_message(&mut ws_tx, &relay).await {
                             break;
                         }

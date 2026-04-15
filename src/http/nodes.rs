@@ -245,6 +245,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                     trigger_rule,
                                     trigger_detail,
                                     last_total_bytes,
+                                    enabled_for_channels,
                                 } => {
                                     let payload = SessionEvent::SessionNotification {
                                         kind,
@@ -257,12 +258,13 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                         trigger_detail,
                                         node: Some(name.clone()),
                                         last_total_bytes,
+                                        enabled_for_channels,
                                     };
-                                    handle_forwarded_session_event(&state, &name, payload, true)
+                                    handle_forwarded_session_event(&state, &name, payload)
                                         .await;
                                 }
                                 NodeWsMessage::SessionEvent { payload } => {
-                                    handle_forwarded_session_event(&state, &name, payload, false)
+                                    handle_forwarded_session_event(&state, &name, payload)
                                         .await;
                                 }
                                 _ => {}
@@ -298,13 +300,8 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     warn!(node = %name, reason = %disconnect_reason, drained_waiters, "secondary node disconnected");
 }
 
-async fn handle_forwarded_session_event(
-    state: &AppState,
-    node_name: &str,
-    payload: SessionEvent,
-    send_to_channels: bool,
-) {
-    let delivered = crate::http::sse::session_event_for_delivery(&payload, Some(node_name));
+async fn handle_forwarded_session_event(state: &AppState, node_name: &str, payload: SessionEvent) {
+    let delivered = payload.for_delivery(Some(node_name));
 
     if let SessionEvent::SessionNotification {
         kind,
@@ -315,6 +312,7 @@ async fn handle_forwarded_session_event(
         session_ids,
         trigger_rule,
         trigger_detail,
+        enabled_for_channels,
         ..
     } = &delivered
     {
@@ -332,7 +330,7 @@ async fn handle_forwarded_session_event(
             _ => None,
         };
 
-        if send_to_channels {
+        if *enabled_for_channels {
             if let Some(kind_enum) = maybe_kind {
                 let event = NotificationEvent {
                     kind: kind_enum,

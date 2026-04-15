@@ -281,6 +281,7 @@ function SessionDetailPageContent() {
       ) {
         return
       }
+      setSession((session) => ({ ...session, input_needed: true }) as SessionSummary)
       setIsAttachViewportIdle(true)
     }, ATTACH_IDLE_BORDER_DELAY_MS)
   }, [clearAttachIdleTimer])
@@ -743,6 +744,16 @@ function SessionDetailPageContent() {
           },
           onData: (data) => {
             lastWsFrameAtRef.current = Date.now()
+            setSession(
+              (session) =>
+                ({
+                  ...session,
+                  lastActivity: new Date(),
+                  status: 'running',
+                  last_total_bytes: (session?.last_total_bytes ?? 0) + data.length,
+                  input_needed: false,
+                }) as SessionSummary
+            )
             noteAttachInboundData()
             enqueueTerminalOutput([data])
           },

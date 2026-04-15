@@ -117,6 +117,7 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         node: Option<String>,
         last_total_bytes: u64,
+        enabled_for_channels: bool,
     },
 }
 

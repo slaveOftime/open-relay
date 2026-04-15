@@ -81,7 +81,7 @@ pub struct SilentCandidate {
     pub session_title: Option<String>,
     pub excerpt: String,
     pub output_epoch: Instant,
-    pub notifications_enabled: bool,
+    pub enabled_for_channels: bool,
     pub last_total_bytes: u64,
 }
 
@@ -1063,7 +1063,7 @@ impl SessionStore {
                     session_title: rt.meta.title.clone(),
                     excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
                     output_epoch: last_output,
-                    notifications_enabled: rt.notifications_enabled,
+                    enabled_for_channels: rt.notifications_enabled,
                     last_total_bytes: rt.last_total_bytes,
                 })
             })

@@ -100,7 +100,7 @@ pub(super) async fn run_notification_monitor(
                 trigger_detail,
             );
 
-            if candidate.notifications_enabled {
+            if candidate.enabled_for_channels {
                 let notifier = Arc::clone(&notifier);
                 let event = event.clone();
                 let session_id = session_id.clone();
@@ -119,7 +119,10 @@ pub(super) async fn run_notification_monitor(
             // This is useful for supervisor agent to take over when to send notifications
             let _ = notification_tx.send(event.clone());
 
-            let _ = event_tx.send(event.into_session_event(candidate.last_total_bytes));
+            let _ = event_tx.send(
+                event
+                    .into_session_event(candidate.last_total_bytes, candidate.enabled_for_channels),
+            );
 
             session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
         }

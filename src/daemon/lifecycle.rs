@@ -522,7 +522,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         }
 
         let _ = notification_tx.send(event.clone());
-        let _ = event_tx.send(event.into_session_event(0));
+        let _ = event_tx.send(event.into_session_event(0, true));
     }
 
     let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
