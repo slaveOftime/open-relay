@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "oly"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "aes-gcm",
  "arboard",

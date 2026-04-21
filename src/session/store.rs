@@ -567,7 +567,7 @@ impl SessionStore {
         // try_write_input() is a non-blocking channel send that only needs &self.
         let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
             let rt = handle.read();
-            let initial_total_bytes = rt.last_total_bytes;
+            let initial_total_bytes = rt.raw_total_bytes;
             let modes = rt.mode_snapshot();
             let cooked;
             let transformed = modes.app_cursor_keys
@@ -659,7 +659,7 @@ impl SessionStore {
     ) -> bool {
         let started = Instant::now();
         loop {
-            let current_total_bytes = handle.read().last_total_bytes;
+            let current_total_bytes = handle.read().raw_total_bytes;
 
             if current_total_bytes != initial_total_bytes {
                 debug!(
@@ -1201,6 +1201,7 @@ mod tests {
             meta,
             dir,
             last_total_bytes: excerpt.as_bytes().len() as u64,
+            raw_total_bytes: excerpt.as_bytes().len() as u64,
             broadcast_tx,
             resize_tx,
             pty: super::super::pty::PtyHandle {
@@ -1804,6 +1805,7 @@ mod tests {
             meta,
             dir,
             last_total_bytes: 0,
+            raw_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: super::super::pty::PtyHandle {
@@ -2102,6 +2104,7 @@ mod tests {
         let updater = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut locked = rt_clone.write();
+            locked.raw_total_bytes += 1;
             locked.last_total_bytes += 1;
             locked.last_output_epoch = Some(Instant::now());
         });

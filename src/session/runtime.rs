@@ -19,7 +19,10 @@ use crate::{
     session::persist::append_output,
 };
 
-use super::pty::{EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client};
+use super::pty::{
+    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client,
+    non_activity_passthrough_osc_bytes,
+};
 
 use super::{
     SessionMeta, SessionStatus,
@@ -55,9 +58,11 @@ pub struct SessionRuntime {
     /// Set to `true` once the completed state has been written to the database.
     pub persisted: bool,
     pub requested_final_status: Option<SessionStatus>,
-    /// Total length of canonical filtered PTY output bytes.
+    /// Total length of the canonical filtered PTY output stream for persistence and replay.
+    pub raw_total_bytes: u64,
+    /// Total length of meaningful PTY output bytes that changed the terminal state.
     pub last_total_bytes: u64,
-    /// Timestamp of the last output chunk.
+    /// Timestamp of the last meaningful output chunk.
     pub last_output_epoch: Option<Instant>,
     /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
@@ -77,6 +82,7 @@ pub struct SessionRuntime {
 }
 
 const PTY_WRITER_QUEUE_CAPACITY: usize = 256;
+const MEANINGFUL_OUTPUT_HEURISTIC_MAX_BYTES: usize = 64;
 
 impl SessionRuntime {
     /// Current terminal mode snapshot (DECCKM, bracketed paste).
@@ -92,14 +98,19 @@ impl SessionRuntime {
     /// Returns the current cursor position so the caller can answer terminal
     /// queries without re-locking.
     pub fn push_output(&mut self, filtered_data: &[u8]) -> (u16, u16) {
-        // Add the canonical filtered bytes to the retained terminal state.
-        // Fully stripped chunks do not advance replay offsets.
+        // Always advance the retained raw stream used for replay/resizes.
+        // For small chunks, discount passthrough OSC progress sequences from
+        // the user-facing "meaningful output" counters.
         if !filtered_data.is_empty() {
-            self.last_total_bytes = self
-                .last_total_bytes
+            self.raw_total_bytes = self
+                .raw_total_bytes
                 .saturating_add(filtered_data.len() as u64);
-            self.last_output_epoch = Some(Instant::now());
+            let meaningful_len = meaningful_output_len(filtered_data);
             self.screen_parser.process(filtered_data);
+            if meaningful_len > 0 {
+                self.last_total_bytes = self.last_total_bytes.saturating_add(meaningful_len as u64);
+                self.last_output_epoch = Some(Instant::now());
+            }
         }
 
         self.screen_parser.screen().cursor_position()
@@ -305,7 +316,7 @@ impl SessionRuntime {
             self.pty_size = Some((rows, cols));
             safe_resize_parser(&mut self.screen_parser, rows, cols);
             self.resize_history.push(LogResize {
-                offset: self.last_total_bytes,
+                offset: self.raw_total_bytes,
                 rows,
                 cols,
             });
@@ -314,6 +325,16 @@ impl SessionRuntime {
         }
         resized
     }
+}
+
+fn meaningful_output_len(filtered_data: &[u8]) -> usize {
+    if filtered_data.len() > MEANINGFUL_OUTPUT_HEURISTIC_MAX_BYTES {
+        return filtered_data.len();
+    }
+
+    filtered_data
+        .len()
+        .saturating_sub(non_activity_passthrough_osc_bytes(filtered_data))
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +470,7 @@ pub fn spawn_session(
         meta: meta.clone(),
         dir: full_dir,
         last_total_bytes: 0,
+        raw_total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
         pty: pty_handle,
@@ -669,6 +691,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             last_total_bytes: 0,
+            raw_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -829,6 +852,7 @@ mod tests {
         rt.push_output(filtered.as_ref());
 
         assert_eq!(rt.last_total_bytes, 11);
+        assert_eq!(rt.raw_total_bytes, 11);
     }
 
     #[test]
@@ -838,6 +862,41 @@ mod tests {
 
         assert!(rt.screen_parser.screen().contents().trim().is_empty());
         assert_eq!(rt.last_total_bytes, 0);
+        assert_eq!(rt.raw_total_bytes, 0);
+    }
+
+    #[test]
+    fn test_push_output_non_visible_osc_does_not_advance_meaningful_output() {
+        let mut rt = new_runtime();
+
+        rt.push_output(b"\x1b]9;4;3;0\x07");
+
+        assert!(rt.last_output_epoch.is_none());
+        assert_eq!(rt.last_total_bytes, 0);
+        assert_eq!(rt.raw_total_bytes, b"\x1b]9;4;3;0\x07".len() as u64);
+    }
+
+    #[test]
+    fn test_push_output_subtracts_busy_osc_bytes_from_meaningful_total() {
+        let mut rt = new_runtime();
+
+        rt.push_output(b"hello\x1b]9;4;3;0\x07");
+
+        assert!(rt.last_output_epoch.is_some());
+        assert_eq!(rt.last_total_bytes, 5);
+        assert_eq!(rt.raw_total_bytes, b"hello\x1b]9;4;3;0\x07".len() as u64);
+    }
+
+    #[test]
+    fn test_push_output_large_chunks_skip_meaningful_output_heuristic() {
+        let mut rt = new_runtime();
+        let mut chunk = vec![b'x'; MEANINGFUL_OUTPUT_HEURISTIC_MAX_BYTES];
+        chunk.extend_from_slice(b"\x1b]9;4;3;0\x07");
+
+        rt.push_output(&chunk);
+
+        assert_eq!(rt.last_total_bytes, chunk.len() as u64);
+        assert_eq!(rt.raw_total_bytes, chunk.len() as u64);
     }
 
     // -----------------------------------------------------------------------
@@ -922,6 +981,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
             last_total_bytes: 0,
+            raw_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
