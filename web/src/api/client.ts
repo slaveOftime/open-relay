@@ -12,6 +12,7 @@ import type {
   NodeSummary,
   SessionSortField,
   SortOrder,
+  UpdateSessionMetadataSpec,
 } from './types.ts'
 import { AuthRequiredError, TooManyAttemptsError } from './types.ts'
 
@@ -145,6 +146,18 @@ export function fetchSession(id: string, node?: string): Promise<SessionSummary>
 
 export function startSession(spec: CreateSessionSpec): Promise<{ session_id: string }> {
   return req(`${BASE}/sessions`, { method: 'POST', body: JSON.stringify(spec) })
+}
+
+export function updateSessionMetadata(
+  id: string,
+  spec: UpdateSessionMetadataSpec,
+  node?: string
+): Promise<SessionSummary> {
+  const q = node ? `?node=${encodeURIComponent(node)}` : ''
+  return req<SessionSummary>(`${BASE}/sessions/${id}/metadata${q}`, {
+    method: 'POST',
+    body: JSON.stringify(spec),
+  })
 }
 
 export function setSessionNotifications(

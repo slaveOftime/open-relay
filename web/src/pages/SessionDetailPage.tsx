@@ -24,6 +24,7 @@ import CommandLogo from '@/components/CommandLogo'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
 import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
+import SessionMetadataDialog from '@/components/SessionMetadataDialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { getTransferredFiles } from '@/components/ui/file-transfer'
@@ -201,6 +202,7 @@ function SessionDetailPageContent() {
   const [tailLimitInput, setTailLimitInput] = useState('40')
   const [isAttachViewportIdle, setIsAttachViewportIdle] = useState(false)
   const [showNewSessionDialog, setShowNewSessionDialog] = useState(false)
+  const [showMetadataDialog, setShowMetadataDialog] = useState(false)
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
@@ -1325,9 +1327,12 @@ function SessionDetailPageContent() {
             </div>
           </Link>
           <div className="flex items-center gap-3 min-w-0 flex-1">
-            <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold truncate">
+            <button
+              className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold truncate hover:text-[hsl(var(--primary))] transition-colors"
+              onClick={() => setShowMetadataDialog(true)}
+            >
               {session?.id}
-            </span>
+            </button>
             {session && <StatusBadge status={session.status} inputNeeded={session.input_needed} />}
             {node && (
               <Badge className="inline-flex font-light border-[hsl(var(--primary))]/40 bg-[hsl(var(--primary))]/10 text-[hsl(var(--primary))] text-xs">
@@ -1498,6 +1503,11 @@ function SessionDetailPageContent() {
                     {formatByteSize(session.last_total_bytes)}
                   </span>
                 </span>
+                {session.tags.length > 0 && (
+                  <span>
+                    Tags: <span className="text-[hsl(var(--foreground))]">{session.tags.join(', ')}</span>
+                  </span>
+                )}
                 {session.pid != null && (
                   <span>
                     PID: <span className="text-[hsl(var(--foreground))]">{session.pid}</span>
@@ -1689,6 +1699,15 @@ function SessionDetailPageContent() {
           onClose={() => setShowNewSessionDialog(false)}
           initialValues={session ? buildNewSessionInitialValues(session) : undefined}
           node={node ?? undefined}
+        />
+        <SessionMetadataDialog
+          open={showMetadataDialog}
+          session={session}
+          node={node ?? undefined}
+          onClose={() => setShowMetadataDialog(false)}
+          onSaved={(updated) => {
+            setSession(updated)
+          }}
         />
         {/* 
         <Dialog

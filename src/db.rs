@@ -164,6 +164,10 @@ impl Database {
         Ok(())
     }
 
+    pub fn session_output_offset(&self, id: &str) -> u64 {
+        current_output_offset_by_id(&self.sessions_dir, id)
+    }
+
     /// Returns `<sessions_dir>/<id>` if the session exists in the database, else `None`.
     pub async fn get_session_dir(&self, id: &str) -> Result<Option<PathBuf>> {
         if self.session_exists(id).await {
@@ -231,7 +235,7 @@ impl Database {
             .iter()
             .map(|r| {
                 let row = row_to_meta(r);
-                let total_bytes = current_output_offset_by_id(&self.sessions_dir, &row.id);
+                let total_bytes = self.session_output_offset(&row.id);
                 meta_to_summary(&row, false, total_bytes)
             })
             .collect();

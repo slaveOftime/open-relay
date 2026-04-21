@@ -142,6 +142,9 @@ async fn dispatch_request(
             )
             .await
         }
+        RpcRequest::SessionMetadataSet { id, title, tags } => {
+            handle_session_metadata_set(id, title, tags, session_store).await
+        }
         RpcRequest::NotifySet { id, enabled } => {
             handle_notify_set(id, enabled, session_store).await
         }
@@ -351,6 +354,23 @@ async fn handle_notify_set(
         }
         Err(_) => RpcResponse::Error {
             message: format!("session not found or not running: {id}"),
+        },
+    }
+}
+
+async fn handle_session_metadata_set(
+    id: String,
+    title: Option<String>,
+    tags: Vec<String>,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match session_store
+        .update_session_metadata(&id, title, tags)
+        .await
+    {
+        Ok(summary) => RpcResponse::Session { summary },
+        Err(err) => RpcResponse::Error {
+            message: err.to_string(),
         },
     }
 }

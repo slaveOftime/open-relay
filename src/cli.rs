@@ -58,6 +58,8 @@ pub enum Commands {
     Daemon(DaemonArgs),
     /// Create a session and run a command. Example: `oly start --detach --title "my fun demo" copilot`.
     Start(StartArgs),
+    /// Override a session's title and tags.
+    Update(UpdateArgs),
     /// Enable or disable notifications for a running session.
     Notify(NotifyArgs),
     /// Display the oly skill markdown.
@@ -223,6 +225,21 @@ pub struct StartArgs {
         value_name = "CMD [ARGS]...",
     )]
     pub cmd_and_args: Vec<String>,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Session ID to update.
+    pub id: String,
+    /// Override the session title. Pass an empty string to clear it.
+    #[arg(long, short = 't')]
+    pub title: Option<String>,
+    /// Override the session tags. Repeat to add multiple tags; Pass an empty string to clear all tags.
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
@@ -557,6 +574,31 @@ mod tests {
         assert_eq!(args.title.as_deref(), Some("Deploy ready"));
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
         assert_eq!(args.cmd_and_args, vec!["copilot".to_string()]);
+    }
+
+    #[test]
+    fn update_parses_title_tags_and_node() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "update",
+            "session-1",
+            "--title",
+            "Deploy ready",
+            "--tag",
+            "prod",
+            "--tag",
+            "release",
+            "--node",
+            "worker-a",
+        ])
+        .unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.id, "session-1");
+        assert_eq!(args.title.as_deref(), Some("Deploy ready"));
+        assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
     }
 
     #[test]

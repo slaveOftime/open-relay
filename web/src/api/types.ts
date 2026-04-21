@@ -87,6 +87,11 @@ export interface CreateSessionSpec {
   node?: string
 }
 
+export interface UpdateSessionMetadataSpec {
+  title?: string | null
+  tags: string[]
+}
+
 // ---------------------------------------------------------------------------
 // Node federation types
 // ---------------------------------------------------------------------------

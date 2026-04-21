@@ -13,6 +13,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+use crate::error::{AppError, Result};
 use crate::protocol::SessionSummary;
 pub(crate) use runtime::ModeSnapshot;
 pub use store::SessionStore;
@@ -123,6 +124,19 @@ pub enum SessionEvent {
 
 pub type SessionEventTx = broadcast::Sender<SessionEvent>;
 
+pub const MAX_SESSION_TITLE_LEN: usize = 256;
+
+pub fn normalize_session_title(title: Option<String>) -> Option<String> {
+    title.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 pub fn normalize_session_tags(tags: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
@@ -137,4 +151,20 @@ pub fn normalize_session_tags(tags: Vec<String>) -> Vec<String> {
         }
     }
     normalized
+}
+
+pub fn validate_session_metadata(
+    title: Option<String>,
+    tags: Vec<String>,
+) -> Result<(Option<String>, Vec<String>)> {
+    let title = normalize_session_title(title);
+    if let Some(title) = title.as_ref()
+        && title.chars().count() > MAX_SESSION_TITLE_LEN
+    {
+        return Err(AppError::Protocol(format!(
+            "session title is too long (max {MAX_SESSION_TITLE_LEN} characters)"
+        )));
+    }
+
+    Ok((title, normalize_session_tags(tags)))
 }

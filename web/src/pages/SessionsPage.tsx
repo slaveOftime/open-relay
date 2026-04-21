@@ -21,6 +21,7 @@ import {
   fetchNodes,
 } from '@/api/client'
 import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
+import SessionMetadataDialog from '@/components/SessionMetadataDialog'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -418,6 +419,7 @@ function SessionRow({
   onKill,
   onToggleNotifications,
   onRunAgain,
+  onEditSession,
   notificationsPending,
   node,
 }: {
@@ -428,6 +430,7 @@ function SessionRow({
   onKill: (id: string) => void
   onToggleNotifications: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
+  onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
 }) {
@@ -462,14 +465,16 @@ function SessionRow({
           className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
           onClick={(e) => {
             e.stopPropagation()
-            navigator.clipboard.writeText(session.id).catch(() => {})
+            onEditSession(session)
           }}
         >
           <Tooltip>
             <TooltipTrigger asChild>
-              <span>{session.id.slice(0, 7)}</span>
+              <button className="truncate text-left hover:text-[hsl(var(--primary))] transition-colors">
+                {session.id.slice(0, 7)}
+              </button>
             </TooltipTrigger>
-            <TooltipContent>{`${session.id} — click to copy`}</TooltipContent>
+            <TooltipContent>{`${session.id} — click to edit`}</TooltipContent>
           </Tooltip>
         </TableCell>
 
@@ -628,6 +633,7 @@ function SessionCard({
   onKill,
   onToggleNotifications,
   onRunAgain,
+  onEditSession,
   notificationsPending,
   node,
 }: {
@@ -638,6 +644,7 @@ function SessionCard({
   onKill: (id: string) => void
   onToggleNotifications: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
+  onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
 }) {
@@ -665,9 +672,12 @@ function SessionCard({
         <CardContent className="px-3 pt-3 pb-3 flex flex-col gap-1">
           {/* Row 1: id, status, pid, created at */}
           <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold">
+            <button
+              className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold hover:text-[hsl(var(--primary))] transition-colors"
+              onClick={() => onEditSession(session)}
+            >
               {session.id.slice(0, 7)}
-            </span>
+            </button>
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
               {formatTimestamp(session.created_at)}
             </span>
@@ -930,6 +940,7 @@ export default function SessionsPage() {
   const [page, setPage] = useState(0)
   const [showNewSession, setShowNewSession] = useState(false)
   const [rerunSession, setRerunSession] = useState<SessionSummary | null>(null)
+  const [editingSession, setEditingSession] = useState<SessionSummary | null>(null)
   const [sseStatus, setSseStatus] = useState<'live' | 'reconnecting' | 'offline'>(
     typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting'
   )
@@ -1307,6 +1318,10 @@ export default function SessionsPage() {
   function handleRunAgain(session: SessionSummary) {
     setRerunSession(session)
     setShowNewSession(true)
+  }
+
+  function handleEditSession(session: SessionSummary) {
+    setEditingSession(session)
   }
 
   function handleNodeChange(node: string | null) {
@@ -1716,6 +1731,7 @@ export default function SessionsPage() {
                       onKill={handleKill}
                       onToggleNotifications={handleToggleNotifications}
                       onRunAgain={handleRunAgain}
+                      onEditSession={handleEditSession}
                       notificationsPending={notificationRequestIds.has(s.id)}
                       node={selectedNode ?? undefined}
                     />
@@ -1826,6 +1842,7 @@ export default function SessionsPage() {
                         onKill={handleKill}
                         onToggleNotifications={handleToggleNotifications}
                         onRunAgain={handleRunAgain}
+                        onEditSession={handleEditSession}
                         notificationsPending={notificationRequestIds.has(s.id)}
                         node={selectedNode ?? undefined}
                       />
@@ -1882,6 +1899,16 @@ export default function SessionsPage() {
           }}
           initialValues={rerunSession ? buildNewSessionInitialValues(rerunSession) : undefined}
           node={selectedNode ?? undefined}
+        />
+        <SessionMetadataDialog
+          open={editingSession !== null}
+          session={editingSession}
+          node={selectedNode ?? undefined}
+          onClose={() => setEditingSession(null)}
+          onSaved={(session: SessionSummary) => {
+            replaceLoadedSession(session)
+            setEditingSession(session)
+          }}
         />
       </div>
     </TooltipProvider>
