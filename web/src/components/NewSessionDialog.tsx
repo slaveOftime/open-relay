@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
 import { startSession } from '@/api/client'
 import type { SessionSummary } from '@/api/types'
+import { formatSessionTagInput, parseSessionTagInput } from '@/lib/sessionMetadata'
 import { parseArgString } from '@/utils/format'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -13,28 +14,6 @@ export type NewSessionInitialValues = {
   title: string
   tags: string
   cwd: string
-}
-
-function normalizeSessionTags(tags: string[]): string[] {
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const tag of tags) {
-    const trimmed = tag.trim()
-    if (trimmed === '') continue
-    const key = trimmed.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    normalized.push(trimmed)
-  }
-  return normalized
-}
-
-function parseSessionTagInput(input: string): string[] {
-  return normalizeSessionTags(input.split(/[,\n]/))
-}
-
-function formatSessionTagInput(tags: string[]): string {
-  return normalizeSessionTags(tags).join(', ')
 }
 
 export function buildNewSessionInitialValues(

@@ -45,19 +45,22 @@ function dotColor(status: SessionStatus, inputNeeded: boolean): string {
 }
 
 export default function StatusBadge({ status, inputNeeded, showDot = true }: Props) {
+  const variant = statusVariant(status, inputNeeded)
+  const label = statusLabel(status, inputNeeded)
+  const shouldPulseDot = inputNeeded || status === 'running'
+
   return (
     <Badge
-      variant={statusVariant(status, inputNeeded)}
+      key={`${status}:${inputNeeded ? 'input-needed' : 'status'}`}
+      variant={variant}
       className="whitespace-nowrap text-xs font-light"
     >
       {showDot && (
         <span
-          className={`w-1.5 h-1.5 rounded-full ${dotColor(status, inputNeeded)} ${
-            inputNeeded || status === 'running' ? 'animate-pulse' : ''
-          }`}
+          className={`w-1.5 h-1.5 rounded-full ${dotColor(status, inputNeeded)} ${shouldPulseDot ? 'animate-pulse' : ''}`}
         />
       )}
-      {statusLabel(status, inputNeeded)}
+      <span>{label}</span>
     </Badge>
   )
 }

@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -166,6 +166,11 @@ pub enum RpcRequest {
         #[serde(default)]
         disable_notifications: bool,
     },
+    SessionMetadataSet {
+        id: String,
+        title: Option<String>,
+        tags: Option<Vec<String>>,
+    },
     NotifySet {
         id: String,
         enabled: bool,
@@ -277,6 +282,7 @@ impl RpcRequest {
             RpcRequest::DaemonStop { .. } => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
+            RpcRequest::SessionMetadataSet { .. } => "session_metadata_set",
             RpcRequest::NotifySet { .. } => "notify_set",
             RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
@@ -318,6 +324,9 @@ pub enum RpcResponse {
     },
     Start {
         session_id: String,
+    },
+    Session {
+        summary: SessionSummary,
     },
     /// Sent once after AttachSubscribe: a terminal-state snapshot describing the
     /// current visible screen, followed by terminal mode flags.

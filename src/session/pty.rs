@@ -937,6 +937,70 @@ fn allow_passthrough_generic_osc(sequence: &[u8], escaped_prefix: bool) -> bool 
     matches!(ps, b"0" | b"1" | b"2") || (ps == b"9" && payload.starts_with(b"4;"))
 }
 
+pub(crate) fn non_activity_passthrough_osc_bytes(text: &[u8]) -> usize {
+    let mut ignored = 0usize;
+    let mut index = 0usize;
+
+    while index < text.len() {
+        let (start, escaped_prefix) = match text.get(index) {
+            Some(0x1b) if text.get(index + 1) == Some(&b']') => (index, true),
+            Some(b']') => (index, false),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        let mut cursor = start + if escaped_prefix { 2 } else { 1 };
+        let digits_start = cursor;
+        while text
+            .get(cursor)
+            .copied()
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            cursor += 1;
+        }
+
+        if cursor == digits_start || text.get(cursor) != Some(&b';') {
+            index = start + 1;
+            continue;
+        }
+        let ps = &text[digits_start..cursor];
+        cursor += 1;
+        let payload_start = cursor;
+
+        let Some((payload_end, sequence_end)) =
+            generic_osc_terminator_bounds(text, cursor, escaped_prefix)
+        else {
+            break;
+        };
+
+        if ps == b"9" && text[payload_start..payload_end].starts_with(b"4;") {
+            ignored = ignored.saturating_add(sequence_end.saturating_sub(start));
+        }
+        index = sequence_end;
+    }
+
+    ignored
+}
+
+fn generic_osc_terminator_bounds(
+    text: &[u8],
+    start: usize,
+    escaped_prefix: bool,
+) -> Option<(usize, usize)> {
+    let mut index = start;
+    while let Some(&byte) = text.get(index) {
+        match byte {
+            0x07 => return Some((index, index + 1)),
+            0x1b if text.get(index + 1) == Some(&b'\\') => return Some((index, index + 2)),
+            b'\\' if !escaped_prefix => return Some((index, index + 1)),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 /// Find the last occurrence of `needle` inside `haystack`.
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
@@ -1090,6 +1154,21 @@ mod tests {
         let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug\x07after";
         assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_non_activity_passthrough_osc_bytes_counts_busy_sequence() {
+        let text = b"before\x1b]9;4;3;0\x07after";
+        assert_eq!(
+            non_activity_passthrough_osc_bytes(text),
+            b"\x1b]9;4;3;0\x07".len()
+        );
+    }
+
+    #[test]
+    fn test_non_activity_passthrough_osc_bytes_ignores_title_sequence() {
+        let text = b"before\x1b]0;relay build\x07after";
+        assert_eq!(non_activity_passthrough_osc_bytes(text), 0);
     }
 
     #[test]

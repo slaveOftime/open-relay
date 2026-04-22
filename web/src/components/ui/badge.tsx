@@ -27,7 +27,7 @@ const badgeVariants = cva(
         created:
           'border-blue-200 bg-blue-50 text-blue-700 dark:border-blue-800/40 dark:bg-blue-900/30 dark:text-blue-300',
         'input-needed':
-          'border-amber-200 bg-amber-50 text-amber-700 animate-pulse dark:border-amber-700/60 dark:bg-amber-900/30 dark:text-amber-300',
+          'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-700/60 dark:bg-amber-900/30 dark:text-amber-300',
         attached:
           'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-700/50 dark:bg-indigo-900/30 dark:text-indigo-300',
       },

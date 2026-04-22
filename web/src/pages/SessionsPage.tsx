@@ -21,6 +21,7 @@ import {
   fetchNodes,
 } from '@/api/client'
 import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
+import SessionMetadataDialog from '@/components/SessionMetadataDialog'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -294,10 +295,7 @@ function SessionTagList({
           variant="outline"
           className="min-w-0 max-w-full border-emerald-500/25 bg-emerald-500/10 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
         >
-          <span className="text-[9px] font-bold leading-none text-emerald-500 dark:text-emerald-300">
-            #
-          </span>
-          <span className="min-w-0 truncate">{tag}</span>
+          <span className="min-w-0 truncate">#{tag}</span>
         </Badge>
       ))}
     </div>
@@ -418,6 +416,7 @@ function SessionRow({
   onKill,
   onToggleNotifications,
   onRunAgain,
+  onEditSession,
   notificationsPending,
   node,
 }: {
@@ -428,6 +427,7 @@ function SessionRow({
   onKill: (id: string) => void
   onToggleNotifications: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
+  onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
 }) {
@@ -462,14 +462,16 @@ function SessionRow({
           className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
           onClick={(e) => {
             e.stopPropagation()
-            navigator.clipboard.writeText(session.id).catch(() => {})
+            onEditSession(session)
           }}
         >
           <Tooltip>
             <TooltipTrigger asChild>
-              <span>{session.id.slice(0, 7)}</span>
+              <button className="truncate text-left hover:text-[hsl(var(--primary))] transition-colors">
+                {session.id.slice(0, 7)}
+              </button>
             </TooltipTrigger>
-            <TooltipContent>{`${session.id} — click to copy`}</TooltipContent>
+            <TooltipContent>{`${session.id} — click to edit`}</TooltipContent>
           </Tooltip>
         </TableCell>
 
@@ -628,6 +630,7 @@ function SessionCard({
   onKill,
   onToggleNotifications,
   onRunAgain,
+  onEditSession,
   notificationsPending,
   node,
 }: {
@@ -638,6 +641,7 @@ function SessionCard({
   onKill: (id: string) => void
   onToggleNotifications: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
+  onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
 }) {
@@ -660,17 +664,23 @@ function SessionCard({
   return (
     <>
       <Card
-        className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
+        className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
-        <CardContent className="px-3 pt-3 pb-3 flex flex-col gap-1">
+        <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1">
           {/* Row 1: id, status, pid, created at */}
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold">
+          <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap">
+            <button
+              className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold hover:text-[hsl(var(--primary))] transition-colors"
+              onClick={() => onEditSession(session)}
+            >
               {session.id.slice(0, 7)}
-            </span>
+            </button>
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
               {formatTimestamp(session.created_at)}
             </span>
+            <div className="text-[hsl(var(--muted-foreground))] text-xs font-mono tabular-nums">
+              {formatByteSize(session.last_total_bytes)}
+            </div>
             <div className="flex-1" />
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
           </div>
@@ -698,9 +708,6 @@ function SessionCard({
           )}
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="text-[hsl(var(--muted-foreground))] font-semibold">
-              {formatByteSize(session.last_total_bytes)}
-            </div>
             {session.tags.length > 0 && (
               <div className="min-w-0 flex-1">
                 <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
@@ -930,6 +937,7 @@ export default function SessionsPage() {
   const [page, setPage] = useState(0)
   const [showNewSession, setShowNewSession] = useState(false)
   const [rerunSession, setRerunSession] = useState<SessionSummary | null>(null)
+  const [editingSession, setEditingSession] = useState<SessionSummary | null>(null)
   const [sseStatus, setSseStatus] = useState<'live' | 'reconnecting' | 'offline'>(
     typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting'
   )
@@ -1309,6 +1317,10 @@ export default function SessionsPage() {
     setShowNewSession(true)
   }
 
+  function handleEditSession(session: SessionSummary) {
+    setEditingSession(session)
+  }
+
   function handleNodeChange(node: string | null) {
     setSelectedNode(node)
     setPage(0)
@@ -1534,14 +1546,30 @@ export default function SessionsPage() {
             className={`md:hidden overflow-hidden transition-all duration-200 ${showFilters ? 'max-h-64 opacity-100' : 'max-h-0 opacity-0'}`}
           >
             <div className="px-3 pb-3 mt-1 flex flex-col gap-2">
-              <Input
-                placeholder="Search sessions…"
-                value={search}
-                onChange={(e) => {
-                  setSearch(e.target.value)
-                  setPage(0)
-                }}
-              />
+              <div className="relative">
+                <Input
+                  className={search ? 'pr-8' : undefined}
+                  placeholder="Search sessions…"
+                  value={search}
+                  onChange={(e) => {
+                    setSearch(e.target.value)
+                    setPage(0)
+                  }}
+                />
+                {search && (
+                  <button
+                    type="button"
+                    aria-label="Clear search"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
+                    onClick={() => {
+                      setSearch('')
+                      setPage(0)
+                    }}
+                  >
+                    <Cross2Icon className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
               <div className="flex gap-2">
                 <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
                   <SelectTrigger className="flex-1 h-8 text-xs">
@@ -1628,15 +1656,30 @@ export default function SessionsPage() {
               <span>Open Relay</span>
             </div>
 
-            <Input
-              className="w-48 h-8 text-sm"
-              placeholder="Search sessions…"
-              value={search}
-              onChange={(e) => {
-                setSearch(e.target.value)
-                setPage(0)
-              }}
-            />
+            <div className="relative w-48">
+              <Input
+                className={search ? 'h-8 w-full pr-8 text-sm' : 'h-8 w-full text-sm'}
+                placeholder="Search sessions…"
+                value={search}
+                onChange={(e) => {
+                  setSearch(e.target.value)
+                  setPage(0)
+                }}
+              />
+              {search && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
+                  onClick={() => {
+                    setSearch('')
+                    setPage(0)
+                  }}
+                >
+                  <Cross2Icon className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
 
             <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
               <SelectTrigger className="flex-0 h-8 text-sm">
@@ -1716,6 +1759,7 @@ export default function SessionsPage() {
                       onKill={handleKill}
                       onToggleNotifications={handleToggleNotifications}
                       onRunAgain={handleRunAgain}
+                      onEditSession={handleEditSession}
                       notificationsPending={notificationRequestIds.has(s.id)}
                       node={selectedNode ?? undefined}
                     />
@@ -1826,6 +1870,7 @@ export default function SessionsPage() {
                         onKill={handleKill}
                         onToggleNotifications={handleToggleNotifications}
                         onRunAgain={handleRunAgain}
+                        onEditSession={handleEditSession}
                         notificationsPending={notificationRequestIds.has(s.id)}
                         node={selectedNode ?? undefined}
                       />
@@ -1882,6 +1927,16 @@ export default function SessionsPage() {
           }}
           initialValues={rerunSession ? buildNewSessionInitialValues(rerunSession) : undefined}
           node={selectedNode ?? undefined}
+        />
+        <SessionMetadataDialog
+          open={editingSession !== null}
+          session={editingSession}
+          node={selectedNode ?? undefined}
+          onClose={() => setEditingSession(null)}
+          onSaved={(session: SessionSummary) => {
+            replaceLoadedSession(session)
+            setEditingSession(session)
+          }}
         />
       </div>
     </TooltipProvider>

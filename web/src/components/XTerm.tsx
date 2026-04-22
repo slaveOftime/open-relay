@@ -237,12 +237,82 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     })
     ro.observe(containerRef.current)
 
+    const findScrollContainer = (node: HTMLElement | null): HTMLElement | null => {
+      let current = node?.parentElement ?? null
+      while (current) {
+        const style = window.getComputedStyle(current)
+        const overflowY = style.overflowY
+        const canScroll =
+          (overflowY === 'auto' || overflowY === 'scroll') &&
+          current.scrollHeight > current.clientHeight
+        if (canScroll) {
+          return current
+        }
+        current = current.parentElement
+      }
+
+      return document.scrollingElement instanceof HTMLElement
+        ? document.scrollingElement
+        : document.documentElement
+    }
+
+    let keyboardSyncRaf = 0
+    let keyboardSyncPasses = 0
+    const maxKeyboardSyncPasses = 8
+    const syncFocusedTerminalIntoView = (): boolean => {
+      const textarea = term.textarea
+      if (!textarea || document.activeElement !== textarea) return false
+
+      const viewport = window.visualViewport
+      const viewportBottom = viewport
+        ? viewport.offsetTop + viewport.height
+        : window.innerHeight
+      const rect = container.getBoundingClientRect()
+      const bottomPadding = 40
+      const overlap = rect.bottom + bottomPadding - viewportBottom
+      if (overlap <= 0) return false
+
+      const scrollContainer = findScrollContainer(container)
+      if (!scrollContainer) return false
+
+      const scrollTop = Math.ceil(overlap)
+
+      if (scrollContainer === document.documentElement || scrollContainer === document.body) {
+        window.scrollBy({ top: scrollTop, behavior: 'auto' })
+        return true
+      }
+
+      scrollContainer.scrollBy({ top: scrollTop, behavior: 'auto' })
+      return true
+    }
+
+    const scheduleKeyboardSync = () => {
+      if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
+      keyboardSyncRaf = requestAnimationFrame(() => {
+        keyboardSyncRaf = 0
+        const didScroll = syncFocusedTerminalIntoView()
+        if (didScroll && keyboardSyncPasses < maxKeyboardSyncPasses) {
+          keyboardSyncPasses += 1
+          scheduleKeyboardSync()
+          return
+        }
+        keyboardSyncPasses = 0
+      })
+    }
+
     // iOS PWA: tapping the terminal canvas doesn't reliably trigger the
     // virtual keyboard in standalone mode. Explicitly focus xterm's internal
     // input element on touchend so the keyboard appears.
     const container = containerRef.current
     const handleTouchEnd = () => {
-      if (onDataRef.current) term.focus()
+      if (!onDataRef.current) return
+      keyboardSyncPasses = 0
+      term.focus()
+      scheduleKeyboardSync()
+    }
+    const handleTerminalFocus = () => {
+      keyboardSyncPasses = 0
+      scheduleKeyboardSync()
     }
     const handlePaste = (event: ClipboardEvent) => {
       const clipboardData = event.clipboardData
@@ -261,8 +331,12 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       event.stopPropagation()
       onPasteRef.current(event)
     }
+    const viewport = window.visualViewport
     container.addEventListener('touchend', handleTouchEnd, { passive: true })
+    term.textarea?.addEventListener('focus', handleTerminalFocus)
     term.textarea?.addEventListener('paste', handlePaste, true)
+    viewport?.addEventListener('resize', scheduleKeyboardSync)
+    viewport?.addEventListener('scroll', scheduleKeyboardSync)
 
     return () => {
       // Null refs immediately so any in-flight callbacks become no-ops
@@ -272,10 +346,14 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       // Cancel our own pending RAFs
       if (initialRaf) cancelAnimationFrame(initialRaf)
       if (pendingRaf) cancelAnimationFrame(pendingRaf)
+      if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
       dataDisposable.dispose()
       ro.disconnect()
       container.removeEventListener('touchend', handleTouchEnd)
+      term.textarea?.removeEventListener('focus', handleTerminalFocus)
       term.textarea?.removeEventListener('paste', handlePaste)
+      viewport?.removeEventListener('resize', scheduleKeyboardSync)
+      viewport?.removeEventListener('scroll', scheduleKeyboardSync)
       // Defer dispose by TWO frames so xterm's own internally-scheduled
       // RAFs can fully drain before _renderService is torn down.
       requestAnimationFrame(() => requestAnimationFrame(() => term.dispose()))

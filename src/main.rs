@@ -237,6 +237,30 @@ async fn run() -> Result<()> {
             }
         }
 
+        Commands::Update(update_args) => {
+            let inner = RpcRequest::SessionMetadataSet {
+                id: update_args.id.clone(),
+                title: update_args.title,
+                tags: update_args.tags,
+            };
+            match ipc::send_request_checked(&config, node_wrap(update_args.node, inner)).await? {
+                RpcResponse::Session { summary } => {
+                    println!(
+                        "Updated session {}. Title: {}. Tags: {}",
+                        summary.id,
+                        summary.title.as_deref().unwrap_or("—"),
+                        if summary.tags.is_empty() {
+                            "—".to_string()
+                        } else {
+                            summary.tags.join(", ")
+                        }
+                    );
+                    Ok(())
+                }
+                _ => Err(AppError::Protocol("unexpected response type".to_string())),
+            }
+        }
+
         Commands::Notify(notify_args) => match notify_args.command {
             NotifyCommand::Disable(args) => {
                 let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;

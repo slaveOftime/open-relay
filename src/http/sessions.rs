@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     db::meta_to_summary,
+    error::AppError,
     protocol::{
         ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
     },
@@ -426,6 +427,87 @@ pub async fn get_session(
                 Json(serde_json::json!({ "error": err.to_string() })),
             )
                 .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SessionMetadataBody {
+    pub title: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+
+fn session_metadata_error_response(err: AppError) -> axum::response::Response {
+    match err {
+        AppError::Protocol(message) => {
+            let status = if message.starts_with("session not found:") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, Json(serde_json::json!({ "error": message }))).into_response()
+        }
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": other.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn set_session_metadata(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<NodeParams>,
+    Json(body): Json<SessionMetadataBody>,
+) -> impl IntoResponse {
+    if let Some(ref node) = params.node {
+        let rpc = RpcRequest::SessionMetadataSet {
+            id: id.clone(),
+            title: body.title.clone(),
+            tags: body.tags.clone(),
+        };
+        return match state.node_registry.proxy_rpc(node, &rpc).await {
+            Ok(RpcResponse::Session { summary }) => Json(summary).into_response(),
+            Ok(RpcResponse::Error { message }) => (
+                if message.starts_with("session not found:") {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "unexpected response from node" })),
+            )
+                .into_response(),
+        };
+    }
+
+    match state
+        .store
+        .update_session_metadata(&id, body.title.clone(), body.tags.clone())
+        .await
+    {
+        Ok(summary) => {
+            info!(
+                session_id = %id,
+                title = ?summary.title,
+                tags = ?summary.tags,
+                "session metadata updated"
+            );
+            Json(summary).into_response()
+        }
+        Err(err) => {
+            warn!(session_id = %id, %err, "failed to update session metadata");
+            session_metadata_error_response(err)
         }
     }
 }

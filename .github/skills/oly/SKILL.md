@@ -70,9 +70,18 @@ oly send <ID> "cat " oly-file:/path/to/file key:enter
 
 ```bash
 oly attach <ID>      # Detach: Ctrl-], then d
+oly update <ID> --title "better name"
+oly update <ID> --title ""
+oly update <ID> --tag prod --tag release
+oly update <ID> --tag ""
 oly stop <ID>
 oly ls                # oly ls --json for agents
 ```
+
+- `oly update` changes session metadata without restarting the session.
+- `--title ""` clears the title. If `--title` is omitted, the existing title is kept.
+- `--tag ""` clears all tags. If `--tag` is omitted, existing tags are kept.
+- Repeating `--tag` replaces the full tag list with the provided tags.
 
 ### 5) Notify
 
