@@ -1546,14 +1546,30 @@ export default function SessionsPage() {
             className={`md:hidden overflow-hidden transition-all duration-200 ${showFilters ? 'max-h-64 opacity-100' : 'max-h-0 opacity-0'}`}
           >
             <div className="px-3 pb-3 mt-1 flex flex-col gap-2">
-              <Input
-                placeholder="Search sessions…"
-                value={search}
-                onChange={(e) => {
-                  setSearch(e.target.value)
-                  setPage(0)
-                }}
-              />
+              <div className="relative">
+                <Input
+                  className={search ? 'pr-8' : undefined}
+                  placeholder="Search sessions…"
+                  value={search}
+                  onChange={(e) => {
+                    setSearch(e.target.value)
+                    setPage(0)
+                  }}
+                />
+                {search && (
+                  <button
+                    type="button"
+                    aria-label="Clear search"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
+                    onClick={() => {
+                      setSearch('')
+                      setPage(0)
+                    }}
+                  >
+                    <Cross2Icon className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
               <div className="flex gap-2">
                 <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
                   <SelectTrigger className="flex-1 h-8 text-xs">
@@ -1640,15 +1656,30 @@ export default function SessionsPage() {
               <span>Open Relay</span>
             </div>
 
-            <Input
-              className="w-48 h-8 text-sm"
-              placeholder="Search sessions…"
-              value={search}
-              onChange={(e) => {
-                setSearch(e.target.value)
-                setPage(0)
-              }}
-            />
+            <div className="relative w-48">
+              <Input
+                className={search ? 'h-8 w-full pr-8 text-sm' : 'h-8 w-full text-sm'}
+                placeholder="Search sessions…"
+                value={search}
+                onChange={(e) => {
+                  setSearch(e.target.value)
+                  setPage(0)
+                }}
+              />
+              {search && (
+                <button
+                  type="button"
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
+                  onClick={() => {
+                    setSearch('')
+                    setPage(0)
+                  }}
+                >
+                  <Cross2Icon className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
 
             <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
               <SelectTrigger className="flex-0 h-8 text-sm">
