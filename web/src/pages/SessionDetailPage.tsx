@@ -1505,7 +1505,8 @@ function SessionDetailPageContent() {
                 </span>
                 {session.tags.length > 0 && (
                   <span>
-                    Tags: <span className="text-[hsl(var(--foreground))]">{session.tags.join(', ')}</span>
+                    Tags:{' '}
+                    <span className="text-[hsl(var(--foreground))]">{session.tags.join(', ')}</span>
                   </span>
                 )}
                 {session.pid != null && (
@@ -1524,19 +1525,20 @@ function SessionDetailPageContent() {
         <div
           id="main-container"
           className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
+          style={{ scrollbarGutter: 'stable' }}
         >
           {/* Terminal area */}
           <div
-            className={`flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
+            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
           >
             <div
+              aria-hidden="true"
+              className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
+            />
+            <div
               ref={termContainerRef}
-              className="relative flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] py-2 pl-2 pr-0 h-full w-full overflow-x-auto"
+              className="flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full overflow-x-auto"
             >
-              <div
-                aria-hidden="true"
-                className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
-              />
               <XTerm
                 key={mode === 'logs' ? `logs-${logsView}` : mode}
                 ref={termRef}

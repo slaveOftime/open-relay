@@ -2,10 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
 import { updateSessionMetadata } from '@/api/client'
 import type { SessionSummary } from '@/api/types'
-import {
-  buildSessionMetadataUpdateSpec,
-  formatSessionTagInput,
-} from '@/lib/sessionMetadata'
+import { buildSessionMetadataUpdateSpec, formatSessionTagInput } from '@/lib/sessionMetadata'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'

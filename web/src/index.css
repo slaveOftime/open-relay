@@ -88,7 +88,6 @@
     background-color: hsl(var(--background));
     color-scheme: light dark;
     overscroll-behavior: none;
-    scrollbar-gutter: stable;
   }
 
   body {
@@ -176,16 +175,6 @@
 }
 
 @layer utilities {
-  .overflow-auto,
-  .overflow-scroll,
-  .overflow-x-auto,
-  .overflow-x-scroll,
-  .overflow-y-auto,
-  .overflow-y-scroll,
-  .scrollbar-stable {
-    scrollbar-gutter: stable;
-  }
-
   .animate-shimmer {
     animation: shimmer 1.5s infinite;
     background: linear-gradient(
