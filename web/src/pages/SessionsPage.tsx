@@ -295,10 +295,7 @@ function SessionTagList({
           variant="outline"
           className="min-w-0 max-w-full border-emerald-500/25 bg-emerald-500/10 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
         >
-          <span className="text-[9px] font-bold leading-none text-emerald-500 dark:text-emerald-300">
-            #
-          </span>
-          <span className="min-w-0 truncate">{tag}</span>
+          <span className="min-w-0 truncate">#{tag}</span>
         </Badge>
       ))}
     </div>
