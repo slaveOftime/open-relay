@@ -563,7 +563,7 @@ export default function AttachPanel({
         <div className="sm:hidden w-full h-10 flex items-center overflow-y-hidden overflow-x-auto">
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('left')}
             aria-label="Left"
           >
@@ -571,7 +571,7 @@ export default function AttachPanel({
           </Button>
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('up')}
             aria-label="Up"
           >
@@ -579,7 +579,7 @@ export default function AttachPanel({
           </Button>
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('down')}
             aria-label="Down"
           >
@@ -587,7 +587,7 @@ export default function AttachPanel({
           </Button>
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('right')}
             aria-label="Right"
           >
@@ -595,7 +595,7 @@ export default function AttachPanel({
           </Button>
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('tab')}
             aria-label="Tab"
           >
@@ -603,7 +603,7 @@ export default function AttachPanel({
           </Button>
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2"
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('enter')}
             aria-label="Enter"
           >
