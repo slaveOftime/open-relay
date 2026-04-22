@@ -596,14 +596,6 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
-            onClick={() => handleSendKeySpec('esc')}
-            aria-label="Esc"
-          >
-            Esc
-          </Button>
-          <Button
-            variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('tab')}
             aria-label="Tab"
           >
@@ -611,7 +603,15 @@ export default function AttachPanel({
           </Button>
           <Button
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            className="shrink-0 text-amber-600 px-2.5"
+            onClick={() => handleSendKeySpec('esc')}
+            aria-label="Esc"
+          >
+            Esc
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-amber-600 px-2.5"
             onClick={() => handleSendKeySpec('enter')}
             aria-label="Enter"
           >
