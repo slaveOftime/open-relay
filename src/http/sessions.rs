@@ -434,8 +434,7 @@ pub async fn get_session(
 #[derive(Debug, Deserialize)]
 pub struct SessionMetadataBody {
     pub title: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
+    pub tags: Option<Vec<String>>,
 }
 
 fn session_metadata_error_response(err: AppError) -> axum::response::Response {

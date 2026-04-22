@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -169,8 +169,7 @@ pub enum RpcRequest {
     SessionMetadataSet {
         id: String,
         title: Option<String>,
-        #[serde(default)]
-        tags: Vec<String>,
+        tags: Option<Vec<String>>,
     },
     NotifySet {
         id: String,

@@ -20,7 +20,10 @@ use crate::{
     db::meta_to_summary,
     error::{AppError, Result},
     protocol::{ListQuery, SessionSummary},
-    session::{SessionEvent, SessionEventTx, SessionLiveSummary, validate_session_metadata},
+    session::{
+        SessionEvent, SessionEventTx, SessionLiveSummary, validate_session_metadata,
+        validate_session_metadata_update,
+    },
 };
 
 use super::{
@@ -357,9 +360,10 @@ impl SessionStore {
         &self,
         id: &str,
         title: Option<String>,
-        tags: Vec<String>,
+        tags: Option<Vec<String>>,
     ) -> Result<SessionSummary> {
-        let (title, tags) = validate_session_metadata(title, tags)?;
+        let title_provided = title.is_some();
+        let (title, tags) = validate_session_metadata_update(title, tags)?;
         let live_handle = {
             let sessions = self.sessions.load();
             sessions.get(id).cloned()
@@ -368,10 +372,10 @@ impl SessionStore {
         let summary = if let Some(handle) = live_handle {
             let meta = {
                 let mut rt = handle.write();
-                if title.is_some() {
+                if title_provided {
                     rt.meta.title = title.clone();
                 }
-                if !tags.is_empty() {
+                if let Some(tags) = tags.as_ref() {
                     rt.meta.tags = tags.clone();
                 }
                 rt.meta.clone()
@@ -382,20 +386,17 @@ impl SessionStore {
             let Some(mut meta) = self.db.get_session(id).await? else {
                 return Err(AppError::Protocol(format!("session not found: {id}")));
             };
-            if title.is_some() {
+            if title_provided {
                 meta.title = title;
             }
-            if !tags.is_empty() {
+            if let Some(tags) = tags {
                 meta.tags = tags;
             }
             self.db.update_session(&meta).await?;
             meta_to_summary(&meta, false, self.db.session_output_offset(id))
         };
 
-        info!(
-            session_id = id,
-            "session metadata updated"
-        );
+        info!(session_id = id, "session metadata updated");
         let _ = self
             .event_tx
             .send(SessionEvent::SessionUpdated(summary.clone()));
@@ -2185,7 +2186,11 @@ mod tests {
             .update_session_metadata(
                 "meta001",
                 Some("  Deploy ready  ".to_string()),
-                vec!["prod".to_string(), " Prod ".to_string(), "".to_string()],
+                Some(vec![
+                    "prod".to_string(),
+                    " Prod ".to_string(),
+                    "".to_string(),
+                ]),
             )
             .await
             .expect("update live session metadata");
@@ -2223,7 +2228,7 @@ mod tests {
             .update_session_metadata(
                 "meta002",
                 Some("new".to_string()),
-                vec![" release ".to_string()],
+                Some(vec![" release ".to_string()]),
             )
             .await
             .expect("update persisted session metadata");
@@ -2237,6 +2242,86 @@ mod tests {
             .expect("session should exist");
         assert_eq!(saved.title, Some("new".to_string()));
         assert_eq!(saved.tags, vec!["release".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn update_session_metadata_clears_explicit_empty_values() {
+        let db = make_test_db().await;
+        let meta = SessionMeta {
+            id: "meta003".to_string(),
+            title: Some("old".to_string()),
+            tags: vec!["old".to_string()],
+            command: "sh".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: None,
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code: Some(0),
+        };
+        db.insert_session(&meta)
+            .await
+            .expect("insert persisted session");
+        let store = store_with(Vec::new(), db.clone());
+
+        let summary = store
+            .update_session_metadata(
+                "meta003",
+                Some("   ".to_string()),
+                Some(vec!["".to_string(), "   ".to_string()]),
+            )
+            .await
+            .expect("clear persisted session metadata");
+
+        assert_eq!(summary.title, None);
+        assert!(summary.tags.is_empty());
+        let saved = db
+            .get_session("meta003")
+            .await
+            .expect("load saved session")
+            .expect("session should exist");
+        assert_eq!(saved.title, None);
+        assert!(saved.tags.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_session_metadata_ignores_omitted_fields() {
+        let db = make_test_db().await;
+        let meta = SessionMeta {
+            id: "meta004".to_string(),
+            title: Some("keep".to_string()),
+            tags: vec!["keep".to_string()],
+            command: "sh".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: None,
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code: Some(0),
+        };
+        db.insert_session(&meta)
+            .await
+            .expect("insert persisted session");
+        let store = store_with(Vec::new(), db.clone());
+
+        let summary = store
+            .update_session_metadata("meta004", None, None)
+            .await
+            .expect("ignore omitted metadata");
+
+        assert_eq!(summary.title.as_deref(), Some("keep"));
+        assert_eq!(summary.tags, vec!["keep".to_string()]);
+        let saved = db
+            .get_session("meta004")
+            .await
+            .expect("load saved session")
+            .expect("session should exist");
+        assert_eq!(saved.title.as_deref(), Some("keep"));
+        assert_eq!(saved.tags, vec!["keep".to_string()]);
     }
 
     #[tokio::test]

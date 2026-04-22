@@ -234,12 +234,12 @@ pub struct StartArgs {
 pub struct UpdateArgs {
     /// Session ID to update.
     pub id: String,
-    /// Override the session title. Pass an empty string to clear it.
+    /// Override the session title. Pass an empty string to clear it; omit to leave unchanged.
     #[arg(long, short = 't')]
     pub title: Option<String>,
-    /// Override the session tags. Repeat to add multiple tags; Pass an empty string to clear all tags.
+    /// Override the session tags. Repeat to add multiple tags; pass an empty string to clear all tags; omit to leave unchanged.
     #[arg(long = "tag")]
-    pub tags: Vec<String>,
+    pub tags: Option<Vec<String>>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
@@ -597,8 +597,29 @@ mod tests {
         };
         assert_eq!(args.id, "session-1");
         assert_eq!(args.title.as_deref(), Some("Deploy ready"));
-        assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+        assert_eq!(
+            args.tags,
+            Some(vec!["prod".to_string(), "release".to_string()])
+        );
         assert_eq!(args.node.as_deref(), Some("worker-a"));
+    }
+
+    #[test]
+    fn update_distinguishes_omitted_and_empty_overrides() {
+        let cli = Cli::try_parse_from(["oly", "update", "session-1", "--title", ""]).unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.id, "session-1");
+        assert_eq!(args.title.as_deref(), Some(""));
+        assert_eq!(args.tags, None);
+
+        let cli = Cli::try_parse_from(["oly", "update", "session-1", "--tag", ""]).unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.title, None);
+        assert_eq!(args.tags, Some(vec!["".to_string()]));
     }
 
     #[test]

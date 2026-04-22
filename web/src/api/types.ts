@@ -88,8 +88,8 @@ export interface CreateSessionSpec {
 }
 
 export interface UpdateSessionMetadataSpec {
-  title?: string | null
-  tags: string[]
+  title?: string
+  tags?: string[]
 }
 
 // ---------------------------------------------------------------------------

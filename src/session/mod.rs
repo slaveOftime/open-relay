@@ -157,7 +157,11 @@ pub fn validate_session_metadata(
     title: Option<String>,
     tags: Vec<String>,
 ) -> Result<(Option<String>, Vec<String>)> {
-    let title = normalize_session_title(title);
+    let title = validate_normalized_session_title(normalize_session_title(title))?;
+    Ok((title, normalize_session_tags(tags)))
+}
+
+fn validate_normalized_session_title(title: Option<String>) -> Result<Option<String>> {
     if let Some(title) = title.as_ref()
         && title.chars().count() > MAX_SESSION_TITLE_LEN
     {
@@ -166,5 +170,14 @@ pub fn validate_session_metadata(
         )));
     }
 
-    Ok((title, normalize_session_tags(tags)))
+    Ok(title)
+}
+
+pub fn validate_session_metadata_update(
+    title: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<(Option<String>, Option<Vec<String>>)> {
+    let title = validate_normalized_session_title(normalize_session_title(title))?;
+    let tags = tags.map(normalize_session_tags);
+    Ok((title, tags))
 }

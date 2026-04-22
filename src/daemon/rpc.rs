@@ -361,7 +361,7 @@ async fn handle_notify_set(
 async fn handle_session_metadata_set(
     id: String,
     title: Option<String>,
-    tags: Vec<String>,
+    tags: Option<Vec<String>>,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     match session_store

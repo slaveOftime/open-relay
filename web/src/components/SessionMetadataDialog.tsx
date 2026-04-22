@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
 import { updateSessionMetadata } from '@/api/client'
 import type { SessionSummary } from '@/api/types'
-import { formatSessionTagInput, parseSessionTagInput } from '@/lib/sessionMetadata'
+import {
+  buildSessionMetadataUpdateSpec,
+  formatSessionTagInput,
+} from '@/lib/sessionMetadata'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -52,17 +55,18 @@ export default function SessionMetadataDialog({
 
   async function handleSubmit() {
     if (!session) return
+    const spec = buildSessionMetadataUpdateSpec(
+      { title: session.title, tags: session.tags },
+      { title, tags }
+    )
+    if (Object.keys(spec).length === 0) {
+      handleClose()
+      return
+    }
     setLoading(true)
     setError(null)
     try {
-      const updated = await updateSessionMetadata(
-        session.id,
-        {
-          title,
-          tags: parseSessionTagInput(tags),
-        },
-        node
-      )
+      const updated = await updateSessionMetadata(session.id, spec, node)
       onSaved(updated)
       handleClose()
     } catch (err) {
@@ -105,6 +109,9 @@ export default function SessionMetadataDialog({
                 autoFocus
               />
             </Form.Control>
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              Leave blank to clear the title.
+            </p>
           </Form.Field>
           <Form.Field name="tags" className="flex flex-col gap-1.5">
             <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Tags</Form.Label>
