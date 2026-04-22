@@ -17,6 +17,7 @@ import type { UploadSessionFileResponse } from '@/api/client'
 // ── Input history ─────────────────────────────────────────────────────────────
 const INPUT_HISTORY_KEY = 'open-relay:input-history'
 const SESSION_INPUT_DRAFT_KEY_PREFIX = 'open-relay:session-input-draft:'
+const SESSION_DRAWER_OPEN_KEY_PREFIX = 'open-relay:session-drawer-open:'
 const ATTACH_BUSY_INTERVAL_MS = 2000
 
 interface InputHistoryEntry {
@@ -78,6 +79,35 @@ function saveSessionInputDraft(sessionId: string, text: string): void {
   }
 }
 
+function getSessionDrawerOpenKey(sessionId: string): string | null {
+  const trimmed = sessionId.trim()
+  return trimmed ? `${SESSION_DRAWER_OPEN_KEY_PREFIX}${trimmed}` : null
+}
+
+function loadSessionDrawerOpen(sessionId: string): boolean {
+  const storageKey = getSessionDrawerOpenKey(sessionId)
+  if (!storageKey) return false
+  try {
+    return localStorage.getItem(storageKey) === '1'
+  } catch {
+    return false
+  }
+}
+
+function saveSessionDrawerOpen(sessionId: string, isOpen: boolean): void {
+  const storageKey = getSessionDrawerOpenKey(sessionId)
+  if (!storageKey) return
+  try {
+    if (!isOpen) {
+      localStorage.removeItem(storageKey)
+      return
+    }
+    localStorage.setItem(storageKey, '1')
+  } catch {
+    /* ignore */
+  }
+}
+
 // ── AttachPanel ───────────────────────────────────────────────────────────────
 interface AttachPanelProps {
   sessionId: string
@@ -120,7 +150,7 @@ export default function AttachPanel({
   showKeyError,
   uploadFile,
 }: AttachPanelProps) {
-  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [drawerOpen, setDrawerOpen] = useState(() => loadSessionDrawerOpen(sessionId))
   const [customInput, setCustomInput] = useState('')
   const [customKeys, setCustomKeys] = useState('')
   const [isUploading, setIsUploading] = useState(false)
@@ -129,10 +159,11 @@ export default function AttachPanel({
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
   const shouldPersistDraftRef = useRef(false)
+  const shouldPersistDrawerOpenRef = useRef(false)
   const busyIntervalRef = useRef<number | null>(null)
   const drawerScrollTimeoutsRef = useRef<number[]>([])
 
-  function findScrollContainer(node: HTMLElement | null): HTMLElement | null {
+  const findScrollContainer = useCallback((node: HTMLElement | null): HTMLElement | null => {
     let current = node?.parentElement ?? null
     while (current) {
       const style = window.getComputedStyle(current)
@@ -149,13 +180,13 @@ export default function AttachPanel({
     return document.scrollingElement instanceof HTMLElement
       ? document.scrollingElement
       : document.documentElement
-  }
+  }, [])
 
-  function scrollDrawerIntoView() {
+  const scrollDrawerIntoView = useCallback(() => {
     const target = findScrollContainer(rootRef.current)
     if (!target) return
     target.scrollTo({ top: target.scrollHeight, behavior: 'auto' })
-  }
+  }, [findScrollContainer])
 
   function resizeCustomInput() {
     const textarea = customInputRef.current
@@ -180,6 +211,19 @@ export default function AttachPanel({
   useEffect(() => {
     resizeCustomInput()
   }, [customInput])
+
+  useEffect(() => {
+    shouldPersistDrawerOpenRef.current = false
+    setDrawerOpen(loadSessionDrawerOpen(sessionId))
+  }, [sessionId])
+
+  useEffect(() => {
+    if (!shouldPersistDrawerOpenRef.current) {
+      shouldPersistDrawerOpenRef.current = true
+      return
+    }
+    saveSessionDrawerOpen(sessionId, drawerOpen)
+  }, [drawerOpen, sessionId])
 
   useEffect(() => {
     shouldPersistDraftRef.current = false
@@ -252,12 +296,21 @@ export default function AttachPanel({
     const nextOpen = !drawerOpen
     setDrawerOpen(nextOpen)
 
+    if (!nextOpen) {
+      for (const timeoutId of drawerScrollTimeoutsRef.current) {
+        window.clearTimeout(timeoutId)
+      }
+      drawerScrollTimeoutsRef.current = []
+    }
+  }
+
+  useEffect(() => {
     for (const timeoutId of drawerScrollTimeoutsRef.current) {
       window.clearTimeout(timeoutId)
     }
     drawerScrollTimeoutsRef.current = []
 
-    if (!nextOpen) return
+    if (!drawerOpen) return
 
     for (const delay of [0, 160, 320]) {
       const timeoutId = window.setTimeout(() => {
@@ -265,7 +318,7 @@ export default function AttachPanel({
       }, delay)
       drawerScrollTimeoutsRef.current.push(timeoutId)
     }
-  }
+  }, [drawerOpen, scrollDrawerIntoView])
 
   function clearPendingSingleClick() {
     if (sendClickTimeoutRef.current !== null) {
