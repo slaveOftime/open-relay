@@ -257,35 +257,46 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     }
 
     let keyboardSyncRaf = 0
-    const syncFocusedTerminalIntoView = () => {
+    let keyboardSyncPasses = 0
+    const maxKeyboardSyncPasses = 8
+    const syncFocusedTerminalIntoView = (): boolean => {
       const textarea = term.textarea
-      if (!textarea || document.activeElement !== textarea) return
+      if (!textarea || document.activeElement !== textarea) return false
 
       const viewport = window.visualViewport
       const viewportBottom = viewport
         ? viewport.offsetTop + viewport.height
         : window.innerHeight
       const rect = container.getBoundingClientRect()
-      const bottomPadding = 20
+      const bottomPadding = 40
       const overlap = rect.bottom + bottomPadding - viewportBottom
-      if (overlap <= 0) return
+      if (overlap <= 0) return false
 
       const scrollContainer = findScrollContainer(container)
-      if (!scrollContainer) return
+      if (!scrollContainer) return false
+
+      const scrollTop = Math.ceil(overlap)
 
       if (scrollContainer === document.documentElement || scrollContainer === document.body) {
-        window.scrollBy({ top: overlap, behavior: 'smooth' })
-        return
+        window.scrollBy({ top: scrollTop, behavior: 'auto' })
+        return true
       }
 
-      scrollContainer.scrollBy({ top: overlap, behavior: 'smooth' })
+      scrollContainer.scrollBy({ top: scrollTop, behavior: 'auto' })
+      return true
     }
 
     const scheduleKeyboardSync = () => {
       if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
       keyboardSyncRaf = requestAnimationFrame(() => {
         keyboardSyncRaf = 0
-        syncFocusedTerminalIntoView()
+        const didScroll = syncFocusedTerminalIntoView()
+        if (didScroll && keyboardSyncPasses < maxKeyboardSyncPasses) {
+          keyboardSyncPasses += 1
+          scheduleKeyboardSync()
+          return
+        }
+        keyboardSyncPasses = 0
       })
     }
 
@@ -295,10 +306,12 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     const container = containerRef.current
     const handleTouchEnd = () => {
       if (!onDataRef.current) return
+      keyboardSyncPasses = 0
       term.focus()
       scheduleKeyboardSync()
     }
     const handleTerminalFocus = () => {
+      keyboardSyncPasses = 0
       scheduleKeyboardSync()
     }
     const handlePaste = (event: ClipboardEvent) => {
