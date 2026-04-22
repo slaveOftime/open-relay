@@ -2,9 +2,6 @@
   <!-- Deep OLED Black Background -->
   <rect width="64" height="64" rx="14" fill="#050505" />
   
-  <!-- Subtle inner framing line for a sharp app container look -->
-  <rect x="1" y="1" width="62" height="62" rx="13" fill="none" stroke="#262626" stroke-width="2" />
-
   <!-- Crisp CLI Prompt (>_) in Emerald Green -->
   <path d="M 8 12 L 12 16 L 8 20 M 15 20 L 19 20" fill="none" stroke="#10b981" stroke-width="2" stroke-linecap="square" stroke-linejoin="miter" />
 
