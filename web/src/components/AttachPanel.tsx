@@ -596,6 +596,14 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            onClick={() => handleSendKeySpec('esc')}
+            aria-label="Esc"
+          >
+            Esc
+          </Button>
+          <Button
+            variant={'ghost'}
+            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
             onClick={() => handleSendKeySpec('tab')}
             aria-label="Tab"
           >
@@ -612,14 +620,14 @@ export default function AttachPanel({
         </div>
         <Button
           variant="ghost"
-          className="shrink-0"
+          className="shrink-0 px-2.5"
           onClick={toggleDrawer}
           aria-label="Open input panel"
         >
           {drawerOpen ? (
-            <DoubleArrowDownIcon className="w-6 h-6" />
+            <DoubleArrowDownIcon className="w-5 h-5" />
           ) : (
-            <DoubleArrowUpIcon className="w-6 h-6" />
+            <DoubleArrowUpIcon className="w-5 h-5" />
           )}
         </Button>
       </div>
