@@ -15,7 +15,7 @@ export function formatAge(createdAt: string): string {
 export function formatTimestamp(iso: string): string {
   const d = new Date(iso)
   return d.toLocaleString([], {
-    year: 'numeric',
+    year: '2-digit',
     month: 'short',
     day: '2-digit',
     hour: '2-digit',

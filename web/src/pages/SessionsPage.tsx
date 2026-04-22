@@ -664,11 +664,11 @@ function SessionCard({
   return (
     <>
       <Card
-        className={`relative rounded-xl shadow-none mx-3 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
+        className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
       >
-        <CardContent className="px-3 pt-3 pb-3 flex flex-col gap-1">
+        <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1">
           {/* Row 1: id, status, pid, created at */}
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap">
             <button
               className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold hover:text-[hsl(var(--primary))] transition-colors"
               onClick={() => onEditSession(session)}
@@ -678,6 +678,9 @@ function SessionCard({
             <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
               {formatTimestamp(session.created_at)}
             </span>
+            <div className="text-[hsl(var(--muted-foreground))] text-xs font-mono tabular-nums">
+              {formatByteSize(session.last_total_bytes)}
+            </div>
             <div className="flex-1" />
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
           </div>
@@ -705,9 +708,6 @@ function SessionCard({
           )}
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="text-[hsl(var(--muted-foreground))] font-semibold">
-              {formatByteSize(session.last_total_bytes)}
-            </div>
             {session.tags.length > 0 && (
               <div className="min-w-0 flex-1">
                 <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
