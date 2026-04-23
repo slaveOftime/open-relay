@@ -1211,6 +1211,17 @@ export default function SessionsPage() {
     statusFilter,
   ])
 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      void reloadSessions({ background: true })
+    }, 30_000)
+
+    return () => {
+      clearInterval(interval)
+    }
+  }, [reloadSessions])
+
+
   const pagedSessions = sessions
 
   const total = remoteTotal
