@@ -28,7 +28,7 @@ describe('parseArgString', () => {
     ])
   })
 })
-})
+
 describe('sessionDisplayName', () => {
   it('preserves backslashes when quoting a Windows hook command for display', () => {
     expect(
