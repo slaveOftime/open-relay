@@ -2,6 +2,7 @@ import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import LoginDialog from './components/LoginDialog'
 import { getAuthStatus, getToken } from './api/client'
+import { startSessionEvents, stopSessionEvents } from '@/lib/sessionEvents'
 import {
   consumePendingNotificationTarget,
   notificationClickMessageTarget,
@@ -96,6 +97,20 @@ function NotificationClickRouting() {
   return null
 }
 
+function SessionEventsBootstrap({ enabled }: { enabled: boolean }) {
+  useEffect(() => {
+    if (!enabled) {
+      stopSessionEvents()
+      return
+    }
+
+    startSessionEvents()
+    return () => stopSessionEvents()
+  }, [enabled])
+
+  return null
+}
+
 export default function App() {
   // null = still loading, false = no auth required, true = auth required
   const [authRequired, setAuthRequired] = useState<boolean | null>(null)
@@ -140,6 +155,7 @@ export default function App() {
     <BrowserRouter>
       <LastRoutePersistence />
       <NotificationClickRouting />
+      <SessionEventsBootstrap enabled={authRequired !== null && (!authRequired || isAuthed)} />
       <LoginDialog open={showLogin} onSuccess={handleLoginSuccess} />
 
       {/* Render the app; when auth is required but not yet granted, the login

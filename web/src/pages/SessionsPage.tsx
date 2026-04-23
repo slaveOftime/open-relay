@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import type { ListParams } from '@/api/client'
 import {
   SessionSortField,
@@ -7,7 +7,6 @@ import {
   isSessionStatusFilter,
   isSessionSortField,
   isSortOrder,
-  type SessionNotificationData,
   type SessionSummary,
   type SessionStatusFilter,
   type NodeSummary,
@@ -17,7 +16,6 @@ import {
   stopSession,
   killSession,
   setSessionNotifications,
-  subscribeEvents,
   fetchNodes,
 } from '@/api/client'
 import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
@@ -33,8 +31,8 @@ import {
 import Logo from '@/components/Logo'
 import CommandLogo from '@/components/CommandLogo'
 import SseStatusDot from '@/components/SseStatusDot'
+import SessionActivitySparkline from '@/components/SessionActivitySparkline'
 import StatusBadge from '@/components/StatusBadge'
-import SparklineSvg, { SparklineStore } from '@/components/SparklineSvg'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -80,11 +78,15 @@ import {
   syncPushSubscription,
   type PushSetupState,
 } from '@/lib/push'
+import {
+  ingestSessionSummaries,
+  subscribeSessionEvents,
+  useSseConnectionState,
+} from '@/lib/sessionEvents'
 const PREFS_KEY = 'open-relay.webv2.sessions.preferences.v1'
 const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
 const PAGE_SIZE = 15
 
-const sparklines = new SparklineStore()
 const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
 
 type GroupBy = 'none' | 'cwd' | 'command' | 'tag'
@@ -235,27 +237,6 @@ function fetchSessionsOnce(params: ListParams) {
   })
   sessionPageRequests.set(key, request)
   return request
-}
-
-function buildSeriesMap(items: SessionSummary[]) {
-  items.forEach((session) => {
-    sparklines.recordTotal(session.id, session.last_total_bytes)
-  })
-  return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
-}
-
-function syncSeriesMap(items: SessionSummary[]) {
-  return new Map(items.map((session) => [session.id, sparklines.getSeries(session.id)]))
-}
-
-function updateSparklineForSession(session: SessionSummary) {
-  sparklines.recordTotal(session.id, session.last_total_bytes)
-}
-
-function updateSparklineForNotification(notification: SessionNotificationData) {
-  notification.session_ids.forEach((sessionId) => {
-    sparklines.recordTotal(sessionId, notification.last_total_bytes)
-  })
 }
 
 function normalizeSessionTags(tags: string[]): string[] {
@@ -410,7 +391,6 @@ function GroupHeaderLabel({
 
 function SessionRow({
   session,
-  series,
   animateIn,
   onStop,
   onKill,
@@ -421,7 +401,6 @@ function SessionRow({
   node,
 }: {
   session: SessionSummary
-  series: number[]
   animateIn?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
@@ -525,7 +504,7 @@ function SessionRow({
 
         {/* Activity */}
         <TableCell className="px-3 py-2.5">
-          <SparklineSvg series={series} enableAnimation={isRunning} />
+          <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} />
         </TableCell>
 
         {/* PID */}
@@ -540,9 +519,9 @@ function SessionRow({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button asChild variant="link" size="icon">
-                    <a href={attachHref} aria-label="Attach">
+                    <Link to={attachHref} aria-label="Attach">
                       <Link2Icon className="h-4 w-4" />
-                    </a>
+                    </Link>
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>Attach</TooltipContent>
@@ -587,9 +566,9 @@ function SessionRow({
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button asChild variant="ghost" size="icon">
-                  <a href={logsHref} aria-label="Logs">
+                  <Link to={logsHref} aria-label="Logs">
                     <FileTextIcon className="h-4 w-4" />
-                  </a>
+                  </Link>
                 </Button>
               </TooltipTrigger>
               <TooltipContent>Logs</TooltipContent>
@@ -624,7 +603,6 @@ function SessionRow({
 
 function SessionCard({
   session,
-  series,
   animateIn,
   onStop,
   onKill,
@@ -635,7 +613,6 @@ function SessionCard({
   node,
 }: {
   session: SessionSummary
-  series: number[]
   animateIn?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
@@ -718,11 +695,11 @@ function SessionCard({
           {/* Row 4: activity sparkline */}
           {session.status === 'running' && (
             <div className="pt-1 w-full opacity-90">
-              <SparklineSvg
-                series={series}
+              <SessionActivitySparkline
+                sessionId={session.id}
+                isRunning={isRunning}
                 fullWidth
                 className="w-full"
-                enableAnimation={isRunning}
               />
             </div>
           )}
@@ -742,10 +719,10 @@ function SessionCard({
               className="border-[hsl(var(--primary))] text-[hsl(var(--primary))]"
               size="sm"
             >
-              <a href={attachHref}>
+                <Link to={attachHref}>
                 <Link2Icon className="h-4 w-4" />
                 Attach
-              </a>
+                </Link>
             </Button>
           )}
           {isRunning && (
@@ -776,9 +753,9 @@ function SessionCard({
           )}
           <div className="flex-1"></div>
           <Button asChild variant="ghost" size="icon">
-            <a href={logsHref} aria-label="Logs">
+            <Link to={logsHref} aria-label="Logs">
               <FileTextIcon className="h-4 w-4" />
-            </a>
+            </Link>
           </Button>
           <Tooltip>
             <TooltipTrigger asChild>
@@ -938,10 +915,6 @@ export default function SessionsPage() {
   const [showNewSession, setShowNewSession] = useState(false)
   const [rerunSession, setRerunSession] = useState<SessionSummary | null>(null)
   const [editingSession, setEditingSession] = useState<SessionSummary | null>(null)
-  const [sseStatus, setSseStatus] = useState<'live' | 'reconnecting' | 'offline'>(
-    typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting'
-  )
-  const [seriesMap, setSeriesMap] = useState<Map<string, number[]>>(new Map())
   const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set())
   const [notificationRequestIds, setNotificationRequestIds] = useState<Set<string>>(new Set())
   const [showFilters, setShowFilters] = useState(false)
@@ -955,6 +928,7 @@ export default function SessionsPage() {
   const loadedSessionIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
   const pushStateRef = useRef<PushSetupState>('idle')
+  const sseStatus = useSseConnectionState()
 
   useEffect(() => {
     pushStateRef.current = pushState
@@ -965,12 +939,8 @@ export default function SessionsPage() {
   }, [sessions])
 
   const applySessionItems = useCallback((items: SessionSummary[]) => {
+    ingestSessionSummaries(items)
     setSessions(items)
-    setSeriesMap(buildSeriesMap(items))
-  }, [])
-
-  const refreshRenderedSparklines = useCallback(() => {
-    setSeriesMap((prev) => new Map(Array.from(prev.keys(), (id) => [id, sparklines.getSeries(id)])))
   }, [])
 
   const applyLoadedSessionSnapshot = useCallback(
@@ -1161,29 +1131,6 @@ export default function SessionsPage() {
     }
   }, [])
 
-  // Periodically advance sparkline buckets so activity decays visually
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (!isMounted.current) return
-      setSessions((prev) => {
-        setSeriesMap(syncSeriesMap(prev))
-        return prev
-      })
-    }, 2_000)
-    return () => clearInterval(id)
-  }, [])
-
-  useEffect(() => {
-    const handleOnline = () => setSseStatus('reconnecting')
-    const handleOffline = () => setSseStatus('offline')
-    window.addEventListener('online', handleOnline)
-    window.addEventListener('offline', handleOffline)
-    return () => {
-      window.removeEventListener('online', handleOnline)
-      window.removeEventListener('offline', handleOffline)
-    }
-  }, [])
-
   useEffect(() => {
     saveSessionPrefs({ search, statusFilter, groupBy, node: selectedNode, sortField, sortOrder })
   }, [search, selectedNode, statusFilter, groupBy, sortField, sortOrder])
@@ -1211,7 +1158,7 @@ export default function SessionsPage() {
   }, [])
 
   useEffect(() => {
-    const cleanup = subscribeEvents((ev) => {
+    const cleanup = subscribeSessionEvents((ev) => {
       if (ev.event === 'snapshot') {
         if (selectedNode) return
         applyLoadedSessionSnapshot(ev.data)
@@ -1219,14 +1166,11 @@ export default function SessionsPage() {
       }
       if (ev.event === 'session_created') {
         if (!matchesSelectedNode(selectedNode, ev.data.node)) return
-        updateSparklineForSession(ev.data)
         void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_updated') {
         if (!matchesSelectedNode(selectedNode, ev.data.node)) return
-        updateSparklineForSession(ev.data)
-        refreshRenderedSparklines()
         if (!matchesStatusFilter(statusFilter, ev.data.status)) {
           removeLoadedSession(ev.data.id)
           void reloadSessions({ background: true })
@@ -1242,20 +1186,15 @@ export default function SessionsPage() {
       if (ev.event === 'session_deleted') {
         if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         removeLoadedSession(ev.data.id)
-        sparklines.remove(ev.data.id)
         void reloadSessions({ background: true })
         return
       }
       if (ev.event === 'session_notification') {
-        if (matchesSelectedNode(selectedNode, ev.data.node)) {
-          updateSparklineForNotification(ev.data)
-          refreshRenderedSparklines()
-        }
         if (pushStateRef.current === 'subscribed') return
         void showSessionNotification(ev.data)
         return
       }
-    }, setSseStatus)
+    })
     return () => {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
@@ -1266,7 +1205,6 @@ export default function SessionsPage() {
     removeLoadedSession,
     replaceLoadedSession,
     reloadSessions,
-    refreshRenderedSparklines,
     scheduleDelayedReload,
     selectedNode,
     statusFilter,
@@ -1753,7 +1691,6 @@ export default function SessionsPage() {
                     <SessionCard
                       key={s.id}
                       session={s}
-                      series={seriesMap.get(s.id) ?? []}
                       animateIn={enteringIds.has(s.id)}
                       onStop={handleStop}
                       onKill={handleKill}
@@ -1864,7 +1801,6 @@ export default function SessionsPage() {
                       <SessionRow
                         key={`${s.id}:${s.status}:${s.input_needed ? 'input' : 'normal'}`}
                         session={s}
-                        series={seriesMap.get(s.id) ?? []}
                         animateIn={enteringIds.has(s.id)}
                         onStop={handleStop}
                         onKill={handleKill}
