@@ -21,6 +21,7 @@ import {
 } from '@/utils/logReplay'
 import StatusBadge from '@/components/StatusBadge'
 import CommandLogo from '@/components/CommandLogo'
+import SessionActivitySparkline from '@/components/SessionActivitySparkline'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
 import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
@@ -62,6 +63,7 @@ import {
 } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
 import AttachPanel from '@/components/AttachPanel'
+import { ingestSessionSummary, useLiveSessionSummary } from '@/lib/sessionEvents'
 
 function isSessionRunning(session: SessionSummary | null): boolean {
   return session
@@ -90,6 +92,19 @@ function normalizeSnapshotOutputForXterm(output: Uint8Array): Uint8Array {
     writeIndex += 1
   }
   return normalized
+}
+
+function didSessionVisibleOutputAdvance(
+  previous: SessionSummary | null,
+  next: SessionSummary
+): boolean {
+  if (!previous) {
+    return Boolean(next.last_output_epoch) || next.last_total_bytes > 0
+  }
+  if (next.last_output_epoch && next.last_output_epoch !== previous.last_output_epoch) {
+    return true
+  }
+  return next.last_total_bytes > previous.last_total_bytes
 }
 
 const DEFAULT_LOG_TAIL = 200
@@ -176,6 +191,7 @@ function SessionDetailPageContent() {
   const logsView = searchParams.get('view') === 'replay' ? 'replay' : 'tail'
   const isTailMode = logsView === 'tail'
   const node = searchParams.get('node')
+  const liveSession = useLiveSessionSummary(id, node)
 
   const [session, setSession] = useState<SessionSummary | null>(null)
   const [replayIdx, setReplayIdx] = useState(0)
@@ -240,6 +256,7 @@ function SessionDetailPageContent() {
   const replayCommittedIdxRef = useRef(0)
   const attachIdleTimerRef = useRef<number | null>(null)
   const attachIdleCountdownArmedRef = useRef(false)
+  const previousLiveSessionRef = useRef<SessionSummary | null>(null)
 
   const clearAttachIdleTimer = useCallback(() => {
     if (attachIdleTimerRef.current !== null) {
@@ -283,12 +300,11 @@ function SessionDetailPageContent() {
       ) {
         return
       }
-      setSession((session) => ({ ...session, input_needed: true }) as SessionSummary)
       setIsAttachViewportIdle(true)
     }, ATTACH_IDLE_BORDER_DELAY_MS)
   }, [clearAttachIdleTimer])
 
-  const noteAttachInboundData = useCallback(() => {
+  const noteVisibleSessionActivity = useCallback(() => {
     if (!isMounted.current) return
 
     attachIdleCountdownArmedRef.current = true
@@ -486,6 +502,10 @@ function SessionDetailPageContent() {
   }, [mode])
 
   useEffect(() => {
+    previousLiveSessionRef.current = null
+  }, [id, node])
+
+  useEffect(() => {
     if (mode !== 'attach' || !wsConnected) {
       disarmAttachIdleAnimation()
     }
@@ -518,6 +538,31 @@ function SessionDetailPageContent() {
       window.removeEventListener('offline', handleOffline)
     }
   }, [])
+
+  useEffect(() => {
+    if (!liveSession) return
+
+    setSession((current) => (current === liveSession ? current : liveSession))
+
+    if (modeRef.current === 'attach') {
+      const previous = previousLiveSessionRef.current
+      const becameResponsive = Boolean(previous?.input_needed) && !liveSession.input_needed
+
+      if (!isSessionRunning(liveSession)) {
+        disarmAttachIdleAnimation()
+      } else if (liveSession.input_needed) {
+        attachIdleCountdownArmedRef.current = false
+        clearAttachIdleTimer()
+        if (isMounted.current) {
+          setIsAttachViewportIdle(true)
+        }
+      } else if (becameResponsive || didSessionVisibleOutputAdvance(previous, liveSession)) {
+        noteVisibleSessionActivity()
+      }
+    }
+
+    previousLiveSessionRef.current = liveSession
+  }, [clearAttachIdleTimer, disarmAttachIdleAnimation, liveSession, noteVisibleSessionActivity])
 
   const fetchMoreLogs = useCallback(async () => {
     if (!id || isFetchingMoreRef.current) return false
@@ -625,9 +670,10 @@ function SessionDetailPageContent() {
       if (cancelled) return
       fetchSession(id, node ?? undefined)
         .then((s) => {
+          ingestSessionSummary(s)
           if (!cancelled && isMounted.current) setSession(s)
         })
-        .catch(() => {})
+        .catch(() => { })
     })
     return () => {
       cancelled = true
@@ -746,17 +792,6 @@ function SessionDetailPageContent() {
           },
           onData: (data) => {
             lastWsFrameAtRef.current = Date.now()
-            setSession(
-              (session) =>
-                ({
-                  ...session,
-                  lastActivity: new Date(),
-                  status: 'running',
-                  last_total_bytes: (session?.last_total_bytes ?? 0) + data.length,
-                  input_needed: false,
-                }) as SessionSummary
-            )
-            noteAttachInboundData()
             enqueueTerminalOutput([data])
           },
           onModeChanged: () => {
@@ -783,13 +818,13 @@ function SessionDetailPageContent() {
             setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
             fetchSession(id!, node ?? undefined)
               .then((s) => {
+                ingestSessionSummary(s)
                 if (isMounted.current) setSession(s)
               })
-              .catch(() => {})
+              .catch(() => { })
           },
           onError: (msg) => {
             lastWsFrameAtRef.current = Date.now()
-            noteAttachInboundData()
             pushConnectTrace(`server error frame: ${msg}`)
             if (!isMounted.current) return
             termRef.current?.writeln(`\r\n\x1b[31mError: ${msg}\x1b[0m`)
@@ -845,7 +880,6 @@ function SessionDetailPageContent() {
     setSearchParams,
     wsReconnectKey,
     enqueueTerminalOutput,
-    noteAttachInboundData,
     disarmAttachIdleAnimation,
   ])
 
@@ -988,11 +1022,12 @@ function SessionDetailPageContent() {
             }
             fetchSession(id!, node ?? undefined)
               .then((s) => {
+                ingestSessionSummary(s)
                 if (!cancelled && isMounted.current) setSession(s)
               })
-              .catch(() => {})
+              .catch(() => { })
           })
-          .catch(() => {})
+          .catch(() => { })
       })
       return () => {
         cancelled = true
@@ -1019,11 +1054,12 @@ function SessionDetailPageContent() {
           commitReplayIdx(res.chunks.length, { force: true })
           fetchSession(id!, node ?? undefined)
             .then((s) => {
+              ingestSessionSummary(s)
               if (!cancelled && isMounted.current) setSession(s)
             })
-            .catch(() => {})
+            .catch(() => { })
         })
-        .catch(() => {})
+        .catch(() => { })
     })
 
     return () => {
@@ -1246,21 +1282,23 @@ function SessionDetailPageContent() {
 
   async function handleStop() {
     if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => {})
+    await stopSession(id, undefined, node ?? undefined).catch(() => { })
     fetchSession(id, node ?? undefined)
       .then((s) => {
+        ingestSessionSummary(s)
         if (isMounted.current) setSession(s)
       })
-      .catch(() => {})
+      .catch(() => { })
   }
   async function handleKill() {
     if (!id) return
-    await killSession(id, node ?? undefined).catch(() => {})
+    await killSession(id, node ?? undefined).catch(() => { })
     fetchSession(id, node ?? undefined)
       .then((s) => {
+        ingestSessionSummary(s)
         if (isMounted.current) setSession(s)
       })
-      .catch(() => {})
+      .catch(() => { })
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -1314,7 +1352,6 @@ function SessionDetailPageContent() {
         ))}
     </div>
   )
-
   return (
     <TooltipProvider>
       <div className="flex flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] h-full">
@@ -1525,11 +1562,10 @@ function SessionDetailPageContent() {
         <div
           id="main-container"
           className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
-          style={{ scrollbarGutter: 'stable' }}
         >
           {/* Terminal area */}
           <div
-            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
+            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-71px)] sm:h-full'}`}
           >
             <div
               aria-hidden="true"
@@ -1669,7 +1705,18 @@ function SessionDetailPageContent() {
                   uploadFile={handleUploadFile}
                 />
               </div>
-              <div className="sm:hidden flex items-center justify-center h-8">{attachedState}</div>
+              <div className="sm:hidden flex items-center justify-center h-8 relative">
+                {session &&
+                  <SessionActivitySparkline
+                    sessionId={session.id}
+                    isRunning={isSessionRunning(session)}
+                    fullWidth
+                    height={24}
+                    className="absolute left-0 bottom-0 right-0 opacity-50"
+                  />
+                }
+                {attachedState}
+              </div>
             </>
           )}
         </div>
@@ -1708,6 +1755,7 @@ function SessionDetailPageContent() {
           node={node ?? undefined}
           onClose={() => setShowMetadataDialog(false)}
           onSaved={(updated) => {
+            ingestSessionSummary(updated)
             setSession(updated)
           }}
         />

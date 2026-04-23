@@ -41,11 +41,39 @@ export default defineConfig({
         // window.fetch() cannot complete a protocol upgrade.
         //
         // The daemon already serves index.html as the SPA fallback, so keeping
-        // HTML out of the precache avoids stale shell responses for / and lets
-        // dev HMR use the normal network path without a service worker in front.
-        // Leaving no matching route for /api/ means Workbox never calls
-        // respondWith(), so the browser handles those requests natively.
-        runtimeCaching: [],
+        // HTML out of the precache and disabling Workbox's navigation fallback
+        // avoids stale shell responses for / and keeps the entry document on the
+        // normal network path. Leaving no matching route for /api/ means Workbox
+        // never calls respondWith(), so the browser handles those requests
+        // natively.
+        runtimeCaching: [
+          {
+            urlPattern: ({ request, sameOrigin, url }) => {
+              if (!sameOrigin) return false
+              if (url.pathname.startsWith('/api/')) return false
+              return ['style', 'script', 'worker'].includes(request.destination)
+            },
+            handler: 'StaleWhileRevalidate',
+            options: {
+              cacheName: 'static-assets',
+            },
+          },
+          {
+            urlPattern: ({ request, sameOrigin, url }) => {
+              if (!sameOrigin) return false
+              if (url.pathname.startsWith('/api/')) return false
+              return ['font', 'image'].includes(request.destination)
+            },
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'media-assets',
+              expiration: {
+                maxEntries: 128,
+                maxAgeSeconds: 60 * 60 * 24 * 30,
+              },
+            },
+          },
+        ],
       },
     }),
   ],

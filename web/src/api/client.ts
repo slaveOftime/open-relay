@@ -306,7 +306,7 @@ export function deletePushSubscription(
 // ---------------------------------------------------------------------------
 
 type EventCallback = (ev: SessionEvent) => void
-type SseConnectionState = 'live' | 'reconnecting' | 'offline'
+export type SseConnectionState = 'live' | 'reconnecting' | 'offline'
 
 export function subscribeEvents(
   cb: EventCallback,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
@@ -23,26 +23,32 @@ type SparklinePoint = {
 
 type SparklinePalette = {
   stroke: string
-  strokeSoft: string
-  fill: string
+  strokeHighlight: string
+  glow: string
+  fillTop: string
+  fillBottom: string
   dot: string
   baseline: string
 }
 
 const RUNNING_PALETTE: SparklinePalette = {
-  stroke: '#16A34A',
-  strokeSoft: '#22C55E55',
-  fill: '#22C55E14',
-  dot: '#4ADE80',
-  baseline: '#22C55E33',
+  stroke: '#34C85B',
+  strokeHighlight: '#8EF5AB',
+  glow: '#2BC851A6',
+  fillTop: '#2EEA6B30',
+  fillBottom: '#0A130B00',
+  dot: '#B5F8C8',
+  baseline: '#23442A',
 }
 
 const IDLE_PALETTE: SparklinePalette = {
-  stroke: '#94A3B8',
-  strokeSoft: '#CBD5E144',
-  fill: '#CBD5E112',
-  dot: '#CBD5E1',
-  baseline: '#CBD5E133',
+  stroke: '#7D8B97',
+  strokeHighlight: '#C5D0D8',
+  glow: '#32404B66',
+  fillTop: '#7D8B9724',
+  fillBottom: '#11181D00',
+  dot: '#D6DEE4',
+  baseline: '#24303A',
 }
 
 export default function SparklineSvg({
@@ -55,6 +61,7 @@ export default function SparklineSvg({
 }: Props) {
   const hostRef = useRef<HTMLSpanElement | null>(null)
   const [measuredWidth, setMeasuredWidth] = useState<number>(width)
+  const gradientSeed = useId().replace(/[^a-zA-Z0-9_-]/g, '')
 
   useEffect(() => {
     if (!fullWidth) return
@@ -88,6 +95,8 @@ export default function SparklineSvg({
     () => buildSparklineModel(series, renderWidth, height, enableAnimation),
     [enableAnimation, height, renderWidth, series]
   )
+  const areaGradientId = `${gradientSeed}-area`
+  const glowGradientId = `${gradientSeed}-glow`
 
   return (
     <Tooltip delayDuration={150}>
@@ -103,6 +112,16 @@ export default function SparklineSvg({
             aria-hidden="true"
           >
             <title>{tooltipLabel}</title>
+            <defs>
+              <linearGradient id={areaGradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={model.palette.fillTop} />
+                <stop offset="100%" stopColor={model.palette.fillBottom} />
+              </linearGradient>
+              <linearGradient id={glowGradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={model.palette.strokeHighlight} stopOpacity="0.8" />
+                <stop offset="100%" stopColor={model.palette.glow} stopOpacity="0.9" />
+              </linearGradient>
+            </defs>
             <line
               x1="0"
               y1={model.baselineY}
@@ -111,36 +130,55 @@ export default function SparklineSvg({
               stroke={model.palette.baseline}
               strokeWidth="1"
             />
-            <polygon points={model.areaPoints} fill={model.palette.fill} />
-            <polyline
-              points={model.linePoints}
+            <path d={model.areaPath} fill={`url(#${areaGradientId})`} />
+            <path
+              d={model.linePath}
               fill="none"
-              stroke={model.palette.strokeSoft}
-              strokeWidth="4"
+              stroke={`url(#${glowGradientId})`}
+              strokeWidth="5.5"
               strokeLinecap="round"
               strokeLinejoin="round"
+              opacity="0.12"
             />
-            <polyline
-              points={model.linePoints}
+            <path
+              d={model.linePath}
+              fill="none"
+              stroke={`url(#${glowGradientId})`}
+              strokeWidth="3.4"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              opacity="0.24"
+            />
+            <path
+              d={model.linePath}
               fill="none"
               stroke={model.palette.stroke}
-              strokeWidth="1.8"
+              strokeWidth="2"
               strokeLinecap="round"
               strokeLinejoin="round"
             />
-            <circle cx={model.lastPoint.x} cy={model.lastPoint.y} r="1.7" fill={model.palette.dot}>
+            <path
+              d={model.linePath}
+              fill="none"
+              stroke={model.palette.strokeHighlight}
+              strokeWidth="0.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              opacity="0.62"
+            />
+            <circle cx={model.lastPoint.x} cy={model.lastPoint.y} r="1.7" fill={model.palette.dot} opacity="0.72">
               {enableAnimation ? (
                 <>
                   <animate
                     attributeName="r"
-                    values="1.4;2.1;1.4"
-                    dur="1.5s"
+                    values="1.3;2;1.3"
+                    dur="1.8s"
                     repeatCount="indefinite"
                   />
                   <animate
                     attributeName="opacity"
-                    values="0.7;1;0.7"
-                    dur="1.5s"
+                    values="0.65;1;0.65"
+                    dur="1.8s"
                     repeatCount="indefinite"
                   />
                 </>
@@ -175,10 +213,13 @@ export default function SparklineSvg({
 export class SparklineStore {
   private readonly numBuckets = SPARKLINE_NUM_BUCKETS
   private readonly bucketMs = SPARKLINE_BUCKET_MS
+  private readonly listeners = new Set<() => void>()
+  private readonly emptySeries = new Array(this.numBuckets).fill(0)
+  private decayTimer: ReturnType<typeof setInterval> | null = null
 
   private data = new Map<
     string,
-    { counts: number[]; lastBucket: number; lastTotalBytes: number | null }
+    { counts: number[]; snapshot: number[]; lastBucket: number; lastTotalBytes: number | null }
   >()
 
   private nowBucket(): number {
@@ -188,8 +229,10 @@ export class SparklineStore {
   private getOrCreate(id: string) {
     let entry = this.data.get(id)
     if (!entry) {
+      const counts = new Array(this.numBuckets).fill(0)
       entry = {
-        counts: new Array(this.numBuckets).fill(0),
+        counts,
+        snapshot: [...counts],
         lastBucket: this.nowBucket(),
         lastTotalBytes: null,
       }
@@ -198,17 +241,71 @@ export class SparklineStore {
     return entry
   }
 
+  subscribe(listener: () => void): () => void {
+    this.listeners.add(listener)
+    this.ensureDecayTimer()
+    return () => {
+      this.listeners.delete(listener)
+      if (this.listeners.size === 0) {
+        this.stopDecayTimer()
+      }
+    }
+  }
+
+  private emitChange(): void {
+    this.listeners.forEach((listener) => listener())
+  }
+
+  private ensureDecayTimer(): void {
+    if (this.decayTimer !== null || typeof window === 'undefined') {
+      return
+    }
+    this.decayTimer = window.setInterval(() => {
+      let changed = false
+      for (const entry of this.data.values()) {
+        changed = this.advance(entry) || changed
+      }
+      if (changed) {
+        this.emitChange()
+      }
+    }, this.bucketMs)
+  }
+
+  private stopDecayTimer(): void {
+    if (this.decayTimer === null) {
+      return
+    }
+    clearInterval(this.decayTimer)
+    this.decayTimer = null
+  }
+
+  private refreshSnapshot(entry: {
+    counts: number[]
+    snapshot: number[]
+    lastBucket: number
+    lastTotalBytes: number | null
+  }): void {
+    entry.snapshot = [...entry.counts]
+  }
+
   /** Advance the ring buffer to the current bucket, zero-filling gaps. */
-  private advance(entry: { counts: number[]; lastBucket: number; lastTotalBytes: number | null }) {
+  private advance(entry: {
+    counts: number[]
+    snapshot: number[]
+    lastBucket: number
+    lastTotalBytes: number | null
+  }): boolean {
     const now = this.nowBucket()
     const delta = now - entry.lastBucket
-    if (delta <= 0) return
+    if (delta <= 0) return false
     const gap = Math.min(delta, this.numBuckets)
     for (let i = 0; i < gap; i++) {
       entry.counts.shift()
       entry.counts.push(0)
     }
     entry.lastBucket = now
+    this.refreshSnapshot(entry)
+    return true
   }
 
   ensure(id: string): void {
@@ -220,28 +317,40 @@ export class SparklineStore {
     const entry = this.getOrCreate(id)
     this.advance(entry)
     entry.counts[entry.counts.length - 1] += value
+    this.refreshSnapshot(entry)
+    this.emitChange()
   }
 
   /** Record absolute byte totals and add the positive delta into the current bucket. */
   recordTotal(id: string, totalBytes: number, previousTotalBytes?: number): void {
     const entry = this.getOrCreate(id)
-    this.advance(entry)
+    const advanced = this.advance(entry)
     const baseline = previousTotalBytes ?? entry.lastTotalBytes ?? totalBytes
     const delta = Math.max(totalBytes - baseline, 0)
     entry.lastTotalBytes = totalBytes
-    if (delta > 0) entry.counts[entry.counts.length - 1] += delta
+    if (delta > 0) {
+      entry.counts[entry.counts.length - 1] += delta
+      this.refreshSnapshot(entry)
+      this.emitChange()
+      return
+    }
+    if (advanced) {
+      this.emitChange()
+    }
   }
 
   /** Returns the current bucket series (advances to now first). */
   getSeries(id: string): number[] {
     const entry = this.data.get(id)
-    if (!entry) return new Array(this.numBuckets).fill(0)
+    if (!entry) return this.emptySeries
     this.advance(entry)
-    return [...entry.counts]
+    return entry.snapshot
   }
 
   remove(id: string) {
-    this.data.delete(id)
+    if (this.data.delete(id)) {
+      this.emitChange()
+    }
   }
 }
 
@@ -251,25 +360,21 @@ function buildSparklineModel(
   height: number,
   isRunning: boolean
 ): {
-  areaPoints: string
-  linePoints: string
+  areaPath: string
+  linePath: string
   lastPoint: SparklinePoint
   baselineY: number
   palette: SparklinePalette
 } {
-  const baselineY = Math.max(2, height - 4)
+  const baselineY = Math.max(2, height - 3)
   const palette = isRunning ? RUNNING_PALETTE : IDLE_PALETTE
   const points = buildSparklinePoints(series, width, height)
-  const linePoints = points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(' ')
-  const areaPoints = [
-    `0,${baselineY.toFixed(2)}`,
-    ...points.map((point) => `${point.x.toFixed(2)},${point.y.toFixed(2)}`),
-    `${width.toFixed(2)},${baselineY.toFixed(2)}`,
-  ].join(' ')
+  const linePath = buildSmoothLinePath(points)
+  const areaPath = buildAreaPath(points, baselineY)
 
   return {
-    areaPoints,
-    linePoints,
+    areaPath,
+    linePath,
     lastPoint: points[points.length - 1] ?? { x: width, y: baselineY },
     baselineY,
     palette,
@@ -278,7 +383,7 @@ function buildSparklineModel(
 
 function buildSparklinePoints(series: number[], width: number, height: number): SparklinePoint[] {
   if (series.length < 2) {
-    const baselineY = Math.max(2, height - 4)
+    const baselineY = Math.max(2, height - 3)
     return [
       { x: 0, y: baselineY },
       { x: width, y: baselineY },
@@ -286,18 +391,40 @@ function buildSparklinePoints(series: number[], width: number, height: number): 
   }
 
   const maxValue = Math.max(...series, 0)
-  const topPadding = 3
-  const bottomPadding = 4
+  const topPadding = 2
+  const bottomPadding = 3
   const range = Math.max(height - topPadding - bottomPadding, 1)
   const step = width / (series.length - 1)
 
   return series.map((value, index) => {
     const x = index * step
     const normalized = maxValue <= 0 ? 0 : Math.log10(value + 1) / Math.log10(maxValue + 1)
-    const emphasis = normalized <= 0 ? 0 : Math.pow(normalized, 0.85)
+    const emphasis = normalized <= 0 ? 0 : Math.pow(normalized, 0.86)
     const y = height - bottomPadding - emphasis * range
     return { x, y }
   })
+}
+
+function buildSmoothLinePath(points: SparklinePoint[]): string {
+  if (points.length === 0) return ''
+  const [first, ...rest] = points
+  return [
+    `M ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
+    ...rest.map((point) => `L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`),
+  ].join(' ')
+}
+
+function buildAreaPath(points: SparklinePoint[], baselineY: number): string {
+  if (points.length === 0) return ''
+  const first = points[0]
+  const last = points[points.length - 1]
+  return [
+    `M ${first.x.toFixed(2)} ${baselineY.toFixed(2)}`,
+    `L ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
+    buildSmoothLinePath(points).slice(1),
+    `L ${last.x.toFixed(2)} ${baselineY.toFixed(2)}`,
+    'Z',
+  ].join(' ')
 }
 
 function calculateRecentBytesPerSecond(series: number[]): number {

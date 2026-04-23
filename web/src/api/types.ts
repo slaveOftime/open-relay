@@ -73,6 +73,7 @@ export interface SessionSummary {
   notifications_enabled: boolean
   node?: string | null
   last_total_bytes: number
+  last_output_epoch?: string | null
 }
 
 export interface CreateSessionSpec {
