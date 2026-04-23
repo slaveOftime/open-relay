@@ -94,10 +94,11 @@ export function statusLabel(status: SessionStatus, inputNeeded: boolean): string
 // ---------------------------------------------------------------------------
 
 /** Quote a single shell token if it contains whitespace or shell-special chars. */
+/** Quote a display token if it contains whitespace or shell-special chars. */
 function shellQuote(token: string): string {
   if (/[\s"'\\$`!|&;<>(){}]/.test(token)) {
-    // Escape inner double-quotes and wrap in double quotes
-    return '"' + token.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+    // This is rendered for humans, not re-parsed by a shell, so preserve literal backslashes.
+    return '"' + token.replace(/"/g, '\\"') + '"'
   }
   return token
 }
