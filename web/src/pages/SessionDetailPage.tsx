@@ -1562,11 +1562,10 @@ function SessionDetailPageContent() {
         <div
           id="main-container"
           className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
-          style={{ scrollbarGutter: 'stable' }}
         >
           {/* Terminal area */}
           <div
-            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
+            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-71px)] sm:h-full'}`}
           >
             <div
               aria-hidden="true"
