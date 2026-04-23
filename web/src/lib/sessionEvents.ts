@@ -85,13 +85,21 @@ class SessionEventsStore {
   }
 
   subscribeStore(listener: StoreListener): () => void {
+    this.retain()
     this.storeListeners.add(listener)
-    return () => this.storeListeners.delete(listener)
+    return () => {
+      this.storeListeners.delete(listener)
+      this.release()
+    }
   }
 
   subscribeEvents(listener: EventListener): () => void {
+    this.retain()
     this.eventListeners.add(listener)
-    return () => this.eventListeners.delete(listener)
+    return () => {
+      this.eventListeners.delete(listener)
+      this.release()
+    }
   }
 
   getConnectionState(): SseConnectionState {

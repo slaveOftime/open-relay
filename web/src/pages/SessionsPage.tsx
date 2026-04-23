@@ -1214,6 +1214,8 @@ export default function SessionsPage() {
   const pagedSessions = sessions
 
   const total = remoteTotal
+  const pageStart = total === 0 ? 0 : page * PAGE_SIZE + 1
+  const pageEnd = Math.min(page * PAGE_SIZE + pagedSessions.length, total)
 
   useEffect(() => {
     const lastPage = Math.max(Math.ceil(total / PAGE_SIZE) - 1, 0)
@@ -1827,7 +1829,7 @@ export default function SessionsPage() {
           )}
           <div className="flex-1"></div>
           <span className="text-sm">
-            {PAGE_SIZE} / {total}
+            {pageStart}-{pageEnd} / {total}
           </span>
           <div />
           {totalPages > 1 && (
