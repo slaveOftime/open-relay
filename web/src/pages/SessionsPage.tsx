@@ -699,7 +699,8 @@ function SessionCard({
                 sessionId={session.id}
                 isRunning={isRunning}
                 fullWidth
-                className="w-full"
+                height={16}
+                className="w-full opacity-70"
               />
             </div>
           )}

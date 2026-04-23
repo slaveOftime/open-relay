@@ -1712,8 +1712,8 @@ function SessionDetailPageContent() {
                     sessionId={session.id}
                     isRunning={isSessionRunning(session)}
                     fullWidth
-                    height={32}
-                    className="absolute inset-0 opacity-50"
+                    height={24}
+                    className="absolute left-0 bottom-0 right-0 opacity-50"
                   />
                 }
                 {attachedState}
