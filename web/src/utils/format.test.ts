@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseArgString } from './format'
+import { parseArgString, sessionDisplayName } from './format'
 
 describe('parseArgString', () => {
   it('preserves backslashes in quoted Windows path arguments', () => {
@@ -26,5 +26,22 @@ describe('parseArgString', () => {
       'hello world',
       'say "hi"',
     ])
+  })
+})
+
+describe('sessionDisplayName', () => {
+  it('preserves backslashes when quoting a Windows hook command for display', () => {
+    expect(
+      sessionDisplayName({
+        command: 'wechat-relay',
+        args: [
+          'listen',
+          '--hook',
+          String.raw`node C:\Users\woo\Documents\Code\jarvis\scripts\wechat-bridge-hook.ts --wechat {payload}`,
+        ],
+      })
+    ).toBe(
+      String.raw`wechat-relay listen --hook "node C:\Users\woo\Documents\Code\jarvis\scripts\wechat-bridge-hook.ts --wechat {payload}"`
+    )
   })
 })
