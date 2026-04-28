@@ -4,11 +4,13 @@ import { FileDropZone } from './ui/file-drop-zone'
 import { getFirstTransferredFile } from './ui/file-transfer'
 import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { ArrowLeftIcon, ArrowRightIcon, PaperclipIcon, SendIcon } from 'lucide-react'
+import { PaperclipIcon, SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
 import {
-  ArrowDownIcon,
-  ArrowUpIcon,
+  ChevronDownIcon,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  ChevronUpIcon,
   DoubleArrowDownIcon,
   DoubleArrowUpIcon,
 } from '@radix-ui/react-icons'
@@ -567,7 +569,7 @@ export default function AttachPanel({
             onClick={() => handleSendKeySpec('left')}
             aria-label="Left"
           >
-            <ArrowLeftIcon className="w-6 h-6" />
+            <ChevronLeftIcon className="w-6 h-6" />
           </Button>
           <Button
             variant={'ghost'}
@@ -575,7 +577,7 @@ export default function AttachPanel({
             onClick={() => handleSendKeySpec('up')}
             aria-label="Up"
           >
-            <ArrowUpIcon className="w-6 h-6" />
+            <ChevronUpIcon className="w-6 h-6" />
           </Button>
           <Button
             variant={'ghost'}
@@ -583,7 +585,7 @@ export default function AttachPanel({
             onClick={() => handleSendKeySpec('down')}
             aria-label="Down"
           >
-            <ArrowDownIcon className="w-6 h-6" />
+            <ChevronDownIcon className="w-6 h-6" />
           </Button>
           <Button
             variant={'ghost'}
@@ -591,7 +593,7 @@ export default function AttachPanel({
             onClick={() => handleSendKeySpec('right')}
             aria-label="Right"
           >
-            <ArrowRightIcon className="w-6 h-6" />
+            <ChevronRightIcon className="w-6 h-6" />
           </Button>
           <Button
             variant={'ghost'}
