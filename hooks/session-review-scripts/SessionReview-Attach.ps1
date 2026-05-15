@@ -106,6 +106,83 @@ function Get-SessionEventsLogPath {
     return [System.IO.Path]::Combine($stateDir, 'sessions', $SessionId, 'events.log')
 }
 
+function Get-OpenTerminalRecordPath {
+    param(
+        [string]$SessionId
+    )
+
+    $stateDir = Get-OlyStateDir
+    return [System.IO.Path]::Combine($stateDir, 'session-review', 'open-terminals', "$SessionId.json")
+}
+
+function Remove-OpenTerminalRecord {
+    param(
+        [string]$SessionId
+    )
+
+    $recordPath = Get-OpenTerminalRecordPath -SessionId $SessionId
+    if (Test-Path -LiteralPath $recordPath -PathType Leaf) {
+        Remove-Item -LiteralPath $recordPath -Force
+    }
+}
+
+function Save-OpenTerminalRecord {
+    param(
+        [string]$SessionId,
+        [string]$AttachScriptPath
+    )
+
+    $recordPath = Get-OpenTerminalRecordPath -SessionId $SessionId
+    $recordDir = Split-Path -Parent $recordPath
+    [System.IO.Directory]::CreateDirectory($recordDir) | Out-Null
+
+    $record = [pscustomobject]@{
+        sessionId        = $SessionId
+        attachScriptPath = $AttachScriptPath
+    }
+
+    $record | ConvertTo-Json -Compress | Set-Content -LiteralPath $recordPath -Encoding ASCII
+}
+
+function Get-OpenTerminalProcessOrNull {
+    param(
+        [string]$SessionId
+    )
+
+    $recordPath = Get-OpenTerminalRecordPath -SessionId $SessionId
+    if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+        $attachScriptPath = [string]$record.attachScriptPath
+        if (-not $attachScriptPath) {
+            throw 'Terminal record does not contain attachScriptPath.'
+        }
+
+        $processInfo = @(
+            Get-CimInstance Win32_Process -Filter "Name = 'cmd.exe'" |
+                Where-Object { $_.CommandLine -and $_.CommandLine.Contains($attachScriptPath) } |
+                Select-Object -First 1
+        )
+
+        if ($processInfo.Count -eq 0) {
+            Write-HookLog "removing stale terminal record for session=$SessionId because no cmd.exe is using '$attachScriptPath'"
+            Remove-OpenTerminalRecord -SessionId $SessionId
+            return $null
+        }
+
+        $process = Get-Process -Id ([int]$processInfo[0].ProcessId) -ErrorAction Stop
+        return $process
+    }
+    catch {
+        Write-HookLog "removing stale terminal record for session=$SessionId because validation failed: $($_.Exception.Message)"
+        Remove-OpenTerminalRecord -SessionId $SessionId
+        return $null
+    }
+}
+
 function Get-LatestResizeEvent {
     param(
         [string]$EventsLogPath
@@ -206,20 +283,6 @@ function Quote-CmdArgument {
     return '"' + $Value.Replace('"', '""') + '"'
 }
 
-function Get-AttachCommandLine {
-    param(
-        [string]$SessionId,
-        [string]$WorkingDirectory
-    )
-
-    $attachCommand = "oly attach $SessionId"
-    if (-not $WorkingDirectory) {
-        return $attachCommand
-    }
-
-    return "cd /d $(Quote-CmdArgument $WorkingDirectory) && $attachCommand"
-}
-
 function New-AttachCommandScript {
     param(
         [string]$SessionId,
@@ -243,23 +306,6 @@ function New-AttachCommandScript {
     return $scriptPath
 }
 
-function Invoke-DetachedCmdLauncher {
-    param(
-        [string]$LauncherBody,
-        [string]$SessionId,
-        [string]$Label
-    )
-
-    $cmdCommand = Get-Command cmd.exe -ErrorAction Stop
-    $launcherPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "oly-attach-launch-$SessionId.cmd")
-    $contents = "@echo off`r`n$LauncherBody`r`n"
-    Set-Content -LiteralPath $launcherPath -Value $contents -Encoding ASCII
-
-    Write-HookLog "launcher path='$launcherPath' body='$LauncherBody'"
-    Start-Process -FilePath $cmdCommand.Source -ArgumentList @('/c', (Quote-CmdArgument $launcherPath)) -WindowStyle Hidden | Out-Null
-    Write-HookLog "launched detached $Label launcher for session=$SessionId"
-}
-
 function Start-AttachTerminal {
     param(
         [string]$SessionId,
@@ -270,9 +316,15 @@ function Start-AttachTerminal {
 
     $cmdCommand = Get-Command cmd.exe -ErrorAction Stop
     $terminalSize = Get-TerminalSize -Rows $Rows -Cols $Cols
-    $attachCommand = Get-AttachCommandLine -SessionId $SessionId -WorkingDirectory $WorkingDirectory
     $attachScriptPath = New-AttachCommandScript -SessionId $SessionId -WorkingDirectory $WorkingDirectory
-    Write-HookLog "launch session=$SessionId rows=$($terminalSize.Rows) cols=$($terminalSize.Cols) cwd='$WorkingDirectory' cmd='$attachCommand'"
+
+    $existingProcess = Get-OpenTerminalProcessOrNull -SessionId $SessionId
+    if ($existingProcess) {
+        Write-HookLog "session=$SessionId already has open terminal pid=$($existingProcess.Id); skipping launch"
+        return
+    }
+
+    Write-HookLog "launch session=$SessionId rows=$($terminalSize.Rows) cols=$($terminalSize.Cols) cwd='$WorkingDirectory'"
     Write-HookLog "attach script path='$attachScriptPath'"
 
     $wtCommand = Get-Command wt.exe -ErrorAction SilentlyContinue
@@ -289,27 +341,17 @@ function Start-AttachTerminal {
             $wtArgs += @('--pos', $position)
         }
 
-        $launcherParts = @(
-            'start',
-            '""',
-            (Quote-CmdArgument $wtCommand.Source),
-            '--window',
-            'new',
-            '--size',
-            (Quote-CmdArgument "$($terminalSize.Cols),$($terminalSize.Rows)")
-        )
-        if ($position) {
-            $launcherParts += @('--pos', (Quote-CmdArgument $position))
-        }
-        $launcherParts += @((Quote-CmdArgument $cmdCommand.Source), '/k', 'call', (Quote-CmdArgument $attachScriptPath))
-
-        Invoke-DetachedCmdLauncher -LauncherBody ($launcherParts -join ' ') -SessionId $SessionId -Label 'wt.exe'
+        $wtArgs += @($cmdCommand.Source, '/k', 'call', $attachScriptPath)
+        $process = Start-Process -FilePath $wtCommand.Source -ArgumentList $wtArgs -PassThru
+        Save-OpenTerminalRecord -SessionId $SessionId -AttachScriptPath $attachScriptPath
+        Write-HookLog "launched wt.exe pid=$($process.Id) attachScript='$attachScriptPath' for session=$SessionId"
         return
     }
 
-    $cmdLine = "mode con: cols=$($terminalSize.Cols) lines=$($terminalSize.Rows) && call $(Quote-CmdArgument $attachScriptPath)"
-    $launcher = "start `"`" $(Quote-CmdArgument $cmdCommand.Source) /k $(Quote-CmdArgument $cmdLine)"
-    Invoke-DetachedCmdLauncher -LauncherBody $launcher -SessionId $SessionId -Label 'cmd.exe fallback'
+    $cmdLine = "mode con: cols=$($terminalSize.Cols) lines=$($terminalSize.Rows) && call $([char]34)$attachScriptPath$([char]34)"
+    $process = Start-Process -FilePath $cmdCommand.Source -ArgumentList @('/k', $cmdLine) -PassThru
+    Save-OpenTerminalRecord -SessionId $SessionId -AttachScriptPath $attachScriptPath
+    Write-HookLog "launched cmd.exe pid=$($process.Id) attachScript='$attachScriptPath' for session=$SessionId"
 }
 
 try {
