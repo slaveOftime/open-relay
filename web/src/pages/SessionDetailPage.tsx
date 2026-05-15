@@ -24,8 +24,10 @@ import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/SessionActivitySparkline'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
 import Logo from '@/components/Logo'
-import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
+import NewSessionDialog from '@/components/NewSessionDialog'
+import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/SessionMetadataDialog'
+import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { getTransferredFiles } from '@/components/ui/file-transfer'
@@ -109,70 +111,6 @@ function didSessionVisibleOutputAdvance(
 
 const DEFAULT_LOG_TAIL = 200
 const ATTACH_IDLE_BORDER_DELAY_MS = 10_000
-
-// ── Confirm Action Dialog ────────────────────────────────────────────────────
-function ConfirmActionDialog({
-  action,
-  sessionId,
-  onConfirm,
-  onClose,
-}: {
-  action: 'stop' | 'kill' | null
-  sessionId: string
-  onConfirm: (a: 'stop' | 'kill') => void
-  onClose: () => void
-}) {
-  return (
-    <Dialog
-      open={action !== null}
-      onOpenChange={(open) => {
-        if (!open) onClose()
-      }}
-    >
-      <DialogContent className="max-w-sm">
-        <DialogHeader>
-          <DialogTitle>{action === 'kill' ? 'Kill Session' : 'Stop Session'}</DialogTitle>
-        </DialogHeader>
-        <p className="text-sm text-[hsl(var(--muted-foreground))]">
-          {action === 'kill' ? (
-            <>
-              Are you sure you want to{' '}
-              <span className="text-red-600 dark:text-red-400 font-semibold">kill</span> session{' '}
-              <span className="font-mono text-[hsl(var(--foreground))]">
-                {sessionId.slice(0, 7)}
-              </span>
-              ? The process will be terminated immediately.
-            </>
-          ) : (
-            <>
-              Are you sure you want to{' '}
-              <span className="text-amber-600 dark:text-amber-400 font-semibold">stop</span> session{' '}
-              <span className="font-mono text-[hsl(var(--foreground))]">
-                {sessionId.slice(0, 7)}
-              </span>
-              ? A graceful shutdown signal will be sent.
-            </>
-          )}
-        </p>
-        <div className="flex justify-end gap-2 pt-1">
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            variant={action === 'kill' ? 'kill' : 'stop'}
-            size="sm"
-            onClick={() => {
-              if (action) onConfirm(action)
-              onClose()
-            }}
-          >
-            Yes
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
-  )
-}
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function SessionDetailPage() {
@@ -1372,13 +1310,13 @@ function SessionDetailPageContent() {
             </button>
             {session && <StatusBadge status={session.status} inputNeeded={session.input_needed} />}
             {node && (
-              <Badge className="inline-flex font-light border-[hsl(var(--primary))]/40 bg-[hsl(var(--primary))]/10 text-[hsl(var(--primary))] text-xs">
+              <Badge variant="accent" className="inline-flex text-xs font-light">
                 {node}
               </Badge>
             )}
             <div className="hidden sm:inline-block">{attachedState}</div>
             {mode === 'attach' && !isOnline && (
-              <Badge className="inline-flex font-light border-amber-400/40 bg-amber-400/10 text-amber-600 dark:text-amber-300">
+              <Badge variant="warning" className="inline-flex font-light">
                 <TrackNextIcon className="h-4 w-4" />
                 <span className="hidden sm:inline">Offline</span>
               </Badge>
@@ -1556,7 +1494,7 @@ function SessionDetailPageContent() {
           </div>
         )}
 
-        {wsError && <div className="text-red-500 text-sm">{wsError}</div>}
+        {wsError && <div className="text-sm text-[hsl(var(--destructive))]">{wsError}</div>}
 
         {/* ── Main body ── */}
         <div
@@ -1734,7 +1672,7 @@ function SessionDetailPageContent() {
           </Button>
         )}
 
-        <ConfirmActionDialog
+        <SessionActionConfirmDialog
           action={pendingAction}
           sessionId={id ?? ''}
           onConfirm={(action) => {

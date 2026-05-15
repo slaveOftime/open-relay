@@ -18,8 +18,10 @@ import {
   setSessionNotifications,
   fetchNodes,
 } from '@/api/client'
-import NewSessionDialog, { buildNewSessionInitialValues } from '@/components/NewSessionDialog'
+import NewSessionDialog from '@/components/NewSessionDialog'
+import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/SessionMetadataDialog'
+import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -273,8 +275,8 @@ function SessionTagList({
       {normalizedTags.map((tag) => (
         <Badge
           key={tag}
-          variant="outline"
-          className="min-w-0 max-w-full border-emerald-500/25 bg-emerald-500/10 text-[10px] font-semibold text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
+          variant="accent"
+          className="min-w-0 max-w-full text-[10px] font-semibold"
         >
           <span className="min-w-0 truncate">#{tag}</span>
         </Badge>
@@ -309,6 +311,7 @@ function SessionNotificationButton({
           aria-label={label}
           disabled={disabled || pending}
           onClick={onToggle}
+          className="shrink-0"
         >
           <span className="relative inline-flex h-4 w-4 items-center justify-center">
             <BellIcon className="h-4 w-4" />
@@ -518,7 +521,7 @@ function SessionRow({
             {isRunning && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button asChild variant="link" size="icon">
+                  <Button asChild variant="link" size="icon" className="shrink-0">
                     <Link to={attachHref} aria-label="Attach">
                       <Link2Icon className="h-4 w-4" />
                     </Link>
@@ -532,9 +535,9 @@ function SessionRow({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="ghost"
+                      variant="stop"
                       size="icon"
-                      className="text-amber-600 hover:text-amber-600"
+                      className="shrink-0"
                       onClick={() => setPendingAction('stop')}
                     >
                       <StopIcon className="h-4 w-4" />
@@ -545,9 +548,9 @@ function SessionRow({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="ghost"
+                      variant="kill"
                       size="icon"
-                      className="text-red-600 hover:text-red-600"
+                      className="shrink-0"
                       onClick={() => setPendingAction('kill')}
                     >
                       <Cross2Icon className="h-4 w-4" />
@@ -565,7 +568,7 @@ function SessionRow({
             )}
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button asChild variant="ghost" size="icon">
+                <Button asChild variant="ghost" size="icon" className="shrink-0">
                   <Link to={logsHref} aria-label="Logs">
                     <FileTextIcon className="h-4 w-4" />
                   </Link>
@@ -575,7 +578,7 @@ function SessionRow({
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" onClick={() => onRunAgain(session)}>
+                <Button variant="ghost" size="icon" className="shrink-0" onClick={() => onRunAgain(session)}>
                   <CopyIcon className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
@@ -586,7 +589,7 @@ function SessionRow({
       </TableRow>
 
       {/* Confirm dialog */}
-      <ConfirmActionDialog
+      <SessionActionConfirmDialog
         action={pendingAction}
         sessionId={session.id}
         onConfirm={(action) => {
@@ -774,7 +777,7 @@ function SessionCard({
         </CardFooter>
       </Card>
 
-      <ConfirmActionDialog
+      <SessionActionConfirmDialog
         action={pendingAction}
         sessionId={session.id}
         onConfirm={(action) => {
@@ -784,71 +787,6 @@ function SessionCard({
         onClose={() => setPendingAction(null)}
       />
     </>
-  )
-}
-
-// ── Confirm Action Dialog ──────────────────────────────────────────────────
-
-function ConfirmActionDialog({
-  action,
-  sessionId,
-  onConfirm,
-  onClose,
-}: {
-  action: 'stop' | 'kill' | null
-  sessionId: string
-  onConfirm: (a: 'stop' | 'kill') => void
-  onClose: () => void
-}) {
-  return (
-    <Dialog
-      open={action !== null}
-      onOpenChange={(open) => {
-        if (!open) onClose()
-      }}
-    >
-      <DialogContent className="max-w-sm">
-        <DialogHeader>
-          <DialogTitle>{action === 'kill' ? 'Kill Session' : 'Stop Session'}</DialogTitle>
-        </DialogHeader>
-        <p className="text-sm text-[hsl(var(--muted-foreground))]">
-          {action === 'kill' ? (
-            <>
-              Are you sure you want to <span className="text-red-500 font-semibold">kill</span>{' '}
-              session{' '}
-              <span className="font-mono text-[hsl(var(--foreground))]">
-                {sessionId.slice(0, 7)}
-              </span>
-              ? The process will be terminated immediately.
-            </>
-          ) : (
-            <>
-              Are you sure you want to <span className="text-amber-500 font-semibold">stop</span>{' '}
-              session{' '}
-              <span className="font-mono text-[hsl(var(--foreground))]">
-                {sessionId.slice(0, 7)}
-              </span>
-              ? A graceful shuTableCellown signal will be sent.
-            </>
-          )}
-        </p>
-        <div className="flex justify-end gap-2 pt-1">
-          <Button variant="ghost" size="sm" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button
-            variant={action === 'kill' ? 'kill' : 'stop'}
-            size="sm"
-            onClick={() => {
-              if (action) onConfirm(action)
-              onClose()
-            }}
-          >
-            Yes
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
   )
 }
 

@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button'
 import { FileDropZone } from './ui/file-drop-zone'
 import { getFirstTransferredFile } from './ui/file-transfer'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PaperclipIcon, SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
@@ -531,9 +532,9 @@ export default function AttachPanel({
               Text Input
             </p>
             <div className="relative">
-              <textarea
+              <Textarea
                 ref={customInputRef}
-                className="flex min-h-[72px] w-full rounded-md border border-[hsl(var(--input))] bg-[hsl(var(--secondary))] px-3 py-2 pr-12 text-sm text-[hsl(var(--foreground))] placeholder:text-[hsl(var(--muted-foreground))] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-1 disabled:cursor-not-allowed disabled:opacity-50 transition-colors resize-none"
+                className="min-h-[72px] pr-12 resize-none"
                 placeholder="Type text here. Enter adds a new line. ctrl+enter to send."
                 rows={3}
                 value={customInput}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { RotateCcw, ZoomIn, ZoomOut } from 'lucide-react'
+import { ZoomIn, ZoomOut } from 'lucide-react'
+import { Cross2Icon } from '@radix-ui/react-icons'
 
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
@@ -29,6 +30,7 @@ export default function ImagePreviewDialog({
 }: ImagePreviewDialogProps) {
   const [zoom, setZoom] = useState(1)
   const [offset, setOffset] = useState<ImagePreviewOffset>({ x: 0, y: 0 })
+  const [isDragging, setIsDragging] = useState(false)
   const [viewportSize, setViewportSize] = useState<ImagePreviewDimensions>({ width: 0, height: 0 })
   const [imageSize, setImageSize] = useState<ImagePreviewDimensions>({ width: 0, height: 0 })
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -49,24 +51,22 @@ export default function ImagePreviewDialog({
 
   const resetView = useCallback(() => {
     dragStateRef.current = null
+    setIsDragging(false)
     setZoom(1)
     setOffset({ x: 0, y: 0 })
   }, [])
 
   useEffect(() => {
     if (!open) return
-    resetView()
     measureViewport()
     window.addEventListener('resize', measureViewport)
     return () => {
       window.removeEventListener('resize', measureViewport)
     }
-  }, [measureViewport, open, resetView, src])
+  }, [measureViewport, open, src])
 
   useEffect(() => {
-    if (!open) {
-      dragStateRef.current = null
-    }
+    if (!open) dragStateRef.current = null
   }, [open])
 
   const applyZoom = useCallback(
@@ -96,6 +96,7 @@ export default function ImagePreviewDialog({
         originX: offset.x,
         originY: offset.y,
       }
+      setIsDragging(true)
       event.currentTarget.setPointerCapture(event.pointerId)
     },
     [offset.x, offset.y, zoom]
@@ -122,6 +123,7 @@ export default function ImagePreviewDialog({
   const handlePointerEnd = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (dragStateRef.current?.pointerId !== event.pointerId) return
     dragStateRef.current = null
+    setIsDragging(false)
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId)
     }
@@ -138,13 +140,19 @@ export default function ImagePreviewDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="left-0 top-0 flex h-screen max-h-screen w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 bg-black/95 p-0 text-white">
-        <div className="flex items-start justify-between gap-3 border-b border-white/10 px-3 py-2 pr-12">
+      <DialogContent
+        showCloseButton={false}
+        className="left-0 top-0 flex h-screen max-h-screen w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 bg-black/95 p-0 text-white"
+      >
+        <div className="flex items-start justify-between gap-3 border-b border-white/10 px-3 py-2">
           <div className="min-w-0">
             <DialogTitle className="text-sm font-semibold text-white">Image preview</DialogTitle>
             {path && <p className="truncate text-[11px] leading-4 text-white/70">{path}</p>}
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
+            <span className="min-w-12 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-right text-[11px] text-white/70">
+              {Math.round(zoom * 100)}%
+            </span>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -189,9 +197,21 @@ export default function ImagePreviewDialog({
               </TooltipTrigger>
               <TooltipContent>Reset view</TooltipContent>
             </Tooltip>
-            <span className="min-w-12 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-right text-[11px] text-white/70">
-              {Math.round(zoom * 100)}%
-            </span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8 rounded-full text-white/80 hover:bg-white/10 hover:text-white"
+                  onClick={() => onOpenChange(false)}
+                >
+                  <Cross2Icon className="h-4 w-4" />
+                  <span className="sr-only">Close preview</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Close</TooltipContent>
+            </Tooltip>
           </div>
         </div>
         <div
@@ -211,7 +231,7 @@ export default function ImagePreviewDialog({
                 draggable={false}
                 className="max-h-full max-w-full select-none object-contain will-change-transform"
                 style={{
-                  cursor: zoom > 1 ? (dragStateRef.current ? 'grabbing' : 'grab') : 'default',
+                  cursor: zoom > 1 ? (isDragging ? 'grabbing' : 'grab') : 'default',
                   transform: `translate(${offset.x}px, ${offset.y}px) scale(${zoom})`,
                   transformOrigin: 'center center',
                 }}
