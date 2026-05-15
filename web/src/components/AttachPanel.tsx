@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Button } from '@/components/ui/button'
 import { FileDropZone } from './ui/file-drop-zone'
-import { getFirstTransferredFile } from './ui/file-transfer'
+import { getTransferredFiles } from './ui/file-transfer'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { PaperclipIcon, SendIcon } from 'lucide-react'
+import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
-import { insertUploadedPathAtSelection } from './attach-panel-input'
+import { insertUploadedPathAtSelection, removeUploadedPathFromInput } from './attach-panel-input'
 import {
   coerceSessionImagePreviews,
   getVisibleImagePreviewPaths,
@@ -452,33 +452,47 @@ export default function AttachPanel({
     fileInputRef.current?.click()
   }
 
-  const uploadSelectedFile = useCallback(
-    async (file: File) => {
+  const uploadSelectedFiles = useCallback(
+    async (files: File[]) => {
       if (!uploadFile) return
+      if (files.length === 0) return
 
       setIsUploading(true)
       try {
-        const response = await uploadFile(file)
-        if (response.ok) {
+        const uploadedPaths: string[] = []
+        const nextImagePreviews: SessionImagePreviews = {}
+
+        for (const file of files) {
+          const response = await uploadFile(file)
+          if (!response.ok) continue
+
+          uploadedPaths.push(response.path)
+          if (isPreviewableImageFile(file)) {
+            try {
+              const previewSource = await readFileAsDataUrl(file)
+              nextImagePreviews[response.path] = previewSource
+            } catch (error) {
+              showKeyError(error instanceof Error ? error.message : 'image preview unavailable')
+            }
+          }
+        }
+
+        if (uploadedPaths.length > 0) {
           const textarea = customInputRef.current
           const value = textarea?.value ?? customInputValueRef.current
-          const insertion = insertUploadedPathAtSelection(value, response.path, {
+          const insertion = insertUploadedPathAtSelection(value, uploadedPaths.join(' '), {
             start: textarea?.selectionStart ?? value.length,
             end: textarea?.selectionEnd ?? value.length,
           })
           pendingCustomInputSelectionRef.current = insertion.selection
           updateCustomInput(insertion.value)
-          if (isPreviewableImageFile(file)) {
-            try {
-              const previewSource = await readFileAsDataUrl(file)
-              setImagePreviews((previous) => ({
-                ...previous,
-                [response.path]: previewSource,
-              }))
-            } catch (error) {
-              showKeyError(error instanceof Error ? error.message : 'image preview unavailable')
-            }
-          }
+        }
+
+        if (Object.keys(nextImagePreviews).length > 0) {
+          setImagePreviews((previous) => ({
+            ...previous,
+            ...nextImagePreviews,
+          }))
         }
       } catch (error) {
         showKeyError(error instanceof Error ? error.message : 'file upload failed')
@@ -494,20 +508,20 @@ export default function AttachPanel({
 
     function handlePaste(event: ClipboardEvent) {
       if (isUploading) return
-      const file = getFirstTransferredFile(event.clipboardData)
-      if (!file) return
+      const files = getTransferredFiles(event.clipboardData)
+      if (files.length === 0) return
       event.preventDefault()
-      void uploadSelectedFile(file)
+      void uploadSelectedFiles(files)
     }
 
     window.addEventListener('paste', handlePaste)
     return () => {
       window.removeEventListener('paste', handlePaste)
     }
-  }, [isUploading, uploadFile, uploadSelectedFile])
+  }, [isUploading, uploadFile, uploadSelectedFiles])
 
   async function handleUploadDrop(file: File) {
-    await uploadSelectedFile(file)
+    await uploadSelectedFiles([file])
   }
 
   async function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
@@ -515,7 +529,26 @@ export default function AttachPanel({
     event.target.value = ''
     if (!file || !uploadFile) return
 
-    await uploadSelectedFile(file)
+    await uploadSelectedFiles([file])
+  }
+
+  function handleRemoveImagePreview(path: string) {
+    const textarea = customInputRef.current
+    const value = textarea?.value ?? customInputValueRef.current
+    const removal = removeUploadedPathFromInput(value, path, {
+      start: textarea?.selectionStart ?? value.length,
+      end: textarea?.selectionEnd ?? value.length,
+    })
+    pendingCustomInputSelectionRef.current = removal.selection
+    updateCustomInput(removal.value)
+    setImagePreviews((previous) => {
+      const nextPreviews = { ...previous }
+      delete nextPreviews[path]
+      return nextPreviews
+    })
+    if (previewPath === path) {
+      setPreviewPath(null)
+    }
   }
 
   const visibleImagePreviewPaths = getVisibleImagePreviewPaths(customInput, imagePreviews)
@@ -571,22 +604,31 @@ export default function AttachPanel({
             {visibleImagePreviewPaths.length > 0 && (
               <div className="flex flex-wrap gap-3 mt-2">
                 {visibleImagePreviewPaths.map((path) => (
-                  <button
-                    key={path}
-                    type="button"
-                    className="rounded-md text-left transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--card))]"
-                    onClick={() => setPreviewPath(path)}
-                    title={path}
-                  >
-                    <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--secondary))]">
-                      <img
-                        src={imagePreviews[path]}
-                        alt={path}
-                        className="h-8 w-8 object-cover"
-                        draggable={false}
-                      />
-                    </span>
-                  </button>
+                  <span key={path} className="group relative inline-flex">
+                    <button
+                      type="button"
+                      className="rounded-md text-left transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--card))]"
+                      onClick={() => setPreviewPath(path)}
+                      title={path}
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--secondary))]">
+                        <img
+                          src={imagePreviews[path]}
+                          alt={path}
+                          className="h-8 w-8 object-cover"
+                          draggable={false}
+                        />
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-[hsl(var(--destructive))] text-[hsl(var(--destructive-foreground))] opacity-0 shadow-sm transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-1 group-hover:opacity-100 group-focus-within:opacity-100"
+                      aria-label={`Remove ${path}`}
+                      onClick={() => handleRemoveImagePreview(path)}
+                    >
+                      <XIcon className="h-3 w-3" aria-hidden="true" />
+                    </button>
+                  </span>
                 ))}
               </div>
             )}

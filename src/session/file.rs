@@ -133,7 +133,9 @@ fn resolve_session_upload_target(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_session_upload_relative_path;
+    use std::{fs, path::Path, time::SystemTime};
+
+    use super::{normalize_session_upload_relative_path, unique_path_for_name};
 
     #[test]
     fn normalize_upload_path_accepts_nested_relative_path() {
@@ -145,5 +147,29 @@ mod tests {
     #[test]
     fn normalize_upload_path_rejects_parent_traversal() {
         assert!(normalize_session_upload_relative_path("../file.txt").is_none());
+    }
+
+    #[test]
+    fn unique_path_for_name_adds_suffix_when_file_exists() {
+        let files_dir = temp_test_dir("unique_path_for_name_adds_suffix");
+        fs::create_dir_all(&files_dir).expect("create temp files dir");
+        fs::write(files_dir.join("image.png"), b"first").expect("write existing file");
+        fs::write(files_dir.join("image-1.png"), b"second").expect("write existing suffixed file");
+
+        let unique_path = unique_path_for_name(&files_dir, Path::new("image.png"));
+        assert_eq!(
+            unique_path.file_name().and_then(|name| name.to_str()),
+            Some("image-2.png")
+        );
+
+        fs::remove_dir_all(files_dir).expect("remove temp files dir");
+    }
+
+    fn temp_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock should be after UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("oly-{name}-{}-{nanos}", std::process::id()))
     }
 }
