@@ -5,6 +5,7 @@
 - Keep UI styling **theme-token driven** so future rethemes mostly happen in shared primitives, not page files.
 - Prefer **shared components** in `web\src\components\ui` and small reusable app components in `web\src\components`.
 - Add new primitives only when a pattern is used in more than one place or is clearly semantic.
+- Treat `web\DESIGN.md` as the product design source of truth for colors, density, shape, and retheming guidance.
 
 ## Current structure
 
@@ -13,6 +14,8 @@
 - `src\pages\*`: page composition only; avoid page-local design systems.
 
 ## Design rules
+
+Follow the compact dark system in `web\DESIGN.md`: 32px default controls, 6-8px radii, quiet near-black surfaces, hairline borders, and Open Relay green as the primary accent.
 
 1. **Start from existing primitives**
    - Use `Button`, `Input`, `Textarea`, `Badge`, `Dialog`, `AlertDialog`, `Tooltip`, `Select`, `Card`, `Table`, and `Slider` before writing raw elements.
