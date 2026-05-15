@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PaperclipIcon, SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
+import { insertUploadedPathAtSelection } from './attach-panel-input'
 import {
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -158,12 +159,19 @@ export default function AttachPanel({
   const [isUploading, setIsUploading] = useState(false)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const customInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const customInputValueRef = useRef(customInput)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const sendClickTimeoutRef = useRef<number | null>(null)
   const shouldPersistDraftRef = useRef(false)
   const shouldPersistDrawerOpenRef = useRef(false)
   const busyIntervalRef = useRef<number | null>(null)
   const drawerScrollTimeoutsRef = useRef<number[]>([])
+  const pendingCustomInputSelectionRef = useRef<{ start: number; end: number } | null>(null)
+
+  const updateCustomInput = useCallback((nextValue: string) => {
+    customInputValueRef.current = nextValue
+    setCustomInput(nextValue)
+  }, [])
 
   const findScrollContainer = useCallback((node: HTMLElement | null): HTMLElement | null => {
     let current = node?.parentElement ?? null
@@ -229,8 +237,8 @@ export default function AttachPanel({
 
   useEffect(() => {
     shouldPersistDraftRef.current = false
-    setCustomInput(loadSessionInputDraft(sessionId))
-  }, [sessionId])
+    updateCustomInput(loadSessionInputDraft(sessionId))
+  }, [sessionId, updateCustomInput])
 
   useEffect(() => {
     if (!shouldPersistDraftRef.current) {
@@ -239,6 +247,14 @@ export default function AttachPanel({
     }
     saveSessionInputDraft(sessionId, customInput)
   }, [customInput, sessionId])
+
+  useEffect(() => {
+    const pendingSelection = pendingCustomInputSelectionRef.current
+    const textarea = customInputRef.current
+    if (!pendingSelection || !textarea) return
+    textarea.setSelectionRange(pendingSelection.start, pendingSelection.end)
+    pendingCustomInputSelectionRef.current = null
+  }, [customInput])
 
   useEffect(() => {
     return () => {
@@ -269,7 +285,7 @@ export default function AttachPanel({
     if (sendEnter) {
       handleSendKeySpec('enter')
     }
-    setCustomInput('')
+    updateCustomInput('')
   }
 
   function handleSendKeySpec(spec: string) {
@@ -372,12 +388,14 @@ export default function AttachPanel({
       try {
         const response = await uploadFile(file)
         if (response.ok) {
-          setCustomInput((prev) => {
-            if (prev.trim()) {
-              return prev + ' ' + response.path
-            }
-            return response.path
+          const textarea = customInputRef.current
+          const value = textarea?.value ?? customInputValueRef.current
+          const insertion = insertUploadedPathAtSelection(value, response.path, {
+            start: textarea?.selectionStart ?? value.length,
+            end: textarea?.selectionEnd ?? value.length,
           })
+          pendingCustomInputSelectionRef.current = insertion.selection
+          updateCustomInput(insertion.value)
         }
       } catch (error) {
         showKeyError(error instanceof Error ? error.message : 'file upload failed')
@@ -385,7 +403,7 @@ export default function AttachPanel({
         setIsUploading(false)
       }
     },
-    [showKeyError, uploadFile]
+    [showKeyError, updateCustomInput, uploadFile]
   )
 
   useEffect(() => {
@@ -434,7 +452,7 @@ export default function AttachPanel({
                 placeholder="Type text here. Enter adds a new line. ctrl+enter to send."
                 rows={3}
                 value={customInput}
-                onChange={(e) => setCustomInput(e.target.value)}
+                onChange={(e) => updateCustomInput(e.target.value)}
                 onFocus={startBusyHeartbeat}
                 onBlur={stopBusyHeartbeat}
                 onKeyDown={(e) => {
