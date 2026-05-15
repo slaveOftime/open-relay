@@ -8,6 +8,13 @@ import { PaperclipIcon, SendIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
 import { insertUploadedPathAtSelection } from './attach-panel-input'
 import {
+  coerceSessionImagePreviews,
+  getVisibleImagePreviewPaths,
+  isPreviewableImageFile,
+  type SessionImagePreviews,
+} from './attach-panel-image-preview'
+import ImagePreviewDialog from './ImagePreviewDialog'
+import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -21,6 +28,7 @@ import type { UploadSessionFileResponse } from '@/api/client'
 const INPUT_HISTORY_KEY = 'open-relay:input-history'
 const SESSION_INPUT_DRAFT_KEY_PREFIX = 'open-relay:session-input-draft:'
 const SESSION_DRAWER_OPEN_KEY_PREFIX = 'open-relay:session-drawer-open:'
+const SESSION_IMAGE_PREVIEW_KEY_PREFIX = 'open-relay:session-image-preview:'
 const ATTACH_BUSY_INTERVAL_MS = 2000
 
 interface InputHistoryEntry {
@@ -111,6 +119,54 @@ function saveSessionDrawerOpen(sessionId: string, isOpen: boolean): void {
   }
 }
 
+function getSessionImagePreviewKey(sessionId: string): string | null {
+  const trimmed = sessionId.trim()
+  return trimmed ? `${SESSION_IMAGE_PREVIEW_KEY_PREFIX}${trimmed}` : null
+}
+
+function loadSessionImagePreviews(sessionId: string): SessionImagePreviews {
+  const storageKey = getSessionImagePreviewKey(sessionId)
+  if (!storageKey) return {}
+  try {
+    const raw = sessionStorage.getItem(storageKey)
+    if (!raw) return {}
+    return coerceSessionImagePreviews(JSON.parse(raw))
+  } catch {
+    return {}
+  }
+}
+
+function saveSessionImagePreviews(sessionId: string, previews: SessionImagePreviews): void {
+  const storageKey = getSessionImagePreviewKey(sessionId)
+  if (!storageKey) return
+  try {
+    if (Object.keys(previews).length === 0) {
+      sessionStorage.removeItem(storageKey)
+      return
+    }
+    sessionStorage.setItem(storageKey, JSON.stringify(previews))
+  } catch {
+    /* ignore */
+  }
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        resolve(reader.result)
+        return
+      }
+      reject(new Error('image preview unavailable'))
+    }
+    reader.onerror = () => {
+      reject(reader.error ?? new Error('image preview unavailable'))
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
 // ── AttachPanel ───────────────────────────────────────────────────────────────
 interface AttachPanelProps {
   sessionId: string
@@ -156,7 +212,11 @@ export default function AttachPanel({
   const [drawerOpen, setDrawerOpen] = useState(() => loadSessionDrawerOpen(sessionId))
   const [customInput, setCustomInput] = useState('')
   const [customKeys, setCustomKeys] = useState('')
+  const [imagePreviews, setImagePreviews] = useState<SessionImagePreviews>(() =>
+    loadSessionImagePreviews(sessionId)
+  )
   const [isUploading, setIsUploading] = useState(false)
+  const [previewPath, setPreviewPath] = useState<string | null>(null)
   const rootRef = useRef<HTMLDivElement | null>(null)
   const customInputRef = useRef<HTMLTextAreaElement | null>(null)
   const customInputValueRef = useRef(customInput)
@@ -241,12 +301,21 @@ export default function AttachPanel({
   }, [sessionId, updateCustomInput])
 
   useEffect(() => {
+    setImagePreviews(loadSessionImagePreviews(sessionId))
+    setPreviewPath(null)
+  }, [sessionId])
+
+  useEffect(() => {
     if (!shouldPersistDraftRef.current) {
       shouldPersistDraftRef.current = true
       return
     }
     saveSessionInputDraft(sessionId, customInput)
   }, [customInput, sessionId])
+
+  useEffect(() => {
+    saveSessionImagePreviews(sessionId, imagePreviews)
+  }, [imagePreviews, sessionId])
 
   useEffect(() => {
     const pendingSelection = pendingCustomInputSelectionRef.current
@@ -286,6 +355,8 @@ export default function AttachPanel({
       handleSendKeySpec('enter')
     }
     updateCustomInput('')
+    setImagePreviews({})
+    setPreviewPath(null)
   }
 
   function handleSendKeySpec(spec: string) {
@@ -396,6 +467,17 @@ export default function AttachPanel({
           })
           pendingCustomInputSelectionRef.current = insertion.selection
           updateCustomInput(insertion.value)
+          if (isPreviewableImageFile(file)) {
+            try {
+              const previewSource = await readFileAsDataUrl(file)
+              setImagePreviews((previous) => ({
+                ...previous,
+                [response.path]: previewSource,
+              }))
+            } catch (error) {
+              showKeyError(error instanceof Error ? error.message : 'image preview unavailable')
+            }
+          }
         }
       } catch (error) {
         showKeyError(error instanceof Error ? error.message : 'file upload failed')
@@ -434,6 +516,9 @@ export default function AttachPanel({
 
     await uploadSelectedFile(file)
   }
+
+  const visibleImagePreviewPaths = getVisibleImagePreviewPaths(customInput, imagePreviews)
+  const previewSource = previewPath ? imagePreviews[previewPath] ?? null : null
 
   return (
     <div ref={rootRef}>
@@ -482,6 +567,28 @@ export default function AttachPanel({
                 </TooltipTrigger>
               </Tooltip>
             </div>
+            {visibleImagePreviewPaths.length > 0 && (
+              <div className="flex flex-wrap gap-3 mt-2">
+                {visibleImagePreviewPaths.map((path) => (
+                  <button
+                    key={path}
+                    type="button"
+                    className="rounded-md text-left transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--card))]"
+                    onClick={() => setPreviewPath(path)}
+                    title={path}
+                  >
+                    <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--secondary))]">
+                      <img
+                        src={imagePreviews[path]}
+                        alt={path}
+                        className="h-8 w-8 object-cover"
+                        draggable={false}
+                      />
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <div>
             <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
@@ -651,6 +758,12 @@ export default function AttachPanel({
           )}
         </Button>
       </div>
+      <ImagePreviewDialog
+        open={previewPath !== null}
+        path={previewPath}
+        src={previewSource}
+        onOpenChange={(open) => !open && setPreviewPath(null)}
+      />
     </div>
   )
 }
