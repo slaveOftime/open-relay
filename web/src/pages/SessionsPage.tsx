@@ -22,6 +22,18 @@ import NewSessionDialog from '@/components/NewSessionDialog'
 import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/SessionMetadataDialog'
 import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
+import {
+  clampSessionTableColumnSize,
+  coerceSessionTableColumnSettings,
+  getOrderedSessionTableColumns,
+  getSessionTableWidth,
+  reorderSessionTableColumn,
+  SESSION_TABLE_COLUMN_STORAGE_KEY,
+  type SessionTableColumn,
+  type SessionTableColumnKey,
+  type SessionTableColumnOrder,
+  type SessionTableColumnSizes,
+} from './sessions-table-columns'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -184,6 +196,29 @@ function saveSessionPrefs(prefs: SessionPrefs) {
   }
 }
 
+function loadSessionTableColumnSettings() {
+  if (typeof window === 'undefined') return coerceSessionTableColumnSettings(null)
+  try {
+    const raw = window.localStorage.getItem(SESSION_TABLE_COLUMN_STORAGE_KEY)
+    if (!raw) return coerceSessionTableColumnSettings(null)
+    return coerceSessionTableColumnSettings(JSON.parse(raw))
+  } catch {
+    return coerceSessionTableColumnSettings(null)
+  }
+}
+
+function saveSessionTableColumnSettings(settings: {
+  sizes: SessionTableColumnSizes
+  order: SessionTableColumnOrder
+}) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(SESSION_TABLE_COLUMN_STORAGE_KEY, JSON.stringify(settings))
+  } catch {
+    /* ignore */
+  }
+}
+
 function normalizeStoredNode(value: unknown): string | null {
   if (typeof value !== 'string') return null
   const trimmed = value.trim()
@@ -331,7 +366,7 @@ function SessionNotificationButton({
 function SkeletonRow() {
   return (
     <tr className="border-b border-[hsl(var(--border))]">
-      {[8, 30, 12, 10, 8, 8, 20, 8].map((w, i) => (
+      {[8, 10, 24, 14, 22, 30, 12, 16, 10, 8, 18].map((w, i) => (
         <TableCell key={i} className="px-3 py-3">
           <div
             className="h-3 rounded animate-shimmer"
@@ -402,6 +437,7 @@ function SessionRow({
   onEditSession,
   notificationsPending,
   node,
+  columns,
 }: {
   session: SessionSummary
   animateIn?: boolean
@@ -412,6 +448,7 @@ function SessionRow({
   onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
+  columns: SessionTableColumn[]
 }) {
   const navigate = useNavigate()
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
@@ -433,159 +470,193 @@ function SessionRow({
     navigate(buildSessionHref(session.id, mode, node))
   }
 
+  function renderCell(columnKey: SessionTableColumnKey) {
+    switch (columnKey) {
+      case 'id':
+        return (
+          <TableCell
+            key={columnKey}
+            className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
+            onClick={(e) => {
+              e.stopPropagation()
+              onEditSession(session)
+            }}
+          >
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button className="truncate text-left hover:text-[hsl(var(--primary))] transition-colors">
+                  {session.id.slice(0, 7)}
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{`${session.id} — click to edit`}</TooltipContent>
+            </Tooltip>
+          </TableCell>
+        )
+      case 'output':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2.5 truncate max-w-0">
+            <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+              {formatByteSize(session.last_total_bytes)}
+            </span>
+          </TableCell>
+        )
+      case 'title':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2.5 truncate max-w-0">
+            <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+              {session.title?.trim() || '—'}
+            </span>
+          </TableCell>
+        )
+      case 'tags':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2 align-middle">
+            <SessionTagList tags={session.tags} emptyLabel="—" className="flex-wrap gap-1" />
+          </TableCell>
+        )
+      case 'command':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2.5 truncate max-w-0">
+            <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
+              <CommandLogo command={session.command} size={24} />
+              <span className="truncate">{sessionDisplayName(session)}</span>
+            </span>
+          </TableCell>
+        )
+      case 'cwd':
+        return (
+          <TableCell
+            key={columnKey}
+            className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0"
+          >
+            {session.cwd ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span>{session.cwd}</span>
+                </TooltipTrigger>
+                <TooltipContent>{session.cwd}</TooltipContent>
+              </Tooltip>
+            ) : null}
+          </TableCell>
+        )
+      case 'status':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2.5 whitespace-nowrap">
+            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
+          </TableCell>
+        )
+      case 'created_at':
+        return (
+          <TableCell
+            key={columnKey}
+            className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs whitespace-nowrap"
+          >
+            {formatTimestamp(session.created_at)}
+          </TableCell>
+        )
+      case 'activity':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2.5">
+            <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} />
+          </TableCell>
+        )
+      case 'pid':
+        return (
+          <TableCell
+            key={columnKey}
+            className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono"
+          >
+            {session.pid != null && session.pid}
+          </TableCell>
+        )
+      case 'actions':
+        return (
+          <TableCell key={columnKey} className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center gap-1">
+              {isRunning && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button asChild variant="link" size="icon" className="shrink-0">
+                      <Link to={attachHref} aria-label="Attach">
+                        <Link2Icon className="h-4 w-4" />
+                      </Link>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Attach</TooltipContent>
+                </Tooltip>
+              )}
+              {isRunning && (
+                <>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="stop"
+                        size="icon"
+                        className="shrink-0"
+                        onClick={() => setPendingAction('stop')}
+                      >
+                        <StopIcon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Stop</TooltipContent>
+                  </Tooltip>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="kill"
+                        size="icon"
+                        className="shrink-0"
+                        onClick={() => setPendingAction('kill')}
+                      >
+                        <Cross2Icon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Kill</TooltipContent>
+                  </Tooltip>
+                  <SessionNotificationButton
+                    enabled={session.notifications_enabled}
+                    disabled={!isRunning}
+                    pending={notificationsPending}
+                    onToggle={() => onToggleNotifications(session)}
+                  />
+                </>
+              )}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button asChild variant="ghost" size="icon" className="shrink-0">
+                    <Link to={logsHref} aria-label="Logs">
+                      <FileTextIcon className="h-4 w-4" />
+                    </Link>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Logs</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="shrink-0"
+                    onClick={() => onRunAgain(session)}
+                  >
+                    <CopyIcon className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Run Again</TooltipContent>
+              </Tooltip>
+            </div>
+          </TableCell>
+        )
+    }
+  }
+
   return (
     <>
       <TableRow
         className={`group border-b border-[hsl(var(--border))] transition-colors duration-150 hover:bg-[hsl(var(--accent))] cursor-pointer ${rowOpacity} ${animateClass}`}
         onClick={() => openSession(isRunning ? 'attach' : 'logs')}
       >
-        {/* ID */}
-        <TableCell
-          className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
-          onClick={(e) => {
-            e.stopPropagation()
-            onEditSession(session)
-          }}
-        >
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button className="truncate text-left hover:text-[hsl(var(--primary))] transition-colors">
-                {session.id.slice(0, 7)}
-              </button>
-            </TooltipTrigger>
-            <TooltipContent>{`${session.id} — click to edit`}</TooltipContent>
-          </Tooltip>
-        </TableCell>
-
-        <TableCell className="px-3 py-2.5 truncate max-w-0">
-          <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            {formatByteSize(session.last_total_bytes)}
-          </span>
-        </TableCell>
-
-        {/* Title */}
-        <TableCell className="px-3 py-2.5 truncate max-w-0">
-          <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            {session.title?.trim() || '—'}
-          </span>
-        </TableCell>
-
-        {/* Tags */}
-        <TableCell className="px-3 py-2 align-middle">
-          <SessionTagList tags={session.tags} emptyLabel="—" className="flex-wrap gap-1" />
-        </TableCell>
-
-        {/* CMD */}
-        <TableCell className="px-3 py-2.5 truncate max-w-0">
-          <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-            <CommandLogo command={session.command} size={24} />
-            <span className="truncate">{sessionDisplayName(session)}</span>
-          </span>
-        </TableCell>
-
-        {/* CWD */}
-        <TableCell className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0">
-          {session.cwd ? (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <span>{session.cwd}</span>
-              </TooltipTrigger>
-              <TooltipContent>{session.cwd}</TooltipContent>
-            </Tooltip>
-          ) : null}
-        </TableCell>
-
-        {/* Status */}
-        <TableCell className="px-3 py-2.5 whitespace-nowrap">
-          <StatusBadge status={session.status} inputNeeded={session.input_needed} />
-        </TableCell>
-
-        {/* Created at */}
-        <TableCell className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs whitespace-nowrap">
-          {formatTimestamp(session.created_at)}
-        </TableCell>
-
-        {/* Activity */}
-        <TableCell className="px-3 py-2.5">
-          <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} />
-        </TableCell>
-
-        {/* PID */}
-        <TableCell className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono">
-          {session.pid != null && session.pid}
-        </TableCell>
-
-        {/* Actions */}
-        <TableCell className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
-          <div className="flex items-center gap-1">
-            {isRunning && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button asChild variant="link" size="icon" className="shrink-0">
-                    <Link to={attachHref} aria-label="Attach">
-                      <Link2Icon className="h-4 w-4" />
-                    </Link>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Attach</TooltipContent>
-              </Tooltip>
-            )}
-            {isRunning && (
-              <>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="stop"
-                      size="icon"
-                      className="shrink-0"
-                      onClick={() => setPendingAction('stop')}
-                    >
-                      <StopIcon className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Stop</TooltipContent>
-                </Tooltip>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="kill"
-                      size="icon"
-                      className="shrink-0"
-                      onClick={() => setPendingAction('kill')}
-                    >
-                      <Cross2Icon className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Kill</TooltipContent>
-                </Tooltip>
-                <SessionNotificationButton
-                  enabled={session.notifications_enabled}
-                  disabled={!isRunning}
-                  pending={notificationsPending}
-                  onToggle={() => onToggleNotifications(session)}
-                />
-              </>
-            )}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button asChild variant="ghost" size="icon" className="shrink-0">
-                  <Link to={logsHref} aria-label="Logs">
-                    <FileTextIcon className="h-4 w-4" />
-                  </Link>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Logs</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon" className="shrink-0" onClick={() => onRunAgain(session)}>
-                  <CopyIcon className="h-4 w-4" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>Run Again</TooltipContent>
-            </Tooltip>
-          </div>
-        </TableCell>
+        {columns.map((column) => renderCell(column.key))}
       </TableRow>
 
       {/* Confirm dialog */}
@@ -859,9 +930,22 @@ export default function SessionsPage() {
   const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
   const [loadError, setLoadError] = useState<LoadErrorState | null>(null)
+  const [tableColumnSettings, setTableColumnSettings] = useState(loadSessionTableColumnSettings)
+  const tableColumnSizes = tableColumnSettings.sizes
+  const tableColumnOrder = tableColumnSettings.order
+  const orderedTableColumns = useMemo(
+    () => getOrderedSessionTableColumns(tableColumnOrder),
+    [tableColumnOrder]
+  )
 
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const delayedReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const tableResizeRef = useRef<{
+    columnKey: SessionTableColumnKey
+    startX: number
+    startWidth: number
+  } | null>(null)
+  const tableColumnDragRef = useRef<SessionTableColumnKey | null>(null)
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
   const loadedSessionIdsRef = useRef<Set<string>>(new Set())
@@ -1075,6 +1159,10 @@ export default function SessionsPage() {
   }, [search, selectedNode, statusFilter, groupBy, sortField, sortOrder])
 
   useEffect(() => {
+    saveSessionTableColumnSettings(tableColumnSettings)
+  }, [tableColumnSettings])
+
+  useEffect(() => {
     if (!selectedNode) {
       void loadLocal()
     }
@@ -1286,6 +1374,74 @@ export default function SessionsPage() {
     setPage(0)
   }
 
+  function beginColumnResize(columnKey: SessionTableColumnKey, event: React.PointerEvent) {
+    event.preventDefault()
+    event.stopPropagation()
+    tableResizeRef.current = {
+      columnKey,
+      startX: event.clientX,
+      startWidth: tableColumnSizes[columnKey],
+    }
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  function updateColumnResize(event: React.PointerEvent) {
+    const resize = tableResizeRef.current
+    if (!resize) return
+    event.preventDefault()
+    const nextWidth = clampSessionTableColumnSize(
+      resize.columnKey,
+      resize.startWidth + event.clientX - resize.startX
+    )
+    setTableColumnSettings((previous) => {
+      if (previous.sizes[resize.columnKey] === nextWidth) return previous
+      return {
+        ...previous,
+        sizes: {
+          ...previous.sizes,
+          [resize.columnKey]: nextWidth,
+        },
+      }
+    })
+  }
+
+  function endColumnResize(event: React.PointerEvent) {
+    if (!tableResizeRef.current) return
+    tableResizeRef.current = null
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  function beginColumnReorder(columnKey: SessionTableColumnKey, event: React.DragEvent) {
+    tableColumnDragRef.current = columnKey
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', columnKey)
+  }
+
+  function moveColumnBefore(columnKey: SessionTableColumnKey, event: React.DragEvent) {
+    const draggedColumn = tableColumnDragRef.current
+    if (!draggedColumn || draggedColumn === columnKey) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'move'
+  }
+
+  function dropColumnBefore(columnKey: SessionTableColumnKey, event: React.DragEvent) {
+    const draggedColumn =
+      tableColumnDragRef.current || (event.dataTransfer.getData('text/plain') as SessionTableColumnKey)
+    tableColumnDragRef.current = null
+    if (!draggedColumn || draggedColumn === columnKey) return
+    event.preventDefault()
+    setTableColumnSettings((previous) => ({
+      ...previous,
+      order: reorderSessionTableColumn(previous.order, draggedColumn, columnKey),
+    }))
+  }
+
+  function endColumnReorder() {
+    tableColumnDragRef.current = null
+  }
+
   const hasActiveFilters =
     search !== '' ||
     statusFilter !== 'all' ||
@@ -1351,6 +1507,7 @@ export default function SessionsPage() {
       </SelectContent>
     </Select>
   )
+  const tableWidth = getSessionTableWidth(tableColumnSizes)
 
   return (
     <TooltipProvider>
@@ -1674,66 +1831,78 @@ export default function SessionsPage() {
             <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
           )}
           {!loading && sessions.length > 0 && (
-            <Table className="w-full border-collapse table-fixed">
+            <Table
+              className="w-full border-collapse table-fixed"
+              style={{ minWidth: `${tableWidth}px` }}
+            >
               <colgroup>
-                <col style={{ width: '5rem' }} />
-                <col style={{ width: '6rem' }} />
-                <col style={{ width: 'auto', minWidth: '6rem' }} />
-                <col style={{ width: 'auto', minWidth: '6rem' }} />
-                <col style={{ width: 'auto', minWidth: '6rem' }} />
-                <col style={{ width: 'auto' }} />
-                <col style={{ width: '8rem' }} />
-                <col style={{ width: '10rem' }} />
-                <col style={{ width: '6rem' }} />
-                <col style={{ width: '5rem' }} />
-                <col style={{ width: '11rem' }} />
+                {orderedTableColumns.map((column) => (
+                  <col key={column.key} style={{ width: `${tableColumnSizes[column.key]}px` }} />
+                ))}
               </colgroup>
               <TableHeader>
                 <TableRow>
-                  {(
-                    [
-                      { key: 'id', label: 'ID', sortField: SessionSortField.Id },
-                      { key: 'output', label: 'Output', sortField: undefined },
-                      { key: 'title', label: 'Title', sortField: SessionSortField.Title },
-                      { key: 'tags', label: 'Tags', sortField: undefined },
-                      {
-                        key: 'command',
-                        label: 'Command',
-                        sortField: SessionSortField.Command,
-                      },
-                      { key: 'cwd', label: 'CWD', sortField: SessionSortField.Cwd },
-                      { key: 'status', label: 'Status', sortField: SessionSortField.Status },
-                      {
-                        key: 'created_at',
-                        label: 'Created At',
-                        sortField: SessionSortField.CreatedAt,
-                      },
-                      { key: 'activity', label: 'Activity', sortField: undefined },
-                      { key: 'pid', label: 'PID', sortField: SessionSortField.Pid },
-                      { key: 'actions', label: 'Actions', sortField: undefined },
-                    ] as const
-                  ).map((col) => (
-                    <TableHead
-                      key={col.key}
-                      className={`px-3 py-2.5 text-left text-xs font-medium tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
-                        col.sortField
-                          ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
-                          : 'text-[hsl(var(--muted-foreground))]'
-                      } ${col.sortField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
-                      onClick={col.sortField ? () => handleSort(col.sortField!) : undefined}
-                    >
-                      <span className="inline-flex items-center gap-1">
-                        {col.label}
-                        {col.sortField && (
-                          <SortIcon
-                            field={col.sortField}
-                            sortField={sortField}
-                            sortOrder={sortOrder}
-                          />
-                        )}
-                      </span>
-                    </TableHead>
-                  ))}
+                  {orderedTableColumns.map((col) => {
+                    const sortableField = col.sortField
+                    return (
+                      <TableHead
+                        key={col.key}
+                        onDragOver={(event) => moveColumnBefore(col.key, event)}
+                        onDrop={(event) => dropColumnBefore(col.key, event)}
+                        className={`relative px-3 py-2.5 text-left text-xs font-medium tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
+                          sortableField
+                            ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
+                            : 'text-[hsl(var(--muted-foreground))]'
+                        } ${sortableField === sortField ? 'text-[hsl(var(--primary))]' : 'text-[hsl(var(--muted-foreground))]'}`}
+                        onClick={sortableField ? () => handleSort(sortableField) : undefined}
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            draggable
+                            aria-label={`Drag ${col.label} column`}
+                            className="inline-flex h-5 w-4 cursor-grab items-center justify-center rounded text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--foreground))] active:cursor-grabbing"
+                            onClick={(event) => event.stopPropagation()}
+                            onDragStart={(event) => beginColumnReorder(col.key, event)}
+                            onDragEnd={endColumnReorder}
+                          >
+                            <GridIcon className="h-3 w-3" />
+                          </button>
+                          <span className="inline-flex min-w-0 items-center gap-1">
+                            {col.label}
+                            {sortableField && (
+                              <SortIcon
+                                field={sortableField}
+                                sortField={sortField}
+                                sortOrder={sortOrder}
+                              />
+                            )}
+                          </span>
+                        </span>
+                        <span
+                          role="separator"
+                          aria-orientation="vertical"
+                          aria-label={`Resize ${col.label} column`}
+                          className="absolute right-0 top-0 z-30 h-full w-2 cursor-col-resize touch-none select-none after:absolute after:right-0 after:top-2 after:h-[calc(100%-1rem)] after:w-px after:bg-[hsl(var(--border))] hover:after:bg-[hsl(var(--primary))]"
+                          onClick={(event) => event.stopPropagation()}
+                          onPointerDown={(event) => beginColumnResize(col.key, event)}
+                          onPointerMove={updateColumnResize}
+                          onPointerUp={endColumnResize}
+                          onPointerCancel={endColumnResize}
+                          onDoubleClick={(event) => {
+                            event.stopPropagation()
+                          setTableColumnSettings((previous) => ({
+                            ...previous,
+                            sizes: {
+                              ...previous.sizes,
+                              [col.key]: col.defaultWidth,
+                            },
+                          }))
+                        }}
+                      />
+                      </TableHead>
+                    )
+                  })}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -1742,7 +1911,7 @@ export default function SessionsPage() {
                     {groupBy !== 'none' && key && (
                       <TableRow>
                         <TableCell
-                          colSpan={10}
+                          colSpan={orderedTableColumns.length}
                           className="px-3 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-[hsl(var(--border))]"
                         >
                           <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
@@ -1761,6 +1930,7 @@ export default function SessionsPage() {
                         onEditSession={handleEditSession}
                         notificationsPending={notificationRequestIds.has(s.id)}
                         node={selectedNode ?? undefined}
+                        columns={orderedTableColumns}
                       />
                     ))}
                   </Fragment>
