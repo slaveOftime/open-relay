@@ -6,6 +6,7 @@ import { buildSessionMetadataUpdateSpec, formatSessionTagInput } from '@/lib/ses
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { FormActions, FormError, FormField } from '@/components/ui/form-field'
 
 type SessionMetadataDialogProps = {
   open: boolean
@@ -90,54 +91,50 @@ function SessionMetadataDialogForm({
       <DialogHeader>
         <DialogTitle>Edit Session</DialogTitle>
       </DialogHeader>
-      <Form.Root
-        onSubmit={(event) => {
-          event.preventDefault()
-          void handleSubmit()
-        }}
-        className="mt-1 flex flex-col gap-3"
-      >
-        <div className="rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 px-3 py-2 flex items-center gap-2">
-          <div className="text-xs text-[hsl(var(--muted-foreground))]">Session:</div>
-          <div className="font-mono text-sm text-[hsl(var(--foreground))] break-all">{session.id}</div>
-        </div>
-        <Form.Field name="title" className="flex flex-col gap-1.5">
-          <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Title</Form.Label>
-          <Form.Control asChild>
+        <Form.Root
+          onSubmit={(event) => {
+            event.preventDefault()
+            void handleSubmit()
+          }}
+          className="mt-1 flex flex-col gap-4"
+        >
+          <div className="rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 px-3 py-2 flex items-center gap-2">
+            <div className="text-xs text-[hsl(var(--muted-foreground))]">Session:</div>
+            <div className="font-mono text-sm text-[hsl(var(--foreground))] break-all">{session.id}</div>
+          </div>
+          <FormField
+            name="title"
+            label="Title"
+            description="Leave blank to clear the title."
+          >
             <Input
               value={title}
               onChange={(event) => setTitle(event.target.value)}
               placeholder="Optional display name"
               autoFocus
             />
-          </Form.Control>
-          <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-            Leave blank to clear the title.
-          </p>
-        </Form.Field>
-        <Form.Field name="tags" className="flex flex-col gap-1.5">
-          <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Tags</Form.Label>
-          <Form.Control asChild>
+          </FormField>
+          <FormField
+            name="tags"
+            label="Tags"
+            description="Separate tags with commas. Leave blank to clear all tags."
+          >
             <Input
               value={tags}
               onChange={(event) => setTags(event.target.value)}
               placeholder="prod, release"
             />
-          </Form.Control>
-          <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-            Separate tags with commas. Leave blank to clear all tags.
-          </p>
-        </Form.Field>
-        {error && <p className="text-xs text-red-500">{error}</p>}
-        <div className="flex justify-end gap-2 pt-1">
-          <Button type="button" variant="ghost" size="sm" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button type="submit" size="sm" disabled={loading}>
-            {loading ? 'Saving…' : 'Save'}
-          </Button>
-        </div>
-      </Form.Root>
-    </DialogContent>
-  )
+          </FormField>
+          {error ? <FormError>{error}</FormError> : null}
+          <FormActions>
+            <Button type="button" variant="ghost" size="sm" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button type="submit" size="sm" disabled={loading}>
+              {loading ? 'Saving…' : 'Save'}
+            </Button>
+          </FormActions>
+        </Form.Root>
+      </DialogContent>
+    )
 }
