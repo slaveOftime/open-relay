@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { login, setToken } from '../api/client'
 import { TooManyAttemptsError } from '../api/types'
 import { Button } from './ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog'
 import { Input } from './ui/input'
 
 interface LoginDialogProps {
@@ -92,53 +93,56 @@ export default function LoginDialog({ open, onSuccess }: LoginDialogProps) {
   const isLocked = !!lockedUntil
 
   return (
-    /* Full-viewport blocking overlay — intentionally non-dismissible */
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
-      <div className="w-full max-w-sm rounded-xl border border-white/10 bg-[hsl(var(--background))] p-8 shadow-2xl">
-        {/* Logo / title */}
-        <div className="mb-6 text-center">
-          <div className="mb-3 flex justify-center">
-            <img src="/icon.svg" alt="" aria-hidden="true" className="h-16 w-16" />
-          </div>
-          <h1 className="text-xl font-semibold tracking-tight">Open Relay</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Enter the daemon password to continue
-          </p>
+    <Dialog open={open}>
+      <DialogContent
+        showCloseButton={false}
+        className="max-w-sm border-[hsl(var(--border))] bg-[hsl(var(--background))] p-0 shadow-2xl"
+        onEscapeKeyDown={(event) => event.preventDefault()}
+        onInteractOutside={(event) => event.preventDefault()}
+      >
+        <div className="p-8">
+          <DialogHeader className="mb-6 text-center">
+            <div className="mb-3 flex justify-center">
+              <img src="/icon.svg" alt="" aria-hidden="true" className="h-16 w-16" />
+            </div>
+            <DialogTitle className="text-xl">Open Relay</DialogTitle>
+            <DialogDescription>Enter the daemon password to continue</DialogDescription>
+          </DialogHeader>
+
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <Input
+              ref={inputRef}
+              type="password"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={loading || isLocked}
+              autoFocus
+              autoComplete="current-password"
+            />
+
+            {error && (
+              <p className="text-sm text-[hsl(var(--destructive))]">
+                {error}
+                {isLocked && countdown && (
+                  <span className="ml-1 font-mono">Retry in {countdown}.</span>
+                )}
+              </p>
+            )}
+
+            {attemptsRemaining != null && !isLocked && attemptsRemaining > 0 && (
+              <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                {attemptsRemaining} attempt{attemptsRemaining === 1 ? '' : 's'} remaining before
+                lockout.
+              </p>
+            )}
+
+            <Button type="submit" className="w-full" disabled={loading || isLocked || !password}>
+              {loading ? 'Verifying…' : 'Sign in'}
+            </Button>
+          </form>
         </div>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <Input
-            ref={inputRef}
-            type="password"
-            placeholder="Password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            disabled={loading || isLocked}
-            autoFocus
-            autoComplete="current-password"
-          />
-
-          {error && (
-            <p className="text-sm text-destructive">
-              {error}
-              {isLocked && countdown && (
-                <span className="ml-1 font-mono">Retry in {countdown}.</span>
-              )}
-            </p>
-          )}
-
-          {attemptsRemaining != null && !isLocked && attemptsRemaining > 0 && (
-            <p className="text-xs text-muted-foreground">
-              {attemptsRemaining} attempt{attemptsRemaining === 1 ? '' : 's'} remaining before
-              lockout.
-            </p>
-          )}
-
-          <Button type="submit" className="w-full" disabled={loading || isLocked || !password}>
-            {loading ? 'Verifying…' : 'Sign in'}
-          </Button>
-        </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }

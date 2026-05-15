@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 import StatusBadge from './StatusBadge'
-import { badgeVariants } from './ui/badge'
+import { badgeVariants } from './ui/badge-variants'
 
 describe('StatusBadge', () => {
   it('renders a single input-needed label', () => {

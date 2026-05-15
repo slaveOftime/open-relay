@@ -1,34 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
 import { startSession } from '@/api/client'
-import type { SessionSummary } from '@/api/types'
-import { formatSessionTagInput, parseSessionTagInput } from '@/lib/sessionMetadata'
+import { parseSessionTagInput } from '@/lib/sessionMetadata'
 import { parseArgString } from '@/utils/format'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-
-export type NewSessionInitialValues = {
-  cmd: string
-  args: string
-  title: string
-  tags: string
-  cwd: string
-}
-
-export function buildNewSessionInitialValues(
-  session: Pick<SessionSummary, 'command' | 'args' | 'title' | 'tags' | 'cwd'>
-): NewSessionInitialValues {
-  return {
-    cmd: session.command,
-    args: session.args
-      .map((arg) => (/\s/.test(arg) ? `"${arg.replace(/"/g, '\\"')}"` : arg))
-      .join(' '),
-    title: session.title ?? '',
-    tags: formatSessionTagInput(session.tags),
-    cwd: session.cwd ?? '',
-  }
-}
+import { FormActions, FormError, FormField } from '@/components/ui/form-field'
+import type { NewSessionInitialValues } from './new-session-dialog-values'
 
 export default function NewSessionDialog({
   open,
@@ -119,81 +98,59 @@ export default function NewSessionDialog({
             event.preventDefault()
             void handleSubmit()
           }}
-          className="mt-1 flex flex-col gap-3"
+          className="mt-1 flex flex-col gap-4"
         >
-          <Form.Field name="command" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
-              Command <span className="text-red-500">*</span>
-            </Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={cmd}
-                onChange={(event) => setCmd(event.target.value)}
-                placeholder="claude, bash, python…"
-                required
-                autoFocus
-              />
-            </Form.Control>
-            <Form.Message match="valueMissing" className="text-xs text-red-500">
-              Command is required
-            </Form.Message>
-          </Form.Field>
-          <Form.Field name="arguments" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
-              Arguments
-            </Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={args}
-                onChange={(event) => setArgs(event.target.value)}
-                placeholder="--model sonnet-3.7 (space-separated)"
-              />
-            </Form.Control>
-          </Form.Field>
-          <Form.Field name="title" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Title</Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                placeholder="Optional display name"
-              />
-            </Form.Control>
-          </Form.Field>
-          <Form.Field name="tags" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">Tags</Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={tags}
-                onChange={(event) => setTags(event.target.value)}
-                placeholder="prod, release"
-              />
-            </Form.Control>
-            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-              Separate tags with commas.
-            </p>
-          </Form.Field>
-          <Form.Field name="cwd" className="flex flex-col gap-1.5">
-            <Form.Label className="text-xs text-[hsl(var(--muted-foreground))]">
-              Working Directory
-            </Form.Label>
-            <Form.Control asChild>
-              <Input
-                value={cwd}
-                onChange={(event) => setCwd(event.target.value)}
-                placeholder="/path/to/project"
-              />
-            </Form.Control>
-          </Form.Field>
-          {error && <p className="text-xs text-red-500">{error}</p>}
-          <div className="flex justify-end gap-2 pt-1">
+          <FormField
+            name="command"
+            label="Command"
+            required
+            error={error === 'Command is required' ? error : undefined}
+          >
+            <Input
+              value={cmd}
+              onChange={(event) => setCmd(event.target.value)}
+              placeholder="claude, bash, python…"
+              required
+              autoFocus
+            />
+          </FormField>
+          <FormField name="arguments" label="Arguments">
+            <Input
+              value={args}
+              onChange={(event) => setArgs(event.target.value)}
+              placeholder="--model sonnet-3.7 (space-separated)"
+            />
+          </FormField>
+          <FormField name="title" label="Title">
+            <Input
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Optional display name"
+            />
+          </FormField>
+          <FormField name="tags" label="Tags" description="Separate tags with commas.">
+            <Input
+              value={tags}
+              onChange={(event) => setTags(event.target.value)}
+              placeholder="prod, release"
+            />
+          </FormField>
+          <FormField name="cwd" label="Working Directory">
+            <Input
+              value={cwd}
+              onChange={(event) => setCwd(event.target.value)}
+              placeholder="/path/to/project"
+            />
+          </FormField>
+          {error && error !== 'Command is required' ? <FormError>{error}</FormError> : null}
+          <FormActions>
             <Button type="button" variant="ghost" size="sm" onClick={handleClose}>
               Cancel
             </Button>
             <Button type="submit" size="sm" disabled={loading}>
               {loading ? 'Starting…' : 'Start Session'}
             </Button>
-          </div>
+          </FormActions>
         </Form.Root>
       </DialogContent>
     </Dialog>
