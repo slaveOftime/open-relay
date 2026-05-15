@@ -557,7 +557,7 @@ function SessionRow({
       case 'activity':
         return (
           <TableCell key={columnKey} className="px-3 py-2.5">
-            <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} />
+            <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} fullWidth />
           </TableCell>
         )
       case 'pid':

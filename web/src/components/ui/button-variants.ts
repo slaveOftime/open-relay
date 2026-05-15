@@ -6,7 +6,7 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default:
-          'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:bg-[hsl(var(--primary)/0.9)]',
+          'bg-[hsl(var(--primary))] text-[hsl(var(--primary-foreground))] hover:bg-[hsl(var(--primary))] hover:opacity-90',
         destructive:
           'bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 dark:bg-red-900/60 dark:text-red-200 dark:border-red-800/50 dark:hover:bg-red-900/80',
         outline:

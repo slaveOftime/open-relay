@@ -142,15 +142,19 @@ export default function ImagePreviewDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
-        className="left-0 top-0 flex h-screen max-h-screen w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 bg-black/95 p-0 text-white"
+        className="left-0 top-0 flex h-screen max-h-screen w-screen max-w-none translate-x-0 translate-y-0 flex-col gap-0 rounded-none border-0 bg-[hsl(var(--background)/0.96)] p-0 text-[hsl(var(--foreground))]"
       >
-        <div className="flex items-start justify-between gap-3 border-b border-white/10 px-3 py-2">
+        <div className="flex items-start justify-between gap-3 border-b border-[hsl(var(--border))] bg-[hsl(var(--card)/0.84)] px-3 py-2 backdrop-blur-sm">
           <div className="min-w-0">
-            <DialogTitle className="text-sm font-semibold text-white">Image preview</DialogTitle>
-            {path && <p className="truncate text-[11px] leading-4 text-white/70">{path}</p>}
+            <DialogTitle className="text-sm font-semibold text-[hsl(var(--foreground))]">
+              Image preview
+            </DialogTitle>
+            {path && (
+              <p className="truncate text-[11px] leading-4 text-[hsl(var(--muted-foreground))]">{path}</p>
+            )}
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
-            <span className="min-w-12 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-right text-[11px] text-white/70">
+            <span className="min-w-12 rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--secondary))] px-2 py-1 text-right text-[11px] text-[hsl(var(--muted-foreground))]">
               {Math.round(zoom * 100)}%
             </span>
             <Tooltip>
@@ -159,7 +163,7 @@ export default function ImagePreviewDialog({
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="h-8 w-8 rounded-full text-white/80 hover:bg-white/10 hover:text-white"
+                  className="h-8 w-8 rounded-full text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--foreground))]"
                   onClick={() => applyZoom(zoom - IMAGE_PREVIEW_ZOOM_STEP)}
                 >
                   <ZoomOut className="h-4 w-4" />
@@ -174,7 +178,7 @@ export default function ImagePreviewDialog({
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="h-8 w-8 rounded-full text-white/80 hover:bg-white/10 hover:text-white"
+                  className="h-8 w-8 rounded-full text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--foreground))]"
                   onClick={() => applyZoom(zoom + IMAGE_PREVIEW_ZOOM_STEP)}
                 >
                   <ZoomIn className="h-4 w-4" />
@@ -189,7 +193,7 @@ export default function ImagePreviewDialog({
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="h-8 text-white/80 hover:bg-white/10 hover:text-white"
+                  className="h-8 text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--foreground))]"
                   onClick={resetView}
                 >
                   <span>Reset</span>
@@ -203,7 +207,7 @@ export default function ImagePreviewDialog({
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="h-8 w-8 rounded-full text-white/80 hover:bg-white/10 hover:text-white"
+                  className="h-8 w-8 rounded-full text-[hsl(var(--muted-foreground))] hover:bg-[hsl(var(--accent))] hover:text-[hsl(var(--foreground))]"
                   onClick={() => onOpenChange(false)}
                 >
                   <Cross2Icon className="h-4 w-4" />
