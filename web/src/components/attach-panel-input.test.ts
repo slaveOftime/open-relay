@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
-import { insertTextAtSelection, insertUploadedPathAtSelection } from './attach-panel-input'
+import {
+  insertTextAtSelection,
+  insertUploadedPathAtSelection,
+  removeUploadedPathFromInput,
+} from './attach-panel-input'
 
 describe('attach-panel input helpers', () => {
   it('inserts uploaded paths at the current cursor position', () => {
@@ -41,6 +45,31 @@ describe('attach-panel input helpers', () => {
       selection: {
         start: 1,
         end: 1,
+      },
+    })
+  })
+
+  it('removes uploaded paths and their append spacing from input text', () => {
+    expect(
+      removeUploadedPathFromInput('echo hello /tmp/paste.png /tmp/other.png', '/tmp/paste.png', {
+        start: 36,
+        end: 36,
+      })
+    ).toEqual({
+      value: 'echo hello /tmp/other.png',
+      selection: {
+        start: 21,
+        end: 21,
+      },
+    })
+  })
+
+  it('removes every occurrence so hidden previews stay removed', () => {
+    expect(removeUploadedPathFromInput('/tmp/paste.png cat /tmp/paste.png', '/tmp/paste.png')).toEqual({
+      value: 'cat',
+      selection: {
+        start: 3,
+        end: 3,
       },
     })
   })

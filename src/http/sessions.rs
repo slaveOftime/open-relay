@@ -836,7 +836,7 @@ pub async fn upload_file(
             id: id.clone(),
             path: pathbuf_to_rpc_path(&relative_path),
             bytes: bytes.to_vec(),
-            dedupe: false,
+            dedupe: true,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::UploadFile { path, bytes }) => Json(UploadFileResponse {
@@ -863,7 +863,7 @@ pub async fn upload_file(
         };
     }
 
-    match write_session_upload(&state.config, &id, &raw_target, &bytes, false) {
+    match write_session_upload(&state.config, &id, &raw_target, &bytes, true) {
         Ok(target_path) => Json(UploadFileResponse {
             ok: true,
             path: target_path.to_string_lossy().to_string(),

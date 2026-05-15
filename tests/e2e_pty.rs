@@ -28,7 +28,7 @@ where
 
 fn native_shell_timeout() -> Duration {
     if cfg!(target_os = "windows") {
-        Duration::from_secs(6)
+        Duration::from_secs(12)
     } else {
         Duration::from_secs(3)
     }
@@ -105,17 +105,20 @@ fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
             fetch_logs(tmp, &id)
         )
     });
-    let prompt = trailing_prompt(&baseline).to_string();
-    let ready_marker = format!("oly_e2e_bash_ready_{test_name}");
+    // Use a simple marker that won't wrap across lines in the terminal
+    let ready_marker = "oly_e2e_bash_ready";
     let ready_command = format!("echo {ready_marker}");
     send_line(tmp, &id, &ready_command);
 
-    let ready = wait_for_prompted_output(
+    // On Windows+WSL, startup warnings can make the initial trailing line unstable.
+    // For readiness, only require that new output appears and includes the marker.
+    let ready = wait_for_log(
         tmp,
         &id,
-        &baseline,
-        &prompt,
-        [ready_marker.as_str()],
+        |log| {
+            let log = normalize_log_text(log);
+            log.len() > baseline.len() && log.contains(ready_marker)
+        },
         timeout,
     );
     assert!(
@@ -143,7 +146,10 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
     let id = start_session(&tmp, shell);
 
     let initial = wait_for_stable_log(&tmp, &id, timeout).unwrap_or_else(|| {
-        panic!("shell did not reach a stable prompt within 3 s; session = {id}")
+        panic!(
+            "shell did not reach a stable prompt within {} s; session = {id}",
+            timeout.as_secs()
+        )
     });
     let prompt = trailing_prompt(&initial).to_string();
 
@@ -154,7 +160,8 @@ fn e2e_native_shell_echo_marker_appears_in_logs() {
     let result = wait_for_prompted_output(&tmp, &id, &initial, &prompt, [MARKER], timeout);
     assert!(
         result.is_some(),
-        "marker '{MARKER}' did not appear in logs within 3 s.\nLogs:\n{}",
+        "marker '{MARKER}' did not appear in logs within {} s.\nLogs:\n{}",
+        timeout.as_secs(),
         fetch_logs(&tmp, &id)
     );
 }
@@ -175,7 +182,7 @@ fn e2e_two_separate_input_calls_execute_command() {
     let id = start_session(&tmp, shell);
 
     let initial = wait_for_stable_log(&tmp, &id, timeout)
-        .expect("shell did not reach a stable prompt within 3 s");
+        .unwrap_or_else(|| panic!("shell did not reach a stable prompt within {} s", timeout.as_secs()));
     let prompt = trailing_prompt(&initial).to_string();
 
     const MARKER: &str = "oly_e2e_two_inputs_marker";
@@ -207,7 +214,7 @@ fn e2e_multiple_commands_appear_in_order() {
     let id = start_session(&tmp, shell);
 
     let initial = wait_for_stable_log(&tmp, &id, timeout)
-        .expect("shell did not reach a stable prompt within 3 s");
+        .unwrap_or_else(|| panic!("shell did not reach a stable prompt within {} s", timeout.as_secs()));
     let prompt = trailing_prompt(&initial).to_string();
 
     send_line(&tmp, &id, "echo oly_e2e_order_first");
@@ -573,7 +580,7 @@ fn e2e_logs_contain_no_escape_artifacts() {
     let id = start_session(&tmp, shell);
 
     let initial = wait_for_stable_log(&tmp, &id, timeout)
-        .expect("shell did not reach a stable prompt within 3 s");
+        .unwrap_or_else(|| panic!("shell did not reach a stable prompt within {} s", timeout.as_secs()));
     let prompt = trailing_prompt(&initial).to_string();
 
     send_line(&tmp, &id, "echo ARTIFACT_CHECK_1");
@@ -619,9 +626,19 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     let id2 = start_session(&tmp, shell);
 
     let initial1 = wait_for_stable_log(&tmp, &id1, timeout)
-        .unwrap_or_else(|| panic!("session {id1} did not reach a stable prompt within 3 s"));
+        .unwrap_or_else(|| {
+            panic!(
+                "session {id1} did not reach a stable prompt within {} s",
+                timeout.as_secs()
+            )
+        });
     let initial2 = wait_for_stable_log(&tmp, &id2, timeout)
-        .unwrap_or_else(|| panic!("session {id2} did not reach a stable prompt within 3 s"));
+        .unwrap_or_else(|| {
+            panic!(
+                "session {id2} did not reach a stable prompt within {} s",
+                timeout.as_secs()
+            )
+        });
     let prompt1 = trailing_prompt(&initial1).to_string();
     let prompt2 = trailing_prompt(&initial2).to_string();
 

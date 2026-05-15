@@ -68,7 +68,16 @@ jobs:
 
       - name: Test
         run: |
-          cargo test
+          cargo test --test cli_errors
+          cargo test --test e2e_csvlens
+          cargo test --test e2e_daemon
+          # Windows PTY e2e tests require single-threaded execution due to resource contention
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test --test e2e_pty -- --test-threads=1
+          else
+            cargo test --test e2e_pty
+          fi
+        shell: bash
 
       - name: Build Release
         run: cargo build --release

@@ -16,30 +16,14 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::Mutex,
     sync::atomic::{AtomicUsize, Ordering},
     thread::sleep,
     time::{Duration, Instant},
 };
 
-/// Tests no longer need a global in-binary lock:
-/// - each test gets its own `OLY_STATE_DIR`
-/// - each test gets a unique `OLY_SOCKET_NAME`
-/// - each daemon listens on its own tmp-backed resources
-///
-/// Keep the old `.lock().unwrap_or_else(...)` call sites working so the suite can
-/// run in parallel without a broad call-site rewrite.
-pub static E2E_LOCK: NoopLock = NoopLock;
+pub static E2E_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TMP_DIR: AtomicUsize = AtomicUsize::new(0);
-
-pub struct NoopLock;
-
-pub struct NoopGuard;
-
-impl NoopLock {
-    pub fn lock(&self) -> Result<NoopGuard, std::sync::PoisonError<NoopGuard>> {
-        Ok(NoopGuard)
-    }
-}
 
 pub fn oly_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oly"))
