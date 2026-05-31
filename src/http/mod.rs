@@ -32,6 +32,7 @@ use crate::{
     node::NodeRegistry,
     notification::dispatcher::Notifier,
     session::{SessionEvent, SessionStore},
+    utils::format_http_url,
 };
 
 #[derive(Clone)]
@@ -175,14 +176,6 @@ pub async fn serve(state: AppState) {
     .await
     {
         error!(%err, "HTTP server error");
-    }
-
-    fn format_http_url(bind: &str, port: u16) -> String {
-        if bind.contains(':') {
-            format!("http://[{bind}]:{port}")
-        } else {
-            format!("http://{bind}:{port}")
-        }
     }
 }
 

@@ -18,6 +18,7 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
     session::SessionStore,
     storage,
+    utils::format_http_url,
 };
 
 use super::{
@@ -372,14 +373,6 @@ fn spawn_detached(
     }
     let child = cmd.spawn()?;
     Ok(child.id())
-}
-
-fn format_http_url(bind: &str, port: u16) -> String {
-    if bind.contains(':') {
-        format!("http://[{bind}]:{port}")
-    } else {
-        format!("http://{bind}:{port}")
-    }
 }
 
 async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: bool) -> Result<()> {
