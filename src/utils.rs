@@ -9,3 +9,11 @@ pub fn get_base_url(endpoint: &str) -> String {
     }
     endpoint.to_string()
 }
+
+pub fn format_http_url(bind: &str, port: u16) -> String {
+    if bind.contains(':') {
+        format!("http://[{bind}]:{port}")
+    } else {
+        format!("http://{bind}:{port}")
+    }
+}

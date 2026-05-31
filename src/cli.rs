@@ -111,6 +111,9 @@ pub struct DaemonStartArgs {
     /// Run the daemon in the background, detached from this terminal.
     #[arg(long, short = 'd')]
     pub detach: bool,
+    /// Override default HTTP bind address.
+    #[arg(long, value_name = "ADDR")]
+    pub bind: Option<String>,
     /// Override default HTTP port.
     #[arg(long, short = 'p')]
     pub port: Option<u16>,
@@ -651,5 +654,17 @@ mod tests {
             args.notification_hook.as_deref(),
             Some("C:/tools/notify.exe")
         );
+    }
+
+    #[test]
+    fn daemon_start_parses_bind_override() {
+        let cli = Cli::try_parse_from(["oly", "daemon", "start", "--bind", "0.0.0.0"]).unwrap();
+        let Commands::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        let DaemonCommand::Start(args) = args.command else {
+            panic!("expected daemon start subcommand");
+        };
+        assert_eq!(args.bind.as_deref(), Some("0.0.0.0"));
     }
 }

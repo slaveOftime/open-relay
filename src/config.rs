@@ -43,6 +43,7 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
 
 #[derive(Debug)]
 pub struct AppConfig {
+    pub http_bind: String,
     pub http_port: u16,
     pub log_level: String,
     pub stop_grace_seconds: u64,
@@ -67,6 +68,7 @@ pub struct AppConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct AppConfigOverrides {
+    bind: Option<String>,
     http_port: Option<u16>,
     log_level: Option<String>,
     prompt_patterns: Option<Vec<String>>,
@@ -87,6 +89,10 @@ impl AppConfig {
         let sessions_dir = state_dir.join("sessions");
         let overrides = load_overrides(&state_dir);
         let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
+        let http_bind = overrides
+            .bind
+            .and_then(normalize_optional_string)
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         let http_port = overrides.http_port.unwrap_or(15443);
         let log_level = overrides
             .log_level
@@ -122,6 +128,7 @@ impl AppConfig {
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds,
+            http_bind,
             http_port,
             prompt_patterns,
             web_push_vapid_public_key,
@@ -141,9 +148,13 @@ impl AppConfig {
 
     pub fn with_runtime_overrides(
         mut self,
+        http_bind: Option<String>,
         http_port: Option<u16>,
         notification_hook: Option<String>,
     ) -> Self {
+        if let Some(http_bind) = http_bind.and_then(normalize_optional_string) {
+            self.http_bind = http_bind;
+        }
         if let Some(http_port) = http_port {
             self.http_port = http_port;
         }
@@ -271,6 +282,7 @@ mod tests {
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
         AppConfig {
+            http_bind: "127.0.0.1".to_string(),
             http_port: 15443,
             log_level: "info".to_string(),
             stop_grace_seconds: 5,
@@ -294,9 +306,13 @@ mod tests {
 
     #[test]
     fn runtime_overrides_replace_port_and_notification_hook() {
-        let config = test_config()
-            .with_runtime_overrides(Some(17000), Some("  C:/tools/notify.exe  ".to_string()));
+        let config = test_config().with_runtime_overrides(
+            Some(" 0.0.0.0 ".to_string()),
+            Some(17000),
+            Some("  C:/tools/notify.exe  ".to_string()),
+        );
 
+        assert_eq!(config.http_bind, "0.0.0.0");
         assert_eq!(config.http_port, 17000);
         assert_eq!(
             config.notification_hook.as_deref(),
@@ -306,8 +322,9 @@ mod tests {
 
     #[test]
     fn runtime_overrides_leave_config_values_when_not_provided() {
-        let config = test_config().with_runtime_overrides(None, None);
+        let config = test_config().with_runtime_overrides(None, None, None);
 
+        assert_eq!(config.http_bind, "127.0.0.1");
         assert_eq!(config.http_port, 15443);
         assert_eq!(config.notification_hook.as_deref(), Some("config-hook"));
     }

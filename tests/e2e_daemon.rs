@@ -339,6 +339,28 @@ fn e2e_federation_api_keys_and_join_handshake() {
 }
 
 #[test]
+fn e2e_daemon_supports_bind_override() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_daemon_bind_override");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http_with_bind(&tmp, "0.0.0.0", port);
+
+    let daemon_log = fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default();
+    assert!(
+        daemon_log.contains(&format!("HTTP server listening at http://0.0.0.0:{port}")),
+        "expected daemon log to report bind override, got:\n{daemon_log}"
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let nodes_resp = reqwest::get(format!("http://127.0.0.1:{port}/api/nodes"))
+            .await
+            .expect("GET /api/nodes should succeed when bound to 0.0.0.0");
+        assert_eq!(nodes_resp.status(), reqwest::StatusCode::OK);
+    });
+}
+
+#[test]
 fn e2e_federation_primary_secondary_full_lifecycle() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 

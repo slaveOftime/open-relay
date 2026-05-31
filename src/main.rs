@@ -166,6 +166,7 @@ async fn run() -> Result<()> {
             DaemonCommand::Start(start_args) => {
                 daemon::start(
                     config.with_runtime_overrides(
+                        start_args.bind.clone(),
                         start_args.port,
                         start_args.notification_hook.clone(),
                     ),

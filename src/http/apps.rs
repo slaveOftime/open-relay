@@ -990,6 +990,7 @@ mod tests {
 
     fn test_config(state_dir: PathBuf) -> AppConfig {
         AppConfig {
+            http_bind: "127.0.0.1".into(),
             http_port: 0,
             log_level: "info".into(),
             stop_grace_seconds: 5,

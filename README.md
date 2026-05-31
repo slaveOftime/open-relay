@@ -130,6 +130,7 @@ oly send <id> key:up key:enter
 
 By default, `oly daemon start -d` also serves a local web UI and HTTP API on `http://127.0.0.1:15443`.
 
+- Use `--bind` to change the bind address (for example `--bind 0.0.0.0`).
 - Use `--port` to change the port.
 - Use `--no-http` for CLI-only operation.
 - Use `--no-auth` only if you understand the risk and are protecting access elsewhere.
@@ -173,7 +174,7 @@ oly logs --node worker-1 --wait-for-prompt <id>
 
 | Command | Purpose |
 | --- | --- |
-| `oly daemon start [--detach] [--port <port>] [--no-auth] [--no-http]` | Start the daemon, optional local web API/UI |
+| `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--no-auth] [--no-http]` | Start the daemon, optional local web API/UI |
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
 | `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]` | List sessions |

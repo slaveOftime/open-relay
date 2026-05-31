@@ -18,6 +18,7 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
     session::SessionStore,
     storage,
+    utils::format_http_url,
 };
 
 use super::{
@@ -185,6 +186,7 @@ pub async fn start(
             no_auth,
             no_http,
             auth_hash.as_deref(),
+            &config.http_bind,
             config.http_port,
             config.notification_hook.as_deref(),
         )?;
@@ -234,7 +236,11 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
     if no_http {
         let _ = writeln!(out, "HTTP:         disabled (--no-http)");
     } else {
-        let _ = writeln!(out, "HTTP:         http://127.0.0.1:{}", config.http_port);
+        let _ = writeln!(
+            out,
+            "HTTP:         {}",
+            format_http_url(&config.http_bind, config.http_port)
+        );
         let _ = writeln!(
             out,
             "Auth:         {}",
@@ -305,6 +311,7 @@ fn spawn_detached(
     no_auth: bool,
     no_http: bool,
     auth_hash: Option<&str>,
+    bind: &str,
     port: u16,
     notification_hook: Option<&str>,
 ) -> Result<u32> {
@@ -313,6 +320,8 @@ fn spawn_detached(
     cmd.arg("daemon")
         .arg("start")
         .arg("--foreground-internal")
+        .arg("--bind")
+        .arg(bind)
         .arg("--port")
         .arg(port.to_string())
         .stdin(Stdio::null())
@@ -326,6 +335,7 @@ fn spawn_detached(
         // `/proc/<pid>/cmdline`, which would leak the PHC hash.
         cmd.env("OLY_AUTH_HASH_INTERNAL", hash);
     }
+
     if no_http {
         cmd.arg("--no-http");
     }
@@ -592,6 +602,7 @@ mod tests {
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
         AppConfig {
+            http_bind: "127.0.0.1".to_string(),
             http_port: 15443,
             log_level: "info".to_string(),
             stop_grace_seconds: 5,
