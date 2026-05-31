@@ -55,8 +55,16 @@ pub struct AppState {
 struct WebAssets;
 
 pub async fn serve(state: AppState) {
+    let bind = state.config.http_bind.clone();
     let port = state.config.http_port;
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let ip = match bind.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip,
+        Err(err) => {
+            error!(%err, bind = %bind, "failed to parse HTTP bind address");
+            return;
+        }
+    };
+    let addr = std::net::SocketAddr::new(ip, port);
 
     let wwwroot_dir = match apps::ensure_wwwroot(&state.config) {
         Ok(path) => path,
@@ -158,7 +166,7 @@ pub async fn serve(state: AppState) {
         }
     };
 
-    info!("HTTP server listening at http://127.0.0.1:{port}");
+    info!("HTTP server listening at {}", format_http_url(&bind, port));
 
     if let Err(err) = axum::serve(
         listener,
@@ -167,6 +175,14 @@ pub async fn serve(state: AppState) {
     .await
     {
         error!(%err, "HTTP server error");
+    }
+
+    fn format_http_url(bind: &str, port: u16) -> String {
+        if bind.contains(':') {
+            format!("http://[{bind}]:{port}")
+        } else {
+            format!("http://{bind}:{port}")
+        }
     }
 }
 

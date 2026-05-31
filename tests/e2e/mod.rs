@@ -192,6 +192,10 @@ pub fn pick_free_port() -> u16 {
 }
 
 pub fn start_daemon_http(tmp: &PathBuf, port: u16) -> DaemonGuard {
+    start_daemon_http_with_bind(tmp, "127.0.0.1", port)
+}
+
+pub fn start_daemon_http_with_bind(tmp: &PathBuf, bind: &str, port: u16) -> DaemonGuard {
     let log_path = tmp.join("daemon-stderr.log");
     let log_file = fs::File::create(&log_path).expect("create daemon log file");
 
@@ -201,6 +205,8 @@ pub fn start_daemon_http(tmp: &PathBuf, port: u16) -> DaemonGuard {
             "start",
             "--foreground-internal",
             "--no-auth",
+            "--bind",
+            bind,
             "--port",
             &port.to_string(),
         ])

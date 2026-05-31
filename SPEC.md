@@ -124,11 +124,12 @@ The implemented top-level commands are:
 
 ### 6.2 Daemon commands
 
-### `oly daemon start [--detach] [--port <port>] [--no-auth] [--no-http]`
+### `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--no-auth] [--no-http]`
 
 - Starts the daemon.
 - Runs in the foreground by default.
 - `--detach` starts it in the background.
+- `--bind` overrides the default HTTP bind address.
 - `--port` overrides the default HTTP port.
 - `--no-auth` disables HTTP authentication and requires explicit risk acknowledgement.
 - `--no-http` disables the HTTP API and browser UI entirely.
@@ -260,13 +261,14 @@ Supported key forms include:
 
 ## 7. HTTP and browser surface
 
-When HTTP is enabled, the daemon serves on loopback:
+When HTTP is enabled, the daemon serves on `127.0.0.1` by default:
 
 ```text
 http://127.0.0.1:15443
 ```
 
-The port is configurable via `oly daemon start --port <port>` or config.
+The bind address is configurable via `oly daemon start --bind <addr>` or config (`bind`).
+The port is configurable via `oly daemon start --port <port>` or config (`http_port`).
 
 Implemented HTTP surface includes:
 

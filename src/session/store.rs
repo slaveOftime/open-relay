@@ -1897,6 +1897,7 @@ mod tests {
     fn make_test_config(max_running_sessions: usize) -> AppConfig {
         use std::path::PathBuf;
         AppConfig {
+            http_bind: "127.0.0.1".to_string(),
             silence_seconds: 10,
             stop_grace_seconds: 5,
             session_eviction_seconds: 15,
