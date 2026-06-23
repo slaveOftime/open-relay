@@ -17,6 +17,18 @@ const PUSH_DISABLED_KEY = 'open-relay.web.push.disabled.v1'
 let passiveSyncInFlight: Promise<PushSetupState> | null = null
 let passiveSyncCachedState: PushSetupState | null = null
 
+function getUnsupportedPushState(): PushSetupState | null {
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') return 'unsupported'
+  if (
+    !('serviceWorker' in navigator) ||
+    !('PushManager' in window) ||
+    !('Notification' in window)
+  ) {
+    return 'unsupported'
+  }
+  return null
+}
+
 function isPushExplicitlyDisabled(): boolean {
   if (typeof window === 'undefined') return false
   try {
@@ -67,35 +79,31 @@ function toPushSubscriptionInput(sub: PushSubscription): PushSubscriptionInput |
 }
 
 export async function syncPushSubscription(requestPermission: boolean): Promise<PushSetupState> {
+  const unsupportedState = getUnsupportedPushState()
+  if (unsupportedState) return unsupportedState
+
   const explicitlyDisabled = isPushExplicitlyDisabled()
   if (!requestPermission && passiveSyncCachedState && !explicitlyDisabled) {
     return passiveSyncCachedState
   }
+
+  let permission = Notification.permission
+  if (permission === 'default' && requestPermission) {
+    permission = await Notification.requestPermission()
+  }
+
   if (passiveSyncInFlight) {
     if (!requestPermission) return passiveSyncInFlight
     await passiveSyncInFlight.catch(() => {})
   }
 
   const run = (async (): Promise<PushSetupState> => {
-    if (
-      !('serviceWorker' in navigator) ||
-      !('PushManager' in window) ||
-      !('Notification' in window)
-    ) {
-      return 'unsupported'
-    }
-
     const res = await fetchPushPublicKey()
     if (!res.public_key) return 'unconfigured'
     const publicKey = res.public_key
 
     const registration = await registerPushWorker()
     if (!registration) return 'unsupported'
-
-    let permission = Notification.permission
-    if (permission === 'default' && requestPermission) {
-      permission = await Notification.requestPermission()
-    }
 
     if (permission === 'denied') {
       const deniedSub = await registration.pushManager.getSubscription()
@@ -136,7 +144,12 @@ export async function syncPushSubscription(requestPermission: boolean): Promise<
 }
 
 export async function disablePushNotifications(): Promise<PushSetupState> {
-  const nextState = Notification.permission === 'denied' ? 'denied' : 'idle'
+  const nextState =
+    typeof window !== 'undefined' &&
+    'Notification' in window &&
+    Notification.permission === 'denied'
+      ? 'denied'
+      : 'idle'
   if (!('serviceWorker' in navigator)) {
     passiveSyncCachedState = nextState
     setPushExplicitlyDisabled(true)
