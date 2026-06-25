@@ -3,30 +3,32 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use tracing::warn;
 
 pub fn safe_resize_parser(parser: &mut vt100::Parser, rows: u16, cols: u16) {
-    let resize = catch_unwind(AssertUnwindSafe(|| {
-        parser.screen_mut().set_size(rows, cols);
-    }));
-
-    if resize.is_ok() {
+    if parser.screen().size() == (rows, cols) {
         return;
     }
 
     let snapshot = parser.screen().state_formatted();
-    warn!(
-        rows,
-        cols, "vt100 parser resize panicked; rebuilding parser from snapshot"
-    );
+    let rebuild = catch_unwind(AssertUnwindSafe(|| {
+        let mut rebuilt = vt100::Parser::new(rows, cols, 0);
+        if !snapshot.is_empty() {
+            rebuilt.process(&snapshot);
+        }
+        *parser = rebuilt;
+    }));
 
-    let mut rebuilt = vt100::Parser::new(rows, cols, 0);
-    if !snapshot.is_empty() {
-        rebuilt.process(&snapshot);
+    if rebuild.is_err() {
+        warn!(
+            rows,
+            cols, "vt100 parser resize rebuild panicked; resetting parser"
+        );
+        *parser = vt100::Parser::new(rows, cols, 0);
     }
-    *parser = rebuilt;
 }
 
 #[cfg(test)]
 mod tests {
     use super::safe_resize_parser;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     fn parser_contents(rows: u16, cols: u16, data: &[u8]) -> String {
         let mut parser = vt100::Parser::new(rows, cols, 0);
@@ -73,5 +75,21 @@ mod tests {
 
         let contents = parser_contents(10, 5, &parser.screen().state_formatted());
         assert!(contents.contains("12345"));
+    }
+
+    #[test]
+    fn safe_resize_handles_wide_glyph_at_new_right_edge() {
+        let mut parser = vt100::Parser::new(42, 120, 0);
+        let bytes = format!("{}中", "x".repeat(99));
+        parser.process(bytes.as_bytes());
+
+        safe_resize_parser(&mut parser, 42, 100);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            parser.process(b"\x1b[K\x1b[1K\x1b[P\x1b[@after resize");
+        }));
+
+        assert!(result.is_ok());
+        assert_eq!(parser.screen().size(), (42, 100));
     }
 }

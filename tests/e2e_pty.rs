@@ -181,8 +181,12 @@ fn e2e_two_separate_input_calls_execute_command() {
 
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, timeout)
-        .unwrap_or_else(|| panic!("shell did not reach a stable prompt within {} s", timeout.as_secs()));
+    let initial = wait_for_stable_log(&tmp, &id, timeout).unwrap_or_else(|| {
+        panic!(
+            "shell did not reach a stable prompt within {} s",
+            timeout.as_secs()
+        )
+    });
     let prompt = trailing_prompt(&initial).to_string();
 
     const MARKER: &str = "oly_e2e_two_inputs_marker";
@@ -213,8 +217,12 @@ fn e2e_multiple_commands_appear_in_order() {
 
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, timeout)
-        .unwrap_or_else(|| panic!("shell did not reach a stable prompt within {} s", timeout.as_secs()));
+    let initial = wait_for_stable_log(&tmp, &id, timeout).unwrap_or_else(|| {
+        panic!(
+            "shell did not reach a stable prompt within {} s",
+            timeout.as_secs()
+        )
+    });
     let prompt = trailing_prompt(&initial).to_string();
 
     send_line(&tmp, &id, "echo oly_e2e_order_first");
@@ -579,8 +587,12 @@ fn e2e_logs_contain_no_escape_artifacts() {
 
     let id = start_session(&tmp, shell);
 
-    let initial = wait_for_stable_log(&tmp, &id, timeout)
-        .unwrap_or_else(|| panic!("shell did not reach a stable prompt within {} s", timeout.as_secs()));
+    let initial = wait_for_stable_log(&tmp, &id, timeout).unwrap_or_else(|| {
+        panic!(
+            "shell did not reach a stable prompt within {} s",
+            timeout.as_secs()
+        )
+    });
     let prompt = trailing_prompt(&initial).to_string();
 
     send_line(&tmp, &id, "echo ARTIFACT_CHECK_1");
@@ -625,20 +637,18 @@ fn e2e_multiple_concurrent_sessions_are_independent() {
     let id1 = start_session(&tmp, shell);
     let id2 = start_session(&tmp, shell);
 
-    let initial1 = wait_for_stable_log(&tmp, &id1, timeout)
-        .unwrap_or_else(|| {
-            panic!(
-                "session {id1} did not reach a stable prompt within {} s",
-                timeout.as_secs()
-            )
-        });
-    let initial2 = wait_for_stable_log(&tmp, &id2, timeout)
-        .unwrap_or_else(|| {
-            panic!(
-                "session {id2} did not reach a stable prompt within {} s",
-                timeout.as_secs()
-            )
-        });
+    let initial1 = wait_for_stable_log(&tmp, &id1, timeout).unwrap_or_else(|| {
+        panic!(
+            "session {id1} did not reach a stable prompt within {} s",
+            timeout.as_secs()
+        )
+    });
+    let initial2 = wait_for_stable_log(&tmp, &id2, timeout).unwrap_or_else(|| {
+        panic!(
+            "session {id2} did not reach a stable prompt within {} s",
+            timeout.as_secs()
+        )
+    });
     let prompt1 = trailing_prompt(&initial1).to_string();
     let prompt2 = trailing_prompt(&initial2).to_string();
 
