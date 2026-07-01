@@ -174,6 +174,7 @@ impl WebPushChannel {
         vapid_private_key_b64: &str,
         vapid_public_key_b64: &str,
         vapid_subject: &str,
+        proxy_url: Option<&str>,
         db: std::sync::Arc<Database>,
     ) -> Result<Self> {
         use p256::elliptic_curve::sec1::ToEncodedPoint as _;
@@ -202,9 +203,16 @@ impl WebPushChannel {
 
         validate_vapid_subject(vapid_subject)?;
 
-        let http = reqwest::Client::builder()
+        let mut http_builder = reqwest::Client::builder()
             .pool_max_idle_per_host(0)
-            .pool_idle_timeout(Duration::from_secs(5))
+            .pool_idle_timeout(Duration::from_secs(5));
+        if let Some(proxy_url) = proxy_url {
+            let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| {
+                AppError::Protocol(format!("invalid web push proxy URL '{proxy_url}': {e}"))
+            })?;
+            http_builder = http_builder.proxy(proxy);
+        }
+        let http = http_builder
             .build()
             .map_err(|e| AppError::Protocol(format!("web push HTTP client init failed: {e}")))?;
 

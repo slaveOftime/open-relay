@@ -120,6 +120,9 @@ pub struct DaemonStartArgs {
     /// Override the configured local notification hook for this daemon run.
     #[arg(long, value_name = "PATH")]
     pub notification_hook: Option<String>,
+    /// Route outbound web push delivery through an HTTP(S) or SOCKS proxy.
+    #[arg(long, value_name = "URL")]
+    pub web_push_proxy: Option<String>,
     /// Disable HTTP authentication. You will be asked to confirm the security risk.
     #[arg(long)]
     pub no_auth: bool,
@@ -653,6 +656,28 @@ mod tests {
         assert_eq!(
             args.notification_hook.as_deref(),
             Some("C:/tools/notify.exe")
+        );
+    }
+
+    #[test]
+    fn daemon_start_parses_web_push_proxy_override() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "daemon",
+            "start",
+            "--web-push-proxy",
+            "socks5://127.0.0.1:1080",
+        ])
+        .unwrap();
+        let Commands::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        let DaemonCommand::Start(args) = args.command else {
+            panic!("expected daemon start subcommand");
+        };
+        assert_eq!(
+            args.web_push_proxy.as_deref(),
+            Some("socks5://127.0.0.1:1080")
         );
     }
 

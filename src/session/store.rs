@@ -1907,6 +1907,7 @@ mod tests {
             web_push_vapid_public_key: None,
             web_push_vapid_private_key: None,
             web_push_subject: None,
+            web_push_proxy: None,
             state_dir: PathBuf::from("."),
             sessions_dir: PathBuf::from("."),
             db_file: PathBuf::from("."),

@@ -169,6 +169,7 @@ async fn run() -> Result<()> {
                         start_args.bind.clone(),
                         start_args.port,
                         start_args.notification_hook.clone(),
+                        start_args.web_push_proxy.clone(),
                     ),
                     start_args.detach,
                     start_args.foreground_internal,
