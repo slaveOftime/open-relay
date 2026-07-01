@@ -4,6 +4,29 @@ import { FitAddon } from '@xterm/addon-fit'
 import { hasTransferredFiles } from './ui/file-transfer'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
+import './XTerm.css'
+
+const TERMINAL_FONT_SIZE = 13
+const TERMINAL_FONT_FACE = '"Open Relay Terminal"'
+const TERMINAL_FONT_FAMILY =
+  `${TERMINAL_FONT_FACE}, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, ` +
+  '"Liberation Mono", "Courier New", monospace'
+const TERMINAL_FONT_VARIANTS = [
+  `400 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
+  `700 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
+  `italic 400 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
+  `italic 700 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
+]
+
+function loadEmbeddedTerminalFont(): Promise<void> {
+  if (typeof document === 'undefined' || !('fonts' in document)) {
+    return Promise.resolve()
+  }
+
+  return Promise.all(TERMINAL_FONT_VARIANTS.map((font) => document.fonts.load(font))).then(
+    () => undefined
+  )
+}
 
 function getTerminalTheme(): ITheme {
   const dark = window.matchMedia('(prefers-color-scheme: dark)').matches
@@ -173,9 +196,8 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
 
     const term = new Terminal({
       theme: getTerminalTheme(),
-      fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-      fontSize: 13,
+      fontFamily: TERMINAL_FONT_FAMILY,
+      fontSize: TERMINAL_FONT_SIZE,
       lineHeight: 1,
       cursorBlink: true,
       cursorStyle: 'block',
@@ -203,16 +225,36 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       onResizeRef.current?.(next.cols, next.rows)
     }
 
-    // Defer the initial fit so the renderer has completed its first frame
-    let initialRaf = requestAnimationFrame(() => {
-      initialRaf = 0
+    const syncTerminalLayout = (refreshRows: boolean) => {
       if (!termRef.current) return
+
       try {
         fitRef.current?.fit()
         emitResizeIfChanged()
+
+        if (refreshRows && term.rows > 0) {
+          term.refresh(0, term.rows - 1)
+        }
       } catch {
         /* ignore if already disposed */
       }
+    }
+
+    // Defer the initial fit so the renderer has completed its first frame
+    let initialRaf = requestAnimationFrame(() => {
+      initialRaf = 0
+      syncTerminalLayout(false)
+    })
+
+    let fontLoadRaf = 0
+    // Re-fit after the bundled font loads so terminal metrics stay stable everywhere.
+    void loadEmbeddedTerminalFont().then(() => {
+      if (!termRef.current) return
+
+      fontLoadRaf = requestAnimationFrame(() => {
+        fontLoadRaf = 0
+        syncTerminalLayout(true)
+      })
     })
 
     // Forward keyboard data
@@ -226,13 +268,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       if (pendingRaf) cancelAnimationFrame(pendingRaf)
       pendingRaf = requestAnimationFrame(() => {
         pendingRaf = 0
-        if (!termRef.current) return
-        try {
-          fitRef.current?.fit()
-          emitResizeIfChanged()
-        } catch {
-          /* ignore during unmount */
-        }
+        syncTerminalLayout(false)
       })
     })
     ro.observe(containerRef.current)
@@ -346,6 +382,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       // Cancel our own pending RAFs
       if (initialRaf) cancelAnimationFrame(initialRaf)
       if (pendingRaf) cancelAnimationFrame(pendingRaf)
+      if (fontLoadRaf) cancelAnimationFrame(fontLoadRaf)
       if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
       dataDisposable.dispose()
       ro.disconnect()
