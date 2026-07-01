@@ -998,6 +998,7 @@ mod tests {
             web_push_subject: None,
             web_push_vapid_public_key: None,
             web_push_vapid_private_key: None,
+            web_push_proxy: None,
             state_dir: state_dir.clone(),
             sessions_dir: state_dir.join("sessions"),
             db_file: state_dir.join("oly.db"),

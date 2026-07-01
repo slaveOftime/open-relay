@@ -189,6 +189,7 @@ pub async fn start(
             &config.http_bind,
             config.http_port,
             config.notification_hook.as_deref(),
+            config.web_push_proxy.as_deref(),
         )?;
         wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
 
@@ -314,6 +315,7 @@ fn spawn_detached(
     bind: &str,
     port: u16,
     notification_hook: Option<&str>,
+    web_push_proxy: Option<&str>,
 ) -> Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -341,6 +343,9 @@ fn spawn_detached(
     }
     if let Some(notification_hook) = notification_hook {
         cmd.arg("--notification-hook").arg(notification_hook);
+    }
+    if let Some(web_push_proxy) = web_push_proxy {
+        cmd.arg("--web-push-proxy").arg(web_push_proxy);
     }
     // On Windows the spawned process must be placed in its own process group
     // and detached from the parent console.  Without these flags the daemon
@@ -621,6 +626,7 @@ mod tests {
             session_eviction_seconds: 15,
             max_running_sessions: 50,
             notification_hook: None,
+            web_push_proxy: None,
         }
     }
 

@@ -154,7 +154,13 @@ pub(super) fn build_notifier(db: Arc<Database>, config: &AppConfig) -> Notifier 
         config.web_push_vapid_private_key.clone(),
         config.web_push_subject.clone(),
     ) {
-        match WebPushChannel::new(&vapid_private_key, &vapid_public_key, &vapid_subject, db) {
+        match WebPushChannel::new(
+            &vapid_private_key,
+            &vapid_public_key,
+            &vapid_subject,
+            config.web_push_proxy.as_deref(),
+            db,
+        ) {
             Ok(channel) => {
                 info!("web push channel enabled");
                 channels.push(Box::new(channel));

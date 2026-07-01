@@ -51,6 +51,7 @@ pub struct AppConfig {
     pub web_push_subject: Option<String>,
     pub web_push_vapid_public_key: Option<String>,
     pub web_push_vapid_private_key: Option<String>,
+    pub web_push_proxy: Option<String>,
     pub state_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub db_file: PathBuf,
@@ -75,6 +76,7 @@ struct AppConfigOverrides {
     web_push_subject: Option<String>,
     web_push_vapid_public_key: Option<String>,
     web_push_vapid_private_key: Option<String>,
+    web_push_proxy: Option<String>,
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
     /// Path to an executable invoked on every local OS notification.
@@ -113,6 +115,11 @@ impl AppConfig {
         let web_push_subject = overrides
             .web_push_subject
             .and_then(normalize_optional_string);
+        let web_push_proxy = resolve_optional_string_setting(
+            None,
+            std::env::var("OLY_WEB_PUSH_PROXY").ok(),
+            overrides.web_push_proxy,
+        );
         let socket_name = std::env::var("OLY_SOCKET_NAME")
             .ok()
             .and_then(normalize_optional_string)
@@ -134,6 +141,7 @@ impl AppConfig {
             web_push_vapid_public_key,
             web_push_vapid_private_key,
             web_push_subject,
+            web_push_proxy,
             socket_name,
             socket_file: state_dir.join("daemon.sock"),
             lock_file: state_dir.join("daemon.lock"),
@@ -151,6 +159,7 @@ impl AppConfig {
         http_bind: Option<String>,
         http_port: Option<u16>,
         notification_hook: Option<String>,
+        web_push_proxy: Option<String>,
     ) -> Self {
         if let Some(http_bind) = http_bind.and_then(normalize_optional_string) {
             self.http_bind = http_bind;
@@ -160,6 +169,9 @@ impl AppConfig {
         }
         if let Some(notification_hook) = notification_hook.and_then(normalize_optional_string) {
             self.notification_hook = Some(notification_hook);
+        }
+        if let Some(web_push_proxy) = web_push_proxy.and_then(normalize_optional_string) {
+            self.web_push_proxy = Some(web_push_proxy);
         }
         self
     }
@@ -273,6 +285,17 @@ fn normalize_optional_string(value: String) -> Option<String> {
     }
 }
 
+fn resolve_optional_string_setting(
+    runtime_value: Option<String>,
+    env_value: Option<String>,
+    config_value: Option<String>,
+) -> Option<String> {
+    runtime_value
+        .and_then(normalize_optional_string)
+        .or_else(|| env_value.and_then(normalize_optional_string))
+        .or_else(|| config_value.and_then(normalize_optional_string))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -290,6 +313,7 @@ mod tests {
             web_push_subject: None,
             web_push_vapid_public_key: None,
             web_push_vapid_private_key: None,
+            web_push_proxy: Some("http://config-proxy:8080".to_string()),
             state_dir: state_dir.clone(),
             sessions_dir: state_dir.join("sessions"),
             db_file: state_dir.join("oly.db"),
@@ -310,6 +334,7 @@ mod tests {
             Some(" 0.0.0.0 ".to_string()),
             Some(17000),
             Some("  C:/tools/notify.exe  ".to_string()),
+            Some("  socks5://127.0.0.1:1080  ".to_string()),
         );
 
         assert_eq!(config.http_bind, "0.0.0.0");
@@ -318,14 +343,44 @@ mod tests {
             config.notification_hook.as_deref(),
             Some("C:/tools/notify.exe")
         );
+        assert_eq!(
+            config.web_push_proxy.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
     }
 
     #[test]
     fn runtime_overrides_leave_config_values_when_not_provided() {
-        let config = test_config().with_runtime_overrides(None, None, None);
+        let config = test_config().with_runtime_overrides(None, None, None, None);
 
         assert_eq!(config.http_bind, "127.0.0.1");
         assert_eq!(config.http_port, 15443);
         assert_eq!(config.notification_hook.as_deref(), Some("config-hook"));
+        assert_eq!(
+            config.web_push_proxy.as_deref(),
+            Some("http://config-proxy:8080")
+        );
+    }
+
+    #[test]
+    fn optional_string_setting_prefers_runtime_over_env_over_config() {
+        let resolved = super::resolve_optional_string_setting(
+            Some("  socks5://runtime:1080 ".to_string()),
+            Some(" http://env:8080 ".to_string()),
+            Some(" http://config:8000 ".to_string()),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("socks5://runtime:1080"));
+    }
+
+    #[test]
+    fn optional_string_setting_ignores_blank_higher_priority_values() {
+        let resolved = super::resolve_optional_string_setting(
+            Some("   ".to_string()),
+            Some("  ".to_string()),
+            Some(" http://config:8000 ".to_string()),
+        );
+
+        assert_eq!(resolved.as_deref(), Some("http://config:8000"));
     }
 }
