@@ -62,6 +62,11 @@ pub struct SessionRuntime {
     pub raw_total_bytes: u64,
     /// Total length of meaningful PTY output bytes that changed the terminal state.
     pub last_total_bytes: u64,
+    /// Timestamp the runtime was created (PTY spawned). Used as a fallback
+    /// silence anchor for sessions that have never produced any meaningful
+    /// output, so they still surface via `silent_candidates` after a grace
+    /// period instead of being silently ignored forever.
+    pub spawned_at: Instant,
     /// Timestamp of the last meaningful output chunk.
     pub last_output_epoch: Option<Instant>,
     /// Timestamp of the last input bytes forwarded to the PTY.
@@ -114,6 +119,18 @@ impl SessionRuntime {
         }
 
         self.screen_parser.screen().cursor_position()
+    }
+
+    /// The output epoch used for silence/notification bookkeeping.
+    ///
+    /// Falls back to `spawned_at` when the session has never produced any
+    /// meaningful output, so a process that starts up and then silently
+    /// blocks (e.g. waiting on a password prompt before printing anything)
+    /// is still treated as having a well-defined "since when has this been
+    /// silent" anchor instead of being permanently invisible to silence
+    /// detection.
+    pub fn effective_output_epoch(&self) -> Instant {
+        self.last_output_epoch.unwrap_or(self.spawned_at)
     }
 
     /// Build a `SessionSummary` snapshot from the current runtime state.
@@ -185,7 +202,7 @@ impl SessionRuntime {
     pub fn input_needed(&self) -> bool {
         matches!(self.meta.status, SessionStatus::Running)
             && self.notified_output_epoch.is_some()
-            && self.notified_output_epoch == self.last_output_epoch
+            && self.notified_output_epoch == Some(self.effective_output_epoch())
     }
 
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
@@ -483,6 +500,7 @@ pub fn spawn_session(
         completed_at: None,
         persisted: false,
         requested_final_status: None,
+        spawned_at: Instant::now(),
         last_output_epoch: None,
         last_input_at: None,
         last_attach_activity_at: None,
@@ -704,6 +722,7 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
+            spawned_at: Instant::now(),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
@@ -994,6 +1013,7 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
+            spawned_at: Instant::now(),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,

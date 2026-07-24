@@ -1069,15 +1069,28 @@ impl SessionStore {
                 if let Some(last_attach_activity) = rt.last_attach_activity_at {
                     if now.duration_since(last_attach_activity) < attach_suppression_window {
                         trace!("silent becase recent attach activity");
+                        let effective_output = rt.effective_output_epoch();
                         drop(rt);
                         let mut rt = handle.write();
-                        rt.last_notified_at = rt.last_output_epoch;
+                        rt.last_notified_at = Some(effective_output);
                         return None;
                     }
                 }
 
-                // If output just happend, there is not need to notify in supression window, treat it as notified
-                let last_output = rt.last_output_epoch?;
+                // Sessions that have never produced any meaningful output (e.g. a
+                // process that starts up and then silently waits for a password or
+                // other input before printing anything) must still be considered:
+                // fall back to the spawn time so they are not permanently invisible
+                // to silence detection. `rt.spawned_at` never changes, so once such
+                // a session is notified it will not be re-notified unless real
+                // output eventually arrives and advances the epoch.
+                let last_output = rt.effective_output_epoch();
+
+                // If output (or, absent any output, the session start) just
+                // happened, there is no need to notify within the suppression
+                // window, treat it as notified. This also covers the grace period
+                // right after spawn where a session hasn't had a chance to print
+                // anything yet.
                 if now.duration_since(last_output) < attach_suppression_window {
                     trace!("silent becase recent output activity");
                     return None;
@@ -1265,6 +1278,7 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
+            spawned_at: Instant::now(),
             last_output_epoch: last_output_at,
             last_input_at: None,
             last_attach_activity_at: None,
@@ -1409,13 +1423,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_candidates_ignores_no_output_yet() {
+    async fn test_silent_candidates_suppresses_no_output_within_grace_period() {
+        // A session that has produced no output yet is still within the
+        // attach/output suppression window right after spawn, so it must not
+        // be flagged yet — this is the short grace period, not a permanent
+        // exemption from silence detection (see the regression test below).
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime("abc1234", SessionStatus::Running, "prompt> ", None);
         let store = store_with(vec![rt], make_test_db().await);
         let candidates = store.silent_candidates(silence, min_interval);
         assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_flags_never_output_session_past_silence() {
+        // Regression test for a genuinely running session that has never
+        // emitted a single byte (e.g. it is blocked waiting for input before
+        // printing its first prompt). Such a session must still surface as a
+        // silent candidate once the spawn-relative silence window elapses,
+        // instead of being silently invisible forever because
+        // `last_output_epoch` is `None`.
+        let silence = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime("abc1234", SessionStatus::Running, "", None);
+        {
+            let mut locked = rt.write();
+            locked.spawned_at = Instant::now() - Duration::from_secs(10);
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+        let candidates = store.silent_candidates(silence, min_interval);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session_id, "abc1234");
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_ignores_never_output_non_running_session() {
+        // A stopped/completed session that never produced output must not be
+        // treated as a silent "awaiting input" candidate — `is_completed()`
+        // gating must take precedence over the spawn-time fallback.
+        let silence = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime("abc1234", SessionStatus::Stopped, "", None);
+        {
+            let mut locked = rt.write();
+            locked.spawned_at = Instant::now() - Duration::from_secs(10);
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+        let candidates = store.silent_candidates(silence, min_interval);
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_never_output_respects_min_notification_interval() {
+        // Once a never-output session has been notified, it must not be
+        // re-notified again immediately just because the poll loop runs
+        // again — the same min-notification-interval guard that applies to
+        // sessions with real output must also apply here.
+        let silence = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime("abc1234", SessionStatus::Running, "", None);
+        {
+            let mut locked = rt.write();
+            locked.spawned_at = Instant::now() - Duration::from_secs(30);
+            locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+        let candidates = store.silent_candidates(silence, min_interval);
+        assert!(
+            candidates.is_empty(),
+            "should suppress re-notification within min_notification_interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_input_needed_true_for_never_output_session_after_notify() {
+        // Distinguishing "genuinely running and silent" from "awaiting
+        // input": once the monitor notifies for a never-output session,
+        // `input_needed()` must report true so status inference surfaces it
+        // correctly, even though `last_output_epoch` is still `None`.
+        let rt = make_runtime("abc1234", SessionStatus::Running, "", None);
+        {
+            let mut locked = rt.write();
+            locked.spawned_at = Instant::now() - Duration::from_secs(10);
+        }
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let silence = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+
+        let candidates = store.silent_candidates(silence, min_interval);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "never-output session past silence should be a candidate"
+        );
+
+        store.mark_notified(
+            "abc1234",
+            candidates[0].output_epoch,
+            std::time::Instant::now(),
+        );
+
+        let locked = rt.read();
+        assert!(
+            locked.input_needed(),
+            "session should be reported as awaiting input after notification, even with no real output"
+        );
     }
 
     #[tokio::test]
@@ -1869,6 +1982,7 @@ mod tests {
             completed_at: None,
             persisted: false,
             requested_final_status: None,
+            spawned_at: Instant::now(),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
