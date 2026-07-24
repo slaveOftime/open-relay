@@ -46,6 +46,7 @@ import {
 //   SelectValue,
 // } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   ChevronLeftIcon,
@@ -152,6 +153,7 @@ function SessionDetailPageContent() {
     typeof navigator === 'undefined' ? true : navigator.onLine
   )
   const [isInfoBarToggled, setIsInfoBarToggled] = useState(false)
+  const [isAttachPanelOpen, setIsAttachPanelOpen] = useState(false)
   const [tailLimit, setTailLimit] = useState<number | null>(null)
   const [tailLimitInput, setTailLimitInput] = useState('40')
   const [isAttachViewportIdle, setIsAttachViewportIdle] = useState(false)
@@ -1292,7 +1294,7 @@ function SessionDetailPageContent() {
   )
   return (
     <TooltipProvider>
-      <div className="flex flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] h-full">
+      <div className="flex h-screen w-full min-w-0 flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] supports-[height:100dvh]:h-dvh">
         {/* ── Header ── */}
         <header className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
           <Link to="/">
@@ -1497,13 +1499,14 @@ function SessionDetailPageContent() {
         {wsError && <div className="text-sm text-[hsl(var(--destructive))]">{wsError}</div>}
 
         {/* ── Main body ── */}
-        <div
-          id="main-container"
-          className="sm:flex overflow-y-visible sm:overflow-hidden flex-1 min-h-0"
-        >
+        <ScrollArea type={isAttachPanelOpen ? 'always' : 'auto'} className="min-h-0 flex-1">
+          <div
+            id="main-container"
+            className={`h-full ${isAttachPanelOpen ? 'overflow-y-visible' : 'overflow-y-hidden'} sm:flex sm:overflow-y-hidden`}
+          >
           {/* Terminal area */}
           <div
-            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-71px)] sm:h-full'}`}
+            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
           >
             <div
               aria-hidden="true"
@@ -1641,6 +1644,7 @@ function SessionDetailPageContent() {
                   sendBusy={sendBusy}
                   showKeyError={showKeyError}
                   uploadFile={handleUploadFile}
+                  onDrawerOpenChange={setIsAttachPanelOpen}
                 />
               </div>
               <div className="sm:hidden flex items-center justify-center h-8 relative">
@@ -1657,7 +1661,8 @@ function SessionDetailPageContent() {
               </div>
             </>
           )}
-        </div>
+          </div>
+        </ScrollArea>
 
         {/* Navigate back button (hide in logs mode to avoid overlap with scrubber controls) */}
         {mode !== 'attach' && mode !== 'logs' && (

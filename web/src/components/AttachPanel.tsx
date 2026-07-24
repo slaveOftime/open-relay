@@ -175,6 +175,7 @@ interface AttachPanelProps {
   sendBusy: () => void
   showKeyError: (message: string) => void
   uploadFile?: (file: File) => Promise<UploadSessionFileResponse>
+  onDrawerOpenChange?: (open: boolean) => void
 }
 
 const popularKeys = [
@@ -209,6 +210,7 @@ export default function AttachPanel({
   sendBusy,
   showKeyError,
   uploadFile,
+  onDrawerOpenChange,
 }: AttachPanelProps) {
   const [drawerOpen, setDrawerOpen] = useState(() => loadSessionDrawerOpen(sessionId))
   const [customInput, setCustomInput] = useState('')
@@ -295,6 +297,10 @@ export default function AttachPanel({
     }
     saveSessionDrawerOpen(sessionId, drawerOpen)
   }, [drawerOpen, sessionId])
+
+  useEffect(() => {
+    onDrawerOpenChange?.(drawerOpen)
+  }, [drawerOpen, onDrawerOpenChange])
 
   useEffect(() => {
     shouldPersistDraftRef.current = false
@@ -552,7 +558,7 @@ export default function AttachPanel({
   }
 
   const visibleImagePreviewPaths = getVisibleImagePreviewPaths(customInput, imagePreviews)
-  const previewSource = previewPath ? imagePreviews[previewPath] ?? null : null
+  const previewSource = previewPath ? (imagePreviews[previewPath] ?? null) : null
 
   return (
     <div ref={rootRef}>
