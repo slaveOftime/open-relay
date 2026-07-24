@@ -1096,10 +1096,13 @@ impl SessionStore {
                     return None;
                 }
 
-                // If just notified in short time, the there is no need notify again
+                // Suppress rapid repeat notifications. `last_notified_at` is
+                // normally later than `last_output`, so compare it with `now`;
+                // subtracting it from the output epoch can underflow and kill
+                // the notification monitor task.
                 if let Some(last_notified_at) = rt.last_notified_at {
-                    if last_output - last_notified_at < min_notification_interval {
-                        trace!("silent becase just notified since last output");
+                    if now.duration_since(last_notified_at) < min_notification_interval {
+                        trace!("silent because notification was sent recently");
                         return None;
                     }
                 }
@@ -1475,17 +1478,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_silent_candidates_never_output_respects_min_notification_interval() {
-        // Once a never-output session has been notified, it must not be
-        // re-notified again immediately just because the poll loop runs
-        // again — the same min-notification-interval guard that applies to
-        // sessions with real output must also apply here.
+    async fn test_silent_candidates_respects_min_notification_interval_after_output() {
+        // A notification timestamp normally follows the output timestamp.
+        // This must suppress the candidate instead of panicking on an
+        // attempted `last_output - last_notified_at` subtraction.
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
-        let rt = make_runtime("abc1234", SessionStatus::Running, "", None);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "waiting for approval",
+            Some(Duration::from_secs(5)),
+        );
         {
             let mut locked = rt.write();
-            locked.spawned_at = Instant::now() - Duration::from_secs(30);
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
         let store = store_with(vec![rt], make_test_db().await);
@@ -1754,6 +1760,30 @@ mod tests {
             "screen two\nscreen three\n"
         );
         assert!(resizes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn render_live_logs_preserves_input_needed() {
+        let runtime = make_runtime(
+            "prompt123",
+            SessionStatus::Running,
+            "Allow directory access?",
+            Some(Duration::from_secs(5)),
+        );
+        let output_epoch = runtime.read().effective_output_epoch();
+        let store = store_with(vec![runtime], make_test_db().await);
+        store.mark_notified("prompt123", output_epoch, Instant::now());
+        assert!(store.is_input_needed("prompt123"));
+
+        store
+            .render_live_logs("prompt123", 10, false, 80)
+            .await
+            .expect("render live logs");
+
+        assert!(
+            store.is_input_needed("prompt123"),
+            "reading logs must not acknowledge an input-required prompt"
+        );
     }
 
     #[tokio::test]
