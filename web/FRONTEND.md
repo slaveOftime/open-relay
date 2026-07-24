@@ -28,6 +28,7 @@ Follow the compact dark system in `web\DESIGN.md`: 32px default controls, 6-8px 
 
 3. **Use theme tokens, not file-local colors**
    - Prefer classes based on `hsl(var(--background))`, `--foreground`, `--muted`, `--border`, `--primary`, `--destructive`, and related tokens.
+   - Use `--scrollbar-thumb` and `--scrollbar-thumb-hover` for custom scroll areas so they match native scrollbars across themes.
    - Avoid hard-coded page colors like `text-red-500` or one-off emerald/amber blocks unless the token system cannot express the state yet.
 
 4. **Keep dialogs consistent**
