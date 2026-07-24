@@ -1112,9 +1112,9 @@ pub async fn get_logs_tail(
             from_file: false,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::LogsTail { output, resizes }) => {
-                logs_tail_binary_response(output, &resizes)
-            }
+            Ok(RpcResponse::LogsTail {
+                output, resizes, ..
+            }) => logs_tail_binary_response(output, &resizes),
             Ok(RpcResponse::Error { message }) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),

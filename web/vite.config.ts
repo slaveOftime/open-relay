@@ -106,7 +106,7 @@ export default defineConfig({
   build: {
     target: 'es2020',
     sourcemap: false,
-    minify: 'esbuild',
+    minify: 'oxc',
     cssMinify: true,
     reportCompressedSize: true,
     rollupOptions: {
@@ -121,9 +121,5 @@ export default defineConfig({
         },
       },
     },
-  },
-  esbuild: {
-    // Trim production output while preserving app behavior.
-    drop: ['debugger'],
   },
 })
