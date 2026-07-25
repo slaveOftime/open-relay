@@ -11,6 +11,10 @@ use crate::{
 };
 
 pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<String>) -> Result<()> {
+    if list_args.follow {
+        return super::list_tui::run(config, &list_args, node).await;
+    }
+
     const CMD_WIDTH: usize = 12;
     const INPUT_WIDTH: usize = 8;
     const TITLE_WIDTH: usize = 12;
@@ -168,6 +172,9 @@ fn session_json(session: &SessionSummary) -> Value {
         "input_needed": session.input_needed,
         "last_total_bytes": session.last_total_bytes,
         "last_output_epoch": session.last_output_epoch.map(|dt| dt.to_rfc3339()),
+        "rows": session.rows,
+        "cols": session.cols,
+        "attach_count": session.attach_count,
         "notifications_enabled": session.notifications_enabled,
     })
 }
@@ -183,7 +190,7 @@ fn input_required_label(input_needed: bool) -> &'static str {
     if input_needed { "required" } else { "-" }
 }
 
-fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
+pub(super) fn build_list_query(args: &ListArgs) -> Result<ListQuery> {
     let since = parse_datetime_arg(args.since.as_deref(), "since")?;
     let until = parse_datetime_arg(args.until.as_deref(), "until")?;
 
@@ -251,6 +258,7 @@ mod tests {
             search: Some("demo".to_string()),
             tags: vec!["prod".to_string(), " release ".to_string(), " ".to_string()],
             json: true,
+            follow: false,
             status: vec![],
             since: None,
             until: None,
@@ -286,6 +294,9 @@ mod tests {
             node: None,
             last_total_bytes: 4096,
             last_output_epoch: None,
+            rows: Some(24),
+            cols: Some(80),
+            attach_count: 0,
         };
 
         let value = session_json(&session);

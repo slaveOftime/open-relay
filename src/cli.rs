@@ -187,8 +187,11 @@ pub struct ListArgs {
     #[arg(long = "tag")]
     pub tags: Vec<String>,
     /// Print machine-readable JSON instead of the default table.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "follow")]
     pub json: bool,
+    /// Follow sessions in an interactive realtime terminal UI.
+    #[arg(long, short = 'f')]
+    pub follow: bool,
     /// Only show sessions with these statuses (repeatable).
     #[arg(long = "status", short = 's', value_enum)]
     pub status: Vec<ListStatus>,
@@ -635,6 +638,16 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+    }
+
+    #[test]
+    fn list_parses_follow_and_rejects_json_combination() {
+        let cli = Cli::try_parse_from(["oly", "ls", "--follow"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(args.follow);
+        assert!(Cli::try_parse_from(["oly", "ls", "--follow", "--json"]).is_err());
     }
 
     #[test]

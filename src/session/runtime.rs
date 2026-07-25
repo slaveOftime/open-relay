@@ -152,6 +152,9 @@ impl SessionRuntime {
             node: None,
             last_total_bytes: self.last_total_bytes,
             last_output_epoch: self.last_output_epoch.and_then(instant_to_utc),
+            rows: self.pty_size.map(|(rows, _)| rows),
+            cols: self.pty_size.map(|(_, cols)| cols),
+            attach_count: self.attach_count,
         }
     }
 

@@ -568,6 +568,12 @@ pub struct SessionSummary {
     pub node: Option<String>,
     pub last_total_bytes: u64,
     pub last_output_epoch: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub attach_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -257,6 +257,9 @@ mod tests {
             node: None,
             last_total_bytes: 0,
             last_output_epoch: None,
+            rows: None,
+            cols: None,
+            attach_count: 0,
         }
     }
 
