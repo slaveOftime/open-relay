@@ -190,7 +190,7 @@
       visibility 180ms ease;
     contain: paint;
     will-change: opacity;
-    z-index: 1;
+    z-index: 9999;
   }
   .terminal-viewport-idle-overlay.is-active {
     opacity: 1;
