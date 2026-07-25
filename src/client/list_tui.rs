@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
@@ -33,6 +33,7 @@ use crate::{
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const RATE_HISTORY_LEN: usize = 30;
 const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -113,7 +114,11 @@ async fn fetch_sessions(
         },
         None => inner,
     };
-    match ipc::send_request_checked(config, request).await? {
+    let response =
+        tokio::time::timeout(REFRESH_TIMEOUT, ipc::send_request_checked(config, request))
+            .await
+            .map_err(|_| AppError::Protocol("session refresh timed out".to_string()))??;
+    match response {
         RpcResponse::List { mut sessions, .. } => {
             sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             Ok(sessions)
@@ -131,6 +136,9 @@ struct App {
     next_slot: usize,
     message: Option<String>,
     filter: String,
+    normalized_filter: String,
+    search_text: Vec<String>,
+    visible: Vec<usize>,
     status_filter: StatusFilter,
 }
 
@@ -140,6 +148,10 @@ enum StatusFilter {
     All,
     Active,
     Inactive,
+}
+
+fn is_active_status(status: &str) -> bool {
+    matches!(status, "created" | "running" | "stopping")
 }
 
 impl StatusFilter {
@@ -206,10 +218,27 @@ impl RateState {
     }
 }
 
+fn session_search_text(session: &SessionSummary) -> String {
+    let mut text = format!("{}\n{}", session.id, session.command);
+    if let Some(title) = &session.title {
+        text.push('\n');
+        text.push_str(title);
+    }
+    text.to_lowercase()
+}
+
 impl App {
     fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
         let selected_id = self.sessions.get(self.selected).map(|item| item.id.clone());
         let now = Instant::now();
+        let session_ids = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<HashSet<_>>();
+        let attach_counts = sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.attach_count))
+            .collect::<HashMap<_, _>>();
         for session in &sessions {
             match self.rates.get_mut(&session.id) {
                 Some(rate) => rate.sample(session, now),
@@ -219,65 +248,67 @@ impl App {
                 }
             }
         }
-        self.rates
-            .retain(|id, _| sessions.iter().any(|session| session.id == *id));
-        self.sessions = sessions;
+        self.rates.retain(|id, _| session_ids.contains(id));
         self.opened.retain(|id, opened| {
-            let attach_count = self
-                .sessions
-                .iter()
-                .find(|session| session.id == *id)
-                .map(|session| session.attach_count);
+            let attach_count = attach_counts.get(id).copied();
             let launch_pending = opened.launched_at.elapsed() < Duration::from_secs(5);
-            let active = attach_count.is_some_and(|count| count > 0);
-            if opened.marker.exists() && !launch_pending && !active {
+            let attached = attach_count.is_some_and(|count| count > 0);
+            if opened.marker.exists() && !launch_pending && !attached {
                 let _ = std::fs::remove_file(&opened.marker);
             }
             attach_count.is_some() && (launch_pending || opened.marker.exists())
         });
+        self.search_text = sessions.iter().map(session_search_text).collect();
+        self.sessions = sessions;
         self.selected = selected_id
             .and_then(|id| self.sessions.iter().position(|item| item.id == id))
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
-        if !self.visible_indices().contains(&self.selected) {
-            self.first();
+        self.rebuild_visible();
+    }
+
+    fn rebuild_visible(&mut self) {
+        self.visible.clear();
+        self.visible.extend(
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter(|(index, session)| {
+                    let active = is_active_status(&session.status);
+                    let status_matches = match self.status_filter {
+                        StatusFilter::All => true,
+                        StatusFilter::Active => active,
+                        StatusFilter::Inactive => !active,
+                    };
+                    status_matches
+                        && (self.normalized_filter.is_empty()
+                            || self.search_text[*index].contains(&self.normalized_filter))
+                })
+                .map(|(index, _)| index),
+        );
+        if !self.visible.contains(&self.selected)
+            && let Some(index) = self.visible.first()
+        {
+            self.selected = *index;
         }
     }
 
-    fn visible_indices(&self) -> Vec<usize> {
-        let filter = self.filter.to_lowercase();
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, session)| {
-                let active = matches!(session.status.as_str(), "created" | "running" | "stopping");
-                let status_matches = match self.status_filter {
-                    StatusFilter::All => true,
-                    StatusFilter::Active => active,
-                    StatusFilter::Inactive => !active,
-                };
-                let text_matches = filter.is_empty()
-                    || session.id.to_lowercase().contains(&filter)
-                    || session.command.to_lowercase().contains(&filter)
-                    || session
-                        .title
-                        .as_deref()
-                        .is_some_and(|title| title.to_lowercase().contains(&filter));
-                status_matches && text_matches
-            })
-            .map(|(index, _)| index)
-            .collect()
+    fn selected_session(&self) -> Option<&SessionSummary> {
+        self.visible
+            .contains(&self.selected)
+            .then(|| &self.sessions[self.selected])
     }
 
     fn select_visible(&mut self, offset: isize) {
-        let visible = self.visible_indices();
-        if visible.is_empty() {
+        if self.visible.is_empty() {
             return;
         }
-        let position = visible
+        let position = self
+            .visible
             .iter()
             .position(|index| *index == self.selected)
             .unwrap_or(0) as isize;
-        self.selected = visible[(position + offset).rem_euclid(visible.len() as isize) as usize];
+        self.selected =
+            self.visible[(position + offset).rem_euclid(self.visible.len() as isize) as usize];
     }
 
     fn previous(&mut self) {
@@ -289,33 +320,37 @@ impl App {
     }
 
     fn first(&mut self) {
-        if let Some(index) = self.visible_indices().first() {
+        if let Some(index) = self.visible.first() {
             self.selected = *index;
         }
     }
 
     fn last(&mut self) {
-        if let Some(index) = self.visible_indices().last() {
+        if let Some(index) = self.visible.last() {
             self.selected = *index;
         }
     }
 
-    fn push_filter(&mut self, character: char) {
-        self.filter.push(character);
+    fn update_text_filter(&mut self) {
+        self.normalized_filter = self.filter.to_lowercase();
+        self.rebuild_visible();
         self.first();
         self.message = None;
+    }
+
+    fn push_filter(&mut self, character: char) {
+        self.filter.push(character);
+        self.update_text_filter();
     }
 
     fn pop_filter(&mut self) {
         self.filter.pop();
-        self.first();
-        self.message = None;
+        self.update_text_filter();
     }
 
     fn clear_filter(&mut self) {
         self.filter.clear();
-        self.first();
-        self.message = None;
+        self.update_text_filter();
     }
 
     fn toggle_status_filter(&mut self) {
@@ -324,6 +359,7 @@ impl App {
             StatusFilter::Active => StatusFilter::Inactive,
             StatusFilter::Inactive => StatusFilter::All,
         };
+        self.rebuild_visible();
         self.first();
         self.message = Some(format!(
             "showing {} sessions · Ctrl+S toggle",
@@ -332,29 +368,23 @@ impl App {
     }
 
     fn open_selected_terminal(&mut self, node: Option<&str>) {
-        let Some(session) = self.sessions.get(self.selected) else {
+        let Some(session) = self.selected_session() else {
             return;
         };
-        let attach = matches!(session.status.as_str(), "created" | "running");
-        if attach && self.opened.contains_key(&session.id) {
-            self.message = Some(format!("{} is already jacked in", session.id));
+        let attach = is_active_status(&session.status);
+        let id = session.id.clone();
+        let size = (session.cols.unwrap_or(80), session.rows.unwrap_or(24));
+        if attach && self.opened.contains_key(&id) {
+            self.message = Some(format!("{id} is already jacked in"));
             return;
         }
 
-        let size = (session.cols.unwrap_or(80), session.rows.unwrap_or(24));
-        let marker = attach.then(|| terminal_marker(&session.id));
-        match spawn_session_terminal(
-            &session.id,
-            node,
-            size,
-            self.next_slot,
-            attach,
-            marker.as_deref(),
-        ) {
+        let marker = attach.then(|| terminal_marker(&id));
+        match spawn_session_terminal(&id, node, size, self.next_slot, attach, marker.as_deref()) {
             Ok(()) => {
                 if let Some(marker) = marker {
                     self.opened.insert(
-                        session.id.clone(),
+                        id.clone(),
                         OpenedTerminal {
                             marker,
                             launched_at: Instant::now(),
@@ -363,9 +393,9 @@ impl App {
                 }
                 self.next_slot += 1;
                 self.message = Some(if attach {
-                    format!("opened {} · link established", session.id)
+                    format!("opened {id} · link established")
                 } else {
-                    format!("opened {} · log tail", session.id)
+                    format!("opened {id} · log tail")
                 });
             }
             Err(error) => self.message = Some(format!("launch failed: {error}")),
@@ -378,11 +408,11 @@ fn open_selected_inline(
     app: &mut App,
     node: Option<&str>,
 ) -> Result<()> {
-    let Some(session) = app.sessions.get(app.selected) else {
+    let Some(session) = app.selected_session() else {
         return Ok(());
     };
     let id = session.id.clone();
-    let attach = matches!(session.status.as_str(), "created" | "running");
+    let attach = is_active_status(&session.status);
     let (executable, args) = session_command(&id, node, attach)?;
 
     terminal.suspend()?;
@@ -556,7 +586,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         header[1],
     );
 
-    let visible = app.visible_indices();
+    let visible = &app.visible;
     if app.sessions.is_empty() || visible.is_empty() {
         let empty = if app.sessions.is_empty() {
             "\n  no signals detected\n  start one: oly start -d <cmd>".to_string()
@@ -568,7 +598,17 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             chunks[1],
         );
     } else {
-        let items = visible.iter().map(|index| {
+        let selected_position = visible
+            .iter()
+            .position(|index| *index == app.selected)
+            .unwrap_or(0);
+        let viewport_len = chunks[1].height.max(1) as usize;
+        let viewport_start = selected_position
+            .saturating_sub(viewport_len / 2)
+            .min(visible.len().saturating_sub(viewport_len));
+        let viewport_end = (viewport_start + viewport_len).min(visible.len());
+        let viewport = &visible[viewport_start..viewport_end];
+        let items = viewport.iter().map(|index| {
             let session = &app.sessions[*index];
             session_item(
                 session,
@@ -584,8 +624,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
                 .bg(Color::Rgb(25, 55, 72))
                 .add_modifier(Modifier::BOLD),
         );
-        let selected = visible.iter().position(|index| *index == app.selected);
-        let mut state = ListState::default().with_selected(selected);
+        let mut state =
+            ListState::default().with_selected(Some(selected_position - viewport_start));
         frame.render_stateful_widget(list, chunks[1], &mut state);
     }
 
@@ -619,7 +659,7 @@ fn session_item(
     available_width: u16,
     now: Instant,
 ) -> ListItem<'static> {
-    let active = matches!(session.status.as_str(), "running" | "created" | "stopping");
+    let active = is_active_status(&session.status);
     let mut status = status_glyph(&session.status, session.input_needed);
     if !active {
         status.1 = Color::DarkGray;
@@ -1224,13 +1264,13 @@ mod tests {
         for character in "WORKER".chars() {
             app.push_filter(character);
         }
-        assert_eq!(app.visible_indices(), [1]);
+        assert_eq!(app.visible.clone(), [1]);
         assert_eq!(app.selected, 1);
         app.next();
         assert_eq!(app.selected, 1);
 
         app.clear_filter();
-        assert_eq!(app.visible_indices(), [0, 1]);
+        assert_eq!(app.visible.clone(), [0, 1]);
     }
 
     #[test]
@@ -1241,13 +1281,34 @@ mod tests {
         inactive.status = "stopped".to_string();
         app.replace_sessions(vec![active, inactive]);
 
-        assert_eq!(app.visible_indices(), [0, 1]);
+        assert_eq!(app.visible.clone(), [0, 1]);
         app.toggle_status_filter();
-        assert_eq!(app.visible_indices(), [0]);
+        assert_eq!(app.visible.clone(), [0]);
         app.toggle_status_filter();
-        assert_eq!(app.visible_indices(), [1]);
+        assert_eq!(app.visible.clone(), [1]);
         app.toggle_status_filter();
-        assert_eq!(app.visible_indices(), [0, 1]);
+        assert_eq!(app.visible.clone(), [0, 1]);
+    }
+
+    #[test]
+    fn empty_filter_has_no_selected_session() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("visible")]);
+        for character in "missing".chars() {
+            app.push_filter(character);
+        }
+        assert!(app.visible.is_empty());
+        assert!(app.selected_session().is_none());
+    }
+
+    #[test]
+    fn stopping_session_is_attachable() {
+        let mut item = session("stopping");
+        item.status = "stopping".to_string();
+        assert!(super::is_active_status(&item.status));
+        let (_, args) =
+            super::session_command(&item.id, None, super::is_active_status(&item.status)).unwrap();
+        assert_eq!(args, ["attach", "stopping"]);
     }
 
     #[test]
