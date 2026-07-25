@@ -28,55 +28,6 @@ struct PendingKeyBurst {
     deadline: Instant,
 }
 
-#[cfg(windows)]
-struct AttachRenderer {
-    parser: vt100::Parser,
-    needs_full_repaint: bool,
-}
-
-#[cfg(windows)]
-impl AttachRenderer {
-    fn new(rows: u16, cols: u16) -> Self {
-        Self {
-            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
-            needs_full_repaint: false,
-        }
-    }
-
-    fn render_initial(&mut self, data: &[u8]) -> Vec<u8> {
-        self.parser.process(data);
-        self.needs_full_repaint = false;
-        self.parser.screen().state_formatted()
-    }
-
-    fn render_chunk(&mut self, data: &[u8]) -> Vec<u8> {
-        let previous = self.parser.screen().clone();
-        self.parser.process(data);
-
-        // Render from canonical screen state instead of forwarding ConPTY's
-        // wrap-dependent bytes. Once the initial snapshot is on screen, state
-        // diffs preserve that exact baseline without full-screen flashing.
-        let update = if self.needs_full_repaint {
-            self.needs_full_repaint = false;
-            self.parser.screen().state_formatted()
-        } else {
-            self.parser.screen().state_diff(&previous)
-        };
-        if update.is_empty() {
-            return update;
-        }
-        let mut synchronized = b"\x1b[?2026h".to_vec();
-        synchronized.extend_from_slice(&update);
-        synchronized.extend_from_slice(b"\x1b[?2026l");
-        synchronized
-    }
-
-    fn resize(&mut self, rows: u16, cols: u16) {
-        crate::session::vt100::safe_resize_parser(&mut self.parser, rows, cols);
-        self.needs_full_repaint = true;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -167,14 +118,8 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         // snapshot data so the restored screen starts from a known state.
         write_bytes_to_stdout(b"\x1b[H\x1b[2J")?;
 
-        #[cfg(windows)]
-        let mut renderer = AttachRenderer::new(rows, cols);
-        #[cfg(windows)]
-        write_bytes_to_stdout(&renderer.render_initial(&initial_data))?;
-
-        #[cfg(not(windows))]
+        // Write the initial terminal-state snapshot directly.
         write_bytes_to_stdout(&initial_data)?;
-
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         // Drain any stale resize events queued by writing replay data
@@ -277,10 +222,6 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
                         if (actual_cols, actual_rows) != last_sent_size {
                             last_sent_size = (actual_cols, actual_rows);
-
-                            #[cfg(windows)]
-                            renderer.resize(actual_rows, actual_cols);
-
                             ipc::write_request_to_writer(
                                 &mut write_half,
                                 RpcRequest::AttachResize {
@@ -421,9 +362,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 }
                 Ok(Some(Ok(response))) => match response {
                     RpcResponse::AttachStreamChunk { data, .. } => {
-                        #[cfg(windows)]
-                        write_bytes_to_stdout(&renderer.render_chunk(&data))?;
-                        #[cfg(not(windows))]
+                        // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
                         write_bytes_to_stdout(&data)?;
                     }
                     RpcResponse::AttachModeChanged {
@@ -858,34 +797,6 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn windows_live_chunk_is_repainted_from_canonical_screen_state() {
-        let mut renderer = AttachRenderer::new(4, 20);
-        let initial = renderer.render_initial(b"\x1b[2;5Hbefore");
-        let mut replay = vt100::Parser::new(4, 20, 0);
-        replay.process(&initial);
-
-        let mut redraw = b"\x1b[H".to_vec();
-        redraw.extend_from_slice(&vec![b' '; 25]);
-        redraw.extend_from_slice("工作目录".as_bytes());
-
-        let rendered = renderer.render_chunk(&redraw);
-
-        assert!(rendered.starts_with(b"\x1b[?2026h"));
-        assert!(rendered.ends_with(b"\x1b[?2026l"));
-        replay.process(&rendered);
-        assert_eq!(
-            replay.screen().contents(),
-            renderer.parser.screen().contents()
-        );
-        assert!(
-            !rendered
-                .windows(b"\x1b[2J".len())
-                .any(|window| window == b"\x1b[2J")
-        );
     }
 
     // -----------------------------------------------------------------------
