@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -9,7 +9,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -57,12 +57,29 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
                 && key.kind != KeyEventKind::Release
             {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                    KeyCode::Down | KeyCode::Char('j') => app.next(),
+                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        break;
+                    }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.toggle_status_filter()
+                    }
+                    KeyCode::Esc => app.clear_filter(),
+                    KeyCode::Backspace => app.pop_filter(),
+                    KeyCode::Up => app.previous(),
+                    KeyCode::Down => app.next(),
                     KeyCode::Home => app.first(),
                     KeyCode::End => app.last(),
-                    KeyCode::Enter => app.open_selected(node.as_deref()),
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.open_selected_terminal(node.as_deref())
+                    }
+                    KeyCode::Enter => {
+                        open_selected_inline(&mut terminal, &mut app, node.as_deref())?
+                    }
+                    KeyCode::Char(character)
+                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                    {
+                        app.push_filter(character)
+                    }
                     _ => {}
                 }
             }
@@ -113,6 +130,26 @@ struct App {
     opened: HashMap<String, OpenedTerminal>,
     next_slot: usize,
     message: Option<String>,
+    filter: String,
+    status_filter: StatusFilter,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StatusFilter {
+    #[default]
+    All,
+    Active,
+    Inactive,
+}
+
+impl StatusFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Inactive => "inactive",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -201,32 +238,100 @@ impl App {
         self.selected = selected_id
             .and_then(|id| self.sessions.iter().position(|item| item.id == id))
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
+        if !self.visible_indices().contains(&self.selected) {
+            self.first();
+        }
+    }
+
+    fn visible_indices(&self) -> Vec<usize> {
+        let filter = self.filter.to_lowercase();
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                let active = matches!(session.status.as_str(), "created" | "running" | "stopping");
+                let status_matches = match self.status_filter {
+                    StatusFilter::All => true,
+                    StatusFilter::Active => active,
+                    StatusFilter::Inactive => !active,
+                };
+                let text_matches = filter.is_empty()
+                    || session.id.to_lowercase().contains(&filter)
+                    || session.command.to_lowercase().contains(&filter)
+                    || session
+                        .title
+                        .as_deref()
+                        .is_some_and(|title| title.to_lowercase().contains(&filter));
+                status_matches && text_matches
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn select_visible(&mut self, offset: isize) {
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            return;
+        }
+        let position = visible
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0) as isize;
+        self.selected = visible[(position + offset).rem_euclid(visible.len() as isize) as usize];
     }
 
     fn previous(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.sessions.len() - 1);
-        }
+        self.select_visible(-1);
     }
 
     fn next(&mut self) {
-        if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1) % self.sessions.len();
-        }
+        self.select_visible(1);
     }
 
     fn first(&mut self) {
-        self.selected = 0;
+        if let Some(index) = self.visible_indices().first() {
+            self.selected = *index;
+        }
     }
 
     fn last(&mut self) {
-        self.selected = self.sessions.len().saturating_sub(1);
+        if let Some(index) = self.visible_indices().last() {
+            self.selected = *index;
+        }
     }
 
-    fn open_selected(&mut self, node: Option<&str>) {
+    fn push_filter(&mut self, character: char) {
+        self.filter.push(character);
+        self.first();
+        self.message = None;
+    }
+
+    fn pop_filter(&mut self) {
+        self.filter.pop();
+        self.first();
+        self.message = None;
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.first();
+        self.message = None;
+    }
+
+    fn toggle_status_filter(&mut self) {
+        self.status_filter = match self.status_filter {
+            StatusFilter::All => StatusFilter::Active,
+            StatusFilter::Active => StatusFilter::Inactive,
+            StatusFilter::Inactive => StatusFilter::All,
+        };
+        self.first();
+        self.message = Some(format!(
+            "showing {} sessions · Ctrl+S toggle",
+            self.status_filter.label()
+        ));
+    }
+
+    fn open_selected_terminal(&mut self, node: Option<&str>) {
         let Some(session) = self.sessions.get(self.selected) else {
             return;
         };
@@ -268,6 +373,53 @@ impl App {
     }
 }
 
+fn open_selected_inline(
+    terminal: &mut TuiTerminal,
+    app: &mut App,
+    node: Option<&str>,
+) -> Result<()> {
+    let Some(session) = app.sessions.get(app.selected) else {
+        return Ok(());
+    };
+    let id = session.id.clone();
+    let attach = matches!(session.status.as_str(), "created" | "running");
+    let (executable, args) = session_command(&id, node, attach)?;
+
+    terminal.suspend()?;
+    let result = Command::new(executable).args(args).status();
+    let wait_result = if attach { Ok(()) } else { wait_for_ctrl_d() };
+    terminal.resume()?;
+    wait_result?;
+
+    app.message = Some(match result {
+        Ok(status) if status.success() => format!("returned from {id}"),
+        Ok(status) => format!("session {id} exited with {status}"),
+        Err(error) => format!("open failed: {error}"),
+    });
+    Ok(())
+}
+
+fn wait_for_ctrl_d() -> Result<()> {
+    println!("\nPress Ctrl+D to return to the session list");
+    io::stdout().flush()?;
+    enable_raw_mode()?;
+    let result = loop {
+        match event::read() {
+            Ok(Event::Key(key))
+                if key.kind != KeyEventKind::Release
+                    && key.code == KeyCode::Char('d')
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                break Ok(());
+            }
+            Ok(_) => {}
+            Err(error) => break Err(error.into()),
+        }
+    };
+    let _ = disable_raw_mode();
+    result
+}
+
 struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -293,6 +445,20 @@ impl TuiTerminal {
 
     fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<()> {
         self.terminal.draw(render)?;
+        Ok(())
+    }
+
+    fn suspend(&mut self) -> Result<()> {
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()?;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> Result<()> {
+        enable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        self.terminal.clear()?;
         Ok(())
     }
 }
@@ -352,9 +518,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(
-            " {} sessions · {} live",
+            " {} sessions · {} live · {}",
             app.sessions.len(),
-            running
+            running,
+            app.status_filter.label()
         )),
     ]);
     let header_block = || {
@@ -389,14 +556,20 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         header[1],
     );
 
-    if app.sessions.is_empty() {
+    let visible = app.visible_indices();
+    if app.sessions.is_empty() || visible.is_empty() {
+        let empty = if app.sessions.is_empty() {
+            "\n  no signals detected\n  start one: oly start -d <cmd>".to_string()
+        } else {
+            format!("\n  no sessions match ‘{}’", app.filter)
+        };
         frame.render_widget(
-            Paragraph::new("\n  no signals detected\n  start one: oly start -d <cmd>")
-                .style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(empty).style(Style::default().fg(Color::DarkGray)),
             chunks[1],
         );
     } else {
-        let items = app.sessions.iter().map(|session| {
+        let items = visible.iter().map(|index| {
+            let session = &app.sessions[*index];
             session_item(
                 session,
                 app.rates.get(&session.id),
@@ -411,14 +584,24 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
                 .bg(Color::Rgb(25, 55, 72))
                 .add_modifier(Modifier::BOLD),
         );
-        let mut state = ListState::default().with_selected(Some(app.selected));
+        let selected = visible.iter().position(|index| *index == app.selected);
+        let mut state = ListState::default().with_selected(selected);
         frame.render_stateful_widget(list, chunks[1], &mut state);
     }
 
-    let help = app.message.as_deref().unwrap_or(match mode {
-        LayoutMode::Narrow => " ↑↓/jk move  ↵ open  q quit",
-        _ => " ↑↓ / j k  navigate    Enter  open terminal    Home/End  warp    q  disconnect",
-    });
+    let default_help = if app.filter.is_empty() {
+        match mode {
+            LayoutMode::Narrow => " type filter  Ctrl+S status  ↵ open  Ctrl+D exit".to_string(),
+            _ => " type to filter    Ctrl+S status    Enter open    Ctrl+Enter window    Ctrl+C/D exit".to_string(),
+        }
+    } else {
+        format!(
+            " filter: {}_    status: {} (Ctrl+S)    Backspace edit    Esc clear    Ctrl+C/D exit",
+            app.filter,
+            app.status_filter.label()
+        )
+    };
+    let help = app.message.as_deref().unwrap_or(&default_help);
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(if app.message.is_some() {
             Color::Yellow
@@ -436,7 +619,11 @@ fn session_item(
     available_width: u16,
     now: Instant,
 ) -> ListItem<'static> {
-    let status = status_glyph(&session.status, session.input_needed);
+    let active = matches!(session.status.as_str(), "running" | "created" | "stopping");
+    let mut status = status_glyph(&session.status, session.input_needed);
+    if !active {
+        status.1 = Color::DarkGray;
+    }
     let status_text = status_label(&session.status, session.input_needed);
     let name = session
         .title
@@ -448,13 +635,18 @@ fn session_item(
     let animation_age = rate
         .map(|value| now.duration_since(value.sampled_at))
         .unwrap_or_default();
-    let rate_color = rate_color(current_rate, animation_age);
+    let rate_color = if active {
+        rate_color(current_rate, animation_age)
+    } else {
+        Color::DarkGray
+    };
+    let session_id = pad_truncated(&session.id, 8);
     let item = match mode {
         LayoutMode::Narrow => {
             let indicator =
                 tiny_indicator(current_rate, session.status == "running", animation_age);
-            let status_width = UnicodeWidthStr::width(status_text).clamp(5, 8);
-            let fixed_width = 5
+            let status_width = UnicodeWidthStr::width(status_text).clamp(5, 9);
+            let fixed_width = 14
                 + status_width
                 + UnicodeWidthStr::width(age.as_str()).max(5)
                 + UnicodeWidthStr::width(indicator.as_str());
@@ -463,6 +655,10 @@ fn session_item(
                 .max(1);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", status.0), Style::default().fg(status.1)),
+                Span::styled(
+                    format!("{session_id} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(format!("{} ", truncate(name, name_width))),
                 Span::styled(
                     format!("{status_text:<status_width$} "),
@@ -473,15 +669,19 @@ fn session_item(
             ]))
         }
         LayoutMode::Medium => {
-            let fixed_width = 2 + 9 + 7 + 13;
+            let fixed_width = 2 + 9 + 10 + 7 + 13;
             let name_width = (available_width as usize)
                 .saturating_sub(fixed_width)
                 .clamp(8, 30);
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", status.0), Style::default().fg(status.1)),
+                Span::styled(
+                    format!("{session_id} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(pad_truncated(name, name_width)),
                 Span::styled(
-                    format!(" {:<8}", status_text),
+                    format!(" {:<9}", status_text),
                     Style::default().fg(status.1),
                 ),
                 Span::styled(
@@ -504,7 +704,7 @@ fn session_item(
             } else {
                 format!("{} {}", session.command, session.args.join(" "))
             };
-            let fixed_width = 2 + 23 + 8 + 9 + 7 + 13 + 10;
+            let fixed_width = 2 + 23 + 8 + 10 + 7 + 9 + 13 + 10;
             let command_width = (available_width as usize)
                 .saturating_sub(fixed_width)
                 .max(8);
@@ -519,10 +719,14 @@ fn session_item(
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    format!("{:<8} ", status_text),
+                    format!("{:<9} ", status_text),
                     Style::default().fg(status.1),
                 ),
                 Span::styled(format!("{:>5} ", age), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{session_id} "),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(pad_truncated(&command, command_width)),
                 Span::styled(
                     format!(
@@ -539,14 +743,10 @@ fn session_item(
             ]))
         }
     };
-    if session.status == "stopped" {
-        item.style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        )
-    } else {
+    if active {
         item
+    } else {
+        item.style(Style::default().fg(Color::DarkGray))
     }
 }
 
@@ -641,7 +841,7 @@ fn pad_truncated(value: &str, width: usize) -> String {
 }
 
 fn status_label<'a>(status: &'a str, input_needed: bool) -> &'a str {
-    if input_needed { "input" } else { status }
+    if input_needed { "attention" } else { status }
 }
 
 fn status_glyph(status: &str, input_needed: bool) -> (&'static str, Color) {
@@ -780,6 +980,17 @@ fn session_command(
 }
 
 #[cfg(windows)]
+fn powershell_encoded_command(script: &str) -> String {
+    use base64::Engine as _;
+
+    let utf16 = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(utf16)
+}
+
+#[cfg(windows)]
 fn spawn_session_terminal(
     id: &str,
     node: Option<&str>,
@@ -803,11 +1014,13 @@ fn spawn_session_terminal(
         &format!("oly · {id}"),
     ]);
     let script = shell_command(&executable, &attach_args, marker, true);
-    command.args(["powershell.exe", "-NoProfile"]);
+    let encoded_script = powershell_encoded_command(&script);
+    command.arg("powershell.exe");
+    command.arg("-NoProfile");
     if !attach {
         command.arg("-NoExit");
     }
-    command.args(["-Command", &script]);
+    command.args(["-EncodedCommand", &encoded_script]);
     command.spawn().map(|_| ())
 }
 
@@ -1001,6 +1214,43 @@ mod tests {
     }
 
     #[test]
+    fn quick_filter_is_case_insensitive_and_limits_navigation() {
+        let mut app = App::default();
+        let first = session("alpha");
+        let mut second = session("beta");
+        second.title = Some("Worker Two".to_string());
+        app.replace_sessions(vec![first, second]);
+
+        for character in "WORKER".chars() {
+            app.push_filter(character);
+        }
+        assert_eq!(app.visible_indices(), [1]);
+        assert_eq!(app.selected, 1);
+        app.next();
+        assert_eq!(app.selected, 1);
+
+        app.clear_filter();
+        assert_eq!(app.visible_indices(), [0, 1]);
+    }
+
+    #[test]
+    fn status_filter_cycles_all_active_inactive() {
+        let mut app = App::default();
+        let active = session("active");
+        let mut inactive = session("inactive");
+        inactive.status = "stopped".to_string();
+        app.replace_sessions(vec![active, inactive]);
+
+        assert_eq!(app.visible_indices(), [0, 1]);
+        app.toggle_status_filter();
+        assert_eq!(app.visible_indices(), [0]);
+        app.toggle_status_filter();
+        assert_eq!(app.visible_indices(), [1]);
+        app.toggle_status_filter();
+        assert_eq!(app.visible_indices(), [0, 1]);
+    }
+
+    #[test]
     fn refresh_calculates_rate_and_keeps_history_bounded() {
         let mut app = App::default();
         let first = session("a");
@@ -1030,9 +1280,29 @@ mod tests {
     }
 
     #[test]
-    fn input_required_replaces_running_status_label() {
-        assert_eq!(super::status_label("running", true), "input");
+    fn input_required_uses_attention_status_label() {
+        assert_eq!(super::status_label("running", true), "attention");
         assert_eq!(super::status_label("running", false), "running");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_script_is_encoded_as_utf16le() {
+        use base64::Engine as _;
+
+        let script = "try { & 'D:\\oly.exe' 'attach' '123' } finally { cleanup }";
+        let encoded = super::powershell_encoded_command(script);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let decoded = String::from_utf16(
+            &bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(decoded, script);
     }
 
     #[test]
