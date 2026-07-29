@@ -18,10 +18,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Layout},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
 use crate::{
@@ -36,6 +36,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const RATE_HISTORY_LEN: usize = 30;
+const STOP_GRACE_SECONDS: u64 = 15;
 const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
 pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String>) -> Result<()> {
@@ -57,31 +58,16 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
             if let Event::Key(key) = event::read()?
                 && key.kind != KeyEventKind::Release
             {
-                match key.code {
-                    KeyCode::Char('c' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        break;
-                    }
-                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.toggle_status_filter()
-                    }
-                    KeyCode::Esc => app.clear_filter(),
-                    KeyCode::Backspace => app.pop_filter(),
-                    KeyCode::Up => app.previous(),
-                    KeyCode::Down => app.next(),
-                    KeyCode::Home => app.first(),
-                    KeyCode::End => app.last(),
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.open_selected_terminal(node.as_deref())
-                    }
-                    KeyCode::Enter => {
+                match route_key(&mut app, key, node.as_deref()) {
+                    AppAction::None => {}
+                    AppAction::Quit => break,
+                    AppAction::OpenInline => {
                         open_selected_inline(&mut terminal, &mut app, node.as_deref())?
                     }
-                    KeyCode::Char(character)
-                        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-                    {
-                        app.push_filter(character)
+                    AppAction::Start(launch) => {
+                        start_clone(config, &mut terminal, &mut app, launch).await?
                     }
-                    _ => {}
+                    AppAction::Stop(target) => stop_session(config, &mut app, target).await,
                 }
             }
         }
@@ -127,6 +113,83 @@ async fn fetch_sessions(
     }
 }
 
+async fn start_clone(
+    config: &AppConfig,
+    terminal: &mut TuiTerminal,
+    app: &mut App,
+    launch: CloneLaunch,
+) -> Result<()> {
+    match ipc::send_request_checked(config, launch.request()).await {
+        Ok(RpcResponse::Start { session_id }) => {
+            app.clone_dialog = None;
+            app.message = Some(format!("started new session {session_id}"));
+            if launch.attach_after_start {
+                open_session_inline(terminal, app, &session_id, launch.node.as_deref(), true)?;
+            }
+        }
+        Ok(_) => {
+            set_clone_error(app, "unexpected response type".to_string());
+        }
+        Err(error) => set_clone_error(app, format!("start failed: {error}")),
+    }
+    Ok(())
+}
+
+async fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
+    let request = wrap_node(
+        target.node.as_deref(),
+        RpcRequest::Stop {
+            id: target.id.clone(),
+            grace_seconds: STOP_GRACE_SECONDS,
+        },
+    );
+    apply_stop_response(
+        app,
+        &target,
+        ipc::send_request_checked(config, request).await,
+    );
+}
+
+fn apply_stop_response(app: &mut App, target: &SessionTarget, response: Result<RpcResponse>) {
+    match response {
+        Ok(RpcResponse::Stop { stopped: true }) => {
+            app.message = Some(format!("stopped {}", target.id));
+            if let Some(session) = app
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == target.id)
+            {
+                session.status = "stopped".to_string();
+            }
+        }
+        Ok(_) => {
+            app.message = Some(format!(
+                "stop failed for {}: unexpected response",
+                target.id
+            ))
+        }
+        Err(error) => app.message = Some(format!("stop failed for {}: {error}", target.id)),
+    }
+}
+
+fn wrap_node(node: Option<&str>, inner: RpcRequest) -> RpcRequest {
+    match node {
+        Some(node) => RpcRequest::NodeProxy {
+            node: node.to_string(),
+            inner: Box::new(inner),
+        },
+        None => inner,
+    }
+}
+
+fn set_clone_error(app: &mut App, error: String) {
+    if let Some(dialog) = app.clone_dialog.as_mut() {
+        dialog.error = Some(error);
+    } else {
+        app.message = Some(error);
+    }
+}
+
 #[derive(Default)]
 struct App {
     sessions: Vec<SessionSummary>,
@@ -140,6 +203,512 @@ struct App {
     search_text: Vec<String>,
     visible: Vec<usize>,
     status_filter: StatusFilter,
+    clone_dialog: Option<CloneDialog>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AppAction {
+    None,
+    Quit,
+    OpenInline,
+    Start(CloneLaunch),
+    Stop(SessionTarget),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SessionTarget {
+    id: String,
+    node: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CloneLaunch {
+    title: Option<String>,
+    tags: Vec<String>,
+    command: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    node: Option<String>,
+    rows: Option<u16>,
+    cols: Option<u16>,
+    disable_notifications: bool,
+    attach_after_start: bool,
+}
+
+impl CloneLaunch {
+    fn request(&self) -> RpcRequest {
+        wrap_node(
+            self.node.as_deref(),
+            RpcRequest::Start {
+                title: self.title.clone(),
+                tags: self.tags.clone(),
+                cmd: self.command.clone(),
+                args: self.args.clone(),
+                cwd: self.cwd.clone(),
+                rows: self.rows,
+                cols: self.cols,
+                disable_notifications: self.disable_notifications,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloneField {
+    Command,
+    Args,
+    Cwd,
+    Title,
+    Tags,
+    Node,
+    Rows,
+    Cols,
+    DisableNotifications,
+    AttachAfterStart,
+}
+
+const CLONE_FIELDS: [CloneField; 10] = [
+    CloneField::Command,
+    CloneField::Args,
+    CloneField::Cwd,
+    CloneField::Title,
+    CloneField::Tags,
+    CloneField::Node,
+    CloneField::Rows,
+    CloneField::Cols,
+    CloneField::DisableNotifications,
+    CloneField::AttachAfterStart,
+];
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct EditText {
+    value: String,
+    cursor: usize,
+}
+
+impl EditText {
+    fn new(value: String) -> Self {
+        let cursor = value.chars().count();
+        Self { value, cursor }
+    }
+
+    fn byte_index(&self) -> usize {
+        self.value
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.value.len(), |(index, _)| index)
+    }
+
+    fn insert(&mut self, character: char) {
+        let index = self.byte_index();
+        self.value.insert(index, character);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        self.delete();
+    }
+
+    fn delete(&mut self) {
+        let start = self.byte_index();
+        if start == self.value.len() {
+            return;
+        }
+        let end = self.value[start..]
+            .char_indices()
+            .nth(1)
+            .map_or(self.value.len(), |(offset, _)| start + offset);
+        self.value.replace_range(start..end, "");
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.value.chars().count());
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CloneDialog {
+    source_id: String,
+    active: usize,
+    command: EditText,
+    args: EditText,
+    cwd: EditText,
+    title: EditText,
+    tags: EditText,
+    node: EditText,
+    rows: EditText,
+    cols: EditText,
+    disable_notifications: bool,
+    attach_after_start: bool,
+    error: Option<String>,
+}
+
+impl CloneDialog {
+    fn from_session(session: &SessionSummary, list_node: Option<&str>) -> Self {
+        Self {
+            source_id: session.id.clone(),
+            active: 0,
+            command: EditText::new(session.command.clone()),
+            args: EditText::new(format_terminal_words(&session.args)),
+            cwd: EditText::new(session.cwd.clone().unwrap_or_default()),
+            title: EditText::new(session.title.clone().unwrap_or_default()),
+            tags: EditText::new(format_terminal_words(&session.tags)),
+            node: EditText::new(
+                session
+                    .node
+                    .as_deref()
+                    .or(list_node)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            rows: EditText::new(
+                session
+                    .rows
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            cols: EditText::new(
+                session
+                    .cols
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            disable_notifications: !session.notifications_enabled,
+            attach_after_start: false,
+            error: None,
+        }
+    }
+
+    fn active_field(&self) -> CloneField {
+        CLONE_FIELDS[self.active]
+    }
+
+    fn next(&mut self) {
+        self.active = (self.active + 1) % CLONE_FIELDS.len();
+        self.error = None;
+    }
+
+    fn previous(&mut self) {
+        self.active = (self.active + CLONE_FIELDS.len() - 1) % CLONE_FIELDS.len();
+        self.error = None;
+    }
+
+    fn active_text_mut(&mut self) -> Option<&mut EditText> {
+        match self.active_field() {
+            CloneField::Command => Some(&mut self.command),
+            CloneField::Args => Some(&mut self.args),
+            CloneField::Cwd => Some(&mut self.cwd),
+            CloneField::Title => Some(&mut self.title),
+            CloneField::Tags => Some(&mut self.tags),
+            CloneField::Node => Some(&mut self.node),
+            CloneField::Rows => Some(&mut self.rows),
+            CloneField::Cols => Some(&mut self.cols),
+            CloneField::DisableNotifications | CloneField::AttachAfterStart => None,
+        }
+    }
+
+    fn toggle_active(&mut self) {
+        match self.active_field() {
+            CloneField::DisableNotifications => {
+                self.disable_notifications = !self.disable_notifications
+            }
+            CloneField::AttachAfterStart => self.attach_after_start = !self.attach_after_start,
+            _ => {}
+        }
+        self.error = None;
+    }
+
+    fn launch(&self) -> std::result::Result<CloneLaunch, String> {
+        if self.command.value.trim().is_empty() {
+            return Err("command is required".to_string());
+        }
+        let args = parse_terminal_words("args", &self.args.value)?;
+        let tags = parse_terminal_words("tags", &self.tags.value)?;
+        let rows = parse_dimension("rows", &self.rows.value)?;
+        let cols = parse_dimension("cols", &self.cols.value)?;
+        Ok(CloneLaunch {
+            title: optional_text(&self.title.value),
+            tags,
+            command: self.command.value.clone(),
+            args,
+            cwd: optional_text(&self.cwd.value),
+            node: optional_text(&self.node.value),
+            rows,
+            cols,
+            disable_notifications: self.disable_notifications,
+            attach_after_start: self.attach_after_start,
+        })
+    }
+}
+
+fn format_terminal_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if word.is_empty() {
+                return "\"\"".to_string();
+            }
+            if word
+                .chars()
+                .all(|character| !character.is_whitespace() && !matches!(character, '\'' | '"'))
+            {
+                return word.clone();
+            }
+            let escaped = word
+                .chars()
+                .flat_map(|character| {
+                    if matches!(character, '"' | '\\') {
+                        ['\\', character].into_iter().collect::<Vec<_>>()
+                    } else {
+                        [character].into_iter().collect()
+                    }
+                })
+                .collect::<String>();
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_terminal_words(label: &str, value: &str) -> std::result::Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut word_started = false;
+    let mut quote = None;
+    let mut characters = value.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                } else {
+                    word.push(character);
+                }
+            }
+            Some('"') => {
+                if character == '"' {
+                    quote = None;
+                } else if character == '\\' {
+                    match characters.peek().copied() {
+                        Some('"' | '\\') => word.push(characters.next().unwrap()),
+                        _ => word.push(character),
+                    }
+                } else {
+                    word.push(character);
+                }
+            }
+            Some(_) => unreachable!(),
+            None if character.is_whitespace() => {
+                if word_started {
+                    words.push(std::mem::take(&mut word));
+                    word_started = false;
+                }
+            }
+            None if matches!(character, '\'' | '"') => {
+                quote = Some(character);
+                word_started = true;
+            }
+            None if character == '\\' => {
+                word_started = true;
+                match characters.peek().copied() {
+                    Some(next) if next.is_whitespace() || matches!(next, '\'' | '"' | '\\') => {
+                        word.push(characters.next().unwrap());
+                    }
+                    _ => word.push(character),
+                }
+            }
+            None => {
+                word.push(character);
+                word_started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err(format!("{label} has an unclosed quote"));
+    }
+    if word_started {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+fn parse_dimension(label: &str, value: &str) -> std::result::Result<Option<u16>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|dimension| *dimension > 0)
+        .map(Some)
+        .ok_or_else(|| format!("{label} must be 1-65535"))
+}
+
+fn optional_text(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&str>) -> AppAction {
+    if matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return AppAction::Quit;
+    }
+
+    if app.clone_dialog.is_some() {
+        return route_clone_dialog_key(app, key);
+    }
+
+    match key.code {
+        _ if is_clone_dialog_key(key) => {
+            let Some(session) = app.selected_session() else {
+                app.message = Some("no session selected to clone".to_string());
+                return AppAction::None;
+            };
+            app.clone_dialog = Some(CloneDialog::from_session(session, list_node));
+            AppAction::None
+        }
+        KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let Some(session) = app.selected_session() else {
+                app.message = Some("no session selected to stop".to_string());
+                return AppAction::None;
+            };
+            if !matches!(session.status.as_str(), "created" | "running") {
+                app.message = Some(format!(
+                    "{} cannot be stopped while {}",
+                    session.id, session.status
+                ));
+                return AppAction::None;
+            }
+            AppAction::Stop(SessionTarget {
+                id: session.id.clone(),
+                node: session
+                    .node
+                    .clone()
+                    .or_else(|| list_node.map(str::to_string)),
+            })
+        }
+        KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_status_filter();
+            AppAction::None
+        }
+        KeyCode::Esc => {
+            app.clear_filter();
+            AppAction::None
+        }
+        KeyCode::Backspace => {
+            app.pop_filter();
+            AppAction::None
+        }
+        KeyCode::Up => {
+            app.previous();
+            AppAction::None
+        }
+        KeyCode::Down => {
+            app.next();
+            AppAction::None
+        }
+        KeyCode::Home => {
+            app.first();
+            AppAction::None
+        }
+        KeyCode::End => {
+            app.last();
+            AppAction::None
+        }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.open_selected_terminal(list_node);
+            AppAction::None
+        }
+        KeyCode::Enter => AppAction::OpenInline,
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            app.push_filter(character);
+            AppAction::None
+        }
+        _ => AppAction::None,
+    }
+}
+
+fn is_clone_dialog_key(key: crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('\u{4}'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d' | 'D')))
+}
+
+fn route_clone_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
+    if key.code == KeyCode::Esc {
+        app.clone_dialog = None;
+        app.message = Some("clone cancelled".to_string());
+        return AppAction::None;
+    }
+
+    let dialog = app.clone_dialog.as_mut().expect("dialog checked above");
+    match key.code {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => dialog.previous(),
+        KeyCode::Tab => dialog.next(),
+        KeyCode::BackTab => dialog.previous(),
+        KeyCode::Enter => match dialog.launch() {
+            Ok(launch) => return AppAction::Start(launch),
+            Err(error) => dialog.error = Some(error),
+        },
+        KeyCode::Char(' ') if dialog.active_text_mut().is_none() => dialog.toggle_active(),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if let Some(field) = dialog.active_text_mut() {
+                field.insert(character);
+                dialog.error = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.backspace();
+                dialog.error = None;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.delete();
+                dialog.error = None;
+            }
+        }
+        KeyCode::Left => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.right();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.cursor = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.cursor = field.value.chars().count();
+            }
+        }
+        _ => {}
+    }
+    AppAction::None
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -413,7 +982,17 @@ fn open_selected_inline(
     };
     let id = session.id.clone();
     let attach = is_active_status(&session.status);
-    let (executable, args) = session_command(&id, node, attach)?;
+    open_session_inline(terminal, app, &id, node, attach)
+}
+
+fn open_session_inline(
+    terminal: &mut TuiTerminal,
+    app: &mut App,
+    id: &str,
+    node: Option<&str>,
+    attach: bool,
+) -> Result<()> {
+    let (executable, args) = session_command(id, node, attach)?;
 
     terminal.suspend()?;
     let result = Command::new(executable).args(args).status();
@@ -631,12 +1210,14 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let default_help = if app.filter.is_empty() {
         match mode {
-            LayoutMode::Narrow => " type filter  Ctrl+S status  ↵ open  Ctrl+D exit".to_string(),
-            _ => " type to filter    Ctrl+S status    Enter open    Ctrl+Enter window    Ctrl+C/D exit".to_string(),
+            LayoutMode::Narrow => {
+                " type filter  ^D clone  ^K stop  ↵ open  ^C exit".to_string()
+            }
+            _ => " type to filter    Ctrl+D duplicate    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
         }
     } else {
         format!(
-            " filter: {}_    status: {} (Ctrl+S)    Backspace edit    Esc clear    Ctrl+C/D exit",
+            " filter: {}_    status: {} (Ctrl+S)    Ctrl+D duplicate    Ctrl+K stop    Backspace edit    Esc clear",
             app.filter,
             app.status_filter.label()
         )
@@ -650,6 +1231,163 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         })),
         chunks[2],
     );
+
+    if let Some(dialog) = app.clone_dialog.as_ref() {
+        render_clone_dialog(frame, dialog);
+    }
+}
+
+fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
+    let area = centered_rect(frame.area(), 96, 13);
+    frame.render_widget(Clear, area);
+    let cursor_visible = clone_cursor_visible();
+    let fields =
+        CLONE_FIELDS.map(|field| clone_field_line(dialog, field, area.width, cursor_visible));
+    let mut lines = fields.to_vec();
+    lines.push(Line::from(Span::styled(
+        dialog.error.as_deref().unwrap_or(
+            " * Quote spaces · ←/→ cursor · Tab/Ctrl+Tab fields · Space toggle · Enter start · Esc cancel",
+        ),
+        Style::default().fg(if dialog.error.is_some() {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(format!(" Clone {} as new session ", dialog.source_id))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        area,
+    );
+}
+
+fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
+    let width = area.width.saturating_sub(2).min(max_width).max(1);
+    let height = area.height.saturating_sub(2).min(max_height).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn clone_field_line(
+    dialog: &CloneDialog,
+    field: CloneField,
+    width: u16,
+    cursor_visible: bool,
+) -> Line<'static> {
+    let active = dialog.active_field() == field;
+    let label = match field {
+        CloneField::Command => "Cmd",
+        CloneField::Args => "Args",
+        CloneField::Cwd => "Cwd",
+        CloneField::Title => "Title",
+        CloneField::Tags => "Tags",
+        CloneField::Node => "Node",
+        CloneField::Rows => "Rows",
+        CloneField::Cols => "Cols",
+        CloneField::DisableNotifications => "Disable notifications",
+        CloneField::AttachAfterStart => "Attach after start",
+    };
+    let value_width = width.saturating_sub(22) as usize;
+    let value = match field {
+        CloneField::Command => {
+            edit_text_display(&dialog.command, active, value_width, cursor_visible)
+        }
+        CloneField::Args => edit_text_display(&dialog.args, active, value_width, cursor_visible),
+        CloneField::Cwd => edit_text_display(&dialog.cwd, active, value_width, cursor_visible),
+        CloneField::Title => edit_text_display(&dialog.title, active, value_width, cursor_visible),
+        CloneField::Tags => edit_text_display(&dialog.tags, active, value_width, cursor_visible),
+        CloneField::Node => edit_text_display(&dialog.node, active, value_width, cursor_visible),
+        CloneField::Rows => edit_text_display(&dialog.rows, active, value_width, cursor_visible),
+        CloneField::Cols => edit_text_display(&dialog.cols, active, value_width, cursor_visible),
+        CloneField::DisableNotifications => {
+            pad_truncated(&checkbox(dialog.disable_notifications), value_width)
+        }
+        CloneField::AttachAfterStart => {
+            pad_truncated(&checkbox(dialog.attach_after_start), value_width)
+        }
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(" {:<21}", label),
+            Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
+        ),
+        Span::styled(
+            value,
+            Style::default()
+                .fg(if active { Color::White } else { Color::Gray })
+                .add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+    ])
+}
+
+fn edit_text_display(field: &EditText, active: bool, width: usize, cursor_visible: bool) -> String {
+    if !active {
+        return pad_truncated(&field.value, width);
+    }
+    edit_text_viewport(field, width, cursor_visible)
+}
+
+fn edit_text_viewport(field: &EditText, width: usize, cursor_visible: bool) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let cursor_byte = field.byte_index();
+    let cursor_cell = UnicodeWidthStr::width(&field.value[..cursor_byte]);
+    let mut content = field.value.clone();
+    content.insert(cursor_byte, if cursor_visible { '▏' } else { ' ' });
+    let total_width = UnicodeWidthStr::width(content.as_str());
+    let viewport_start = cursor_cell
+        .saturating_sub(width / 2)
+        .min(total_width.saturating_sub(width));
+    let viewport_end = viewport_start + width;
+    let mut position = 0;
+    let mut visible = String::new();
+
+    for character in content.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        let character_end = position + character_width;
+        if character_end > viewport_start && position < viewport_end {
+            let visible_width = UnicodeWidthStr::width(visible.as_str());
+            if visible_width + character_width <= width {
+                visible.push(character);
+            }
+        }
+        position = character_end;
+        if position >= viewport_end {
+            break;
+        }
+    }
+
+    let padding = width.saturating_sub(UnicodeWidthStr::width(visible.as_str()));
+    visible.push_str(&" ".repeat(padding));
+    visible
+}
+
+fn clone_cursor_visible() -> bool {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(true, |elapsed| (elapsed.as_millis() / 500) % 2 == 0)
+}
+
+fn checkbox(checked: bool) -> String {
+    if checked {
+        "[x]".to_string()
+    } else {
+        "[ ]".to_string()
+    }
 }
 
 fn session_item(
@@ -1206,9 +1944,21 @@ fn shell_quote(value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, WindowRect, arrange_window};
-    use crate::protocol::SessionSummary;
+    use super::{App, AppAction, CloneField, CloneLaunch, WindowRect, arrange_window, route_key};
+    use crate::{
+        error::AppError,
+        protocol::{RpcRequest, RpcResponse, SessionSummary},
+    };
     use chrono::{TimeZone, Utc};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
 
     fn session(id: &str) -> SessionSummary {
         SessionSummary {
@@ -1232,6 +1982,262 @@ mod tests {
             cols: Some(80),
             attach_count: 0,
         }
+    }
+
+    #[test]
+    fn ctrl_d_opens_complete_prefilled_clone_dialog() {
+        let mut app = App::default();
+        let mut source = session("source");
+        source.title = Some("Agent review".to_string());
+        source.tags = vec!["review".to_string(), "night shift".to_string()];
+        source.command = "copilot".to_string();
+        source.args = vec!["--model".to_string(), "gpt 5".to_string()];
+        source.cwd = Some("D:\\work tree".to_string());
+        source.notifications_enabled = true;
+        source.node = Some("worker-a".to_string());
+        source.rows = Some(42);
+        source.cols = Some(132);
+        app.replace_sessions(vec![source]);
+
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('d')), None),
+            AppAction::None
+        );
+        let dialog = app.clone_dialog.as_ref().unwrap();
+        assert_eq!(dialog.source_id, "source");
+        assert_eq!(dialog.command.value, "copilot");
+        assert_eq!(dialog.args.value, r#"--model "gpt 5""#);
+        assert_eq!(dialog.cwd.value, "D:\\work tree");
+        assert_eq!(dialog.title.value, "Agent review");
+        assert_eq!(dialog.tags.value, r#"review "night shift""#);
+        assert_eq!(dialog.node.value, "worker-a");
+        assert_eq!(dialog.rows.value, "42");
+        assert_eq!(dialog.cols.value, "132");
+        assert!(!dialog.disable_notifications);
+        assert!(!dialog.attach_after_start);
+    }
+
+    #[test]
+    fn ctrl_c_is_the_only_list_exit_and_ctrl_v_no_longer_clones() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('v')), None),
+            AppAction::None
+        );
+        assert!(app.clone_dialog.is_none());
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('c')), None),
+            AppAction::Quit
+        );
+    }
+
+    #[test]
+    fn raw_ctrl_d_opens_clone_dialog() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Char('\u{4}')), None),
+            AppAction::None
+        );
+        assert!(app.clone_dialog.is_some());
+    }
+
+    #[test]
+    fn terminal_word_input_round_trips_launch_values() {
+        let values = vec![
+            "plain".to_string(),
+            "two words".to_string(),
+            "say\"hi".to_string(),
+            "C:\\work tree".to_string(),
+            String::new(),
+            "single'quote".to_string(),
+        ];
+        let formatted = super::format_terminal_words(&values);
+        assert_eq!(
+            super::parse_terminal_words("args", &formatted).unwrap(),
+            values
+        );
+        assert_eq!(
+            super::parse_terminal_words(
+                "args",
+                r#"--flag "two words" 'single quoted' C:\work\ path"#,
+            )
+            .unwrap(),
+            ["--flag", "two words", "single quoted", "C:\\work path"]
+        );
+        assert_eq!(
+            super::parse_terminal_words("args", r#""unfinished"#).unwrap_err(),
+            "args has an unclosed quote"
+        );
+    }
+
+    #[test]
+    fn focused_text_viewport_tracks_and_blinks_cursor() {
+        let mut field = super::EditText::new("0123456789abcdefghij".to_string());
+
+        field.cursor = 0;
+        assert_eq!(super::edit_text_viewport(&field, 10, true), "▏012345678");
+
+        field.cursor = 10;
+        assert_eq!(super::edit_text_viewport(&field, 10, true), "56789▏abcd");
+        assert_eq!(super::edit_text_viewport(&field, 10, false), "56789 abcd");
+
+        field.cursor = field.value.chars().count();
+        assert_eq!(super::edit_text_viewport(&field, 10, true), "bcdefghij▏");
+
+        let wide = super::EditText::new("日本語 abcdefghij".to_string());
+        let visible = super::edit_text_viewport(&wide, 10, true);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(visible.as_str()), 10);
+        assert!(visible.contains('▏'));
+    }
+
+    #[test]
+    fn tab_and_ctrl_tab_navigate_clone_fields() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('d')), None);
+
+        assert_eq!(
+            app.clone_dialog.as_ref().unwrap().active_field(),
+            CloneField::Command
+        );
+        route_key(&mut app, key(KeyCode::Tab), None);
+        assert_eq!(
+            app.clone_dialog.as_ref().unwrap().active_field(),
+            CloneField::Args
+        );
+        route_key(&mut app, ctrl(KeyCode::Tab), None);
+        assert_eq!(
+            app.clone_dialog.as_ref().unwrap().active_field(),
+            CloneField::Command
+        );
+        route_key(&mut app, key(KeyCode::BackTab), None);
+        assert_eq!(
+            app.clone_dialog.as_ref().unwrap().active_field(),
+            CloneField::AttachAfterStart
+        );
+    }
+
+    #[test]
+    fn enter_confirms_complete_modified_launch_and_request_payload() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('d')), Some("list-node"));
+        let dialog = app.clone_dialog.as_mut().unwrap();
+        dialog.command = super::EditText::new("agent-cli".to_string());
+        dialog.args = super::EditText::new(r#"run "two words""#.to_string());
+        dialog.cwd = super::EditText::new("D:\\jobs".to_string());
+        dialog.title = super::EditText::new("Cloned agent".to_string());
+        dialog.tags = super::EditText::new("alpha beta".to_string());
+        dialog.node = super::EditText::new("worker-b".to_string());
+        dialog.rows = super::EditText::new("50".to_string());
+        dialog.cols = super::EditText::new("160".to_string());
+        dialog.disable_notifications = true;
+        dialog.attach_after_start = true;
+
+        let expected = CloneLaunch {
+            title: Some("Cloned agent".to_string()),
+            tags: vec!["alpha".to_string(), "beta".to_string()],
+            command: "agent-cli".to_string(),
+            args: vec!["run".to_string(), "two words".to_string()],
+            cwd: Some("D:\\jobs".to_string()),
+            node: Some("worker-b".to_string()),
+            rows: Some(50),
+            cols: Some(160),
+            disable_notifications: true,
+            attach_after_start: true,
+        };
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::Start(expected)
+        );
+
+        let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), None) else {
+            panic!("expected start action");
+        };
+        match launch.request() {
+            RpcRequest::NodeProxy { node, inner } => {
+                assert_eq!(node, "worker-b");
+                match *inner {
+                    RpcRequest::Start {
+                        title,
+                        tags,
+                        cmd,
+                        args,
+                        cwd,
+                        rows,
+                        cols,
+                        disable_notifications,
+                    } => {
+                        assert_eq!(title.as_deref(), Some("Cloned agent"));
+                        assert_eq!(tags, ["alpha", "beta"]);
+                        assert_eq!(cmd, "agent-cli");
+                        assert_eq!(args, ["run", "two words"]);
+                        assert_eq!(cwd.as_deref(), Some("D:\\jobs"));
+                        assert_eq!(rows, Some(50));
+                        assert_eq!(cols, Some(160));
+                        assert!(disable_notifications);
+                    }
+                    other => panic!("unexpected inner request: {}", other.name()),
+                }
+            }
+            other => panic!("unexpected request: {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn ctrl_k_routes_stoppable_selection_and_handles_empty_or_inactive_state() {
+        let mut app = App::default();
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('k')), None),
+            AppAction::None
+        );
+        assert_eq!(app.message.as_deref(), Some("no session selected to stop"));
+
+        let mut active = session("active");
+        active.node = Some("worker-a".to_string());
+        app.replace_sessions(vec![active]);
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('k')), Some("list-node")),
+            AppAction::Stop(super::SessionTarget {
+                id: "active".to_string(),
+                node: Some("worker-a".to_string()),
+            })
+        );
+
+        app.sessions[0].status = "stopped".to_string();
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('k')), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("active cannot be stopped while stopped")
+        );
+    }
+
+    #[test]
+    fn stale_stop_response_is_safe_and_explains_failure() {
+        let mut app = App::default();
+        let target = super::SessionTarget {
+            id: "vanished".to_string(),
+            node: None,
+        };
+        super::apply_stop_response(
+            &mut app,
+            &target,
+            Err(AppError::Protocol("session not found".to_string())),
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("stop failed for vanished: protocol error: session not found")
+        );
+
+        super::apply_stop_response(&mut app, &target, Ok(RpcResponse::Stop { stopped: true }));
+        assert_eq!(app.message.as_deref(), Some("stopped vanished"));
     }
 
     #[test]

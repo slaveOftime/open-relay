@@ -186,6 +186,8 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
 | `oly skill` | Print the bundled `oly` skill markdown |
 
+In the interactive `oly ls --follow` view, `Ctrl+D` opens a clone editor prefilled from the selected session, `Tab`/`Ctrl+Tab` move between launch settings, and `Enter` starts a new session without changing the original. Use `Ctrl+K` to stop the selected running session, `Enter` to open it inline, `Ctrl+Enter` to open it in another terminal window, and `Ctrl+C` to exit the list view.
+
 Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `key:esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, modifier forms like `key:ctrl+c`, `key:alt+x`, `key:meta+enter`, `key:shift+tab`, and raw bytes via `key:hex:...`.
 
 ### Federation commands
