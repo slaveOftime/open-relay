@@ -78,7 +78,7 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
                     start_clone(config, &mut terminal, &mut app, launch).await?
                 }
                 AppAction::Update(update) => update_session(config, &mut app, update).await,
-                AppAction::Stop(target) => stop_session(config, &mut app, target).await,
+                AppAction::Stop(target) => stop_session(config, &mut app, target),
             }
         }
 
@@ -191,7 +191,7 @@ fn apply_update_response(app: &mut App, target_id: &str, response: Result<RpcRes
     }
 }
 
-async fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
+fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
     let request = wrap_node(
         target.node.as_deref(),
         RpcRequest::Stop {
@@ -199,33 +199,11 @@ async fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) 
             grace_seconds: STOP_GRACE_SECONDS,
         },
     );
-    apply_stop_response(
-        app,
-        &target,
-        ipc::send_request_checked(config, request).await,
-    );
-}
-
-fn apply_stop_response(app: &mut App, target: &SessionTarget, response: Result<RpcResponse>) {
-    match response {
-        Ok(RpcResponse::Stop { stopped: true }) => {
-            app.message = Some(format!("stopped {}", target.id));
-            if let Some(session) = app
-                .sessions
-                .iter_mut()
-                .find(|session| session.id == target.id)
-            {
-                session.status = "stopped".to_string();
-            }
-        }
-        Ok(_) => {
-            app.message = Some(format!(
-                "stop failed for {}: unexpected response",
-                target.id
-            ))
-        }
-        Err(error) => app.message = Some(format!("stop failed for {}: {error}", target.id)),
-    }
+    let config = config.clone();
+    tokio::spawn(async move {
+        let _ = ipc::send_request_checked(&config, request).await;
+    });
+    app.message = Some(format!("stop signal sent to {}", target.id));
 }
 
 fn wrap_node(node: Option<&str>, inner: RpcRequest) -> RpcRequest {
@@ -1542,9 +1520,18 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         let mut state = TableState::new()
             .with_offset(viewport_start)
             .with_selected(Some(selected_position));
-        frame.render_stateful_widget(table, chunks[1], &mut state);
+        let show_scrollbar = visible.len() > viewport_len;
+        let table_area = if show_scrollbar {
+            Rect {
+                width: chunks[1].width.saturating_sub(1),
+                ..chunks[1]
+            }
+        } else {
+            chunks[1]
+        };
+        frame.render_stateful_widget(table, table_area, &mut state);
 
-        if visible.len() > viewport_len {
+        if show_scrollbar {
             let mut scrollbar_state = ScrollbarState::new(visible.len())
                 .position(selected_position)
                 .viewport_content_length(viewport_len);
@@ -1560,7 +1547,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let default_help = if app.filter.is_empty() {
         match mode {
             LayoutMode::Narrow => {
-                " type filter  ^D clone  ^U edit  ^K stop  ↵ open  ^C exit".to_string()
+                " type filter  ^D clone  ^U edit  ^K stop  ↵/^↵ open ^C exit".to_string()
             }
             _ => " type to filter    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
         }
@@ -1573,11 +1560,17 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     };
     let help = app.message.as_deref().unwrap_or(&default_help);
     frame.render_widget(
-        Paragraph::new(help).style(Style::default().fg(if app.message.is_some() {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        })),
+        Paragraph::new(help)
+            .style(Style::default().fg(if app.message.is_some() {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
         chunks[2],
     );
 
@@ -1589,11 +1582,12 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
-    let area = centered_rect(frame.area(), 96, 13);
+    let area = centered_rect(frame.area(), 96, 14);
     let cursor_visible = clone_cursor_visible();
     let fields =
         CLONE_FIELDS.map(|field| clone_field_line(dialog, field, area.width, cursor_visible));
     let mut lines = fields.to_vec();
+    lines.push(tip_separator(area.width));
     lines.push(dialog_footer(dialog.error.as_deref(), CLONE_DIALOG_HELP));
     render_dialog(
         frame,
@@ -1605,7 +1599,7 @@ fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
 }
 
 fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
-    let area = centered_rect(frame.area(), 110, 18);
+    let area = centered_rect(frame.area(), 110, 19);
     let cursor_visible = clone_cursor_visible();
     let mut lines = UPDATE_FIELDS
         .map(|field| update_field_line(dialog, field, area.width, cursor_visible))
@@ -1615,6 +1609,7 @@ fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
             .into_iter()
             .map(|(label, value)| update_read_only_line(label, &value, area.width)),
     );
+    lines.push(tip_separator(area.width));
     lines.push(dialog_footer(dialog.error.as_deref(), UPDATE_DIALOG_HELP));
     render_dialog(
         frame,
@@ -1627,6 +1622,13 @@ fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
         },
         lines,
     );
+}
+
+fn tip_separator(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "\u{2500}".repeat(width.saturating_sub(2) as usize),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn dialog_footer<'a>(error: Option<&'a str>, help: &'static str) -> Line<'a> {
@@ -1837,7 +1839,7 @@ fn clone_field_line(
         CloneField::Node => "Node",
         CloneField::Rows => "Rows",
         CloneField::Cols => "Cols",
-        CloneField::DisableNotifications => "Disable notifications",
+        CloneField::DisableNotifications => "Notifications",
         CloneField::AttachAfterStart => "Attach after start",
     };
     let value_width = width.saturating_sub(22) as usize;
@@ -1853,7 +1855,7 @@ fn clone_field_line(
         CloneField::Rows => edit_text_display(&dialog.rows, active, value_width, cursor_visible),
         CloneField::Cols => edit_text_display(&dialog.cols, active, value_width, cursor_visible),
         CloneField::DisableNotifications => {
-            pad_truncated(&checkbox(dialog.disable_notifications), value_width)
+            pad_truncated(&checkbox(!dialog.disable_notifications), value_width)
         }
         CloneField::AttachAfterStart => {
             pad_truncated(&checkbox(dialog.attach_after_start), value_width)
@@ -1967,6 +1969,23 @@ fn session_table_widths(mode: LayoutMode) -> Vec<Constraint> {
     }
 }
 
+fn session_table_alignments(mode: LayoutMode) -> Vec<Alignment> {
+    match mode {
+        LayoutMode::Narrow | LayoutMode::Medium => vec![Alignment::Left; 6],
+        LayoutMode::Wide => vec![
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Right,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Right,
+        ],
+    }
+}
+
 fn session_table_header(mode: LayoutMode) -> Row<'static> {
     let labels = match mode {
         LayoutMode::Narrow => vec!["", "ID", "SESSION", "STATE", "AGE", "I/O"],
@@ -1975,11 +1994,19 @@ fn session_table_header(mode: LayoutMode) -> Row<'static> {
             "", "SESSION", "PID", "STATE", "AGE", "ID", "COMMAND", "RATE", "OUTPUT",
         ],
     };
-    Row::new(labels).style(
+    let cells = labels
+        .into_iter()
+        .zip(session_table_alignments(mode))
+        .map(|(label, alignment)| aligned_cell(label, alignment));
+    Row::new(cells).style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+fn aligned_cell(content: impl Into<Line<'static>>, alignment: Alignment) -> Cell<'static> {
+    Cell::from(content.into().alignment(alignment))
 }
 
 fn session_row(
@@ -2009,29 +2036,41 @@ fn session_row(
     } else {
         Color::DarkGray
     };
+    let alignments = session_table_alignments(mode);
     let row = match mode {
         LayoutMode::Narrow => Row::new(vec![
-            Cell::from(Span::styled(status.0, Style::default().fg(status.1))),
-            Cell::from(session.id.clone()).style(Style::default().fg(Color::DarkGray)),
-            Cell::from(name),
-            Cell::from(status_text.to_string()).style(Style::default().fg(status.1)),
-            Cell::from(Line::from(age).alignment(Alignment::Right))
+            aligned_cell(
+                Span::styled(status.0, Style::default().fg(status.1)),
+                alignments[0],
+            ),
+            aligned_cell(session.id.clone(), alignments[1])
                 .style(Style::default().fg(Color::DarkGray)),
-            Cell::from(sparkline(rate, COMPACT_SPARKLINE_WIDTH))
+            aligned_cell(name, alignments[2]),
+            aligned_cell(status_text.to_string(), alignments[3])
+                .style(Style::default().fg(status.1)),
+            aligned_cell(age, alignments[4]).style(Style::default().fg(Color::DarkGray)),
+            aligned_cell(sparkline(rate, COMPACT_SPARKLINE_WIDTH), alignments[5])
                 .style(Style::default().fg(rate_color)),
         ]),
         LayoutMode::Medium => Row::new(vec![
-            Cell::from(Span::styled(status.0, Style::default().fg(status.1))),
-            Cell::from(session.id.clone()).style(Style::default().fg(Color::DarkGray)),
-            Cell::from(name),
-            Cell::from(status_text.to_string()).style(Style::default().fg(status.1)),
-            Cell::from(Line::from(age).alignment(Alignment::Right))
+            aligned_cell(
+                Span::styled(status.0, Style::default().fg(status.1)),
+                alignments[0],
+            ),
+            aligned_cell(session.id.clone(), alignments[1])
                 .style(Style::default().fg(Color::DarkGray)),
-            Cell::from(Line::from(format!(
-                "{} {:>6}/s",
-                sparkline(rate, SPARKLINE_WIDTH),
-                format_bytes(current_rate)
-            )))
+            aligned_cell(name, alignments[2]),
+            aligned_cell(status_text.to_string(), alignments[3])
+                .style(Style::default().fg(status.1)),
+            aligned_cell(age, alignments[4]).style(Style::default().fg(Color::DarkGray)),
+            aligned_cell(
+                format!(
+                    "{} {:>6}/s",
+                    sparkline(rate, SPARKLINE_WIDTH),
+                    format_bytes(current_rate)
+                ),
+                alignments[5],
+            )
             .style(Style::default().fg(rate_color)),
         ]),
         LayoutMode::Wide => {
@@ -2041,29 +2080,33 @@ fn session_row(
                 format!("{} {}", session.command, session.args.join(" "))
             };
             Row::new(vec![
-                Cell::from(Span::styled(status.0, Style::default().fg(status.1))),
-                Cell::from(name),
-                Cell::from(
-                    Line::from(session.pid.map_or("-".into(), |pid| pid.to_string()))
-                        .alignment(Alignment::Right),
+                aligned_cell(
+                    Span::styled(status.0, Style::default().fg(status.1)),
+                    alignments[0],
+                ),
+                aligned_cell(name, alignments[1]),
+                aligned_cell(
+                    session.pid.map_or("-".into(), |pid| pid.to_string()),
+                    alignments[2],
                 )
                 .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(status_text.to_string()).style(Style::default().fg(status.1)),
-                Cell::from(Line::from(age).alignment(Alignment::Right))
+                aligned_cell(status_text.to_string(), alignments[3])
+                    .style(Style::default().fg(status.1)),
+                aligned_cell(age, alignments[4]).style(Style::default().fg(Color::DarkGray)),
+                aligned_cell(session.id.clone(), alignments[5])
                     .style(Style::default().fg(Color::DarkGray)),
-                Cell::from(session.id.clone()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(command),
-                Cell::from(format!(
-                    "{} {:>6}/s",
-                    sparkline(rate, SPARKLINE_WIDTH),
-                    format_bytes(current_rate)
-                ))
-                .style(Style::default().fg(rate_color)),
-                Cell::from(
-                    Line::from(format_bytes(session.last_total_bytes as f64))
-                        .alignment(Alignment::Right),
+                aligned_cell(command, alignments[6]),
+                aligned_cell(
+                    format!(
+                        "{} {:>6}/s",
+                        sparkline(rate, SPARKLINE_WIDTH),
+                        format_bytes(current_rate)
+                    ),
+                    alignments[7],
                 )
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(rate_color)),
+                aligned_cell(format_bytes(session.last_total_bytes as f64), alignments[8])
+                    .style(Style::default().fg(Color::DarkGray)),
             ])
         }
     };
@@ -2472,7 +2515,7 @@ mod tests {
     };
     use chrono::{Local, TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, layout::Alignment};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -2822,6 +2865,29 @@ mod tests {
     }
 
     #[test]
+    fn list_and_dialog_tips_render_with_top_dividers() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+
+        let list = render_app(&mut app, 120, 30);
+        let list_lines = list.lines().collect::<Vec<_>>();
+        let help_index = list_lines
+            .iter()
+            .position(|line| line.contains("Ctrl+D duplicate"))
+            .unwrap();
+        assert!(list_lines[help_index - 1].contains('\u{2500}'));
+
+        route_key(&mut app, ctrl(KeyCode::Char('d')), None);
+        let dialog = render_app(&mut app, 120, 30);
+        let dialog_lines = dialog.lines().collect::<Vec<_>>();
+        let help_index = dialog_lines
+            .iter()
+            .position(|line| line.contains("Enter create"))
+            .unwrap();
+        assert!(dialog_lines[help_index - 1].contains('\u{2500}'));
+    }
+
+    #[test]
     fn clone_and_update_dialogs_render_native_shadows() {
         let mut app = App::default();
         app.replace_sessions(vec![session("source")]);
@@ -3163,27 +3229,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_stop_response_is_safe_and_explains_failure() {
-        let mut app = App::default();
-        let target = super::SessionTarget {
-            id: "vanished".to_string(),
-            node: None,
-        };
-        super::apply_stop_response(
-            &mut app,
-            &target,
-            Err(AppError::Protocol("session not found".to_string())),
-        );
-        assert_eq!(
-            app.message.as_deref(),
-            Some("stop failed for vanished: protocol error: session not found")
-        );
-
-        super::apply_stop_response(&mut app, &target, Ok(RpcResponse::Stop { stopped: true }));
-        assert_eq!(app.message.as_deref(), Some("stopped vanished"));
-    }
-
-    #[test]
     fn refresh_keeps_selection_by_id() {
         let mut app = App::default();
         app.replace_sessions(vec![session("a"), session("b")]);
@@ -3422,6 +3467,65 @@ mod tests {
         assert!(narrow.contains("SESSION"));
         assert!(narrow.contains("STATE"));
         assert!(!narrow.contains("RATE"));
+    }
+
+    #[test]
+    fn table_headers_share_each_modes_cell_alignments() {
+        assert_eq!(
+            super::session_table_alignments(super::LayoutMode::Narrow),
+            vec![Alignment::Left; 6]
+        );
+        assert_eq!(
+            super::session_table_alignments(super::LayoutMode::Medium),
+            vec![Alignment::Left; 6]
+        );
+        assert_eq!(
+            super::session_table_alignments(super::LayoutMode::Wide),
+            vec![
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Right,
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Right,
+            ]
+        );
+
+        let mut item = session("alignment-id");
+        item.title = Some("alignment-title".to_string());
+        item.command = "alignment-command".to_string();
+        item.pid = Some(4242);
+        item.last_total_bytes = 12_345;
+        let output = super::format_bytes(item.last_total_bytes as f64);
+        let mut app = App::default();
+        app.replace_sessions(vec![item]);
+
+        let rendered = render_app(&mut app, 120, 12);
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("OUTPUT"))
+            .unwrap();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("alignment-title"))
+            .unwrap();
+        let display_start = |line: &str, value: &str| {
+            let byte_index = line.find(value).unwrap();
+            unicode_width::UnicodeWidthStr::width(&line[..byte_index])
+        };
+        let selected_row_offset =
+            display_start(row, "alignment-title") - display_start(header, "SESSION");
+        assert_eq!(
+            display_start(header, "PID") + 3 + selected_row_offset,
+            display_start(row, "4242") + 4
+        );
+        assert_eq!(
+            display_start(header, "OUTPUT") + "OUTPUT".len() + selected_row_offset,
+            display_start(row, &output) + output.len()
+        );
     }
 
     #[test]
