@@ -403,7 +403,7 @@ impl EditText {
 
 #[derive(Debug, Eq, PartialEq)]
 struct CloneDialog {
-    source_id: String,
+    source_id: Option<String>,
     active: usize,
     command: EditText,
     args: EditText,
@@ -421,7 +421,7 @@ struct CloneDialog {
 impl CloneDialog {
     fn from_session(session: &SessionSummary, list_node: Option<&str>) -> Self {
         Self {
-            source_id: session.id.clone(),
+            source_id: Some(session.id.clone()),
             active: 0,
             command: EditText::new(session.command.clone()),
             args: EditText::new(format_terminal_words(&session.args)),
@@ -449,6 +449,24 @@ impl CloneDialog {
                     .unwrap_or_default(),
             ),
             disable_notifications: !session.notifications_enabled,
+            attach_after_start: false,
+            error: None,
+        }
+    }
+
+    fn blank() -> Self {
+        Self {
+            source_id: None,
+            active: 0,
+            command: EditText::new(String::new()),
+            args: EditText::new(String::new()),
+            cwd: EditText::new(String::new()),
+            title: EditText::new(String::new()),
+            tags: EditText::new(String::new()),
+            node: EditText::new(String::new()),
+            rows: EditText::new(String::new()),
+            cols: EditText::new(String::new()),
+            disable_notifications: false,
             attach_after_start: false,
             error: None,
         }
@@ -775,6 +793,10 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
     }
 
     match key.code {
+        _ if is_new_session_dialog_key(key) => {
+            app.clone_dialog = Some(CloneDialog::blank());
+            AppAction::None
+        }
         _ if is_clone_dialog_key(key) => {
             let Some(session) = app.selected_session() else {
                 app.message = Some("no session selected to clone".to_string());
@@ -860,6 +882,12 @@ fn is_clone_dialog_key(key: crossterm::event::KeyEvent) -> bool {
             && matches!(key.code, KeyCode::Char('d' | 'D')))
 }
 
+fn is_new_session_dialog_key(key: crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('\u{e}'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('n' | 'N')))
+}
+
 fn is_update_dialog_key(key: crossterm::event::KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\u{15}'))
         || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -868,8 +896,17 @@ fn is_update_dialog_key(key: crossterm::event::KeyEvent) -> bool {
 
 fn route_clone_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
     if key.code == KeyCode::Esc {
+        let message = if app
+            .clone_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.source_id.is_some())
+        {
+            "duplicate cancelled"
+        } else {
+            "new session cancelled"
+        };
         app.clone_dialog = None;
-        app.message = Some("clone cancelled".to_string());
+        app.message = Some(message.to_string());
         return AppAction::None;
     }
 
@@ -1547,13 +1584,13 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let default_help = if app.filter.is_empty() {
         match mode {
             LayoutMode::Narrow => {
-                " type filter  ^D clone  ^U edit  ^K stop  ↵/^↵ open ^C exit".to_string()
+                " type filter  ^N new  ^D clone  ^U edit  ^K stop  ↵/^↵ open ^C exit".to_string()
             }
-            _ => " type to filter    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
+            _ => " type to filter    Ctrl+N new    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
         }
     } else {
         format!(
-            " filter: {}_    status: {} (Ctrl+S)    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Backspace edit    Esc clear",
+            " filter: {}_    status: {} (Ctrl+S)    Ctrl+N new    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Backspace edit    Esc clear",
             app.filter,
             app.status_filter.label()
         )
@@ -1592,7 +1629,10 @@ fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
     render_dialog(
         frame,
         area,
-        format!(" Duplicate {} ", dialog.source_id),
+        dialog.source_id.as_ref().map_or_else(
+            || " New Session ".to_string(),
+            |source_id| format!(" Duplicate {source_id} "),
+        ),
         Color::Cyan,
         lines,
     );
@@ -2586,7 +2626,7 @@ mod tests {
             AppAction::None
         );
         let dialog = app.clone_dialog.as_ref().unwrap();
-        assert_eq!(dialog.source_id, "source");
+        assert_eq!(dialog.source_id.as_deref(), Some("source"));
         assert_eq!(dialog.command.value, "copilot");
         assert_eq!(dialog.args.value, r#"--model "gpt 5""#);
         assert_eq!(dialog.cwd.value, "D:\\work tree");
@@ -2597,6 +2637,36 @@ mod tests {
         assert_eq!(dialog.cols.value, "132");
         assert!(!dialog.disable_notifications);
         assert!(!dialog.attach_after_start);
+    }
+
+    #[test]
+    fn ctrl_n_opens_completely_blank_new_session_dialog() {
+        let mut app = App::default();
+        let mut source = session("source");
+        source.title = Some("must not copy".to_string());
+        source.node = Some("worker-a".to_string());
+        app.replace_sessions(vec![source]);
+
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('n')), Some("list-node")),
+            AppAction::None
+        );
+        let dialog = app.clone_dialog.as_ref().unwrap();
+        assert!(dialog.source_id.is_none());
+        assert!(dialog.command.value.is_empty());
+        assert!(dialog.args.value.is_empty());
+        assert!(dialog.cwd.value.is_empty());
+        assert!(dialog.title.value.is_empty());
+        assert!(dialog.tags.value.is_empty());
+        assert!(dialog.node.value.is_empty());
+        assert!(dialog.rows.value.is_empty());
+        assert!(dialog.cols.value.is_empty());
+        assert!(!dialog.disable_notifications);
+        assert!(!dialog.attach_after_start);
+
+        let rendered = render_app(&mut app, 120, 30);
+        assert!(rendered.contains("New Session"));
+        assert!(!rendered.contains("Duplicate source"));
     }
 
     #[test]
@@ -2625,6 +2695,21 @@ mod tests {
             AppAction::None
         );
         assert!(app.clone_dialog.is_some());
+    }
+
+    #[test]
+    fn raw_ctrl_n_opens_blank_new_session_dialog() {
+        let mut app = App::default();
+
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Char('\u{e}')), None),
+            AppAction::None
+        );
+        assert!(
+            app.clone_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.source_id.is_none())
+        );
     }
 
     #[test]
