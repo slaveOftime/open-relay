@@ -244,17 +244,23 @@ async fn run() -> Result<()> {
                 id: update_args.id.clone(),
                 title: update_args.title,
                 tags: update_args.tags,
+                notifications_enabled: update_args.notifications.map(|value| value.enabled()),
             };
             match ipc::send_request_checked(&config, node_wrap(update_args.node, inner)).await? {
                 RpcResponse::Session { summary } => {
                     println!(
-                        "Updated session {}. Title: {}. Tags: {}",
+                        "Updated session {}. Title: {}. Tags: {}. Notifications: {}",
                         summary.id,
                         summary.title.as_deref().unwrap_or("—"),
                         if summary.tags.is_empty() {
                             "—".to_string()
                         } else {
                             summary.tags.join(", ")
+                        },
+                        if summary.notifications_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
                         }
                     );
                     Ok(())

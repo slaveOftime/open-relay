@@ -170,6 +170,8 @@ pub enum RpcRequest {
         id: String,
         title: Option<String>,
         tags: Option<Vec<String>>,
+        #[serde(default)]
+        notifications_enabled: Option<bool>,
     },
     NotifySet {
         id: String,

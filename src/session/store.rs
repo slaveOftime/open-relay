@@ -361,6 +361,7 @@ impl SessionStore {
         id: &str,
         title: Option<String>,
         tags: Option<Vec<String>>,
+        notifications_enabled: Option<bool>,
     ) -> Result<SessionSummary> {
         let title_provided = title.is_some();
         let (title, tags) = validate_session_metadata_update(title, tags)?;
@@ -372,11 +373,17 @@ impl SessionStore {
         let summary = if let Some(handle) = live_handle {
             let meta = {
                 let mut rt = handle.write();
+                if notifications_enabled.is_some() && rt.is_completed() {
+                    return Err(AppError::Protocol(format!("session not running: {id}")));
+                }
                 if title_provided {
                     rt.meta.title = title.clone();
                 }
                 if let Some(tags) = tags.as_ref() {
                     rt.meta.tags = tags.clone();
+                }
+                if let Some(enabled) = notifications_enabled {
+                    rt.set_notifications_enabled(enabled);
                 }
                 rt.meta.clone()
             };
@@ -386,6 +393,9 @@ impl SessionStore {
             let Some(mut meta) = self.db.get_session(id).await? else {
                 return Err(AppError::Protocol(format!("session not found: {id}")));
             };
+            if notifications_enabled.is_some() {
+                return Err(AppError::Protocol(format!("session not running: {id}")));
+            }
             if title_provided {
                 meta.title = title;
             }
@@ -2337,6 +2347,7 @@ mod tests {
                     " Prod ".to_string(),
                     "".to_string(),
                 ]),
+                Some(false),
             )
             .await
             .expect("update live session metadata");
@@ -2346,6 +2357,7 @@ mod tests {
         let locked = rt.read();
         assert_eq!(locked.meta.title.as_deref(), Some("Deploy ready"));
         assert_eq!(locked.meta.tags, vec!["prod".to_string()]);
+        assert!(!locked.notifications_enabled);
     }
 
     #[tokio::test]
@@ -2375,6 +2387,7 @@ mod tests {
                 "meta002",
                 Some("new".to_string()),
                 Some(vec![" release ".to_string()]),
+                None,
             )
             .await
             .expect("update persisted session metadata");
@@ -2417,6 +2430,7 @@ mod tests {
                 "meta003",
                 Some("   ".to_string()),
                 Some(vec!["".to_string(), "   ".to_string()]),
+                None,
             )
             .await
             .expect("clear persisted session metadata");
@@ -2455,7 +2469,7 @@ mod tests {
         let store = store_with(Vec::new(), db.clone());
 
         let summary = store
-            .update_session_metadata("meta004", None, None)
+            .update_session_metadata("meta004", None, None, None)
             .await
             .expect("ignore omitted metadata");
 
@@ -2468,6 +2482,38 @@ mod tests {
             .expect("session should exist");
         assert_eq!(saved.title.as_deref(), Some("keep"));
         assert_eq!(saved.tags, vec!["keep".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn update_session_metadata_rejects_notification_change_for_stopped_session() {
+        let db = make_test_db().await;
+        let meta = SessionMeta {
+            id: "meta005".to_string(),
+            title: Some("keep".to_string()),
+            tags: vec!["keep".to_string()],
+            command: "sh".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code: Some(0),
+        };
+        db.insert_session(&meta)
+            .await
+            .expect("insert persisted session");
+        let store = store_with(Vec::new(), db);
+
+        let error = store
+            .update_session_metadata("meta005", None, None, Some(false))
+            .await
+            .expect_err("stopped sessions cannot change notification state");
+        assert_eq!(
+            error.to_string(),
+            "protocol error: session not running: meta005"
+        );
     }
 
     #[tokio::test]

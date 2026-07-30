@@ -21,7 +21,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Shadow, Sparkline, Table, TableState,
+    },
 };
 
 use crate::{
@@ -30,14 +33,21 @@ use crate::{
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse, SessionSummary},
+    session::{MAX_SESSION_TITLE_LEN, normalize_session_tags, normalize_session_title},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const RATE_HISTORY_LEN: usize = 30;
+const COMPACT_SPARKLINE_WIDTH: usize = 3;
+const SPARKLINE_WIDTH: usize = 5;
 const STOP_GRACE_SECONDS: u64 = 15;
 const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const CLONE_DIALOG_HELP: &str =
+    " Quotes keep spaces · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
+const UPDATE_DIALOG_HELP: &str =
+    " Quote multi-word tags · Tab/Shift+Tab · Space toggle · Enter save · Esc cancel";
 
 pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -54,21 +64,21 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
 
     loop {
         terminal.draw(|frame| render(frame, &mut app))?;
-        if event::poll(FRAME_INTERVAL)? {
-            if let Event::Key(key) = event::read()?
-                && key.kind != KeyEventKind::Release
-            {
-                match route_key(&mut app, key, node.as_deref()) {
-                    AppAction::None => {}
-                    AppAction::Quit => break,
-                    AppAction::OpenInline => {
-                        open_selected_inline(&mut terminal, &mut app, node.as_deref())?
-                    }
-                    AppAction::Start(launch) => {
-                        start_clone(config, &mut terminal, &mut app, launch).await?
-                    }
-                    AppAction::Stop(target) => stop_session(config, &mut app, target).await,
+        if let Some(event) = read_terminal_event(FRAME_INTERVAL)?
+            && let Event::Key(key) = event
+            && key.kind != KeyEventKind::Release
+        {
+            match route_key(&mut app, key, node.as_deref()) {
+                AppAction::None => {}
+                AppAction::Quit => break,
+                AppAction::OpenInline => {
+                    open_selected_inline(&mut terminal, &mut app, node.as_deref())?
                 }
+                AppAction::Start(launch) => {
+                    start_clone(config, &mut terminal, &mut app, launch).await?
+                }
+                AppAction::Update(update) => update_session(config, &mut app, update).await,
+                AppAction::Stop(target) => stop_session(config, &mut app, target).await,
             }
         }
 
@@ -85,6 +95,34 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
     }
 
     Ok(())
+}
+
+fn read_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
+    read_terminal_event_with(timeout, event::poll, event::read)
+}
+
+fn read_terminal_event_with(
+    timeout: Duration,
+    poll: impl FnOnce(Duration) -> io::Result<bool>,
+    read: impl FnOnce() -> io::Result<Event>,
+) -> io::Result<Option<Event>> {
+    match poll(timeout) {
+        Ok(false) => Ok(None),
+        Ok(true) => match read() {
+            Ok(event) => Ok(Some(event)),
+            Err(error) if is_transient_terminal_error(&error) => Ok(None),
+            Err(error) => Err(error),
+        },
+        Err(error) if is_transient_terminal_error(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_transient_terminal_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
 }
 
 async fn fetch_sessions(
@@ -133,6 +171,24 @@ async fn start_clone(
         Err(error) => set_clone_error(app, format!("start failed: {error}")),
     }
     Ok(())
+}
+
+async fn update_session(config: &AppConfig, app: &mut App, update: SessionUpdate) {
+    let target_id = update.id.clone();
+    let response = ipc::send_request_checked(config, update.request()).await;
+    apply_update_response(app, &target_id, response);
+}
+
+fn apply_update_response(app: &mut App, target_id: &str, response: Result<RpcResponse>) {
+    match response {
+        Ok(RpcResponse::Session { summary }) => {
+            app.update_dialog = None;
+            app.apply_updated_summary(summary);
+            app.message = Some(format!("updated session {target_id}"));
+        }
+        Ok(_) => set_update_error(app, "unexpected response type".to_string()),
+        Err(error) => set_update_error(app, format!("update failed: {error}")),
+    }
 }
 
 async fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
@@ -190,6 +246,14 @@ fn set_clone_error(app: &mut App, error: String) {
     }
 }
 
+fn set_update_error(app: &mut App, error: String) {
+    if let Some(dialog) = app.update_dialog.as_mut() {
+        dialog.error = Some(error);
+    } else {
+        app.message = Some(error);
+    }
+}
+
 #[derive(Default)]
 struct App {
     sessions: Vec<SessionSummary>,
@@ -204,6 +268,7 @@ struct App {
     visible: Vec<usize>,
     status_filter: StatusFilter,
     clone_dialog: Option<CloneDialog>,
+    update_dialog: Option<UpdateDialog>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -212,6 +277,7 @@ enum AppAction {
     Quit,
     OpenInline,
     Start(CloneLaunch),
+    Update(SessionUpdate),
     Stop(SessionTarget),
 }
 
@@ -219,6 +285,29 @@ enum AppAction {
 struct SessionTarget {
     id: String,
     node: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SessionUpdate {
+    id: String,
+    node: Option<String>,
+    title: Option<String>,
+    tags: Option<Vec<String>>,
+    notifications_enabled: Option<bool>,
+}
+
+impl SessionUpdate {
+    fn request(&self) -> RpcRequest {
+        wrap_node(
+            self.node.as_deref(),
+            RpcRequest::SessionMetadataSet {
+                id: self.id.clone(),
+                title: self.title.clone(),
+                tags: self.tags.clone(),
+                notifications_enabled: self.notifications_enabled,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -449,6 +538,141 @@ impl CloneDialog {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateField {
+    Title,
+    Tags,
+    Notifications,
+}
+
+const UPDATE_FIELDS: [UpdateField; 3] = [
+    UpdateField::Title,
+    UpdateField::Tags,
+    UpdateField::Notifications,
+];
+
+#[derive(Debug)]
+struct UpdateDialog {
+    target_id: String,
+    target_node: Option<String>,
+    active: usize,
+    title: EditText,
+    tags: EditText,
+    original_title: Option<String>,
+    original_tags: Vec<String>,
+    notifications_enabled: bool,
+    original_notifications_enabled: bool,
+    summary: SessionSummary,
+    available: bool,
+    error: Option<String>,
+}
+
+impl UpdateDialog {
+    fn from_session(session: &SessionSummary, list_node: Option<&str>) -> Self {
+        Self {
+            target_id: session.id.clone(),
+            target_node: session
+                .node
+                .clone()
+                .or_else(|| list_node.map(str::to_string)),
+            active: 0,
+            title: EditText::new(session.title.clone().unwrap_or_default()),
+            tags: EditText::new(format_terminal_words(&session.tags)),
+            original_title: session.title.clone(),
+            original_tags: session.tags.clone(),
+            notifications_enabled: session.notifications_enabled,
+            original_notifications_enabled: session.notifications_enabled,
+            summary: session.clone(),
+            available: true,
+            error: None,
+        }
+    }
+
+    fn active_field(&self) -> UpdateField {
+        UPDATE_FIELDS[self.active]
+    }
+
+    fn next(&mut self) {
+        self.active = (self.active + 1) % UPDATE_FIELDS.len();
+        self.error = None;
+    }
+
+    fn previous(&mut self) {
+        self.active = (self.active + UPDATE_FIELDS.len() - 1) % UPDATE_FIELDS.len();
+        self.error = None;
+    }
+
+    fn active_text_mut(&mut self) -> Option<&mut EditText> {
+        match self.active_field() {
+            UpdateField::Title => Some(&mut self.title),
+            UpdateField::Tags => Some(&mut self.tags),
+            UpdateField::Notifications => None,
+        }
+    }
+
+    fn toggle_active(&mut self) {
+        if self.active_field() == UpdateField::Notifications {
+            self.notifications_enabled = !self.notifications_enabled;
+        }
+        self.error = None;
+    }
+
+    fn sync_summary(&mut self, summary: Option<&SessionSummary>) {
+        let unavailable_message = format!(
+            "session {} is no longer available in the current list",
+            self.target_id
+        );
+        match summary {
+            Some(summary) => {
+                self.summary = summary.clone();
+                self.available = true;
+                if self.error.as_deref() == Some(unavailable_message.as_str()) {
+                    self.error = None;
+                }
+            }
+            None => {
+                self.available = false;
+                self.error = Some(unavailable_message);
+            }
+        }
+    }
+
+    fn update(&self) -> std::result::Result<SessionUpdate, String> {
+        if !self.available {
+            return Err(format!(
+                "session {} is no longer available in the current list",
+                self.target_id
+            ));
+        }
+
+        let normalized_title = normalize_session_title(Some(self.title.value.clone()));
+        if normalized_title
+            .as_ref()
+            .is_some_and(|title| title.chars().count() > MAX_SESSION_TITLE_LEN)
+        {
+            return Err(format!(
+                "session title is too long (max {MAX_SESSION_TITLE_LEN} characters)"
+            ));
+        }
+
+        let parsed_tags = parse_terminal_words("tags", &self.tags.value)?;
+        let normalized_tags = normalize_session_tags(parsed_tags);
+        let title = (normalized_title != self.original_title).then(|| self.title.value.clone());
+        let tags = (normalized_tags != self.original_tags).then_some(normalized_tags);
+        let notifications_enabled = (self.notifications_enabled
+            != self.original_notifications_enabled)
+            .then_some(self.notifications_enabled);
+
+        Ok(SessionUpdate {
+            id: self.target_id.clone(),
+            node: self.target_node.clone(),
+            title,
+            tags,
+            notifications_enabled,
+        })
+    }
+}
+
 fn format_terminal_words(words: &[String]) -> String {
     words
         .iter()
@@ -568,6 +792,9 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
     if app.clone_dialog.is_some() {
         return route_clone_dialog_key(app, key);
     }
+    if app.update_dialog.is_some() {
+        return route_update_dialog_key(app, key);
+    }
 
     match key.code {
         _ if is_clone_dialog_key(key) => {
@@ -576,6 +803,14 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
                 return AppAction::None;
             };
             app.clone_dialog = Some(CloneDialog::from_session(session, list_node));
+            AppAction::None
+        }
+        _ if is_update_dialog_key(key) => {
+            let Some(session) = app.selected_session() else {
+                app.message = Some("no session selected to update".to_string());
+                return AppAction::None;
+            };
+            app.update_dialog = Some(UpdateDialog::from_session(session, list_node));
             AppAction::None
         }
         KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -647,6 +882,12 @@ fn is_clone_dialog_key(key: crossterm::event::KeyEvent) -> bool {
             && matches!(key.code, KeyCode::Char('d' | 'D')))
 }
 
+fn is_update_dialog_key(key: crossterm::event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('\u{15}'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('u' | 'U')))
+}
+
 fn route_clone_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
     if key.code == KeyCode::Esc {
         app.clone_dialog = None;
@@ -661,6 +902,70 @@ fn route_clone_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> App
         KeyCode::BackTab => dialog.previous(),
         KeyCode::Enter => match dialog.launch() {
             Ok(launch) => return AppAction::Start(launch),
+            Err(error) => dialog.error = Some(error),
+        },
+        KeyCode::Char(' ') if dialog.active_text_mut().is_none() => dialog.toggle_active(),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if let Some(field) = dialog.active_text_mut() {
+                field.insert(character);
+                dialog.error = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.backspace();
+                dialog.error = None;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.delete();
+                dialog.error = None;
+            }
+        }
+        KeyCode::Left => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.right();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.cursor = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.cursor = field.value.chars().count();
+            }
+        }
+        _ => {}
+    }
+    AppAction::None
+}
+
+fn route_update_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
+    if key.code == KeyCode::Esc {
+        app.update_dialog = None;
+        app.message = Some("update cancelled".to_string());
+        return AppAction::None;
+    }
+
+    let dialog = app.update_dialog.as_mut().expect("dialog checked above");
+    match key.code {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => dialog.previous(),
+        KeyCode::Tab => dialog.next(),
+        KeyCode::BackTab => dialog.previous(),
+        KeyCode::Enter => match dialog.update() {
+            Ok(update) => return AppAction::Update(update),
             Err(error) => dialog.error = Some(error),
         },
         KeyCode::Char(' ') if dialog.active_text_mut().is_none() => dialog.toggle_active(),
@@ -832,6 +1137,38 @@ impl App {
         self.selected = selected_id
             .and_then(|id| self.sessions.iter().position(|item| item.id == id))
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
+        self.rebuild_visible();
+        self.sync_update_dialog();
+    }
+
+    fn sync_update_dialog(&mut self) {
+        let Some(target_id) = self
+            .update_dialog
+            .as_ref()
+            .map(|dialog| dialog.target_id.clone())
+        else {
+            return;
+        };
+        let summary = self
+            .sessions
+            .iter()
+            .find(|session| session.id == target_id)
+            .cloned();
+        if let Some(dialog) = self.update_dialog.as_mut() {
+            dialog.sync_summary(summary.as_ref());
+        }
+    }
+
+    fn apply_updated_summary(&mut self, summary: SessionSummary) {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == summary.id)
+        else {
+            return;
+        };
+        self.search_text[index] = session_search_text(&summary);
+        self.sessions[index] = summary;
         self.rebuild_visible();
     }
 
@@ -1145,24 +1482,27 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         .map(|rate| now.duration_since(rate.sampled_at))
         .min()
         .unwrap_or_default();
+    let throughput_header =
+        Layout::horizontal([Constraint::Length(7), Constraint::Min(0)]).split(header[1]);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                aggregate_sparkline(&app.rates, 6),
-                Style::default().fg(rate_color(throughput, animation_age)),
-            ),
-            Span::styled(
-                format!(" {:>7}/s", format_bytes(throughput)),
-                Style::default().fg(if throughput > 0.0 {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-        ]))
+        Sparkline::default()
+            .data(aggregate_sparkline_data(&app.rates, 6))
+            .style(Style::default().fg(rate_color(throughput, animation_age)))
+            .block(header_block()),
+        throughput_header[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!("{:>8}/s", format_bytes(throughput)),
+            Style::default().fg(if throughput > 0.0 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ))
         .alignment(Alignment::Right)
         .block(header_block()),
-        header[1],
+        throughput_header[1],
     );
 
     let visible = &app.visible;
@@ -1181,43 +1521,52 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             .iter()
             .position(|index| *index == app.selected)
             .unwrap_or(0);
-        let viewport_len = chunks[1].height.max(1) as usize;
+        let viewport_len = chunks[1].height.saturating_sub(1).max(1) as usize;
         let viewport_start = selected_position
             .saturating_sub(viewport_len / 2)
             .min(visible.len().saturating_sub(viewport_len));
-        let viewport_end = (viewport_start + viewport_len).min(visible.len());
-        let viewport = &visible[viewport_start..viewport_end];
-        let items = viewport.iter().map(|index| {
+        let rows = visible.iter().map(|index| {
             let session = &app.sessions[*index];
-            session_item(
-                session,
-                app.rates.get(&session.id),
-                mode,
-                chunks[1].width.saturating_sub(2),
-                now,
-            )
+            session_row(session, app.rates.get(&session.id), mode, now)
         });
-        let list = List::new(items).highlight_symbol("▸ ").highlight_style(
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(25, 55, 72))
-                .add_modifier(Modifier::BOLD),
-        );
-        let mut state =
-            ListState::default().with_selected(Some(selected_position - viewport_start));
-        frame.render_stateful_widget(list, chunks[1], &mut state);
+        let table = Table::new(rows, session_table_widths(mode))
+            .header(session_table_header(mode))
+            .column_spacing(1)
+            .highlight_symbol("▸ ")
+            .row_highlight_style(
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(25, 55, 72))
+                    .add_modifier(Modifier::BOLD),
+            );
+        let mut state = TableState::new()
+            .with_offset(viewport_start)
+            .with_selected(Some(selected_position));
+        frame.render_stateful_widget(table, chunks[1], &mut state);
+
+        if visible.len() > viewport_len {
+            let mut scrollbar_state = ScrollbarState::new(visible.len())
+                .position(selected_position)
+                .viewport_content_length(viewport_len);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃");
+            frame.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
+        }
     }
 
     let default_help = if app.filter.is_empty() {
         match mode {
             LayoutMode::Narrow => {
-                " type filter  ^D clone  ^K stop  ↵ open  ^C exit".to_string()
+                " type filter  ^D clone  ^U edit  ^K stop  ↵ open  ^C exit".to_string()
             }
-            _ => " type to filter    Ctrl+D duplicate    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
+            _ => " type to filter    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
         }
     } else {
         format!(
-            " filter: {}_    status: {} (Ctrl+S)    Ctrl+D duplicate    Ctrl+K stop    Backspace edit    Esc clear",
+            " filter: {}_    status: {} (Ctrl+S)    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Backspace edit    Esc clear",
             app.filter,
             app.status_filter.label()
         )
@@ -1234,35 +1583,231 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     if let Some(dialog) = app.clone_dialog.as_ref() {
         render_clone_dialog(frame, dialog);
+    } else if let Some(dialog) = app.update_dialog.as_ref() {
+        render_update_dialog(frame, dialog);
     }
 }
 
 fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
     let area = centered_rect(frame.area(), 96, 13);
-    frame.render_widget(Clear, area);
     let cursor_visible = clone_cursor_visible();
     let fields =
         CLONE_FIELDS.map(|field| clone_field_line(dialog, field, area.width, cursor_visible));
     let mut lines = fields.to_vec();
-    lines.push(Line::from(Span::styled(
-        dialog.error.as_deref().unwrap_or(
-            " * Quote spaces · ←/→ cursor · Tab/Ctrl+Tab fields · Space toggle · Enter start · Esc cancel",
-        ),
-        Style::default().fg(if dialog.error.is_some() {
+    lines.push(dialog_footer(dialog.error.as_deref(), CLONE_DIALOG_HELP));
+    render_dialog(
+        frame,
+        area,
+        format!(" Duplicate {} ", dialog.source_id),
+        Color::Cyan,
+        lines,
+    );
+}
+
+fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
+    let area = centered_rect(frame.area(), 110, 18);
+    let cursor_visible = clone_cursor_visible();
+    let mut lines = UPDATE_FIELDS
+        .map(|field| update_field_line(dialog, field, area.width, cursor_visible))
+        .to_vec();
+    lines.extend(
+        update_read_only_values(&dialog.summary)
+            .into_iter()
+            .map(|(label, value)| update_read_only_line(label, &value, area.width)),
+    );
+    lines.push(dialog_footer(dialog.error.as_deref(), UPDATE_DIALOG_HELP));
+    render_dialog(
+        frame,
+        area,
+        format!(" Update {} ", dialog.target_id),
+        if dialog.available {
+            Color::Cyan
+        } else {
+            Color::Red
+        },
+        lines,
+    );
+}
+
+fn dialog_footer<'a>(error: Option<&'a str>, help: &'static str) -> Line<'a> {
+    Line::from(Span::styled(
+        error.unwrap_or(help),
+        Style::default().fg(if error.is_some() {
             Color::Red
         } else {
             Color::DarkGray
         }),
-    )));
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(format!(" Clone {} as new session ", dialog.source_id))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+    ))
+}
+
+fn render_dialog<'a>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: String,
+    border_color: Color,
+    lines: Vec<Line<'a>>,
+) {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .shadow(Shadow::dark_shade().style(Style::default().fg(Color::DarkGray)));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn update_field_line(
+    dialog: &UpdateDialog,
+    field: UpdateField,
+    width: u16,
+    cursor_visible: bool,
+) -> Line<'static> {
+    let active = dialog.active_field() == field;
+    let (label, value) = match field {
+        UpdateField::Title => (
+            "Title",
+            edit_text_display(
+                &dialog.title,
+                active,
+                width.saturating_sub(24) as usize,
+                cursor_visible,
+            ),
         ),
-        area,
-    );
+        UpdateField::Tags => (
+            "Tags",
+            edit_text_display(
+                &dialog.tags,
+                active,
+                width.saturating_sub(24) as usize,
+                cursor_visible,
+            ),
+        ),
+        UpdateField::Notifications => (
+            "Notifications",
+            pad_truncated(
+                &checkbox(dialog.notifications_enabled),
+                width.saturating_sub(24) as usize,
+            ),
+        ),
+    };
+    Line::from(vec![
+        Span::styled(
+            format!(" {label:<22}"),
+            Style::default()
+                .fg(if active { Color::Yellow } else { Color::Cyan })
+                .add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+        Span::styled(
+            value,
+            Style::default()
+                .fg(if active { Color::White } else { Color::Gray })
+                .add_modifier(if active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
+        ),
+    ])
+}
+
+fn update_read_only_line(label: &str, value: &str, width: u16) -> Line<'static> {
+    let value_width = width.saturating_sub(24) as usize;
+    Line::from(vec![
+        Span::styled(
+            format!(" {label:<22}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            pad_truncated(value, value_width),
+            Style::default().fg(Color::Gray),
+        ),
+    ])
+}
+
+fn update_read_only_values(summary: &SessionSummary) -> Vec<(&'static str, String)> {
+    vec![
+        ("ID", summary.id.clone()),
+        (
+            "State / PID",
+            format!(
+                "{} / {}",
+                summary.status,
+                summary
+                    .pid
+                    .map_or_else(|| "—".to_string(), |pid| pid.to_string())
+            ),
+        ),
+        ("Command", summary.command.clone()),
+        ("Args", display_words(&summary.args)),
+        (
+            "Cwd",
+            summary.cwd.clone().unwrap_or_else(|| "—".to_string()),
+        ),
+        (
+            "Node",
+            summary.node.clone().unwrap_or_else(|| "local".to_string()),
+        ),
+        (
+            "Terminal",
+            format!(
+                "{}x{}",
+                summary
+                    .cols
+                    .map_or_else(|| "—".to_string(), |cols| cols.to_string()),
+                summary
+                    .rows
+                    .map_or_else(|| "—".to_string(), |rows| rows.to_string())
+            ),
+        ),
+        (
+            "Created",
+            super::list::format_timestamp_local(summary.created_at),
+        ),
+        (
+            "Started",
+            format_dialog_timestamp(summary.started_at.as_ref()),
+        ),
+        ("Ended", format_dialog_timestamp(summary.ended_at.as_ref())),
+        (
+            "Runtime",
+            format!(
+                "input={} attaches={}",
+                if summary.input_needed {
+                    "needed"
+                } else {
+                    "clear"
+                },
+                summary.attach_count
+            ),
+        ),
+        (
+            "Output",
+            format!(
+                "{} · last {}",
+                format_bytes(summary.last_total_bytes as f64),
+                format_dialog_timestamp(summary.last_output_epoch.as_ref())
+            ),
+        ),
+    ]
+}
+
+fn display_words(words: &[String]) -> String {
+    if words.is_empty() {
+        "—".to_string()
+    } else {
+        format_terminal_words(words)
+    }
+}
+
+fn format_dialog_timestamp(timestamp: Option<&DateTime<Utc>>) -> String {
+    timestamp.map_or_else(
+        || "—".to_string(),
+        |timestamp| super::list::format_timestamp_local(*timestamp),
+    )
 }
 
 fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
@@ -1384,19 +1929,65 @@ fn clone_cursor_visible() -> bool {
 
 fn checkbox(checked: bool) -> String {
     if checked {
-        "[x]".to_string()
+        "✅".to_string()
     } else {
-        "[ ]".to_string()
+        "❌".to_string()
     }
 }
 
-fn session_item(
+fn session_table_widths(mode: LayoutMode) -> Vec<Constraint> {
+    match mode {
+        LayoutMode::Narrow => vec![
+            Constraint::Length(1),
+            Constraint::Length(8),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(5),
+            Constraint::Length(COMPACT_SPARKLINE_WIDTH as u16),
+        ],
+        LayoutMode::Medium => vec![
+            Constraint::Length(1),
+            Constraint::Length(8),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(5),
+            Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
+        ],
+        LayoutMode::Wide => vec![
+            Constraint::Length(1),
+            Constraint::Length(22),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Length(5),
+            Constraint::Length(8),
+            Constraint::Fill(1),
+            Constraint::Length(12),
+            Constraint::Length(8),
+        ],
+    }
+}
+
+fn session_table_header(mode: LayoutMode) -> Row<'static> {
+    let labels = match mode {
+        LayoutMode::Narrow => vec!["", "ID", "SESSION", "STATE", "AGE", "I/O"],
+        LayoutMode::Medium => vec!["", "ID", "SESSION", "STATE", "AGE", "RATE"],
+        LayoutMode::Wide => vec![
+            "", "SESSION", "PID", "STATE", "AGE", "ID", "COMMAND", "RATE", "OUTPUT",
+        ],
+    };
+    Row::new(labels).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn session_row(
     session: &SessionSummary,
     rate: Option<&RateState>,
     mode: LayoutMode,
-    available_width: u16,
     now: Instant,
-) -> ListItem<'static> {
+) -> Row<'static> {
     let active = is_active_status(&session.status);
     let mut status = status_glyph(&session.status, session.input_needed);
     if !active {
@@ -1405,9 +1996,9 @@ fn session_item(
     let status_text = status_label(&session.status, session.input_needed);
     let name = session
         .title
-        .as_deref()
+        .clone()
         .filter(|title| !title.is_empty())
-        .unwrap_or(&session.command);
+        .unwrap_or_else(|| session.command.clone());
     let age = super::list::format_age(session.created_at, session.started_at, session.ended_at);
     let current_rate = rate.map(|value| value.display_rate(now)).unwrap_or(0.0);
     let animation_age = rate
@@ -1418,129 +2009,80 @@ fn session_item(
     } else {
         Color::DarkGray
     };
-    let session_id = pad_truncated(&session.id, 8);
-    let item = match mode {
-        LayoutMode::Narrow => {
-            let indicator =
-                tiny_indicator(current_rate, session.status == "running", animation_age);
-            let status_width = UnicodeWidthStr::width(status_text).clamp(5, 9);
-            let fixed_width = 14
-                + status_width
-                + UnicodeWidthStr::width(age.as_str()).max(5)
-                + UnicodeWidthStr::width(indicator.as_str());
-            let name_width = (available_width as usize)
-                .saturating_sub(fixed_width)
-                .max(1);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", status.0), Style::default().fg(status.1)),
-                Span::styled(
-                    format!("{session_id} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(format!("{} ", truncate(name, name_width))),
-                Span::styled(
-                    format!("{status_text:<status_width$} "),
-                    Style::default().fg(status.1),
-                ),
-                Span::styled(format!("{:>5} ", age), Style::default().fg(Color::DarkGray)),
-                Span::styled(indicator, Style::default().fg(rate_color)),
-            ]))
-        }
-        LayoutMode::Medium => {
-            let fixed_width = 2 + 9 + 10 + 7 + 13;
-            let name_width = (available_width as usize)
-                .saturating_sub(fixed_width)
-                .clamp(8, 30);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", status.0), Style::default().fg(status.1)),
-                Span::styled(
-                    format!("{session_id} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(pad_truncated(name, name_width)),
-                Span::styled(
-                    format!(" {:<9}", status_text),
-                    Style::default().fg(status.1),
-                ),
-                Span::styled(
-                    format!(" {:>5} ", age),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!(
-                        "{} {:>6}/s",
-                        rate_bar(current_rate, 4),
-                        format_bytes(current_rate)
-                    ),
-                    Style::default().fg(rate_color),
-                ),
-            ]))
-        }
+    let row = match mode {
+        LayoutMode::Narrow => Row::new(vec![
+            Cell::from(Span::styled(status.0, Style::default().fg(status.1))),
+            Cell::from(session.id.clone()).style(Style::default().fg(Color::DarkGray)),
+            Cell::from(name),
+            Cell::from(status_text.to_string()).style(Style::default().fg(status.1)),
+            Cell::from(Line::from(age).alignment(Alignment::Right))
+                .style(Style::default().fg(Color::DarkGray)),
+            Cell::from(sparkline(rate, COMPACT_SPARKLINE_WIDTH))
+                .style(Style::default().fg(rate_color)),
+        ]),
+        LayoutMode::Medium => Row::new(vec![
+            Cell::from(Span::styled(status.0, Style::default().fg(status.1))),
+            Cell::from(session.id.clone()).style(Style::default().fg(Color::DarkGray)),
+            Cell::from(name),
+            Cell::from(status_text.to_string()).style(Style::default().fg(status.1)),
+            Cell::from(Line::from(age).alignment(Alignment::Right))
+                .style(Style::default().fg(Color::DarkGray)),
+            Cell::from(Line::from(format!(
+                "{} {:>6}/s",
+                sparkline(rate, SPARKLINE_WIDTH),
+                format_bytes(current_rate)
+            )))
+            .style(Style::default().fg(rate_color)),
+        ]),
         LayoutMode::Wide => {
             let command = if session.args.is_empty() {
                 session.command.clone()
             } else {
                 format!("{} {}", session.command, session.args.join(" "))
             };
-            let fixed_width = 2 + 23 + 8 + 10 + 7 + 9 + 13 + 10;
-            let command_width = (available_width as usize)
-                .saturating_sub(fixed_width)
-                .max(8);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", status.0), Style::default().fg(status.1)),
-                Span::raw(pad_truncated(name, 22)),
-                Span::styled(
-                    format!(
-                        " {:>6} ",
-                        session.pid.map_or("-".into(), |pid| pid.to_string())
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("{:<9} ", status_text),
-                    Style::default().fg(status.1),
-                ),
-                Span::styled(format!("{:>5} ", age), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{session_id} "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(pad_truncated(&command, command_width)),
-                Span::styled(
-                    format!(
-                        " {} {:>6}/s",
-                        sparkline(rate, 5),
-                        format_bytes(current_rate)
-                    ),
-                    Style::default().fg(rate_color),
-                ),
-                Span::styled(
-                    format!(" {:>8}", format_bytes(session.last_total_bytes as f64)),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]))
+            Row::new(vec![
+                Cell::from(Span::styled(status.0, Style::default().fg(status.1))),
+                Cell::from(name),
+                Cell::from(
+                    Line::from(session.pid.map_or("-".into(), |pid| pid.to_string()))
+                        .alignment(Alignment::Right),
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(status_text.to_string()).style(Style::default().fg(status.1)),
+                Cell::from(Line::from(age).alignment(Alignment::Right))
+                    .style(Style::default().fg(Color::DarkGray)),
+                Cell::from(session.id.clone()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(command),
+                Cell::from(format!(
+                    "{} {:>6}/s",
+                    sparkline(rate, SPARKLINE_WIDTH),
+                    format_bytes(current_rate)
+                ))
+                .style(Style::default().fg(rate_color)),
+                Cell::from(
+                    Line::from(format_bytes(session.last_total_bytes as f64))
+                        .alignment(Alignment::Right),
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+            ])
         }
     };
     if active {
-        item
+        row
     } else {
-        item.style(Style::default().fg(Color::DarkGray))
+        row.style(Style::default().fg(Color::DarkGray))
     }
 }
 
-fn aggregate_sparkline(rates: &HashMap<String, RateState>, width: usize) -> String {
-    let values = (0..width)
+fn aggregate_sparkline_data(rates: &HashMap<String, RateState>, width: usize) -> Vec<u64> {
+    (0..width)
         .map(|index| {
             rates
                 .values()
                 .filter_map(|rate| rate.history.iter().rev().nth(width - index - 1))
                 .sum::<f64>()
         })
-        .collect::<Vec<_>>();
-    let max = values.iter().copied().fold(1.0_f64, f64::max);
-    values
-        .into_iter()
-        .map(|value| SPARK_BLOCKS[((value / max) * 7.0).round() as usize])
+        .map(|value| value.ceil().max(0.0) as u64)
         .collect()
 }
 
@@ -1563,27 +2105,6 @@ fn sparkline(rate: Option<&RateState>, width: usize) -> String {
         .map(|value| SPARK_BLOCKS[((value / max) * 7.0).round() as usize])
         .collect::<String>();
     format!("{}{}", "▁".repeat(padding), spark)
-}
-
-fn rate_bar(rate: f64, width: usize) -> String {
-    let level = if rate <= 0.0 {
-        0
-    } else {
-        ((rate.log2() + 1.0) / 3.0).ceil().clamp(1.0, width as f64) as usize
-    };
-    format!("{}{}", "▰".repeat(level), "▱".repeat(width - level))
-}
-
-fn tiny_indicator(rate: f64, running: bool, animation_age: Duration) -> String {
-    if rate > 0.0 {
-        let phase = (animation_age.as_millis() / 40) as usize;
-        SPARK_BLOCKS[(phase + ((rate.log2().max(0.0) as usize) % 5) + 3) % SPARK_BLOCKS.len()]
-            .to_string()
-    } else if running {
-        "·".to_string()
-    } else {
-        "○".to_string()
-    }
 }
 
 fn rate_color(rate: f64, animation_age: Duration) -> Color {
@@ -1949,8 +2470,9 @@ mod tests {
         error::AppError,
         protocol::{RpcRequest, RpcResponse, SessionSummary},
     };
-    use chrono::{TimeZone, Utc};
+    use chrono::{Local, TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1982,6 +2504,23 @@ mod tests {
             cols: Some(80),
             attach_count: 0,
         }
+    }
+
+    fn render_app(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::render(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = *buffer.area();
+        (area.y..area.bottom())
+            .map(|y| {
+                let mut line = (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                line.push('\n');
+                line
+            })
+            .collect()
     }
 
     #[test]
@@ -2043,6 +2582,410 @@ mod tests {
             AppAction::None
         );
         assert!(app.clone_dialog.is_some());
+    }
+
+    #[test]
+    fn ctrl_u_opens_metadata_update_with_only_supported_fields_editable() {
+        let mut app = App::default();
+        let mut source = session("source");
+        source.title = Some("Agent review".to_string());
+        source.tags = vec!["review".to_string(), "night shift".to_string()];
+        source.command = "copilot".to_string();
+        source.args = vec!["--model".to_string(), "gpt 5".to_string()];
+        source.cwd = Some("D:\\work tree".to_string());
+        source.node = Some("worker-a".to_string());
+        source.pid = Some(4242);
+        source.notifications_enabled = true;
+        source.started_at = Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap());
+        source.rows = Some(42);
+        source.cols = Some(132);
+        app.replace_sessions(vec![source]);
+
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('u')), Some("list-node")),
+            AppAction::None
+        );
+        let dialog = app.update_dialog.as_ref().unwrap();
+        assert_eq!(dialog.target_id, "source");
+        assert_eq!(dialog.target_node.as_deref(), Some("worker-a"));
+        assert_eq!(dialog.title.value, "Agent review");
+        assert_eq!(dialog.tags.value, r#"review "night shift""#);
+        assert!(dialog.notifications_enabled);
+        assert_eq!(
+            super::UPDATE_FIELDS,
+            [
+                super::UpdateField::Title,
+                super::UpdateField::Tags,
+                super::UpdateField::Notifications,
+            ]
+        );
+
+        let read_only = super::update_read_only_values(&dialog.summary);
+        let labels = read_only
+            .iter()
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "ID",
+                "State / PID",
+                "Command",
+                "Args",
+                "Cwd",
+                "Node",
+                "Terminal",
+                "Created",
+                "Started",
+                "Ended",
+                "Runtime",
+                "Output",
+            ]
+        );
+        assert_eq!(dialog.summary.command, "copilot");
+        assert_eq!(dialog.summary.pid, Some(4242));
+        let editable_line = super::update_field_line(dialog, super::UpdateField::Title, 80, true);
+        assert!(editable_line.to_string().contains("Title"));
+        assert!(!editable_line.to_string().contains("editable"));
+        assert_eq!(
+            editable_line.spans[0].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+        let read_only_line = super::update_read_only_line("ID", "source", 80);
+        assert!(read_only_line.to_string().contains("ID"));
+        assert!(!read_only_line.to_string().contains("read-only"));
+        assert!(read_only_line.to_string().contains("source"));
+        assert_eq!(
+            read_only_line.spans[0].style.fg,
+            Some(ratatui::style::Color::DarkGray)
+        );
+        assert!(app.clone_dialog.is_none());
+    }
+
+    #[test]
+    fn update_dialog_formats_all_timestamps_locally_without_subseconds() {
+        let mut summary = session("source");
+        summary.created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
+            + chrono::Duration::milliseconds(123);
+        summary.started_at = Some(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 0).unwrap()
+                + chrono::Duration::milliseconds(456),
+        );
+        summary.ended_at = Some(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, 0).unwrap()
+                + chrono::Duration::milliseconds(789),
+        );
+        summary.last_output_epoch = Some(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 1, 30).unwrap()
+                + chrono::Duration::milliseconds(987),
+        );
+
+        let values = super::update_read_only_values(&summary)
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let local_seconds = |timestamp: chrono::DateTime<Utc>| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+
+        assert_eq!(values["Created"], local_seconds(summary.created_at));
+        assert_eq!(
+            values["Started"],
+            local_seconds(summary.started_at.unwrap())
+        );
+        assert_eq!(values["Ended"], local_seconds(summary.ended_at.unwrap()));
+        assert_eq!(
+            values["Output"],
+            format!(
+                "0B · last {}",
+                local_seconds(summary.last_output_epoch.unwrap())
+            )
+        );
+        assert!(
+            ["Created", "Started", "Ended", "Output"]
+                .iter()
+                .all(|label| !values[*label].contains('.'))
+        );
+    }
+
+    #[test]
+    fn update_dialog_uses_consistent_placeholder_for_absent_times() {
+        let values = super::update_read_only_values(&session("source"))
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(values["Started"], "—");
+        assert_eq!(values["Ended"], "—");
+        assert_eq!(values["Output"], "0B · last —");
+    }
+
+    #[test]
+    fn ctrl_u_handles_empty_selection_and_raw_control_character() {
+        let mut app = App::default();
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Char('u')), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("no session selected to update")
+        );
+
+        app.replace_sessions(vec![session("source")]);
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Char('\u{15}')), None),
+            AppAction::None
+        );
+        assert!(app.update_dialog.is_some());
+    }
+
+    #[test]
+    fn update_dialog_navigation_and_cancel_are_isolated_from_list_actions() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().active_field(),
+            super::UpdateField::Title
+        );
+
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Tab), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().active_field(),
+            super::UpdateField::Tags
+        );
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Tab), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().active_field(),
+            super::UpdateField::Notifications
+        );
+        assert!(!app.update_dialog.as_ref().unwrap().notifications_enabled);
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Char(' ')), None),
+            AppAction::None
+        );
+        assert!(app.update_dialog.as_ref().unwrap().notifications_enabled);
+        assert_eq!(
+            route_key(&mut app, ctrl(KeyCode::Tab), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().active_field(),
+            super::UpdateField::Tags
+        );
+
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Esc), None),
+            AppAction::None
+        );
+        assert!(app.update_dialog.is_none());
+        assert_eq!(app.message.as_deref(), Some("update cancelled"));
+    }
+
+    #[test]
+    fn dialog_boolean_fields_use_emoji_indicators() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+        let dialog = app.update_dialog.as_mut().unwrap();
+
+        let disabled =
+            super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
+        assert!(disabled.to_string().contains("❌"));
+        assert!(!disabled.to_string().contains("disabled"));
+
+        dialog.notifications_enabled = true;
+        let enabled = super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
+        assert!(enabled.to_string().contains("✅"));
+        assert!(!enabled.to_string().contains("enabled"));
+
+        assert_eq!(super::checkbox(true), "✅");
+        assert_eq!(super::checkbox(false), "❌");
+    }
+
+    #[test]
+    fn dialog_help_is_concise_and_uses_standard_navigation_terms() {
+        assert!(unicode_width::UnicodeWidthStr::width(super::CLONE_DIALOG_HELP) <= 94);
+        assert!(unicode_width::UnicodeWidthStr::width(super::UPDATE_DIALOG_HELP) <= 108);
+        assert!(super::CLONE_DIALOG_HELP.contains("Tab/Shift+Tab"));
+        assert!(super::UPDATE_DIALOG_HELP.contains("Tab/Shift+Tab"));
+        assert!(!super::CLONE_DIALOG_HELP.contains("Ctrl+Tab"));
+        assert!(!super::UPDATE_DIALOG_HELP.contains("Ctrl+Tab"));
+    }
+
+    #[test]
+    fn clone_and_update_dialogs_render_native_shadows() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+
+        route_key(&mut app, ctrl(KeyCode::Char('d')), None);
+        let clone = render_app(&mut app, 120, 30);
+        assert!(clone.contains("Duplicate source"));
+        assert!(clone.contains('▓'));
+
+        route_key(&mut app, key(KeyCode::Esc), None);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+        let update = render_app(&mut app, 120, 30);
+        assert!(update.contains("Update source"));
+        assert!(update.contains('▓'));
+    }
+
+    #[test]
+    fn update_dialog_validates_title_and_tag_input() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+
+        app.update_dialog.as_mut().unwrap().title =
+            super::EditText::new("x".repeat(crate::session::MAX_SESSION_TITLE_LEN + 1));
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().error.as_deref(),
+            Some("session title is too long (max 256 characters)")
+        );
+
+        let dialog = app.update_dialog.as_mut().unwrap();
+        dialog.title = super::EditText::new("valid".to_string());
+        dialog.tags = super::EditText::new("alpha \"unfinished".to_string());
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().error.as_deref(),
+            Some("tags has an unclosed quote")
+        );
+    }
+
+    #[test]
+    fn update_submission_omits_unchanged_fields_and_routes_to_session_node() {
+        let mut app = App::default();
+        let mut source = session("source");
+        source.title = Some("Current title".to_string());
+        source.tags = vec!["alpha".to_string(), "night shift".to_string()];
+        source.node = Some("worker-a".to_string());
+        app.replace_sessions(vec![source]);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), Some("list-node"));
+
+        let expected = super::SessionUpdate {
+            id: "source".to_string(),
+            node: Some("worker-a".to_string()),
+            title: None,
+            tags: None,
+            notifications_enabled: None,
+        };
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::Update(expected)
+        );
+
+        let dialog = app.update_dialog.as_mut().unwrap();
+        dialog.title = super::EditText::new(String::new());
+        dialog.tags = super::EditText::new(r#"beta "two words""#.to_string());
+        dialog.notifications_enabled = true;
+        let AppAction::Update(update) = route_key(&mut app, key(KeyCode::Enter), None) else {
+            panic!("expected update action");
+        };
+        assert_eq!(update.title.as_deref(), Some(""));
+        assert_eq!(
+            update.tags,
+            Some(vec!["beta".to_string(), "two words".to_string()])
+        );
+        assert_eq!(update.notifications_enabled, Some(true));
+        match update.request() {
+            RpcRequest::NodeProxy { node, inner } => {
+                assert_eq!(node, "worker-a");
+                assert!(matches!(
+                    *inner,
+                    RpcRequest::SessionMetadataSet {
+                        ref id,
+                        title: Some(ref title),
+                        tags: Some(ref tags),
+                        notifications_enabled: Some(true),
+                    } if id == "source" && title.is_empty() && tags == &["beta", "two words"]
+                ));
+            }
+            other => panic!("unexpected request: {}", other.name()),
+        }
+    }
+
+    #[test]
+    fn update_dialog_tracks_stop_and_blocks_disappeared_session() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+        app.update_dialog.as_mut().unwrap().title = super::EditText::new("draft title".to_string());
+
+        let mut stopped = session("source");
+        stopped.status = "stopped".to_string();
+        stopped.ended_at = Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 2, 0).unwrap());
+        app.replace_sessions(vec![stopped]);
+        let dialog = app.update_dialog.as_ref().unwrap();
+        assert!(dialog.available);
+        assert_eq!(dialog.summary.status, "stopped");
+        assert_eq!(dialog.title.value, "draft title");
+        assert!(matches!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::Update(_)
+        ));
+
+        app.replace_sessions(Vec::new());
+        assert!(!app.update_dialog.as_ref().unwrap().available);
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::None
+        );
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().error.as_deref(),
+            Some("session source is no longer available in the current list")
+        );
+    }
+
+    #[test]
+    fn successful_update_refreshes_row_and_keeps_follow_tui_active() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source"), session("other")]);
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+
+        let mut updated = session("source");
+        updated.title = Some("Updated title".to_string());
+        updated.tags = vec!["new".to_string()];
+        super::apply_update_response(
+            &mut app,
+            "source",
+            Ok(RpcResponse::Session { summary: updated }),
+        );
+        assert!(app.update_dialog.is_none());
+        assert_eq!(app.sessions[0].title.as_deref(), Some("Updated title"));
+        assert_eq!(app.sessions[0].tags, ["new"]);
+        assert_eq!(app.message.as_deref(), Some("updated session source"));
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Down), None),
+            AppAction::None
+        );
+
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+        super::apply_update_response(
+            &mut app,
+            "other",
+            Err(AppError::Protocol("session disappeared".to_string())),
+        );
+        assert!(app.update_dialog.is_some());
+        assert_eq!(
+            app.update_dialog.as_ref().unwrap().error.as_deref(),
+            Some("update failed: protocol error: session disappeared")
+        );
     }
 
     #[test]
@@ -2250,6 +3193,59 @@ mod tests {
     }
 
     #[test]
+    fn external_stop_refresh_updates_state_without_losing_selection() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("a"), session("b")]);
+        app.selected = 1;
+
+        let mut stopped = session("b");
+        stopped.status = "stopped".to_string();
+        app.replace_sessions(vec![session("a"), stopped]);
+
+        assert_eq!(
+            app.selected_session().map(|item| item.id.as_str()),
+            Some("b")
+        );
+        assert_eq!(
+            app.selected_session().map(|item| item.status.as_str()),
+            Some("stopped")
+        );
+
+        app.replace_sessions(vec![session("a")]);
+        assert_eq!(
+            app.selected_session().map(|item| item.id.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn transient_terminal_errors_do_not_end_the_follow_loop() {
+        let interrupted = super::read_terminal_event_with(
+            std::time::Duration::ZERO,
+            |_| Err(std::io::ErrorKind::Interrupted.into()),
+            || panic!("read must not run after an interrupted poll"),
+        )
+        .unwrap();
+        assert!(interrupted.is_none());
+
+        let would_block = super::read_terminal_event_with(
+            std::time::Duration::ZERO,
+            |_| Ok(true),
+            || Err(std::io::ErrorKind::WouldBlock.into()),
+        )
+        .unwrap();
+        assert!(would_block.is_none());
+
+        let fatal = super::read_terminal_event_with(
+            std::time::Duration::ZERO,
+            |_| Err(std::io::ErrorKind::BrokenPipe.into()),
+            || panic!("read must not run after a fatal poll error"),
+        )
+        .unwrap_err();
+        assert_eq!(fatal.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
     fn navigation_wraps() {
         let mut app = App::default();
         app.replace_sessions(vec![session("a"), session("b")]);
@@ -2386,7 +3382,65 @@ mod tests {
         app.replace_sessions(vec![session("a"), session("b")]);
         app.rates.get_mut("a").unwrap().history = [0.0, 10.0, 20.0].into();
         app.rates.get_mut("b").unwrap().history = [0.0, 20.0, 20.0].into();
-        assert_eq!(super::aggregate_sparkline(&app.rates, 3), "▁▆█");
+        assert_eq!(super::aggregate_sparkline_data(&app.rates, 3), [0, 30, 40]);
+    }
+
+    #[test]
+    fn table_render_keeps_selected_row_visible_and_shows_scrollbar() {
+        let mut app = App::default();
+        let sessions = (0..24)
+            .map(|index| {
+                let mut item = session(&format!("id-{index:02}"));
+                item.title = Some(format!("Session {index:02}"));
+                item.pid = Some(1000 + index);
+                item
+            })
+            .collect();
+        app.replace_sessions(sessions);
+        app.selected = 18;
+
+        let rendered = render_app(&mut app, 120, 14);
+
+        assert!(rendered.contains("SESSION"));
+        assert!(rendered.contains("COMMAND"));
+        assert!(rendered.contains("OUTPUT"));
+        assert!(rendered.contains("Session 18"));
+        assert!(rendered.contains('┃'));
+    }
+
+    #[test]
+    fn table_render_uses_responsive_headers() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+
+        let medium = render_app(&mut app, 80, 12);
+        assert!(medium.contains("SESSION"));
+        assert!(medium.contains("RATE"));
+        assert!(!medium.contains("COMMAND"));
+
+        let narrow = render_app(&mut app, 50, 12);
+        assert!(narrow.contains("SESSION"));
+        assert!(narrow.contains("STATE"));
+        assert!(!narrow.contains("RATE"));
+    }
+
+    #[test]
+    fn responsive_rows_keep_compact_and_normal_session_sparklines() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        app.rates.get_mut("source").unwrap().history = [1.0, 2.0, 4.0, 8.0, 16.0].into();
+
+        let compact = super::sparkline(app.rates.get("source"), super::COMPACT_SPARKLINE_WIDTH);
+        let narrow = render_app(&mut app, 50, 12);
+        let narrow_row = narrow.lines().find(|line| line.contains("source")).unwrap();
+        assert!(narrow_row.contains(&compact));
+        assert_eq!(unicode_width::UnicodeWidthStr::width(compact.as_str()), 3);
+
+        let normal = super::sparkline(app.rates.get("source"), super::SPARKLINE_WIDTH);
+        let medium = render_app(&mut app, 80, 12);
+        let medium_row = medium.lines().find(|line| line.contains("source")).unwrap();
+        assert!(medium_row.contains(&normal));
+        assert_eq!(unicode_width::UnicodeWidthStr::width(normal.as_str()), 5);
     }
 
     #[test]

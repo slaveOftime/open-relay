@@ -125,7 +125,7 @@ fn print_session_row(
         .pid
         .map(|v| v.to_string())
         .unwrap_or_else(|| "-".to_string());
-    let created = format_created_at_local(session.created_at);
+    let created = format_timestamp_local(session.created_at);
 
     let input = truncate_display_value(input_required_label(session.input_needed), input_width);
     let output = &session.last_total_bytes.to_string();
@@ -179,8 +179,8 @@ fn session_json(session: &SessionSummary) -> Value {
     })
 }
 
-fn format_created_at_local(created_at: DateTime<Utc>) -> String {
-    created_at
+pub(super) fn format_timestamp_local(timestamp: DateTime<Utc>) -> String {
+    timestamp
         .with_timezone(&Local)
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()

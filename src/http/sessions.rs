@@ -435,6 +435,7 @@ pub async fn get_session(
 pub struct SessionMetadataBody {
     pub title: Option<String>,
     pub tags: Option<Vec<String>>,
+    pub notifications_enabled: Option<bool>,
 }
 
 fn session_metadata_error_response(err: AppError) -> axum::response::Response {
@@ -466,6 +467,7 @@ pub async fn set_session_metadata(
             id: id.clone(),
             title: body.title.clone(),
             tags: body.tags.clone(),
+            notifications_enabled: body.notifications_enabled,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::Session { summary }) => Json(summary).into_response(),
@@ -493,7 +495,12 @@ pub async fn set_session_metadata(
 
     match state
         .store
-        .update_session_metadata(&id, body.title.clone(), body.tags.clone())
+        .update_session_metadata(
+            &id,
+            body.title.clone(),
+            body.tags.clone(),
+            body.notifications_enabled,
+        )
         .await
     {
         Ok(summary) => {
@@ -947,7 +954,20 @@ pub async fn send_input(
 mod tests {
     use std::path::PathBuf;
 
-    use super::pathbuf_to_rpc_path;
+    use super::{SessionMetadataBody, pathbuf_to_rpc_path};
+
+    #[test]
+    fn session_metadata_body_accepts_notification_override() {
+        let body: SessionMetadataBody = serde_json::from_value(serde_json::json!({
+            "title": "Review",
+            "tags": ["alpha"],
+            "notifications_enabled": false
+        }))
+        .expect("metadata body should deserialize");
+        assert_eq!(body.title.as_deref(), Some("Review"));
+        assert_eq!(body.tags, Some(vec!["alpha".to_string()]));
+        assert_eq!(body.notifications_enabled, Some(false));
+    }
 
     #[test]
     fn accepts_nested_relative_upload_path() {
