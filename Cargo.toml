@@ -82,7 +82,7 @@ gpui = { version = "0.2.2", optional = true }
 gpui-terminal = { version = "0.1.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

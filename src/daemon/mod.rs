@@ -1,4 +1,5 @@
 mod auth;
+mod crash;
 mod lifecycle;
 mod rpc;
 mod rpc_attach;
