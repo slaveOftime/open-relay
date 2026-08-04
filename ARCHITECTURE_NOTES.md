@@ -207,6 +207,53 @@ own `Drop` implementation; ConPTY mode restoration is automatic.
 
 ---
 
+### EC-10: Multi-Byte UTF-8 Split Across IPC Socket Reads
+
+**Problem**: Any IPC read could fail with `I/O error: incomplete utf-8 byte
+sequence from index N` (typically `N` just under 4096).  The most visible
+symptom was `sync lost: …` in the `oly ls --follow` TUI, but every IPC helper
+was affected — including the attach stream, so a session whose payload happened
+to straddle a boundary could drop the attachment.
+
+**Root cause**: `read_line_bounded` in `src/ipc.rs` decoded each `fill_buf`
+chunk with `str::from_utf8` *before* appending it to the output `String`.  The
+local socket hands back arbitrary byte counts (~4 KB on Windows named pipes),
+so a 2–4 byte UTF-8 character straddling that boundary was rejected as
+`Utf8Error { error_len: None }`.  Only payloads that were both large **and**
+contained non-ASCII text (CJK titles, box-drawing characters, emoji, Windows
+paths with accents) tripped it, which is why it looked intermittent.
+
+**Fix**: Accumulate the raw bytes in a `Vec<u8>` and decode **once**, after the
+newline terminator (or EOF) is reached.  Genuinely invalid UTF-8 is still
+rejected with `ErrorKind::InvalidData`, and the `MAX_IPC_LINE_BYTES` cap is
+still enforced against the accumulated length before each `extend_from_slice`.
+
+**Source**: `src/ipc.rs` — `read_line_bounded`.
+
+---
+
+### EC-11: Inline Session View Leaked Into the Main Screen Buffer
+
+**Problem**: Pressing Enter in `oly ls --follow` handed the terminal to a child
+`oly attach` / `oly logs` on the **main** screen buffer.  The child's output was
+interleaved with the surrounding shell scrollback, so scrolling during (or
+after) an inline session showed unrelated content.
+
+**Root cause**: `TuiTerminal::suspend` called `LeaveAlternateScreen` before
+spawning the child, on the assumption that the child needs the main buffer.  It
+does not — per EC-2 the attach client deliberately never enters the alternate
+screen, so it simply renders wherever the parent left the terminal.
+
+**Fix**: `suspend` now stays on the alternate screen and only releases raw mode,
+clearing the buffer and homing the cursor so the child starts clean.  `resume`
+re-issues `EnterAlternateScreen` unconditionally, because the child's
+`RawModeGuard` teardown emits `\x1b[?1049l` (EC-9) which drops the terminal back
+to the main buffer even though the list TUI never left it.
+
+**Source**: `src/client/list_tui.rs` — `TuiTerminal::suspend` / `resume`.
+
+---
+
 ## 2) Architecture-Wide Limitations and Operational Notes
 
 ### Terminal Restoration on SIGKILL (All Platforms)

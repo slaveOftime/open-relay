@@ -9,9 +9,12 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use crossterm::{
+    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1409,16 +1412,29 @@ impl TuiTerminal {
         Ok(())
     }
 
+    /// Hand the terminal to a child process (`oly attach` / `oly logs`) while
+    /// staying on the alternate screen.  Keeping the alternate buffer means the
+    /// inline session view is fully isolated: nothing from the surrounding
+    /// shell — or from the session list itself — remains visible behind it.
+    /// Only raw mode is released, because the child installs its own.
     fn suspend(&mut self) -> Result<()> {
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        self.terminal.show_cursor()?;
+        execute!(
+            self.terminal.backend_mut(),
+            crossterm::terminal::Clear(ClearType::All),
+            MoveTo(0, 0),
+            Show
+        )?;
         Ok(())
     }
 
+    /// Take the terminal back after the child exits.  `EnterAlternateScreen` is
+    /// re-issued unconditionally: an attached child's teardown emits
+    /// `\x1b[?1049l`, which drops the terminal back to the main buffer even
+    /// though we never left it ourselves.
     fn resume(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), EnterAlternateScreen)?;
+        execute!(self.terminal.backend_mut(), EnterAlternateScreen, Hide)?;
         self.terminal.clear()?;
         Ok(())
     }
