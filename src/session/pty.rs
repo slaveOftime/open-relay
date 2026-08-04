@@ -925,21 +925,47 @@ fn allow_passthrough_generic_osc(sequence: &[u8], escaped_prefix: bool) -> bool 
     if sequence.get(index) != Some(&b';') {
         return false;
     }
-    let payload = &sequence[index + 1..];
 
-    // OSC 0/1/2: icon/window title notifications.
-    // 0 => icon + window title, 1 => icon title, 2 => window title.
-    // These are one-way notifications and safe to pass through.
-    //
-    // OSC 9;4;...: progress/busy notifications used by terminals that
-    // implement this convention. This is also one-way and safe to pass
-    // through to attached clients.
+    is_passthrough_osc(ps, &sequence[index + 1..])
+}
+
+/// Decide whether an Operating System Command carries a one-way semantic
+/// notification that attached terminals should still observe.
+///
+/// OSC 0/1/2: icon/window title notifications.
+/// 0 => icon + window title, 1 => icon title, 2 => window title.
+///
+/// OSC 9;4;...: progress/busy notifications used by terminals that implement
+/// this convention.
+fn is_passthrough_osc(ps: &[u8], payload: &[u8]) -> bool {
     matches!(ps, b"0" | b"1" | b"2") || (ps == b"9" && payload.starts_with(b"4;"))
 }
 
-pub(crate) fn non_activity_passthrough_osc_bytes(text: &[u8]) -> usize {
-    let mut ignored = 0usize;
-    let mut index = 0usize;
+/// One complete Operating System Command sequence located inside a byte slice.
+struct ScannedOsc {
+    start: usize,
+    end: usize,
+    ps_start: usize,
+    ps_end: usize,
+    payload_end: usize,
+}
+
+impl ScannedOsc {
+    fn ps<'a>(&self, text: &'a [u8]) -> &'a [u8] {
+        &text[self.ps_start..self.ps_end]
+    }
+
+    fn payload<'a>(&self, text: &'a [u8]) -> &'a [u8] {
+        &text[self.ps_end + 1..self.payload_end]
+    }
+}
+
+/// Find the next complete Operating System Command sequence at or after `from`.
+///
+/// Both the escape-prefixed form and the bare ConPTY variant (leading Escape
+/// dropped) are recognised. Returns `None` once no terminated sequence remains.
+fn next_osc_sequence(text: &[u8], from: usize) -> Option<ScannedOsc> {
+    let mut index = from;
 
     while index < text.len() {
         let (start, escaped_prefix) = match text.get(index) {
@@ -951,8 +977,8 @@ pub(crate) fn non_activity_passthrough_osc_bytes(text: &[u8]) -> usize {
             }
         };
 
-        let mut cursor = start + if escaped_prefix { 2 } else { 1 };
-        let digits_start = cursor;
+        let ps_start = start + if escaped_prefix { 2 } else { 1 };
+        let mut cursor = ps_start;
         while text
             .get(cursor)
             .copied()
@@ -961,27 +987,67 @@ pub(crate) fn non_activity_passthrough_osc_bytes(text: &[u8]) -> usize {
             cursor += 1;
         }
 
-        if cursor == digits_start || text.get(cursor) != Some(&b';') {
+        if cursor == ps_start || text.get(cursor) != Some(&b';') {
             index = start + 1;
             continue;
         }
-        let ps = &text[digits_start..cursor];
-        cursor += 1;
-        let payload_start = cursor;
 
-        let Some((payload_end, sequence_end)) =
-            generic_osc_terminator_bounds(text, cursor, escaped_prefix)
-        else {
-            break;
-        };
+        let (payload_end, end) = generic_osc_terminator_bounds(text, cursor + 1, escaped_prefix)?;
+        return Some(ScannedOsc {
+            start,
+            end,
+            ps_start,
+            ps_end: cursor,
+            payload_end,
+        });
+    }
 
-        if ps == b"9" && text[payload_start..payload_end].starts_with(b"4;") {
-            ignored = ignored.saturating_add(sequence_end.saturating_sub(start));
+    None
+}
+
+pub(crate) fn non_activity_passthrough_osc_bytes(text: &[u8]) -> usize {
+    let mut ignored = 0usize;
+    let mut index = 0usize;
+
+    while let Some(osc) = next_osc_sequence(text, index) {
+        if osc.ps(text) == b"9" && osc.payload(text).starts_with(b"4;") {
+            ignored = ignored.saturating_add(osc.end.saturating_sub(osc.start));
         }
-        index = sequence_end;
+        index = osc.end;
     }
 
     ignored
+}
+
+/// Collect the one-way Operating System Command notifications (window/icon
+/// title and progress/busy indicators) contained in a pseudo-terminal chunk.
+///
+/// Sequences are returned in stream order using the escape-prefixed form so
+/// that a client repainting from canonical screen state — which drops
+/// Operating System Commands entirely — can still forward these semantic
+/// signals to its own terminal. The bare ConPTY variant is re-prefixed with
+/// Escape; the original string terminator style is preserved otherwise.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn extract_passthrough_osc_sequences(text: &[u8]) -> Vec<u8> {
+    let mut forwarded = Vec::new();
+    let mut index = 0usize;
+
+    while let Some(osc) = next_osc_sequence(text, index) {
+        index = osc.end;
+        if !is_passthrough_osc(osc.ps(text), osc.payload(text)) {
+            continue;
+        }
+
+        forwarded.extend_from_slice(b"\x1b]");
+        forwarded.extend_from_slice(&text[osc.ps_start..osc.payload_end]);
+        if text.get(osc.payload_end) == Some(&0x07) {
+            forwarded.push(0x07);
+        } else {
+            forwarded.extend_from_slice(b"\x1b\\");
+        }
+    }
+
+    forwarded
 }
 
 fn generic_osc_terminator_bounds(
@@ -1169,6 +1235,45 @@ mod tests {
     fn test_non_activity_passthrough_osc_bytes_ignores_title_sequence() {
         let text = b"before\x1b]0;relay build\x07after";
         assert_eq!(non_activity_passthrough_osc_bytes(text), 0);
+    }
+
+    #[test]
+    fn test_extract_passthrough_osc_sequences_keeps_title_and_progress() {
+        let text = b"before\x1b]0;relay build\x07mid\x1b]9;4;3;0\x07after";
+        assert_eq!(
+            extract_passthrough_osc_sequences(text),
+            b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_extract_passthrough_osc_sequences_preserves_string_terminator() {
+        let text = b"\x1b]2;relay\x1b\\tail";
+        assert_eq!(
+            extract_passthrough_osc_sequences(text),
+            b"\x1b]2;relay\x1b\\".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_extract_passthrough_osc_sequences_restores_bare_conpty_prefix() {
+        let text = b"before]9;4;1;40\x07after";
+        assert_eq!(
+            extract_passthrough_osc_sequences(text),
+            b"\x1b]9;4;1;40\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_extract_passthrough_osc_sequences_skips_other_sequences() {
+        let text = b"plain\x1b[2Jtext\x1b]7;file://host/tmp\x07\x1b]9;hello\x07";
+        assert!(extract_passthrough_osc_sequences(text).is_empty());
+    }
+
+    #[test]
+    fn test_extract_passthrough_osc_sequences_ignores_unterminated_sequence() {
+        let text = b"\x1b]0;relay build";
+        assert!(extract_passthrough_osc_sequences(text).is_empty());
     }
 
     #[test]
