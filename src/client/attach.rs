@@ -85,11 +85,17 @@ impl AttachRenderer {
 }
 
 /// Extract the semantic terminal signals (window title, progress and busy
-/// indicators) that the daemon's escape filter allows through, so they survive
-/// a repaint driven by canonical screen state.
+/// indicators, cursor shape) that the canonical screen state does not model,
+/// so they survive a repaint driven by that state.
 #[cfg(windows)]
 fn passthrough_signals(data: &[u8]) -> Vec<u8> {
-    crate::session::pty::extract_passthrough_osc_sequences(data)
+    let mut signals = crate::session::pty::extract_passthrough_osc_sequences(data);
+    if let Some(params) = crate::session::pty::last_cursor_style_params(data) {
+        signals.extend_from_slice(b"\x1b[");
+        signals.extend_from_slice(params);
+        signals.extend_from_slice(b" q");
+    }
+    signals
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +934,31 @@ mod tests {
         let rendered = renderer.render_chunk(b"\x1b]2;relay\x07");
 
         assert_eq!(rendered, b"\x1b]2;relay\x07".to_vec());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_live_chunk_forwards_cursor_shape_changes() {
+        // The canonical screen state does not model DECSCUSR, so an editor's
+        // bar cursor would be lost on every repaint without this passthrough.
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[H");
+
+        let rendered = renderer.render_chunk(b"\x1b[6 q\x1b[Hediting");
+
+        assert!(rendered.starts_with(b"\x1b[6 q"));
+        assert!(renderer.parser.screen().contents().contains("editing"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_initial_snapshot_forwards_restored_signals() {
+        let mut renderer = AttachRenderer::new(4, 20);
+
+        let rendered = renderer.render_initial(b"\x1b[Hready\x1b]0;relay\x07\x1b[6 q");
+
+        assert!(rendered.starts_with(b"\x1b]0;relay\x07\x1b[6 q"));
+        assert!(renderer.parser.screen().contents().contains("ready"));
     }
 
     // -----------------------------------------------------------------------

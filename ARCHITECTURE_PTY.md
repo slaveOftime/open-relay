@@ -239,6 +239,31 @@ The replay is sent as the `AttachStreamInit` response frame directly from the
 ring buffer.  The ring already stores the canonical filtered stream, so attach
 handlers no longer run their own `EscapeFilter` pass.
 
+### Terminal Signal Restore
+
+A fresh attach normally starts from `attach_snapshot_init()`, which renders the
+canonical screen state (`vt100::Screen::state_formatted`) instead of replaying
+history.  That state models only the character grid, cursor and input modes, so
+three one-way signals would be lost on every attach:
+
+| Signal | Sequence | Tracked in |
+|---|---|---|
+| Icon / window title | `OSC 0`, `OSC 1`, `OSC 2` | `TerminalSignals::icon_title` / `window_title` |
+| Progress / busy indicator | `OSC 9;4;<state>;<pct>` | `TerminalSignals::progress` |
+| Cursor shape (DECSCUSR) | `CSI <n> SP q` | `TerminalSignals::cursor_style` |
+
+`SessionRuntime::push_output()` feeds every filtered chunk to
+`TerminalSignals::observe()`, which retains the latest value of each slot, and
+`attach_snapshot_bytes()` appends `TerminalSignals::restore_bytes()` after the
+screen state.  A cleared progress indicator (`OSC 9;4;0`) and a default cursor
+shape (`CSI 0 SP q`) drop their slot instead of being replayed as a no-op, and
+payloads over 1 KiB are ignored so a misbehaving child cannot pin memory.
+
+On Windows the attach client repaints from its own canonical parser, so
+`passthrough_signals()` re-extracts the same signals from each live chunk
+(`extract_passthrough_osc_sequences` plus `last_cursor_style_params`) and writes
+them ahead of the repaint.
+
 ### Offset Tracking
 
 Each byte in the ring has a monotonically increasing logical offset.  Clients
@@ -358,9 +383,20 @@ Patterns stripped:
 - **OSC 10/11 color responses**: `\x1b]10;rgb:xxxx/xxxx/xxxx\x07`
 - **Generic OSC**: `\x1b]<num>;<payload>\x07` (e.g., shell CWD updates)
 
+Passthrough allowlist: `OSC 0/1/2` (icon and window title) and `OSC 9;4;…`
+(progress / busy) are one-way notifications and survive the filter.  A bare
+ConPTY variant that reaches the allowlist is rewritten into the escaped form
+before being forwarded — emitting it verbatim is not a valid escape sequence, so
+the client's terminal would print `]0;title` as literal text.  Only BEL and
+`ESC \` terminate a bare sequence: a lone backslash is treated as payload, since
+Windows shells report titles such as `C:\Users\me`.
+
 Cross-chunk handling: `pending` field carries incomplete sequences across
 `filter()` calls.  This handles ConPTY splitting ESC sequences at arbitrary
-byte boundaries.
+byte boundaries.  The carried prefix is capped at `MAX_PENDING_ESCAPE_BYTES`
+(4 KiB); plain text that merely looks like the start of a sequence (for example
+a line ending in `]12;`) is flushed verbatim rather than stalling the session's
+output stream while `pending` grows without bound.
 
 ### Canonical Filtered Stream
 

@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::pty::{
-    EscapeFilter, PtyHandle, RuntimeChild, extract_query_responses_no_client,
+    EscapeFilter, PtyHandle, RuntimeChild, TerminalSignals, extract_query_responses_no_client,
     non_activity_passthrough_osc_bytes,
 };
 
@@ -81,6 +81,10 @@ pub struct SessionRuntime {
     pub notified_output_epoch: Option<Instant>,
     /// Live rendered terminal state for attach snapshot restoration.
     pub screen_parser: vt100::Parser,
+    /// Window/icon title and progress notifications the session last emitted.
+    /// The screen parser does not model these, so they are tracked separately
+    /// and replayed with the attach snapshot.
+    pub terminal_signals: TerminalSignals,
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
     pub notifications_enabled: bool,
@@ -112,6 +116,7 @@ impl SessionRuntime {
                 .saturating_add(filtered_data.len() as u64);
             let meaningful_len = meaningful_output_len(filtered_data);
             self.screen_parser.process(filtered_data);
+            self.terminal_signals.observe(filtered_data);
             if meaningful_len > 0 {
                 self.last_total_bytes = self.last_total_bytes.saturating_add(meaningful_len as u64);
                 self.last_output_epoch = Some(Instant::now());
@@ -158,8 +163,13 @@ impl SessionRuntime {
         }
     }
 
+    /// Bytes that restore the session's visible terminal state on a freshly
+    /// attached client: the rendered screen plus the window/icon title and
+    /// progress notifications the terminal parser does not model.
     pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
-        self.screen_parser.screen().state_formatted()
+        let mut snapshot = self.screen_parser.screen().state_formatted();
+        snapshot.extend_from_slice(&self.terminal_signals.restore_bytes());
+        snapshot
     }
 
     pub fn render_logs(&self, tail: usize, keep_color: bool, term_cols: u16) -> Vec<u8> {
@@ -511,6 +521,7 @@ pub fn spawn_session(
         notified_output_epoch: None,
         last_notified_at: None,
         screen_parser: vt100::Parser::new(rows, cols, 0),
+        terminal_signals: TerminalSignals::default(),
         output_closed: false,
         notifications_enabled,
     }));
@@ -733,6 +744,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
+            terminal_signals: Default::default(),
             output_closed: false,
             notifications_enabled: true,
         }
@@ -910,6 +922,40 @@ mod tests {
     }
 
     #[test]
+    fn test_attach_snapshot_restores_title_progress_and_cursor_style() {
+        // The screen parser drops Operating System Commands and does not model
+        // the cursor shape, so an attaching client would otherwise keep the
+        // window title, progress indicator and cursor shape of its own shell.
+        let mut rt = new_runtime();
+
+        rt.push_output(b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07\x1b[6 qbuilding");
+
+        let snapshot = rt.attach_snapshot_bytes();
+        let contains = |needle: &[u8]| {
+            snapshot
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+
+        assert!(contains(b"\x1b]0;relay build\x07"));
+        assert!(contains(b"\x1b]9;4;3;0\x07"));
+        assert!(contains(b"\x1b[6 q"));
+        assert!(rt.screen_parser.screen().contents().contains("building"));
+    }
+
+    #[test]
+    fn test_attach_snapshot_omits_signals_for_a_silent_session() {
+        let mut rt = new_runtime();
+
+        rt.push_output(b"plain output");
+
+        assert_eq!(
+            rt.attach_snapshot_bytes(),
+            rt.screen_parser.screen().state_formatted()
+        );
+    }
+
+    #[test]
     fn test_push_output_large_chunks_skip_meaningful_output_heuristic() {
         let mut rt = new_runtime();
         let mut chunk = vec![b'x'; MEANINGFUL_OUTPUT_HEURISTIC_MAX_BYTES];
@@ -1024,6 +1070,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
+            terminal_signals: Default::default(),
             output_closed: false,
             notifications_enabled: true,
         };

@@ -178,6 +178,17 @@ pub enum TerminalQuery {
     KittyKeyboard,
 }
 
+/// Upper bound on the incomplete escape-sequence prefix carried from one
+/// pseudo-terminal chunk into the next.
+///
+/// A trailing byte run that merely *looks* like the start of an escape
+/// sequence (for example plain text ending in `]12;`) would otherwise be
+/// buffered forever, because every following chunk keeps extending the same
+/// unterminated candidate. That stalls the session's output for every attached
+/// client and grows the buffer without bound. Real sequences are far shorter
+/// than this limit, so a candidate that exceeds it is flushed verbatim instead.
+const MAX_PENDING_ESCAPE_BYTES: usize = 4096;
+
 /// Fixed terminal-capability queries that can be matched by exact byte text.
 const TERMINAL_QUERY_PATTERNS: [(&[u8], TerminalQuery); 6] = [
     (b"\x1b[6n", TerminalQuery::CursorPositionReport),
@@ -675,9 +686,14 @@ fn filter_cpr_chunk_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
         regex::bytes::Regex::new(r"\x1b]\d{1,3}(?:;[^\x07\x1b]*)*(?:\x07|\x1b\\)").unwrap()
     });
 
+    // Bare Operating System Command without the introducing Escape. Only the
+    // BEL terminator is accepted here: a lone backslash is far more likely to
+    // be part of the payload (Windows shells report `C:\Users\...` as the
+    // window title) than a ConPTY-mangled string terminator, and treating it
+    // as a terminator truncates the title and spills its tail onto the screen.
     static GENERIC_OSC_BARE_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let generic_osc_bare_re = GENERIC_OSC_BARE_RE
-        .get_or_init(|| regex::bytes::Regex::new(r"]\d{1,3}(?:;[^\x07\\]*)*(?:\x07|\\)").unwrap());
+        .get_or_init(|| regex::bytes::Regex::new(r"]\d{1,3}(?:;[^\x07\x1b]*)*\x07").unwrap());
 
     static APC_FULL_RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
     let apc_full_re =
@@ -699,6 +715,7 @@ fn filter_cpr_chunk_bytes(pending: &mut Vec<u8>, chunk: &[u8]) -> Vec<u8> {
         .into_iter()
         .flatten()
         .min()
+        .filter(|start| combined.len() - start <= MAX_PENDING_ESCAPE_BYTES)
     {
         *pending = combined[start..].to_vec();
         combined.truncate(start);
@@ -881,7 +898,9 @@ fn is_partial_generic_osc_sequence_bytes(candidate: &[u8]) -> bool {
                     candidate.get(index + 1) != Some(&b'\\')
                 };
             }
-            b'\\' => return false,
+            // A backslash is ordinary payload text, not a terminator, so a
+            // title such as `C:\Users\me` stays buffered until its real
+            // terminator arrives in a later chunk.
             _ => index += 1,
         }
     }
@@ -899,11 +918,23 @@ fn filter_generic_osc_with_allowlist(
 
     for mat in regex.find_iter(text) {
         out.extend_from_slice(&text[last_end..mat.start()]);
-        let sequence = mat.as_bytes();
-        if allow_passthrough_generic_osc(sequence, escaped_prefix) {
-            out.extend_from_slice(sequence);
-        }
         last_end = mat.end();
+
+        let sequence = mat.as_bytes();
+        if !allow_passthrough_generic_osc(sequence, escaped_prefix) {
+            continue;
+        }
+
+        // Restore the introducing Escape that ConPTY dropped. Forwarding the
+        // bare form verbatim is not a valid escape sequence, so the client's
+        // terminal would print it as literal text (`]0;title`) instead of
+        // acting on it. The escaped-form pass runs first, so a bare match that
+        // is already preceded by an Escape must not be prefixed twice.
+        let already_escaped = escaped_prefix || (mat.start() > 0 && text[mat.start() - 1] == 0x1b);
+        if !already_escaped {
+            out.push(0x1b);
+        }
+        out.extend_from_slice(sequence);
     }
 
     out.extend_from_slice(&text[last_end..]);
@@ -992,7 +1023,7 @@ fn next_osc_sequence(text: &[u8], from: usize) -> Option<ScannedOsc> {
             continue;
         }
 
-        let (payload_end, end) = generic_osc_terminator_bounds(text, cursor + 1, escaped_prefix)?;
+        let (payload_end, end) = generic_osc_terminator_bounds(text, cursor + 1)?;
         return Some(ScannedOsc {
             start,
             end,
@@ -1050,17 +1081,163 @@ pub(crate) fn extract_passthrough_osc_sequences(text: &[u8]) -> Vec<u8> {
     forwarded
 }
 
-fn generic_osc_terminator_bounds(
-    text: &[u8],
-    start: usize,
-    escaped_prefix: bool,
-) -> Option<(usize, usize)> {
+/// Return the parameters of the last cursor-style sequence in `text`.
+///
+/// `CSI <n> SP q` (DECSCUSR) selects the cursor shape and blink used by editors
+/// such as Vim, Helix and Neovim. The terminal parser models neither, so it is
+/// handled alongside the other one-way notifications. Returns `None` when the
+/// chunk carries no cursor-style change.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn last_cursor_style_params(text: &[u8]) -> Option<&[u8]> {
+    let mut found: Option<&[u8]> = None;
+    let mut index = 0usize;
+
+    while let Some(offset) = find_bytes_from(text, b"\x1b[", index) {
+        let params_start = offset + 2;
+        let mut cursor = params_start;
+        while text.get(cursor).is_some_and(|byte| byte.is_ascii_digit()) {
+            cursor += 1;
+        }
+
+        if text.get(cursor) == Some(&b' ') && text.get(cursor + 1) == Some(&b'q') {
+            found = Some(&text[params_start..cursor]);
+            index = cursor + 2;
+        } else {
+            index = params_start;
+        }
+    }
+
+    found
+}
+
+/// Longest notification payload retained per slot in [`TerminalSignals`].
+///
+/// Window titles are short in practice; the cap keeps a misbehaving child from
+/// pinning an arbitrarily large payload in the session runtime for the rest of
+/// its life.
+const MAX_RETAINED_SIGNAL_PAYLOAD_BYTES: usize = 1024;
+
+/// The one-way terminal notifications a session has most recently emitted.
+///
+/// The rendered screen state used for attach restore models only the character
+/// grid, cursor and input modes — Operating System Commands are dropped by the
+/// terminal parser entirely. Without this, a client that attaches (or a Windows
+/// client that repaints from canonical state) shows the correct screen while
+/// the window title and progress/busy indicator silently keep whatever values
+/// the user's own shell left behind. Retaining the last value of each slot lets
+/// the daemon replay them alongside the screen snapshot.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TerminalSignals {
+    /// Payload of the most recent icon-title notification (OSC 0 or OSC 1).
+    icon_title: Option<Vec<u8>>,
+    /// Payload of the most recent window-title notification (OSC 0 or OSC 2).
+    window_title: Option<Vec<u8>>,
+    /// Payload of the most recent progress notification (OSC 9;4), if the
+    /// indicator is currently showing.
+    progress: Option<Vec<u8>>,
+    /// Parameters of the most recent cursor-style sequence (DECSCUSR), if the
+    /// session selected a non-default shape.
+    cursor_style: Option<Vec<u8>>,
+}
+
+impl TerminalSignals {
+    /// Record the passthrough notifications carried by one filtered chunk.
+    pub fn observe(&mut self, data: &[u8]) {
+        if let Some(params) = last_cursor_style_params(data) {
+            // An empty or zero parameter restores the terminal default, which
+            // needs no replay.
+            self.cursor_style = if params.is_empty() || params == b"0" {
+                None
+            } else {
+                Some(params.to_vec())
+            };
+        }
+
+        let mut index = 0usize;
+
+        while let Some(osc) = next_osc_sequence(data, index) {
+            index = osc.end;
+
+            let payload = osc.payload(data);
+            if payload.len() > MAX_RETAINED_SIGNAL_PAYLOAD_BYTES {
+                continue;
+            }
+
+            match osc.ps(data) {
+                b"0" => {
+                    self.icon_title = Some(payload.to_vec());
+                    self.window_title = Some(payload.to_vec());
+                }
+                b"1" => self.icon_title = Some(payload.to_vec()),
+                b"2" => self.window_title = Some(payload.to_vec()),
+                b"9" if payload.starts_with(b"4;") => {
+                    // OSC 9;4;0 removes the indicator, so drop the slot rather
+                    // than replaying a clear on every future attach.
+                    let state = payload[2..]
+                        .split(|&byte| byte == b';')
+                        .next()
+                        .unwrap_or_default();
+                    self.progress = if state == b"0" {
+                        None
+                    } else {
+                        Some(payload.to_vec())
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Escape sequences that reproduce the retained notifications on a freshly
+    /// attached terminal. Empty when the session never emitted any.
+    pub fn restore_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+
+        match (self.icon_title.as_deref(), self.window_title.as_deref()) {
+            (Some(icon), Some(window)) if icon == window => push_osc(&mut bytes, b"0", icon),
+            (icon, window) => {
+                if let Some(icon) = icon {
+                    push_osc(&mut bytes, b"1", icon);
+                }
+                if let Some(window) = window {
+                    push_osc(&mut bytes, b"2", window);
+                }
+            }
+        }
+
+        if let Some(progress) = self.progress.as_deref() {
+            push_osc(&mut bytes, b"9", progress);
+        }
+
+        if let Some(cursor_style) = self.cursor_style.as_deref() {
+            bytes.extend_from_slice(b"\x1b[");
+            bytes.extend_from_slice(cursor_style);
+            bytes.extend_from_slice(b" q");
+        }
+
+        bytes
+    }
+}
+
+fn push_osc(out: &mut Vec<u8>, ps: &[u8], payload: &[u8]) {
+    out.extend_from_slice(b"\x1b]");
+    out.extend_from_slice(ps);
+    out.push(b';');
+    out.extend_from_slice(payload);
+    out.push(0x07);
+}
+
+/// Locate the string terminator of an Operating System Command payload.
+///
+/// Returns `(payload_end, sequence_end)`. Only BEL and the two-byte string
+/// terminator are accepted; a lone backslash is treated as payload text so
+/// window titles containing Windows paths are not truncated.
+fn generic_osc_terminator_bounds(text: &[u8], start: usize) -> Option<(usize, usize)> {
     let mut index = start;
     while let Some(&byte) = text.get(index) {
         match byte {
             0x07 => return Some((index, index + 1)),
             0x1b if text.get(index + 1) == Some(&b'\\') => return Some((index, index + 2)),
-            b'\\' if !escaped_prefix => return Some((index, index + 1)),
             _ => index += 1,
         }
     }
@@ -1220,6 +1397,139 @@ mod tests {
         let text = "before\x1b]7;file://host/home/binwen/open-relay/target/debug\x07after";
         assert_eq!(filter_text_chunk(&mut pending, text), "beforeafter");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_restores_escape_on_bare_conpty_title() {
+        // ConPTY can drop the introducing Escape. Forwarding the bare form
+        // verbatim makes the client's terminal print `]0;relay build` as text.
+        let mut pending = Vec::new();
+        let text = "before]0;relay build\x07after";
+        assert_eq!(
+            filter_text_chunk(&mut pending, text),
+            "before\x1b]0;relay build\x07after"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_does_not_double_escape_full_title_sequence() {
+        let mut pending = Vec::new();
+        let text = "before\x1b]0;relay build\x07after";
+        let filtered = filter_text_chunk(&mut pending, text);
+        assert_eq!(filtered, text);
+        assert!(!filtered.contains("\x1b\x1b"));
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_keeps_backslashes_inside_title_payload() {
+        // A lone backslash is payload, not a ConPTY-mangled string terminator;
+        // treating it as one truncated the title and spilled `Users\me` onto
+        // the screen as literal text.
+        let mut pending = Vec::new();
+        let text = "before]0;C:\\Users\\me\x07after";
+        assert_eq!(
+            filter_text_chunk(&mut pending, text),
+            "before\x1b]0;C:\\Users\\me\x07after"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_buffers_split_title_containing_backslash() {
+        let mut pending = Vec::new();
+        assert_eq!(
+            filter_text_chunk(&mut pending, "before\x1b]0;C:\\Users"),
+            "before"
+        );
+        assert_eq!(pending_text(&pending), "\x1b]0;C:\\Users");
+
+        assert_eq!(
+            filter_text_chunk(&mut pending, "\\me\x07after"),
+            "\x1b]0;C:\\Users\\me\x07after"
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_filter_cpr_chunk_flushes_oversized_partial_sequence() {
+        // Plain text that merely looks like the start of a sequence must not
+        // stall the session's output stream by growing `pending` forever.
+        let mut pending = Vec::new();
+        let mut text = b"\x1b]0;".to_vec();
+        text.extend(std::iter::repeat_n(b'x', MAX_PENDING_ESCAPE_BYTES));
+
+        let filtered = filter_cpr_chunk_bytes(&mut pending, &text);
+
+        assert_eq!(filtered, text);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_last_cursor_style_params_returns_final_change() {
+        assert_eq!(
+            last_cursor_style_params(b"a\x1b[2 qb\x1b[6 qc"),
+            Some(&b"6"[..])
+        );
+        assert_eq!(last_cursor_style_params(b"\x1b[ q"), Some(&b""[..]));
+        assert_eq!(last_cursor_style_params(b"\x1b[2Jplain\x1b[0m"), None);
+    }
+
+    #[test]
+    fn test_terminal_signals_restore_title_and_progress() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]0;relay build\x07work\x1b]9;4;3;0\x07");
+
+        assert_eq!(
+            signals.restore_bytes(),
+            b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_terminal_signals_keep_latest_title_and_distinct_icon_title() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]0;first\x07");
+        signals.observe(b"\x1b]2;window\x07");
+
+        assert_eq!(
+            signals.restore_bytes(),
+            b"\x1b]1;first\x07\x1b]2;window\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_terminal_signals_clear_progress_when_indicator_is_removed() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b]9;4;3;0\x07");
+        signals.observe(b"\x1b]9;4;0;0\x07");
+
+        assert!(signals.restore_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_terminal_signals_restore_cursor_style() {
+        let mut signals = TerminalSignals::default();
+        signals.observe(b"\x1b[6 q");
+        assert_eq!(signals.restore_bytes(), b"\x1b[6 q".to_vec());
+
+        signals.observe(b"\x1b[0 q");
+        assert!(signals.restore_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_terminal_signals_ignore_oversized_payload() {
+        let mut signals = TerminalSignals::default();
+        let mut chunk = b"\x1b]2;".to_vec();
+        chunk.extend(std::iter::repeat_n(
+            b'x',
+            MAX_RETAINED_SIGNAL_PAYLOAD_BYTES + 1,
+        ));
+        chunk.push(0x07);
+
+        signals.observe(&chunk);
+
+        assert!(signals.restore_bytes().is_empty());
     }
 
     #[test]

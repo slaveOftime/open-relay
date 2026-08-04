@@ -1299,6 +1299,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             screen_parser,
+            terminal_signals: Default::default(),
             output_closed: false,
             notifications_enabled: true,
         }))
@@ -2030,6 +2031,7 @@ mod tests {
             last_notified_at: None,
             notified_output_epoch: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
+            terminal_signals: Default::default(),
             output_closed: false,
             notifications_enabled: true,
         }));
