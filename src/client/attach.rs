@@ -46,12 +46,19 @@ impl AttachRenderer {
     fn render_initial(&mut self, data: &[u8]) -> Vec<u8> {
         self.parser.process(data);
         self.needs_full_repaint = false;
-        self.parser.screen().state_formatted()
+        let mut rendered = passthrough_signals(data);
+        rendered.extend_from_slice(&self.parser.screen().state_formatted());
+        rendered
     }
 
     fn render_chunk(&mut self, data: &[u8]) -> Vec<u8> {
         let previous = self.parser.screen().clone();
         self.parser.process(data);
+
+        // The canonical screen state only models the grid, cursor and modes,
+        // so window title and progress/busy notifications are forwarded from
+        // the original bytes; otherwise they would be dropped entirely.
+        let mut rendered = passthrough_signals(data);
 
         // Render from canonical screen state instead of forwarding ConPTY's
         // wrap-dependent bytes. Once the initial snapshot is on screen, state
@@ -63,18 +70,26 @@ impl AttachRenderer {
             self.parser.screen().state_diff(&previous)
         };
         if update.is_empty() {
-            return update;
+            return rendered;
         }
-        let mut synchronized = b"\x1b[?2026h".to_vec();
-        synchronized.extend_from_slice(&update);
-        synchronized.extend_from_slice(b"\x1b[?2026l");
-        synchronized
+        rendered.extend_from_slice(b"\x1b[?2026h");
+        rendered.extend_from_slice(&update);
+        rendered.extend_from_slice(b"\x1b[?2026l");
+        rendered
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
         crate::session::vt100::safe_resize_parser(&mut self.parser, rows, cols);
         self.needs_full_repaint = true;
     }
+}
+
+/// Extract the semantic terminal signals (window title, progress and busy
+/// indicators) that the daemon's escape filter allows through, so they survive
+/// a repaint driven by canonical screen state.
+#[cfg(windows)]
+fn passthrough_signals(data: &[u8]) -> Vec<u8> {
+    crate::session::pty::extract_passthrough_osc_sequences(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -886,6 +901,33 @@ mod tests {
                 .windows(b"\x1b[2J".len())
                 .any(|window| window == b"\x1b[2J")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_live_chunk_forwards_title_and_progress_signals() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[H");
+
+        let rendered =
+            renderer.render_chunk(b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07\x1b[Hworking");
+
+        let expected_signals = b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07";
+        assert!(rendered.starts_with(expected_signals));
+        assert!(rendered[expected_signals.len()..].starts_with(b"\x1b[?2026h"));
+        assert!(rendered.ends_with(b"\x1b[?2026l"));
+        assert!(renderer.parser.screen().contents().contains("working"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_title_only_chunk_is_forwarded_without_repaint() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[Hidle");
+
+        let rendered = renderer.render_chunk(b"\x1b]2;relay\x07");
+
+        assert_eq!(rendered, b"\x1b]2;relay\x07".to_vec());
     }
 
     // -----------------------------------------------------------------------
