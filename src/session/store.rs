@@ -85,6 +85,8 @@ pub struct SilentCandidate {
     pub session_title: Option<String>,
     pub excerpt: String,
     pub output_epoch: Instant,
+    pub silence_epoch: Instant,
+    pub should_notify: bool,
     pub enabled_for_channels: bool,
     pub last_total_bytes: u64,
 }
@@ -1058,8 +1060,7 @@ impl SessionStore {
         evicted_sessions.retain(|_, evicted_at| now.duration_since(*evicted_at) < eviction_ttl);
     }
 
-    /// Returns silent-notification candidates with session id, raw excerpt,
-    /// and output epoch.
+    /// Returns silent candidates with their output and latest activity epochs.
     pub fn silent_candidates(
         &self,
         attach_suppression_window: Duration,
@@ -1095,14 +1096,17 @@ impl SessionStore {
                 // a session is notified it will not be re-notified unless real
                 // output eventually arrives and advances the epoch.
                 let last_output = rt.effective_output_epoch();
+                let pending_input = rt
+                    .last_input_at
+                    .filter(|last_input| *last_input > last_output);
+                let silence_epoch = pending_input.unwrap_or(last_output);
 
-                // If output (or, absent any output, the session start) just
-                // happened, there is no need to notify within the suppression
-                // window, treat it as notified. This also covers the grace period
-                // right after spawn where a session hasn't had a chance to print
-                // anything yet.
-                if now.duration_since(last_output) < attach_suppression_window {
-                    trace!("silent becase recent output activity");
+                // Anchor silence to pending user input when the PTY has not
+                // produced output afterward. This avoids treating an old output
+                // epoch as an already-expired timer while the user is still
+                // composing input.
+                if now.duration_since(silence_epoch) < attach_suppression_window {
+                    trace!("silent because of recent input or output activity");
                     return None;
                 }
 
@@ -1110,7 +1114,9 @@ impl SessionStore {
                 // normally later than `last_output`, so compare it with `now`;
                 // subtracting it from the output epoch can underflow and kill
                 // the notification monitor task.
-                if let Some(last_notified_at) = rt.last_notified_at {
+                if pending_input.is_none()
+                    && let Some(last_notified_at) = rt.last_notified_at
+                {
                     if now.duration_since(last_notified_at) < min_notification_interval {
                         trace!("silent because notification was sent recently");
                         return None;
@@ -1140,6 +1146,8 @@ impl SessionStore {
                     session_title: rt.meta.title.clone(),
                     excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
                     output_epoch: last_output,
+                    silence_epoch,
+                    should_notify: pending_input.is_none(),
                     enabled_for_channels: rt.notifications_enabled,
                     last_total_bytes: rt.last_total_bytes,
                 })
@@ -1155,6 +1163,19 @@ impl SessionStore {
             let mut rt = handle.write();
             rt.notified_output_epoch = Some(output_epoch);
             rt.last_notified_at = Some(notified_at);
+        }
+    }
+
+    /// Marks a session as awaiting input without recording a delivered notification.
+    pub fn mark_input_required(&self, session_id: &str, output_epoch: Instant) {
+        let sessions = self.sessions.load();
+        if let Some(handle) = sessions.get(session_id) {
+            let summary = {
+                let mut rt = handle.write();
+                rt.notified_output_epoch = Some(output_epoch);
+                rt.to_summary()
+            };
+            let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
         }
     }
 }
@@ -1380,6 +1401,71 @@ mod tests {
         let candidates = store.silent_candidates(silence, min_interval);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
+        assert!(candidates[0].should_notify);
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_paused_input_uses_input_as_silence_anchor() {
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        let input_at = Instant::now() - Duration::from_secs(8);
+        rt.write().last_input_at = Some(input_at);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].should_notify);
+        assert_eq!(candidates[0].silence_epoch, input_at);
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_recent_paused_input_waits_from_input_time() {
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(2));
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mark_input_required_does_not_record_notification_delivery() {
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        let output_epoch = rt.read().effective_output_epoch();
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let mut events = store.event_tx().subscribe();
+
+        store.mark_input_required("abc1234", output_epoch);
+
+        let locked = rt.read();
+        assert!(locked.input_needed());
+        assert!(locked.last_notified_at.is_none());
+        drop(locked);
+        let event = events.try_recv().expect("session update should be emitted");
+        assert!(matches!(
+            event,
+            SessionEvent::SessionUpdated(summary) if summary.input_needed
+        ));
     }
 
     #[tokio::test]
