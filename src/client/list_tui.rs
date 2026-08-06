@@ -1085,7 +1085,7 @@ impl RateState {
     }
 
     fn sample(&mut self, session: &SessionSummary, now: Instant) {
-        let elapsed = now.duration_since(self.sampled_at).as_secs_f64();
+        let elapsed = now.saturating_duration_since(self.sampled_at).as_secs_f64();
         let bytes = session.last_total_bytes.saturating_sub(self.total_bytes);
         self.previous_rate = self.display_rate(now);
         self.rate = if bytes > 0 && elapsed > 0.0 {
@@ -1103,8 +1103,8 @@ impl RateState {
     }
 
     fn display_rate(&self, now: Instant) -> f64 {
-        let progress =
-            now.duration_since(self.sampled_at).as_secs_f64() / REFRESH_INTERVAL.as_secs_f64();
+        let progress = now.saturating_duration_since(self.sampled_at).as_secs_f64()
+            / REFRESH_INTERVAL.as_secs_f64();
         let eased = progress.clamp(0.0, 1.0);
         self.previous_rate + (self.rate - self.previous_rate) * eased
     }
@@ -1185,12 +1185,19 @@ impl App {
         else {
             return;
         };
-        self.search_text[index] = session_search_text(&summary);
         self.sessions[index] = summary;
+        if let Some(search_text) = self.search_text.get_mut(index) {
+            *search_text = session_search_text(&self.sessions[index]);
+        } else {
+            self.search_text = self.sessions.iter().map(session_search_text).collect();
+        }
         self.rebuild_visible();
     }
 
     fn rebuild_visible(&mut self) {
+        if self.search_text.len() != self.sessions.len() {
+            self.search_text = self.sessions.iter().map(session_search_text).collect();
+        }
         self.visible.clear();
         self.visible.extend(
             self.sessions
@@ -1205,7 +1212,10 @@ impl App {
                     };
                     status_matches
                         && (self.normalized_filter.is_empty()
-                            || self.search_text[*index].contains(&self.normalized_filter))
+                            || self
+                                .search_text
+                                .get(*index)
+                                .is_some_and(|text| text.contains(&self.normalized_filter)))
                 })
                 .map(|(index, _)| index),
         );
@@ -1219,7 +1229,8 @@ impl App {
     fn selected_session(&self) -> Option<&SessionSummary> {
         self.visible
             .contains(&self.selected)
-            .then(|| &self.sessions[self.selected])
+            .then(|| self.sessions.get(self.selected))
+            .flatten()
     }
 
     fn select_visible(&mut self, offset: isize) {
@@ -1231,8 +1242,10 @@ impl App {
             .iter()
             .position(|index| *index == self.selected)
             .unwrap_or(0) as isize;
-        self.selected =
-            self.visible[(position + offset).rem_euclid(self.visible.len() as isize) as usize];
+        let next = (position + offset).rem_euclid(self.visible.len() as isize) as usize;
+        if let Some(index) = self.visible.get(next).copied() {
+            self.selected = index;
+        }
     }
 
     fn previous(&mut self) {
@@ -1510,7 +1523,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let animation_age = app
         .rates
         .values()
-        .map(|rate| now.duration_since(rate.sampled_at))
+        .map(|rate| now.saturating_duration_since(rate.sampled_at))
         .min()
         .unwrap_or_default();
     let throughput_header =
@@ -1556,9 +1569,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         let viewport_start = selected_position
             .saturating_sub(viewport_len / 2)
             .min(visible.len().saturating_sub(viewport_len));
-        let rows = visible.iter().map(|index| {
-            let session = &app.sessions[*index];
-            session_row(session, app.rates.get(&session.id), mode, now)
+        let rows = visible.iter().filter_map(|index| {
+            app.sessions
+                .get(*index)
+                .map(|session| session_row(session, app.rates.get(&session.id), mode, now))
         });
         let table = Table::new(rows, session_table_widths(mode))
             .header(session_table_header(mode))
@@ -2085,7 +2099,7 @@ fn session_row(
     let age = super::list::format_age(session.created_at, session.started_at, session.ended_at);
     let current_rate = rate.map(|value| value.display_rate(now)).unwrap_or(0.0);
     let animation_age = rate
-        .map(|value| now.duration_since(value.sampled_at))
+        .map(|value| now.saturating_duration_since(value.sampled_at))
         .unwrap_or_default();
     let rate_color = if active {
         rate_color(current_rate, animation_age)
@@ -2201,7 +2215,10 @@ fn sparkline(rate: Option<&RateState>, width: usize) -> String {
     let spark = values
         .iter()
         .rev()
-        .map(|value| SPARK_BLOCKS[((value / max) * 7.0).round() as usize])
+        .map(|value| {
+            let index = ((value / max) * 7.0).round() as usize;
+            SPARK_BLOCKS[index.min(SPARK_BLOCKS.len() - 1)]
+        })
         .collect::<String>();
     format!("{}{}", "▁".repeat(padding), spark)
 }
@@ -3701,5 +3718,43 @@ mod tests {
             assert!(rect.x + rect.width as i32 <= work.x + work.width as i32);
             assert!(rect.y + rect.height as i32 <= work.y + work.height as i32);
         }
+    }
+
+    #[test]
+    fn render_tolerates_stale_visible_indices() {
+        let mut app = App::default();
+        app.sessions = vec![session("a")];
+        app.search_text = vec!["a".to_string()];
+        app.visible = vec![usize::MAX];
+        app.selected = usize::MAX;
+
+        let rendered = render_app(&mut app, 120, 20);
+
+        assert!(rendered.contains("OPEN RELAY"));
+    }
+
+    #[test]
+    fn rebuild_visible_repairs_stale_search_index() {
+        let mut app = App::default();
+        app.sessions = vec![session("a")];
+        app.search_text.clear();
+        app.normalized_filter = "cmd".to_string();
+
+        app.rebuild_visible();
+
+        assert_eq!(app.search_text, vec!["a\ncmd".to_string()]);
+        assert_eq!(app.visible, vec![0]);
+    }
+
+    #[test]
+    fn rate_state_tolerates_a_future_sample_instant() {
+        let summary = session("a");
+        let now = std::time::Instant::now();
+        let mut rate = super::RateState::new(&summary, now);
+        rate.sampled_at = now + std::time::Duration::from_secs(1);
+
+        assert_eq!(rate.display_rate(now), 0.0);
+        rate.sample(&summary, now);
+        assert_eq!(rate.display_rate(now), 0.0);
     }
 }
