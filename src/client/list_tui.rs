@@ -52,7 +52,25 @@ const CLONE_DIALOG_HELP: &str =
 const UPDATE_DIALOG_HELP: &str =
     " Quote multi-word tags · Tab/Shift+Tab · Space toggle · Enter save · Esc cancel";
 
-pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String>) -> Result<()> {
+use super::list::ListTarget;
+
+struct SessionRefresh {
+    sessions: Vec<SessionSummary>,
+    failed_nodes: HashSet<Option<String>>,
+    failures: Vec<String>,
+}
+
+impl SessionRefresh {
+    fn warning(&self) -> Option<String> {
+        (!self.failures.is_empty()).then(|| format!("sync lost: {}", self.failures.join(" · ")))
+    }
+}
+
+pub(super) async fn run(
+    config: &AppConfig,
+    args: &ListArgs,
+    targets: Vec<ListTarget>,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::Protocol(
             "--follow requires an interactive terminal".to_string(),
@@ -61,7 +79,10 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
 
     let query = super::list::build_list_query(args)?;
     let mut app = App::default();
-    app.replace_sessions(fetch_sessions(config, query.clone(), node.as_deref()).await?);
+    app.show_node = targets.len() > 1;
+    let refresh = fetch_sessions(config, query.clone(), &targets).await?;
+    app.message = refresh.warning();
+    app.replace_sessions(refresh.sessions);
     let mut terminal = TuiTerminal::new()?;
     let mut last_refresh = Instant::now();
 
@@ -71,12 +92,10 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
             && let Event::Key(key) = event
             && key.kind != KeyEventKind::Release
         {
-            match route_key(&mut app, key, node.as_deref()) {
+            match route_key(&mut app, key, None) {
                 AppAction::None => {}
                 AppAction::Quit => break,
-                AppAction::OpenInline => {
-                    open_selected_inline(&mut terminal, &mut app, node.as_deref())?
-                }
+                AppAction::OpenInline => open_selected_inline(&mut terminal, &mut app, None)?,
                 AppAction::Start(launch) => {
                     start_clone(config, &mut terminal, &mut app, launch).await?
                 }
@@ -86,10 +105,21 @@ pub(super) async fn run(config: &AppConfig, args: &ListArgs, node: Option<String
         }
 
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
-            match fetch_sessions(config, query.clone(), node.as_deref()).await {
-                Ok(sessions) => {
-                    app.replace_sessions(sessions);
-                    app.message = None;
+            match fetch_sessions(config, query.clone(), &targets).await {
+                Ok(mut refresh) => {
+                    refresh.sessions.extend(
+                        app.sessions
+                            .iter()
+                            .filter(|session| refresh.failed_nodes.contains(&session.node))
+                            .cloned(),
+                    );
+                    refresh
+                        .sessions
+                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                    refresh.sessions.truncate(query.limit);
+                    let warning = refresh.warning();
+                    app.replace_sessions(refresh.sessions);
+                    app.message = warning;
                 }
                 Err(error) => app.message = Some(format!("sync lost: {error}")),
             }
@@ -131,27 +161,68 @@ fn is_transient_terminal_error(error: &io::Error) -> bool {
 async fn fetch_sessions(
     config: &AppConfig,
     query: crate::protocol::ListQuery,
-    node: Option<&str>,
-) -> Result<Vec<SessionSummary>> {
-    let inner = RpcRequest::List { query };
-    let request = match node {
-        Some(node) => RpcRequest::NodeProxy {
-            node: node.to_string(),
-            inner: Box::new(inner),
-        },
-        None => inner,
-    };
-    let response =
-        tokio::time::timeout(REFRESH_TIMEOUT, ipc::send_request_checked(config, request))
-            .await
-            .map_err(|_| AppError::Protocol("session refresh timed out".to_string()))??;
-    match response {
-        RpcResponse::List { mut sessions, .. } => {
-            sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            Ok(sessions)
+    targets: &[ListTarget],
+) -> Result<SessionRefresh> {
+    let requests = targets.iter().map(|target| {
+        let query = query.clone();
+        async move {
+            let result = async {
+                let inner = RpcRequest::List { query };
+                let request = match target.node.as_ref() {
+                    Some(node) => RpcRequest::NodeProxy {
+                        node: node.clone(),
+                        inner: Box::new(inner),
+                    },
+                    None => inner,
+                };
+                let response = tokio::time::timeout(
+                    REFRESH_TIMEOUT,
+                    ipc::send_request_checked(config, request),
+                )
+                .await
+                .map_err(|_| AppError::Protocol("session refresh timed out".to_string()))??;
+                match response {
+                    RpcResponse::List { mut sessions, .. } => {
+                        if let Some(node) = target.node.as_ref() {
+                            for session in &mut sessions {
+                                session.node = Some(node.clone());
+                            }
+                        }
+                        Ok(sessions)
+                    }
+                    _ => Err(AppError::Protocol("unexpected response type".to_string())),
+                }
+            }
+            .await;
+            (target.node.clone(), result)
         }
-        _ => Err(AppError::Protocol("unexpected response type".to_string())),
+    });
+    let mut sessions = Vec::new();
+    let mut failed_nodes = HashSet::new();
+    let mut failures = Vec::new();
+    let mut successful_targets = 0;
+    for (node, result) in futures_util::future::join_all(requests).await {
+        match result {
+            Ok(target_sessions) => {
+                successful_targets += 1;
+                sessions.extend(target_sessions);
+            }
+            Err(error) => {
+                failures.push(format!("{}: {error}", node.as_deref().unwrap_or("local")));
+                failed_nodes.insert(node);
+            }
+        }
     }
+    if successful_targets == 0 {
+        return Err(AppError::Protocol(failures.join(" · ")));
+    }
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sessions.truncate(query.limit);
+    Ok(SessionRefresh {
+        sessions,
+        failed_nodes,
+        failures,
+    })
 }
 
 async fn start_clone(
@@ -178,13 +249,20 @@ async fn start_clone(
 
 async fn update_session(config: &AppConfig, app: &mut App, update: SessionUpdate) {
     let target_id = update.id.clone();
+    let target_node = update.node.clone();
     let response = ipc::send_request_checked(config, update.request()).await;
-    apply_update_response(app, &target_id, response);
+    apply_update_response(app, &target_id, target_node.as_deref(), response);
 }
 
-fn apply_update_response(app: &mut App, target_id: &str, response: Result<RpcResponse>) {
+fn apply_update_response(
+    app: &mut App,
+    target_id: &str,
+    target_node: Option<&str>,
+    response: Result<RpcResponse>,
+) {
     match response {
-        Ok(RpcResponse::Session { summary }) => {
+        Ok(RpcResponse::Session { mut summary }) => {
+            summary.node = target_node.map(str::to_string);
             app.update_dialog = None;
             app.apply_updated_summary(summary);
             app.message = Some(format!("updated session {target_id}"));
@@ -250,6 +328,7 @@ struct App {
     status_filter: StatusFilter,
     clone_dialog: Option<CloneDialog>,
     update_dialog: Option<UpdateDialog>,
+    show_node: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1112,6 +1191,10 @@ impl RateState {
 
 fn session_search_text(session: &SessionSummary) -> String {
     let mut text = format!("{}\n{}", session.id, session.command);
+    if let Some(node) = &session.node {
+        text.push('\n');
+        text.push_str(node);
+    }
     if let Some(title) = &session.title {
         text.push('\n');
         text.push_str(title);
@@ -1119,30 +1202,34 @@ fn session_search_text(session: &SessionSummary) -> String {
     text.to_lowercase()
 }
 
+fn session_key(session: &SessionSummary) -> String {
+    session.node.as_ref().map_or_else(
+        || session.id.clone(),
+        |node| format!("{node}\0{}", session.id),
+    )
+}
+
 impl App {
     fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        let selected_id = self.sessions.get(self.selected).map(|item| item.id.clone());
+        let selected_key = self.sessions.get(self.selected).map(session_key);
         let now = Instant::now();
-        let session_ids = sessions
-            .iter()
-            .map(|session| session.id.clone())
-            .collect::<HashSet<_>>();
+        let session_keys = sessions.iter().map(session_key).collect::<HashSet<_>>();
         let attach_counts = sessions
             .iter()
-            .map(|session| (session.id.clone(), session.attach_count))
+            .map(|session| (session_key(session), session.attach_count))
             .collect::<HashMap<_, _>>();
         for session in &sessions {
-            match self.rates.get_mut(&session.id) {
+            let key = session_key(session);
+            match self.rates.get_mut(&key) {
                 Some(rate) => rate.sample(session, now),
                 None => {
-                    self.rates
-                        .insert(session.id.clone(), RateState::new(session, now));
+                    self.rates.insert(key, RateState::new(session, now));
                 }
             }
         }
-        self.rates.retain(|id, _| session_ids.contains(id));
-        self.opened.retain(|id, opened| {
-            let attach_count = attach_counts.get(id).copied();
+        self.rates.retain(|key, _| session_keys.contains(key));
+        self.opened.retain(|key, opened| {
+            let attach_count = attach_counts.get(key).copied();
             let launch_pending = opened.launched_at.elapsed() < Duration::from_secs(5);
             let attached = attach_count.is_some_and(|count| count > 0);
             if opened.marker.exists() && !launch_pending && !attached {
@@ -1152,8 +1239,12 @@ impl App {
         });
         self.search_text = sessions.iter().map(session_search_text).collect();
         self.sessions = sessions;
-        self.selected = selected_id
-            .and_then(|id| self.sessions.iter().position(|item| item.id == id))
+        self.selected = selected_key
+            .and_then(|key| {
+                self.sessions
+                    .iter()
+                    .position(|item| session_key(item) == key)
+            })
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
         self.sync_update_dialog();
@@ -1170,7 +1261,14 @@ impl App {
         let summary = self
             .sessions
             .iter()
-            .find(|session| session.id == target_id)
+            .find(|session| {
+                session.id == target_id
+                    && session.node.as_ref()
+                        == self
+                            .update_dialog
+                            .as_ref()
+                            .and_then(|dialog| dialog.target_node.as_ref())
+            })
             .cloned();
         if let Some(dialog) = self.update_dialog.as_mut() {
             dialog.sync_summary(summary.as_ref());
@@ -1178,10 +1276,11 @@ impl App {
     }
 
     fn apply_updated_summary(&mut self, summary: SessionSummary) {
+        let key = session_key(&summary);
         let Some(index) = self
             .sessions
             .iter()
-            .position(|session| session.id == summary.id)
+            .position(|session| session_key(session) == key)
         else {
             return;
         };
@@ -1310,18 +1409,27 @@ impl App {
         };
         let attach = is_active_status(&session.status);
         let id = session.id.clone();
+        let target_node = session.node.as_deref().or(node).map(str::to_string);
+        let key = session_key(session);
         let size = (session.cols.unwrap_or(80), session.rows.unwrap_or(24));
-        if attach && self.opened.contains_key(&id) {
+        if attach && self.opened.contains_key(&key) {
             self.message = Some(format!("{id} is already jacked in"));
             return;
         }
 
         let marker = attach.then(|| terminal_marker(&id));
-        match spawn_session_terminal(&id, node, size, self.next_slot, attach, marker.as_deref()) {
+        match spawn_session_terminal(
+            &id,
+            target_node.as_deref(),
+            size,
+            self.next_slot,
+            attach,
+            marker.as_deref(),
+        ) {
             Ok(()) => {
                 if let Some(marker) = marker {
                     self.opened.insert(
-                        id.clone(),
+                        key,
                         OpenedTerminal {
                             marker,
                             launched_at: Instant::now(),
@@ -1349,8 +1457,9 @@ fn open_selected_inline(
         return Ok(());
     };
     let id = session.id.clone();
+    let target_node = session.node.as_deref().or(node).map(str::to_string);
     let attach = is_active_status(&session.status);
-    open_session_inline(terminal, app, &id, node, attach)
+    open_session_inline(terminal, app, &id, target_node.as_deref(), attach)
 }
 
 fn open_session_inline(
@@ -1492,7 +1601,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     let throughput = app
         .sessions
         .iter()
-        .filter_map(|session| app.rates.get(&session.id))
+        .filter_map(|session| app.rates.get(&session_key(session)))
         .map(|rate| rate.display_rate(now))
         .sum::<f64>();
     let header = Layout::horizontal([Constraint::Min(0), Constraint::Length(18)]).split(chunks[0]);
@@ -1570,12 +1679,18 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             .saturating_sub(viewport_len / 2)
             .min(visible.len().saturating_sub(viewport_len));
         let rows = visible.iter().filter_map(|index| {
-            app.sessions
-                .get(*index)
-                .map(|session| session_row(session, app.rates.get(&session.id), mode, now))
+            app.sessions.get(*index).map(|session| {
+                session_row(
+                    session,
+                    app.rates.get(&session_key(session)),
+                    mode,
+                    now,
+                    app.show_node,
+                )
+            })
         });
-        let table = Table::new(rows, session_table_widths(mode))
-            .header(session_table_header(mode))
+        let table = Table::new(rows, session_table_widths(mode, app.show_node))
+            .header(session_table_header(mode, app.show_node))
             .column_spacing(1)
             .highlight_symbol("▸ ")
             .row_highlight_style(
@@ -2007,8 +2122,8 @@ fn checkbox(checked: bool) -> String {
     }
 }
 
-fn session_table_widths(mode: LayoutMode) -> Vec<Constraint> {
-    match mode {
+fn session_table_widths(mode: LayoutMode, show_node: bool) -> Vec<Constraint> {
+    let mut widths = match mode {
         LayoutMode::Narrow => vec![
             Constraint::Length(1),
             Constraint::Length(8),
@@ -2036,11 +2151,15 @@ fn session_table_widths(mode: LayoutMode) -> Vec<Constraint> {
             Constraint::Length(12),
             Constraint::Length(8),
         ],
+    };
+    if show_node {
+        widths.insert(1, Constraint::Length(10));
     }
+    widths
 }
 
-fn session_table_alignments(mode: LayoutMode) -> Vec<Alignment> {
-    match mode {
+fn session_table_alignments(mode: LayoutMode, show_node: bool) -> Vec<Alignment> {
+    let mut alignments = match mode {
         LayoutMode::Narrow | LayoutMode::Medium => vec![Alignment::Left; 6],
         LayoutMode::Wide => vec![
             Alignment::Left,
@@ -2053,20 +2172,27 @@ fn session_table_alignments(mode: LayoutMode) -> Vec<Alignment> {
             Alignment::Left,
             Alignment::Right,
         ],
+    };
+    if show_node {
+        alignments.insert(1, Alignment::Left);
     }
+    alignments
 }
 
-fn session_table_header(mode: LayoutMode) -> Row<'static> {
-    let labels = match mode {
+fn session_table_header(mode: LayoutMode, show_node: bool) -> Row<'static> {
+    let mut labels = match mode {
         LayoutMode::Narrow => vec!["", "ID", "SESSION", "STATE", "AGE", "I/O"],
         LayoutMode::Medium => vec!["", "ID", "SESSION", "STATE", "AGE", "RATE"],
         LayoutMode::Wide => vec![
             "", "SESSION", "PID", "STATE", "AGE", "ID", "COMMAND", "RATE", "OUTPUT",
         ],
     };
+    if show_node {
+        labels.insert(1, "NODE");
+    }
     let cells = labels
         .into_iter()
-        .zip(session_table_alignments(mode))
+        .zip(session_table_alignments(mode, show_node))
         .map(|(label, alignment)| aligned_cell(label, alignment));
     Row::new(cells).style(
         Style::default()
@@ -2084,6 +2210,7 @@ fn session_row(
     rate: Option<&RateState>,
     mode: LayoutMode,
     now: Instant,
+    show_node: bool,
 ) -> Row<'static> {
     let active = is_active_status(&session.status);
     let mut status = status_glyph(&session.status, session.input_needed);
@@ -2106,80 +2233,101 @@ fn session_row(
     } else {
         Color::DarkGray
     };
-    let alignments = session_table_alignments(mode);
-    let row = match mode {
-        LayoutMode::Narrow => Row::new(vec![
+    let alignments = session_table_alignments(mode, show_node);
+    let node_offset = usize::from(show_node);
+    let mut cells = match mode {
+        LayoutMode::Narrow => vec![
             aligned_cell(
                 Span::styled(status.0, Style::default().fg(status.1)),
                 alignments[0],
             ),
-            aligned_cell(session.id.clone(), alignments[1])
+            aligned_cell(session.id.clone(), alignments[1 + node_offset])
                 .style(Style::default().fg(Color::DarkGray)),
-            aligned_cell(name, alignments[2]),
-            aligned_cell(status_text.to_string(), alignments[3])
+            aligned_cell(name, alignments[2 + node_offset]),
+            aligned_cell(status_text.to_string(), alignments[3 + node_offset])
                 .style(Style::default().fg(status.1)),
-            aligned_cell(age, alignments[4]).style(Style::default().fg(Color::DarkGray)),
-            aligned_cell(sparkline(rate, COMPACT_SPARKLINE_WIDTH), alignments[5])
-                .style(Style::default().fg(rate_color)),
-        ]),
-        LayoutMode::Medium => Row::new(vec![
+            aligned_cell(age, alignments[4 + node_offset])
+                .style(Style::default().fg(Color::DarkGray)),
+            aligned_cell(
+                sparkline(rate, COMPACT_SPARKLINE_WIDTH),
+                alignments[5 + node_offset],
+            )
+            .style(Style::default().fg(rate_color)),
+        ],
+        LayoutMode::Medium => vec![
             aligned_cell(
                 Span::styled(status.0, Style::default().fg(status.1)),
                 alignments[0],
             ),
-            aligned_cell(session.id.clone(), alignments[1])
+            aligned_cell(session.id.clone(), alignments[1 + node_offset])
                 .style(Style::default().fg(Color::DarkGray)),
-            aligned_cell(name, alignments[2]),
-            aligned_cell(status_text.to_string(), alignments[3])
+            aligned_cell(name, alignments[2 + node_offset]),
+            aligned_cell(status_text.to_string(), alignments[3 + node_offset])
                 .style(Style::default().fg(status.1)),
-            aligned_cell(age, alignments[4]).style(Style::default().fg(Color::DarkGray)),
+            aligned_cell(age, alignments[4 + node_offset])
+                .style(Style::default().fg(Color::DarkGray)),
             aligned_cell(
                 format!(
                     "{} {:>6}/s",
                     sparkline(rate, SPARKLINE_WIDTH),
                     format_bytes(current_rate)
                 ),
-                alignments[5],
+                alignments[5 + node_offset],
             )
             .style(Style::default().fg(rate_color)),
-        ]),
+        ],
         LayoutMode::Wide => {
             let command = if session.args.is_empty() {
                 session.command.clone()
             } else {
                 format!("{} {}", session.command, session.args.join(" "))
             };
-            Row::new(vec![
+            vec![
                 aligned_cell(
                     Span::styled(status.0, Style::default().fg(status.1)),
                     alignments[0],
                 ),
-                aligned_cell(name, alignments[1]),
+                aligned_cell(name, alignments[1 + node_offset]),
                 aligned_cell(
                     session.pid.map_or("-".into(), |pid| pid.to_string()),
-                    alignments[2],
+                    alignments[2 + node_offset],
                 )
                 .style(Style::default().fg(Color::DarkGray)),
-                aligned_cell(status_text.to_string(), alignments[3])
+                aligned_cell(status_text.to_string(), alignments[3 + node_offset])
                     .style(Style::default().fg(status.1)),
-                aligned_cell(age, alignments[4]).style(Style::default().fg(Color::DarkGray)),
-                aligned_cell(session.id.clone(), alignments[5])
+                aligned_cell(age, alignments[4 + node_offset])
                     .style(Style::default().fg(Color::DarkGray)),
-                aligned_cell(command, alignments[6]),
+                aligned_cell(session.id.clone(), alignments[5 + node_offset])
+                    .style(Style::default().fg(Color::DarkGray)),
+                aligned_cell(command, alignments[6 + node_offset]),
                 aligned_cell(
                     format!(
                         "{} {:>6}/s",
                         sparkline(rate, SPARKLINE_WIDTH),
                         format_bytes(current_rate)
                     ),
-                    alignments[7],
+                    alignments[7 + node_offset],
                 )
                 .style(Style::default().fg(rate_color)),
-                aligned_cell(format_bytes(session.last_total_bytes as f64), alignments[8])
-                    .style(Style::default().fg(Color::DarkGray)),
-            ])
+                aligned_cell(
+                    format_bytes(session.last_total_bytes as f64),
+                    alignments[8 + node_offset],
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+            ]
         }
     };
+    if show_node {
+        cells.insert(
+            1,
+            aligned_cell(
+                session.node.clone().unwrap_or_else(|| "local".to_string()),
+                alignments[1],
+            )
+            .style(Style::default().fg(Color::Cyan)),
+        );
+    }
+    let row = Row::new(cells);
     if active {
         row
     } else {
@@ -3148,6 +3296,7 @@ mod tests {
         super::apply_update_response(
             &mut app,
             "source",
+            None,
             Ok(RpcResponse::Session { summary: updated }),
         );
         assert!(app.update_dialog.is_none());
@@ -3163,6 +3312,7 @@ mod tests {
         super::apply_update_response(
             &mut app,
             "other",
+            None,
             Err(AppError::Protocol("session disappeared".to_string())),
         );
         assert!(app.update_dialog.is_some());
@@ -3588,17 +3738,38 @@ mod tests {
     }
 
     #[test]
+    fn multi_node_table_displays_node_and_keeps_duplicate_ids_distinct() {
+        let mut app = App {
+            show_node: true,
+            ..App::default()
+        };
+        let mut local = session("shared");
+        local.title = Some("Local session".to_string());
+        let mut remote = session("shared");
+        remote.title = Some("Remote session".to_string());
+        remote.node = Some("worker-a".to_string());
+        app.replace_sessions(vec![local, remote]);
+
+        let rendered = render_app(&mut app, 120, 12);
+
+        assert!(rendered.contains("NODE"));
+        assert!(rendered.contains("local"));
+        assert!(rendered.contains("worker-a"));
+        assert_eq!(app.rates.len(), 2);
+    }
+
+    #[test]
     fn table_headers_share_each_modes_cell_alignments() {
         assert_eq!(
-            super::session_table_alignments(super::LayoutMode::Narrow),
+            super::session_table_alignments(super::LayoutMode::Narrow, false),
             vec![Alignment::Left; 6]
         );
         assert_eq!(
-            super::session_table_alignments(super::LayoutMode::Medium),
+            super::session_table_alignments(super::LayoutMode::Medium, false),
             vec![Alignment::Left; 6]
         );
         assert_eq!(
-            super::session_table_alignments(super::LayoutMode::Wide),
+            super::session_table_alignments(super::LayoutMode::Wide, false),
             vec![
                 Alignment::Left,
                 Alignment::Left,

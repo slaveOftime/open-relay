@@ -208,9 +208,12 @@ pub struct ListArgs {
         default_value_if("follow", "true", Some("100"))
     )]
     pub limit: usize,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
+    /// Target a secondary node by name. Repeat to monitor multiple nodes.
+    #[arg(long, short = 'n', value_name = "NODE")]
+    pub node: Vec<String>,
+    /// Include sessions from the current (or primary) daemon.
+    #[arg(long)]
+    pub node_local: bool,
 }
 
 #[derive(Debug, Args)]
@@ -673,6 +676,26 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+    }
+
+    #[test]
+    fn list_parses_multiple_nodes_and_local_node() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "ls",
+            "--follow",
+            "--node",
+            "worker-a",
+            "--node",
+            "worker-b",
+            "--node-local",
+        ])
+        .unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert_eq!(args.node, vec!["worker-a", "worker-b"]);
+        assert!(args.node_local);
     }
 
     #[test]

@@ -184,10 +184,7 @@ async fn run() -> Result<()> {
             DaemonCommand::Status => daemon::status(config).await,
         },
 
-        Commands::List(list_args) => {
-            let node = list_args.node.clone();
-            client::run_list(&config, list_args, node).await
-        }
+        Commands::List(list_args) => client::run_list(&config, list_args).await,
 
         Commands::Start(start_args) => {
             let cli::StartArgs {

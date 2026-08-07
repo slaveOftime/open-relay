@@ -10,9 +10,35 @@ use crate::{
     protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SessionSummary, SortOrder},
 };
 
-pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<String>) -> Result<()> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ListTarget {
+    pub(super) node: Option<String>,
+}
+
+pub(super) fn list_targets(args: &ListArgs) -> Vec<ListTarget> {
+    let mut nodes = Vec::new();
+    for node in &args.node {
+        if !nodes.contains(node) {
+            nodes.push(node.clone());
+        }
+    }
+
+    let mut targets = Vec::new();
+    if args.node_local || nodes.is_empty() {
+        targets.push(ListTarget { node: None });
+    }
+    targets.extend(
+        nodes
+            .into_iter()
+            .map(|node| ListTarget { node: Some(node) }),
+    );
+    targets
+}
+
+pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
+    let targets = list_targets(&list_args);
     if list_args.follow {
-        return super::list_tui::run(config, &list_args, node).await;
+        return super::list_tui::run(config, &list_args, targets).await;
     }
 
     const CMD_WIDTH: usize = 12;
@@ -24,44 +50,68 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
     let limit = query.limit;
     let mut used_db_fallback = false;
 
-    let (mut sessions, total): (Vec<SessionSummary>, usize) = if let Some(node_name) = node {
-        // Remote list via IPC NodeProxy.
-        let inner = RpcRequest::List { query };
-        let req = RpcRequest::NodeProxy {
-            node: node_name,
-            inner: Box::new(inner),
+    let multiple_targets = targets.len() > 1;
+    let mut sessions = Vec::new();
+    let mut total = 0;
+    for target in targets {
+        let response = match target.node.as_ref() {
+            Some(node) => {
+                let request = RpcRequest::NodeProxy {
+                    node: node.clone(),
+                    inner: Box::new(RpcRequest::List {
+                        query: query.clone(),
+                    }),
+                };
+                ipc::send_request_checked(config, request).await
+            }
+            None => {
+                ipc::send_request_checked(
+                    config,
+                    RpcRequest::List {
+                        query: query.clone(),
+                    },
+                )
+                .await
+            }
         };
-        match ipc::send_request_checked(config, req).await? {
-            RpcResponse::List { sessions, total } => (sessions, total),
-            _ => return Err(AppError::Protocol("unexpected response type".to_string())),
-        }
-    } else {
-        // Daemon handles DB + in-memory overlay; fall back to DB-only when unavailable.
-        match ipc::send_request_checked(
-            config,
-            RpcRequest::List {
-                query: query.clone(),
-            },
-        )
-        .await
-        {
+        let (mut target_sessions, target_total) = match response {
             Ok(RpcResponse::List { sessions, total }) => (sessions, total),
             Ok(_) => return Err(AppError::Protocol("unexpected response type".to_string())),
-            Err(AppError::DaemonUnavailable(_)) | Err(AppError::Protocol(_)) => {
+            Err(AppError::DaemonUnavailable(_)) | Err(AppError::Protocol(_))
+                if target.node.is_none() && !multiple_targets =>
+            {
                 used_db_fallback = true;
                 let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
                 let total = db.count_summaries(&query).await?;
                 let sessions = db.list_summaries(&query).await?;
                 (sessions, total)
             }
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
+        };
+        if let Some(node) = target.node {
+            for session in &mut target_sessions {
+                session.node = Some(node.clone());
+            }
         }
-    };
+        sessions.extend(target_sessions);
+        total += target_total;
+    }
 
-    sessions.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sessions.truncate(limit);
+    sessions.reverse();
 
     if list_args.json {
-        let items = sessions.iter().map(session_json).collect::<Vec<_>>();
+        let items = sessions
+            .iter()
+            .map(|session| {
+                let mut item = session_json(session);
+                if multiple_targets {
+                    item["node"] = json!(session.node.as_deref().unwrap_or("local"));
+                }
+                item
+            })
+            .collect::<Vec<_>>();
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -88,11 +138,21 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs, node: Option<Stri
         return Ok(());
     }
 
-    println!(
-        "ID      STATUS    INPUT    OUTPUT       CMD          AGE    PID    CREATE_AT↓            TITLE        ARGS"
-    );
+    if multiple_targets {
+        println!(
+            "NODE         ID      STATUS    INPUT    OUTPUT       CMD          AGE    PID    CREATE_AT↓            TITLE        ARGS"
+        );
+    } else {
+        println!(
+            "ID      STATUS    INPUT    OUTPUT       CMD          AGE    PID    CREATE_AT↓            TITLE        ARGS"
+        );
+    }
 
     for session in sessions {
+        if multiple_targets {
+            let node = truncate_display_value(session.node.as_deref().unwrap_or("local"), 12);
+            print!("{node:<12} ");
+        }
         print_session_row(&session, CMD_WIDTH, INPUT_WIDTH, TITLE_WIDTH, ARGS_WIDTH);
     }
 
@@ -248,7 +308,7 @@ pub fn truncate_display_value(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_list_query, input_required_label, session_json};
+    use super::{build_list_query, input_required_label, list_targets, session_json};
     use crate::{cli::ListArgs, protocol::SessionSummary};
     use chrono::{TimeZone, Utc};
 
@@ -263,7 +323,8 @@ mod tests {
             since: None,
             until: None,
             limit: 25,
-            node: None,
+            node: vec![],
+            node_local: false,
         };
 
         let query = build_list_query(&args).expect("query should build");
@@ -272,6 +333,28 @@ mod tests {
         assert_eq!(query.tags, vec!["prod".to_string(), "release".to_string()]);
         assert_eq!(query.limit, 25);
         assert!(query.statuses.is_empty());
+    }
+
+    #[test]
+    fn list_targets_support_local_and_deduplicate_nodes() {
+        let args = ListArgs {
+            search: None,
+            tags: vec![],
+            json: false,
+            follow: true,
+            status: vec![],
+            since: None,
+            until: None,
+            limit: 100,
+            node: vec!["worker-a".into(), "worker-b".into(), "worker-a".into()],
+            node_local: true,
+        };
+
+        let targets = list_targets(&args);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].node, None);
+        assert_eq!(targets[1].node.as_deref(), Some("worker-a"));
+        assert_eq!(targets[2].node.as_deref(), Some("worker-b"));
     }
 
     #[test]
