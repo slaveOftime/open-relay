@@ -2444,6 +2444,7 @@ fn truncate(value: &str, width: usize) -> String {
     result
 }
 
+#[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WindowRect {
     x: i32,
@@ -2452,6 +2453,7 @@ struct WindowRect {
     height: u32,
 }
 
+#[cfg(any(windows, test))]
 fn arrange_window(
     work: WindowRect,
     anchor: WindowRect,
