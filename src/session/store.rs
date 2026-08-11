@@ -40,6 +40,10 @@ const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']];
 const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
 const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A PTY echoes back almost everything the user types, so output landing this
+/// soon after a keystroke is attributed to that keystroke instead of to the
+/// program. Anything later than this is considered self-driven program output.
+const INPUT_ECHO_WINDOW: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
 const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(3_000);
 #[cfg(test)]
@@ -1096,31 +1100,44 @@ impl SessionStore {
                 // a session is notified it will not be re-notified unless real
                 // output eventually arrives and advances the epoch.
                 let last_output = rt.effective_output_epoch();
-                let pending_input = rt
-                    .last_input_at
-                    .filter(|last_input| *last_input > last_output);
-                let silence_epoch = pending_input.unwrap_or(last_output);
+                let last_input = rt.last_input_at;
 
-                // Anchor silence to pending user input when the PTY has not
-                // produced output afterward. This avoids treating an old output
-                // epoch as an already-expired timer while the user is still
-                // composing input.
+                // Silence is measured from the newest activity of any kind, so a
+                // user who is still typing never looks "silent" and an old output
+                // epoch is never treated as an already-expired timer.
+                let silence_epoch = last_input.map_or(last_output, |input| input.max(last_output));
+
                 if now.duration_since(silence_epoch) < attach_suppression_window {
                     trace!("silent because of recent input or output activity");
                     return None;
                 }
 
+                // A PTY echoes back what the user types, so output that lands
+                // within `INPUT_ECHO_WINDOW` of a keystroke is almost certainly
+                // that echo rather than the program asking for attention. The
+                // same is true when nothing came back at all (echo is off, e.g.
+                // a password prompt): the user is mid-input either way.
+                //
+                // Once the gap grows beyond the echo window the program clearly
+                // produced something on its own and then went quiet, which is
+                // exactly the "waiting for you" state worth notifying about.
+                let input_driven = match last_input {
+                    Some(last_input) if last_output <= last_input => true,
+                    Some(last_input) => last_output.duration_since(last_input) <= INPUT_ECHO_WINDOW,
+                    None => false,
+                };
+                let should_notify = !input_driven;
+
                 // Suppress rapid repeat notifications. `last_notified_at` is
                 // normally later than `last_output`, so compare it with `now`;
                 // subtracting it from the output epoch can underflow and kill
                 // the notification monitor task.
-                if pending_input.is_none()
+                if should_notify
                     && let Some(last_notified_at) = rt.last_notified_at
+                    && now.duration_since(last_notified_at) < min_notification_interval
                 {
-                    if now.duration_since(last_notified_at) < min_notification_interval {
-                        trace!("silent because notification was sent recently");
-                        return None;
-                    }
+                    trace!("silent because notification was sent recently");
+                    return None;
                 }
 
                 if rt.notified_output_epoch == Some(last_output) {
@@ -1134,6 +1151,7 @@ impl SessionStore {
                     last_attach_activity_at = ?rt.last_attach_activity_at,
                     last_output_epoch = ?rt.last_output_epoch,
                     last_notified_at = ?rt.last_notified_at,
+                    input_driven,
                     "silent candidate ready"
                 );
 
@@ -1147,7 +1165,7 @@ impl SessionStore {
                     excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
                     output_epoch: last_output,
                     silence_epoch,
-                    should_notify: pending_input.is_none(),
+                    should_notify,
                     enabled_for_channels: rt.notifications_enabled,
                     last_total_bytes: rt.last_total_bytes,
                 })
@@ -1423,6 +1441,140 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert!(!candidates[0].should_notify);
         assert_eq!(candidates[0].silence_epoch, input_at);
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_echoed_input_does_not_notify() {
+        // The PTY echoed the keystroke back almost immediately, so the output
+        // only shows the user what they typed. Even once the silence window
+        // elapses this must not push a notification — the user is simply
+        // pausing while composing input.
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ls",
+            Some(Duration::from_millis(29_600)),
+        );
+        let input_at = Instant::now() - Duration::from_secs(30);
+        rt.write().last_input_at = Some(input_at);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            !candidates[0].should_notify,
+            "output within the echo window of user input must not notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_output_long_after_input_notifies() {
+        // The program kept printing well past the echo window and then went
+        // quiet, which means it produced something on its own and is now
+        // waiting for the user — worth a notification.
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "Do you want to proceed? (y/n)",
+            Some(Duration::from_secs(10)),
+        );
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(60));
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].should_notify,
+            "output produced well after the input echo window should notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_notify_after_echo_suppressed_cycle() {
+        // Echo suppression must not blackhole later notifications: once the
+        // program itself prints something well after the user's keystroke, the
+        // session becomes notify-worthy again even though the previous cycle
+        // only flagged "input required".
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ls",
+            Some(Duration::from_millis(29_600)),
+        );
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(30));
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+
+        let first = store.silent_candidates(suppression_window, min_interval);
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].should_notify);
+        store.mark_input_required("abc1234", first[0].output_epoch);
+
+        // Same epoch → nothing new to report.
+        assert!(
+            store
+                .silent_candidates(suppression_window, min_interval)
+                .is_empty()
+        );
+
+        // The program prints on its own and then goes quiet.
+        rt.write().last_output_epoch = Some(Instant::now() - Duration::from_secs(6));
+
+        let second = store.silent_candidates(suppression_window, min_interval);
+        assert_eq!(second.len(), 1);
+        assert!(
+            second[0].should_notify,
+            "program output after the echo window must re-enable notifications"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_uses_latest_activity_as_silence_anchor() {
+        // Output arrived after the input, so silence must be measured from the
+        // output rather than the older input timestamp.
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(10)),
+        );
+        let output_at = rt.read().effective_output_epoch();
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(60));
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].silence_epoch, output_at);
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_recent_echo_output_suppressed_by_window() {
+        // Fresh echo output keeps the session out of the candidate list while
+        // the user is actively typing.
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> l",
+            Some(Duration::from_millis(200)),
+        );
+        rt.write().last_input_at = Some(Instant::now() - Duration::from_millis(300));
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]

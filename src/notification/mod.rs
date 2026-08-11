@@ -20,9 +20,10 @@ use crate::{
 
 /// Periodically checks all running sessions for silence and emits local OS
 /// notifications once per output epoch. Silence alone is sufficient to
-/// trigger a notification unless the latest activity is unacknowledged user
-/// input. Prompt patterns are used to pick a better body line but do **not**
-/// gate delivery.
+/// trigger a notification unless the session's latest output is merely the
+/// PTY echoing what the user just typed, in which case the user is still
+/// composing input and only the "input required" flag is updated. Prompt
+/// patterns are used to pick a better body line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
     notifier: Arc<Notifier>,
     session_store: Arc<SessionStore>,
@@ -71,7 +72,7 @@ pub(super) async fn run_notification_monitor(
                 }
                 debug!(
                     session_id,
-                    "marking input required without notification after paused user input"
+                    "marking input required without notification because the session is only echoing user input"
                 );
                 session_store.mark_input_required(&session_id, output_epoch);
                 continue;
