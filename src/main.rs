@@ -24,9 +24,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::AppConfig;
 
+#[cfg(not(windows))]
 use libmimalloc_sys::{mi_option_set_default, mi_option_set_enabled_default};
+#[cfg(not(windows))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -47,6 +50,10 @@ async fn main() {
     std::process::exit(code);
 }
 
+#[cfg(windows)]
+fn configure_mimalloc_defaults() {}
+
+#[cfg(not(windows))]
 fn configure_mimalloc_defaults() {
     // libmimalloc-sys does not expose the newer v3 purge constants as stable
     // Rust constants, so use the documented enum values from mimalloc.h.

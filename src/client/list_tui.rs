@@ -1,20 +1,21 @@
 use std::{
+    any::Any,
     collections::{HashMap, HashSet, VecDeque},
     io::{self, IsTerminal, Write},
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{
-        ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{ClearType, EnterAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -41,12 +42,15 @@ use crate::{
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const REDRAW_INTERVAL: Duration = Duration::from_millis(250);
 const RATE_HISTORY_LEN: usize = 30;
 const COMPACT_SPARKLINE_WIDTH: usize = 3;
 const SPARKLINE_WIDTH: usize = 5;
 const STOP_GRACE_SECONDS: u64 = 15;
 const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const TUI_RESTORE_BYTES: &[u8] = b"\x1b[?1049l\x1b[?2026l\x1b[0m\x1b[?25h\x1b[0 q\
+    \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
 const CLONE_DIALOG_HELP: &str =
     " Quotes keep spaces · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
 const UPDATE_DIALOG_HELP: &str =
@@ -71,11 +75,26 @@ pub(super) async fn run(
     args: &ListArgs,
     targets: Vec<ListTarget>,
 ) -> Result<()> {
+    match AssertUnwindSafe(run_inner(config, args, targets))
+        .catch_unwind()
+        .await
+    {
+        Ok(result) => result,
+        Err(payload) => Err(AppError::Protocol(format!(
+            "interactive session list crashed: {}",
+            panic_payload_message(payload.as_ref())
+        ))),
+    }
+}
+
+async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::Protocol(
             "--follow requires an interactive terminal".to_string(),
         ));
     }
+    #[cfg(windows)]
+    native_crash::install();
 
     let query = super::list::build_list_query(args)?;
     let mut app = App::default();
@@ -85,23 +104,32 @@ pub(super) async fn run(
     app.replace_sessions(refresh.sessions);
     let mut terminal = TuiTerminal::new()?;
     let mut last_refresh = Instant::now();
+    let mut last_draw = Instant::now();
+    let mut redraw = true;
 
     loop {
-        terminal.draw(|frame| render(frame, &mut app))?;
-        if let Some(event) = read_terminal_event(FRAME_INTERVAL)?
-            && let Event::Key(key) = event
-            && key.kind != KeyEventKind::Release
-        {
-            match route_key(&mut app, key, None) {
-                AppAction::None => {}
-                AppAction::Quit => break,
-                AppAction::OpenInline => open_selected_inline(&mut terminal, &mut app, None)?,
-                AppAction::Start(launch) => {
-                    start_clone(config, &mut terminal, &mut app, launch).await?
+        if redraw || last_draw.elapsed() >= REDRAW_INTERVAL {
+            terminal.draw(|frame| render(frame, &mut app))?;
+            last_draw = Instant::now();
+            redraw = false;
+        }
+
+        match read_terminal_event(INPUT_POLL_INTERVAL)? {
+            Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
+                match route_key(&mut app, key, None) {
+                    AppAction::None => {}
+                    AppAction::Quit => break,
+                    AppAction::OpenInline => open_selected_inline(&mut terminal, &mut app, None)?,
+                    AppAction::Start(launch) => {
+                        start_clone(config, &mut terminal, &mut app, launch).await?
+                    }
+                    AppAction::Update(update) => update_session(config, &mut app, update).await,
+                    AppAction::Stop(target) => stop_session(config, &mut app, target),
                 }
-                AppAction::Update(update) => update_session(config, &mut app, update).await,
-                AppAction::Stop(target) => stop_session(config, &mut app, target),
+                redraw = true;
             }
+            Some(Event::Resize(_, _)) => redraw = true,
+            _ => {}
         }
 
         if last_refresh.elapsed() >= REFRESH_INTERVAL {
@@ -124,10 +152,22 @@ pub(super) async fn run(
                 Err(error) => app.message = Some(format!("sync lost: {error}")),
             }
             last_refresh = Instant::now();
+            redraw = true;
         }
     }
 
+    terminal.teardown()?;
     Ok(())
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn read_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
@@ -1508,22 +1548,33 @@ fn wait_for_ctrl_d() -> Result<()> {
 
 struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    cleaned_up: bool,
 }
 
 impl TuiTerminal {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
+        #[cfg(windows)]
+        native_crash::set_tui_active(true);
         let mut stdout = io::stdout();
         if let Err(error) = execute!(stdout, EnterAlternateScreen) {
             let _ = disable_raw_mode();
+            let _ = restore_tui_state(&mut stdout);
+            #[cfg(windows)]
+            native_crash::set_tui_active(false);
             return Err(error.into());
         }
         match Terminal::new(CrosstermBackend::new(stdout)) {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => Ok(Self {
+                terminal,
+                cleaned_up: false,
+            }),
             Err(error) => {
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
+                let _ = restore_tui_state(&mut stdout);
+                #[cfg(windows)]
+                native_crash::set_tui_active(false);
                 Err(error.into())
             }
         }
@@ -1560,13 +1611,125 @@ impl TuiTerminal {
         self.terminal.clear()?;
         Ok(())
     }
+
+    fn teardown(&mut self) -> Result<()> {
+        if self.cleaned_up {
+            return Ok(());
+        }
+
+        let mut first_error = disable_raw_mode().err();
+        if let Err(error) = restore_tui_state(self.terminal.backend_mut())
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        #[cfg(windows)]
+        native_crash::set_tui_active(false);
+        self.cleaned_up = true;
+
+        if let Some(error) = first_error {
+            Err(error.into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for TuiTerminal {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
+        let _ = self.teardown();
+    }
+}
+
+fn restore_tui_state(writer: &mut impl Write) -> io::Result<()> {
+    writer.write_all(TUI_RESTORE_BYTES)?;
+    writer.flush()
+}
+
+#[cfg(windows)]
+mod native_crash {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows_sys::Win32::{
+        Storage::FileSystem::WriteFile,
+        System::{
+            Console::{GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE},
+            Diagnostics::Debug::{
+                EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, SetUnhandledExceptionFilter,
+            },
+        },
+    };
+
+    use super::TUI_RESTORE_BYTES;
+
+    static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static CRASH_REPORTED: AtomicBool = AtomicBool::new(false);
+
+    /// Restore the terminal just before the process dies from a fatal exception.
+    ///
+    /// Only the top-level unhandled-exception filter is used: unlike a vectored
+    /// handler it runs solely for genuinely unhandled exceptions, so handled
+    /// first-chance exceptions raised by normal Windows code cannot tear down
+    /// the live TUI by mistake.
+    pub(super) fn install() {
+        unsafe {
+            SetUnhandledExceptionFilter(Some(handle_unhandled_exception));
+        }
+    }
+
+    pub(super) fn set_tui_active(active: bool) {
+        if active {
+            CRASH_REPORTED.store(false, Ordering::SeqCst);
+        }
+        TUI_ACTIVE.store(active, Ordering::SeqCst);
+    }
+
+    unsafe extern "system" fn handle_unhandled_exception(info: *const EXCEPTION_POINTERS) -> i32 {
+        unsafe { report_crash(info) };
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe fn report_crash(info: *const EXCEPTION_POINTERS) {
+        if TUI_ACTIVE.load(Ordering::SeqCst) && !CRASH_REPORTED.swap(true, Ordering::SeqCst) {
+            unsafe {
+                write_handle(STD_OUTPUT_HANDLE, TUI_RESTORE_BYTES);
+                write_handle(STD_ERROR_HANDLE, native_crash_message(info));
+            }
+        }
+    }
+
+    unsafe fn native_crash_message(info: *const EXCEPTION_POINTERS) -> &'static [u8] {
+        let code = unsafe {
+            if info.is_null() || (*info).ExceptionRecord.is_null() {
+                0
+            } else {
+                (*(*info).ExceptionRecord).ExceptionCode as u32
+            }
+        };
+        match code {
+            0xC0000005 => {
+                b"\r\nerror: interactive session list crashed: STATUS_ACCESS_VIOLATION\r\n"
+            }
+            0xC00000FD => b"\r\nerror: interactive session list crashed: STATUS_STACK_OVERFLOW\r\n",
+            0xC0000374 => {
+                b"\r\nerror: interactive session list crashed: STATUS_HEAP_CORRUPTION\r\n"
+            }
+            _ => b"\r\nerror: interactive session list crashed: native exception\r\n",
+        }
+    }
+
+    unsafe fn write_handle(handle_kind: STD_HANDLE, bytes: &[u8]) {
+        let handle = unsafe { GetStdHandle(handle_kind) };
+        let mut written = 0;
+        let _ = unsafe {
+            WriteFile(
+                handle,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
     }
 }
 
@@ -2731,7 +2894,10 @@ fn shell_quote(value: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AppAction, CloneField, CloneLaunch, WindowRect, arrange_window, route_key};
+    use super::{
+        App, AppAction, CloneField, CloneLaunch, TUI_RESTORE_BYTES, WindowRect, arrange_window,
+        panic_payload_message, restore_tui_state, route_key,
+    };
     use crate::{
         error::AppError,
         protocol::{RpcRequest, RpcResponse, SessionSummary},
@@ -3929,5 +4095,41 @@ mod tests {
         assert_eq!(rate.display_rate(now), 0.0);
         rate.sample(&summary, now);
         assert_eq!(rate.display_rate(now), 0.0);
+    }
+
+    #[test]
+    fn panic_payload_message_preserves_useful_details() {
+        let borrowed: Box<dyn std::any::Any + Send> = Box::new("render failed");
+        let owned: Box<dyn std::any::Any + Send> = Box::new("terminal failed".to_string());
+        let unknown: Box<dyn std::any::Any + Send> = Box::new(42_u32);
+
+        assert_eq!(panic_payload_message(borrowed.as_ref()), "render failed");
+        assert_eq!(panic_payload_message(owned.as_ref()), "terminal failed");
+        assert_eq!(
+            panic_payload_message(unknown.as_ref()),
+            "<non-string panic payload>"
+        );
+    }
+
+    #[test]
+    fn terminal_restore_is_complete_and_flushed() {
+        let mut output = Vec::new();
+
+        restore_tui_state(&mut output).unwrap();
+
+        assert_eq!(output, TUI_RESTORE_BYTES);
+        for sequence in [
+            b"\x1b[?1049l".as_slice(),
+            b"\x1b[?2026l".as_slice(),
+            b"\x1b[0m".as_slice(),
+            b"\x1b[?25h".as_slice(),
+            b"\x1b[?2004l".as_slice(),
+        ] {
+            assert!(
+                output
+                    .windows(sequence.len())
+                    .any(|window| window == sequence)
+            );
+        }
     }
 }
