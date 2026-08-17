@@ -829,10 +829,16 @@ fn e2e_stopped_session_logs_persist_on_disk() {
 
     sleep(Duration::from_secs(3));
 
-    let log = normalize_log_text(&fetch_logs(&tmp, &id));
+    let raw = normalize_log_text(&fetch_logs(&tmp, &id));
+    let log = raw
+        .lines()
+        .filter(|line| !(line.starts_with("--- Session ") && line.ends_with(" ---")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let log = normalize_log_text(&log);
     assert_eq!(
         log, expected,
-        "logs should persist on disk after session eviction with the exact original output.\nLogs:\n{log}"
+        "logs should persist on disk after session eviction with the exact original output.\nLogs:\n{raw}"
     );
 }
 

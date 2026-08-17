@@ -26,11 +26,12 @@ so there is no response.  The child application blocks indefinitely waiting for
 the reply.
 
 **Root cause**: The PTY output path was transparent — it forwarded bytes to the
-ring buffer but never synthesized terminal responses.
+canonical stream but never synthesized terminal responses.
 
-**Fix**: `extract_query_responses_no_client()` in `src/session/pty.rs`
-intercepts these queries and writes a synthetic response to the master fd
-before the bytes reach the filtered ring buffer:
+**Fix**: `PtyScanner` in `src/session/scan.rs` reports these probes as
+`TerminalQuery` values and the PTY reader
+writes a synthetic response to the child's standard input
+while stripping the probe from the canonical stream:
 - Reads `$COLORFGBG` environment variable if set (common in color-aware
   terminals).
 - Falls back to white foreground (`rgb:ffff/ffff/ffff`) and black background
@@ -74,14 +75,14 @@ initial display.
 **Root cause**: Resize and initial data were not sequenced — the client
 optimistically sent resize as soon as the IPC connection opened.
 
-**Fix**: The `AttachStreamInit` frame carries `initial_data` (the full ring
+**Fix**: The `AttachStreamInit` frame carries `initial_data` (the screen snapshot or log
 replay).  The client writes this replay to the terminal **before** sending
 `AttachResize`.  The daemon applies the resize only when it processes the
 `AttachResize` message, guaranteeing the replay is already consumed
 client-side.
 
 **Affected files**: `src/client/attach.rs` (send resize after parsing init),
-`src/daemon/rpc.rs` (emit `AttachStreamInit` with ring data).
+`src/daemon/rpc_attach.rs` (emit `AttachStreamInit` with the replay data).
 
 ---
 
@@ -134,10 +135,11 @@ These bare sequences pollute the output stream visible to clients.
 **Root cause**: ConPTY implementation quirk — it echoes the response to the
 master before the child consumes it.
 
-**Fix**: `EscapeFilter` in `src/session/pty.rs` strips these bare CPR sequences
+**Fix**: `PtyScanner` in `src/session/scan.rs` strips these bare CPR sequences
 in the PTY reader before they reach the canonical retained stream.
 
-**Source**: `src/session/pty.rs` — `EscapeFilter`.
+**Source**: `src/session/scan.rs` — `bare_csi`, gated on `BARE_CONPTY_FORMS`
+(Windows only: on Unix the same bytes are ordinary program output).
 
 ---
 
@@ -150,34 +152,39 @@ creating feedback loops.  Other OSC sequences may similarly be echoed.
 
 **Root cause**: Echo pass-through from terminal emulator to PTY master.
 
-**Fix**: `EscapeFilter` strips generic OSC sequences (BEL-terminated and
+**Fix**: `PtyScanner` strips non-allowlisted OSC sequences (BEL-terminated and
 ST-terminated) in the PTY reader before they are retained or broadcast.
 
-**Source**: `src/session/pty.rs`.
+**Source**: `src/session/scan.rs` — `osc`, `is_passthrough_osc`.
 
 ---
 
 ### EC-8: Partial Escape Sequences Across `read()` Boundaries
 
-**Problem**: The PTY reader thread reads 4 KB chunks.  An escape sequence
-(e.g., an OSC string or a multi-byte CPR response) can be split across two
-consecutive `read()` calls.  Naive per-chunk processing would fail to recognize
-the split sequence.
+**Problem**: The PTY reader thread reads in fixed-size chunks (64 KiB).  An
+escape sequence — an OSC string, a multi-byte CPR response — can be split across
+two consecutive `read()` calls.  Naive per-chunk processing would fail to
+recognize the split sequence.
 
-**Root cause**: POSIX `read()` on PTY master provides no framing — sequences
+**Root cause**: POSIX `read()` on a PTY master provides no framing — sequences
 can span arbitrary chunk boundaries.
 
-**Fix**: Two carry-forward buffers:
-- `query_tail: Vec<u8>` in the reader loop — carries the tail of a chunk that
-  might be the start of a query sequence.
-- `EscapeFilter.pending: Vec<u8>` in `src/session/pty.rs` — carries incomplete
-  escape sequences across calls to `filter()`.
+**Fix**: A single carry-forward buffer, `PtyScanner.pending`, holds the trailing
+bytes of a chunk that form an incomplete sequence and prepends them to the next
+chunk.  Because filtering, probe extraction, signal recording and activity
+accounting all happen in that one scanner pass, there is exactly one place that
+has to get the split right — the previous design needed two independent
+carry-forward buffers kept in sync (`query_tail` and `EscapeFilter.pending`).
 
-Both are reset when the sequence is completed or proven not to be an escape
-sequence.
+The buffer is capped at `MAX_PENDING_ESCAPE_BYTES` (4 KiB) so plain text that
+merely looks like the start of a sequence cannot stall the stream, and it is
+cleared as soon as the sequence completes or is proven not to be one.
 
-**Source**: `src/session/pty.rs` — `EscapeFilter`; `src/session/runtime.rs` —
-`query_tail`.
+The invariant is enforced by `chunking_does_not_change_the_result`, which
+re-scans the same input at every chunk size from 1 byte upward and asserts the
+filtered output is byte-identical.
+
+**Source**: `src/session/scan.rs` — `PtyScanner::scan`.
 
 ---
 
@@ -282,8 +289,8 @@ terminal (Windows).
 ### Escape Sequence Fragmentation
 
 Large bursts of PTY output can send escape sequences across `read()` chunk
-boundaries.  The carry-forward buffers (`query_tail`, `EscapeFilter.pending`)
-handle known sequences, but novel sequences from future terminal capabilities
+boundaries.  The single carry-forward buffer (`PtyScanner.pending`, capped at 4 KiB)
+handles known sequences, but novel sequences from future terminal capabilities
 may not be handled.
 
 ### Multi-Client Input Multiplexing
@@ -293,10 +300,12 @@ multiple clients interleaves at the byte level.  This is correct for automation
 (only one client sends input) but may be confusing for human multi-attach
 scenarios.  There is no UI indication of which client is typing.
 
-### Ring Buffer Overflow
+### Broadcast Lag
 
-If a session emits more than `ring_capacity_bytes` of output before any client
-attaches, early output is lost.  `output.log` always has the full history.
+If a client is slower than the session produces output, its bounded broadcast
+channel lags and the daemon drops the oldest chunks for that subscriber.  The
+client recovers by re-requesting a snapshot; `output.log` always has the full
+history.
 
 ### Federation Latency
 
@@ -325,7 +334,7 @@ targeted files listed below for the exact flow being changed.
 | IPC protocol bug | `src/daemon/rpc.rs`, `src/ipc.rs` |
 | CLI attach behavior | `src/client/attach.rs`, `src/client/input.rs` |
 | Terminal mode tracking | `src/session/runtime.rs` (`push_output`), `src/client/attach.rs` (mode tracking) |
-| Escape sequence handling | `src/session/pty.rs` (`EscapeFilter`, `extract_query_responses_no_client`) |
+| Escape sequence handling | `src/session/scan.rs` (`PtyScanner`, `ScanOut`), `src/session/pty.rs` (`TerminalQuery`, `TerminalSignals`) |
 | API behavior bug | `src/http/*.rs`, `src/db.rs` |
 | Web terminal/UI bug | `web/src/pages/SessionDetailPage.tsx`, `web/src/components/XTerm.tsx` |
 | Key input translation | `web/src/utils/keyInput.ts`, `src/client/attach.rs` |
@@ -341,9 +350,9 @@ targeted files listed below for the exact flow being changed.
 
 | Issue | Impact | Mitigation |
 |---|---|---|
-| Echo of device responses | CPR/DSR/OSC responses appear in master output | `EscapeFilter` strips them once in the PTY reader before retention and fan-out |
-| DSR query forwarding | Queries like `\x1b[6n` forwarded to attach clients cause CPR response feedback loop | `EscapeFilter` strips DSR queries in the canonical filtered stream |
-| ESC split across reads | Sequences split at arbitrary byte boundaries | `pending` field in `EscapeFilter` carries fragments |
+| Echo of device responses | CPR/DSR/OSC responses appear in master output | `PtyScanner` strips them once in the PTY reader before retention and fan-out |
+| DSR query forwarding | Queries like `\x1b[6n` forwarded to attach clients cause CPR response feedback loop | `PtyScanner` strips DSR queries from the canonical stream and the reader answers them on the child stdin |
+| ESC split across reads | Sequences split at arbitrary byte boundaries | `PtyScanner.pending` carries fragments across chunks |
 | No SIGWINCH | ConPTY uses `ResizePseudoConsole()` internally | `portable_pty` abstracts this |
 | No SIGCHLD | Child exit detected via `WaitForSingleObject` | `try_wait()` polls periodically |
 | Process group semantics | No `setsid()` / process groups | ConPTY manages child lifetime |
@@ -363,7 +372,7 @@ targeted files listed below for the exact flow being changed.
 ### Encoding Assumptions
 
 - PTY output is treated as raw bytes, not decoded as UTF-8
-- `String::from_utf8_lossy` used only in filter functions that need regex
+- The filter path is pure bytes: no `String::from_utf8_lossy`, no regex
 - JSON framing uses base64 for binary data, preserving all bytes
-- Cross-chunk `pending` buffers in `EscapeFilter` operate on bytes (`Vec<u8>`)
+- The cross-chunk `pending` buffer in `PtyScanner` operates on bytes (`Vec<u8>`)
   so non-UTF-8 PTY output is preserved exactly

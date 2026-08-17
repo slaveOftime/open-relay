@@ -23,6 +23,12 @@ use crate::{
 const PASTE_BURST_WAIT: Duration = Duration::from_millis(30);
 const PASTE_KEY_SUPPRESS_WINDOW: Duration = Duration::from_millis(150);
 
+/// Upper bound on how many bytes of already-queued server output are written
+/// to the terminal in one go. Batching turns a burst of frames into a single
+/// blocking write plus flush; the cap keeps the terminal painting
+/// incrementally rather than freezing on one very large write.
+const MAX_BATCHED_FRAME_BYTES: usize = 1024 * 1024;
+
 struct PendingKeyBurst {
     data: String,
     deadline: Instant,
@@ -440,35 +446,71 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     stream_error = Some(err);
                     break;
                 }
-                Ok(Some(Ok(response))) => match response {
-                    RpcResponse::AttachStreamChunk { data, .. } => {
+                Ok(Some(Ok(response))) => {
+                    // Drain every frame the daemon has already queued and
+                    // concatenate the output chunks into one buffer. A burst of
+                    // output (an echoed paste, a full-screen redraw) otherwise
+                    // costs one blocking write plus one flush of the unbuffered
+                    // stdout handle per frame, which is what makes a large
+                    // paste visibly crawl across the screen.
+                    let mut batch = Vec::new();
+                    let mut response = Some(response);
+                    loop {
+                        let Some(current) = response.take() else {
+                            break;
+                        };
+                        match current {
+                            RpcResponse::AttachStreamChunk { data, .. } => {
+                                if batch.is_empty() {
+                                    batch = data;
+                                } else {
+                                    batch.extend_from_slice(&data);
+                                }
+                            }
+                            RpcResponse::AttachModeChanged {
+                                app_cursor_keys,
+                                bracketed_paste_mode,
+                            } => {
+                                child_app_cursor_keys = app_cursor_keys;
+                                child_bracketed_paste_mode = bracketed_paste_mode;
+                            }
+                            RpcResponse::AttachResized { rows: _, cols: _ } => {
+                                // Another client resized the PTY.  We cannot
+                                // programmatically resize the terminal window (only the
+                                // screen buffer on Windows, which corrupts the display).
+                                // Instead, update last_sent_size to the actual terminal
+                                // size so that the dedup guard in Event::Resize prevents
+                                // echoing our unchanged dimensions back to the server.
+                                let (actual_cols, actual_rows) =
+                                    terminal::size().unwrap_or((80, 24));
+                                last_sent_size = (actual_cols, actual_rows);
+                            }
+                            RpcResponse::AttachStreamDone { .. } => {
+                                running = false;
+                            }
+                            _ => {}
+                        }
+
+                        if !running || batch.len() >= MAX_BATCHED_FRAME_BYTES {
+                            break;
+                        }
+                        match frame_rx.try_recv() {
+                            Ok(Ok(next)) => response = Some(next),
+                            Ok(Err(err)) => {
+                                stream_error = Some(err);
+                                running = false;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    if !batch.is_empty() {
                         #[cfg(windows)]
-                        write_bytes_to_stdout(&renderer.render_chunk(&data))?;
+                        write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
                         #[cfg(not(windows))]
-                        write_bytes_to_stdout(&data)?;
+                        write_bytes_to_stdout(&batch)?;
                     }
-                    RpcResponse::AttachModeChanged {
-                        app_cursor_keys,
-                        bracketed_paste_mode,
-                    } => {
-                        child_app_cursor_keys = app_cursor_keys;
-                        child_bracketed_paste_mode = bracketed_paste_mode;
-                    }
-                    RpcResponse::AttachResized { rows: _, cols: _ } => {
-                        // Another client resized the PTY.  We cannot
-                        // programmatically resize the terminal window (only the
-                        // screen buffer on Windows, which corrupts the display).
-                        // Instead, update last_sent_size to the actual terminal
-                        // size so that the dedup guard in Event::Resize prevents
-                        // echoing our unchanged dimensions back to the server.
-                        let (actual_cols, actual_rows) = terminal::size().unwrap_or((80, 24));
-                        last_sent_size = (actual_cols, actual_rows);
-                    }
-                    RpcResponse::AttachStreamDone { .. } => {
-                        running = false;
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 

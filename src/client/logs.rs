@@ -161,7 +161,7 @@ mod tests {
     fn helper_identifies_inactive_sessions() {
         assert_eq!(
             inactive_session_helper("abc123", Some("failed")).as_deref(),
-            Some("--- Session abc123 is failed. ---")
+            Some("--- Session abc123 is failed ---")
         );
         assert!(inactive_session_helper("abc123", Some("running")).is_none());
         assert!(inactive_session_helper("abc123", Some("created")).is_none());

@@ -94,6 +94,11 @@ const WS_FRAME_PONG: u8 = 7;
 const WS_FLAG_APP_CURSOR_KEYS: u8 = 1 << 0;
 const WS_FLAG_BRACKETED_PASTE_MODE: u8 = 1 << 1;
 
+/// Upper bound on how much already-queued PTY output one WebSocket data frame
+/// carries. Batching keeps a burst of output to one send instead of one per
+/// reader chunk, while the cap keeps the browser painting incrementally.
+const MAX_COALESCED_CHUNK_BYTES: usize = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -300,6 +305,9 @@ async fn handle_ws_streaming(
         app_cursor_keys,
         bracketed_paste_mode,
     };
+    // Held for the lifetime of the stream so mode changes can be detected with
+    // a relaxed atomic load per chunk instead of a session read lock.
+    let shared_modes = state.store.shared_modes(&id);
 
     let mut current_offset = end_offset;
     let mut completion_check = tokio::time::interval(Duration::from_millis(200));
@@ -353,26 +361,42 @@ async fn handle_ws_streaming(
             // PTY output from broadcast channel.
             chunk = broadcast_rx.recv() => {
                 match chunk {
-                    Ok(filtered_arc) => {
-                        if !filtered_arc.is_empty() {
-                            let msg = ServerMessage::Data {
-                                data: filtered_arc.to_vec(),
+                    Ok(mut filtered) => {
+                        // Coalesce every chunk the reader has already produced
+                        // into one WebSocket frame, so a burst of output costs
+                        // one send instead of one per 64 KiB read.
+                        let mut coalesced: Option<Vec<u8>> = None;
+                        while coalesced.as_ref().map_or(filtered.len(), Vec::len)
+                            < MAX_COALESCED_CHUNK_BYTES
+                        {
+                            let Ok(next) = broadcast_rx.try_recv() else {
+                                break;
                             };
+                            let buffer = coalesced
+                                .get_or_insert_with(|| filtered.as_ref().to_vec());
+                            buffer.extend_from_slice(&next);
+                        }
+                        let batch_len = coalesced.as_ref().map_or(filtered.len(), Vec::len);
+
+                        if batch_len > 0 {
+                            let data = coalesced
+                                .unwrap_or_else(|| std::mem::take(&mut filtered).into());
+                            let msg = ServerMessage::Data { data };
                             if !send_server_message(&mut socket, &msg).await {
                                 let _ = state.store.attach_detach(&id).await;
                                 return;
                             }
                         }
-                        current_offset += filtered_arc.len() as u64;
+                        current_offset += batch_len as u64;
                         trace!(
                             session_id = %id,
-                            filtered_bytes = filtered_arc.len(),
+                            filtered_bytes = batch_len,
                             current_offset,
                             "forwarded live PTY output over local WebSocket"
                         );
 
                         // Check for mode changes.
-                        let current_modes = state.store.get_mode_snapshot(&id);
+                        let current_modes = shared_modes.as_ref().map(|shared| shared.load());
                         if let Some(modes) = current_modes {
                             if modes != last_modes {
                                 debug!(

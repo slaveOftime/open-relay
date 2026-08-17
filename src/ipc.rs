@@ -220,18 +220,25 @@ pub async fn read_request_from_reader(
     Ok(envelope.payload)
 }
 
+/// Serialise one envelope into a newline-terminated frame.
+///
+/// Building the whole frame in memory first means one `write_all` per frame
+/// instead of separate payload/newline writes. On the streaming attach path
+/// that halves the syscalls per chunk of PTY output.
+fn encode_frame<T: serde::Serialize>(version: u16, payload: T) -> Result<Vec<u8>> {
+    let envelope = RpcEnvelope { version, payload };
+    let mut frame = serde_json::to_vec(&envelope)?;
+    frame.push(b'\n');
+    Ok(frame)
+}
+
 /// Write a single `RpcResponse` to the write-half of a split stream.
 pub async fn write_response_to_writer(
     writer: &mut WriteHalf<Stream>,
     payload: RpcResponse,
 ) -> Result<()> {
-    let envelope = RpcEnvelope {
-        version: PROTOCOL_VERSION,
-        payload,
-    };
-    let message = serde_json::to_string(&envelope)?;
-    writer.write_all(message.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    let frame = encode_frame(PROTOCOL_VERSION, payload)?;
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -269,13 +276,8 @@ pub async fn write_request_to_writer(
     writer: &mut WriteHalf<Stream>,
     payload: RpcRequest,
 ) -> Result<()> {
-    let envelope = RpcEnvelope {
-        version: PROTOCOL_VERSION,
-        payload,
-    };
-    let message = serde_json::to_string(&envelope)?;
-    writer.write_all(message.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    let frame = encode_frame(PROTOCOL_VERSION, payload)?;
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }

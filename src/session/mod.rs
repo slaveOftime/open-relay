@@ -4,6 +4,7 @@ pub(crate) mod persist;
 pub mod pty;
 pub(crate) mod resize;
 mod runtime;
+pub(crate) mod scan;
 mod store;
 pub(crate) mod vt100;
 
@@ -15,7 +16,7 @@ use tokio::sync::broadcast;
 
 use crate::error::{AppError, Result};
 use crate::protocol::SessionSummary;
-pub(crate) use runtime::ModeSnapshot;
+pub(crate) use runtime::{ModeSnapshot, SharedModes};
 pub use store::SessionStore;
 pub use store::SilentCandidate;
 

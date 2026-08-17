@@ -40,6 +40,7 @@ async-trait = "0.1"
 interprocess = { version = "2.4", features = ["tokio"] }
 portable-pty = "0.9"
 regex = "1"
+memchr = "2"
 notify-rust = "4.14.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

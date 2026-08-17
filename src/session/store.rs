@@ -48,7 +48,13 @@ const INPUT_ECHO_WINDOW: Duration = Duration::from_secs(1);
 const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(3_000);
 #[cfg(test)]
 const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const ATTACH_INPUT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How often `wait_for_change` input polls for the child's response.
+///
+/// This is pure added latency on every keystroke that asks to be acknowledged,
+/// so it is kept well below the threshold at which typing feels laggy. The poll
+/// is a single relaxed read of a counter behind a read lock, so a short
+/// interval costs almost nothing.
+const ATTACH_INPUT_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(4);
 
 type SessionMap = HashMap<String, Arc<SessionHandle>>;
 
@@ -419,10 +425,16 @@ impl SessionStore {
         Ok(summary)
     }
 
-    /// Returns the current terminal mode snapshot for the session, if available.
-    pub fn get_mode_snapshot(&self, id: &str) -> Option<crate::session::ModeSnapshot> {
+    /// Returns the session's lock-free terminal-mode mirror.
+    ///
+    /// Attach relays hold this for the lifetime of the connection so they can
+    /// detect DECCKM/bracketed-paste changes after every output chunk without
+    /// taking the session lock.
+    pub fn shared_modes(&self, id: &str) -> Option<Arc<crate::session::SharedModes>> {
         let sessions = self.sessions.load();
-        sessions.get(id).map(|handle| handle.read().mode_snapshot())
+        sessions
+            .get(id)
+            .map(|handle| Arc::clone(&handle.read().shared_modes))
     }
 
     pub async fn render_live_logs(
@@ -505,7 +517,7 @@ impl SessionStore {
         (
             Vec<(u64, Bytes)>,
             u64,
-            broadcast::Receiver<Arc<Bytes>>,
+            broadcast::Receiver<Bytes>,
             bool,
             bool,
         ),
@@ -552,10 +564,8 @@ impl SessionStore {
     pub async fn attach_snapshot_init(
         &self,
         id: &str,
-    ) -> std::result::Result<
-        (Vec<u8>, u64, broadcast::Receiver<Arc<Bytes>>, bool, bool),
-        SessionError,
-    > {
+    ) -> std::result::Result<(Vec<u8>, u64, broadcast::Receiver<Bytes>, bool, bool), SessionError>
+    {
         let handle = self.lookup_runtime(id).await?;
         let rt = handle.read();
         let snapshot = rt.attach_snapshot_bytes();
@@ -1339,6 +1349,7 @@ mod tests {
             notified_output_epoch: None,
             screen_parser,
             terminal_signals: Default::default(),
+            shared_modes: Default::default(),
             output_closed: false,
             notifications_enabled: true,
         }))
@@ -2270,6 +2281,7 @@ mod tests {
             notified_output_epoch: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
             terminal_signals: Default::default(),
+            shared_modes: Default::default(),
             output_closed: false,
             notifications_enabled: true,
         }));

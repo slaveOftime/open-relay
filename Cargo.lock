@@ -4853,6 +4853,7 @@ dependencies = [
  "image",
  "interprocess",
  "libmimalloc-sys",
+ "memchr",
  "mimalloc",
  "mime_guess",
  "notify-rust",
