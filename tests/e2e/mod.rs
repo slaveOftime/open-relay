@@ -355,6 +355,46 @@ pub fn wait_for_exact_log_with_tail(
     None
 }
 
+/// Remove the `--- Session <id> is <status> ---` trailer `oly logs` appends
+/// for inactive sessions, so transcript comparisons do not depend on whether
+/// the poll raced the daemon noticing the child's exit.
+pub fn strip_session_status_marker(log: &str, id: &str) -> String {
+    let mut normalized = normalize_log_text(log);
+    let marker_prefix = format!("--- Session {id} is ");
+    if normalized
+        .rsplit_once('\n')
+        .is_some_and(|(_, last)| last.starts_with(&marker_prefix) && last.ends_with(" ---"))
+    {
+        normalized.truncate(normalized.rfind('\n').expect("marker has a preceding line"));
+    } else if normalized.starts_with(&marker_prefix) && normalized.ends_with(" ---") {
+        normalized.clear();
+    }
+    normalized
+}
+
+/// Like [`wait_for_exact_log_with_tail`], but tolerant of the session status
+/// trailer. A short-lived command can exit before the first poll lands, and
+/// the exact moment the daemon flips the session to `stopped` is racy, so
+/// tests that only care about transcript content must not depend on it.
+pub fn wait_for_exact_log_with_tail_ignoring_status_marker(
+    tmp: &PathBuf,
+    id: &str,
+    tail: usize,
+    expected: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let expected = normalize_log_text(expected);
+    while Instant::now() < deadline {
+        let log = strip_session_status_marker(&fetch_logs_with_tail(tmp, id, tail), id);
+        if log == expected {
+            return Some(log);
+        }
+        sleep(Duration::from_millis(250));
+    }
+    None
+}
+
 pub fn fetch_logs_node(tmp: &PathBuf, node: &str, id: &str) -> String {
     let output = oly_cmd(tmp)
         .args(["logs", id, "--node", node, "--tail", "200", "--no-truncate"])

@@ -523,6 +523,103 @@ pub(crate) fn is_passthrough_osc(ps: &[u8], payload: &[u8]) -> bool {
     matches!(ps, b"0" | b"1" | b"2") || (ps == b"9" && payload.starts_with(b"4;"))
 }
 
+/// Extract the passthrough Operating System Commands from a canonical
+/// filtered stream.
+///
+/// The Windows attach client repaints from the terminal parser's canonical
+/// screen state, which models neither window titles nor progress indicators;
+/// the sequences carrying those notifications are re-emitted alongside each
+/// repaint so they survive. Streams reaching the client were already
+/// normalised by the daemon's scanner — bare ConPTY forms regained their
+/// `ESC` introducer — so only the well-formed `ESC ]` form is recognised
+/// here.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn extract_passthrough_osc_sequences(data: &[u8]) -> Vec<u8> {
+    let mut forwarded = Vec::new();
+    let mut index = 0usize;
+
+    while let Some(offset) = memchr(0x1b, &data[index..]) {
+        let start = index + offset;
+        index = start + 1;
+        if data.get(start + 1) != Some(&b']') {
+            continue;
+        }
+
+        let ps_start = start + 2;
+        let mut cursor = ps_start;
+        while matches!(data.get(cursor), Some(byte) if byte.is_ascii_digit()) {
+            cursor += 1;
+        }
+        if cursor == ps_start || data.get(cursor) != Some(&b';') {
+            continue;
+        }
+        let ps = &data[ps_start..cursor];
+        let payload_start = cursor + 1;
+        cursor = payload_start;
+
+        let mut bounds: Option<(usize, usize)> = None;
+        loop {
+            match data.get(cursor) {
+                None => break,
+                Some(0x07) => {
+                    bounds = Some((cursor, cursor + 1));
+                    break;
+                }
+                Some(0x1b) => {
+                    if data.get(cursor + 1) == Some(&b'\\') {
+                        bounds = Some((cursor, cursor + 2));
+                    }
+                    break;
+                }
+                Some(_) => cursor += 1,
+            }
+        }
+        let Some((payload_end, end)) = bounds else {
+            continue;
+        };
+
+        if is_passthrough_osc(ps, &data[payload_start..payload_end]) {
+            forwarded.extend_from_slice(&data[start..end]);
+        }
+        index = end;
+    }
+
+    forwarded
+}
+
+/// Parameters of the last cursor-style sequence (`CSI <n> SP q`, DECSCUSR) in
+/// a canonical filtered stream, or `None` when it carries no cursor-shape
+/// change. The terminal parser models neither shape nor blink, so the Windows
+/// attach client re-emits the last one alongside each repaint.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn last_cursor_style_params(data: &[u8]) -> Option<&[u8]> {
+    let mut found: Option<&[u8]> = None;
+    let mut index = 0usize;
+
+    while let Some(offset) = memchr(0x1b, &data[index..]) {
+        let start = index + offset;
+        if data.get(start + 1) != Some(&b'[') {
+            index = start + 1;
+            continue;
+        }
+
+        let params_start = start + 2;
+        let mut cursor = params_start;
+        while matches!(data.get(cursor), Some(byte) if byte.is_ascii_digit()) {
+            cursor += 1;
+        }
+
+        if data.get(cursor) == Some(&b' ') && data.get(cursor + 1) == Some(&b'q') {
+            found = Some(&data[params_start..cursor]);
+            index = cursor + 2;
+        } else {
+            index = params_start;
+        }
+    }
+
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1126,59 @@ mod tests {
 
         harness.filter(&chunk);
         assert!(harness.scanner.take_changed_signals().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Client-side signal extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn passthrough_extraction_keeps_title_and_progress() {
+        let data = b"before\x1b]0;relay build\x07mid\x1b]9;4;3;0\x07after";
+        assert_eq!(
+            extract_passthrough_osc_sequences(data),
+            b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn passthrough_extraction_preserves_string_terminator() {
+        let data = b"\x1b]2;relay\x1b\\tail";
+        assert_eq!(
+            extract_passthrough_osc_sequences(data),
+            b"\x1b]2;relay\x1b\\".to_vec()
+        );
+    }
+
+    #[test]
+    fn passthrough_extraction_skips_other_sequences() {
+        let data = b"plain\x1b[2Jtext\x1b]7;file://host/tmp\x07\x1b]9;hello\x07";
+        assert!(extract_passthrough_osc_sequences(data).is_empty());
+    }
+
+    #[test]
+    fn passthrough_extraction_ignores_unterminated_sequence() {
+        let data = b"\x1b]0;relay build";
+        assert!(extract_passthrough_osc_sequences(data).is_empty());
+    }
+
+    #[test]
+    fn passthrough_extraction_keeps_backslash_payload_intact() {
+        let data = b"\x1b]0;C:\\Users\\me\x07";
+        assert_eq!(
+            extract_passthrough_osc_sequences(data),
+            b"\x1b]0;C:\\Users\\me\x07".to_vec()
+        );
+    }
+
+    #[test]
+    fn cursor_style_params_returns_final_change() {
+        assert_eq!(
+            last_cursor_style_params(b"a\x1b[2 qb\x1b[6 qc"),
+            Some(&b"6"[..])
+        );
+        assert_eq!(last_cursor_style_params(b"\x1b[ q"), Some(&b""[..]));
+        assert_eq!(last_cursor_style_params(b"\x1b[2Jplain\x1b[0m"), None);
     }
 
     // -----------------------------------------------------------------------

@@ -692,7 +692,16 @@ fn e2e_high_bandwidth_output_logs_intact() {
     let id = start_session(&tmp, cmd);
 
     let expected = plain_output((1..=500).map(|i| format!("LINE_{i}")));
-    let result = wait_for_exact_log_with_tail(&tmp, &id, 600, &expected, Duration::from_secs(10));
+    // The command exits almost as soon as it finishes printing, so a poll can
+    // land after the daemon already flipped the session to `stopped`; compare
+    // the transcript content only.
+    let result = wait_for_exact_log_with_tail_ignoring_status_marker(
+        &tmp,
+        &id,
+        600,
+        &expected,
+        Duration::from_secs(10),
+    );
     assert!(
         result.is_some(),
         "high-bandwidth output did not match the exact expected transcript.\nLogs (tail):\n{}",
@@ -703,7 +712,7 @@ fn e2e_high_bandwidth_output_logs_intact() {
         .args(["logs", &id, "--tail", "600", "--no-truncate"])
         .output()
         .expect("`oly logs --tail 600` failed");
-    let full_text = normalize_log_text(&String::from_utf8_lossy(&full_log.stdout));
+    let full_text = strip_session_status_marker(&String::from_utf8_lossy(&full_log.stdout), &id);
     assert_eq!(
         full_text, expected,
         "high-bandwidth --tail 600 output did not match the exact expected transcript.\nLogs:\n{full_text}"
@@ -830,12 +839,7 @@ fn e2e_stopped_session_logs_persist_on_disk() {
     sleep(Duration::from_secs(3));
 
     let raw = normalize_log_text(&fetch_logs(&tmp, &id));
-    let log = raw
-        .lines()
-        .filter(|line| !(line.starts_with("--- Session ") && line.ends_with(" ---")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let log = normalize_log_text(&log);
+    let log = strip_session_status_marker(&raw, &id);
     assert_eq!(
         log, expected,
         "logs should persist on disk after session eviction with the exact original output.\nLogs:\n{raw}"

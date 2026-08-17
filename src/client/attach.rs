@@ -95,8 +95,8 @@ impl AttachRenderer {
 /// so they survive a repaint driven by that state.
 #[cfg(windows)]
 fn passthrough_signals(data: &[u8]) -> Vec<u8> {
-    let mut signals = crate::session::pty::extract_passthrough_osc_sequences(data);
-    if let Some(params) = crate::session::pty::last_cursor_style_params(data) {
+    let mut signals = crate::session::scan::extract_passthrough_osc_sequences(data);
+    if let Some(params) = crate::session::scan::last_cursor_style_params(data) {
         signals.extend_from_slice(b"\x1b[");
         signals.extend_from_slice(params);
         signals.extend_from_slice(b" q");
