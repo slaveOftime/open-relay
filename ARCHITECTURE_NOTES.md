@@ -330,7 +330,7 @@ targeted files listed below for the exact flow being changed.
 
 | Problem area | Files to open |
 |---|---|
-| Session lifecycle bug | `src/session/runtime.rs`, `src/session/store.rs`, `src/daemon/lifecycle.rs` |
+| Session lifecycle bug | `src/session/runtime.rs`, `src/session/store/`, `src/daemon/lifecycle.rs` |
 | IPC protocol bug | `src/daemon/rpc.rs`, `src/ipc.rs` |
 | CLI attach behavior | `src/client/attach.rs`, `src/client/input.rs` |
 | Terminal mode tracking | `src/session/runtime.rs` (`push_output`), `src/client/attach.rs` (mode tracking) |

@@ -85,7 +85,7 @@ impl AttachRenderer {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        crate::session::vt100::safe_resize_parser(&mut self.parser, rows, cols);
+        crate::session::screen::safe_resize_parser(&mut self.parser, rows, cols);
         self.needs_full_repaint = true;
     }
 }

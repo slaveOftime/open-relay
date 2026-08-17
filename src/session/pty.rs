@@ -1,10 +1,8 @@
-// ---------------------------------------------------------------------------
-// PTY ownership plus terminal query/notification types
-//
-// The byte-level scanning that classifies pseudo-terminal output lives in
-// `super::scan`; this module owns the pseudo-terminal itself and the semantic
-// types the scanner produces.
-// ---------------------------------------------------------------------------
+//! PTY ownership plus the terminal query and notification types.
+//!
+//! The byte-level scanning that classifies pseudo-terminal output lives in
+//! [`super::scan`]; this module owns the pseudo-terminal itself and the
+//! semantic types the scanner produces.
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;

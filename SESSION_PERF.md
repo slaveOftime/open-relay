@@ -97,7 +97,7 @@ read(64 KiB) → PtyScanner::scan(&buf[..n], &mut out)
 | Broadcast | `session/runtime.rs` | `Arc<Bytes>` → `Bytes` (already refcounted; the `Arc` was redundant) |
 | Writer queue | `session/runtime.rs` | `PTY_WRITER_QUEUE_CAPACITY` 256 → 4096 |
 | Mode publication | `session/runtime.rs` | New `SharedModes` (`AtomicU8`); attach loops do a relaxed atomic load instead of a `RwLock` read **per chunk**. `get_mode_snapshot()` removed. |
-| Attach poll | `session/store.rs` | `ATTACH_INPUT_OUTPUT_POLL_INTERVAL` 50 ms → 4 ms |
+| Attach poll | `session/store/attach.rs` | `ATTACH_INPUT_OUTPUT_POLL_INTERVAL` 50 ms → 4 ms |
 | Frame coalescing | `daemon/rpc_attach.rs`, `http/ws.rs` | Drain all queued chunks, emit one frame. Cap `MAX_COALESCED_CHUNK_BYTES` = 1 MiB |
 | Client batching | `client/attach.rs` | Drain via `try_recv()`, concatenate, single `write_all` + `flush`. Cap `MAX_BATCHED_FRAME_BYTES` = 1 MiB |
 | IPC framing | `ipc.rs` | New `encode_frame()`: one buffered write + flush instead of three separate awaits |
@@ -136,7 +136,7 @@ Reproduce the end-to-end number with the harness in [§6](#6-reproducing-the-end
   the full length and asserts the filtered output is byte-identical every time. If you
   change the scanner, this test is your safety net — do not weaken it.
 - **Golden fixtures** `output-copilot.expected` and `output-opencode.expected`
-  (driven from `src/session/logs.rs`) pass byte-for-byte, which is the pixel-perfect
+  (driven from `src/session/logs/`) pass byte-for-byte, which is the pixel-perfect
   rendering guarantee.
 - Full suite on Linux: **398/398 unit, 19/19 `e2e_pty`, 9/9 `e2e_daemon`,
   1/1 `e2e_csvlens`, 17/17 `cli_errors`.**
@@ -301,7 +301,7 @@ git stash && cargo build --release && cp target/release/oly /tmp/oly-baseline &&
 | `src/session/pty.rs` | Rewritten. PTY ownership + terminal semantics only: `PtyHandle`, `RuntimeChild`, `TerminalQuery::response()`, `TerminalSignals`, `collect_chunk_bytes`. |
 | `src/session/runtime.rs` | `SharedModes`, `PTY_READ_BUFFER_BYTES`, `PTY_WRITER_QUEUE_CAPACITY`, `push_output`, and the rewritten reader thread (~l. 570–665). |
 | `src/session/persist.rs` | `OutputLog` persistent append handle. `append_output_raw` is now `#[cfg(test)]`. |
-| `src/session/store.rs` | `shared_modes()`, `ATTACH_INPUT_OUTPUT_POLL_INTERVAL`. `get_mode_snapshot()` removed. |
+| `src/session/store/` | `shared_modes()`, `ATTACH_INPUT_OUTPUT_POLL_INTERVAL`. `get_mode_snapshot()` removed. |
 | `src/daemon/rpc_attach.rs`, `src/http/ws.rs` | Attach relays: chunk coalescing + lock-free mode polling. |
 | `src/client/attach.rs` | Client-side frame batching (~l. 440–505). |
 | `src/ipc.rs` | `encode_frame()`. |
@@ -326,8 +326,9 @@ These were deliberate. Changing them without understanding why will reintroduce 
   output. Only the marked variants (`CSI ? u`, `CSI = n u`, …) are probes.
 - **`regex` is still a dependency** — `src/notification/prompt.rs` uses it. It is simply
   no longer anywhere near the PTY hot path.
-- **`SessionRuntime` is constructed literally in test helpers** in `runtime.rs` (~l. 807,
-  ~l. 1150) and `store.rs` (~l. 1347, ~l. 2278). Adding a field breaks all four.
+- **`SessionRuntime` is constructed literally in test helpers** in `runtime.rs` and
+  `store/testsupport.rs`. Adding a field breaks all of them; find them with
+  `grep -rn 'SessionRuntime {' src/`.
 - **Release profile is `opt-level="z"`, `lto="fat"`, `codegen-units=1`** — expect 80–90 s
   builds. Budget for it; do not assume the build hung.
 

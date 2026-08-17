@@ -1,3 +1,9 @@
+//! On-disk session state: the output log, the event log and their offsets.
+//!
+//! A session directory holds `output.log` (the canonical filtered PTY byte
+//! stream), `events.log` (lifecycle and resize records) and the index sidecars
+//! maintained by [`super::logs`].
+
 use crate::error::Result;
 use std::{
     fs,
@@ -5,14 +11,13 @@ use std::{
     path::Path,
 };
 
-pub fn append_output(dir: &Path, chunk: &str) -> Result<()> {
-    let path = dir.join("output.log");
-    let mut file = fs::OpenOptions::new()
+/// Create an empty `output.log` so readers can open it before the child has
+/// produced anything.
+pub fn create_output_log(dir: &Path) -> Result<()> {
+    fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open(path)?;
-    file.write_all(chunk.as_bytes())?;
-    file.flush()?;
+        .open(dir.join("output.log"))?;
     Ok(())
 }
 

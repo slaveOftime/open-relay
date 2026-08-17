@@ -131,11 +131,23 @@ src/session/
 │   ├── SharedModes     Lock-free DECCKM / bracketed-paste mirror
 │   ├── resize_tx       Broadcast channel for resize notifications
 │   └── pty_size        Current PTY dimensions for dedupe
-├── vt100.rs            Screen parser helpers (safe resize, rehydration)
-├── logs.rs             Log rendering and paging over the persisted stream
-├── store.rs            SessionStore (session registry, attach/detach/resize)
+├── screen.rs           Screen parser helpers (safe resize, rehydration)
+├── logs/               Reading back the persisted stream
+│   ├── index.rs        Record boundaries, `output.log.idx` sidecar, pagination
+│   └── render.rs       vt100 replay of log bytes into rendered rows
+├── store/              SessionStore, one file per concern
+│   ├── mod.rs          Shared state, constants, `lookup_runtime()`
+│   ├── lifecycle.rs    start / stop / kill / terminate / evict
+│   ├── query.rs        Read-only observation, metadata edits, live-log reads
+│   ├── attach.rs       attach / detach / input / resize (latency-sensitive)
+│   └── notify.rs       Silence detection for push notifications
+├── file.rs             Uploaded-file storage under `sessions/<id>/files/`
 └── persist.rs          Disk persistence (append-only log + OutputLog handle)
 ```
+
+`store.rs` and `logs.rs` are directories rather than single files purely for
+comprehension: each submodule contributes its own `impl SessionStore` block, so
+`SessionStore` remains one type with one public API.
 
 There is no separate `mode_tracker.rs`, `cursor_tracker.rs` or `ring.rs`.
 Terminal modes and the cursor position are read directly from the `vt100`

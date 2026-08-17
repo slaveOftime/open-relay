@@ -100,10 +100,15 @@ Primary references:
   - `src/session/pty.rs` - PTY ownership (PtyHandle), terminal query/notification types.
   - `src/session/scan.rs` - single-pass PTY output scanner (filter + probes + signals + activity).
   - `src/session/runtime.rs` - SessionRuntime: screen + broadcast + pty + meta + spawn.
-  - `src/session/store.rs` - in-memory registry, attach/detach, input, resize, stop.
-  - `src/session/vt100.rs` - screen parser helpers (safe resize, snapshot rehydration).
-  - `src/session/logs.rs` - log rendering and paging over the persisted stream.
+  - `src/session/store/` - in-memory registry, split by concern: `lifecycle.rs`
+    (start/stop/kill/evict), `query.rs` (read-only observation + metadata),
+    `attach.rs` (attach/detach/input/resize), `notify.rs` (silence detection).
+  - `src/session/screen.rs` - screen parser helpers (safe resize, snapshot rehydration).
+  - `src/session/logs/` - `index.rs` (record boundaries, `output.log.idx`, paging)
+    and `render.rs` (vt100 replay of the persisted stream).
   - `src/session/persist.rs` - append logs/events on disk (`OutputLog` append handle).
+  - `src/session/file.rs` - uploaded-file storage inside a session directory.
+  - `src/session/resize.rs` - resize broadcast helper with self-echo suppression.
   - `src/session/mod.rs` - shared types.
 - **Persistence + storage**
   - `src/db.rs` - SQL access layer (sessions, push subscriptions, API keys).

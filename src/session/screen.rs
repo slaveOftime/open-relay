@@ -1,3 +1,9 @@
+//! Helpers for driving the `vt100` terminal screen parser.
+//!
+//! Deliberately *not* named `vt100`: this module and the crate it wraps would
+//! otherwise share a name, and callers such as [`super::runtime`] refer to both
+//! in the same scope.
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use tracing::warn;

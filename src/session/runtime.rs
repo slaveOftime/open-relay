@@ -1,3 +1,9 @@
+//! One live session: the PTY, its reader/writer threads and the rendered
+//! screen state that attach clients replay from.
+//!
+//! [`SessionRuntime`] is the in-memory half of a session; [`super::store`]
+//! owns the registry of them and [`super::persist`] the on-disk half.
+
 use std::{
     io::{ErrorKind, Read, Write},
     path::PathBuf,
@@ -16,7 +22,7 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, Result},
     protocol::{LogResize, SessionSummary},
-    session::persist::append_output,
+    session::persist::create_output_log,
 };
 
 use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
@@ -25,7 +31,7 @@ use super::scan::{PtyScanner, ScanOut};
 use super::{
     SessionMeta, SessionStatus,
     persist::{OutputLog, append_event, append_resize_event},
-    vt100::safe_resize_parser,
+    screen::safe_resize_parser,
 };
 
 // ---------------------------------------------------------------------------
@@ -496,7 +502,7 @@ pub fn spawn_session(
     let runtime_child = RuntimeChild::Pty(child);
     meta.pid = runtime_child.process_id();
 
-    append_output(&full_dir, "")?;
+    create_output_log(&full_dir)?;
     append_event(&full_dir, "session created")?;
     append_resize_event(&full_dir, 0, rows, cols)?;
 
