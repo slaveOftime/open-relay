@@ -85,7 +85,7 @@ mimalloc = { version = "0.1.48", features = ["v3"] }
 libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Environment", "Win32_System_Kernel", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

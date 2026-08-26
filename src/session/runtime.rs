@@ -5,6 +5,7 @@
 //! owns the registry of them and [`super::persist`] the on-disk half.
 
 use std::{
+    ffi::{OsStr, OsString},
     io::{ErrorKind, Read, Write},
     path::PathBuf,
     sync::Arc,
@@ -457,7 +458,17 @@ pub fn spawn_session(
     );
     std::fs::create_dir_all(&full_dir)?;
 
-    let Ok(cmd) = which::which(&meta.command) else {
+    let spawn_env = load_spawn_environment();
+    let command_cwd = meta
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| full_dir.clone());
+    let search_path = spawn_env
+        .iter()
+        .find(|(key, _)| env_key_eq(key, OsStr::new("PATH")))
+        .map(|(_, value)| value);
+    let Ok(cmd) = which::which_in(&meta.command, search_path, &command_cwd) else {
         return Err(AppError::Protocol(format!(
             "command not found: {}",
             meta.command
@@ -465,6 +476,10 @@ pub fn spawn_session(
     };
 
     let mut cmd = CommandBuilder::new(cmd);
+    cmd.env_clear();
+    for (key, value) in spawn_env {
+        cmd.env(key, value);
+    }
     cmd.args(&meta.args);
     let cwd_fallback = full_dir.to_string_lossy().into_owned();
     cmd.cwd(meta.cwd.as_ref().unwrap_or(&cwd_fallback));
@@ -702,6 +717,109 @@ pub fn spawn_session(
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn load_spawn_environment() -> Vec<(OsString, OsString)> {
+    let inherited = std::env::vars_os().collect::<Vec<_>>();
+
+    #[cfg(windows)]
+    {
+        match load_windows_user_environment() {
+            Ok(refreshed) => merge_spawn_environment(inherited, refreshed),
+            Err(err) => {
+                warn!(%err, "failed to refresh Windows user environment; using daemon environment");
+                inherited
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    inherited
+}
+
+fn merge_spawn_environment(
+    mut inherited: Vec<(OsString, OsString)>,
+    refreshed: Vec<(OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    for (key, value) in refreshed {
+        inherited.retain(|(existing, _)| !env_key_eq(existing, &key));
+        inherited.push((key, value));
+    }
+    inherited
+}
+
+#[cfg(windows)]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn load_windows_user_environment() -> std::io::Result<Vec<(OsString, OsString)>> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::TOKEN_QUERY,
+        System::{
+            Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
+            Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+    };
+
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut environment = null_mut();
+        let created = CreateEnvironmentBlock(&mut environment, token, 0);
+        let create_error = std::io::Error::last_os_error();
+        let _ = CloseHandle(token);
+        if created == 0 {
+            return Err(create_error);
+        }
+
+        let mut block = Vec::new();
+        let mut cursor = environment.cast::<u16>();
+        loop {
+            let current = *cursor;
+            block.push(current);
+            cursor = cursor.add(1);
+            if current == 0 && *cursor == 0 {
+                block.push(0);
+                break;
+            }
+        }
+
+        let _ = DestroyEnvironmentBlock(environment.cast_const());
+        Ok(parse_windows_environment_block(&block))
+    }
+}
+
+#[cfg(windows)]
+fn parse_windows_environment_block(block: &[u16]) -> Vec<(OsString, OsString)> {
+    use std::os::windows::ffi::OsStringExt;
+
+    block
+        .split(|unit| *unit == 0)
+        .take_while(|entry| !entry.is_empty())
+        .filter_map(|entry| {
+            let separator = entry.iter().position(|unit| *unit == b'=' as u16)?;
+            if separator == 0 {
+                return None;
+            }
+            Some((
+                OsString::from_wide(&entry[..separator]),
+                OsString::from_wide(&entry[separator + 1..]),
+            ))
+        })
+        .collect()
+}
+
 pub(crate) fn instant_to_utc(instant: Instant) -> Option<DateTime<Utc>> {
     let elapsed = chrono::TimeDelta::from_std(instant.elapsed()).ok()?;
     Utc::now().checked_sub_signed(elapsed)
@@ -718,6 +836,65 @@ fn format_command_for_display(command: &str, args: &[String]) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn refreshed_environment_overrides_inherited_values() {
+        let merged = merge_spawn_environment(
+            vec![
+                (OsString::from("PATH"), OsString::from("stale")),
+                (OsString::from("DAEMON_ONLY"), OsString::from("kept")),
+            ],
+            vec![
+                (OsString::from("PATH"), OsString::from("fresh")),
+                (OsString::from("NEW_VALUE"), OsString::from("added")),
+            ],
+        );
+
+        assert_eq!(
+            merged
+                .iter()
+                .find(|(key, _)| env_key_eq(key, OsStr::new("PATH")))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("fresh"))
+        );
+        assert!(merged.iter().any(|(key, value)| {
+            key == OsStr::new("DAEMON_ONLY") && value == OsStr::new("kept")
+        }));
+        assert!(merged.iter().any(|(key, value)| {
+            key == OsStr::new("NEW_VALUE") && value == OsStr::new("added")
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refreshed_environment_keys_are_case_insensitive_on_windows() {
+        let merged = merge_spawn_environment(
+            vec![(OsString::from("Path"), OsString::from("stale"))],
+            vec![(OsString::from("PATH"), OsString::from("fresh"))],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].1, OsString::from("fresh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parses_windows_environment_block() {
+        let mut block = "PATH=C:\\Tools\0EMPTY=\0BROKEN\0=C:=C:\\Work\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        block.push(0);
+
+        let parsed = parse_windows_environment_block(&block);
+
+        assert_eq!(
+            parsed,
+            vec![
+                (OsString::from("PATH"), OsString::from("C:\\Tools")),
+                (OsString::from("EMPTY"), OsString::new()),
+            ]
+        );
+    }
 
     #[test]
     fn test_generate_session_id_is_7_chars() {
