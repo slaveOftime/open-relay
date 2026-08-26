@@ -20,37 +20,48 @@ const MAX_IPC_LINE_BYTES: usize = 10 * 1024 * 1024;
 /// if the accumulated data exceeds [`MAX_IPC_LINE_BYTES`] before a newline is
 /// found.  This prevents a malicious local client from exhausting memory by
 /// sending an infinitely long line without a terminator.
+///
+/// Bytes are accumulated raw and decoded once, after the terminator is found.
+/// Decoding each `fill_buf` chunk individually would reject payloads whose
+/// multi-byte UTF-8 characters straddle a chunk boundary — the socket hands us
+/// arbitrary byte counts, so a 3-byte character can easily be split across two
+/// reads (e.g. "incomplete utf-8 byte sequence from index 4094").
 async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut String,
 ) -> io::Result<usize> {
-    let mut total = 0usize;
+    let mut raw: Vec<u8> = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return Ok(total);
+            break;
         }
         let newline_pos = available.iter().position(|&b| b == b'\n');
         let used = match newline_pos {
             Some(pos) => pos + 1,
             None => available.len(),
         };
-        total += used;
-        if total > MAX_IPC_LINE_BYTES {
+        if raw.len() + used > MAX_IPC_LINE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("IPC message exceeds {MAX_IPC_LINE_BYTES} byte limit"),
             ));
         }
-        let chunk = &available[..used];
-        let s = std::str::from_utf8(chunk)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        buf.push_str(s);
+        raw.extend_from_slice(&available[..used]);
         reader.consume(used);
         if newline_pos.is_some() {
-            return Ok(total);
+            break;
         }
     }
+
+    let total = raw.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    let text = String::from_utf8(raw)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.utf8_error()))?;
+    buf.push_str(&text);
+    Ok(total)
 }
 
 pub async fn connect(config: &AppConfig) -> Result<Stream> {
@@ -209,18 +220,25 @@ pub async fn read_request_from_reader(
     Ok(envelope.payload)
 }
 
+/// Serialise one envelope into a newline-terminated frame.
+///
+/// Building the whole frame in memory first means one `write_all` per frame
+/// instead of separate payload/newline writes. On the streaming attach path
+/// that halves the syscalls per chunk of PTY output.
+fn encode_frame<T: serde::Serialize>(version: u16, payload: T) -> Result<Vec<u8>> {
+    let envelope = RpcEnvelope { version, payload };
+    let mut frame = serde_json::to_vec(&envelope)?;
+    frame.push(b'\n');
+    Ok(frame)
+}
+
 /// Write a single `RpcResponse` to the write-half of a split stream.
 pub async fn write_response_to_writer(
     writer: &mut WriteHalf<Stream>,
     payload: RpcResponse,
 ) -> Result<()> {
-    let envelope = RpcEnvelope {
-        version: PROTOCOL_VERSION,
-        payload,
-    };
-    let message = serde_json::to_string(&envelope)?;
-    writer.write_all(message.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    let frame = encode_frame(PROTOCOL_VERSION, payload)?;
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -258,21 +276,70 @@ pub async fn write_request_to_writer(
     writer: &mut WriteHalf<Stream>,
     payload: RpcRequest,
 ) -> Result<()> {
-    let envelope = RpcEnvelope {
-        version: PROTOCOL_VERSION,
-        payload,
-    };
-    let message = serde_json::to_string(&envelope)?;
-    writer.write_all(message.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    let frame = encode_frame(PROTOCOL_VERSION, payload)?;
+    writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_success_response;
+    use super::{MAX_IPC_LINE_BYTES, ensure_success_response, read_line_bounded};
     use crate::{error::AppError, protocol::RpcResponse};
+    use tokio::io::BufReader;
+
+    /// `BufReader` with a tiny capacity reproduces the socket behaviour of
+    /// handing back an arbitrary byte count per `fill_buf`.
+    async fn read_line_in_chunks(data: &[u8], capacity: usize) -> std::io::Result<String> {
+        let mut reader = BufReader::with_capacity(capacity, data);
+        let mut line = String::new();
+        read_line_bounded(&mut reader, &mut line).await?;
+        Ok(line)
+    }
+
+    #[tokio::test]
+    async fn read_line_bounded_joins_multibyte_chars_split_across_chunks() {
+        // "€" is 3 bytes, so a 4-byte read window splits it in half.
+        let payload = "aa€bb ⣿ 中文\n";
+        let line = read_line_in_chunks(payload.as_bytes(), 4)
+            .await
+            .expect("split multi-byte characters must not fail the read");
+        assert_eq!(line, payload);
+    }
+
+    #[tokio::test]
+    async fn read_line_bounded_stops_at_the_first_newline() {
+        let line = read_line_in_chunks(b"first\nsecond\n", 4)
+            .await
+            .expect("read should succeed");
+        assert_eq!(line, "first\n");
+    }
+
+    #[tokio::test]
+    async fn read_line_bounded_returns_partial_data_on_eof() {
+        let line = read_line_in_chunks("héllo".as_bytes(), 3)
+            .await
+            .expect("unterminated input should return what was read");
+        assert_eq!(line, "héllo");
+    }
+
+    #[tokio::test]
+    async fn read_line_bounded_rejects_genuinely_invalid_utf8() {
+        let err = read_line_in_chunks(b"ok\xff\xfe\n", 4)
+            .await
+            .expect_err("invalid UTF-8 must still be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_line_bounded_enforces_the_line_limit() {
+        let oversized = vec![b'a'; MAX_IPC_LINE_BYTES + 16];
+        let err = read_line_in_chunks(&oversized, 8192)
+            .await
+            .expect_err("oversized lines must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds"));
+    }
 
     #[test]
     fn ensure_success_response_preserves_non_error_payloads() {

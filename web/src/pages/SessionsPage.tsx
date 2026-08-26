@@ -707,6 +707,7 @@ function SessionCard({
     ? 'text-[hsl(var(--foreground))]/70'
     : 'text-[hsl(var(--foreground))]'
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
+  const opacityClass = session.status === 'stopped' || session.status === 'killed' || session.status === 'failed' ? 'opacity-60' : ''
 
   function openSession(mode: 'attach' | 'logs') {
     navigate(buildSessionHref(session.id, mode, node))
@@ -715,7 +716,7 @@ function SessionCard({
   return (
     <>
       <Card
-        className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass}`}
+        className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass} ${opacityClass}`}
       >
         <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1">
           {/* Row 1: id, status, pid, created at */}
@@ -742,11 +743,11 @@ function SessionCard({
               <div className="shrink-0 pt-0.5">
                 <CommandLogo command={session.command} size={36} />
               </div>
-              <div className="min-w-0 flex-1">
+              <div className="min-w-0 flex-1 line-clamp-5 break-all">
                 {session.title?.trim() && (
-                  <div className="text-[hsl(var(--primary))] break-all">{session.title.trim()}</div>
+                  <span className="block text-[hsl(var(--primary))]">{session.title.trim()}</span>
                 )}
-                <div className="text-base font-medium break-all">{sessionDisplayName(session)}</div>
+                <span className="block text-base font-medium">{sessionDisplayName(session)}</span>
               </div>
             </div>
           </div>

@@ -58,7 +58,7 @@ pub enum Commands {
     Daemon(DaemonArgs),
     /// Create a session and run a command. Example: `oly start --detach --title "my fun demo" copilot`.
     Start(StartArgs),
-    /// Override a session's title and tags.
+    /// Override a session's title, tags, and notification setting.
     Update(UpdateArgs),
     /// Enable or disable notifications for a running session.
     Notify(NotifyArgs),
@@ -187,8 +187,11 @@ pub struct ListArgs {
     #[arg(long = "tag")]
     pub tags: Vec<String>,
     /// Print machine-readable JSON instead of the default table.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "follow")]
     pub json: bool,
+    /// Follow sessions in an interactive realtime terminal UI.
+    #[arg(long, short = 'f')]
+    pub follow: bool,
     /// Only show sessions with these statuses (repeatable).
     #[arg(long = "status", short = 's', value_enum)]
     pub status: Vec<ListStatus>,
@@ -198,12 +201,19 @@ pub struct ListArgs {
     /// Created at or before (RFC3339, e.g. 2026-03-04T15:04:05Z).
     #[arg(long, value_name = "RFC3339")]
     pub until: Option<String>,
-    /// Maximum number of sessions to return.
-    #[arg(long, default_value_t = 10)]
+    /// Maximum number of sessions to return (defaults to 100 with --follow, otherwise 10).
+    #[arg(
+        long,
+        default_value_t = 10,
+        default_value_if("follow", "true", Some("100"))
+    )]
     pub limit: usize,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
+    /// Target a secondary node by name. Repeat to monitor multiple nodes.
+    #[arg(long, short = 'n', value_name = "NODE")]
+    pub node: Vec<String>,
+    /// Include sessions from the current (or primary) daemon.
+    #[arg(long)]
+    pub node_local: bool,
 }
 
 #[derive(Debug, Args)]
@@ -246,9 +256,24 @@ pub struct UpdateArgs {
     /// Override the session tags. Repeat to add multiple tags; pass an empty string to clear all tags; omit to leave unchanged.
     #[arg(long = "tag")]
     pub tags: Option<Vec<String>>,
+    /// Override notifications for a running session; omit to leave unchanged.
+    #[arg(long, value_enum, value_name = "enabled|disabled")]
+    pub notifications: Option<NotificationSetting>,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NotificationSetting {
+    Enabled,
+    Disabled,
+}
+
+impl NotificationSetting {
+    pub fn enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -470,7 +495,9 @@ pub struct JoinListArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, DaemonCommand, NotifyCommand, parse_timeout_ms};
+    use super::{
+        Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, parse_timeout_ms,
+    };
     use clap::Parser;
 
     #[test]
@@ -594,6 +621,8 @@ mod tests {
             "prod",
             "--tag",
             "release",
+            "--notifications",
+            "disabled",
             "--node",
             "worker-a",
         ])
@@ -607,6 +636,7 @@ mod tests {
             args.tags,
             Some(vec!["prod".to_string(), "release".to_string()])
         );
+        assert_eq!(args.notifications, Some(NotificationSetting::Disabled));
         assert_eq!(args.node.as_deref(), Some("worker-a"));
     }
 
@@ -619,6 +649,7 @@ mod tests {
         assert_eq!(args.id, "session-1");
         assert_eq!(args.title.as_deref(), Some(""));
         assert_eq!(args.tags, None);
+        assert_eq!(args.notifications, None);
 
         let cli = Cli::try_parse_from(["oly", "update", "session-1", "--tag", ""]).unwrap();
         let Commands::Update(args) = cli.command else {
@@ -626,6 +657,16 @@ mod tests {
         };
         assert_eq!(args.title, None);
         assert_eq!(args.tags, Some(vec!["".to_string()]));
+        assert_eq!(args.notifications, None);
+
+        let cli = Cli::try_parse_from(["oly", "update", "session-1", "--notifications", "enabled"])
+            .unwrap();
+        let Commands::Update(args) = cli.command else {
+            panic!("expected update command");
+        };
+        assert_eq!(args.title, None);
+        assert_eq!(args.tags, None);
+        assert_eq!(args.notifications, Some(NotificationSetting::Enabled));
     }
 
     #[test]
@@ -635,6 +676,52 @@ mod tests {
             panic!("expected list command");
         };
         assert_eq!(args.tags, vec!["prod".to_string(), "release".to_string()]);
+    }
+
+    #[test]
+    fn list_parses_multiple_nodes_and_local_node() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "ls",
+            "--follow",
+            "--node",
+            "worker-a",
+            "--node",
+            "worker-b",
+            "--node-local",
+        ])
+        .unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert_eq!(args.node, vec!["worker-a", "worker-b"]);
+        assert!(args.node_local);
+    }
+
+    #[test]
+    fn list_parses_follow_and_rejects_json_combination() {
+        let cli = Cli::try_parse_from(["oly", "ls", "--follow"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(args.follow);
+        assert_eq!(args.limit, 100);
+        assert!(Cli::try_parse_from(["oly", "ls", "--follow", "--json"]).is_err());
+    }
+
+    #[test]
+    fn list_limit_defaults_depend_on_follow_and_explicit_value_wins() {
+        let cli = Cli::try_parse_from(["oly", "ls"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert_eq!(args.limit, 10);
+
+        let cli = Cli::try_parse_from(["oly", "ls", "--follow", "--limit", "25"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert_eq!(args.limit, 25);
     }
 
     #[test]

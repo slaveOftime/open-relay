@@ -24,9 +24,12 @@ use std::path::{Path, PathBuf};
 
 use crate::config::AppConfig;
 
+#[cfg(not(windows))]
 use libmimalloc_sys::{mi_option_set_default, mi_option_set_enabled_default};
+#[cfg(not(windows))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -47,6 +50,10 @@ async fn main() {
     std::process::exit(code);
 }
 
+#[cfg(windows)]
+fn configure_mimalloc_defaults() {}
+
+#[cfg(not(windows))]
 fn configure_mimalloc_defaults() {
     // libmimalloc-sys does not expose the newer v3 purge constants as stable
     // Rust constants, so use the documented enum values from mimalloc.h.
@@ -184,10 +191,7 @@ async fn run() -> Result<()> {
             DaemonCommand::Status => daemon::status(config).await,
         },
 
-        Commands::List(list_args) => {
-            let node = list_args.node.clone();
-            client::run_list(&config, list_args, node).await
-        }
+        Commands::List(list_args) => client::run_list(&config, list_args).await,
 
         Commands::Start(start_args) => {
             let cli::StartArgs {
@@ -244,17 +248,23 @@ async fn run() -> Result<()> {
                 id: update_args.id.clone(),
                 title: update_args.title,
                 tags: update_args.tags,
+                notifications_enabled: update_args.notifications.map(|value| value.enabled()),
             };
             match ipc::send_request_checked(&config, node_wrap(update_args.node, inner)).await? {
                 RpcResponse::Session { summary } => {
                     println!(
-                        "Updated session {}. Title: {}. Tags: {}",
+                        "Updated session {}. Title: {}. Tags: {}. Notifications: {}",
                         summary.id,
                         summary.title.as_deref().unwrap_or("—"),
                         if summary.tags.is_empty() {
                             "—".to_string()
                         } else {
                             summary.tags.join(", ")
+                        },
+                        if summary.notifications_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
                         }
                     );
                     Ok(())

@@ -23,9 +23,85 @@ use crate::{
 const PASTE_BURST_WAIT: Duration = Duration::from_millis(30);
 const PASTE_KEY_SUPPRESS_WINDOW: Duration = Duration::from_millis(150);
 
+/// Upper bound on how many bytes of already-queued server output are written
+/// to the terminal in one go. Batching turns a burst of frames into a single
+/// blocking write plus flush; the cap keeps the terminal painting
+/// incrementally rather than freezing on one very large write.
+const MAX_BATCHED_FRAME_BYTES: usize = 1024 * 1024;
+
 struct PendingKeyBurst {
     data: String,
     deadline: Instant,
+}
+
+#[cfg(windows)]
+struct AttachRenderer {
+    parser: vt100::Parser,
+    needs_full_repaint: bool,
+}
+
+#[cfg(windows)]
+impl AttachRenderer {
+    fn new(rows: u16, cols: u16) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+            needs_full_repaint: false,
+        }
+    }
+
+    fn render_initial(&mut self, data: &[u8]) -> Vec<u8> {
+        self.parser.process(data);
+        self.needs_full_repaint = false;
+        let mut rendered = passthrough_signals(data);
+        rendered.extend_from_slice(&self.parser.screen().state_formatted());
+        rendered
+    }
+
+    fn render_chunk(&mut self, data: &[u8]) -> Vec<u8> {
+        let previous = self.parser.screen().clone();
+        self.parser.process(data);
+
+        // The canonical screen state only models the grid, cursor and modes,
+        // so window title and progress/busy notifications are forwarded from
+        // the original bytes; otherwise they would be dropped entirely.
+        let mut rendered = passthrough_signals(data);
+
+        // Render from canonical screen state instead of forwarding ConPTY's
+        // wrap-dependent bytes. Once the initial snapshot is on screen, state
+        // diffs preserve that exact baseline without full-screen flashing.
+        let update = if self.needs_full_repaint {
+            self.needs_full_repaint = false;
+            self.parser.screen().state_formatted()
+        } else {
+            self.parser.screen().state_diff(&previous)
+        };
+        if update.is_empty() {
+            return rendered;
+        }
+        rendered.extend_from_slice(b"\x1b[?2026h");
+        rendered.extend_from_slice(&update);
+        rendered.extend_from_slice(b"\x1b[?2026l");
+        rendered
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        crate::session::screen::safe_resize_parser(&mut self.parser, rows, cols);
+        self.needs_full_repaint = true;
+    }
+}
+
+/// Extract the semantic terminal signals (window title, progress and busy
+/// indicators, cursor shape) that the canonical screen state does not model,
+/// so they survive a repaint driven by that state.
+#[cfg(windows)]
+fn passthrough_signals(data: &[u8]) -> Vec<u8> {
+    let mut signals = crate::session::scan::extract_passthrough_osc_sequences(data);
+    if let Some(params) = crate::session::scan::last_cursor_style_params(data) {
+        signals.extend_from_slice(b"\x1b[");
+        signals.extend_from_slice(params);
+        signals.extend_from_slice(b" q");
+    }
+    signals
 }
 
 // ---------------------------------------------------------------------------
@@ -118,8 +194,14 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         // snapshot data so the restored screen starts from a known state.
         write_bytes_to_stdout(b"\x1b[H\x1b[2J")?;
 
-        // Write the initial terminal-state snapshot directly.
+        #[cfg(windows)]
+        let mut renderer = AttachRenderer::new(rows, cols);
+        #[cfg(windows)]
+        write_bytes_to_stdout(&renderer.render_initial(&initial_data))?;
+
+        #[cfg(not(windows))]
         write_bytes_to_stdout(&initial_data)?;
+
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         // Drain any stale resize events queued by writing replay data
@@ -222,6 +304,10 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                         let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
                         if (actual_cols, actual_rows) != last_sent_size {
                             last_sent_size = (actual_cols, actual_rows);
+
+                            #[cfg(windows)]
+                            renderer.resize(actual_rows, actual_cols);
+
                             ipc::write_request_to_writer(
                                 &mut write_half,
                                 RpcRequest::AttachResize {
@@ -360,33 +446,71 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     stream_error = Some(err);
                     break;
                 }
-                Ok(Some(Ok(response))) => match response {
-                    RpcResponse::AttachStreamChunk { data, .. } => {
-                        // Daemon already filtered CPR/DSR via EscapeFilter; write raw.
-                        write_bytes_to_stdout(&data)?;
+                Ok(Some(Ok(response))) => {
+                    // Drain every frame the daemon has already queued and
+                    // concatenate the output chunks into one buffer. A burst of
+                    // output (an echoed paste, a full-screen redraw) otherwise
+                    // costs one blocking write plus one flush of the unbuffered
+                    // stdout handle per frame, which is what makes a large
+                    // paste visibly crawl across the screen.
+                    let mut batch = Vec::new();
+                    let mut response = Some(response);
+                    loop {
+                        let Some(current) = response.take() else {
+                            break;
+                        };
+                        match current {
+                            RpcResponse::AttachStreamChunk { data, .. } => {
+                                if batch.is_empty() {
+                                    batch = data;
+                                } else {
+                                    batch.extend_from_slice(&data);
+                                }
+                            }
+                            RpcResponse::AttachModeChanged {
+                                app_cursor_keys,
+                                bracketed_paste_mode,
+                            } => {
+                                child_app_cursor_keys = app_cursor_keys;
+                                child_bracketed_paste_mode = bracketed_paste_mode;
+                            }
+                            RpcResponse::AttachResized { rows: _, cols: _ } => {
+                                // Another client resized the PTY.  We cannot
+                                // programmatically resize the terminal window (only the
+                                // screen buffer on Windows, which corrupts the display).
+                                // Instead, update last_sent_size to the actual terminal
+                                // size so that the dedup guard in Event::Resize prevents
+                                // echoing our unchanged dimensions back to the server.
+                                let (actual_cols, actual_rows) =
+                                    terminal::size().unwrap_or((80, 24));
+                                last_sent_size = (actual_cols, actual_rows);
+                            }
+                            RpcResponse::AttachStreamDone { .. } => {
+                                running = false;
+                            }
+                            _ => {}
+                        }
+
+                        if !running || batch.len() >= MAX_BATCHED_FRAME_BYTES {
+                            break;
+                        }
+                        match frame_rx.try_recv() {
+                            Ok(Ok(next)) => response = Some(next),
+                            Ok(Err(err)) => {
+                                stream_error = Some(err);
+                                running = false;
+                            }
+                            Err(_) => break,
+                        }
                     }
-                    RpcResponse::AttachModeChanged {
-                        app_cursor_keys,
-                        bracketed_paste_mode,
-                    } => {
-                        child_app_cursor_keys = app_cursor_keys;
-                        child_bracketed_paste_mode = bracketed_paste_mode;
+
+                    if !batch.is_empty() {
+                        #[cfg(windows)]
+                        write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
+                        #[cfg(not(windows))]
+                        write_bytes_to_stdout(&batch)?;
                     }
-                    RpcResponse::AttachResized { rows: _, cols: _ } => {
-                        // Another client resized the PTY.  We cannot
-                        // programmatically resize the terminal window (only the
-                        // screen buffer on Windows, which corrupts the display).
-                        // Instead, update last_sent_size to the actual terminal
-                        // size so that the dedup guard in Event::Resize prevents
-                        // echoing our unchanged dimensions back to the server.
-                        let (actual_cols, actual_rows) = terminal::size().unwrap_or((80, 24));
-                        last_sent_size = (actual_cols, actual_rows);
-                    }
-                    RpcResponse::AttachStreamDone { .. } => {
-                        running = false;
-                    }
-                    _ => {}
-                },
+                }
             }
         }
 
@@ -797,6 +921,86 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_live_chunk_is_repainted_from_canonical_screen_state() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let initial = renderer.render_initial(b"\x1b[2;5Hbefore");
+        let mut replay = vt100::Parser::new(4, 20, 0);
+        replay.process(&initial);
+
+        let mut redraw = b"\x1b[H".to_vec();
+        redraw.extend_from_slice(&vec![b' '; 25]);
+        redraw.extend_from_slice("工作目录".as_bytes());
+
+        let rendered = renderer.render_chunk(&redraw);
+
+        assert!(rendered.starts_with(b"\x1b[?2026h"));
+        assert!(rendered.ends_with(b"\x1b[?2026l"));
+        replay.process(&rendered);
+        assert_eq!(
+            replay.screen().contents(),
+            renderer.parser.screen().contents()
+        );
+        assert!(
+            !rendered
+                .windows(b"\x1b[2J".len())
+                .any(|window| window == b"\x1b[2J")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_live_chunk_forwards_title_and_progress_signals() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[H");
+
+        let rendered =
+            renderer.render_chunk(b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07\x1b[Hworking");
+
+        let expected_signals = b"\x1b]0;relay build\x07\x1b]9;4;3;0\x07";
+        assert!(rendered.starts_with(expected_signals));
+        assert!(rendered[expected_signals.len()..].starts_with(b"\x1b[?2026h"));
+        assert!(rendered.ends_with(b"\x1b[?2026l"));
+        assert!(renderer.parser.screen().contents().contains("working"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_title_only_chunk_is_forwarded_without_repaint() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[Hidle");
+
+        let rendered = renderer.render_chunk(b"\x1b]2;relay\x07");
+
+        assert_eq!(rendered, b"\x1b]2;relay\x07".to_vec());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_live_chunk_forwards_cursor_shape_changes() {
+        // The canonical screen state does not model DECSCUSR, so an editor's
+        // bar cursor would be lost on every repaint without this passthrough.
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[H");
+
+        let rendered = renderer.render_chunk(b"\x1b[6 q\x1b[Hediting");
+
+        assert!(rendered.starts_with(b"\x1b[6 q"));
+        assert!(renderer.parser.screen().contents().contains("editing"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_initial_snapshot_forwards_restored_signals() {
+        let mut renderer = AttachRenderer::new(4, 20);
+
+        let rendered = renderer.render_initial(b"\x1b[Hready\x1b]0;relay\x07\x1b[6 q");
+
+        assert!(rendered.starts_with(b"\x1b]0;relay\x07\x1b[6 q"));
+        assert!(renderer.parser.screen().contents().contains("ready"));
     }
 
     // -----------------------------------------------------------------------

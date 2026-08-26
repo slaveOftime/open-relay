@@ -22,6 +22,8 @@
     --border: 214 32% 82%;
     --input: 214 32% 82%;
     --ring: 239 84% 60%;
+    --scrollbar-thumb: 214 32% 72%;
+    --scrollbar-thumb-hover: 215 16% 52%;
     --radius: 0.375rem;
     --terminal-bg: 210 25% 97%;
     --terminal-fg: 224 71% 10%;
@@ -48,6 +50,8 @@
       --border: 220 9% 16%;
       --input: 220 9% 16%;
       --ring: 160 84% 39%;
+      --scrollbar-thumb: 220 9% 22%;
+      --scrollbar-thumb-hover: 220 9% 32%;
       --terminal-bg: 220 18% 3%;
       --terminal-fg: 210 20% 92%;
     }
@@ -73,6 +77,8 @@
     --border: 220 9% 16%;
     --input: 220 9% 16%;
     --ring: 160 84% 39%;
+    --scrollbar-thumb: 220 9% 22%;
+    --scrollbar-thumb-hover: 220 9% 32%;
     --terminal-bg: 220 18% 3%;
     --terminal-fg: 210 20% 92%;
   }
@@ -151,26 +157,11 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(214 32% 72%);
+    background: hsl(var(--scrollbar-thumb));
     border-radius: 3px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(215 16% 52%);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme='light']) ::-webkit-scrollbar-thumb {
-      background: hsl(220 9% 22%);
-    }
-    :root:not([data-theme='light']) ::-webkit-scrollbar-thumb:hover {
-      background: hsl(220 9% 32%);
-    }
-  }
-
-  :root[data-theme='dark'] ::-webkit-scrollbar-thumb {
-    background: hsl(220 9% 22%);
-  }
-  :root[data-theme='dark'] ::-webkit-scrollbar-thumb:hover {
-    background: hsl(220 9% 32%);
+    background: hsl(var(--scrollbar-thumb-hover));
   }
 }
 
@@ -199,7 +190,7 @@
       visibility 180ms ease;
     contain: paint;
     will-change: opacity;
-    z-index: 1;
+    z-index: 9999;
   }
   .terminal-viewport-idle-overlay.is-active {
     opacity: 1;

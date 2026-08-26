@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, fs::File, process::Stdio, sync::Arc, time::Duration};
+use std::{fmt::Write as _, fs::File, path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use interprocess::local_socket::traits::tokio::Listener as _;
 use tokio::sync::{Mutex, mpsc};
@@ -24,6 +24,7 @@ use crate::{
 use super::{
     JoinHandles, NotifierHandle,
     auth::{confirm_no_auth_risk, prompt_and_hash_password},
+    crash,
     rpc::handle_client,
 };
 
@@ -190,6 +191,7 @@ pub async fn start(
             config.http_port,
             config.notification_hook.as_deref(),
             config.web_push_proxy.as_deref(),
+            &config.state_dir,
         )?;
         wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
 
@@ -308,6 +310,7 @@ async fn wait_for_daemon_ready(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_detached(
     no_auth: bool,
     no_http: bool,
@@ -316,9 +319,30 @@ fn spawn_detached(
     port: u16,
     notification_hook: Option<&str>,
     web_push_proxy: Option<&str>,
+    state_dir: &Path,
 ) -> Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
+
+    // The detached child has no console and nobody reads its stdout/stderr,
+    // so historically `Stdio::null()` silently discarded everything the
+    // process ever wrote there. That is exactly where the default Rust panic
+    // hook prints ("thread 'x' panicked at ..."), where the stack-overflow
+    // guard page handler prints before aborting, and where a lot of native
+    // (non-Rust) crash output ends up. Redirect stderr to a durable file
+    // instead so a future crash leaves evidence behind; stdin/stdout remain
+    // discarded since nothing meaningful is expected there.
+    let stderr_log_path = crash::stderr_log_path(state_dir);
+    if let Some(parent) = stderr_log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let stderr_file = File::options()
+        .create(true)
+        .append(true)
+        .open(&stderr_log_path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
+
     cmd.arg("daemon")
         .arg("start")
         .arg("--foreground-internal")
@@ -328,7 +352,14 @@ fn spawn_detached(
         .arg(port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr_file);
+
+    // Ensure panics/aborts print a backtrace to the (now-captured) stderr
+    // file, unless the caller already asked for a specific level.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        cmd.env("RUST_BACKTRACE", "1");
+    }
+
     if no_auth {
         cmd.arg("--no-auth");
     } else if let Some(hash) = auth_hash {
@@ -433,6 +464,14 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         .with(file_layer)
         .with(stderr_layer)
         .init();
+
+    // Install crash diagnostics as early as possible so nothing that happens
+    // afterwards (DB open, session restore, HTTP/PTY startup, ...) can go
+    // wrong silently. See daemon::crash for why this is needed: the process
+    // normally runs fully detached with stdout/stderr discarded, so panics
+    // and native crashes previously left no trace at all.
+    crash::install_panic_hook(config.state_dir.clone());
+    crash::install_native_crash_handler(config.state_dir.clone());
 
     let pid = std::process::id();
     info!(pid, log_level = %config.log_level, "daemon started");

@@ -11,3 +11,4 @@ node_modules
 /npm/bin/oly-darwin-arm64
 /npm/bin/oly-win32-x64.exe
 test-results
+.tli

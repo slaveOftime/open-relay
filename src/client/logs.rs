@@ -65,7 +65,9 @@ pub async fn run_logs(
             inner: Box::new(inner),
         };
         return match ipc::send_request_checked(config, req).await? {
-            RpcResponse::LogsTail { output, .. } => print_log_output(output, keep_color),
+            RpcResponse::LogsTail { output, status, .. } => {
+                print_log_output(output, keep_color, id, status.as_deref())
+            }
             _ => Err(AppError::Protocol("unexpected response type".to_string())),
         };
     }
@@ -94,8 +96,8 @@ async fn run_logs_local(
         )
         .await
         {
-            Ok(RpcResponse::LogsTail { output, .. }) => {
-                return print_log_output(output, keep_color);
+            Ok(RpcResponse::LogsTail { output, status, .. }) => {
+                return print_log_output(output, keep_color, id, status.as_deref());
             }
             Ok(_) => return Err(AppError::Protocol("unexpected response type".to_string())),
             Err(AppError::DaemonUnavailable(_)) => {}
@@ -104,10 +106,11 @@ async fn run_logs_local(
     }
 
     let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
-    let session_dir = match db.get_session_dir(id).await? {
-        Some(dir) => dir,
+    let session = match db.get_session(id).await? {
+        Some(session) => session,
         None => return Err(AppError::Protocol(format!("session not found: {id}"))),
     };
+    let session_dir = config.sessions_dir.join(id);
 
     let log_path = session_dir.join("output.log");
     if !log_path.exists() {
@@ -119,14 +122,49 @@ async fn run_logs_local(
 
     let output = render_log_file(&log_path, tail, keep_color, term_cols, None)?;
 
-    print_log_output(output, keep_color)
+    print_log_output(output, keep_color, id, Some(session.status.as_str()))
 }
 
-fn print_log_output(output: Vec<u8>, keep_color: bool) -> Result<()> {
+fn print_log_output(
+    output: Vec<u8>,
+    keep_color: bool,
+    id: &str,
+    status: Option<&str>,
+) -> Result<()> {
     let _reset_guard = crate::terminal_guards::ColorfulGuard::new(keep_color);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     out.write_all(&output)?;
 
+    if let Some(line) = inactive_session_helper(id, status) {
+        if !output.is_empty() && !output.ends_with(b"\n") {
+            writeln!(out)?;
+        }
+        writeln!(out, "{line}")?;
+    }
+
     Ok(())
+}
+
+fn inactive_session_helper(id: &str, status: Option<&str>) -> Option<String> {
+    match status {
+        Some("created" | "running") | None => None,
+        Some(status) => Some(format!("--- Session {id} is {status} ---")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inactive_session_helper;
+
+    #[test]
+    fn helper_identifies_inactive_sessions() {
+        assert_eq!(
+            inactive_session_helper("abc123", Some("failed")).as_deref(),
+            Some("--- Session abc123 is failed ---")
+        );
+        assert!(inactive_session_helper("abc123", Some("running")).is_none());
+        assert!(inactive_session_helper("abc123", Some("created")).is_none());
+        assert!(inactive_session_helper("abc123", None).is_none());
+    }
 }

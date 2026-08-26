@@ -20,8 +20,10 @@ use crate::{
 
 /// Periodically checks all running sessions for silence and emits local OS
 /// notifications once per output epoch. Silence alone is sufficient to
-/// trigger a notification. Prompt patterns are used to pick a better body
-/// line but do **not** gate delivery.
+/// trigger a notification unless the session's latest output is merely the
+/// PTY echoing what the user just typed, in which case the user is still
+/// composing input and only the "input required" flag is updated. Prompt
+/// patterns are used to pick a better body line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
     notifier: Arc<Notifier>,
     session_store: Arc<SessionStore>,
@@ -64,32 +66,45 @@ pub(super) async fn run_notification_monitor(
                 "evaluating notification triggers for candidate in detail"
             );
 
-            let (trigger_rule, trigger_detail) =
-                if let Some(pattern) = find_prompt_match(&excerpt, &patterns) {
-                    info!(
-                        session_id,
-                        trigger_rule = NotificationTriggerRule::RegexPattern.as_str(),
-                        pattern = pattern.as_str(),
-                        "notification triggered"
-                    );
-                    (NotificationTriggerRule::RegexPattern, Some(pattern.clone()))
-                } else if let Some(llm_detail) = evaluate_llm_direct_trigger(&excerpt) {
-                    info!(
-                        session_id,
-                        trigger_rule = NotificationTriggerRule::LlmCheck.as_str(),
-                        "notification triggered"
-                    );
-                    (NotificationTriggerRule::LlmCheck, Some(llm_detail))
-                } else if Instant::now().duration_since(output_epoch) >= silence {
-                    info!(
-                        session_id,
-                        trigger_rule = NotificationTriggerRule::Silence.as_str(),
-                        "notification triggered"
-                    );
-                    (NotificationTriggerRule::Silence, None)
-                } else {
+            if !candidate.should_notify {
+                if Instant::now().saturating_duration_since(candidate.silence_epoch) < silence {
                     continue;
-                };
+                }
+                debug!(
+                    session_id,
+                    "marking input required without notification because the session is only echoing user input"
+                );
+                session_store.mark_input_required(&session_id, output_epoch);
+                continue;
+            }
+
+            let (trigger_rule, trigger_detail) = if let Some(pattern) =
+                find_prompt_match(&excerpt, &patterns)
+            {
+                info!(
+                    session_id,
+                    trigger_rule = NotificationTriggerRule::RegexPattern.as_str(),
+                    pattern = pattern.as_str(),
+                    "notification triggered"
+                );
+                (NotificationTriggerRule::RegexPattern, Some(pattern.clone()))
+            } else if let Some(llm_detail) = evaluate_llm_direct_trigger(&excerpt) {
+                info!(
+                    session_id,
+                    trigger_rule = NotificationTriggerRule::LlmCheck.as_str(),
+                    "notification triggered"
+                );
+                (NotificationTriggerRule::LlmCheck, Some(llm_detail))
+            } else if Instant::now().saturating_duration_since(candidate.silence_epoch) >= silence {
+                info!(
+                    session_id,
+                    trigger_rule = NotificationTriggerRule::Silence.as_str(),
+                    "notification triggered"
+                );
+                (NotificationTriggerRule::Silence, None)
+            } else {
+                continue;
+            };
 
             let body = sanitize_notification_excerpt(&excerpt);
             let event = NotificationEvent::input_needed_with_trigger(

@@ -91,6 +91,7 @@ export interface CreateSessionSpec {
 export interface UpdateSessionMetadataSpec {
   title?: string
   tags?: string[]
+  notifications_enabled?: boolean
 }
 
 // ---------------------------------------------------------------------------

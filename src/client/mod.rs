@@ -1,6 +1,7 @@
 mod attach;
 pub mod join;
 mod list;
+mod list_tui;
 mod logs;
 mod send;
 

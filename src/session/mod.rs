@@ -1,11 +1,15 @@
+//! Session management: live runtimes, their on-disk state and the shared
+//! metadata types the rest of the daemon speaks in.
+
 pub(crate) mod file;
 pub mod logs;
 pub(crate) mod persist;
 pub mod pty;
 pub(crate) mod resize;
 mod runtime;
+pub(crate) mod scan;
+pub(crate) mod screen;
 mod store;
-pub(crate) mod vt100;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -15,7 +19,7 @@ use tokio::sync::broadcast;
 
 use crate::error::{AppError, Result};
 use crate::protocol::SessionSummary;
-pub(crate) use runtime::ModeSnapshot;
+pub(crate) use runtime::{ModeSnapshot, SharedModes};
 pub use store::SessionStore;
 pub use store::SilentCandidate;
 

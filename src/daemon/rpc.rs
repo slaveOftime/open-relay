@@ -142,8 +142,13 @@ async fn dispatch_request(
             )
             .await
         }
-        RpcRequest::SessionMetadataSet { id, title, tags } => {
-            handle_session_metadata_set(id, title, tags, session_store).await
+        RpcRequest::SessionMetadataSet {
+            id,
+            title,
+            tags,
+            notifications_enabled,
+        } => {
+            handle_session_metadata_set(id, title, tags, notifications_enabled, session_store).await
         }
         RpcRequest::NotifySet { id, enabled } => {
             handle_notify_set(id, enabled, session_store).await
@@ -362,10 +367,11 @@ async fn handle_session_metadata_set(
     id: String,
     title: Option<String>,
     tags: Option<Vec<String>>,
+    notifications_enabled: Option<bool>,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     match session_store
-        .update_session_metadata(&id, title, tags)
+        .update_session_metadata(&id, title, tags, notifications_enabled)
         .await
     {
         Ok(summary) => RpcResponse::Session { summary },
@@ -436,7 +442,12 @@ async fn handle_logs_tail(
             .render_live_logs(&id, tail, keep_color, term_cols)
             .await
     {
-        return RpcResponse::LogsTail { output, resizes };
+        let status = session_store.get_summary(&id).map(|summary| summary.status);
+        return RpcResponse::LogsTail {
+            output,
+            resizes,
+            status,
+        };
     }
 
     let session_dir = match db.get_session_dir(&id).await {
@@ -472,9 +483,17 @@ async fn handle_logs_tail(
         }
     };
 
+    let status = db
+        .get_session(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|meta| meta.status.as_str().to_string());
+
     RpcResponse::LogsTail {
         output: lines,
         resizes,
+        status,
     }
 }
 

@@ -1,3 +1,5 @@
+//! Uploaded-file storage inside a session directory (`sessions/<id>/files/`).
+
 use std::{
     fs, io,
     path::{Component, Path, PathBuf},
@@ -9,7 +11,7 @@ use crate::{
     error::{AppError, Result},
 };
 
-fn normalize_session_upload_relative_path_path(path: &Path) -> Option<PathBuf> {
+fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -33,7 +35,7 @@ pub(crate) fn ensure_session_files_dir(config: &AppConfig, id: &str) -> Result<P
 }
 
 pub(crate) fn normalize_session_upload_relative_path(path: &str) -> Option<PathBuf> {
-    normalize_session_upload_relative_path_path(Path::new(path.trim()))
+    normalize_relative_path(Path::new(path.trim()))
 }
 
 pub(crate) fn write_session_upload(
@@ -53,7 +55,7 @@ pub(crate) fn write_session_upload_path(
     bytes: &[u8],
     dedupe: bool,
 ) -> Result<PathBuf> {
-    let Some(relative_path) = normalize_session_upload_relative_path_path(relative_path) else {
+    let Some(relative_path) = normalize_relative_path(relative_path) else {
         return Err(AppError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid upload path",

@@ -12,6 +12,15 @@ use crate::{
 
 use super::SessionStoreHandle;
 
+/// Upper bound on how much already-queued PTY output one attach frame carries.
+///
+/// Batching output chunks is what keeps a large paste from costing one framed
+/// write, JSON encode and base64 pass per 64 KiB read. The cap keeps a batch
+/// well under the IPC line limit once base64 expansion is accounted for, and
+/// keeps the client painting incrementally instead of stalling on one huge
+/// frame.
+const MAX_COALESCED_CHUNK_BYTES: usize = 1024 * 1024;
+
 pub(super) async fn handle_attach_subscribe(
     id: String,
     from_byte_offset: Option<u64>,
@@ -127,6 +136,9 @@ pub(super) async fn handle_attach_subscribe(
         app_cursor_keys,
         bracketed_paste_mode,
     };
+    // Held for the lifetime of the stream so mode changes can be detected with
+    // a relaxed atomic load per chunk instead of a session read lock.
+    let shared_modes = session_store.shared_modes(&id);
 
     let result = async {
         loop {
@@ -222,26 +234,49 @@ pub(super) async fn handle_attach_subscribe(
 
                 chunk = broadcast_rx.recv() => {
                     match chunk {
-                        Ok(filtered_arc) => {
-                            if !filtered_arc.is_empty() {
+                        Ok(mut filtered) => {
+                            // Coalesce every chunk the reader has already
+                            // produced into one IPC frame. A large paste echoes
+                            // back as a burst of 64 KiB reads; forwarding them
+                            // individually costs one framed write, one JSON
+                            // encode and one base64 pass each, which is what
+                            // made pasting feel sluggish.
+                            let mut coalesced: Option<Vec<u8>> = None;
+                            while coalesced.as_ref().map_or(filtered.len(), Vec::len)
+                                < MAX_COALESCED_CHUNK_BYTES
+                            {
+                                let Ok(next) = broadcast_rx.try_recv() else {
+                                    break;
+                                };
+                                let buffer = coalesced
+                                    .get_or_insert_with(|| filtered.as_ref().to_vec());
+                                buffer.extend_from_slice(&next);
+                            }
+                            let batch_len = coalesced
+                                .as_ref()
+                                .map_or(filtered.len(), Vec::len);
+
+                            if batch_len > 0 {
+                                let data = coalesced
+                                    .unwrap_or_else(|| std::mem::take(&mut filtered).into());
                                 ipc::write_response_to_writer(
                                     &mut writer,
                                     RpcResponse::AttachStreamChunk {
                                         offset: current_offset,
-                                        data: filtered_arc.to_vec(),
+                                        data,
                                     },
                                 )
                                 .await?;
                             }
-                            current_offset += filtered_arc.len() as u64;
+                            current_offset += batch_len as u64;
                             trace!(
                                 session_id = %id,
-                                filtered_bytes = filtered_arc.len(),
+                                filtered_bytes = batch_len,
                                 current_offset,
                                 "forwarded live PTY output over IPC stream"
                             );
 
-                            if let Some(modes) = session_store.get_mode_snapshot(&id) {
+                            if let Some(modes) = shared_modes.as_ref().map(|shared| shared.load()) {
                                 if modes != last_modes {
                                     debug!(
                                         session_id = %id,

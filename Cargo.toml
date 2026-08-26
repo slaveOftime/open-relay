@@ -40,6 +40,7 @@ async-trait = "0.1"
 interprocess = { version = "2.4", features = ["tokio"] }
 portable-pty = "0.9"
 regex = "1"
+memchr = "2"
 notify-rust = "4.14.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -49,6 +50,8 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 dirs = "6.0"
 thiserror = "2.0"
 crossterm = "0.29"
+ratatui = "0.30"
+unicode-width = "0.2"
 vt100 = "0.16.2"
 which = "8.0.2"
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
@@ -68,8 +71,6 @@ base64 = "0.22"
 argon2 = "0.5"
 rpassword = "7"
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
-mimalloc = { version = "0.1.48", features = ["v3"] }
-libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
 bytes = "1"
 arc-swap = "1.9.1"
 parking_lot = "0.12"
@@ -78,6 +79,13 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 gpui = { version = "0.2.2", optional = true }
 gpui-terminal = { version = "0.1.0", optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+mimalloc = { version = "0.1.48", features = ["v3"] }
+libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Environment", "Win32_System_Kernel", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

@@ -1,8 +1,7 @@
-// ---------------------------------------------------------------------------
-// ResizeSubscriber — encapsulates resize broadcast reception with
-// self-echo suppression so that each attach handler doesn't need to
-// duplicate the same `tokio::select!` branch + tracking logic.
-// ---------------------------------------------------------------------------
+//! Resize broadcast reception with self-echo suppression.
+//!
+//! Encapsulated here so each attach handler does not duplicate the same
+//! `tokio::select!` branch and tracking logic.
 
 use tokio::sync::broadcast;
 use tracing::debug;

@@ -18,7 +18,7 @@
 4. [PtyHandle — Ownership Boundary](#4-ptyhandle--ownership-boundary)
 5. [Reader & Writer Threads](#5-reader--writer-threads)
 6. [Snapshot & Replay](#6-snapshot--replay)
-7. [Mode Tracking (ModeTracker)](#7-mode-tracking-modetracker)
+7. [Mode Tracking](#7-mode-tracking)
 8. [Escape Sequence Pipeline](#8-escape-sequence-pipeline)
 9. [Streaming Attach Protocol](#9-streaming-attach-protocol)
 10. [Multi-Client Attach](#10-multi-client-attach)
@@ -56,7 +56,7 @@ Design principles:
 - **Attach tracking**: `SessionStore` tracks live attach presence separately
   from PTY lifetime so clients can disconnect and reconnect without killing the
   session.
-- **Deferred cleanup**: completed sessions keep their ring buffer and persisted
+- **Deferred cleanup**: completed sessions keep their rendered screen and persisted
   output available until eviction.
 - **Single shared PTY size**: the PTY adopts the most recent successful resize
   request; per-client size aggregation remains future work.
@@ -73,11 +73,11 @@ Design principles:
                     ┌────▼────┐
                     │ Spawned │  PtyHandle created
                     │         │  Reader/writer threads started
-                    │         │  Ring buffer empty
+                    │         │  Screen + log empty
                     └────┬────┘
                          │
               ┌──────────▼──────────┐
-              │      Running        │  PTY output → ring + broadcast
+              │      Running        │  PTY output → screen + log + broadcast
               │                     │  Input accepted from clients
               │  ┌───────────────┐  │
               │  │  Attach(ed)   │◄─┼── IPC / WebSocket / node proxy
@@ -87,7 +87,7 @@ Design principles:
                          │  Child exits (SIGCHLD / WaitForSingleObject)
                     ┌────▼────┐
                     │ Exited  │  Exit code captured
-                    │         │  Ring buffer preserved (replayable)
+                    │         │  Screen + log preserved (replayable)
                     │         │  No more input accepted
                     └────┬────┘
                          │  Grace period / eviction
@@ -115,29 +115,44 @@ Design principles:
 ```text
 src/session/
 ├── mod.rs              Session types (SessionMeta, SessionStatus, StartSpec)
-├── pty.rs              PTY ownership + escape sequence handling (this doc)
+├── pty.rs              PTY ownership + terminal semantics (this doc)
 │   ├── PtyHandle       Master fd, child, writer channel
 │   ├── RuntimeChild    Child process wrapper
-│   ├── EscapeFilter    CPR/DSR/OSC response stripper
-│   ├── TerminalQuery   Query pattern matching & response generation
-│   ├── has_visible_content()
-│   └── extract_query_responses_no_client()
-├── cursor_tracker.rs   Approximate cursor position tracker for CPR replies
-│   └── CursorTracker   CSI/printable-text based cursor model
-├── mode_tracker.rs     Byte-level DEC private mode state machine
-│   ├── ModeTracker     Parser state machine
-│   └── ModeSnapshot    Current mode values
+│   ├── TerminalQuery   Probes the daemon answers, plus reply generation
+│   └── TerminalSignals Retained title / progress / cursor-shape notifications
+├── scan.rs             Single-pass byte-level PTY output scanner
+│   ├── PtyScanner      VT state machine: filter + probes + signals + activity
+│   └── ScanOut         Reused output buffers for one scan call
 ├── resize.rs           Resize broadcast helper for attach handlers
 │   └── ResizeSubscriber  Self-echo suppression for resize notifications
-├── runtime.rs          SessionRuntime (ring + broadcast + pty + meta)
-│   ├── spawn_session() PTY spawn + thread creation
-│   ├── push_output()   Filtered ring write + raw-mode tracking + persistence
+├── runtime.rs          SessionRuntime (screen + broadcast + pty + meta)
+│   ├── spawn_session() PTY spawn + reader/writer thread creation
+│   ├── push_output()   Screen parse + stream counters + mode publication
+│   ├── SharedModes     Lock-free DECCKM / bracketed-paste mirror
 │   ├── resize_tx       Broadcast channel for resize notifications
-│   └── pty_size        Current PTY dimensions for dedupe + CPR sync
-├── store.rs            SessionStore (session registry, attach/detach/resize)
-├── ring.rs             Fixed-capacity byte ring buffer
-└── persist.rs          Disk persistence (append-only log)
+│   └── pty_size        Current PTY dimensions for dedupe
+├── screen.rs           Screen parser helpers (safe resize, rehydration)
+├── logs/               Reading back the persisted stream
+│   ├── index.rs        Record boundaries, `output.log.idx` sidecar, pagination
+│   └── render.rs       vt100 replay of log bytes into rendered rows
+├── store/              SessionStore, one file per concern
+│   ├── mod.rs          Shared state, constants, `lookup_runtime()`
+│   ├── lifecycle.rs    start / stop / kill / terminate / evict
+│   ├── query.rs        Read-only observation, metadata edits, live-log reads
+│   ├── attach.rs       attach / detach / input / resize (latency-sensitive)
+│   └── notify.rs       Silence detection for push notifications
+├── file.rs             Uploaded-file storage under `sessions/<id>/files/`
+└── persist.rs          Disk persistence (append-only log + OutputLog handle)
 ```
+
+`store.rs` and `logs.rs` are directories rather than single files purely for
+comprehension: each submodule contributes its own `impl SessionStore` block, so
+`SessionStore` remains one type with one public API.
+
+There is no separate `mode_tracker.rs`, `cursor_tracker.rs` or `ring.rs`.
+Terminal modes and the cursor position are read directly from the `vt100`
+screen parser that already models the session, and the retained stream is the
+append-only `output.log` rather than an in-memory ring.
 
 ---
 
@@ -179,19 +194,33 @@ PTY master fds on Linux are pollable with `epoll`, but:
 
 ```text
 std::thread::spawn("pty-reader-{id}") {
+    let mut buf     = vec![0u8; 64 * 1024];   // one read swallows a whole burst
+    let mut scanner = PtyScanner::new();      // carries partial sequences + signals
+    let mut out     = ScanOut::default();     // reused buffers, no steady-state alloc
+    let mut log     = OutputLog::open(dir);   // persistent append handle
+
     loop {
-        let n = master_reader.read(&mut buf[..4096]);
+        let n = master_reader.read(&mut buf);
         if n == 0 || n == Err(_) → break;
 
-        // 1. Answer shared terminal queries before fan-out
-        for resp in extract_query_responses_no_client(&buf, &mut tail, cursor_tracker.position()) {
-            writer_tx.send(resp);  // Write response back to PTY stdin
-        }
+        // 1. ONE pass over the chunk produces everything downstream needs.
+        scanner.scan(&buf[..n], &mut out);
+        //    out.filtered       → the canonical stream
+        //    out.queries        → probes that need a session-global reply
+        //    out.progress_bytes → bytes that are not screen activity
+        //    scanner signals    → title / progress / cursor shape, if changed
 
-        // 2. Derive canonical filtered output, then retain/broadcast it
-        let bytes = Bytes::copy_from_slice(&buf[..n]);
-        let filtered = EscapeFilter::filter(bytes);
-        push_output(bytes, filtered);  // → mode_tracker.process(raw) + ring.push(filtered) + broadcast_tx.send(filtered)
+        // 2. One write lock: screen parse, stream counters, mode publication.
+        let cursor = runtime.write().push_output(&filtered, out.meaningful_bytes());
+
+        // 3. Persist and fan out the same filtered bytes.
+        log.append(&filtered);
+        broadcast_tx.send(filtered);          // Bytes, refcounted, no copy per client
+
+        // 4. Answer the probes that have a session-global reply.
+        for query in out.queries.drain(..) {
+            writer_tx.send(query.response(cursor));
+        }
     }
 }
 ```
@@ -199,6 +228,25 @@ std::thread::spawn("pty-reader-{id}") {
 **Why a blocking thread?**  High-bandwidth PTY output (e.g., `cat /dev/urandom`)
 would starve the Tokio executor if run as an async task.  A dedicated thread
 ensures PTY reads never block other tasks.
+
+**Why one pass?**  The previous pipeline filtered each chunk with ~20 sequential
+`regex::bytes::Regex::replace_all` passes, each allocating a fresh buffer, then
+scanned the raw chunk a second time to extract probes, and scanned the filtered
+chunk a third time to discount progress notifications.  Measured end to end that
+capped the reader at roughly 35 MB/s.  Because a paste is echoed back by the
+child, *every* pasted byte paid that cost, which is exactly why large pastes
+crawled.  The single-pass scanner measures at ~1.7 GB/s on TUI-style output and
+~10 GB/s on plain echoed text.
+
+**Why a 64 KiB buffer?**  Once scanning is cheap, the per-chunk overheads —
+read syscall, write lock, log write, broadcast send, IPC frame — dominate.  A
+larger read collapses a burst into far fewer chunks, and therefore far fewer of
+each of those.
+
+**Why a persistent log handle?**  `OutputLog` keeps `output.log` open in append
+mode for the life of the session instead of reopening it per chunk.  Writes are
+unbuffered, so replay readers (`read_output_from`) still observe bytes as soon
+as the append returns.
 
 ### Writer Thread
 
@@ -215,80 +263,96 @@ Input sources: IPC `AttachInput`, HTTP `POST /sessions/:id/input`, WebSocket
 `input` message.  All go through `SessionStore::attach_input()` which applies
 DECCKM arrow-key transformation before sending to the writer channel.
 
+The writer queue holds 4096 messages.  A bracketed paste arrives as a burst of
+input frames, and a full queue makes the daemon reject input with
+`SessionError::Busy`, which the user experiences as dropped keystrokes; the
+writer drains at PTY speed, so a deep queue costs only memory.
+
 The reader answers terminal capability probes centrally before bytes are fanned
 out to attach clients.  This keeps detached sessions progressing, and it avoids
 leaking probes such as CPR/DSR/DA/DECRPM to the real terminal attached to an
 IPC or WebSocket client.
 
 ---
-
 ## 6) Snapshot & Replay
 
-The ring buffer (`src/session/ring.rs`) is a fixed-capacity circular byte
-buffer (default 1 MiB) that stores the most recent PTY output.
+The retained stream is the append-only `output.log` written by the reader
+thread.  It holds the *canonical filtered stream*: the exact bytes that also
+feed the screen parser and the live broadcast, so every stream offset in the
+system refers to filtered bytes.
 
 ### Replay on Attach
 
-When a client attaches, `attach_subscribe_init()`:
-1. Locks the session store
-2. Reads the ring buffer contents as `Vec<(offset, Bytes)>` chunks
-3. Creates a new `broadcast::Receiver` for live output
-4. Returns the replay chunks + receiver + current mode snapshot
+When a client attaches with an explicit offset, `attach_subscribe_init()`:
+1. Takes a short read lock to clone the session directory and subscribe to the
+   broadcast channel
+2. Reads `output.log` from the requested offset
+3. Returns the replay bytes + end offset + receiver + current mode snapshot
 
-The replay is sent as the `AttachStreamInit` response frame directly from the
-ring buffer.  The ring already stores the canonical filtered stream, so attach
-handlers no longer run their own `EscapeFilter` pass.
+Because the log already stores the canonical filtered stream, attach handlers
+run no filtering of their own.
+
+### Terminal Signal Restore
+
+A fresh attach normally starts from `attach_snapshot_init()`, which renders the
+canonical screen state (`vt100::Screen::state_formatted`) instead of replaying
+history.  That state models only the character grid, cursor and input modes, so
+three one-way signals would be lost on every attach:
+
+| Signal | Sequence | Tracked in |
+|---|---|---|
+| Icon / window title | `OSC 0`, `OSC 1`, `OSC 2` | `TerminalSignals::icon_title` / `window_title` |
+| Progress / busy indicator | `OSC 9;4;<state>;<pct>` | `TerminalSignals::progress` |
+| Cursor shape (DECSCUSR) | `CSI <n> SP q` | `TerminalSignals::cursor_style` |
+
+`PtyScanner` records these as it walks each chunk — the same pass that produces
+the filtered stream — and reports through `take_changed_signals()` whether
+anything actually changed.  The reader copies the new snapshot into
+`SessionRuntime::terminal_signals` only on a change, so the common case costs no
+extra work inside the write lock.  `attach_snapshot_bytes()` appends
+`TerminalSignals::restore_bytes()` after the screen state.  A cleared progress
+indicator (`OSC 9;4;0`) and a default cursor shape (`CSI 0 SP q`) drop their slot
+instead of being replayed as a no-op, and payloads over 1 KiB are ignored so a
+misbehaving child cannot pin memory.
+
+On Windows the attach client repaints from its own canonical parser, so
+`passthrough_signals()` re-extracts the same signals from each live chunk
+(`extract_passthrough_osc_sequences` plus `last_cursor_style_params`) and writes
+them ahead of the repaint.
 
 ### Offset Tracking
 
-Each byte in the ring has a monotonically increasing logical offset.  Clients
-track their current offset to detect gaps (e.g., after broadcast lag).
+Each byte in the log has a monotonically increasing logical offset.  Clients
+track their current offset to detect gaps (e.g., after broadcast lag) and resume
+by re-reading the log from that offset.
 
 ---
 
-## 7) Mode Tracking (ModeTracker)
+## 7) Mode Tracking
 
-`ModeTracker` (`src/session/mode_tracker.rs`) is a byte-level state machine
-that processes raw PTY output and detects DEC private mode changes.
-
-### State Machine
-
-```text
-Normal ──[0x1b]──► Esc
-Esc    ──['[']──► Csi       ──[other]──► Normal
-Csi    ──['?']──► CsiPrivate ──[other]──► Normal
-CsiPrivate ──[digit]──► CsiParam
-CsiParam   ──[digit/';']──► CsiParam (accumulate)
-CsiParam   ──['h']──► process_set() → Normal
-CsiParam   ──['l']──► process_reset() → Normal
-CsiParam   ──[other]──► Normal
-```
-
-### Tracked Modes
-
-| Mode | DEC ID | Set | Reset |
-|---|---|---|---|
-| Application cursor keys (DECCKM) | 1 | `\x1b[?1h` | `\x1b[?1l` |
-| Bracketed paste mode | 2004 | `\x1b[?2004h` | `\x1b[?2004l` |
-
-### Cross-Chunk Correctness
-
-The parser state persists between `process()` calls, so sequences split across
-PTY read boundaries are handled correctly:
-
-```text
-Chunk 1: "output\x1b"     → state = Esc
-Chunk 2: "[?1h"           → detects DECCKM set
-```
-
-### ModeSnapshot
+Terminal modes are **not** tracked by a separate state machine.  The session
+already maintains a full `vt100::Parser` for snapshot rendering, and that parser
+models DEC private modes correctly, including sequences split across PTY read
+boundaries.  `SessionRuntime::mode_snapshot()` simply reads them back:
 
 ```rust
 pub struct ModeSnapshot {
-    pub app_cursor_keys: bool,
-    pub bracketed_paste_mode: bool,
+    pub app_cursor_keys: bool,      // screen.application_cursor()  — DECCKM
+    pub bracketed_paste_mode: bool, // screen.bracketed_paste()     — DEC 2004
 }
 ```
+
+### Lock-Free Publication (`SharedModes`)
+
+Every attach relay has to notice the moment either mode flips, and the natural
+place to check is after each output chunk.  Deriving the snapshot needs the
+session's `RwLock`, and taking it once per chunk per client turned the reader
+thread's lock into a contention point under load.
+
+Instead, `push_output()` packs the two bits into an `AtomicU8`
+(`SessionRuntime::shared_modes`) while it already holds the write lock.  Relays
+clone the `Arc<SharedModes>` once at subscribe time and afterwards poll it with
+a relaxed atomic load — no lock, no allocation.
 
 Used by:
 - `AttachStreamInit` to send initial mode state to clients
@@ -296,41 +360,32 @@ Used by:
 - `attach_input()` to transform arrow keys when DECCKM is active
 
 ---
-
 ## 8) Escape Sequence Pipeline
 
-PTY output passes through several processing stages before reaching clients:
+Every byte the child writes passes through **one** scanner pass
+(`src/session/scan.rs`) before it reaches anything else:
 
 ```text
 PTY master fd
     │
     ▼
-┌─────────────────────────────┐
-│ extract_query_responses_    │  Answers shared terminal queries
-│ no_client()                 │  (CPR/DSR/OSC/DA/XTVERSION/etc.)
-│                             │  Writes responses back to PTY stdin
-│                             │  Prevents detached apps from blocking and
-│                             │  keeps attach clients from answering locally
-└─────────────┬───────────────┘
-              │
-              ▼
-┌─────────────────────────────┐
-│ EscapeFilter                │  Strips CPR/DSR echoes from output
-│                             │  Strips OSC 10/11 color responses
-│                             │  Strips generic OSC sequences
-│                             │  Handles cross-chunk partial sequences
-└─────────────┬───────────────┘
-              │
-              ▼
-┌─────────────────────────────┐
-│ push_output()               │  mode_tracker.process(raw)
-│                             │  Ring buffer append (filtered bytes)
-│                             │  Disk write (same filtered bytes)
-│                             │  broadcast_tx.send(filtered)
-└─────────────┬───────────────┘
-              │
-              ▼
-        Client terminal
+┌───────────────────────────────────────────────────────────────┐
+│ PtyScanner::scan()  — a single byte-level VT state machine    │
+│                                                               │
+│  • bulk-copies runs of plain text (memchr to the next ESC)    │
+│  • strips terminal↔application protocol traffic               │
+│  • collects the probes that need a session-global reply       │
+│  • records title / progress / cursor-shape notifications      │
+│  • counts progress bytes so they are not "screen activity"    │
+│  • carries an incomplete trailing sequence into the next chunk│
+└───────────────────────────┬───────────────────────────────────┘
+                            │  ScanOut { filtered, queries, progress_bytes }
+              ┌─────────────┼─────────────┬──────────────────┐
+              ▼             ▼             ▼                  ▼
+      push_output()   OutputLog     broadcast_tx     query.response()
+      screen parse    append        fan-out          → PTY stdin
+      + counters      output.log    (Bytes)
+      + SharedModes
 ```
 
 This section is the source of truth for terminal query handling and filtered PTY
@@ -338,69 +393,93 @@ output.  The detailed incident catalog for discovered escape-sequence quirks
 lives in
 [`ARCHITECTURE_NOTES.md`](./ARCHITECTURE_NOTES.md#1-architecture-wide-escape-sequence-edge-cases).
 
-### EscapeFilter Details
+### Why a Hand-Written Scanner
 
-ConPTY on Windows echoes terminal device responses (CPR, DSR, OSC color
-queries) back into the master output stream.  `EscapeFilter` now strips these
-once in the PTY reader before bytes are retained in memory, persisted to
-`output.log`, or forwarded to clients.
+The scanner replaced a cascade of roughly twenty
+`regex::bytes::Regex::replace_all` calls, each allocating a fresh buffer, plus a
+separate probe-extraction scan and a separate progress-accounting scan.  Beyond
+the ~50× throughput difference, the single machine also removes a class of
+correctness hazards the cascade had: each regex saw the output of the previous
+one, so a sequence could be created or destroyed by an earlier substitution, and
+ordering between the passes was load-bearing but implicit.
 
-Patterns stripped:
-- **Full CPR**: `\x1b[<row>;<col>R` (with or without `?`)
-- **Bare CPR**: `[<row>;<col>R` (ESC dropped by ConPTY)
-- **DSR/CPR queries**: `\x1b[6n`, `\x1b[5n` (stripped to prevent client
-  terminals from generating their own CPR responses, which would corrupt
-  the child process's stdin via the attach input path)
-- **Bare DSR queries**: `[5n`, `[6n` (ESC dropped by ConPTY)
-- **Private-mode probes**: `\x1b[?<mode>n`, `\x1b[?<mode>$p`
-- **Version / attribute probes**: DA1, DA2, XTVERSION, kitty keyboard queries
-- **Window-size probes**: `\x1b[14t` ... `\x1b[19t`
-- **OSC 10/11 color responses**: `\x1b]10;rgb:xxxx/xxxx/xxxx\x07`
-- **Generic OSC**: `\x1b]<num>;<payload>\x07` (e.g., shell CWD updates)
+`ScanOut` buffers are owned by the reader thread and reused across chunks, so
+steady-state scanning performs no allocation at all.
 
-Cross-chunk handling: `pending` field carries incomplete sequences across
-`filter()` calls.  This handles ConPTY splitting ESC sequences at arbitrary
-byte boundaries.
+### What Is Stripped
 
-### Canonical Filtered Stream
+| Category | Sequences |
+|---|---|
+| Cursor/status reports | `CSI <row>;<col> R`, `CSI ?<row>;<col> R`, `CSI <n> n`, `CSI ?<n> n` |
+| Device attributes | `CSI c`, `CSI <n> c`, `CSI > c`, `CSI = c` and their replies |
+| DEC private mode reports | `CSI ? <mode> $p`, `CSI ? <mode>;<v> $y` |
+| Version probe | `CSI > <n> q` (XTVERSION) |
+| Kitty keyboard | `CSI ? u`, `CSI = <n> u`, `CSI > <n> u`, `CSI < <n> u` |
+| Window-size probes | `CSI 14 t` … `CSI 19 t` (other `CSI <n> t` forms pass through) |
+| String sequences | DCS / APC / PM / SOS payloads (`ESC P`, `ESC _`, `ESC ^`, `ESC X`) |
+| Non-allowlisted OSC | every `OSC <ps>` other than the allowlist below |
 
-`SessionRuntime` keeps raw PTY bytes only long enough to answer terminal
-queries, track modes, and update cursor state.  After that, a single long-lived
-`EscapeFilter` instance produces the canonical filtered stream used for:
-- terminal snapshot updates
-- live broadcast fan-out
-- persisted `output.log`
-- log snapshot and polling reads
+`CSI <n> u` without a private marker is **not** stripped: that is the kitty
+keyboard *stack pop*, a legitimate output sequence.  Only the marked variants
+are probes.
 
-This removes the older per-subscriber filter duplication and makes stream
-offsets refer to filtered bytes rather than raw PTY bytes.
+### Passthrough Allowlist
+
+`OSC 0/1/2` (icon and window title) and `OSC 9;4;…` (progress / busy) are
+one-way notifications and survive the filter.  Only BEL and `ESC \` terminate an
+OSC: a lone backslash is payload, since Windows shells report titles such as
+`C:\Users\me`.
+
+`OSC 9;4` bytes are forwarded to clients but excluded from the meaningful-byte
+count (`ScanOut::meaningful_bytes()`), so a child that only animates a progress
+indicator is still correctly treated as silent by notification logic.  Title
+notifications *do* count as activity.
+
+### ConPTY Bare Forms
+
+Windows ConPTY sometimes drops the introducing `ESC`, so a cursor report can
+arrive as `[35;1R` and a title as `]0;title\x07`.  These escape-less variants are
+recognised **only on Windows** (`BARE_CONPTY_FORMS = cfg!(windows)`).  On Unix
+the same bytes are ordinary program output, and treating them as sequences
+corrupts the rendering of anything that legitimately prints `[12;3R`.  A bare
+form that reaches the allowlist is rewritten into the escaped form before being
+forwarded, since emitting it verbatim is not a valid escape sequence.
+
+### Cross-Chunk Handling
+
+The scanner's `pending` buffer carries an incomplete trailing sequence into the
+next chunk, so a sequence split at any byte boundary is still handled correctly.
+The carried prefix is capped at `MAX_PENDING_ESCAPE_BYTES` (4 KiB): plain text
+that merely looks like the start of a sequence (a line ending in `]12;`, say)
+is flushed verbatim rather than stalling the session's output while `pending`
+grows without bound.
+
+A dedicated test (`chunking_does_not_change_the_result`) re-scans the same input
+at every chunk size from 1 byte upward and asserts the filtered output is
+identical, which is the property the whole design depends on.
 
 ### Query Response Generation
 
-Before PTY bytes are fanned out to attach clients, the daemon scans the stream
-for terminal capability probes and answers the ones that need a shared,
-session-global reply.  This keeps detached applications moving forward and
-prevents attached clients from delegating those probes to the user's real
-terminal.  `extract_query_responses_no_client()` currently handles:
+The daemon answers only the probes whose correct answer is a property of the
+*session*, not of whatever terminal happens to be attached:
 
 | Query | Sequence | Response |
 |---|---|---|
-| Cursor Position Report | `\x1b[6n` | `\x1b[<row>;<col>R` from `CursorTracker` |
-| Device Status Report | `\x1b[5n` | `\x1b[0n` |
-| Foreground color | `\x1b]10;?\x07` | `\x1b]10;rgb:xxxx/xxxx/xxxx\x1b\\` |
-| Background color | `\x1b]11;?\x07` | `\x1b]11;rgb:xxxx/xxxx/xxxx\x1b\\` |
-| Primary device attributes | `\x1b[c` / `\x1b[0c` | `\x1b[?62;c` |
-| Secondary device attributes | `\x1b[>c` / `\x1b[>0c` | `\x1b[>1;0;0c` |
-| XTVERSION | `\x1b[>0q` | `\x1bP>|oly <version>\x1b\\` |
-| DECRPM | `\x1b[?<mode>$p` | `\x1b[?<mode>;2$y` |
-| Kitty keyboard query | `\x1b[?u` | `\x1b[?0u` |
+| Cursor Position Report | `CSI 6 n` | `CSI <row>;<col> R` from the screen parser |
+| Device Status Report | `CSI 5 n` | `CSI 0 n` |
+| Foreground color | `OSC 10 ; ?` | `OSC 10 ; rgb:…` (ST-terminated) |
+| Background color | `OSC 11 ; ?` | `OSC 11 ; rgb:…` (ST-terminated) |
 
-Color responses use `COLORFGBG` env var if set, otherwise default to
-white-on-black.  Window-size-in-pixels probes are filtered out on the attach
-path but are not answered by the daemon today.
+Color responses use the `COLORFGBG` environment variable if set, otherwise
+default to white-on-black.
+
+Device attributes, XTVERSION, DEC private mode reports, kitty keyboard flags and
+window-size-in-pixels probes are **stripped but deliberately not answered**.
+Their answers describe the user's terminal, which the daemon does not know and
+may not have; injecting a guess into the child's stdin corrupts the input stream
+of anything that was not waiting for that reply.
 
 ---
-
 ## 9) Streaming Attach Protocol
 
 All attach paths (IPC, WebSocket, node-proxied) use the same streaming
@@ -410,7 +489,7 @@ protocol.  This was unified from separate polling/streaming implementations.
 
 | Frame | Direction | Purpose |
 |---|---|---|
-| `AttachStreamInit` | Server → Client | Ring buffer replay + initial mode state |
+| `AttachStreamInit` | Server → Client | Screen snapshot or log replay + initial mode state |
 | `AttachStreamChunk` | Server → Client | Incremental PTY output (filtered) |
 | `AttachModeChanged` | Server → Client | Terminal mode transition notification |
 | `AttachResized` | Server → Client | PTY resized by another attached client |
@@ -425,7 +504,7 @@ protocol.  This was unified from separate polling/streaming implementations.
 CLI                              Daemon
  │                                  │
  │──AttachSubscribe────────────────►│
- │                                  │  subscribe to broadcast + ring replay
+ │                                  │  subscribe to broadcast + snapshot/log replay
  │◄──AttachStreamInit──────────────│  (replay bytes + mode snapshot)
  │                                  │
  │◄──AttachStreamChunk─────────────│  (live PTY output, filtered)
@@ -495,7 +574,7 @@ the originating client never receives its own resize back.  Redundant resizes
 If a subscriber falls behind (e.g., slow WebSocket), `RecvError::Lagged` is
 returned.  The handler re-syncs by:
 1. Re-subscribing to the broadcast channel
-2. Reading the full ring buffer as a fresh replay
+2. Re-reading `output.log` from the last acknowledged offset
 3. Continuing from the new end offset
 
 ### Attach Presence Tracking
@@ -540,14 +619,15 @@ The PTY tracks its current dimensions in `SessionRuntime::pty_size`.  Resize
 requests that match the current size are no-ops — neither the PTY nor other
 clients are notified.
 
-### CursorTracker Synchronization
+### Cursor Position Reporting
 
-The PTY reader thread maintains a `CursorTracker` for generating CPR responses.
-After each read is pushed into the runtime, the reader briefly locks
-`SessionRuntime` and syncs the tracker's dimensions from
-`SessionRuntime::pty_size` via `set_size()`.  That keeps subsequent CPR
-responses aligned with the latest successful PTY resize, including resizes that
-originated from another attached client.
+CPR replies are generated from the session's `vt100` screen parser, not from a
+separate approximate cursor model.  `push_output()` returns
+`screen().cursor_position()` after processing the chunk, and the reader uses
+that value for every probe found in the same chunk.  Because the parser is also
+what `safe_resize_parser()` resizes on every successful PTY resize, the reported
+position is automatically consistent with the current PTY dimensions — including
+resizes that originated from another attached client.
 
 ### Race Condition: Rapid Resize
 
@@ -624,10 +704,10 @@ while idle. This is necessary because:
 
 | Failure | Detection | Recovery |
 |---|---|---|
-| Child crashes | `try_wait()` returns exit code | Send `AttachStreamDone`, preserve ring |
+| Child crashes | `try_wait()` returns exit code | Send `AttachStreamDone`, preserve output.log |
 | PTY read failure | Reader thread `read()` returns error | Thread exits, broadcast closed |
 | Client disconnect | IPC/WebSocket `recv()` returns None | `attach_detach()` cleanup |
-| Broadcast lag | `RecvError::Lagged(n)` | Re-subscribe + full ring replay |
+| Broadcast lag | `RecvError::Lagged(n)` | Re-subscribe + replay `output.log` from offset |
 | Writer channel full | `send()` returns error | Input dropped (logged as warning) |
 | IPC connection reset | `read_request` returns error | Client reader task exits |
 | Node proxy disconnect | WebSocket closed | Stream receiver gets None |
@@ -635,8 +715,8 @@ while idle. This is necessary because:
 
 ### Invariants
 
-1. **Ring buffer is always consistent**: Push is atomic (single writer thread)
-2. **Mode state is always consistent**: ModeTracker is only called from the PTY reader's `push_output` path
+1. **Canonical stream is always consistent**: the PTY reader is the single writer — scan, screen update, log append and broadcast happen in that order for every chunk
+2. **Mode state is always consistent**: `TerminalSignals` and `SharedModes` are only updated from the PTY reader's `push_output` path
 3. **Exit code is captured at most once**: `try_wait` → store → done
 4. **Cleanup always runs**: IPC handler has `attach_detach()` in all exit paths
 
@@ -709,19 +789,28 @@ CLI ──AttachInput──► Primary ──proxy_rpc()──► Secondary
    send an immediate resize, so the most recently attached or resized client's
    dimensions are applied; other clients receive a resize notification but
    their local terminal size is not forcefully changed
-3. **No scrollback beyond ring**: Ring is fixed-size; disk persistence is
-   append-only but not queryable for replay
+3. **Unbounded `output.log`**: the retained stream grows for the life of the
+   session; there is no compaction or age-based truncation yet
 4. **Blocking PTY I/O**: 2 threads per session limits to ~hundreds of sessions
-5. **No flow control**: Fast PTY output may overwhelm slow clients (broadcast
-   channel provides buffering but not backpressure)
+5. **No flow control**: fast PTY output may overwhelm slow clients.  Output is
+   batched rather than throttled: relays coalesce every already-queued chunk
+   into one frame (capped at 1 MiB) and slow subscribers that fall off the
+   broadcast channel resync from `output.log`, so nothing is lost — but a client
+   that cannot keep up still cannot slow the child down.
 
 ### Future Work
 
 - **Smallest-client resize**: Track attached client sizes, resize PTY to minimum
 - **Async PTY on Linux**: Use `AsyncFd` for PTY reads on platforms that support
-  it, falling back to threads on Windows
-- **Scrollback API**: Allow clients to request historical output beyond the
-  ring buffer via the persisted append-only log
+  it, falling back to threads on Windows.  The
+  [rmux `PtyIo`](https://github.com/Helvesec/rmux/blob/main/crates/rmux-pty/src/pty.rs)
+  design — a nonblocking master fd exposed via `as_fd()` with `try_read` /
+  `try_write_immediate` — is a good reference for this
+- **Log compaction**: bound `output.log` growth while keeping offset-addressed
+  replay working
+- **Binary attach framing**: attach payloads are base64 inside JSON today
+  (~1.37× wire overhead); a length-prefixed binary frame would remove both the
+  expansion and the encode/decode pass
 - **Structured output parsing**: Detect common patterns (exit codes, prompts)
   in PTY output for enhanced notifications
 - **PTY health monitoring**: Detect hung processes (no output + no child exit)

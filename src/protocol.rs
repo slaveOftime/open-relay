@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -170,6 +170,8 @@ pub enum RpcRequest {
         id: String,
         title: Option<String>,
         tags: Option<Vec<String>>,
+        #[serde(default)]
+        notifications_enabled: Option<bool>,
     },
     NotifySet {
         id: String,
@@ -374,6 +376,8 @@ pub enum RpcResponse {
         output: Vec<u8>,
         #[serde(default)]
         resizes: Vec<LogResize>,
+        #[serde(default)]
+        status: Option<String>,
     },
     LogsPagination {
         offset: usize,
@@ -566,6 +570,12 @@ pub struct SessionSummary {
     pub node: Option<String>,
     pub last_total_bytes: u64,
     pub last_output_epoch: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub attach_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

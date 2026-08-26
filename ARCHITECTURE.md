@@ -67,7 +67,7 @@ Primary references:
                                       +--------+---------------------+
                                       | Session Store + Runtime      |
                                       | - PTY child process          |
-                                      | - ring buffer / polling      |
+                                      | - screen + log + broadcast   |
                                       | - resize/input/stop          |
                                       +--------+---------------------+
                                                |
@@ -97,13 +97,18 @@ Primary references:
   - `src/daemon/auth.rs` - password prompt and no-auth safety confirmation helpers.
   - `src/ipc.rs` - envelope protocol and transport framing.
 - **Session subsystem**
-  - `src/session/pty.rs` - PTY ownership (PtyHandle), escape filtering, terminal query handling.
-  - `src/session/cursor_tracker.rs` - cursor position approximation for CPR responses.
-  - `src/session/mode_tracker.rs` - byte-level DEC private mode state machine.
-  - `src/session/runtime.rs` - SessionRuntime: ring + broadcast + pty + meta + spawn.
-  - `src/session/store.rs` - in-memory registry, attach/detach, input, resize, stop.
-  - `src/session/ring.rs` - fixed-capacity byte ring buffer.
-  - `src/session/persist.rs` - append logs/events on disk.
+  - `src/session/pty.rs` - PTY ownership (PtyHandle), terminal query/notification types.
+  - `src/session/scan.rs` - single-pass PTY output scanner (filter + probes + signals + activity).
+  - `src/session/runtime.rs` - SessionRuntime: screen + broadcast + pty + meta + spawn.
+  - `src/session/store/` - in-memory registry, split by concern: `lifecycle.rs`
+    (start/stop/kill/evict), `query.rs` (read-only observation + metadata),
+    `attach.rs` (attach/detach/input/resize), `notify.rs` (silence detection).
+  - `src/session/screen.rs` - screen parser helpers (safe resize, snapshot rehydration).
+  - `src/session/logs/` - `index.rs` (record boundaries, `output.log.idx`, paging)
+    and `render.rs` (vt100 replay of the persisted stream).
+  - `src/session/persist.rs` - append logs/events on disk (`OutputLog` append handle).
+  - `src/session/file.rs` - uploaded-file storage inside a session directory.
+  - `src/session/resize.rs` - resize broadcast helper with self-echo suppression.
   - `src/session/mod.rs` - shared types.
 - **Persistence + storage**
   - `src/db.rs` - SQL access layer (sessions, push subscriptions, API keys).
@@ -172,7 +177,7 @@ Primary references:
 
 ## 5) Data and State Model
 
-- **In-memory:** active session runtime handles, ring buffers, polling cursors.
+- **In-memory:** active session runtime handles, rendered `vt100` screens, broadcast channels.
 - **Durable:**
   - SQLite tables:
     - `sessions`
@@ -193,8 +198,8 @@ At the system level, the important boundaries are:
 
 - The daemon owns PTY allocation and the child process lifecycle through the
   session runtime.
-- `SessionRuntime` retains filtered PTY output in the ring buffer, persists it
-  to disk, and broadcasts live chunks to attach clients.
+- `SessionRuntime` retains filtered PTY output in the append-only `output.log`,
+  and broadcasts live chunks to attach clients.
 - `SessionStore` mediates input, resize, attach/detach, and stop operations for
   the rest of the system.
 - IPC, WebSocket, and node-proxied clients all consume the same PTY-backed
@@ -254,8 +259,8 @@ Client                            Daemon
   |                                 |
   |-- AttachStream(id, cols, rows) ->|
   |                                 |  lock session
-  |                                 |  read ring buffer
-  |<- AttachStreamInit(data, modes) -|  (initial_data = ring replay)
+  |                                 |  read screen snapshot or log
+  |<- AttachStreamInit(data, modes) -|  (snapshot or log replay)
   |                                 |
   |  [child emits output]           |
   |<-- AttachData(chunk) -----------|
@@ -315,7 +320,7 @@ All WebSocket messages are JSON text frames.  Binary PTY data is base64-encoded.
 
 | `type` field | Additional fields | Description |
 |---|---|---|
-| `init` | `data` (base64), `appCursorKeys`, `bracketedPasteMode` | Ring replay + initial mode state |
+| `init` | `data` (base64), `appCursorKeys`, `bracketedPasteMode` | Screen snapshot or log replay + initial mode state |
 | `data` | `data` (base64) | Incremental PTY output (CPR/OSC filtered) |
 | `mode_changed` | `appCursorKeys`, `bracketedPasteMode` | Live terminal mode update |
 | `session_ended` | `exit_code` | Child process exited |
@@ -331,17 +336,17 @@ Browser                           Daemon
   |                                 |
   |                                 |  attach_subscribe_init():
   |                                 |    lock session
-  |                                 |    read ring buffer
+  |                                 |    read screen snapshot or log
   |                                 |    subscribe to broadcast_tx
   |                                 |    read ModeSnapshot
-  |<-- { type: "init", data, modes } |  ← base64 ring replay + modes
+  |<-- { type: "init", data, modes } |  ← base64 snapshot replay + modes
   |  xterm.js writes replay          |
   |                                 |
   |  [broadcast_rx receives chunks] |
   |<-- { type: "data", data } -------|  ← live output (already source-filtered)
   |<-- { type: "data", data } -------|
   |                                 |
-  |  [ModeTracker detects change]    |
+  |  [SharedModes flips]             |
   |<-- { type: "mode_changed" } -----|  ← when child toggles DECCKM/BP
   |                                 |
   |--- { type: "input", data } ---->|  ← DECCKM transform applied
@@ -358,7 +363,7 @@ Browser                           Daemon
 
 **Resize ordering**: The client MUST NOT send `resize` before it receives `init`.  Sending resize first causes the child to emit a full-screen repaint (`\x1b[2J` + cursor home) that races with and blanks the initial terminal snapshot.
 
-**CPR/OSC filtering**: `EscapeFilter` now runs once in the PTY reader before bytes enter the ring buffer, broadcast stream, or persisted log. Attach handlers forward the already-filtered canonical stream directly.
+**CPR/OSC filtering**: `PtyScanner` runs once in the PTY reader, in a single pass, before bytes reach the screen parser, the broadcast stream or the persisted log. Attach handlers forward the already-filtered canonical stream directly. See [`ARCHITECTURE_PTY.md` §8](./ARCHITECTURE_PTY.md#8-escape-sequence-pipeline).
 
 ---
 
@@ -511,7 +516,6 @@ Config file: `<state_dir>/config.toml` (created on first run with defaults).
 |---|---|---|---|
 | `port` | `u16` | `7703` | HTTP API listen port |
 | `bind` | `string` | `"127.0.0.1"` | HTTP bind address |
-| `ring_capacity_bytes` | `usize` | `524288` | Per-session ring buffer size (bytes) |
 | `log_max_bytes` | `usize` | `10485760` | Max `output.log` size before rotation |
 | `auth_enabled` | `bool` | `true` | Require API key for all HTTP requests |
 | `tls_cert` | `path` | `""` | Path to TLS certificate (PEM) |
