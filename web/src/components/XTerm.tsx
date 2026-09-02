@@ -23,7 +23,7 @@ const TERMINAL_FONT_VARIANTS = [
 // Joystick-style scroll handle tuning: drag offset beyond the deadzone
 // scrolls continuously, with speed proportional to the offset distance.
 const SCROLL_DRAG_DEADZONE_PX = 8
-const SCROLL_LINES_PER_SECOND_PER_PX = 5
+const SCROLL_LINES_PER_SECOND_PER_PX = 2
 
 function loadEmbeddedTerminalFont(): Promise<void> {
   if (typeof document === 'undefined' || !('fonts' in document)) {
@@ -555,7 +555,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         onPointerCancel={handleScrollDragEnd}
         onContextMenu={(event) => event.preventDefault()}
         className={cn(
-          'absolute right-0 bottom-80 z-10 flex h-12 w-8 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/80 text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
+          'absolute right-2 bottom-80 z-10 flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/80 text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
           scrollDragActive ? 'opacity-90' : 'opacity-50'
         )}
       >
