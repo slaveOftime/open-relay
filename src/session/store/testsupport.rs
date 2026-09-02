@@ -48,7 +48,8 @@ pub(super) fn make_runtime(
     };
 
     let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
-    let mut screen_parser = vt100::Parser::new(24, 80, 0);
+    let mut screen_parser =
+        vt100::Parser::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS);
     if !excerpt.is_empty() {
         screen_parser.process(excerpt.as_bytes());
     }
@@ -82,6 +83,7 @@ pub(super) fn make_runtime(
         last_notified_at: None,
         notified_output_epoch: None,
         screen_parser,
+        screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         terminal_signals: Default::default(),
         shared_modes: Default::default(),
         output_closed: false,
@@ -213,7 +215,8 @@ pub(super) fn make_runtime_writable_with_capacity(
         attach_count: 0,
         last_notified_at: None,
         notified_output_epoch: None,
-        screen_parser: vt100::Parser::new(24, 80, 0),
+        screen_parser: vt100::Parser::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS),
+        screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         terminal_signals: Default::default(),
         shared_modes: Default::default(),
         output_closed: false,
@@ -243,6 +246,7 @@ pub(super) fn make_test_config(max_running_sessions: usize) -> AppConfig {
         info_file: PathBuf::from("."),
         lock_file: PathBuf::from("."),
         max_running_sessions,
+        screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         notification_hook: None,
     }
 }

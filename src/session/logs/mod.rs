@@ -19,7 +19,7 @@ mod tests;
 use crate::protocol::LogResize;
 
 pub use index::{read_persisted_log_page, read_resize_events, split_rendered_log_output};
-pub use render::{render_log_file, render_screen};
+pub use render::{render_log_file, render_screen, render_screen_history};
 
 /// Terminal dimensions a caller wants the log replayed at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

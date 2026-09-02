@@ -51,15 +51,7 @@ pub fn render_screen(
     keep_color: bool,
     term_cols: u16,
 ) -> Vec<u8> {
-    let screen = parser.screen();
-    let content_rows: Vec<Vec<u8>> = if keep_color {
-        screen.rows_formatted(0, term_cols).collect()
-    } else {
-        screen
-            .rows(0, term_cols)
-            .map(|row| row.into_bytes())
-            .collect()
-    };
+    let content_rows = collect_rows(parser.screen(), keep_color, term_cols);
     let rows = if let Some((first, last)) = content_bounds(&content_rows) {
         let visible_rows = &content_rows[first..=last];
         let skip = visible_rows.len().saturating_sub(tail);
@@ -68,6 +60,35 @@ pub fn render_screen(
         Vec::new()
     };
     format_rows_for_output(&rows, keep_color)
+}
+
+/// Render up to `tail` of the parser's retained scrollback rows as formatted
+/// `\n`-terminated lines, for seeding a freshly attached terminal's
+/// scrollback.  Only scrolled-off rows are included: the visible screen is
+/// covered by the attach snapshot, so seeding it would duplicate content in
+/// the client's scrollback.  Rows keep the session's PTY width so the
+/// attaching terminal wraps them natively.  Returns `None` when nothing has
+/// scrolled off yet.
+pub fn render_screen_history(screen: &vt100::Screen, tail: usize) -> Option<Vec<u8>> {
+    let rows = crate::session::screen::scrollback_rows(screen);
+    // Trim surrounding blank rows before applying the tail limit so padding
+    // (e.g. blank rows scrolled off by empty prompts) does not crowd out
+    // content rows.
+    let (first, last) = content_bounds(&rows)?;
+    let rows = &rows[first..=last];
+    let skip = rows.len().saturating_sub(tail);
+    Some(format_rows_for_output(&rows[skip..], true))
+}
+
+fn collect_rows(screen: &vt100::Screen, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
+    if keep_color {
+        screen.rows_formatted(0, term_cols).collect()
+    } else {
+        screen
+            .rows(0, term_cols)
+            .map(|row| row.into_bytes())
+            .collect()
+    }
 }
 
 /// Parse raw log bytes through a virtual terminal and collect
@@ -174,7 +195,9 @@ fn process_bytes_with_resizes(
             parser.process(&bytes[processed..resize_offset]);
             processed = resize_offset;
         }
-        safe_resize_parser(parser, resize.rows, resize.cols);
+        // Log replay parsers keep no scrollback: the replay only needs the
+        // final visible state at each size.
+        safe_resize_parser(parser, resize.rows, resize.cols, 0);
     }
 
     if processed < bytes.len() {

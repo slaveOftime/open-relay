@@ -4,6 +4,9 @@ use serde::Deserialize;
 
 use crate::error::Result;
 
+/// Default for [`AppConfig::screen_scrollback_rows`].
+pub const DEFAULT_SCREEN_SCROLLBACK_ROWS: usize = 5000;
+
 /// Default prompt patterns used to detect interactive prompts in terminal output.
 /// These are intentionally broad to cover common shells, REPLs, and CLI tools.
 ///
@@ -62,6 +65,11 @@ pub struct AppConfig {
     pub silence_seconds: u64,
     pub session_eviction_seconds: u64,
     pub max_running_sessions: usize,
+    /// Rows of scrolled-off output each session's live screen parser retains
+    /// in memory, rendered as scrollback history for freshly attaching
+    /// clients.  vt100 only keeps scrollback for the main screen, so
+    /// alternate-screen TUIs are unaffected.
+    pub screen_scrollback_rows: usize,
     /// Optional path to an executable invoked on every local OS notification.
     /// If this is provided, the default local notification mechanism is disabled and this hook is used instead.
     pub notification_hook: Option<String>,
@@ -79,6 +87,7 @@ struct AppConfigOverrides {
     web_push_proxy: Option<String>,
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
+    screen_scrollback_rows: Option<usize>,
     /// Path to an executable invoked on every local OS notification.
     /// Event data is provided via environment variables (OLY_EVENT_*).
     notification_hook: Option<String>,
@@ -126,6 +135,9 @@ impl AppConfig {
             .unwrap_or_else(|| "open-relay.oly.sock".to_string());
 
         let max_running_sessions = overrides.max_running_sessions.unwrap_or(50);
+        let screen_scrollback_rows = overrides
+            .screen_scrollback_rows
+            .unwrap_or(DEFAULT_SCREEN_SCROLLBACK_ROWS);
         let notification_hook = overrides
             .notification_hook
             .and_then(normalize_optional_string);
@@ -150,6 +162,7 @@ impl AppConfig {
             state_dir,
             sessions_dir,
             max_running_sessions,
+            screen_scrollback_rows,
             notification_hook,
         })
     }
@@ -324,6 +337,7 @@ mod tests {
             silence_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 50,
+            screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: Some("config-hook".to_string()),
         }
     }
@@ -382,5 +396,15 @@ mod tests {
         );
 
         assert_eq!(resolved.as_deref(), Some("http://config:8000"));
+    }
+
+    #[test]
+    fn screen_scrollback_rows_override_deserializes() {
+        let overrides: super::AppConfigOverrides =
+            serde_json::from_str(r#"{"screen_scrollback_rows": 250}"#).expect("parse override");
+        assert_eq!(overrides.screen_scrollback_rows, Some(250));
+
+        let empty: super::AppConfigOverrides = serde_json::from_str("{}").expect("parse empty");
+        assert_eq!(empty.screen_scrollback_rows, None);
     }
 }

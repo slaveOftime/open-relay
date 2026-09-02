@@ -177,7 +177,7 @@ Primary references:
 
 ## 5) Data and State Model
 
-- **In-memory:** active session runtime handles, rendered `vt100` screens, broadcast channels.
+- **In-memory:** active session runtime handles, rendered `vt100` screens (including a bounded scrollback of scrolled-off rows per session — `screen_scrollback_rows`, default 5000 — used to seed an attaching terminal's history), broadcast channels.
 - **Durable:**
   - SQLite tables:
     - `sessions`
@@ -241,7 +241,7 @@ Responses on the same socket use the same `id`.  Long-running operations (attach
 |---|---|---|
 | `SessionStarted` | `session_id` | Confirmation of start |
 | `SessionList` | `sessions[]` | Array of session summaries |
-| `AttachStreamInit` | `initial_data` (base64), `app_cursor_keys`, `bracketed_paste_mode` | First frame of streaming attach |
+| `AttachStreamInit` | `initial_data` (base64), `app_cursor_keys`, `bracketed_paste_mode`, `scrollback` (base64, optional) | First frame of streaming attach |
 | `AttachData` | `data` (base64) | Incremental PTY output chunk |
 | `AttachModeChanged` | `app_cursor_keys`, `bracketed_paste_mode` | Live terminal mode update |
 | `AttachPollResult` | `data` (base64), `cursor` | Polling attach result |
@@ -260,7 +260,9 @@ Client                            Daemon
   |-- AttachStream(id, cols, rows) ->|
   |                                 |  lock session
   |                                 |  read screen snapshot or log
-  |<- AttachStreamInit(data, modes) -|  (snapshot or log replay)
+  |<- AttachStreamInit(data, modes, -|  (snapshot or log replay, plus a
+  |    scrollback)                  |   rendered scrollback seed for
+  |                                 |   non-alternate-screen sessions)
   |                                 |
   |  [child emits output]           |
   |<-- AttachData(chunk) -----------|
@@ -524,6 +526,7 @@ Config file: `<state_dir>/config.toml` (created on first run with defaults).
 | `federation.api_key` | `string` | `""` | API key for primary node auth |
 | `notification.vapid_public` | `string` | `""` | VAPID public key for Web Push |
 | `notification.vapid_private` | `string` | `""` | VAPID private key for Web Push |
+| `screen_scrollback_rows` | `usize` | `5000` | Rows of scrolled-off output each live session retains in memory, rendered as history for freshly attaching clients |
 
 CLI flags (`oly --help`) override all config file values.
 

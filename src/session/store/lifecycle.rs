@@ -88,8 +88,14 @@ impl SessionStore {
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
-        let runtime = match spawn_session(&mut meta, session_dir, rows, cols, notifications_enabled)
-        {
+        let runtime = match spawn_session(
+            &mut meta,
+            session_dir,
+            rows,
+            cols,
+            notifications_enabled,
+            config.screen_scrollback_rows,
+        ) {
             Ok(runtime) => runtime,
             Err(err) => {
                 let _ = store_handle.abort_started_session(&session_id).await;

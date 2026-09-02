@@ -85,7 +85,9 @@ impl AttachRenderer {
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
-        crate::session::screen::safe_resize_parser(&mut self.parser, rows, cols);
+        // The attach renderer repaints only the visible screen, so it keeps
+        // no scrollback of its own.
+        crate::session::screen::safe_resize_parser(&mut self.parser, rows, cols, 0);
         self.needs_full_repaint = true;
     }
 }
@@ -147,17 +149,29 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
     // Receive the init frame.
     let init = ipc::read_checked_response_from_reader(&mut reader).await?;
-    let (initial_data, mut running, mut child_bracketed_paste_mode, mut child_app_cursor_keys) =
-        match init {
-            RpcResponse::AttachStreamInit {
-                data,
-                running,
-                bracketed_paste_mode,
-                app_cursor_keys,
-                ..
-            } => (data, running, bracketed_paste_mode, app_cursor_keys),
-            _ => return Err(AppError::Protocol("unexpected response type".to_string())),
-        };
+    let (
+        initial_data,
+        scrollback_seed,
+        mut running,
+        mut child_bracketed_paste_mode,
+        mut child_app_cursor_keys,
+    ) = match init {
+        RpcResponse::AttachStreamInit {
+            data,
+            scrollback,
+            running,
+            bracketed_paste_mode,
+            app_cursor_keys,
+            ..
+        } => (
+            data,
+            scrollback,
+            running,
+            bracketed_paste_mode,
+            app_cursor_keys,
+        ),
+        _ => return Err(AppError::Protocol("unexpected response type".to_string())),
+    };
 
     // When stdio is piped, interactive terminal control fails across platforms,
     // so fall back to a plain stream replay instead of raw-mode attach.
@@ -190,9 +204,16 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         let (cols, rows) = initial_size.unwrap_or_else(|| terminal::size().unwrap_or((80, 24)));
         let mut last_sent_size = (cols, rows);
 
-        // Clear the visible screen and home the cursor before writing
-        // snapshot data so the restored screen starts from a known state.
-        write_bytes_to_stdout(b"\x1b[H\x1b[2J")?;
+        if scrollback_seed.is_empty() {
+            // Clear the visible screen and home the cursor before writing
+            // snapshot data so the restored screen starts from a known state.
+            write_bytes_to_stdout(b"\x1b[H\x1b[2J")?;
+        } else {
+            // Print the session's recent history so the terminal scrollbar
+            // reaches back past the attach point, then push it into
+            // scrollback; the snapshot repaints the now-blank screen.
+            write_bytes_to_stdout(&scrollback_seed_bytes(&scrollback_seed, rows))?;
+        }
 
         #[cfg(windows)]
         let mut renderer = AttachRenderer::new(rows, cols);
@@ -640,6 +661,28 @@ fn can_use_interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
+/// Bytes that land `seed` (daemon-rendered, `\n`-terminated scrollback rows)
+/// in the terminal's scrollback and leave a blank visible screen for the
+/// snapshot repaint.
+///
+/// Raw mode is active, so `\n` does not imply a carriage return and every
+/// seeded row needs an explicit CRLF. `rows` padding newlines then scroll
+/// every seeded row above the visible area — unlike ED 2 (`\x1b[2J`), whose
+/// effect on scrollback varies between terminals, plain scrolling works
+/// everywhere — and `\x1b[H` homes the cursor for the snapshot.
+fn scrollback_seed_bytes(seed: &[u8], rows: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(seed.len() + usize::from(rows) + 8);
+    for &byte in seed {
+        if byte == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+    }
+    out.resize(out.len() + usize::from(rows), b'\n');
+    out.extend_from_slice(b"\x1b[H");
+    out
+}
+
 fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
     let mut stdout = std::io::stdout();
     stdout.write_all(data)?;
@@ -891,6 +934,22 @@ fn is_ctrl_d(key: KeyEvent) -> bool {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    #[test]
+    fn scrollback_seed_uses_crlf_and_scrolls_every_seeded_row_into_history() {
+        let bytes = scrollback_seed_bytes(b"line one\nline two\n\x1b[0m", 3);
+        assert_eq!(
+            bytes,
+            b"line one\r\nline two\r\n\x1b[0m\n\n\n\x1b[H".as_slice()
+        );
+    }
+
+    #[test]
+    fn scrollback_seed_leaves_blank_screen_without_ed2() {
+        let bytes = scrollback_seed_bytes(b"only\n", 2);
+        assert!(!bytes.windows(4).any(|window| window == b"\x1b[2J"));
+        assert!(bytes.ends_with(b"\x1b[H"));
+    }
 
     // -----------------------------------------------------------------------
     // Helper constructors

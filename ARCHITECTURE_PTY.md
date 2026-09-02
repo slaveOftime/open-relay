@@ -320,6 +320,41 @@ On Windows the attach client repaints from its own canonical parser, so
 (`extract_passthrough_osc_sequences` plus `last_cursor_style_params`) and writes
 them ahead of the repaint.
 
+### Scrollback Seeding
+
+The snapshot restores only the visible screen, so a freshly attached
+terminal's scrollbar would start empty — and on Windows the canonical repaint
+never writes to the real scrollback at all.  For sessions **not** in the
+alternate screen, the daemon therefore appends a `scrollback` field to
+`AttachStreamInit`, gated on the subscribe carrying terminal dimensions so
+piped attaches stay byte-exact.  Alternate-screen sessions skip seeding
+because rows that scrolled off there are not linear history.
+
+The seed holds only scrolled-off rows, at most the attaching client's own
+screen height — the visible screen is excluded because the snapshot already
+covers it, and seeding it would duplicate content in the client's scrollback.
+The attached view thus reads like a natively run CLI: up to one screenful of
+history above the live screen.
+
+The seed is rendered from the session's live `vt100` parser, which retains
+scrolled-off rows in memory — bounded by the `screen_scrollback_rows` config
+key (default 5000) — while the persisted `output.log` stays the authoritative
+full history.  vt100 keeps
+scrollback only for the main grid, so alternate-screen TUIs cost nothing, and
+it exposes retained rows only through the viewing offset (one screenful per
+view), which is why `scrollback_rows()` pages through the offset.  Resizes
+rebuild the parser from its state snapshot, so `safe_resize_parser()` first
+re-feeds the retained rows as plain lines to carry them into the new parser's
+scrollback; because the alternate grid's scrollback is inaccessible while a
+TUI is active, a resize during a full-screen TUI drops the pre-TUI history.
+
+The CLI prints the seed before the snapshot: each row is CRLF-terminated
+(raw mode disables ONLCR), then a screenful of padding newlines scrolls every
+seeded row into the real scrollback.  Plain scrolling is used instead of ED 2
+because `\x1b[2J`'s effect on scrollback differs between terminals; the
+seeded rows read continuously into the repainted live screen, matching how
+the child would have looked had it run directly in the user's terminal.
+
 ### Offset Tracking
 
 Each byte in the log has a monotonically increasing logical offset.  Clients

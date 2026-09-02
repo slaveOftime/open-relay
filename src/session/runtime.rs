@@ -123,6 +123,9 @@ pub struct SessionRuntime {
     pub notified_output_epoch: Option<Instant>,
     /// Live rendered terminal state for attach snapshot restoration.
     pub screen_parser: vt100::Parser,
+    /// How many scrolled-off rows `screen_parser` retains; applied at spawn
+    /// and on every resize rebuild.  From `AppConfig::screen_scrollback_rows`.
+    pub screen_scrollback_rows: usize,
     /// Window/icon title, progress and cursor-shape notifications the session
     /// last emitted. The screen parser does not model these, so the reader
     /// thread's scanner tracks them and publishes them here for attach
@@ -402,7 +405,12 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
-            safe_resize_parser(&mut self.screen_parser, rows, cols);
+            safe_resize_parser(
+                &mut self.screen_parser,
+                rows,
+                cols,
+                self.screen_scrollback_rows,
+            );
             self.resize_history.push(LogResize {
                 offset: self.raw_total_bytes,
                 rows,
@@ -443,6 +451,7 @@ pub fn spawn_session(
     rows: u16,
     cols: u16,
     notifications_enabled: bool,
+    screen_scrollback_rows: usize,
 ) -> Result<Arc<RwLock<SessionRuntime>>> {
     let full_dir = session_dir;
     let reader_dir = full_dir.clone();
@@ -582,7 +591,8 @@ pub fn spawn_session(
         attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
-        screen_parser: vt100::Parser::new(rows, cols, 0),
+        screen_parser: vt100::Parser::new(rows, cols, screen_scrollback_rows),
+        screen_scrollback_rows,
         terminal_signals: TerminalSignals::default(),
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
@@ -986,7 +996,8 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            screen_parser: vt100::Parser::new(24, 80, 0),
+            screen_parser: vt100::Parser::new(24, 80, 1000),
+            screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
             shared_modes: Default::default(),
             output_closed: false,
@@ -1333,7 +1344,8 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            screen_parser: vt100::Parser::new(24, 80, 0),
+            screen_parser: vt100::Parser::new(24, 80, 1000),
+            screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
             shared_modes: Default::default(),
             output_closed: false,

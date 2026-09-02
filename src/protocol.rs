@@ -343,6 +343,14 @@ pub enum RpcResponse {
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
+        /// Rendered scrolled-off rows (color, `\n`-terminated), at most the
+        /// client's screen height, which a CLI client prints before the
+        /// snapshot so the terminal scrollbar covers pre-attach history.
+        /// The visible screen is excluded (the snapshot covers it).  Empty
+        /// for alternate-screen sessions, sessions with no scrolled-off rows,
+        /// piped attaches, and older daemons.
+        #[serde(default, with = "base64_bytes")]
+        scrollback: Vec<u8>,
     },
     /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
     AttachStreamChunk {
@@ -500,6 +508,33 @@ pub enum NodeWsMessage {
 #[cfg(test)]
 mod tests {
     use super::{NodeWsMessage, decode_node_ws_payload, encode_node_ws_payload};
+
+    #[test]
+    fn attach_stream_init_without_scrollback_defaults_to_empty() {
+        // Daemons older than the scrollback-seeding change omit the field;
+        // mixed-version federation setups must still decode the frame.
+        let json = r#"{
+            "type": "attach_stream_init",
+            "data": "",
+            "end_offset": 7,
+            "running": true,
+            "bracketed_paste_mode": false,
+            "app_cursor_keys": false
+        }"#;
+
+        let response: super::RpcResponse = serde_json::from_str(json).expect("decode init frame");
+        match response {
+            super::RpcResponse::AttachStreamInit {
+                scrollback,
+                end_offset,
+                ..
+            } => {
+                assert!(scrollback.is_empty());
+                assert_eq!(end_offset, 7);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
 
     #[test]
     fn node_ws_payload_round_trips_uncompressed_binary_json() {

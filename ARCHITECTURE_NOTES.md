@@ -239,23 +239,27 @@ still enforced against the accumulated length before each `extend_from_slice`.
 
 ---
 
-### EC-11: Inline Session View Leaked Into the Main Screen Buffer
+### EC-11: Inline Session View and the Main Screen Buffer
 
-**Problem**: Pressing Enter in `oly ls --follow` handed the terminal to a child
-`oly attach` / `oly logs` on the **main** screen buffer.  The child's output was
-interleaved with the surrounding shell scrollback, so scrolling during (or
-after) an inline session showed unrelated content.
+**History**: Pressing Enter in `oly ls --follow` originally handed the terminal
+to a child `oly attach` / `oly logs` on the **main** screen buffer, which
+interleaved the child's output with the surrounding shell scrollback.  A first
+fix made `TuiTerminal::suspend` stay on the alternate screen for full
+isolation — but the alternate screen has no scrollback, so inline views of
+plain (non-alt-screen) CLIs lost all history and the scrollbar went dead.
 
-**Root cause**: `TuiTerminal::suspend` called `LeaveAlternateScreen` before
-spawning the child, on the assumption that the child needs the main buffer.  It
-does not — per EC-2 the attach client deliberately never enters the alternate
-screen, so it simply renders wherever the parent left the terminal.
-
-**Fix**: `suspend` now stays on the alternate screen and only releases raw mode,
-clearing the buffer and homing the cursor so the child starts clean.  `resume`
-re-issues `EnterAlternateScreen` unconditionally, because the child's
-`RawModeGuard` teardown emits `\x1b[?1049l` (EC-9) which drops the terminal back
-to the main buffer even though the list TUI never left it.
+**Current behavior**: `suspend` leaves the alternate screen again, so the
+child renders on the main buffer like a natively running CLI: output flows
+into scrollback and the scrollbar works during and after the inline view.
+The interleaving the first fix avoided is now the *desired* property — the
+session's output sits in scrollback exactly where the user's own commands
+would have put it.  Per EC-2 the attach client deliberately never enters the
+alternate screen itself, so it simply renders wherever the parent left the
+terminal; a TUI child's own `\x1b[?1049h` still takes over the display as it
+would natively.  `resume` re-issues `EnterAlternateScreen` unconditionally,
+because the child's `RawModeGuard` teardown emits `\x1b[?1049l` (EC-9) which
+drops the terminal to the main buffer even when it never entered the
+alternate screen.
 
 **Source**: `src/client/list_tui.rs` — `TuiTerminal::suspend` / `resume`.
 

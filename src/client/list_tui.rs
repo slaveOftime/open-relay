@@ -12,10 +12,10 @@ use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 
 use crossterm::{
-    cursor::{Hide, MoveTo, Show},
+    cursor::{Hide, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{ClearType, EnterAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1585,19 +1585,14 @@ impl TuiTerminal {
         Ok(())
     }
 
-    /// Hand the terminal to a child process (`oly attach` / `oly logs`) while
-    /// staying on the alternate screen.  Keeping the alternate buffer means the
-    /// inline session view is fully isolated: nothing from the surrounding
-    /// shell — or from the session list itself — remains visible behind it.
-    /// Only raw mode is released, because the child installs its own.
+    /// Hand the terminal to a child process (`oly attach` / `oly logs`) on the
+    /// main screen.  Leaving the alternate buffer lets the child render like a
+    /// natively running CLI: its output flows into the terminal's scrollback,
+    /// so history and the scrollbar keep working during and after the inline
+    /// view.  Only raw mode is released, because the child installs its own.
     fn suspend(&mut self) -> Result<()> {
         disable_raw_mode()?;
-        execute!(
-            self.terminal.backend_mut(),
-            crossterm::terminal::Clear(ClearType::All),
-            MoveTo(0, 0),
-            Show
-        )?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen, Show)?;
         Ok(())
     }
 

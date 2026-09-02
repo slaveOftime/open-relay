@@ -86,9 +86,23 @@ pub(super) async fn handle_attach_subscribe(
         };
 
     let running = session_store.is_running(&id);
+
+    // Seed scrollback only for fresh interactive attaches: offset-based
+    // resumes already have their terminal history, and piped attaches have no
+    // terminal at all. The client only sends dimensions when interactive; the
+    // seed depth is the client's own screen height.
+    let scrollback = match (from_byte_offset, initial_rows, initial_cols) {
+        (None, Some(rows), Some(_)) if rows > 0 => session_store
+            .attach_scrollback_seed(&id, rows)
+            .await
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
     debug!(
         session_id = %id,
         snapshot_bytes = data.len(),
+        scrollback_bytes = scrollback.len(),
         end_offset,
         running,
         app_cursor_keys,
@@ -103,6 +117,7 @@ pub(super) async fn handle_attach_subscribe(
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            scrollback,
         },
     )
     .await?;
