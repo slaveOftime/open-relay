@@ -1,7 +1,9 @@
-import { useRef, useEffect, useImperativeHandle, forwardRef } from 'react'
+import { useRef, useEffect, useImperativeHandle, forwardRef, useState } from 'react'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { ChevronsUpDown } from 'lucide-react'
 import { hasTransferredFiles } from './ui/file-transfer'
+import { cn } from '@/lib/utils'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 import './XTerm.css'
@@ -17,6 +19,11 @@ const TERMINAL_FONT_VARIANTS = [
   `italic 400 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
   `italic 700 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
 ]
+
+// Joystick-style scroll handle tuning: drag offset beyond the deadzone
+// scrolls continuously, with speed proportional to the offset distance.
+const SCROLL_DRAG_DEADZONE_PX = 8
+const SCROLL_LINES_PER_SECOND_PER_PX = 5
 
 function loadEmbeddedTerminalFont(): Promise<void> {
   if (typeof document === 'undefined' || !('fonts' in document)) {
@@ -80,6 +87,34 @@ function getTerminalTheme(): ITheme {
   }
 }
 
+// Dispatch a synthetic wheel event that behaves like a real wheel over the
+// terminal: xterm v6 listens on its scrollable overlay element (and on the
+// root element for mouse reporting). Events bubble up, never down, so the
+// container itself cannot be used as the target.
+function emitTerminalWheel(
+  term: Terminal | null,
+  deltaY: number,
+  deltaMode: number = WheelEvent.DOM_DELTA_LINE
+) {
+  const element = term?.element
+  if (!element) return
+  const target =
+    element.querySelector('.xterm-scrollable-element') ??
+    element.querySelector('.xterm-screen') ??
+    element
+  const rect = target.getBoundingClientRect()
+  target.dispatchEvent(
+    new WheelEvent('wheel', {
+      deltaY,
+      deltaMode,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+      bubbles: true,
+      cancelable: true,
+    })
+  )
+}
+
 export interface XTermHandle {
   write(data: string | Uint8Array, callback?: () => void): void
   writeln(data: string): void
@@ -116,6 +151,15 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   const onPasteRef = useRef(onPaste)
   const onResizeRef = useRef(onResize)
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null)
+  const scrollDragRef = useRef<{
+    anchorY: number
+    currentY: number
+    pendingLines: number
+    lastTime: number
+  } | null>(null)
+  const scrollDragRafRef = useRef(0)
+  const scrollButtonRef = useRef<HTMLButtonElement>(null)
+  const [scrollDragActive, setScrollDragActive] = useState(false)
 
   // Keep callbacks up to date without re-running the mount effect
   useEffect(() => {
@@ -300,9 +344,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       if (!textarea || document.activeElement !== textarea) return false
 
       const viewport = window.visualViewport
-      const viewportBottom = viewport
-        ? viewport.offsetTop + viewport.height
-        : window.innerHeight
+      const viewportBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight
       const rect = container.getBoundingClientRect()
       const bottomPadding = 40
       const overlap = rect.bottom + bottomPadding - viewportBottom
@@ -409,12 +451,117 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     return () => mq.removeEventListener('change', handler)
   }, [])
 
+  // Mobile scroll handle: dragging it vertically emits synthetic wheel
+  // events on the terminal so scrolling works like a mouse wheel. A native
+  // (non-passive) wheel listener forwards touchpad/wheel gestures over the
+  // handle to the terminal without scrolling the page.
+  useEffect(() => {
+    const button = scrollButtonRef.current
+    if (!button) return
+    const forwardWheel = (event: WheelEvent) => {
+      event.preventDefault()
+      event.stopPropagation()
+      emitTerminalWheel(termRef.current, event.deltaY, event.deltaMode)
+    }
+    button.addEventListener('wheel', forwardWheel, { passive: false })
+    return () => {
+      button.removeEventListener('wheel', forwardWheel)
+      if (scrollDragRafRef.current) cancelAnimationFrame(scrollDragRafRef.current)
+    }
+  }, [])
+
+  // Joystick-style loop: while the handle is held, the vertical offset from
+  // the press point drives continuous scrolling — offset down scrolls down,
+  // offset up scrolls up, speed grows with distance.
+  const runScrollDragFrame = (time: number) => {
+    const drag = scrollDragRef.current
+    if (!drag) {
+      scrollDragRafRef.current = 0
+      return
+    }
+    scrollDragRafRef.current = requestAnimationFrame(runScrollDragFrame)
+    const dt = Math.min((time - drag.lastTime) / 1000, 0.1)
+    drag.lastTime = time
+    const offset = drag.currentY - drag.anchorY
+    const distance = Math.abs(offset) - SCROLL_DRAG_DEADZONE_PX
+    if (distance <= 0) return
+    const direction = offset > 0 ? 1 : -1
+    drag.pendingLines += direction * distance * SCROLL_LINES_PER_SECOND_PER_PX * dt
+    const lines = Math.trunc(drag.pendingLines)
+    if (lines === 0) return
+    drag.pendingLines -= lines
+    emitTerminalWheel(termRef.current, lines)
+  }
+
+  const beginScrollDrag = (clientY: number) => {
+    scrollDragRef.current = {
+      anchorY: clientY,
+      currentY: clientY,
+      pendingLines: 0,
+      lastTime: performance.now(),
+    }
+    setScrollDragActive(true)
+    if (!scrollDragRafRef.current) {
+      scrollDragRafRef.current = requestAnimationFrame(runScrollDragFrame)
+    }
+  }
+
+  const handleScrollDragStart = (event: React.PointerEvent<HTMLButtonElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    beginScrollDrag(event.clientY)
+  }
+
+  const handleScrollDragMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!scrollDragRef.current) {
+      // Some touchpads cancel the pointer stream when a drag begins, so
+      // (re)start the drag on any pressed move over the handle.
+      if (!(event.buttons & 1)) return
+      beginScrollDrag(event.clientY)
+      return
+    }
+    event.preventDefault()
+    scrollDragRef.current.currentY = event.clientY
+  }
+
+  const handleScrollDragEnd = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (!scrollDragRef.current) return
+    scrollDragRef.current = null
+    setScrollDragActive(false)
+    if (scrollDragRafRef.current) {
+      cancelAnimationFrame(scrollDragRafRef.current)
+      scrollDragRafRef.current = 0
+    }
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
   return (
-    <div
-      ref={containerRef}
-      className={className}
-      style={{ overflow: 'hidden', touchAction: 'none' }}
-    />
+    <div className={cn('relative', className)}>
+      <div
+        ref={containerRef}
+        className="h-full w-full"
+        style={{ overflow: 'hidden', touchAction: 'none' }}
+      />
+      <button
+        ref={scrollButtonRef}
+        type="button"
+        aria-label="Scroll terminal"
+        onPointerDown={handleScrollDragStart}
+        onPointerMove={handleScrollDragMove}
+        onPointerUp={handleScrollDragEnd}
+        onPointerCancel={handleScrollDragEnd}
+        onContextMenu={(event) => event.preventDefault()}
+        className={cn(
+          'absolute right-0 bottom-80 z-10 flex h-12 w-8 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/80 text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
+          scrollDragActive ? 'opacity-90' : 'opacity-50'
+        )}
+      >
+        <ChevronsUpDown className="h-4 w-4" />
+      </button>
+    </div>
   )
 })
 
