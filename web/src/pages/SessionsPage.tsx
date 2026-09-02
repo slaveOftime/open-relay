@@ -1537,7 +1537,7 @@ export default function SessionsPage() {
         {/* ── Header ── */}
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
-          <div className="flex flex-wrap items-center gap-2 px-3 py-2 md:hidden">
+          <div className="flex flex-nowrap items-center gap-2 px-3 py-2 md:hidden">
             <div
               className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer min-w-0"
               onClick={() => void reloadSessions({ background: false })}
