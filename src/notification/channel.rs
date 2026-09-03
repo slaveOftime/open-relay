@@ -38,8 +38,10 @@ impl LocalOsNotificationChannel {
     /// Spawn the hook process.
     ///
     /// The hook string is split into program + arguments using simple shell-word
-    /// rules (single-quoted, double-quoted, and unquoted tokens).  Each token
-    /// may contain `{placeholder}` substitutions that are replaced with the
+    /// rules (single-quoted, double-quoted, and unquoted tokens). A backslash
+    /// only escapes quotes, whitespace and itself, so Windows paths like
+    /// `C:\tools\notify.exe` need no quoting. Each token may contain
+    /// `{placeholder}` substitutions that are replaced with the
     /// corresponding event field before the process is spawned.
     ///
     /// Supported placeholders:
@@ -102,7 +104,10 @@ impl LocalOsNotificationChannel {
             .expect("split_hook_command returned non-empty vec");
         let args: Vec<String> = iter.collect();
 
-        let result = std::process::Command::new(&program)
+        tracing::debug!(program, args = ?args, "notification hook command resolved");
+
+        let mut command = std::process::Command::new(&program);
+        command
             .args(&args)
             .env("OLY_EVENT_KIND", event.kind.as_str())
             .env("OLY_EVENT_TITLE", &event.title)
@@ -114,12 +119,47 @@ impl LocalOsNotificationChannel {
             .env("OLY_EVENT_SESSION_IDS", &session_ids)
             .env("OLY_EVENT_TRIGGER_RULE", &trigger_rule)
             .env("OLY_EVENT_TRIGGER_DETAIL", &trigger_detail)
-            .spawn();
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        // The daemon runs detached without a console, so on Windows every
+        // hook spawn would otherwise allocate a fresh console window (the
+        // "black window flash"). CREATE_NO_WINDOW keeps hooks invisible;
+        // GUI apps launched *by* the hook still show their own windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let result = command.spawn();
 
         match result {
-            Ok(mut child) => {
+            Ok(child) => {
+                let hook = hook.to_string();
                 tokio::task::spawn_blocking(move || {
-                    let _ = child.wait();
+                    // Fire-and-forget, but surface failures: a hook that
+                    // exits non-zero (bad path, script error) must show up
+                    // in the daemon log instead of vanishing silently.
+                    match child.wait_with_output() {
+                        Ok(output) if !output.status.success() => {
+                            let stderr: String = String::from_utf8_lossy(&output.stderr)
+                                .chars()
+                                .take(500)
+                                .collect();
+                            tracing::warn!(
+                                hook,
+                                status = %output.status,
+                                %stderr,
+                                "notification hook exited with failure"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(hook, %err, "notification hook wait failed");
+                        }
+                    }
                 });
             }
             Err(err) => {
@@ -545,11 +585,19 @@ fn split_hook_command(s: &str) -> Option<Vec<String>> {
                     }
                 }
             }
-            // Backslash outside quotes escapes the next character.
+            // Backslash escapes only quotes, whitespace and itself; before
+            // any other character it is literal, so Windows paths such as
+            // `C:\tools\notify.exe` survive tokenization.
             '\\' => {
                 in_token = true;
-                if let Some(next) = chars.next() {
-                    current.push(next);
+                match chars.peek() {
+                    Some(&next)
+                        if next == '\'' || next == '"' || next == '\\' || next.is_whitespace() =>
+                    {
+                        chars.next();
+                        current.push(next);
+                    }
+                    _ => current.push('\\'),
                 }
             }
             other => {
@@ -657,6 +705,32 @@ mod tests {
                 "/path/with spaces/tool".to_string(),
                 "arg".to_string(),
             ])
+        );
+    }
+
+    #[test]
+    fn test_windows_path_backslashes_are_literal() {
+        // Regression: backslashes in Windows paths must survive tokenization —
+        // they only escape quotes, whitespace and other backslashes.
+        assert_eq!(
+            split_hook_command(
+                r"pwsh -NoProfile -File D:\jarvis\scripts\oly-notify-hook.ps1 {title}"
+            ),
+            Some(vec![
+                "pwsh".to_string(),
+                "-NoProfile".to_string(),
+                "-File".to_string(),
+                r"D:\jarvis\scripts\oly-notify-hook.ps1".to_string(),
+                "{title}".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_double_backslash_collapses_outside_quotes() {
+        assert_eq!(
+            split_hook_command(r"C:\\tools\\notify.exe arg"),
+            Some(vec!["C:\\tools\\notify.exe".to_string(), "arg".to_string()])
         );
     }
 
