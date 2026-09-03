@@ -34,10 +34,12 @@ pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']
 pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
 pub(super) const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// A PTY echoes back almost everything the user types, so output landing this
-/// soon after a keystroke is attributed to that keystroke instead of to the
-/// program. Anything later than this is considered self-driven program output.
-pub(super) const INPUT_ECHO_WINDOW: Duration = Duration::from_secs(1);
+/// Output landing this soon after user activity (text input, mouse
+/// click/hover, resize, attach) is attributed to that activity — keystroke
+/// echo, post-resize redraws and hover/click feedback all take a moment to
+/// settle — instead of to the program asking for attention. Anything later
+/// than this is considered self-driven program output.
+pub(super) const USER_ACTIVITY_WINDOW: Duration = Duration::from_secs(3);
 #[cfg(not(test))]
 pub(super) const ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT: Duration = Duration::from_millis(3_000);
 #[cfg(test)]

@@ -56,22 +56,28 @@ pub struct ScanOut {
     /// Capability probes that need a daemon-generated reply written back to
     /// the child's standard input.
     pub queries: Vec<TerminalQuery>,
-    /// Bytes of `filtered` that carry a progress/busy notification. They are
-    /// forwarded to clients but do not count as screen activity, so a child
-    /// that only animates a progress indicator is still considered idle.
-    pub progress_bytes: usize,
+    /// Bytes of `filtered` that only carry one-way terminal signals:
+    /// window/icon titles (`OSC 0/1/2`) and progress/busy notifications
+    /// (`OSC 9;4`). They are forwarded to clients but do not count as screen
+    /// activity, so a child that only retitles itself (e.g.
+    /// `]0;[ ! ] Action Required`) or animates a progress indicator is still
+    /// considered idle. This is a deliberate trade-off: a bare title flip
+    /// usually accompanies an input-required prompt rather than real
+    /// progress, and genuine progress almost always comes with regular
+    /// screen output that still counts.
+    pub signal_bytes: usize,
 }
 
 impl ScanOut {
     /// Bytes of this chunk that changed what the user can see.
     pub fn meaningful_bytes(&self) -> usize {
-        self.filtered.len().saturating_sub(self.progress_bytes)
+        self.filtered.len().saturating_sub(self.signal_bytes)
     }
 
     fn reset(&mut self) {
         self.filtered.clear();
         self.queries.clear();
-        self.progress_bytes = 0;
+        self.signal_bytes = 0;
     }
 }
 
@@ -331,9 +337,10 @@ impl PtyScanner {
         out.filtered.extend_from_slice(b"\x1b]");
         out.filtered.extend_from_slice(&data[ps_start..payload_end]);
         out.filtered.extend_from_slice(&data[payload_end..end]);
-        if ps == b"9" {
-            out.progress_bytes += out.filtered.len() - emitted_start;
-        }
+        // Only passthrough OSC sequences reach this point, and all of them
+        // (titles, progress/busy) are one-way terminal signals rather than
+        // screen activity.
+        out.signal_bytes += out.filtered.len() - emitted_start;
 
         Some(end - start)
     }
@@ -856,11 +863,19 @@ mod tests {
     }
 
     #[test]
-    fn title_notifications_do_count_as_screen_activity() {
+    fn title_notifications_do_not_count_as_screen_activity() {
+        // A bare title change (e.g. `]0;[ ! ] Action Required | build`) is
+        // how most agent CLIs flag that they are waiting for input; counting
+        // it as activity would keep resetting the silence clock and suppress
+        // the very notification it announces.
         let mut harness = Harness::new();
         let text = b"\x1b]0;relay\x07";
         harness.filter(text);
-        assert_eq!(harness.out.meaningful_bytes(), text.len());
+        assert_eq!(harness.out.meaningful_bytes(), 0);
+
+        // Titles sharing a chunk with real output only discount themselves.
+        harness.filter(b"x\x1b]0;relay\x07");
+        assert_eq!(harness.out.meaningful_bytes(), 1);
     }
 
     #[test]

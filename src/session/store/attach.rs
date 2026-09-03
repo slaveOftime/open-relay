@@ -551,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_attach_detach_clears_presence_and_activity() {
+    async fn test_attach_detach_clears_presence_but_keeps_activity() {
         let rt = make_runtime("detach001", SessionStatus::Running, "$ prompt", None);
         let rt_clone = rt.clone();
         let store = store_with(vec![rt], make_test_db().await);
@@ -569,8 +569,8 @@ mod tests {
 
         let locked = rt_clone.read();
         assert!(
-            locked.last_attach_activity_at.is_none(),
-            "detach should clear attach activity"
+            locked.last_attach_activity_at.is_some(),
+            "detach must keep the activity timestamp: it records when a user last saw the session"
         );
     }
 
@@ -612,8 +612,8 @@ mod tests {
         let locked = rt_clone.read();
         assert_eq!(locked.attach_count, 0, "all clients should be disconnected");
         assert!(
-            locked.last_attach_activity_at.is_none(),
-            "final detach should clear attach activity"
+            locked.last_attach_activity_at.is_some(),
+            "final detach should still keep the last-seen activity timestamp"
         );
     }
 

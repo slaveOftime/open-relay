@@ -1,8 +1,8 @@
 //! Silence detection driving push notifications.
 //!
 //! `silent_candidates` is polled on a timer over every live session, so it
-//! takes a read lock per session and only upgrades to a write lock when it has
-//! to record a suppression.
+//! takes a read lock per session and never writes: all suppression state is
+//! derived from the activity epochs the runtime already maintains.
 
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,7 @@ use tracing::{debug, trace};
 
 use crate::session::SessionEvent;
 
-use super::{INPUT_ECHO_WINDOW, SessionStore, SilentCandidate};
+use super::{SessionStore, SilentCandidate, USER_ACTIVITY_WINDOW};
 
 impl SessionStore {
     /// Returns silent candidates with their output and latest activity epochs.
@@ -29,18 +29,6 @@ impl SessionStore {
                     return None;
                 }
 
-                // If attach just happend, there is not need to notify in supression window, treat it as notified
-                if let Some(last_attach_activity) = rt.last_attach_activity_at {
-                    if now.duration_since(last_attach_activity) < attach_suppression_window {
-                        trace!("silent becase recent attach activity");
-                        let effective_output = rt.effective_output_epoch();
-                        drop(rt);
-                        let mut rt = handle.write();
-                        rt.last_notified_at = Some(effective_output);
-                        return None;
-                    }
-                }
-
                 // Sessions that have never produced any meaningful output (e.g. a
                 // process that starts up and then silently waits for a password or
                 // other input before printing anything) must still be considered:
@@ -49,33 +37,42 @@ impl SessionStore {
                 // a session is notified it will not be re-notified unless real
                 // output eventually arrives and advances the epoch.
                 let last_output = rt.effective_output_epoch();
-                let last_input = rt.last_input_at;
 
-                // Silence is measured from the newest activity of any kind, so a
-                // user who is still typing never looks "silent" and an old output
-                // epoch is never treated as an already-expired timer.
-                let silence_epoch = last_input.map_or(last_output, |input| input.max(last_output));
+                // The newest user-driven activity of any kind: text input,
+                // mouse clicks/hover (delivered as input bytes), resizes,
+                // attach heartbeats and attaches themselves.
+                let user_activity = rt.user_activity_epoch();
+
+                // Silence is measured from the newest activity of any kind, so
+                // a user who is still interacting never looks "silent" and an
+                // old output epoch is never treated as an already-expired
+                // timer. This also covers recent attaches: someone who just
+                // opened the session has seen its current state, so there is
+                // nothing to notify about until the suppression window elapses.
+                let silence_epoch =
+                    user_activity.map_or(last_output, |activity| activity.max(last_output));
 
                 if now.duration_since(silence_epoch) < attach_suppression_window {
-                    trace!("silent because of recent input or output activity");
+                    trace!("silent because of recent user or output activity");
                     return None;
                 }
 
-                // A PTY echoes back what the user types, so output that lands
-                // within `INPUT_ECHO_WINDOW` of a keystroke is almost certainly
-                // that echo rather than the program asking for attention. The
-                // same is true when nothing came back at all (echo is off, e.g.
-                // a password prompt): the user is mid-input either way.
+                // Output that lands within `USER_ACTIVITY_WINDOW` of user
+                // activity is almost certainly a reaction to it — keystroke
+                // echo, a redraw after a resize, hover/click feedback — rather
+                // than the program asking for attention. The same is true when
+                // nothing came back at all (echo is off, e.g. a password
+                // prompt): the user is mid-interaction either way.
                 //
-                // Once the gap grows beyond the echo window the program clearly
+                // Once the gap grows beyond the window the program clearly
                 // produced something on its own and then went quiet, which is
                 // exactly the "waiting for you" state worth notifying about.
-                let input_driven = match last_input {
-                    Some(last_input) if last_output <= last_input => true,
-                    Some(last_input) => last_output.duration_since(last_input) <= INPUT_ECHO_WINDOW,
+                let activity_driven = match user_activity {
+                    Some(activity) if last_output <= activity => true,
+                    Some(activity) => last_output.duration_since(activity) <= USER_ACTIVITY_WINDOW,
                     None => false,
                 };
-                let should_notify = !input_driven;
+                let should_notify = !activity_driven;
 
                 // Suppress rapid repeat notifications. `last_notified_at` is
                 // normally later than `last_output`, so compare it with `now`;
@@ -96,11 +93,10 @@ impl SessionStore {
 
                 debug!(
                     session_id = rt.meta.id.as_str(),
-                    last_input_at = ?rt.last_input_at,
-                    last_attach_activity_at = ?rt.last_attach_activity_at,
+                    user_activity_at = ?user_activity,
                     last_output_epoch = ?rt.last_output_epoch,
                     last_notified_at = ?rt.last_notified_at,
-                    input_driven,
+                    activity_driven,
                     "silent candidate ready"
                 );
 
@@ -762,6 +758,116 @@ mod tests {
         assert!(
             locked.last_output_epoch.is_some(),
             "suppression path should not mutate output epoch — it must remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_attach_activity_within_window_suppresses_notify() {
+        // Attach-class activity (resize, mouse click/hover, attach heartbeat)
+        // shortly before the last output means the output is a reaction to the
+        // user, not the program asking for attention — even though no text
+        // input was ever sent.
+        let suppression_window = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(10)), // output 10s ago
+        );
+        {
+            let mut locked = rt.write();
+            locked.last_attach_activity_at = Some(Instant::now() - Duration::from_secs(12));
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            !candidates[0].should_notify,
+            "output within the user-activity window of attach activity must not notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_attach_activity_well_before_output_notifies() {
+        // The program kept producing output long after the last user
+        // interaction and then went quiet: that is self-driven output worth
+        // a notification.
+        let suppression_window = Duration::from_secs(1);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "Do you want to proceed? (y/n)",
+            Some(Duration::from_secs(10)), // output 10s ago
+        );
+        {
+            let mut locked = rt.write();
+            locked.last_attach_activity_at = Some(Instant::now() - Duration::from_secs(30));
+        }
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let candidates = store.silent_candidates(suppression_window, min_interval);
+
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].should_notify,
+            "output produced well after the user-activity window should notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_attach_itself_counts_as_activity() {
+        // Opening the session is user activity: the attaching user just saw
+        // the current state, so nothing should notify right after.
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+
+        store.register_attach_client("abc1234").await;
+
+        assert!(
+            store
+                .silent_candidates(suppression_window, min_interval)
+                .is_empty(),
+            "a fresh attach should suppress candidacy inside the suppression window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_silent_candidates_stay_suppressed_after_detach() {
+        // Detaching must not hand the session straight back to the notifier:
+        // the user just read the screen, so the activity timestamp survives
+        // the disconnect.
+        let suppression_window = Duration::from_secs(5);
+        let min_interval = Duration::from_secs(10);
+        let rt = make_runtime(
+            "abc1234",
+            SessionStatus::Running,
+            "prompt> ",
+            Some(Duration::from_secs(30)),
+        );
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+
+        store.register_attach_client("abc1234").await;
+        store
+            .attach_detach("abc1234")
+            .await
+            .expect("detach should succeed");
+
+        assert!(
+            store
+                .silent_candidates(suppression_window, min_interval)
+                .is_empty(),
+            "detach should keep the recent-activity suppression alive"
         );
     }
 

@@ -199,6 +199,18 @@ impl SessionRuntime {
         self.last_output_epoch.unwrap_or(self.spawned_at)
     }
 
+    /// Timestamp of the most recent user-driven activity of any kind:
+    /// text input, mouse clicks/hover (delivered as input bytes), resizes,
+    /// attach heartbeats and attaches themselves. Notification suppression
+    /// treats output that closely follows this epoch as a reaction to the
+    /// user rather than the program asking for attention.
+    pub fn user_activity_epoch(&self) -> Option<Instant> {
+        match (self.last_input_at, self.last_attach_activity_at) {
+            (Some(input), Some(attach)) => Some(input.max(attach)),
+            (input, attach) => input.or(attach),
+        }
+    }
+
     /// Build a `SessionSummary` snapshot from the current runtime state.
     pub fn to_summary(&self) -> SessionSummary {
         SessionSummary {
@@ -239,6 +251,9 @@ impl SessionRuntime {
 
     pub fn register_attach_client(&mut self) {
         self.attach_count = self.attach_count.saturating_add(1);
+        // Attaching is itself user activity: someone just opened this
+        // session and saw its current state.
+        self.last_attach_activity_at = Some(Instant::now());
         trace!(
             session_id = %self.meta.id,
             attach_count = self.attach_count,
@@ -268,9 +283,13 @@ impl SessionRuntime {
     }
 
     pub fn clear_attach_state(&mut self) {
-        debug!(session_id = %self.meta.id, "attach activity cleared");
+        debug!(session_id = %self.meta.id, "attach presence cleared");
         self.attach_count = 0;
-        self.last_attach_activity_at = None;
+        // `last_attach_activity_at` deliberately survives detach: it records
+        // when a user last *saw and touched* the session, which stays true
+        // after they disconnect. Clearing it would make a just-detached
+        // session immediately eligible for a notification about the very
+        // output the user had just read.
     }
 
     pub fn input_needed(&self) -> bool {
@@ -1190,6 +1209,31 @@ mod tests {
     }
 
     #[test]
+    fn test_push_output_title_only_chunk_does_not_advance_activity() {
+        // A chunk that only retitles the window (the classic "Action
+        // Required" flip) must not reset the silence clock: it almost always
+        // announces that the program is waiting for input.
+        let mut rt = new_runtime();
+        let chunk = b"\x1b]0;[ ! ] Action Required | build\x07";
+
+        push_scanned(&mut rt, chunk);
+
+        assert!(rt.last_output_epoch.is_none());
+        assert_eq!(rt.last_total_bytes, 0);
+        assert_eq!(rt.raw_total_bytes, chunk.len() as u64);
+    }
+
+    #[test]
+    fn test_push_output_title_and_text_only_counts_text() {
+        let mut rt = new_runtime();
+
+        push_scanned(&mut rt, b"\x1b]0;build\x07done");
+
+        assert!(rt.last_output_epoch.is_some());
+        assert_eq!(rt.last_total_bytes, 4);
+    }
+
+    #[test]
     fn test_attach_snapshot_restores_title_progress_and_cursor_style() {
         // The screen parser drops Operating System Commands and does not model
         // the cursor shape, so an attaching client would otherwise keep the
@@ -1227,7 +1271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_push_output_discounts_progress_bytes_in_large_chunks() {
+    fn test_push_output_discounts_signal_bytes_in_large_chunks() {
         // The scanner accounts progress bytes exactly, so unlike the previous
         // size-limited heuristic a busy indicator is discounted no matter how
         // much other output shares its chunk.

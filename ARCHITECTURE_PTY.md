@@ -207,7 +207,7 @@ std::thread::spawn("pty-reader-{id}") {
         scanner.scan(&buf[..n], &mut out);
         //    out.filtered       → the canonical stream
         //    out.queries        → probes that need a session-global reply
-        //    out.progress_bytes → bytes that are not screen activity
+        //    out.signal_bytes → bytes that are not screen activity
         //    scanner signals    → title / progress / cursor shape, if changed
 
         // 2. One write lock: screen parse, stream counters, mode publication.
@@ -414,7 +414,7 @@ PTY master fd
 │  • counts progress bytes so they are not "screen activity"    │
 │  • carries an incomplete trailing sequence into the next chunk│
 └───────────────────────────┬───────────────────────────────────┘
-                            │  ScanOut { filtered, queries, progress_bytes }
+                            │  ScanOut { filtered, queries, signal_bytes }
               ┌─────────────┼─────────────┬──────────────────┐
               ▼             ▼             ▼                  ▼
       push_output()   OutputLog     broadcast_tx     query.response()
@@ -465,10 +465,14 @@ one-way notifications and survive the filter.  Only BEL and `ESC \` terminate an
 OSC: a lone backslash is payload, since Windows shells report titles such as
 `C:\Users\me`.
 
-`OSC 9;4` bytes are forwarded to clients but excluded from the meaningful-byte
-count (`ScanOut::meaningful_bytes()`), so a child that only animates a progress
-indicator is still correctly treated as silent by notification logic.  Title
-notifications *do* count as activity.
+All passthrough bytes — titles *and* `OSC 9;4` progress — are forwarded to
+clients but excluded from the meaningful-byte count
+(`ScanOut::meaningful_bytes()`), so a child that only retitles itself (e.g.
+`]0;[ ! ] Action Required | build`) or animates a progress indicator is still
+correctly treated as silent by notification logic.  This is a deliberate
+trade-off: a bare title flip usually announces an input-required prompt rather
+than real progress, and genuine progress almost always comes with regular
+screen output that still counts as activity.
 
 ### ConPTY Bare Forms
 
