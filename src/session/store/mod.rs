@@ -80,7 +80,9 @@ impl SessionHandle {
 pub struct SessionStore {
     pub(super) sessions: ArcSwap<SessionMap>,
     pub(super) mutable: TokioMutex<StoreMutableState>,
-    pub(super) eviction_ttl: Duration,
+    /// TTL for evicting completed sessions, in seconds. Atomic so the
+    /// daemon's config hot-reload can adjust it without a restart.
+    pub(super) eviction_ttl_secs: std::sync::atomic::AtomicU64,
     pub(super) db: Arc<Database>,
     pub(super) event_tx: SessionEventTx,
 }
@@ -115,10 +117,24 @@ impl SessionStore {
                 starting_sessions: HashSet::new(),
                 evicted_sessions: HashMap::new(),
             }),
-            eviction_ttl: Duration::from_secs(eviction_seconds.max(1)),
+            eviction_ttl_secs: std::sync::atomic::AtomicU64::new(eviction_seconds.max(1)),
             db,
             event_tx,
         }
+    }
+
+    /// Current eviction TTL for completed sessions.
+    pub(super) fn eviction_ttl(&self) -> Duration {
+        Duration::from_secs(
+            self.eviction_ttl_secs
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Hot-update the eviction TTL after a config reload.
+    pub fn set_eviction_seconds(&self, seconds: u64) {
+        self.eviction_ttl_secs
+            .store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn event_tx(&self) -> SessionEventTx {

@@ -7,7 +7,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     client,
-    config::AppConfig,
+    config::{AppConfig, LiveConfig},
     db::Database,
     error::{AppError, Result},
     http,
@@ -44,7 +44,12 @@ impl Drop for DaemonGuard {
     }
 }
 
-fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
+/// Handle to the daemon's reloadable log-level filter; the config hot-reload
+/// task swaps in a new filter when `log_level` changes in `config.json`.
+pub(super) type LogFilterHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+
+pub(super) fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
     if let Ok(filter) = std::env::var("RUST_LOG") {
         return tracing_subscriber::EnvFilter::try_new(filter)
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -457,10 +462,13 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         .without_time()
         .with_target(false);
 
-    let env_filter = build_env_filter(&config);
+    // Reloadable filter layer: the config hot-reload task swaps in a new
+    // EnvFilter when `log_level` changes in config.json.
+    let (env_filter_layer, log_filter_handle) =
+        tracing_subscriber::reload::Layer::new(build_env_filter(&config));
 
     tracing_subscriber::registry()
-        .with(env_filter)
+        .with(env_filter_layer)
         .with(file_layer)
         .with(stderr_layer)
         .init();
@@ -517,14 +525,20 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         info!(count, "join connectors initialized");
     }
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
-    let notifier: NotifierHandle =
-        Arc::new(crate::notification::build_notifier(db.clone(), &config));
+    let notifier: NotifierHandle = Arc::new(arc_swap::ArcSwap::from_pointee(
+        crate::notification::build_notifier(db.clone(), &config),
+    ));
+
+    // Shared live view of the configuration. The hot-reload task swaps in a
+    // rebuilt AppConfig when config.json changes on disk; subsystems read
+    // through this to pick up hot-reloadable settings without a restart.
+    let live_config = LiveConfig::from_arc(Arc::clone(&config));
 
     let auth_state = auth_hash.map(AuthState::new);
     if !no_http {
         let http_state = http::AppState {
             store: session_store.clone(),
-            config: Arc::clone(&config),
+            config: live_config.clone(),
             db: db.clone(),
             notifier: notifier.clone(),
             event_tx: event_tx.clone(),
@@ -538,7 +552,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     }
 
     let notify_store = session_store.clone();
-    let notify_config = Arc::clone(&config);
+    let notify_config = live_config.clone();
     let notify_event_tx = event_tx.clone();
     let notify_notification_tx = notification_tx.clone();
     let notify_notifier = notifier.clone();
@@ -554,10 +568,28 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     });
     info!("notification monitor task spawned");
 
+    {
+        let reload_config = live_config.clone();
+        let reload_store = session_store.clone();
+        let reload_notifier = notifier.clone();
+        let reload_db = db.clone();
+        tokio::spawn(async move {
+            super::reload::run_config_reloader(
+                reload_config,
+                reload_store,
+                reload_notifier,
+                reload_db,
+                log_filter_handle,
+            )
+            .await;
+        });
+        info!("config hot-reload task spawned");
+    }
+
     if !startup_failed_sessions.is_empty() {
         let notifier = notifier.clone();
         let event = NotificationEvent::startup_recovery(&startup_failed_sessions);
-        let outcome = notifier.dispatch(&event).await;
+        let outcome = notifier.load_full().dispatch(&event).await;
 
         if outcome.any_delivered() {
             info!(
@@ -599,6 +631,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 match incoming {
                     Ok(stream) => {
                         let config_clone = Arc::clone(&config);
+                        let live_config_clone = live_config.clone();
                         let store_clone = session_store.clone();
                         let shutdown_tx_clone = shutdown_tx.clone();
                         let registry_clone = node_registry.clone();
@@ -611,6 +644,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                             if let Err(err) = handle_client(
                                 stream,
                                 config_clone,
+                                live_config_clone,
                                 store_clone,
                                 shutdown_tx_clone,
                                 registry_clone,
@@ -667,6 +701,7 @@ mod tests {
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: None,
             web_push_proxy: None,
+            runtime_overrides: Default::default(),
         }
     }
 

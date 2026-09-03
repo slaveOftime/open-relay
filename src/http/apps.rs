@@ -91,10 +91,10 @@ pub(super) fn ensure_wwwroot(config: &AppConfig) -> io::Result<PathBuf> {
 }
 
 pub(super) async fn list_static_apps(State(state): State<AppState>) -> Response {
-    match discover_static_apps(&state.config.wwwroot_dir()) {
+    match discover_static_apps(&state.config.get().wwwroot_dir()) {
         Ok(apps) => Json(apps).into_response(),
         Err(err) => {
-            error!(%err, "failed to enumerate apps in {}", state.config.wwwroot_dir().display());
+            error!(%err, "failed to enumerate apps in {}", state.config.get().wwwroot_dir().display());
             axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1011,6 +1011,7 @@ mod tests {
             max_running_sessions: 10,
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: None,
+            runtime_overrides: Default::default(),
         }
     }
 

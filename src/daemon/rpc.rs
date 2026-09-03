@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     client,
-    config::AppConfig,
+    config::{AppConfig, LiveConfig},
     db::Database,
     error::Result,
     http::auth,
@@ -33,6 +33,7 @@ use super::{
 pub(super) async fn handle_client(
     stream: Stream,
     config: Arc<AppConfig>,
+    live_config: LiveConfig,
     session_store: SessionStoreHandle,
     shutdown_tx: mpsc::UnboundedSender<()>,
     node_registry: Arc<NodeRegistry>,
@@ -84,6 +85,7 @@ pub(super) async fn handle_client(
     let response = dispatch_request(
         request,
         &config,
+        &live_config,
         &session_store,
         &shutdown_tx,
         &node_registry,
@@ -101,6 +103,7 @@ pub(super) async fn handle_client(
 async fn dispatch_request(
     request: RpcRequest,
     config: &Arc<AppConfig>,
+    live_config: &LiveConfig,
     session_store: &SessionStoreHandle,
     shutdown_tx: &mpsc::UnboundedSender<()>,
     node_registry: &Arc<NodeRegistry>,
@@ -129,7 +132,7 @@ async fn dispatch_request(
             disable_notifications,
         } => {
             handle_start(
-                config,
+                &live_config.get(),
                 session_store,
                 title,
                 tags,
@@ -413,7 +416,7 @@ async fn handle_notify_send(
         body,
         url,
     );
-    let outcome = notifier.dispatch(&event).await;
+    let outcome = notifier.load_full().dispatch(&event).await;
 
     if !outcome.any_delivered() {
         warn!(

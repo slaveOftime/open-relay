@@ -47,6 +47,55 @@ fn e2e_start_spawn_failure_exits_nonzero_with_clear_error() {
 }
 
 #[test]
+fn e2e_config_hot_reload_applies_without_daemon_restart() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_config_hot_reload");
+    let _daemon = start_daemon(&tmp);
+
+    // Restrict the running daemon to a single session by editing config.json;
+    // the hot-reload loop must pick the change up without a restart.
+    fs::write(
+        tmp.join("oly").join("config.json"),
+        r#"{"max_running_sessions": 1}"#,
+    )
+    .expect("rewrite config.json");
+
+    // The reload poll runs every 2s; give it ample margin.
+    sleep(Duration::from_secs(4));
+
+    #[cfg(target_os = "windows")]
+    let long_running: &[&str] = &["cmd.exe", "/c", "ping", "127.0.0.1", "-n", "60"];
+    #[cfg(not(target_os = "windows"))]
+    let long_running: &[&str] = &["sh", "-c", "sleep 60"];
+
+    let first = oly_cmd(&tmp)
+        .args(["start", "--detach"])
+        .args(long_running)
+        .output()
+        .expect("first `oly start` failed to execute");
+    assert!(
+        first.status.success(),
+        "first session should start: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = oly_cmd(&tmp)
+        .args(["start", "--detach"])
+        .args(long_running)
+        .output()
+        .expect("second `oly start` failed to execute");
+    assert!(
+        !second.status.success(),
+        "second session should be rejected by the hot-reloaded max_running_sessions=1"
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("max running sessions limit reached"),
+        "expected max-sessions error, got: {stderr}"
+    );
+}
+
+#[test]
 fn e2e_start_respects_explicit_cwd() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_start_cwd");

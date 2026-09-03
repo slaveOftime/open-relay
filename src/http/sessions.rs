@@ -50,7 +50,7 @@ pub async fn health() -> impl IntoResponse {
 
 pub async fn push_public_key(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "public_key": state.config.web_push_vapid_public_key.clone()
+        "public_key": state.config.get().web_push_vapid_public_key.clone()
     }))
 }
 
@@ -320,7 +320,8 @@ pub async fn create(
     };
 
     let result =
-        match SessionStore::start_session_via_handle(&state.store, &state.config, spec).await {
+        match SessionStore::start_session_via_handle(&state.store, &state.config.get(), spec).await
+        {
             Ok(id) => {
                 let summary = state.store.get_summary(&id);
                 Ok((id, summary))
@@ -409,7 +410,7 @@ pub async fn get_session(
 
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
-            let total_bytes = current_output_offset_by_id(&state.config.sessions_dir, &id);
+            let total_bytes = current_output_offset_by_id(&state.config.get().sessions_dir, &id);
             Json(meta_to_summary(&meta, false, total_bytes)).into_response()
         }
         Ok(None) => {
@@ -536,7 +537,7 @@ pub async fn stop_session(
 ) -> impl IntoResponse {
     let grace = body
         .and_then(|b| b.grace_seconds)
-        .unwrap_or(state.config.stop_grace_seconds);
+        .unwrap_or(state.config.get().stop_grace_seconds);
 
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::Stop {
@@ -870,7 +871,7 @@ pub async fn upload_file(
         };
     }
 
-    match write_session_upload(&state.config, &id, &raw_target, &bytes, true) {
+    match write_session_upload(&state.config.get(), &id, &raw_target, &bytes, true) {
         Ok(target_path) => Json(UploadFileResponse {
             ok: true,
             path: target_path.to_string_lossy().to_string(),

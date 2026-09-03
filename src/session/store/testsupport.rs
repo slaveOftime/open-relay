@@ -248,6 +248,7 @@ pub(super) fn make_test_config(max_running_sessions: usize) -> AppConfig {
         max_running_sessions,
         screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         notification_hook: None,
+        runtime_overrides: Default::default(),
     }
 }
 

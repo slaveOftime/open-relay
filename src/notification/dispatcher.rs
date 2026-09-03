@@ -3,6 +3,13 @@ use super::{
     event::NotificationEvent,
 };
 
+/// Shareable, hot-swappable notifier handle.
+///
+/// The daemon's config hot-reload rebuilds the channels (notification hook,
+/// VAPID keys, push proxy) and swaps in a new [`Notifier`] without a
+/// restart; dispatchers load the current one per event.
+pub type SharedNotifier = std::sync::Arc<arc_swap::ArcSwap<Notifier>>;
+
 #[derive(Debug, Clone)]
 pub struct DispatchOutcome {
     pub attempted: usize,

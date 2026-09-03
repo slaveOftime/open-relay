@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 
@@ -73,6 +74,48 @@ pub struct AppConfig {
     /// Optional path to an executable invoked on every local OS notification.
     /// If this is provided, the default local notification mechanism is disabled and this hook is used instead.
     pub notification_hook: Option<String>,
+    /// CLI/runtime flag overrides, recorded so hot reloads can re-apply them:
+    /// a value passed on the command line keeps winning over `config.json`
+    /// even after the file is edited.
+    pub runtime_overrides: RuntimeOverrides,
+}
+
+/// CLI/runtime flag overrides that take precedence over `config.json`.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeOverrides {
+    pub http_bind: Option<String>,
+    pub http_port: Option<u16>,
+    pub notification_hook: Option<String>,
+    pub web_push_proxy: Option<String>,
+}
+
+/// Shared, hot-reloadable view of the daemon's configuration.
+///
+/// The daemon wraps its [`AppConfig`] in this at startup, and a background
+/// task swaps in a rebuilt config whenever `config.json` changes on disk.
+/// Subsystems that support live updates call [`LiveConfig::get`] at use
+/// time; everything else keeps the startup snapshot it was handed.
+#[derive(Clone)]
+pub struct LiveConfig {
+    current: Arc<arc_swap::ArcSwap<AppConfig>>,
+}
+
+impl LiveConfig {
+    pub fn from_arc(config: Arc<AppConfig>) -> Self {
+        Self {
+            current: Arc::new(arc_swap::ArcSwap::from(config)),
+        }
+    }
+
+    /// The current configuration snapshot.
+    pub fn get(&self) -> Arc<AppConfig> {
+        self.current.load_full()
+    }
+
+    /// Swap in a freshly loaded configuration.
+    pub fn replace(&self, config: AppConfig) {
+        self.current.store(Arc::new(config));
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +123,8 @@ struct AppConfigOverrides {
     bind: Option<String>,
     http_port: Option<u16>,
     log_level: Option<String>,
+    silence_seconds: Option<u64>,
+    stop_grace_seconds: Option<u64>,
     prompt_patterns: Option<Vec<String>>,
     web_push_subject: Option<String>,
     web_push_vapid_public_key: Option<String>,
@@ -97,9 +142,16 @@ impl AppConfig {
     pub fn load() -> Result<Self> {
         let state_dir = crate::storage::resolve_state_dir();
         ensure_config_file(&state_dir);
-        let sessions_dir = state_dir.join("sessions");
         let overrides = load_overrides(&state_dir);
+        Ok(Self::resolve(state_dir, overrides))
+    }
+
+    /// Build a fully-resolved config from parsed `config.json` overrides.
+    fn resolve(state_dir: PathBuf, overrides: AppConfigOverrides) -> Self {
+        let sessions_dir = state_dir.join("sessions");
         let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
+        let silence_seconds = overrides.silence_seconds.unwrap_or(10).max(1);
+        let stop_grace_seconds = overrides.stop_grace_seconds.unwrap_or(5).max(1);
         let http_bind = overrides
             .bind
             .and_then(normalize_optional_string)
@@ -142,10 +194,10 @@ impl AppConfig {
             .notification_hook
             .and_then(normalize_optional_string);
 
-        Ok(Self {
+        Self {
             log_level,
-            silence_seconds: 10,
-            stop_grace_seconds: 5,
+            silence_seconds,
+            stop_grace_seconds,
             session_eviction_seconds,
             http_bind,
             http_port,
@@ -164,7 +216,82 @@ impl AppConfig {
             max_running_sessions,
             screen_scrollback_rows,
             notification_hook,
-        })
+            runtime_overrides: RuntimeOverrides::default(),
+        }
+    }
+
+    /// Re-read `config.json` and rebuild the configuration, keeping
+    /// process-fixed paths and CLI/runtime overrides.
+    ///
+    /// Returns an error when the file cannot be read or parsed, so the
+    /// daemon's hot-reload loop keeps running on the last good configuration
+    /// instead of silently falling back to defaults.
+    pub fn try_reload(&self) -> std::result::Result<Self, String> {
+        let overrides = try_load_overrides(&self.state_dir)?;
+        let mut next = Self::resolve(self.state_dir.clone(), overrides);
+        next.runtime_overrides = self.runtime_overrides.clone();
+        next.apply_runtime_overrides();
+        Ok(next)
+    }
+
+    /// Names of hot-reloadable fields that differ between `self` and `other`.
+    ///
+    /// Everything listed here is picked up by the running daemon without a
+    /// restart; keep this in sync with the reload task in
+    /// `daemon::reload` and the live readers (notification monitor, session
+    /// start paths, HTTP handlers).
+    pub fn hot_reload_changes(&self, other: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.log_level != other.log_level {
+            changed.push("log_level");
+        }
+        if self.silence_seconds != other.silence_seconds {
+            changed.push("silence_seconds");
+        }
+        if self.stop_grace_seconds != other.stop_grace_seconds {
+            changed.push("stop_grace_seconds");
+        }
+        if self.prompt_patterns != other.prompt_patterns {
+            changed.push("prompt_patterns");
+        }
+        if self.notification_hook != other.notification_hook {
+            changed.push("notification_hook");
+        }
+        if self.web_push_subject != other.web_push_subject {
+            changed.push("web_push_subject");
+        }
+        if self.web_push_vapid_public_key != other.web_push_vapid_public_key {
+            changed.push("web_push_vapid_public_key");
+        }
+        if self.web_push_vapid_private_key != other.web_push_vapid_private_key {
+            changed.push("web_push_vapid_private_key");
+        }
+        if self.web_push_proxy != other.web_push_proxy {
+            changed.push("web_push_proxy");
+        }
+        if self.max_running_sessions != other.max_running_sessions {
+            changed.push("max_running_sessions");
+        }
+        if self.session_eviction_seconds != other.session_eviction_seconds {
+            changed.push("session_eviction_seconds");
+        }
+        if self.screen_scrollback_rows != other.screen_scrollback_rows {
+            changed.push("screen_scrollback_rows");
+        }
+        changed
+    }
+
+    /// Names of fields that differ but only take effect after a daemon
+    /// restart (bind address, HTTP port, socket and state paths).
+    pub fn restart_required_changes(&self, other: &Self) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.http_bind != other.http_bind {
+            changed.push("bind");
+        }
+        if self.http_port != other.http_port {
+            changed.push("http_port");
+        }
+        changed
     }
 
     pub fn with_runtime_overrides(
@@ -174,19 +301,32 @@ impl AppConfig {
         notification_hook: Option<String>,
         web_push_proxy: Option<String>,
     ) -> Self {
-        if let Some(http_bind) = http_bind.and_then(normalize_optional_string) {
-            self.http_bind = http_bind;
+        self.runtime_overrides = RuntimeOverrides {
+            http_bind: http_bind.and_then(normalize_optional_string),
+            http_port,
+            notification_hook: notification_hook.and_then(normalize_optional_string),
+            web_push_proxy: web_push_proxy.and_then(normalize_optional_string),
+        };
+        self.apply_runtime_overrides();
+        self
+    }
+
+    /// Re-apply the recorded CLI/runtime overrides on top of file-loaded
+    /// values. Runtime flags always win over `config.json`, including after
+    /// a hot reload.
+    fn apply_runtime_overrides(&mut self) {
+        if let Some(http_bind) = &self.runtime_overrides.http_bind {
+            self.http_bind = http_bind.clone();
         }
-        if let Some(http_port) = http_port {
+        if let Some(http_port) = self.runtime_overrides.http_port {
             self.http_port = http_port;
         }
-        if let Some(notification_hook) = notification_hook.and_then(normalize_optional_string) {
-            self.notification_hook = Some(notification_hook);
+        if let Some(notification_hook) = &self.runtime_overrides.notification_hook {
+            self.notification_hook = Some(notification_hook.clone());
         }
-        if let Some(web_push_proxy) = web_push_proxy.and_then(normalize_optional_string) {
-            self.web_push_proxy = Some(web_push_proxy);
+        if let Some(web_push_proxy) = &self.runtime_overrides.web_push_proxy {
+            self.web_push_proxy = Some(web_push_proxy.clone());
         }
-        self
     }
 
     pub fn wwwroot_dir(&self) -> PathBuf {
@@ -289,6 +429,17 @@ fn load_overrides(state_dir: &PathBuf) -> AppConfigOverrides {
     serde_json::from_str::<AppConfigOverrides>(&raw).unwrap_or_default()
 }
 
+/// Strict override loading for hot reload: unlike [`load_overrides`], read
+/// and parse failures are reported so the caller can keep the last good
+/// configuration instead of silently resetting to defaults.
+fn try_load_overrides(state_dir: &Path) -> std::result::Result<AppConfigOverrides, String> {
+    let path = state_dir.join("config.json");
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    serde_json::from_str::<AppConfigOverrides>(&raw)
+        .map_err(|err| format!("could not parse {}: {err}", path.display()))
+}
+
 fn normalize_optional_string(value: String) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -339,6 +490,7 @@ mod tests {
             max_running_sessions: 50,
             screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: Some("config-hook".to_string()),
+            runtime_overrides: Default::default(),
         }
     }
 
@@ -406,5 +558,96 @@ mod tests {
 
         let empty: super::AppConfigOverrides = serde_json::from_str("{}").expect("parse empty");
         assert_eq!(empty.screen_scrollback_rows, None);
+    }
+
+    #[test]
+    fn try_reload_picks_up_config_file_changes() {
+        let state_dir =
+            std::env::temp_dir().join(format!("oly_config_reload_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(
+            state_dir.join("config.json"),
+            r#"{"notification_hook": "old-hook", "silence_seconds": 42}"#,
+        )
+        .expect("write config.json");
+
+        let mut config = test_config();
+        config.state_dir = state_dir.clone();
+
+        let reloaded = config.try_reload().expect("reload should succeed");
+        assert_eq!(reloaded.notification_hook.as_deref(), Some("old-hook"));
+        assert_eq!(reloaded.silence_seconds, 42);
+        // Fields absent from the file fall back to defaults, not to the
+        // previous in-memory values.
+        assert_eq!(reloaded.max_running_sessions, 50);
+
+        std::fs::write(
+            state_dir.join("config.json"),
+            r#"{"notification_hook": "new-hook", "max_running_sessions": 7}"#,
+        )
+        .expect("rewrite config.json");
+
+        let reloaded = config.try_reload().expect("second reload should succeed");
+        assert_eq!(reloaded.notification_hook.as_deref(), Some("new-hook"));
+        assert_eq!(reloaded.max_running_sessions, 7);
+        assert_eq!(reloaded.silence_seconds, 10);
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn try_reload_rejects_unparseable_config() {
+        let state_dir =
+            std::env::temp_dir().join(format!("oly_config_reload_bad_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(state_dir.join("config.json"), "{ not json").expect("write config.json");
+
+        let mut config = test_config();
+        config.state_dir = state_dir.clone();
+
+        assert!(
+            config.try_reload().is_err(),
+            "a broken config.json must not replace the running configuration"
+        );
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn try_reload_keeps_runtime_overrides_winning_over_file() {
+        let state_dir =
+            std::env::temp_dir().join(format!("oly_config_reload_rt_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::write(
+            state_dir.join("config.json"),
+            r#"{"notification_hook": "file-hook", "http_port": 19000}"#,
+        )
+        .expect("write config.json");
+
+        let mut config = test_config();
+        config.state_dir = state_dir.clone();
+        let config =
+            config.with_runtime_overrides(None, Some(17000), Some("cli-hook".to_string()), None);
+
+        let reloaded = config.try_reload().expect("reload should succeed");
+        assert_eq!(
+            reloaded.notification_hook.as_deref(),
+            Some("cli-hook"),
+            "CLI flag must keep winning over the edited config file"
+        );
+        assert_eq!(reloaded.http_port, 17000);
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn hot_reload_changes_lists_only_hot_fields() {
+        let base = test_config();
+        let mut changed = base.clone();
+        changed.notification_hook = Some("other-hook".to_string());
+        changed.http_port = 1;
+
+        assert_eq!(base.hot_reload_changes(&changed), vec!["notification_hook"]);
+        assert_eq!(base.restart_required_changes(&changed), vec!["http_port"]);
     }
 }

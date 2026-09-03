@@ -343,7 +343,7 @@ async fn handle_forwarded_session_event(state: &AppState, node_name: &str, paylo
                     trigger_detail: trigger_detail.clone(),
                     node: delivered_node,
                 };
-                let outcome = state.notifier.dispatch(&event).await;
+                let outcome = state.notifier.load_full().dispatch(&event).await;
                 if !outcome.any_delivered() {
                     warn!(
                         node = %node_name,

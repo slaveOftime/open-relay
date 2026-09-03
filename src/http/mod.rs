@@ -27,10 +27,10 @@ use tracing::{error, info};
 pub use auth::AuthState;
 
 use crate::{
-    config::AppConfig,
+    config::LiveConfig,
     db::Database,
     node::NodeRegistry,
-    notification::dispatcher::Notifier,
+    notification::dispatcher::SharedNotifier,
     session::{SessionEvent, SessionStore},
     utils::format_http_url,
 };
@@ -38,9 +38,11 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<SessionStore>,
-    pub config: Arc<AppConfig>,
+    /// Live, hot-reloadable configuration view: read via `config.get()` so
+    /// edits to config.json apply without a daemon restart.
+    pub config: LiveConfig,
     pub db: Arc<Database>,
-    pub notifier: Arc<Notifier>,
+    pub notifier: SharedNotifier,
     pub event_tx: broadcast::Sender<SessionEvent>,
     /// None when `--no-auth` was specified; Some when password auth is active.
     pub auth: Option<Arc<AuthState>>,
@@ -56,8 +58,8 @@ pub struct AppState {
 struct WebAssets;
 
 pub async fn serve(state: AppState) {
-    let bind = state.config.http_bind.clone();
-    let port = state.config.http_port;
+    let bind = state.config.get().http_bind.clone();
+    let port = state.config.get().http_port;
     let ip = match bind.parse::<std::net::IpAddr>() {
         Ok(ip) => ip,
         Err(err) => {
@@ -67,13 +69,13 @@ pub async fn serve(state: AppState) {
     };
     let addr = std::net::SocketAddr::new(ip, port);
 
-    let wwwroot_dir = match apps::ensure_wwwroot(&state.config) {
+    let wwwroot_dir = match apps::ensure_wwwroot(&state.config.get()) {
         Ok(path) => path,
         Err(err) => {
             error!(
                 %err,
                 "failed to initialize HTTP wwwroot at {}",
-                state.config.wwwroot_dir().display()
+                state.config.get().wwwroot_dir().display()
             );
             return;
         }
@@ -188,7 +190,7 @@ async fn serve_static_or_proxy(
     let (parts, body) = request.into_parts();
     let uri = parts.uri.clone();
     let headers = parts.headers.clone();
-    let wwwroot_dir = state.config.wwwroot_dir();
+    let wwwroot_dir = state.config.get().wwwroot_dir();
     let auth_token = auth::extract_request_token_parts(&headers, uri.query());
     let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
 

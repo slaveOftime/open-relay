@@ -91,6 +91,7 @@ Primary references:
   - `src/client/join.rs` - persisted join config management and CLI join/start-stop flows.
 - **Daemon lifecycle + IPC handling**
   - `src/daemon/lifecycle.rs` - daemon startup/shutdown, lock/pid handling, foreground runtime orchestration.
+  - `src/daemon/reload.rs` - config.json hot reload: polls mtime, swaps `LiveConfig`, rebuilds notification channels and the log filter.
   - `src/daemon/rpc.rs` - IPC request entrypoint and top-level dispatch.
   - `src/daemon/rpc_attach.rs` - streaming attach/input/resize/detach handlers.
   - `src/daemon/rpc_nodes.rs` - node proxy handlers plus secondary-node connector runtime.
@@ -512,23 +513,40 @@ Browser                           Daemon
 
 ## 11) Configuration Reference
 
-Config file: `<state_dir>/config.toml` (created on first run with defaults).
+Config file: `<state_dir>/config.json` (created on first run with defaults,
+including a freshly generated VAPID key pair).
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `port` | `u16` | `7703` | HTTP API listen port |
-| `bind` | `string` | `"127.0.0.1"` | HTTP bind address |
-| `log_max_bytes` | `usize` | `10485760` | Max `output.log` size before rotation |
-| `auth_enabled` | `bool` | `true` | Require API key for all HTTP requests |
-| `tls_cert` | `path` | `""` | Path to TLS certificate (PEM) |
-| `tls_key` | `path` | `""` | Path to TLS private key (PEM) |
-| `federation.primary_url` | `string` | `""` | Primary node URL (secondary nodes only) |
-| `federation.api_key` | `string` | `""` | API key for primary node auth |
-| `notification.vapid_public` | `string` | `""` | VAPID public key for Web Push |
-| `notification.vapid_private` | `string` | `""` | VAPID private key for Web Push |
-| `screen_scrollback_rows` | `usize` | `5000` | Rows of scrolled-off output each live session retains in memory, rendered as history for freshly attaching clients |
+| `bind` | `string` | `"127.0.0.1"` | HTTP bind address (restart required) |
+| `http_port` | `u16` | `15443` | HTTP API listen port (restart required) |
+| `log_level` | `string` | `"info"` | Daemon log filter (hot) |
+| `silence_seconds` | `u64` | `10` | How long a session must be silent before a silence notification can fire (hot) |
+| `stop_grace_seconds` | `u64` | `5` | Default graceful-stop timeout for `oly stop` / HTTP stop when no explicit grace is given (hot) |
+| `prompt_patterns` | `string[]` | built-in list | Regexes used to pick notification body lines from session excerpts (hot) |
+| `notification_hook` | `string` | `""` | Executable invoked on every local OS notification, with `{placeholder}` substitution and `OLY_EVENT_*` env vars (hot) |
+| `web_push_vapid_public_key` | `string` | generated | VAPID public key for Web Push (hot) |
+| `web_push_vapid_private_key` | `string` | generated | VAPID private key for Web Push (hot) |
+| `web_push_subject` | `string` | `""` | VAPID subject (mailto:/URL) for Web Push (hot) |
+| `web_push_proxy` | `string` | `""` | Proxy URL for Web Push delivery; `OLY_WEB_PUSH_PROXY` env var also honored (hot) |
+| `max_running_sessions` | `usize` | `50` | Max concurrent live sessions (hot) |
+| `session_eviction_seconds` | `u64` | `15` | TTL for evicting completed sessions from memory (hot) |
+| `screen_scrollback_rows` | `usize` | `5000` | Rows of scrolled-off output each live session retains in memory, rendered as history for freshly attaching clients (hot; applies to newly started sessions) |
 
-CLI flags (`oly --help`) override all config file values.
+### Hot reload
+
+The daemon polls `config.json` every 2 s and applies changed keys marked
+**(hot)** without a restart (`src/daemon/reload.rs`): the shared
+`LiveConfig` (`ArcSwap<AppConfig>`) is swapped, notification channels are
+rebuilt when hook/VAPID/proxy settings change, the log filter is reloaded on
+`log_level` changes, and the session store's eviction TTL is updated.
+Edits to `bind`/`http_port` (and socket/state paths) are logged but require
+a daemon restart. An unreadable or unparseable `config.json` is rejected
+with a warning and the last good configuration keeps running.
+
+CLI flags (`oly daemon start --bind/--port/--notification-hook/--web-push-proxy`)
+are recorded as runtime overrides and keep winning over `config.json`
+across reloads.
 
 ---
 

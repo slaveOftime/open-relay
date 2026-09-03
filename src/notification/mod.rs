@@ -7,11 +7,11 @@ use std::{sync::Arc, time::Instant};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, LiveConfig},
     db::Database,
     notification::{
         channel::{LocalOsNotificationChannel, NotificationChannel, WebPushChannel},
-        dispatcher::Notifier,
+        dispatcher::{Notifier, SharedNotifier},
         event::{NotificationEvent, NotificationTriggerRule},
         prompt::{compile_prompt_patterns, find_prompt_match, sanitize_body, strip_ansi_for_body},
     },
@@ -25,19 +25,22 @@ use crate::{
 /// composing input and only the "input required" flag is updated. Prompt
 /// patterns are used to pick a better body line but do **not** gate delivery.
 pub(super) async fn run_notification_monitor(
-    notifier: Arc<Notifier>,
+    notifier: SharedNotifier,
     session_store: Arc<SessionStore>,
-    config: Arc<AppConfig>,
+    config: LiveConfig,
     event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
 ) {
-    let silence = std::time::Duration::from_secs(config.silence_seconds);
     let suppression_window = std::time::Duration::from_secs(5);
     let min_notification_interval = std::time::Duration::from_secs(10);
-    let patterns = compile_prompt_patterns(&config.prompt_patterns);
+
+    // Prompt patterns are cached compiled and rebuilt whenever a config hot
+    // reload swaps in a different source list.
+    let mut cached_pattern_sources = config.get().prompt_patterns.clone();
+    let mut patterns = compile_prompt_patterns(&cached_pattern_sources);
 
     info!(
-        silence_seconds = config.silence_seconds,
+        silence_seconds = config.get().silence_seconds,
         min_notification_interval_seconds = min_notification_interval.as_secs(),
         prompt_patterns = patterns.len(),
         "notification monitor started"
@@ -45,6 +48,19 @@ pub(super) async fn run_notification_monitor(
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Read the live config each tick so hot-reloaded values (silence
+        // window, prompt patterns) apply without a daemon restart.
+        let current_config = config.get();
+        let silence = std::time::Duration::from_secs(current_config.silence_seconds);
+        if current_config.prompt_patterns != cached_pattern_sources {
+            cached_pattern_sources = current_config.prompt_patterns.clone();
+            patterns = compile_prompt_patterns(&cached_pattern_sources);
+            info!(
+                prompt_patterns = patterns.len(),
+                "prompt patterns reloaded from config"
+            );
+        }
 
         let candidates: Vec<SilentCandidate> =
             session_store.silent_candidates(suppression_window, min_notification_interval);
@@ -120,7 +136,7 @@ pub(super) async fn run_notification_monitor(
                 let event = event.clone();
                 let session_id = session_id.clone();
                 tokio::spawn(async move {
-                    if !notifier.dispatch(&event).await.any_delivered() {
+                    if !notifier.load_full().dispatch(&event).await.any_delivered() {
                         warn!(session_id, "notification delivery failed on all channels");
                     }
                 });

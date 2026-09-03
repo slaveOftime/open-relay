@@ -1,6 +1,7 @@
 mod auth;
 mod crash;
 mod lifecycle;
+mod reload;
 mod rpc;
 mod rpc_attach;
 mod rpc_nodes;
@@ -9,7 +10,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, watch};
 
 use crate::{
-    notification::{dispatcher::Notifier, event::NotificationEvent},
+    notification::event::NotificationEvent,
     session::{SessionEvent, SessionStore},
 };
 
@@ -20,4 +21,4 @@ pub(crate) type JoinHandles =
     Arc<Mutex<HashMap<String, (tokio::task::AbortHandle, watch::Sender<bool>)>>>;
 pub(crate) type NotificationTx = tokio::sync::broadcast::Sender<NotificationEvent>;
 pub(crate) type SessionEventTx = tokio::sync::broadcast::Sender<SessionEvent>;
-pub(crate) type NotifierHandle = Arc<Notifier>;
+pub(crate) type NotifierHandle = crate::notification::dispatcher::SharedNotifier;
