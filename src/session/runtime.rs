@@ -30,7 +30,7 @@ use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
 use super::scan::{PtyScanner, ScanOut};
 
 use super::{
-    SessionMeta, SessionStatus,
+    MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus,
     persist::{OutputLog, append_event, append_resize_event},
     screen::safe_resize_parser,
 };
@@ -131,6 +131,11 @@ pub struct SessionRuntime {
     /// thread's scanner tracks them and publishes them here for attach
     /// snapshot restoration.
     pub terminal_signals: TerminalSignals,
+    /// Set once the title was explicitly chosen by the user (at creation or
+    /// through a metadata update). Terminal-emitted title signals are adopted
+    /// as the session title only while this is `false`, so an explicit title
+    /// always wins over the child's `OSC 0/1/2` notifications.
+    pub title_user_set: bool,
     /// Lock-free mirror of `mode_snapshot()` for the attach relays.
     pub shared_modes: Arc<SharedModes>,
     /// Set once the PTY reader has reached EOF or a terminal read error.
@@ -234,6 +239,47 @@ impl SessionRuntime {
             cols: self.pty_size.map(|(_, cols)| cols),
             attach_count: self.attach_count,
         }
+    }
+
+    /// Adopt a terminal-emitted window/icon title as the session title.
+    ///
+    /// Only applies while the user has not chosen a title themselves; an
+    /// explicit title (given at creation or through a metadata update) always
+    /// wins. Returns `true` when the session title actually changed.
+    fn apply_terminal_title(&mut self, payload: &[u8]) -> bool {
+        if self.title_user_set {
+            return false;
+        }
+        let lossy = String::from_utf8_lossy(payload);
+        let trimmed = lossy.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let title: String = trimmed.chars().take(MAX_SESSION_TITLE_LEN).collect();
+        if self.meta.title.as_deref() == Some(title.as_str()) {
+            return false;
+        }
+        debug!(
+            session_id = %self.meta.id,
+            title = %title,
+            "adopting terminal-emitted title as session title"
+        );
+        self.meta.title = Some(title);
+        true
+    }
+
+    /// Publish the reader thread's latest retained terminal signals.
+    ///
+    /// While the session has no user-chosen title, a terminal-emitted
+    /// window/icon title is also adopted as the session title. Returns `true`
+    /// when the session title changed so the caller can broadcast a metadata
+    /// update.
+    pub fn publish_terminal_signals(&mut self, signals: TerminalSignals) -> bool {
+        let adopted = signals
+            .title()
+            .is_some_and(|title| self.apply_terminal_title(title));
+        self.terminal_signals = signals;
+        adopted
     }
 
     /// Bytes that restore the session's visible terminal state on a freshly
@@ -472,6 +518,7 @@ pub fn spawn_session(
     cols: u16,
     notifications_enabled: bool,
     screen_scrollback_rows: usize,
+    event_tx: SessionEventTx,
 ) -> Result<Arc<RwLock<SessionRuntime>>> {
     meta.notifications_enabled = notifications_enabled;
     let full_dir = session_dir;
@@ -615,6 +662,9 @@ pub fn spawn_session(
         screen_parser: vt100::Parser::new(rows, cols, screen_scrollback_rows),
         screen_scrollback_rows,
         terminal_signals: TerminalSignals::default(),
+        // A title present at creation was chosen by the caller, so terminal
+        // title signals must never overwrite it.
+        title_user_set: meta.title.is_some(),
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
         notifications_enabled,
@@ -624,6 +674,7 @@ pub fn spawn_session(
     // and retains/broadcasts only that filtered stream.
     let runtime_reader = runtime.clone();
     let broadcast_tx_reader = broadcast_tx;
+    let reader_event_tx = event_tx;
     let reader_session_id = meta.id.clone();
     std::thread::spawn(move || {
         debug!(session_id = %reader_session_id, "PTY reader thread started");
@@ -663,15 +714,26 @@ pub fn spawn_session(
                     let changed_signals = scanner.take_changed_signals();
 
                     // Single write lock: advance the rendered screen and the
-                    // stream counters, publish any changed notifications, and
-                    // read back the cursor position for query replies.
-                    let cursor_position = {
+                    // stream counters, publish any changed notifications (and
+                    // adopt a terminal-emitted title while the session has no
+                    // user-chosen one), and read back the cursor position for
+                    // query replies.
+                    let (cursor_position, title_update) = {
                         let mut rt = runtime_reader.write();
-                        if let Some(signals) = changed_signals {
-                            rt.terminal_signals = signals;
-                        }
-                        rt.push_output(&filtered, meaningful_len)
+                        let title_adopted = if let Some(signals) = changed_signals {
+                            rt.publish_terminal_signals(signals)
+                        } else {
+                            false
+                        };
+                        let cursor = rt.push_output(&filtered, meaningful_len);
+                        (cursor, title_adopted.then(|| rt.to_summary()))
                     };
+
+                    // Let live clients know the session title was adopted from
+                    // the child's title notification.
+                    if let Some(summary) = title_update {
+                        let _ = reader_event_tx.send(SessionEvent::SessionUpdated(summary));
+                    }
 
                     if let Err(err) = output_log.append(&filtered) {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
@@ -766,6 +828,7 @@ fn load_spawn_environment() -> Vec<(OsString, OsString)> {
     inherited
 }
 
+#[cfg(windows)]
 fn merge_spawn_environment(
     mut inherited: Vec<(OsString, OsString)>,
     refreshed: Vec<(OsString, OsString)>,
@@ -1021,6 +1084,7 @@ mod tests {
             screen_parser: vt100::Parser::new(24, 80, 1000),
             screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
+            title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
             notifications_enabled: true,
@@ -1038,7 +1102,7 @@ mod tests {
         let mut out = ScanOut::default();
         scanner.scan(raw, &mut out);
         if let Some(signals) = scanner.take_changed_signals() {
-            rt.terminal_signals = signals;
+            rt.publish_terminal_signals(signals);
         }
         let meaningful = out.meaningful_bytes();
         rt.push_output(&out.filtered, meaningful)
@@ -1236,6 +1300,84 @@ mod tests {
         assert_eq!(rt.last_total_bytes, 4);
     }
 
+    // -----------------------------------------------------------------------
+    // terminal title adoption
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_terminal_title_adopted_while_session_title_is_unset() {
+        let mut rt = new_runtime();
+        assert!(rt.meta.title.is_none());
+
+        push_scanned(&mut rt, b"\x1b]0;relay build\x07");
+
+        assert_eq!(rt.meta.title.as_deref(), Some("relay build"));
+    }
+
+    #[test]
+    fn test_terminal_title_keeps_tracking_until_user_sets_a_title() {
+        let mut rt = new_runtime();
+
+        push_scanned(&mut rt, b"\x1b]0;first\x07");
+        push_scanned(&mut rt, b"\x1b]2;second\x07");
+        assert_eq!(rt.meta.title.as_deref(), Some("second"));
+
+        rt.meta.title = Some("mine".to_string());
+        rt.title_user_set = true;
+
+        push_scanned(&mut rt, b"\x1b]0;third\x07");
+        assert_eq!(rt.meta.title.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn test_terminal_title_never_overrides_a_user_title() {
+        let mut rt = new_runtime();
+        rt.meta.title = Some("deploy".to_string());
+        rt.title_user_set = true;
+
+        push_scanned(&mut rt, b"\x1b]0;relay build\x07");
+
+        assert_eq!(rt.meta.title.as_deref(), Some("deploy"));
+    }
+
+    #[test]
+    fn test_terminal_title_ignores_empty_payloads_and_trims_whitespace() {
+        let mut rt = new_runtime();
+
+        push_scanned(&mut rt, b"\x1b]0;\x07");
+        assert!(rt.meta.title.is_none());
+
+        push_scanned(&mut rt, b"\x1b]0;  spaced  \x07");
+        assert_eq!(rt.meta.title.as_deref(), Some("spaced"));
+    }
+
+    #[test]
+    fn test_terminal_title_is_capped_at_the_session_title_limit() {
+        let mut rt = new_runtime();
+        let long = "x".repeat(MAX_SESSION_TITLE_LEN + 50);
+        let chunk = format!("\x1b]0;{long}\x07");
+
+        push_scanned(&mut rt, chunk.as_bytes());
+
+        assert_eq!(
+            rt.meta.title.as_deref().map(str::len),
+            Some(MAX_SESSION_TITLE_LEN)
+        );
+    }
+
+    #[test]
+    fn test_publish_terminal_signals_reports_whether_the_title_changed() {
+        let mut rt = new_runtime();
+
+        assert!(!rt.publish_terminal_signals(TerminalSignals::default()));
+
+        let mut signals = TerminalSignals::default();
+        signals.record_osc(b"0", b"relay build");
+        assert!(rt.publish_terminal_signals(signals.clone()));
+        // Re-publishing the same signals is not a change.
+        assert!(!rt.publish_terminal_signals(signals));
+    }
+
     #[test]
     fn test_attach_snapshot_restores_title_progress_and_cursor_style() {
         // The screen parser drops Operating System Commands and does not model
@@ -1395,6 +1537,7 @@ mod tests {
             screen_parser: vt100::Parser::new(24, 80, 1000),
             screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
+            title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
             notifications_enabled: true,

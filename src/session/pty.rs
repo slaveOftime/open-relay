@@ -341,6 +341,15 @@ impl TerminalSignals {
         }
     }
 
+    /// The most recently emitted window/icon title payload, if any.
+    ///
+    /// The window title is preferred; OSC 1 (icon-only) is the fallback for
+    /// children that never set a window title. OSC 0 sets both slots, so it is
+    /// covered by either branch.
+    pub fn title(&self) -> Option<&[u8]> {
+        self.window_title.as_deref().or(self.icon_title.as_deref())
+    }
+
     /// Record the parameters of a cursor-style sequence, or `None` to restore
     /// the terminal default. Returns `true` when the retained state changed.
     pub(crate) fn set_cursor_style(&mut self, params: Option<Vec<u8>>) -> bool {
@@ -448,6 +457,22 @@ mod tests {
         assert_eq!(xterm_color_to_rgb(21), (0x00, 0x00, 0xff));
         assert_eq!(xterm_color_to_rgb(232), (0x08, 0x08, 0x08));
         assert_eq!(xterm_color_to_rgb(255), (0xee, 0xee, 0xee));
+    }
+
+    #[test]
+    fn title_prefers_the_window_title_and_falls_back_to_the_icon_title() {
+        let mut signals = TerminalSignals::default();
+        assert_eq!(signals.title(), None);
+
+        signals.record_osc(b"1", b"icon");
+        assert_eq!(signals.title(), Some(b"icon".as_slice()));
+
+        signals.record_osc(b"2", b"window");
+        assert_eq!(signals.title(), Some(b"window".as_slice()));
+
+        // OSC 0 sets both slots to the same payload.
+        signals.record_osc(b"0", b"both");
+        assert_eq!(signals.title(), Some(b"both".as_slice()));
     }
 
     #[test]

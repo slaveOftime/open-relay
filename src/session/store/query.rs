@@ -116,6 +116,9 @@ impl SessionStore {
                 }
                 if title_provided {
                     rt.meta.title = title.clone();
+                    // An explicit title update wins over terminal-emitted
+                    // title signals; clearing it hands control back to them.
+                    rt.title_user_set = title.is_some();
                 }
                 if let Some(tags) = tags.as_ref() {
                     rt.meta.tags = tags.clone();
