@@ -139,6 +139,7 @@ impl SessionStore {
             cols,
             notifications_enabled,
             config.screen_scrollback_rows,
+            store_handle.event_tx.clone(),
         ) {
             Ok(runtime) => runtime,
             Err(err) => {
