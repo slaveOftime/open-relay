@@ -6,21 +6,21 @@
 class Oly < Formula
   desc "Session-persistent PTY daemon for long-running CLI agents"
   homepage "https://github.com/slaveOftime/open-relay"
-  version "0.3.2"
+  version "0.3.3"
   license "MIT"
 
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/slaveOftime/open-relay/releases/download/v#{version}/oly-macos-arm64.zip"
       # SHA256 is updated automatically by the release workflow.
-      sha256 "b8fa70fa9e4dde5fc82c16b035da0d06e56716c3b19ec4291d004a4f42bd2029"
+      sha256 "7f076d59007b839b079c7b08a55a27753fded524b23462657b76a0c4456cd39b"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
       url "https://github.com/slaveOftime/open-relay/releases/download/v#{version}/oly-linux-amd64.zip"
-      sha256 "8fa728a25b73a7395164c4df84b17ce6b4bf17ba45837ff8c1c18f2c1d0731bf"
+      sha256 "e63c4ea91d1a24c581cf786cdbdac8ad91ab1905929bb52ec8225320800d7fa0"
     end
   end
 
