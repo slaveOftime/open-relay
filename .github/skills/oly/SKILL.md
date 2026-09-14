@@ -108,6 +108,7 @@ oly notify send <ID> --title "Done" --description "Summary." --body "Details."
 
 - `<ID>` is optional — include it to link the notification to a specific session. It must be a **running** session; omit the ID if the session already ended.
 - Toggle per-session notifications: `oly notify enable <ID>` / `oly notify disable <ID>`.
+- Notifications go to the **human** (desktop / configured notification hook), never to another session. To message another session, use `oly send` with the report-back protocol below.
 
 ### Help
 
@@ -171,7 +172,7 @@ Make report text self-identifying (sender session ID, status, key results) — a
 ```bash
 oly ls --json --status running      # what's still alive?
 oly logs <ID> --tail 40             # spot-check one session
-oly notify enable <ID>              # get pinged when it needs input
+oly notify enable <ID>              # let the human get pinged when it needs input
 ```
 
 ### Recover a stuck or failed session
