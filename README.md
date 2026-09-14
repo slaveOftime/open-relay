@@ -279,6 +279,16 @@ Inside that directory, `oly` stores:
 - saved join configs on secondary nodes
 - optional `wwwroot` static content
 
+### Tunable `config.json` keys
+
+These keys can be set in `config.json` (runtime overrides win over the file). Several are hot-reloaded when the file changes, so no daemon restart is needed:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `silence_seconds` | `10` | Idle time before a session is considered silent for `input_needed` detection |
+| `notification_min_interval_seconds` | `10` | Minimum seconds between repeat `input_needed` notifications for the same session |
+| `max_output_log_bytes` | `0` (unlimited) | Cap on a session's `output.log`; when exceeded, the daemon safely truncates it in place |
+
 ---
 
 ## Good fits for `oly`
