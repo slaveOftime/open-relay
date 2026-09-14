@@ -105,6 +105,25 @@ pub fn current_output_offset(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Truncate a session's `output.log` back to zero length.
+///
+/// The reader thread's [`OutputLog`] handle is opened in append mode, so it
+/// keeps writing at the new end-of-file after truncation without needing to
+/// be reopened. Callers must also reset the persisted log index (via
+/// [`super::logs::discard_persisted_log_index`]) and the runtime byte counters
+/// so downstream offsets stay consistent.
+pub fn truncate_output_log(dir: &Path) -> Result<()> {
+    let path = dir.join("output.log");
+    match fs::OpenOptions::new().write(true).open(&path) {
+        Ok(file) => {
+            file.set_len(0)?;
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 pub fn read_output_from(dir: &Path, from_offset: u64) -> Result<(Vec<u8>, u64)> {
     let path = dir.join("output.log");
     let mut file = match fs::File::open(path) {

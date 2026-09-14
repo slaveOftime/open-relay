@@ -69,6 +69,9 @@ pub struct AppConfig {
     pub notification_min_interval_seconds: u64,
     pub session_eviction_seconds: u64,
     pub max_running_sessions: usize,
+    /// Maximum size in bytes an individual session's `output.log` may reach
+    /// before the daemon truncates it in place. `0` disables the cap.
+    pub max_output_log_bytes: u64,
     /// Rows of scrolled-off output each session's live screen parser retains
     /// in memory, rendered as scrollback history for freshly attaching
     /// clients.  vt100 only keeps scrollback for the main screen, so
@@ -136,6 +139,7 @@ struct AppConfigOverrides {
     web_push_proxy: Option<String>,
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
+    max_output_log_bytes: Option<u64>,
     screen_scrollback_rows: Option<usize>,
     /// Path to an executable invoked on every local OS notification.
     /// Event data is provided via environment variables (OLY_EVENT_*).
@@ -195,6 +199,7 @@ impl AppConfig {
             .unwrap_or_else(|| "open-relay.oly.sock".to_string());
 
         let max_running_sessions = overrides.max_running_sessions.unwrap_or(50);
+        let max_output_log_bytes = overrides.max_output_log_bytes.unwrap_or(0);
         let screen_scrollback_rows = overrides
             .screen_scrollback_rows
             .unwrap_or(DEFAULT_SCREEN_SCROLLBACK_ROWS);
@@ -225,6 +230,7 @@ impl AppConfig {
             max_running_sessions,
             screen_scrollback_rows,
             notification_hook,
+            max_output_log_bytes,
             runtime_overrides: RuntimeOverrides::default(),
         }
     }
@@ -286,6 +292,9 @@ impl AppConfig {
         }
         if self.session_eviction_seconds != other.session_eviction_seconds {
             changed.push("session_eviction_seconds");
+        }
+        if self.max_output_log_bytes != other.max_output_log_bytes {
+            changed.push("max_output_log_bytes");
         }
         if self.screen_scrollback_rows != other.screen_scrollback_rows {
             changed.push("screen_scrollback_rows");
@@ -501,6 +510,7 @@ mod tests {
             notification_min_interval_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 50,
+            max_output_log_bytes: 0,
             screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: Some("config-hook".to_string()),
             runtime_overrides: Default::default(),

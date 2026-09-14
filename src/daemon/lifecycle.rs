@@ -665,7 +665,9 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 break;
             }
             _ = session_maintenance_tick.tick() => {
-                session_store.run_maintenance().await;
+                session_store
+                    .run_maintenance(live_config.get().max_output_log_bytes)
+                    .await;
             }
             incoming = listener.accept() => {
                 match incoming {
@@ -739,6 +741,7 @@ mod tests {
             notification_min_interval_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 50,
+            max_output_log_bytes: 0,
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: None,
             web_push_proxy: None,
