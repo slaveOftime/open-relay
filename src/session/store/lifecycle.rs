@@ -316,6 +316,8 @@ impl SessionStore {
             pid: None,
             exit_code: None,
             notifications_enabled: spec.notifications_enabled,
+            foreground_color: None,
+            background_color: None,
         };
 
         state.starting_sessions.insert(id.clone());

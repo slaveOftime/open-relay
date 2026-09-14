@@ -380,6 +380,8 @@ mod tests {
             rows: Some(24),
             cols: Some(80),
             attach_count: 0,
+            foreground_color: None,
+            background_color: None,
         };
 
         let value = session_json(&session);

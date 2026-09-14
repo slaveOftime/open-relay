@@ -593,6 +593,8 @@ mod tests {
             pid: None,
             exit_code: Some(0),
             notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
         };
         db.insert_session(&meta).await.expect("insert session");
 

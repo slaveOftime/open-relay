@@ -303,6 +303,15 @@ pub struct TerminalSignals {
     /// Parameters of the most recent cursor-style sequence (DECSCUSR), if the
     /// session selected a non-default shape.
     cursor_style: Option<Vec<u8>>,
+    /// Payload of the most recent default-foreground-colour set (OSC 10).
+    ///
+    /// Unlike titles and progress these are *not* replayed to attached
+    /// clients: a session's colour scheme is host-specific state that must
+    /// not follow it onto another user's terminal. They are retained purely
+    /// as session metadata.
+    foreground: Option<Vec<u8>>,
+    /// Payload of the most recent default-background-colour set (OSC 11).
+    background: Option<Vec<u8>>,
 }
 
 impl TerminalSignals {
@@ -327,6 +336,16 @@ impl TerminalSignals {
             }
             b"1" => replace_slot(&mut self.icon_title, Some(payload)),
             b"2" => replace_slot(&mut self.window_title, Some(payload)),
+            // An empty payload resets the colour to the terminal default, so
+            // drop the slot rather than retaining an empty spec.
+            b"10" => replace_slot(
+                &mut self.foreground,
+                (!payload.is_empty()).then_some(payload),
+            ),
+            b"11" => replace_slot(
+                &mut self.background,
+                (!payload.is_empty()).then_some(payload),
+            ),
             b"9" if payload.starts_with(b"4;") => {
                 // OSC 9;4;0 removes the indicator, so drop the slot rather than
                 // replaying a clear on every future attach.
@@ -339,6 +358,18 @@ impl TerminalSignals {
             }
             _ => false,
         }
+    }
+
+    /// The most recently emitted default-foreground-colour payload (OSC 10),
+    /// if the session currently has one set.
+    pub fn foreground_color(&self) -> Option<&[u8]> {
+        self.foreground.as_deref()
+    }
+
+    /// The most recently emitted default-background-colour payload (OSC 11),
+    /// if the session currently has one set.
+    pub fn background_color(&self) -> Option<&[u8]> {
+        self.background.as_deref()
     }
 
     /// The most recently emitted window/icon title payload, if any.
@@ -473,6 +504,32 @@ mod tests {
         // OSC 0 sets both slots to the same payload.
         signals.record_osc(b"0", b"both");
         assert_eq!(signals.title(), Some(b"both".as_slice()));
+    }
+
+    #[test]
+    fn colour_slots_track_sets_and_resets() {
+        let mut signals = TerminalSignals::default();
+        assert_eq!(signals.foreground_color(), None);
+        assert_eq!(signals.background_color(), None);
+
+        assert!(signals.record_osc(b"10", b"rgb:ffff/ffff/ffff"));
+        assert!(signals.record_osc(b"11", b"#1e1e1e"));
+        assert_eq!(
+            signals.foreground_color(),
+            Some(b"rgb:ffff/ffff/ffff".as_slice())
+        );
+        assert_eq!(signals.background_color(), Some(b"#1e1e1e".as_slice()));
+
+        // Re-setting the same value is not a change.
+        assert!(!signals.record_osc(b"10", b"rgb:ffff/ffff/ffff"));
+
+        // An empty payload resets to the terminal default.
+        assert!(signals.record_osc(b"10", b""));
+        assert_eq!(signals.foreground_color(), None);
+
+        // Colours are session metadata only: they are never replayed onto an
+        // attaching terminal.
+        assert!(signals.restore_bytes().is_empty());
     }
 
     #[test]

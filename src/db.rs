@@ -103,8 +103,8 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at, notifications_enabled) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at, notifications_enabled, foreground_color, background_color) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(&meta.id)
         .bind(&meta.title)
@@ -119,6 +119,8 @@ impl Database {
         .bind(&started_at)
         .bind(&ended_at)
         .bind(meta.notifications_enabled)
+        .bind(&meta.foreground_color)
+        .bind(&meta.background_color)
         .execute(&self.pool)
         .await?;
 
@@ -136,8 +138,9 @@ impl Database {
         sqlx::query(
             "UPDATE sessions \
              SET title=?1, tags=?2, command=?3, args=?4, cwd=?5, status=?6, pid=?7, \
-                 exit_code=?8, started_at=?9, ended_at=?10, notifications_enabled=?11 \
-             WHERE id=?12",
+                 exit_code=?8, started_at=?9, ended_at=?10, notifications_enabled=?11, \
+                 foreground_color=?12, background_color=?13 \
+             WHERE id=?14",
         )
         .bind(&meta.title)
         .bind(&tags)
@@ -150,6 +153,8 @@ impl Database {
         .bind(&started_at)
         .bind(&ended_at)
         .bind(meta.notifications_enabled)
+        .bind(&meta.foreground_color)
+        .bind(&meta.background_color)
         .bind(&meta.id)
         .execute(&self.pool)
         .await?;
@@ -183,7 +188,8 @@ impl Database {
     pub async fn get_session(&self, id: &str) -> Result<Option<SessionMeta>> {
         let row = sqlx::query(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
-                    created_at, started_at, ended_at, notifications_enabled \
+                    created_at, started_at, ended_at, notifications_enabled, \
+                    foreground_color, background_color \
              FROM sessions WHERE id=?1",
         )
         .bind(id)
@@ -211,7 +217,8 @@ impl Database {
 
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
-                    created_at, started_at, ended_at, notifications_enabled \
+                    created_at, started_at, ended_at, notifications_enabled, \
+                    foreground_color, background_color \
              FROM sessions WHERE 1=1",
         );
 
@@ -256,7 +263,8 @@ impl Database {
 
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
-                    created_at, started_at, ended_at, notifications_enabled \
+                    created_at, started_at, ended_at, notifications_enabled, \
+                    foreground_color, background_color \
              FROM sessions
              WHERE status IN (",
         );
@@ -345,6 +353,8 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
     let started_at_str: Option<String> = r.get(10);
     let ended_at_str: Option<String> = r.get(11);
     let notifications_enabled: bool = r.get(12);
+    let foreground_color: Option<String> = r.get(13);
+    let background_color: Option<String> = r.get(14);
 
     build_meta(
         id,
@@ -360,6 +370,8 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
         started_at_str,
         ended_at_str,
         notifications_enabled,
+        foreground_color,
+        background_color,
     )
 }
 
@@ -378,6 +390,8 @@ fn build_meta(
     started_at_str: Option<String>,
     ended_at_str: Option<String>,
     notifications_enabled: bool,
+    foreground_color: Option<String>,
+    background_color: Option<String>,
 ) -> SessionMeta {
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
@@ -399,6 +413,8 @@ fn build_meta(
         pid: pid.map(|p| p as u32),
         exit_code: exit_code.map(|c| c as i32),
         notifications_enabled,
+        foreground_color,
+        background_color,
     }
 }
 
@@ -440,6 +456,8 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         rows: None,
         cols: None,
         attach_count: 0,
+        foreground_color: meta.foreground_color.clone(),
+        background_color: meta.background_color.clone(),
     }
 }
 

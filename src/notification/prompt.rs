@@ -260,6 +260,8 @@ mod tests {
             rows: None,
             cols: None,
             attach_count: 0,
+            foreground_color: None,
+            background_color: None,
         }
     }
 

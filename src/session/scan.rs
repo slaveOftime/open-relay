@@ -119,6 +119,16 @@ impl PtyScanner {
         Some(self.signals.clone())
     }
 
+    /// Whether any retained signal changed since the last
+    /// [`Self::take_changed_signals`], without clearing the flag.
+    ///
+    /// The reader uses this to avoid skipping a chunk that carries only a
+    /// stripped signal (e.g. a pure colour set produces no filtered bytes but
+    /// still updates session metadata).
+    pub fn signals_changed(&self) -> bool {
+        self.signals_dirty
+    }
+
     /// Scan one raw chunk, filling `out` with the filtered stream and the
     /// probes that need a reply.
     pub fn scan(&mut self, data: &[u8], out: &mut ScanOut) {
@@ -321,6 +331,15 @@ impl PtyScanner {
                 b"11" => out.queries.push(TerminalQuery::BackgroundColor),
                 _ => {}
             }
+            return Some(end - start);
+        }
+
+        // Colour *sets* (OSC 10/11 with a non-query payload) are retained as
+        // session metadata but stay stripped from the forwarded stream: a
+        // session's colour scheme is host-specific state that must not follow
+        // it onto another user's terminal.
+        if matches!(ps, b"10" | b"11") {
+            self.record_osc(ps, payload);
             return Some(end - start);
         }
 
@@ -850,6 +869,39 @@ mod tests {
         let mut harness = Harness::new();
         let text = "before\x1b]0;relay build\x07mid\x1b]9;4;3;0\x07after";
         assert_eq!(harness.filter_text(text), text);
+    }
+
+    #[test]
+    fn colour_sets_are_recorded_but_stripped_from_the_stream() {
+        let mut harness = Harness::new();
+        let filtered = harness.filter(b"\x1b]10;red\x07text\x1b]11;#000\x1b\\");
+
+        // Colour sets never reach attached terminals...
+        assert_eq!(filtered, b"text");
+        // ...but they are retained as session metadata.
+        assert!(harness.scanner.signals_changed());
+        let signals = harness
+            .scanner
+            .take_changed_signals()
+            .expect("colour sets change the retained signals");
+        assert_eq!(signals.foreground_color(), Some(b"red".as_slice()));
+        assert_eq!(signals.background_color(), Some(b"#000".as_slice()));
+    }
+
+    #[test]
+    fn colour_queries_are_answered_not_recorded() {
+        let mut harness = Harness::new();
+        let filtered = harness.filter(b"\x1b]10;?\x07\x1b]11;?\x1b\\");
+
+        assert!(filtered.is_empty());
+        assert_eq!(
+            harness.queries(),
+            &[
+                TerminalQuery::ForegroundColor,
+                TerminalQuery::BackgroundColor
+            ]
+        );
+        assert!(!harness.scanner.signals_changed());
     }
 
     #[test]
