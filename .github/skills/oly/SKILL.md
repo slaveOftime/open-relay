@@ -113,6 +113,7 @@ oly notify send <ID> --title "Done" --description "Summary." --body "Details."
 
 ```bash
 oly --help            # or: oly <command> --help
+oly skill             # print the bundled copy of this skill — bootstrap other agents with it
 ```
 
 ## Recipes
@@ -141,6 +142,29 @@ User: "Run the fixer agent and keep it moving until the tests pass."
    ```
 
 Do NOT answer prompts blindly — when a decision is consequential (destructive action, credentials, ambiguous choice), report to the user instead of guessing.
+
+### Delegate to a worker agent session
+
+Hand a task to another agent CLI and have it report back to you:
+
+1. Start the worker and note the ID:
+   ```bash
+   oly start --title "worker" --cwd /repo --detach pi
+   ```
+2. Optional — switch its model interactively: send `/model` `key:enter`, type a filter, then `key:enter`. Pause ~2s between TUI steps and verify each with `oly logs` before sending the next.
+3. In the task prompt, tell the worker to run `oly skill` itself to learn the CLI — do NOT paste the reference into the prompt. The prompt must include: the task, your own session ID, and the report-back protocol below.
+4. Supervise with the loop from the previous recipe; `oly stop <ID>` when done.
+
+**Report-back protocol (busy-safe).** Sending to another session is not guaranteed: a stopped session rejects input outright (exit 1), and a busy TUI may queue or swallow it. So the sender must check, send, confirm, and retry:
+
+```bash
+oly ls --json --status running          # 1. receiver must be running
+oly send <TARGET> "worker <ID> DONE branch=... commit=... summary=..." key:enter   # 2. send
+oly logs <TARGET> --tail 15             # 3. confirm your text landed in its output
+sleep 10                                # 4. if missing: wait and resend, up to 3 tries
+```
+
+Make report text self-identifying (sender session ID, status, key results) — a busy receiver may only act on the message later.
 
 ### Watch several sessions at once
 
