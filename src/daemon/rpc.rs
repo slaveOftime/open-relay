@@ -201,6 +201,9 @@ async fn dispatch_request(
         RpcRequest::Stop { id, grace_seconds } => {
             handle_stop(id, grace_seconds, session_store).await
         }
+        RpcRequest::Restart { id, force } => {
+            handle_restart(id, force, &live_config.get(), session_store).await
+        }
         RpcRequest::Kill { id } => handle_kill(id, session_store).await,
         RpcRequest::Remove { id, force } => handle_remove(id, force, session_store).await,
         RpcRequest::LogsTail {
@@ -333,6 +336,30 @@ async fn handle_stop(
         RpcResponse::Error {
             message: format!("session not found or failed to stop: {id}"),
         }
+    }
+}
+
+async fn handle_restart(
+    id: String,
+    force: bool,
+    config: &AppConfig,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match SessionStore::restart_session_via_handle(session_store, config, &id, force).await {
+        Ok(session_id) => {
+            info!(
+                source_session_id = id,
+                replacement_session_id = session_id,
+                "session restarted"
+            );
+            RpcResponse::Restart {
+                source_id: id,
+                session_id,
+            }
+        }
+        Err(err) => RpcResponse::Error {
+            message: err.to_string(),
+        },
     }
 }
 
@@ -565,6 +592,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta).await.expect("insert session");
 

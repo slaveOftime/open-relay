@@ -182,6 +182,7 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching |
 | `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
+| `oly restart <id> [--force] [--node <name>]` | Start a new session from persisted launch metadata (`--force` first kills a running source) |
 | `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |

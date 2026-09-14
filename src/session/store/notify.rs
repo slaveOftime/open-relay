@@ -671,7 +671,10 @@ mod tests {
             "prompt> ",
             Some(Duration::from_secs(5)),
         );
-        let store = store_with(vec![runtime], make_test_db().await);
+        let db = make_test_db().await;
+        let meta = runtime.read().meta.clone();
+        db.insert_session(&meta).await.expect("insert session row");
+        let store = store_with(vec![runtime], db);
 
         store
             .set_notifications_enabled("abc1234", false)
@@ -683,6 +686,17 @@ mod tests {
         let rt = handle.read();
         assert!(!rt.to_summary().notifications_enabled);
         assert!(!rt.notifications_enabled);
+        assert!(!rt.meta.notifications_enabled);
+        drop(rt);
+        drop(sessions);
+
+        let persisted = store
+            .db
+            .get_session("abc1234")
+            .await
+            .expect("read persisted session")
+            .expect("session row should exist");
+        assert!(!persisted.notifications_enabled);
     }
 
     #[tokio::test]

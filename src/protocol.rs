@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -220,6 +220,11 @@ pub enum RpcRequest {
         id: String,
         grace_seconds: u64,
     },
+    Restart {
+        id: String,
+        #[serde(default)]
+        force: bool,
+    },
     Kill {
         id: String,
     },
@@ -302,6 +307,7 @@ impl RpcRequest {
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::Stop { .. } => "stop",
+            RpcRequest::Restart { .. } => "restart",
             RpcRequest::Kill { .. } => "kill",
             RpcRequest::Remove { .. } => "remove",
             RpcRequest::LogsTail { .. } => "logs_tail",
@@ -385,6 +391,10 @@ pub enum RpcResponse {
     },
     Stop {
         stopped: bool,
+    },
+    Restart {
+        source_id: String,
+        session_id: String,
     },
     Kill {
         killed: bool,
@@ -519,7 +529,31 @@ pub enum NodeWsMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeWsMessage, decode_node_ws_payload, encode_node_ws_payload};
+    use super::{
+        NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+    };
+
+    #[test]
+    fn restart_protocol_round_trips_and_names_request() {
+        let request = RpcRequest::Restart {
+            id: "old123".into(),
+            force: true,
+        };
+        assert_eq!(request.name(), "restart");
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RpcRequest::Restart { id, force } if id == "old123" && force));
+
+        let response = RpcResponse::Restart {
+            source_id: "old123".into(),
+            session_id: "new456".into(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded: RpcResponse = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(decoded, RpcResponse::Restart { source_id, session_id } if source_id == "old123" && session_id == "new456")
+        );
+    }
 
     #[test]
     fn attach_stream_init_without_scrollback_defaults_to_empty() {

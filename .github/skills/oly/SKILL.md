@@ -75,6 +75,8 @@ oly update <ID> --title ""
 oly update <ID> --tag prod --tag release
 oly update <ID> --tag ""
 oly stop <ID>
+oly restart <ID>      # new ID and logs; source history is retained; --force kills a running source
+oly rm <ID>           # delete a stopped session + its logs; --force also kills a running one
 oly ls                # oly ls --json for agents
 ```
 
@@ -82,6 +84,8 @@ oly ls                # oly ls --json for agents
 - `--title ""` clears the title. If `--title` is omitted, the existing title is kept.
 - `--tag ""` clears all tags. If `--tag` is omitted, existing tags are kept.
 - Repeating `--tag` replaces the full tag list with the provided tags.
+- `oly restart <ID>` creates a new session from persisted command, arguments, cwd, title, tags, and notification settings. It retains the source record and logs; running sources require `--force` and are killed first.
+- `oly rm <ID>` deletes a stopped session's DB row and on-disk logs. Running sessions are refused unless you pass `--force` (which kills the session first).
 
 ### 5) Notify
 

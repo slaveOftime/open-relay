@@ -221,11 +221,20 @@ impl SessionStore {
         enabled: bool,
     ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        let mut rt = handle.write();
-        if rt.is_completed() {
-            return Err(SessionError::NotRunning);
+        let (meta, previous) = {
+            let mut rt = handle.write();
+            if rt.is_completed() {
+                return Err(SessionError::NotRunning);
+            }
+            let previous = rt.notifications_enabled;
+            rt.set_notifications_enabled(enabled);
+            (rt.meta.clone(), previous)
+        };
+        if let Err(err) = self.db.update_session(&meta).await {
+            handle.write().set_notifications_enabled(previous);
+            debug!(session_id = id, %err, "failed to persist session notification setting");
+            return Err(SessionError::Persistence(err.to_string()));
         }
-        rt.set_notifications_enabled(enabled);
         debug!(
             session_id = id,
             notifications_enabled = enabled,
@@ -393,6 +402,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
@@ -436,6 +446,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
@@ -479,6 +490,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await
@@ -517,6 +529,7 @@ mod tests {
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
+            notifications_enabled: true,
         };
         db.insert_session(&meta)
             .await

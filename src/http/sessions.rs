@@ -730,6 +730,14 @@ pub async fn set_session_notifications(
             )
                 .into_response()
         }
+        Err(SessionError::Persistence(message)) => {
+            warn!(session_id = %id, error = %message, "notification toggle persistence failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
     }
 }
 

@@ -226,7 +226,7 @@ impl SessionRuntime {
             ended_at: self.meta.ended_at,
             cwd: self.meta.cwd.clone(),
             input_needed: self.input_needed(),
-            notifications_enabled: self.notifications_enabled,
+            notifications_enabled: self.meta.notifications_enabled,
             node: None,
             last_total_bytes: self.last_total_bytes,
             last_output_epoch: self.last_output_epoch.and_then(instant_to_utc),
@@ -303,6 +303,7 @@ impl SessionRuntime {
             return;
         }
         self.notifications_enabled = enabled;
+        self.meta.notifications_enabled = enabled;
         info!(
             session_id = %self.meta.id,
             notifications_enabled = enabled,
@@ -472,6 +473,7 @@ pub fn spawn_session(
     notifications_enabled: bool,
     screen_scrollback_rows: usize,
 ) -> Result<Arc<RwLock<SessionRuntime>>> {
+    meta.notifications_enabled = notifications_enabled;
     let full_dir = session_dir;
     let reader_dir = full_dir.clone();
     info!(
@@ -987,6 +989,7 @@ mod tests {
             status,
             pid: None,
             exit_code: None,
+            notifications_enabled: true,
         };
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel(4);
         let (resize_tx, _resize_rx) = tokio::sync::broadcast::channel(4);
@@ -1360,6 +1363,7 @@ mod tests {
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
+            notifications_enabled: true,
         };
         let (broadcast_tx, _rx) = broadcast::channel(4);
         let (resize_tx, _resize_rx) = broadcast::channel(4);

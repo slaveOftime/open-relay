@@ -67,6 +67,8 @@ pub enum Commands {
     /// List sessions. Order is most recently created last.
     #[command(name = "ls")]
     List(ListArgs),
+    /// Start a new session from an existing session's persisted launch metadata.
+    Restart(RestartArgs),
     /// Stop a session by ID.
     Stop(StopArgs),
     /// Delete a session and its files. Stopped sessions are removed directly; use --force to also remove a running one.
@@ -338,6 +340,18 @@ pub struct StopArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RestartArgs {
+    /// Session ID whose launch metadata should be reused.
+    pub id: String,
+    /// Kill a running or stopping source session before starting its replacement.
+    #[arg(long)]
+    pub force: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct RemoveArgs {
     /// Session ID to delete. If omitted, uses the most recently created session.
     pub id: Option<String>,
@@ -514,6 +528,26 @@ mod tests {
         Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, parse_timeout_ms,
     };
     use clap::Parser;
+
+    #[test]
+    fn restart_parses_required_id_force_and_node() {
+        let cli = Cli::try_parse_from([
+            "oly",
+            "restart",
+            "session-1",
+            "--force",
+            "--node",
+            "worker-a",
+        ])
+        .unwrap();
+        let Commands::Restart(args) = cli.command else {
+            panic!("expected restart command");
+        };
+        assert_eq!(args.id, "session-1");
+        assert!(args.force);
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
+        assert!(Cli::try_parse_from(["oly", "restart"]).is_err());
+    }
 
     #[test]
     fn rm_parses_id_force_and_node() {

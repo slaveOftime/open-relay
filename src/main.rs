@@ -320,6 +320,24 @@ async fn run() -> Result<()> {
             }
         },
 
+        Commands::Restart(restart_args) => {
+            let source_id = restart_args.id.clone();
+            let inner = RpcRequest::Restart {
+                id: source_id.clone(),
+                force: restart_args.force,
+            };
+            match ipc::send_request_checked(&config, node_wrap(restart_args.node, inner)).await? {
+                RpcResponse::Restart {
+                    source_id,
+                    session_id,
+                } => {
+                    println!("Session {source_id} restarted as {session_id}.");
+                    Ok(())
+                }
+                _ => Err(AppError::Protocol("unexpected response type".to_string())),
+            }
+        }
+
         Commands::Stop(stop_args) => {
             let id =
                 resolve_session_id(&config, stop_args.id.clone(), stop_args.node.as_ref()).await?;

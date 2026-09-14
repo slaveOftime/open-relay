@@ -166,6 +166,116 @@ impl SessionStore {
         result
     }
 
+    /// Create a fresh session from a source session's persisted launch metadata.
+    /// The source row, directory, and logs are retained under the original ID.
+    pub async fn restart_session_via_handle(
+        store_handle: &Arc<Self>,
+        config: &AppConfig,
+        source_id: &str,
+        force: bool,
+    ) -> Result<String> {
+        let live_handle = store_handle.sessions.load().get(source_id).cloned();
+        let (source, needs_termination) = if let Some(handle) = live_handle.as_ref() {
+            let mut runtime = handle.write();
+            // Restarting a session that is still being created is never allowed,
+            // regardless of what refresh_status observes about the child process.
+            if runtime.meta.status == SessionStatus::Created {
+                return Err(AppError::Protocol(format!(
+                    "session is still being created and cannot be restarted: {source_id}"
+                )));
+            }
+            runtime.refresh_status();
+            match runtime.meta.status {
+                SessionStatus::Running | SessionStatus::Stopping if !force => {
+                    return Err(AppError::Protocol(format!(
+                        "session is still running: {source_id}. Stop it first, or pass --force to kill it before restarting."
+                    )));
+                }
+                SessionStatus::Running | SessionStatus::Stopping => (runtime.meta.clone(), true),
+                SessionStatus::Stopped | SessionStatus::Killed | SessionStatus::Failed => {
+                    (runtime.meta.clone(), false)
+                }
+                SessionStatus::Created => {
+                    // `refresh_status` didn't advance the status; treat as
+                    // still-being-created and reject.
+                    return Err(AppError::Protocol(format!(
+                        "session is still being created and cannot be restarted: {source_id}"
+                    )));
+                }
+            }
+        } else {
+            let Some(source) = store_handle.db.get_session(source_id).await? else {
+                return Err(AppError::Protocol(format!(
+                    "session not found: {source_id}"
+                )));
+            };
+            match source.status {
+                SessionStatus::Created => {
+                    return Err(AppError::Protocol(format!(
+                        "session is still being created and cannot be restarted: {source_id}"
+                    )));
+                }
+                SessionStatus::Running | SessionStatus::Stopping => {
+                    return Err(AppError::Protocol(format!(
+                        "session is marked {} but has no live runtime: {source_id}",
+                        source.status.as_str()
+                    )));
+                }
+                SessionStatus::Stopped | SessionStatus::Killed | SessionStatus::Failed => {
+                    (source, false)
+                }
+            }
+        };
+
+        if let Some(cwd) = source.cwd.as_deref() {
+            let path = std::path::Path::new(cwd);
+            if !path.exists() {
+                return Err(AppError::Protocol(format!(
+                    "working directory does not exist: {cwd}"
+                )));
+            }
+            if !path.is_dir() {
+                return Err(AppError::Protocol(format!(
+                    "working directory is not a directory: {cwd}"
+                )));
+            }
+        }
+
+        if needs_termination {
+            let handle = live_handle.expect("live source handle checked above");
+            if !Self::terminate_runtime(source_id.to_string(), handle, 0, SessionStatus::Killed)
+                .await
+            {
+                return Err(AppError::Protocol(format!(
+                    "failed to kill source session before restart: {source_id}"
+                )));
+            }
+            if let Some(summary) = store_handle.get_summary(source_id) {
+                let _ = store_handle
+                    .event_tx
+                    .send(SessionEvent::SessionUpdated(summary));
+            }
+        }
+
+        let spec = StartSpec {
+            title: source.title,
+            tags: source.tags,
+            cmd: source.command,
+            args: source.args,
+            cwd: source.cwd,
+            rows: None,
+            cols: None,
+            notifications_enabled: source.notifications_enabled,
+        };
+        match Self::start_session_via_handle(store_handle, config, spec).await {
+            Ok(session_id) => Ok(session_id),
+            Err(err) if needs_termination => Err(AppError::Protocol(format!(
+                "source session {source_id} was killed, but its replacement failed to start: {err}"
+            ))),
+            Err(err) => Err(err),
+        }
+    }
+
     pub(super) async fn prepare_start_session(
         &self,
         config: &AppConfig,
@@ -204,6 +314,7 @@ impl SessionStore {
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
+            notifications_enabled: spec.notifications_enabled,
         };
 
         state.starting_sessions.insert(id.clone());
@@ -243,7 +354,37 @@ impl SessionStore {
 
     pub(super) async fn abort_started_session(&self, id: &str) -> Result<()> {
         self.mutable.lock().await.starting_sessions.remove(id);
-        self.db.delete_session(id).await
+        if let Some(dir) = self.db.get_session_dir(id).await? {
+            match tokio::fs::remove_dir_all(&dir).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(AppError::Io(err)),
+            }
+        }
+        match self.db.delete_session(id).await {
+            Ok(()) => Ok(()),
+            Err(persist_err) => {
+                // Directory was removed but the row survived. Mark it Failed
+                // so it does not look like a live process and can be cleaned
+                // up by maintenance / a retry.
+                let mark_failed = async {
+                    if let Some(mut meta) = self.db.get_session(id).await? {
+                        meta.status = SessionStatus::Failed;
+                        meta.pid = None;
+                        meta.ended_at = Some(Utc::now());
+                        self.db.update_session(&meta).await?;
+                    }
+                    Ok::<(), AppError>(())
+                }
+                .await;
+                match mark_failed {
+                    Ok(()) => Err(persist_err),
+                    Err(mark_err) => Err(AppError::Protocol(format!(
+                        "deleted session directory but failed to delete DB row for {id}: {persist_err}; additionally failed to mark it failed: {mark_err}"
+                    ))),
+                }
+            }
+        }
     }
 
     pub async fn stop_session(&self, id: &str, grace_seconds: u64) -> bool {
@@ -298,7 +439,7 @@ impl SessionStore {
         // cannot tell where the files live, deleting the DB row would orphan
         // them just the same. Propagate it instead of silently skipping removal.
         if let Some(dir) = self.db.get_session_dir(id).await? {
-            match std::fs::remove_dir_all(&dir) {
+            match tokio::fs::remove_dir_all(&dir).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => {
@@ -699,6 +840,50 @@ mod tests {
             }
             _ => panic!("Expected MaxSessionsReached error, got {:?}", result),
         }
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_running_source_without_force() {
+        let rt = make_runtime("run0001", SessionStatus::Running, "", None);
+        let store = Arc::new(store_with(vec![rt], make_test_db().await));
+        let err = SessionStore::restart_session_via_handle(
+            &store,
+            &make_test_config(2),
+            "run0001",
+            false,
+        )
+        .await
+        .expect_err("running source should require force");
+        assert!(err.to_string().contains("pass --force"));
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_created_source() {
+        let rt = make_runtime("new0001", SessionStatus::Created, "", None);
+        let store = Arc::new(store_with(vec![rt], make_test_db().await));
+        let err = SessionStore::restart_session_via_handle(
+            &store,
+            &make_test_config(2),
+            "new0001",
+            false,
+        )
+        .await
+        .expect_err("created source should be rejected");
+        assert!(err.to_string().contains("still being created"));
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_missing_source() {
+        let store = Arc::new(SessionStore::new(900, make_test_db().await));
+        let err = SessionStore::restart_session_via_handle(
+            &store,
+            &make_test_config(2),
+            "missing",
+            false,
+        )
+        .await
+        .expect_err("missing source should be rejected");
+        assert!(err.to_string().contains("session not found: missing"));
     }
 
     #[tokio::test]

@@ -61,6 +61,7 @@ pub struct SessionMeta {
     pub status: SessionStatus,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+    pub notifications_enabled: bool,
 }
 
 pub struct StartSpec {
@@ -79,6 +80,7 @@ pub enum SessionError {
     Evicted,
     NotRunning,
     Busy,
+    Persistence(String),
 }
 
 impl SessionError {
@@ -87,6 +89,7 @@ impl SessionError {
             Self::Evicted => format!("session evicted from memory: {id}"),
             Self::NotRunning => format!("session not running: {id}"),
             Self::Busy => format!("session input queue is full: {id}"),
+            Self::Persistence(message) => message.clone(),
         }
     }
 }
