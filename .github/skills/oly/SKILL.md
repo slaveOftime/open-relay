@@ -1,18 +1,29 @@
 ---
 name: oly
-description: "Use when starting a long-running or interactive CLI command with oly, especially when it may need later input, should be detachable, or should keep durable logs for supervision and resume."
+description: "Use when starting a long-running or interactive CLI command with oly, especially when it may need later input, should be detachable, or should keep durable logs for supervision and resume. Also use to supervise sessions already running under oly: check status, read logs, send input to push them forward, stop or restart."
 ---
 
 ## When to use
 
 Use `oly start` instead of a direct terminal invocation when ANY of these apply:
 
-- The command may prompt for input later.
+- The command may prompt for input later (approvals, confirmations, credentials).
 - The session must survive terminal closes, disconnects, or agent handoff.
 - Logs, replay, or auditability matter.
 - Another human or agent may need to resume or inspect the work.
 
+Also use `oly` to supervise sessions already running under it: list, inspect, send input, stop, restart.
+
 Do **not** use `oly` for short, non-interactive commands — a normal terminal is simpler.
+
+## Prerequisite
+
+All commands talk to the daemon. If a command fails to connect, start it first:
+
+```bash
+oly daemon status            # check
+oly daemon start --detach    # start if needed
+```
 
 ## Principles
 
@@ -20,6 +31,7 @@ Do **not** use `oly` for short, non-interactive commands — a normal terminal i
 - **Small tails first.** Use `--tail 40`; expand only when context is insufficient.
 - **Fewer polls, longer waits.** Set `--timeout` to match the expected next checkpoint — reduces churn and token cost.
 - **Machine-readable listing.** Use `oly ls --json --status running` for scripting or structured decisions.
+- **ID optional.** Most commands target the most recently created session when the ID is omitted — pass the ID explicitly when juggling multiple sessions.
 
 ## Workflow
 
@@ -43,6 +55,7 @@ oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 
 - `--wait-for-prompt` — blocks until the session likely needs input or timeout expires.
 - `--timeout` — accepts `250ms`, `10s`, `5m`, `1h` (default `5m`). Shorten for fast tasks; lengthen for slow ones.
+- On timeout it prints only the `Waiting for session ...` line and exits 0 with no log output — treat that as "nothing new, decide whether to wait again."
 - Start with `--tail 40`; increase only when recent context is insufficient.
 
 ### 3) Send input
@@ -90,14 +103,58 @@ oly ls                # oly ls --json for agents
 ### 5) Notify
 
 ```bash
-oly notify <ID> --title "Done" --description "Summary." --body "Details."
+oly notify send <ID> --title "Done" --description "Summary." --body "Details."
 ```
 
-- `<ID>` is optional — include it to link the notification to a specific session.
+- `<ID>` is optional — include it to link the notification to a specific session. It must be a **running** session; omit the ID if the session already ended.
 - Toggle per-session notifications: `oly notify enable <ID>` / `oly notify disable <ID>`.
 
 ### Help
 
 ```bash
 oly --help            # or: oly <command> --help
+```
+
+## Recipes
+
+### Supervise an agent session and push it forward
+
+User: "Run the fixer agent and keep it moving until the tests pass."
+
+1. Start it and note the returned ID:
+   ```bash
+   oly start --title "fix tests" --cwd /repo --detach <agent-cmd>
+   ```
+2. Loop until done — wait, read, decide, act:
+   ```bash
+   oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 5m
+   ```
+   Judge the tail: asking for approval? stuck on a menu? finished?
+   ```bash
+   oly send <ID> "yes" key:enter        # unblock a confirmation
+   oly send <ID> key:ctrl+c             # interrupt a hang, then re-prompt
+   ```
+   Repeat with a timeout that matches the task's pace.
+3. When the task completes, summarize the outcome for the user. Use `oly stop <ID>` if the process is still lingering, and optionally alert them:
+   ```bash
+   oly notify send <ID> --title "fix tests" --description "Done — tests pass."
+   ```
+
+Do NOT answer prompts blindly — when a decision is consequential (destructive action, credentials, ambiguous choice), report to the user instead of guessing.
+
+### Watch several sessions at once
+
+```bash
+oly ls --json --status running      # what's still alive?
+oly logs <ID> --tail 40             # spot-check one session
+oly notify enable <ID>              # get pinged when it needs input
+```
+
+### Recover a stuck or failed session
+
+```bash
+oly send <ID> key:ctrl+c            # interrupt a hang
+oly logs <ID> --tail 120            # confirm the failure mode
+oly restart <ID>                    # rerun same cmd/cwd, fresh logs (source history kept)
+oly restart <ID> --force            # even if the source is still running
 ```
