@@ -74,6 +74,10 @@ export interface SessionSummary {
   node?: string | null
   last_total_bytes: number
   last_output_epoch?: string | null
+  /** Default foreground colour the session last set via OSC 10 (raw colour spec). */
+  foreground_color?: string | null
+  /** Default background colour the session last set via OSC 11 (raw colour spec). */
+  background_color?: string | null
 }
 
 export interface CreateSessionSpec {

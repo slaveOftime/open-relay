@@ -46,6 +46,8 @@ pub(super) fn make_runtime(
         pid: None,
         exit_code: None,
         notifications_enabled: true,
+        foreground_color: None,
+        background_color: None,
     };
 
     let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
@@ -189,6 +191,8 @@ pub(super) fn make_runtime_writable_with_capacity(
         pid: None,
         exit_code: None,
         notifications_enabled: true,
+        foreground_color: None,
+        background_color: None,
     };
     let (broadcast_tx, _rx) = broadcast::channel(4);
     let (resize_tx, _resize_rx) = broadcast::channel(4);

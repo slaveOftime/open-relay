@@ -406,6 +406,8 @@ mod tests {
             pid: None,
             exit_code: Some(0),
             notifications_enabled: true,
+            foreground_color: Some("rgb:ffff/ffff/ffff".to_string()),
+            background_color: Some("#1e1e1e".to_string()),
         };
         db.insert_session(&meta)
             .await
@@ -431,6 +433,12 @@ mod tests {
             .expect("session should exist");
         assert_eq!(saved.title, Some("new".to_string()));
         assert_eq!(saved.tags, vec!["release".to_string()]);
+        // Terminal-reported colours survive the insert/update/read roundtrip.
+        assert_eq!(
+            saved.foreground_color.as_deref(),
+            Some("rgb:ffff/ffff/ffff")
+        );
+        assert_eq!(saved.background_color.as_deref(), Some("#1e1e1e"));
     }
 
     #[tokio::test]
@@ -450,6 +458,8 @@ mod tests {
             pid: None,
             exit_code: Some(0),
             notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
         };
         db.insert_session(&meta)
             .await
@@ -494,6 +504,8 @@ mod tests {
             pid: None,
             exit_code: Some(0),
             notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
         };
         db.insert_session(&meta)
             .await
@@ -533,6 +545,8 @@ mod tests {
             pid: None,
             exit_code: Some(0),
             notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
         };
         db.insert_session(&meta)
             .await

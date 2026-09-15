@@ -657,6 +657,14 @@ pub struct SessionSummary {
     pub cols: Option<u16>,
     #[serde(default)]
     pub attach_count: usize,
+    /// Default foreground colour the session last set via OSC 10 (raw colour
+    /// spec, e.g. `rgb:ffff/ffff/ffff` or `#ffffff`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_color: Option<String>,
+    /// Default background colour the session last set via OSC 11 (raw colour
+    /// spec).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

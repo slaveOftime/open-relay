@@ -238,6 +238,8 @@ impl SessionRuntime {
             rows: self.pty_size.map(|(rows, _)| rows),
             cols: self.pty_size.map(|(_, cols)| cols),
             attach_count: self.attach_count,
+            foreground_color: self.meta.foreground_color.clone(),
+            background_color: self.meta.background_color.clone(),
         }
     }
 
@@ -268,18 +270,53 @@ impl SessionRuntime {
         true
     }
 
+    /// Mirror the session's latest terminal-emitted foreground/background
+    /// colours (OSC 10/11) into the session metadata. Unlike the title these
+    /// are always terminal-owned — there is no user-set variant — so every
+    /// change is tracked. Returns `true` when either colour changed.
+    fn apply_terminal_colors(&mut self, signals: &TerminalSignals) -> bool {
+        let foreground = signals
+            .foreground_color()
+            .map(|payload| String::from_utf8_lossy(payload).into_owned());
+        let background = signals
+            .background_color()
+            .map(|payload| String::from_utf8_lossy(payload).into_owned());
+        let mut changed = false;
+        if self.meta.foreground_color != foreground {
+            debug!(
+                session_id = %self.meta.id,
+                foreground_color = ?foreground,
+                "session foreground colour updated from terminal"
+            );
+            self.meta.foreground_color = foreground;
+            changed = true;
+        }
+        if self.meta.background_color != background {
+            debug!(
+                session_id = %self.meta.id,
+                background_color = ?background,
+                "session background colour updated from terminal"
+            );
+            self.meta.background_color = background;
+            changed = true;
+        }
+        changed
+    }
+
     /// Publish the reader thread's latest retained terminal signals.
     ///
     /// While the session has no user-chosen title, a terminal-emitted
-    /// window/icon title is also adopted as the session title. Returns `true`
-    /// when the session title changed so the caller can broadcast a metadata
-    /// update.
+    /// window/icon title is also adopted as the session title, and the
+    /// terminal-emitted foreground/background colours are mirrored into the
+    /// session metadata. Returns `true` when any session metadata changed so
+    /// the caller can broadcast a metadata update.
     pub fn publish_terminal_signals(&mut self, signals: TerminalSignals) -> bool {
-        let adopted = signals
+        let title_adopted = signals
             .title()
             .is_some_and(|title| self.apply_terminal_title(title));
+        let colors_changed = self.apply_terminal_colors(&signals);
         self.terminal_signals = signals;
-        adopted
+        title_adopted || colors_changed
     }
 
     /// Bytes that restore the session's visible terminal state on a freshly
@@ -705,7 +742,13 @@ pub fn spawn_session(
                     // meaningful-activity byte count.
                     scanner.scan(&buf[..n], &mut scan_out);
 
-                    if scan_out.filtered.is_empty() && scan_out.queries.is_empty() {
+                    // A chunk that only carries a stripped signal (e.g. a
+                    // pure colour set) has no filtered bytes and no queries,
+                    // but its signals must still be published.
+                    if scan_out.filtered.is_empty()
+                        && scan_out.queries.is_empty()
+                        && !scanner.signals_changed()
+                    {
                         continue;
                     }
 
@@ -718,20 +761,20 @@ pub fn spawn_session(
                     // adopt a terminal-emitted title while the session has no
                     // user-chosen one), and read back the cursor position for
                     // query replies.
-                    let (cursor_position, title_update) = {
+                    let (cursor_position, meta_update) = {
                         let mut rt = runtime_reader.write();
-                        let title_adopted = if let Some(signals) = changed_signals {
+                        let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
                         } else {
                             false
                         };
                         let cursor = rt.push_output(&filtered, meaningful_len);
-                        (cursor, title_adopted.then(|| rt.to_summary()))
+                        (cursor, meta_changed.then(|| rt.to_summary()))
                     };
 
-                    // Let live clients know the session title was adopted from
-                    // the child's title notification.
-                    if let Some(summary) = title_update {
+                    // Let live clients know session metadata (title and/or
+                    // colours) was adopted from the child's notifications.
+                    if let Some(summary) = meta_update {
                         let _ = reader_event_tx.send(SessionEvent::SessionUpdated(summary));
                     }
 
@@ -828,7 +871,9 @@ fn load_spawn_environment() -> Vec<(OsString, OsString)> {
     inherited
 }
 
-#[cfg(windows)]
+// Only Windows merges a refreshed user environment, but the merge logic is
+// platform-agnostic and unit-tested on every platform.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn merge_spawn_environment(
     mut inherited: Vec<(OsString, OsString)>,
     refreshed: Vec<(OsString, OsString)>,
@@ -1053,6 +1098,8 @@ mod tests {
             pid: None,
             exit_code: None,
             notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
         };
         let (broadcast_tx, _rx) = tokio::sync::broadcast::channel(4);
         let (resize_tx, _resize_rx) = tokio::sync::broadcast::channel(4);
@@ -1099,6 +1146,17 @@ mod tests {
     /// push the filtered result into the runtime the way the reader does.
     fn push_scanned(rt: &mut SessionRuntime, raw: &[u8]) -> (u16, u16) {
         let mut scanner = PtyScanner::new();
+        push_scanned_with(rt, &mut scanner, raw)
+    }
+
+    /// Same as [`push_scanned`] but reuses a scanner across chunks, the way
+    /// the reader thread does — required when a later chunk is only a change
+    /// relative to the scanner's carried signal state (e.g. a colour reset).
+    fn push_scanned_with(
+        rt: &mut SessionRuntime,
+        scanner: &mut PtyScanner,
+        raw: &[u8],
+    ) -> (u16, u16) {
         let mut out = ScanOut::default();
         scanner.scan(raw, &mut out);
         if let Some(signals) = scanner.take_changed_signals() {
@@ -1378,6 +1436,69 @@ mod tests {
         assert!(!rt.publish_terminal_signals(signals));
     }
 
+    // -----------------------------------------------------------------------
+    // terminal colour mirroring
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_terminal_colors_are_mirrored_into_session_metadata() {
+        let mut rt = new_runtime();
+        assert!(rt.meta.foreground_color.is_none());
+        assert!(rt.meta.background_color.is_none());
+
+        push_scanned(
+            &mut rt,
+            b"\x1b]10;rgb:ffff/ffff/ffff\x07\x1b]11;#1e1e1e\x1b\\",
+        );
+
+        assert_eq!(
+            rt.meta.foreground_color.as_deref(),
+            Some("rgb:ffff/ffff/ffff")
+        );
+        assert_eq!(rt.meta.background_color.as_deref(), Some("#1e1e1e"));
+    }
+
+    #[test]
+    fn test_terminal_colors_track_every_change_and_reset() {
+        let mut rt = new_runtime();
+        // The scanner carries signal state across chunks (like the reader
+        // thread's), so a reset is recognised as a change from the last set.
+        let mut scanner = PtyScanner::new();
+
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]11;#111111\x07");
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]11;#222222\x07");
+        assert_eq!(rt.meta.background_color.as_deref(), Some("#222222"));
+
+        // An empty set resets to the terminal default.
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]11;\x07");
+        assert!(rt.meta.background_color.is_none());
+    }
+
+    #[test]
+    fn test_terminal_colors_apply_even_with_a_user_title() {
+        // Colours have no user-set variant: a user-chosen title must not
+        // block colour mirroring.
+        let mut rt = new_runtime();
+        rt.meta.title = Some("mine".to_string());
+        rt.title_user_set = true;
+
+        push_scanned(&mut rt, b"\x1b]10;red\x07");
+
+        assert_eq!(rt.meta.foreground_color.as_deref(), Some("red"));
+        assert_eq!(rt.meta.title.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn test_publish_terminal_signals_reports_color_changes() {
+        let mut rt = new_runtime();
+
+        let mut signals = TerminalSignals::default();
+        signals.record_osc(b"11", b"#1e1e1e");
+        assert!(rt.publish_terminal_signals(signals.clone()));
+        // Re-publishing the same signals is not a change.
+        assert!(!rt.publish_terminal_signals(signals));
+    }
+
     #[test]
     fn test_attach_snapshot_restores_title_progress_and_cursor_style() {
         // The screen parser drops Operating System Commands and does not model
@@ -1506,6 +1627,8 @@ mod tests {
             pid: None,
             exit_code: None,
             notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
         };
         let (broadcast_tx, _rx) = broadcast::channel(4);
         let (resize_tx, _resize_rx) = broadcast::channel(4);

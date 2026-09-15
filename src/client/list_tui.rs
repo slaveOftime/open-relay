@@ -19,6 +19,11 @@ use crossterm::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use tachyonfx::{
+    CellFilter, CellIterator, ColorSpace, Duration as FxDuration, EffectManager, EffectTimer,
+    Interpolation, RefRect, fx,
+};
+
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -26,7 +31,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
         ScrollbarState, Shadow, Sparkline, Table, TableState,
     },
 };
@@ -44,6 +49,15 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const REDRAW_INTERVAL: Duration = Duration::from_millis(250);
+/// Frame cadence while visual effects are running (~30 fps).
+const ANIMATION_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
+/// The background tint a waiting session's row pulses toward: a dark amber
+/// that keeps every status/foreground colour readable on top of it.
+const ATTENTION_PULSE_BG: Color = Color::Rgb(90, 62, 4);
+/// A selected waiting row pulses toward this blend of the selection band and
+/// the attention tint, so the pulse stays visible without hiding that the
+/// row is selected.
+const ATTENTION_PULSE_BG_SELECTED: Color = Color::Rgb(58, 59, 38);
 const RATE_HISTORY_LEN: usize = 30;
 const COMPACT_SPARKLINE_WIDTH: usize = 3;
 const SPARKLINE_WIDTH: usize = 5;
@@ -60,9 +74,13 @@ const TITLE_SAVE_BYTES: &[u8] = b"\x1b[22;0t";
 /// XTWINOPS 23;0 pops the title saved by `TITLE_SAVE_BYTES`.
 const TITLE_RESTORE_BYTES: &[u8] = b"\x1b[23;0t";
 const CLONE_DIALOG_HELP: &str =
-    " Quotes keep spaces · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
+    " Quotes group words · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
 const UPDATE_DIALOG_HELP: &str =
-    " Quote multi-word tags · Tab/Shift+Tab · Space toggle · Enter save · Esc cancel";
+    " Quotes group words · Tab/Shift+Tab · Space toggle · Enter save · Esc cancel";
+/// Width of the label column in the clone/update dialogs.
+const DIALOG_LABEL_WIDTH: usize = 15;
+/// Background of the active field's value, giving it an "input box" look.
+const DIALOG_FIELD_BG: Color = Color::Rgb(38, 44, 54);
 
 use super::list::ListTarget;
 
@@ -116,7 +134,14 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
     let mut redraw = true;
 
     loop {
-        if redraw || last_draw.elapsed() >= REDRAW_INTERVAL {
+        // Effects (attention pulse, fade-ins) need a faster frame cadence;
+        // the idle list ticks over at the slower refresh rate.
+        let redraw_interval = if app.effects.is_running() {
+            ANIMATION_REDRAW_INTERVAL
+        } else {
+            REDRAW_INTERVAL
+        };
+        if redraw || last_draw.elapsed() >= redraw_interval {
             terminal.draw(|frame| render(frame, &mut app))?;
             last_draw = Instant::now();
             redraw = false;
@@ -377,6 +402,21 @@ struct App {
     clone_dialog: Option<CloneDialog>,
     update_dialog: Option<UpdateDialog>,
     show_node: bool,
+    /// Shader-like visual effects (tachyonfx) processed on every frame.
+    effects: EffectManager<String>,
+    /// Timestamp of the previous frame, used to derive the effect tick delta.
+    last_frame_at: Option<Instant>,
+    /// Row rectangles of sessions waiting for input, keyed by session key.
+    /// Each gets its own background pulse effect; the [`RefRect`] is updated
+    /// every frame so the pulse follows the row across scrolling, reordering
+    /// and resizes. The boolean tracks selection: a selected row pulses
+    /// toward a different tint, so a selection change re-registers the effect.
+    attention_rows: HashMap<String, (RefRect, bool)>,
+    /// The message text the fade-in effect was last registered for, so the
+    /// fade replays only when the message actually changes.
+    rendered_message: Option<String>,
+    /// The dialog the open-fade effect was last registered for.
+    rendered_dialog: Option<&'static str>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1795,10 +1835,12 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         LayoutMode::Narrow
     };
+    // The footer is a single compact line so the session table gets every
+    // other row of the terminal.
     let chunks = Layout::vertical([
         Constraint::Length(2),
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(1),
     ])
     .split(area);
     let now = Instant::now();
@@ -1825,12 +1867,15 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(
-            " {} sessions · {} live · {}",
-            app.sessions.len(),
-            running,
-            app.status_filter.label()
-        )),
+        Span::styled(
+            format!(
+                " {} sessions · {} live · {}",
+                app.sessions.len(),
+                running,
+                app.status_filter.label()
+            ),
+            Style::default().fg(Color::Gray),
+        ),
     ]);
     let header_block = || {
         Block::default()
@@ -1868,6 +1913,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     );
 
     let visible = &app.visible;
+    let mut attention_row_rects: Vec<(String, Rect, bool)> = Vec::new();
     if app.sessions.is_empty() || visible.is_empty() {
         let empty = if app.sessions.is_empty() {
             "\n  no signals detected\n  start one: oly start -d <cmd>".to_string()
@@ -1887,7 +1933,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         let viewport_start = selected_position
             .saturating_sub(viewport_len / 2)
             .min(visible.len().saturating_sub(viewport_len));
-        let rows = visible.iter().filter_map(|index| {
+        let rows = visible.iter().enumerate().filter_map(|(position, index)| {
             app.sessions.get(*index).map(|session| {
                 session_row(
                     session,
@@ -1895,19 +1941,17 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
                     mode,
                     now,
                     app.show_node,
+                    position == selected_position,
                 )
             })
         });
+        // Selection styling lives in `session_row` itself: ratatui applies
+        // `row_highlight_style` *after* the cells render, which would
+        // override the semantic status colours (attention/failure/running).
         let table = Table::new(rows, session_table_widths(mode, app.show_node))
             .header(session_table_header(mode, app.show_node))
             .column_spacing(1)
-            .highlight_symbol("▸ ")
-            .row_highlight_style(
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(25, 55, 72))
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_symbol("▸ ");
         let mut state = TableState::new()
             .with_offset(viewport_start)
             .with_selected(Some(selected_position));
@@ -1922,6 +1966,33 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         };
         frame.render_stateful_widget(table, table_area, &mut state);
 
+        // Record where each waiting session's row actually landed (one line
+        // below the header, offset by the scroll position) so the attention
+        // pulse can be scoped to exactly those rows.
+        for (position, index) in visible.iter().enumerate() {
+            let Some(session) = app.sessions.get(*index) else {
+                continue;
+            };
+            if !session.input_needed {
+                continue;
+            }
+            let Some(row_offset) = position.checked_sub(viewport_start) else {
+                continue;
+            };
+            if row_offset >= viewport_len {
+                continue;
+            }
+            attention_row_rects.push((
+                session_key(session),
+                Rect {
+                    y: table_area.y + 1 + row_offset as u16,
+                    height: 1,
+                    ..table_area
+                },
+                position == selected_position,
+            ));
+        }
+
         if show_scrollbar {
             let mut scrollbar_state = ScrollbarState::new(visible.len())
                 .position(selected_position)
@@ -1935,57 +2006,229 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    let default_help = if app.filter.is_empty() {
+    // Footer: compact key hints stay pinned on the left; the latest status
+    // message (if any) renders on the right instead of replacing them, so a
+    // warning never hides the help. One line, no border — the table keeps
+    // the space.
+    // Each hint line is sized to fit the *smallest* width of its layout
+    // mode, so nothing is ever truncated.
+    let help = if app.filter.is_empty() {
         match mode {
-            LayoutMode::Narrow => {
-                " type filter  ^N new  ^D clone  ^U edit  ^K stop  ↵/^↵ open ^C exit".to_string()
+            LayoutMode::Narrow => " filter ^N new ^D dup ^K stop ⏎ open ^C quit".to_string(),
+            LayoutMode::Medium => {
+                " filter · ^N new · ^D dup · ^K stop · ⏎ open · ^C quit".to_string()
             }
-            _ => " type to filter    Ctrl+N new    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Enter open    Ctrl+Enter window    Ctrl+S status    Ctrl+C exit".to_string(),
+            LayoutMode::Wide => {
+                " filter · ^N new · ^D duplicate · ^U update · ^K stop · ^S status · ⏎ open · ^⏎ window · ^C quit"
+                    .to_string()
+            }
         }
     } else {
         format!(
-            " filter: {}_    status: {} (Ctrl+S)    Ctrl+N new    Ctrl+D duplicate    Ctrl+U update    Ctrl+K stop    Backspace edit    Esc clear",
+            " filter: {}_ · status: {} ^S · ⌫ edit · esc clear",
             app.filter,
             app.status_filter.label()
         )
     };
-    let help = app.message.as_deref().unwrap_or(&default_help);
+    let message_width = app
+        .message
+        .as_deref()
+        .map(|message| unicode_width::UnicodeWidthStr::width(message) as u16 + 1)
+        .unwrap_or(0);
+    let footer = Layout::horizontal([Constraint::Min(1), Constraint::Length(message_width)])
+        .split(chunks[2]);
     frame.render_widget(
-        Paragraph::new(help)
-            .style(Style::default().fg(if app.message.is_some() {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }))
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-        chunks[2],
+        Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
+        footer[0],
     );
+    if let Some(message) = app.message.as_deref() {
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .alignment(Alignment::Right),
+            footer[1],
+        );
+    }
+    let message_area = (message_width > 0).then_some(footer[1]);
 
     if let Some(dialog) = app.clone_dialog.as_ref() {
         render_clone_dialog(frame, dialog);
     } else if let Some(dialog) = app.update_dialog.as_ref() {
         render_update_dialog(frame, dialog);
     }
+
+    render_effects(frame, app, message_area, attention_row_rects);
+}
+
+/// Tick and (un)register the list's shader-like effects.
+///
+/// All effects preserve cell symbols and only interpolate colours, so a
+/// frame rendered at effect-time zero is pixel-identical to one rendered
+/// without effects.
+fn attention_pulse_key(session_key: &str) -> String {
+    format!("attention-pulse:{session_key}")
+}
+
+fn render_effects(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    message_area: Option<Rect>,
+    attention_rows: Vec<(String, Rect, bool)>,
+) {
+    // Pulse the background of every row whose session waits for input. The
+    // filter is the row's RefRect alone (updated every frame, so the pulse
+    // follows the row across scrolling, reordering and resizes), and only the
+    // background is animated — every foreground colour (status semantics,
+    // dimming, selection) keeps working on top of the dark amber tint.
+    // Nothing outside those rows is ever touched.
+    let stale: Vec<String> = app
+        .attention_rows
+        .keys()
+        .filter(|key| !attention_rows.iter().any(|(active, _, _)| active == *key))
+        .cloned()
+        .collect();
+    for key in stale {
+        app.effects.cancel_unique_effect(attention_pulse_key(&key));
+        app.attention_rows.remove(&key);
+    }
+    for (key, rect, selected) in attention_rows {
+        let existing = app
+            .attention_rows
+            .get(&key)
+            .map(|(row, was_selected)| (row.clone(), *was_selected));
+        if let Some((row, was_selected)) = existing {
+            row.set(rect);
+            if was_selected == selected {
+                continue;
+            }
+            // The selection state changed the pulse target: swap the effect.
+            app.effects.cancel_unique_effect(attention_pulse_key(&key));
+            app.attention_rows.remove(&key);
+        }
+        // The filter must be attached to the inner effect: the repeating /
+        // ping-pong containers do not apply their own filter to the wrapped
+        // effect's cells.
+        //
+        // tachyonfx has no `fade_to_bg`, so the pulse is a small custom
+        // shader that lerps only the background colour of the row's cells
+        // (selected by the RefRect filter) towards the attention tint.
+        let row = RefRect::new(rect);
+        let target = if selected {
+            ATTENTION_PULSE_BG_SELECTED
+        } else {
+            ATTENTION_PULSE_BG
+        };
+        let pulse = fx::effect_fn(
+            (),
+            EffectTimer::from_ms(800, Interpolation::SineInOut),
+            move |_, context: fx::ShaderFnContext<'_>, cells: CellIterator<'_>| {
+                let alpha = context.alpha();
+                cells.for_each_cell(|_, cell| {
+                    let bg = ColorSpace::Rgb.lerp(&cell.bg, &target, alpha);
+                    cell.set_bg(bg);
+                });
+            },
+        )
+        .with_filter(CellFilter::RefArea(row.clone()));
+        app.effects.add_unique_effect(
+            attention_pulse_key(&key),
+            fx::repeating(fx::ping_pong(pulse)),
+        );
+        app.attention_rows.insert(key, (row, selected));
+    }
+
+    // Fade in a freshly posted status message.
+    if app.rendered_message != app.message {
+        app.rendered_message = app.message.clone();
+        if let (Some(_), Some(area)) = (app.message.as_ref(), message_area) {
+            app.effects.add_unique_effect(
+                "message-fade",
+                fx::fade_from_fg(
+                    Color::DarkGray,
+                    EffectTimer::from_ms(400, Interpolation::QuadOut),
+                )
+                .with_area(area),
+            );
+        }
+    }
+
+    // Fade a clone/update dialog in when it opens.
+    let dialog = if app.clone_dialog.is_some() {
+        Some(("clone-fade", centered_rect(frame.area(), 96, 14)))
+    } else if app.update_dialog.is_some() {
+        Some(("update-fade", centered_rect(frame.area(), 110, 19)))
+    } else {
+        None
+    };
+    match dialog {
+        Some((key, area)) if app.rendered_dialog != Some(key) => {
+            app.rendered_dialog = Some(key);
+            app.effects.add_unique_effect(
+                key,
+                fx::fade_from(
+                    Color::Reset,
+                    Color::Reset,
+                    EffectTimer::from_ms(240, Interpolation::QuadOut),
+                )
+                .with_area(area),
+            );
+        }
+        None => app.rendered_dialog = None,
+        _ => {}
+    }
+
+    let elapsed = app
+        .last_frame_at
+        .map(|instant| instant.elapsed())
+        .unwrap_or_default();
+    app.last_frame_at = Some(Instant::now());
+    let fx_elapsed = FxDuration::from_millis(elapsed.as_millis().min(u32::MAX as u128) as u32);
+    let area = frame.area();
+    app.effects
+        .process_effects(fx_elapsed, frame.buffer_mut(), area);
 }
 
 fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
-    let area = centered_rect(frame.area(), 96, 14);
+    let area = centered_rect(frame.area(), 96, 19);
     let cursor_visible = clone_cursor_visible();
-    let fields =
-        CLONE_FIELDS.map(|field| clone_field_line(dialog, field, area.width, cursor_visible));
-    let mut lines = fields.to_vec();
+    let field_line = |field| clone_field_line(dialog, field, area.width, cursor_visible);
+    let mut lines = vec![section_header("PROCESS")];
+    lines.extend(
+        [CloneField::Command, CloneField::Args, CloneField::Cwd]
+            .into_iter()
+            .map(field_line),
+    );
+    lines.push(Line::default());
+    lines.push(section_header("METADATA"));
+    lines.extend(
+        [CloneField::Title, CloneField::Tags, CloneField::Node]
+            .into_iter()
+            .map(field_line),
+    );
+    lines.push(Line::default());
+    lines.push(section_header("OPTIONS"));
+    lines.extend(
+        [
+            CloneField::Rows,
+            CloneField::Cols,
+            CloneField::DisableNotifications,
+            CloneField::AttachAfterStart,
+        ]
+        .into_iter()
+        .map(field_line),
+    );
     lines.push(tip_separator(area.width));
     lines.push(dialog_footer(dialog.error.as_deref(), CLONE_DIALOG_HELP));
     render_dialog(
         frame,
         area,
         dialog.source_id.as_ref().map_or_else(
-            || " New Session ".to_string(),
-            |source_id| format!(" Duplicate {source_id} "),
+            || " ✚ New Session ".to_string(),
+            |source_id| format!(" ⧉ Duplicate {source_id} "),
         ),
         Color::Cyan,
         lines,
@@ -1993,11 +2236,16 @@ fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
 }
 
 fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
-    let area = centered_rect(frame.area(), 110, 19);
+    let area = centered_rect(frame.area(), 110, 22);
     let cursor_visible = clone_cursor_visible();
-    let mut lines = UPDATE_FIELDS
-        .map(|field| update_field_line(dialog, field, area.width, cursor_visible))
-        .to_vec();
+    let mut lines = vec![section_header("SESSION")];
+    lines.extend(
+        UPDATE_FIELDS
+            .into_iter()
+            .map(|field| update_field_line(dialog, field, area.width, cursor_visible)),
+    );
+    lines.push(Line::default());
+    lines.push(section_header("DETAILS"));
     lines.extend(
         update_read_only_values(&dialog.summary)
             .into_iter()
@@ -2008,7 +2256,7 @@ fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
     render_dialog(
         frame,
         area,
-        format!(" Update {} ", dialog.target_id),
+        format!(" ✎ Update {} ", dialog.target_id),
         if dialog.available {
             Color::Cyan
         } else {
@@ -2026,13 +2274,16 @@ fn tip_separator(width: u16) -> Line<'static> {
 }
 
 fn dialog_footer<'a>(error: Option<&'a str>, help: &'static str) -> Line<'a> {
+    let errored = error.is_some();
     Line::from(Span::styled(
         error.unwrap_or(help),
-        Style::default().fg(if error.is_some() {
-            Color::Red
-        } else {
-            Color::DarkGray
-        }),
+        Style::default()
+            .fg(if errored { Color::Red } else { Color::DarkGray })
+            .add_modifier(if errored {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
     ))
 }
 
@@ -2045,11 +2296,113 @@ fn render_dialog<'a>(
 ) {
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(title)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .shadow(Shadow::dark_shade().style(Style::default().fg(Color::DarkGray)));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// A dim uppercase section header grouping rows inside a dialog.
+fn section_header(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {title}"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+/// The width available to a field value inside a dialog of `width` cells.
+fn dialog_value_width(width: u16) -> usize {
+    (width as usize).saturating_sub(2 + DIALOG_LABEL_WIDTH + 2 + 2)
+}
+
+/// Gutter marker + label + gap shared by every dialog field row. The active
+/// field is marked with `▸` and a bright label; its value sits on a subtle
+/// background so it reads as a focused input box.
+fn dialog_field_line(active: bool, label: &str, value_spans: Vec<Span<'static>>) -> Line<'static> {
+    let label_style = if active {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let mut spans = vec![
+        Span::styled(
+            if active { "▸ " } else { "  " },
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{label:<width$}", width = DIALOG_LABEL_WIDTH),
+            label_style,
+        ),
+        Span::raw("  "),
+    ];
+    spans.extend(value_spans);
+    Line::from(spans)
+}
+
+/// Value spans for an editable text field: a focused "input box" while
+/// active, the stored value otherwise, and a dim placeholder when empty.
+fn text_value_spans(
+    field: &EditText,
+    active: bool,
+    width: usize,
+    cursor_visible: bool,
+    placeholder: &'static str,
+) -> Vec<Span<'static>> {
+    if active {
+        vec![Span::styled(
+            edit_text_viewport(field, width, cursor_visible),
+            Style::default()
+                .fg(Color::White)
+                .bg(DIALOG_FIELD_BG)
+                .add_modifier(Modifier::BOLD),
+        )]
+    } else if field.value.is_empty() {
+        vec![Span::styled(
+            pad_truncated(placeholder, width),
+            Style::default().fg(Color::DarkGray),
+        )]
+    } else {
+        vec![Span::styled(
+            pad_truncated(&field.value, width),
+            Style::default().fg(Color::Gray),
+        )]
+    }
+}
+
+/// Value spans for a boolean field: a `[x]`/`[ ]` indicator plus an optional
+/// dim suffix explaining what the toggle means.
+fn checkbox_spans(checked: bool, active: bool, suffix: Option<&'static str>) -> Vec<Span<'static>> {
+    let style = if active {
+        Style::default()
+            .fg(Color::White)
+            .bg(DIALOG_FIELD_BG)
+            .add_modifier(Modifier::BOLD)
+    } else if checked {
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut spans = vec![Span::styled(checkbox(checked), style)];
+    if let Some(suffix) = suffix {
+        spans.push(Span::styled(
+            format!("  {suffix}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    spans
 }
 
 fn update_field_line(
@@ -2059,64 +2412,33 @@ fn update_field_line(
     cursor_visible: bool,
 ) -> Line<'static> {
     let active = dialog.active_field() == field;
-    let (label, value) = match field {
+    let value_width = dialog_value_width(width);
+    let (label, value_spans) = match field {
         UpdateField::Title => (
             "Title",
-            edit_text_display(
-                &dialog.title,
-                active,
-                width.saturating_sub(24) as usize,
-                cursor_visible,
-            ),
+            text_value_spans(&dialog.title, active, value_width, cursor_visible, "‹auto›"),
         ),
         UpdateField::Tags => (
             "Tags",
-            edit_text_display(
-                &dialog.tags,
-                active,
-                width.saturating_sub(24) as usize,
-                cursor_visible,
-            ),
+            text_value_spans(&dialog.tags, active, value_width, cursor_visible, "‹none›"),
         ),
         UpdateField::Notifications => (
             "Notifications",
-            pad_truncated(
-                &checkbox(dialog.notifications_enabled),
-                width.saturating_sub(24) as usize,
-            ),
+            checkbox_spans(dialog.notifications_enabled, active, None),
         ),
     };
-    Line::from(vec![
-        Span::styled(
-            format!(" {label:<22}"),
-            Style::default()
-                .fg(if active { Color::Yellow } else { Color::Cyan })
-                .add_modifier(if active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ),
-        Span::styled(
-            value,
-            Style::default()
-                .fg(if active { Color::White } else { Color::Gray })
-                .add_modifier(if active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ),
-    ])
+    dialog_field_line(active, label, value_spans)
 }
 
 fn update_read_only_line(label: &str, value: &str, width: u16) -> Line<'static> {
-    let value_width = width.saturating_sub(24) as usize;
+    let value_width = dialog_value_width(width);
     Line::from(vec![
+        Span::raw("  "),
         Span::styled(
-            format!(" {label:<22}"),
+            format!("{label:<width$}", width = DIALOG_LABEL_WIDTH),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::raw("  "),
         Span::styled(
             pad_truncated(value, value_width),
             Style::default().fg(Color::Gray),
@@ -2224,60 +2546,62 @@ fn clone_field_line(
     cursor_visible: bool,
 ) -> Line<'static> {
     let active = dialog.active_field() == field;
-    let label = match field {
-        CloneField::Command => "Cmd",
-        CloneField::Args => "Args",
-        CloneField::Cwd => "Cwd",
-        CloneField::Title => "Title",
-        CloneField::Tags => "Tags",
-        CloneField::Node => "Node",
-        CloneField::Rows => "Rows",
-        CloneField::Cols => "Cols",
-        CloneField::DisableNotifications => "Notifications",
-        CloneField::AttachAfterStart => "Attach after start",
-    };
-    let value_width = width.saturating_sub(22) as usize;
-    let value = match field {
-        CloneField::Command => {
-            edit_text_display(&dialog.command, active, value_width, cursor_visible)
-        }
-        CloneField::Args => edit_text_display(&dialog.args, active, value_width, cursor_visible),
-        CloneField::Cwd => edit_text_display(&dialog.cwd, active, value_width, cursor_visible),
-        CloneField::Title => edit_text_display(&dialog.title, active, value_width, cursor_visible),
-        CloneField::Tags => edit_text_display(&dialog.tags, active, value_width, cursor_visible),
-        CloneField::Node => edit_text_display(&dialog.node, active, value_width, cursor_visible),
-        CloneField::Rows => edit_text_display(&dialog.rows, active, value_width, cursor_visible),
-        CloneField::Cols => edit_text_display(&dialog.cols, active, value_width, cursor_visible),
-        CloneField::DisableNotifications => {
-            pad_truncated(&checkbox(!dialog.disable_notifications), value_width)
-        }
-        CloneField::AttachAfterStart => {
-            pad_truncated(&checkbox(dialog.attach_after_start), value_width)
-        }
-    };
-    Line::from(vec![
-        Span::styled(
-            format!(" {:<21}", label),
-            Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
+    let value_width = dialog_value_width(width);
+    let (label, value_spans) = match field {
+        CloneField::Command => (
+            "Command",
+            text_value_spans(
+                &dialog.command,
+                active,
+                value_width,
+                cursor_visible,
+                "‹required›",
+            ),
         ),
-        Span::styled(
-            value,
-            Style::default()
-                .fg(if active { Color::White } else { Color::Gray })
-                .add_modifier(if active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
+        CloneField::Args => (
+            "Arguments",
+            text_value_spans(&dialog.args, active, value_width, cursor_visible, "‹none›"),
         ),
-    ])
-}
-
-fn edit_text_display(field: &EditText, active: bool, width: usize, cursor_visible: bool) -> String {
-    if !active {
-        return pad_truncated(&field.value, width);
-    }
-    edit_text_viewport(field, width, cursor_visible)
+        CloneField::Cwd => (
+            "Directory",
+            text_value_spans(
+                &dialog.cwd,
+                active,
+                value_width,
+                cursor_visible,
+                "‹default›",
+            ),
+        ),
+        CloneField::Title => (
+            "Title",
+            text_value_spans(&dialog.title, active, value_width, cursor_visible, "‹auto›"),
+        ),
+        CloneField::Tags => (
+            "Tags",
+            text_value_spans(&dialog.tags, active, value_width, cursor_visible, "‹none›"),
+        ),
+        CloneField::Node => (
+            "Node",
+            text_value_spans(&dialog.node, active, value_width, cursor_visible, "‹local›"),
+        ),
+        CloneField::Rows => (
+            "Rows",
+            text_value_spans(&dialog.rows, active, value_width, cursor_visible, "‹auto›"),
+        ),
+        CloneField::Cols => (
+            "Columns",
+            text_value_spans(&dialog.cols, active, value_width, cursor_visible, "‹auto›"),
+        ),
+        CloneField::DisableNotifications => (
+            "Notifications",
+            checkbox_spans(!dialog.disable_notifications, active, None),
+        ),
+        CloneField::AttachAfterStart => (
+            "Attach",
+            checkbox_spans(dialog.attach_after_start, active, Some("on start")),
+        ),
+    };
+    dialog_field_line(active, label, value_spans)
 }
 
 fn edit_text_viewport(field: &EditText, width: usize, cursor_visible: bool) -> String {
@@ -2325,9 +2649,9 @@ fn clone_cursor_visible() -> bool {
 
 fn checkbox(checked: bool) -> String {
     if checked {
-        "✅".to_string()
+        "[x]".to_string()
     } else {
-        "❌".to_string()
+        "[ ]".to_string()
     }
 }
 
@@ -2349,16 +2673,19 @@ fn session_table_widths(mode: LayoutMode, show_node: bool) -> Vec<Constraint> {
             Constraint::Length(5),
             Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
         ],
+        // Same column order as the narrower modes (ID before SESSION before
+        // STATE before AGE before RATE); PID slots in after SESSION, OUTPUT
+        // after RATE and the flexible COMMAND column goes last.
         LayoutMode::Wide => vec![
             Constraint::Length(1),
+            Constraint::Length(8),
             Constraint::Length(22),
             Constraint::Length(6),
             Constraint::Length(9),
             Constraint::Length(5),
+            Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
             Constraint::Length(8),
             Constraint::Fill(1),
-            Constraint::Length(12),
-            Constraint::Length(8),
         ],
     };
     if show_node {
@@ -2373,13 +2700,13 @@ fn session_table_alignments(mode: LayoutMode, show_node: bool) -> Vec<Alignment>
         LayoutMode::Wide => vec![
             Alignment::Left,
             Alignment::Left,
-            Alignment::Right,
-            Alignment::Left,
-            Alignment::Left,
-            Alignment::Left,
-            Alignment::Left,
             Alignment::Left,
             Alignment::Right,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Right,
+            Alignment::Left,
         ],
     };
     if show_node {
@@ -2393,7 +2720,7 @@ fn session_table_header(mode: LayoutMode, show_node: bool) -> Row<'static> {
         LayoutMode::Narrow => vec!["", "ID", "SESSION", "STATE", "AGE", "I/O"],
         LayoutMode::Medium => vec!["", "ID", "SESSION", "STATE", "AGE", "RATE"],
         LayoutMode::Wide => vec![
-            "", "SESSION", "PID", "STATE", "AGE", "ID", "COMMAND", "RATE", "OUTPUT",
+            "", "ID", "SESSION", "PID", "STATE", "AGE", "RATE", "OUTPUT", "COMMAND",
         ],
     };
     if show_node {
@@ -2405,7 +2732,7 @@ fn session_table_header(mode: LayoutMode, show_node: bool) -> Row<'static> {
         .map(|(label, alignment)| aligned_cell(label, alignment));
     Row::new(cells).style(
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -2414,18 +2741,48 @@ fn aligned_cell(content: impl Into<Line<'static>>, alignment: Alignment) -> Cell
     Cell::from(content.into().alignment(alignment))
 }
 
+/// Background of the selected session row. Kept dark and muted so the
+/// semantic status colours (yellow attention, red failure, green running)
+/// stay clearly readable on top of it.
+const SELECTED_ROW_BG: Color = Color::Rgb(25, 55, 72);
+
 fn session_row(
     session: &SessionSummary,
     rate: Option<&RateState>,
     mode: LayoutMode,
     now: Instant,
     show_node: bool,
+    selected: bool,
 ) -> Row<'static> {
     let active = is_active_status(&session.status);
     let mut status = status_glyph(&session.status, session.input_needed);
     if !active {
-        status.1 = Color::DarkGray;
+        // The dimmed status of an inactive session must stay readable on the
+        // selection background.
+        status.1 = if selected {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        };
     }
+    // The status never yields its colour: neither the session's own terminal
+    // colours nor the selection highlight may wash out an attention/failure
+    // signal. Attention additionally renders bold so it pops even harder.
+    let status_style = {
+        let style = Style::default().fg(status.1);
+        if session.input_needed {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    };
+    // Purely decorative cells (ids, ages, byte counts) brighten on the
+    // selected row; semantic colours (status, rate, node) never change.
+    let muted = if selected {
+        Color::White
+    } else {
+        Color::DarkGray
+    };
     let status_text = status_label(&session.status, session.input_needed);
     let name = session
         .title
@@ -2446,17 +2803,12 @@ fn session_row(
     let node_offset = usize::from(show_node);
     let mut cells = match mode {
         LayoutMode::Narrow => vec![
-            aligned_cell(
-                Span::styled(status.0, Style::default().fg(status.1)),
-                alignments[0],
-            ),
+            aligned_cell(Span::styled(status.0, status_style), alignments[0]),
             aligned_cell(session.id.clone(), alignments[1 + node_offset])
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(muted)),
             aligned_cell(name, alignments[2 + node_offset]),
-            aligned_cell(status_text.to_string(), alignments[3 + node_offset])
-                .style(Style::default().fg(status.1)),
-            aligned_cell(age, alignments[4 + node_offset])
-                .style(Style::default().fg(Color::DarkGray)),
+            aligned_cell(status_text.to_string(), alignments[3 + node_offset]).style(status_style),
+            aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
             aligned_cell(
                 sparkline(rate, COMPACT_SPARKLINE_WIDTH),
                 alignments[5 + node_offset],
@@ -2464,17 +2816,12 @@ fn session_row(
             .style(Style::default().fg(rate_color)),
         ],
         LayoutMode::Medium => vec![
-            aligned_cell(
-                Span::styled(status.0, Style::default().fg(status.1)),
-                alignments[0],
-            ),
+            aligned_cell(Span::styled(status.0, status_style), alignments[0]),
             aligned_cell(session.id.clone(), alignments[1 + node_offset])
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(muted)),
             aligned_cell(name, alignments[2 + node_offset]),
-            aligned_cell(status_text.to_string(), alignments[3 + node_offset])
-                .style(Style::default().fg(status.1)),
-            aligned_cell(age, alignments[4 + node_offset])
-                .style(Style::default().fg(Color::DarkGray)),
+            aligned_cell(status_text.to_string(), alignments[3 + node_offset]).style(status_style),
+            aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
             aligned_cell(
                 format!(
                     "{} {:>6}/s",
@@ -2492,37 +2839,33 @@ fn session_row(
                 format!("{} {}", session.command, session.args.join(" "))
             };
             vec![
-                aligned_cell(
-                    Span::styled(status.0, Style::default().fg(status.1)),
-                    alignments[0],
-                ),
-                aligned_cell(name, alignments[1 + node_offset]),
+                aligned_cell(Span::styled(status.0, status_style), alignments[0]),
+                aligned_cell(session.id.clone(), alignments[1 + node_offset])
+                    .style(Style::default().fg(muted)),
+                aligned_cell(name, alignments[2 + node_offset]),
                 aligned_cell(
                     session.pid.map_or("-".into(), |pid| pid.to_string()),
-                    alignments[2 + node_offset],
+                    alignments[3 + node_offset],
                 )
-                .style(Style::default().fg(Color::DarkGray)),
-                aligned_cell(status_text.to_string(), alignments[3 + node_offset])
-                    .style(Style::default().fg(status.1)),
-                aligned_cell(age, alignments[4 + node_offset])
-                    .style(Style::default().fg(Color::DarkGray)),
-                aligned_cell(session.id.clone(), alignments[5 + node_offset])
-                    .style(Style::default().fg(Color::DarkGray)),
-                aligned_cell(command, alignments[6 + node_offset]),
+                .style(Style::default().fg(muted)),
+                aligned_cell(status_text.to_string(), alignments[4 + node_offset])
+                    .style(status_style),
+                aligned_cell(age, alignments[5 + node_offset]).style(Style::default().fg(muted)),
                 aligned_cell(
                     format!(
                         "{} {:>6}/s",
                         sparkline(rate, SPARKLINE_WIDTH),
                         format_bytes(current_rate)
                     ),
-                    alignments[7 + node_offset],
+                    alignments[6 + node_offset],
                 )
                 .style(Style::default().fg(rate_color)),
                 aligned_cell(
                     format_bytes(session.last_total_bytes as f64),
-                    alignments[8 + node_offset],
+                    alignments[7 + node_offset],
                 )
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(muted)),
+                aligned_cell(command, alignments[8 + node_offset]),
             ]
         }
     };
@@ -2537,10 +2880,42 @@ fn session_row(
         );
     }
     let row = Row::new(cells);
+    if selected {
+        // The selection paints background, bold and a bright foreground as
+        // the row's base style. Cell styles sit on top of it, so the status
+        // glyph/label keep their semantic colours even while selected.
+        return row.style(
+            Style::default()
+                .fg(Color::White)
+                .bg(SELECTED_ROW_BG)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    // A session's own terminal colours (reported via OSC 10/11) identify it
+    // in the list. They are applied as the row's base style, and the
+    // cell-level styles on top keep the status glyph/label colours (yellow
+    // attention, red failure, green running) more noticeable than the
+    // session foreground. Inactive rows keep their dimmed foreground; only
+    // the session background carries over.
+    let session_fg = session
+        .foreground_color
+        .as_deref()
+        .and_then(parse_terminal_color);
+    let session_bg = session
+        .background_color
+        .as_deref()
+        .and_then(parse_terminal_color);
+    let mut base = Style::default();
+    if let Some(bg) = session_bg {
+        base = base.bg(bg);
+    }
     if active {
-        row
+        if let Some(fg) = session_fg {
+            base = base.fg(fg);
+        }
+        row.style(base)
     } else {
-        row.style(Style::default().fg(Color::DarkGray))
+        row.style(base.fg(Color::DarkGray))
     }
 }
 
@@ -2614,6 +2989,104 @@ fn pad_truncated(value: &str, width: usize) -> String {
 
 fn status_label<'a>(status: &'a str, input_needed: bool) -> &'a str {
     if input_needed { "attention" } else { status }
+}
+
+/// Parse a terminal colour spec (as reported by a session's `OSC 10`/`OSC 11`
+/// replies, e.g. `#rrggbb`, X11 `rgb:r/g/b` / `rgbi:r/g/b`, or a colour name)
+/// into a ratatui colour. Unrecognised specs fall back to the default style.
+fn parse_terminal_color(spec: &str) -> Option<Color> {
+    let spec = spec.trim();
+    if let Some(hex) = spec.strip_prefix('#') {
+        return parse_hex_color(hex);
+    }
+    if let Some(body) = spec
+        .strip_prefix("rgb:")
+        .or_else(|| spec.strip_prefix("RGB:"))
+    {
+        let mut parts = body.split('/');
+        let (r, g, b) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        return Some(Color::Rgb(
+            scale_hex_component(r)?,
+            scale_hex_component(g)?,
+            scale_hex_component(b)?,
+        ));
+    }
+    if let Some(body) = spec
+        .strip_prefix("rgbi:")
+        .or_else(|| spec.strip_prefix("RGBI:"))
+    {
+        let mut parts = body.split('/');
+        let (r, g, b) = (parts.next()?, parts.next()?, parts.next()?);
+        if parts.next().is_some() {
+            return None;
+        }
+        let component = |value: &str| -> Option<u8> {
+            let value: f32 = value.parse().ok()?;
+            (0.0..=1.0)
+                .contains(&value)
+                .then(|| (value * 255.0).round() as u8)
+        };
+        return Some(Color::Rgb(component(r)?, component(g)?, component(b)?));
+    }
+    named_color(&spec.to_ascii_lowercase())
+}
+
+/// Parse `#RGB`, `#RRGGBB`, `#RRRGGGBBB` or `#RRRRGGGGBBBB` (X11 hex forms,
+/// 1–4 hex digits per component scaled to 8 bits).
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    if hex.is_empty() || !hex.len().is_multiple_of(3) || hex.len() > 12 {
+        return None;
+    }
+    let width = hex.len() / 3;
+    Some(Color::Rgb(
+        scale_hex_component(&hex[..width])?,
+        scale_hex_component(&hex[width..2 * width])?,
+        scale_hex_component(&hex[2 * width..])?,
+    ))
+}
+
+/// Scale a 1–4 digit X11 hex component to 8 bits (the full intensity range
+/// maps to 0–255 regardless of the digit count).
+fn scale_hex_component(digits: &str) -> Option<u8> {
+    if digits.is_empty() || digits.len() > 4 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(digits, 16).ok()?;
+    let max = (1u32 << (4 * digits.len())) - 1;
+    Some(((value * 0xffff / max) >> 8) as u8)
+}
+
+/// A practical subset of the X11 colour names (per `rgb.txt`) covering the
+/// names terminal colour schemes typically report.
+fn named_color(name: &str) -> Option<Color> {
+    let rgb = match name {
+        "black" => (0x00, 0x00, 0x00),
+        "white" => (0xff, 0xff, 0xff),
+        "red" => (0xff, 0x00, 0x00),
+        "green" => (0x00, 0x80, 0x00),
+        "lime" => (0x00, 0xff, 0x00),
+        "blue" => (0x00, 0x00, 0xff),
+        "navy" => (0x00, 0x00, 0x80),
+        "yellow" => (0xff, 0xff, 0x00),
+        "cyan" | "aqua" => (0x00, 0xff, 0xff),
+        "teal" => (0x00, 0x80, 0x80),
+        "magenta" | "fuchsia" => (0xff, 0x00, 0xff),
+        "purple" => (0x80, 0x00, 0x80),
+        "maroon" => (0x80, 0x00, 0x00),
+        "olive" => (0x80, 0x80, 0x00),
+        "orange" => (0xff, 0xa5, 0x00),
+        "pink" => (0xff, 0xc0, 0xcb),
+        "brown" => (0xa5, 0x2a, 0x2a),
+        "gray" | "grey" => (0xbe, 0xbe, 0xbe),
+        "silver" => (0xc0, 0xc0, 0xc0),
+        "darkgray" | "darkgrey" => (0xa9, 0xa9, 0xa9),
+        "lightgray" | "lightgrey" => (0xd3, 0xd3, 0xd3),
+        _ => return None,
+    };
+    Some(Color::Rgb(rgb.0, rgb.1, rgb.2))
 }
 
 fn status_glyph(status: &str, input_needed: bool) -> (&'static str, Color) {
@@ -2982,7 +3455,448 @@ mod tests {
             rows: Some(24),
             cols: Some(80),
             attach_count: 0,
+            foreground_color: None,
+            background_color: None,
         }
+    }
+
+    /// Render a single wide-mode session row into a buffer so cell styles
+    /// (fg/bg) can be asserted directly.
+    fn render_session_row(session: &SessionSummary) -> ratatui::buffer::Buffer {
+        render_session_row_selected(session, false)
+    }
+
+    fn render_session_row_selected(
+        session: &SessionSummary,
+        selected: bool,
+    ) -> ratatui::buffer::Buffer {
+        use ratatui::{layout::Rect, widgets::Widget};
+        let row = super::session_row(
+            session,
+            None,
+            super::LayoutMode::Wide,
+            std::time::Instant::now(),
+            false,
+            selected,
+        );
+        let table = ratatui::widgets::Table::new(
+            vec![row],
+            super::session_table_widths(super::LayoutMode::Wide, false),
+        )
+        .column_spacing(1);
+        let area = Rect::new(0, 0, 140, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        Widget::render(table, area, &mut buffer);
+        buffer
+    }
+
+    /// X position of the first character of `text` on row 0.
+    fn find_text(buffer: &ratatui::buffer::Buffer, text: &str) -> Option<u16> {
+        let width = buffer.area().width;
+        let line: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+        line.find(text).map(|byte| byte as u16)
+    }
+
+    #[test]
+    fn parse_terminal_color_accepts_terminal_colour_specs() {
+        assert_eq!(
+            super::parse_terminal_color("#1e1e1e"),
+            Some(ratatui::style::Color::Rgb(0x1e, 0x1e, 0x1e))
+        );
+        assert_eq!(
+            super::parse_terminal_color("#fff"),
+            Some(ratatui::style::Color::Rgb(0xff, 0xff, 0xff))
+        );
+        assert_eq!(
+            super::parse_terminal_color("#ffffffff0000"),
+            Some(ratatui::style::Color::Rgb(0xff, 0xff, 0x00))
+        );
+        assert_eq!(
+            super::parse_terminal_color("rgb:ffff/0000/8080"),
+            Some(ratatui::style::Color::Rgb(0xff, 0x00, 0x80))
+        );
+        assert_eq!(
+            super::parse_terminal_color("rgb:f/0/8"),
+            Some(ratatui::style::Color::Rgb(0xff, 0x00, 0x88))
+        );
+        assert_eq!(
+            super::parse_terminal_color("rgbi:1/0/0.5"),
+            Some(ratatui::style::Color::Rgb(0xff, 0x00, 0x80))
+        );
+        assert_eq!(
+            super::parse_terminal_color("red"),
+            Some(ratatui::style::Color::Rgb(0xff, 0x00, 0x00))
+        );
+        assert_eq!(
+            super::parse_terminal_color("DarkGray"),
+            Some(ratatui::style::Color::Rgb(0xa9, 0xa9, 0xa9))
+        );
+        assert_eq!(super::parse_terminal_color(""), None);
+        assert_eq!(super::parse_terminal_color("rgb:zz/00/00"), None);
+        assert_eq!(super::parse_terminal_color("rgbi:2/0/0"), None);
+        assert_eq!(super::parse_terminal_color("#12345"), None);
+        assert_eq!(super::parse_terminal_color("chartreuse-ish"), None);
+    }
+
+    #[test]
+    fn session_row_uses_the_sessions_terminal_colours() {
+        let mut item = session("coloured");
+        item.title = Some("deploy".to_string());
+        item.foreground_color = Some("rgb:ffff/ffff/ffff".to_string());
+        item.background_color = Some("#1e1e1e".to_string());
+
+        let buffer = render_session_row(&item);
+
+        // The session name cell carries the session's own colours.
+        let name_x = find_text(&buffer, "deploy").expect("name rendered");
+        let name_cell = &buffer[(name_x, 0)];
+        assert_eq!(name_cell.fg, ratatui::style::Color::Rgb(0xff, 0xff, 0xff));
+        assert_eq!(name_cell.bg, ratatui::style::Color::Rgb(0x1e, 0x1e, 0x1e));
+
+        // The status glyph keeps its own colour on the session background.
+        let glyph = &buffer[(0, 0)];
+        assert_eq!(glyph.symbol(), "●");
+        assert_eq!(glyph.fg, ratatui::style::Color::Green);
+        assert_eq!(glyph.bg, ratatui::style::Color::Rgb(0x1e, 0x1e, 0x1e));
+    }
+
+    #[test]
+    fn session_row_keeps_attention_status_more_noticeable_than_session_colours() {
+        let mut item = session("waiting");
+        item.title = Some("build".to_string());
+        item.input_needed = true;
+        // A loud session foreground must not wash out the attention signal.
+        item.foreground_color = Some("#ffff00".to_string());
+        item.background_color = Some("#1e1e1e".to_string());
+
+        let buffer = render_session_row(&item);
+
+        // Attention glyph stays yellow with its dedicated emphasis...
+        let glyph = &buffer[(0, 0)];
+        assert_eq!(glyph.symbol(), "◆");
+        assert_eq!(glyph.fg, ratatui::style::Color::Yellow);
+        // ...and the status label too.
+        let label_x = find_text(&buffer, "attention").expect("status label rendered");
+        assert_eq!(buffer[(label_x, 0)].fg, ratatui::style::Color::Yellow);
+    }
+
+    #[test]
+    fn inactive_session_row_stays_dimmed_but_keeps_session_background() {
+        let mut item = session("done");
+        item.title = Some("finished".to_string());
+        item.status = "stopped".to_string();
+        item.ended_at = Some(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+        item.foreground_color = Some("#ffffff".to_string());
+        item.background_color = Some("#000040".to_string());
+
+        let buffer = render_session_row(&item);
+
+        let name_x = find_text(&buffer, "finished").expect("name rendered");
+        let name_cell = &buffer[(name_x, 0)];
+        // Inactive rows keep the dimmed foreground...
+        assert_eq!(name_cell.fg, ratatui::style::Color::DarkGray);
+        // ...but still show the session's background identity.
+        assert_eq!(name_cell.bg, ratatui::style::Color::Rgb(0x00, 0x00, 0x40));
+    }
+
+    #[test]
+    fn session_row_without_terminal_colours_is_unchanged() {
+        let mut item = session("plain");
+        item.title = Some("vanilla".to_string());
+
+        let buffer = render_session_row(&item);
+
+        let name_x = find_text(&buffer, "vanilla").expect("name rendered");
+        let name_cell = &buffer[(name_x, 0)];
+        assert_eq!(name_cell.fg, ratatui::style::Color::Reset);
+        assert_eq!(name_cell.bg, ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn selected_row_keeps_status_colours_and_brightens_decorative_cells() {
+        let mut item = session("waiting");
+        item.title = Some("build".to_string());
+        item.input_needed = true;
+        item.foreground_color = Some("#ffff00".to_string());
+        item.background_color = Some("#1e1e1e".to_string());
+
+        let buffer = render_session_row_selected(&item, true);
+
+        // The attention glyph and label keep their yellow even on the
+        // selection band — the highlight must never hide them.
+        let glyph = &buffer[(0, 0)];
+        assert_eq!(glyph.symbol(), "◆");
+        assert_eq!(glyph.fg, ratatui::style::Color::Yellow);
+        assert_eq!(glyph.bg, super::SELECTED_ROW_BG);
+        let label_x = find_text(&buffer, "attention").expect("status label rendered");
+        let label = &buffer[(label_x, 0)];
+        assert_eq!(label.fg, ratatui::style::Color::Yellow);
+        assert_eq!(label.bg, super::SELECTED_ROW_BG);
+
+        // The session name is bright white on the selection band (its own
+        // session colours yield to the selection).
+        let name_x = find_text(&buffer, "build").expect("name rendered");
+        let name = &buffer[(name_x, 0)];
+        assert_eq!(name.fg, ratatui::style::Color::White);
+        assert_eq!(name.bg, super::SELECTED_ROW_BG);
+    }
+
+    #[test]
+    fn selected_row_keeps_failure_status_red() {
+        let mut item = session("failed");
+        item.title = Some("crashed".to_string());
+        item.status = "failed".to_string();
+        item.ended_at = Some(Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap());
+
+        let buffer = render_session_row_selected(&item, true);
+
+        let glyph = &buffer[(0, 0)];
+        assert_eq!(glyph.symbol(), "×");
+        // Inactive statuses stay muted, but must remain readable on the
+        // selection band (gray, not the near-invisible dark gray).
+        assert_eq!(glyph.fg, ratatui::style::Color::Gray);
+        assert_eq!(glyph.bg, super::SELECTED_ROW_BG);
+    }
+
+    #[test]
+    fn attention_pulse_runs_only_while_a_session_needs_input() {
+        let mut app = App::default();
+        let mut item = session("waiting");
+        item.input_needed = true;
+        app.replace_sessions(vec![item]);
+
+        let _ = render_app(&mut app, 120, 12);
+        assert_eq!(app.attention_rows.len(), 1);
+        assert!(app.effects.is_running());
+
+        app.sessions[0].input_needed = false;
+        let _ = render_app(&mut app, 120, 12);
+        assert!(app.attention_rows.is_empty());
+        assert!(!app.effects.is_running());
+    }
+
+    #[test]
+    fn attention_pulse_is_scoped_to_the_waiting_sessions_rows() {
+        let mut app = App::default();
+        let calm = session("calm");
+        let mut waiting = session("waiting");
+        waiting.input_needed = true;
+        app.replace_sessions(vec![calm, waiting]);
+        // The update dialog renders its active field label in yellow: it must
+        // never be pulsed just because some session needs attention.
+        route_key(&mut app, ctrl(KeyCode::Char('u')), None);
+        let cells = |buffer: &ratatui::buffer::Buffer| {
+            let area = *buffer.area();
+            (area.y..area.bottom()).flat_map(move |y| (area.x..area.right()).map(move |x| (x, y)))
+        };
+
+        app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
+        let buffer = render_app_buffer(&mut app, 120, 30);
+
+        // The waiting session's row background pulses (interpolated colour)
+        // while its status foreground is preserved...
+        let glyph = cells(&buffer)
+            .find(|&pos| buffer[pos].symbol() == "◆")
+            .expect("attention glyph rendered");
+        assert!(matches!(
+            buffer[glyph].bg,
+            ratatui::style::Color::Rgb(_, _, _)
+        ));
+        assert_eq!(buffer[glyph].fg, ratatui::style::Color::Yellow);
+        // ...the calm session's row is not animated...
+        let calm_row = cells(&buffer)
+            .find(|&(x, y)| {
+                buffer[(x, y)].symbol() == "c"
+                    && ["a", "l", "m"]
+                        .into_iter()
+                        .enumerate()
+                        .all(|(dx, s)| buffer[(x + dx as u16 + 1, y)].symbol() == s)
+            })
+            .expect("calm session rendered");
+        // (calm is the selected row, so it wears the static selection band.)
+        assert_eq!(buffer[calm_row].bg, super::SELECTED_ROW_BG);
+        // ...while the dialog's yellow field label keeps its exact colour.
+        let label = cells(&buffer)
+            .find(|&(x, y)| {
+                buffer[(x, y)].symbol() == "T"
+                    && ["i", "t", "l", "e"]
+                        .into_iter()
+                        .enumerate()
+                        .all(|(dx, s)| buffer[(x + dx as u16 + 1, y)].symbol() == s)
+            })
+            .expect("dialog Title label rendered");
+        assert_eq!(buffer[label].fg, ratatui::style::Color::Cyan);
+        // Only the waiting session's row is tracked for pulsing.
+        assert_eq!(app.attention_rows.len(), 1);
+        assert!(app.attention_rows.contains_key("waiting"));
+    }
+
+    fn render_app_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| super::render(frame, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn attention_pulse_animates_the_row_background_as_time_passes() {
+        let mut app = App::default();
+        let calm = session("calm");
+        let mut waiting = session("waiting");
+        waiting.input_needed = true;
+        // "calm" stays selected, so the waiting row pulses unselected.
+        app.replace_sessions(vec![calm, waiting]);
+        let glyph_position = |buffer: &ratatui::buffer::Buffer| {
+            let area = *buffer.area();
+            (area.y..area.bottom())
+                .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+                .find(|&(x, y)| buffer[(x, y)].symbol() == "◆")
+                .expect("attention glyph rendered")
+        };
+
+        // At effect-time zero the row is untouched: default background and
+        // the status foreground at its full yellow.
+        let buffer = render_app_buffer(&mut app, 120, 12);
+        let position = glyph_position(&buffer);
+        assert_eq!(buffer[position].fg, ratatui::style::Color::Yellow);
+        assert_eq!(buffer[position].bg, ratatui::style::Color::Reset);
+
+        // Part-way through the pulse the row background has lerped towards
+        // the amber tint while the status foreground is preserved.
+        app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
+        let buffer = render_app_buffer(&mut app, 120, 12);
+        match buffer[position].bg {
+            ratatui::style::Color::Rgb(r, g, b) => {
+                assert!(
+                    r > g && b < 30,
+                    "pulse should tint the row amber: {r},{g},{b}"
+                );
+            }
+            other => panic!("expected an interpolated rgb background, got {other:?}"),
+        }
+        assert_eq!(buffer[position].fg, ratatui::style::Color::Yellow);
+    }
+
+    #[test]
+    fn attention_pulse_retunes_when_the_row_is_selected() {
+        let mut app = App::default();
+        let mut waiting = session("waiting");
+        waiting.input_needed = true;
+        // The waiting session starts out selected.
+        app.replace_sessions(vec![waiting, session("calm")]);
+        let glyph_position = |buffer: &ratatui::buffer::Buffer| {
+            let area = *buffer.area();
+            (area.y..area.bottom())
+                .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+                .find(|&(x, y)| buffer[(x, y)].symbol() == "◆")
+                .expect("attention glyph rendered")
+        };
+
+        // Selected: the pulse blends the selection band with the amber tint,
+        // keeping the blue component of the selection band clearly present.
+        app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
+        let buffer = render_app_buffer(&mut app, 120, 12);
+        match buffer[glyph_position(&buffer)].bg {
+            ratatui::style::Color::Rgb(_, _, b) => {
+                assert!(
+                    b > 20,
+                    "selected pulse should keep the selection band: b={b}"
+                );
+            }
+            other => panic!("expected an interpolated rgb background, got {other:?}"),
+        }
+        assert!(app.attention_rows["waiting"].1);
+
+        // Moving the selection away swaps the pulse back to the plain amber
+        // tint (re-registered, so it restarts from the row's own colours).
+        // Moving the selection away swaps the pulse back to the plain amber
+        // tint. (The swap frame still shows the outgoing effect's final
+        // tick, so assert on the frame after it: at any point of the cycle
+        // the unselected tint keeps the blue channel near zero, far below
+        // the selection-band blend.)
+        route_key(&mut app, key(KeyCode::Down), None);
+        app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
+        let _ = render_app_buffer(&mut app, 120, 12);
+        app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
+        let buffer = render_app_buffer(&mut app, 120, 12);
+        match buffer[glyph_position(&buffer)].bg {
+            ratatui::style::Color::Rgb(_, _, b) => {
+                assert!(b < 15, "unselected pulse is plain amber: b={b}");
+            }
+            other => panic!("expected an interpolated rgb background, got {other:?}"),
+        }
+        assert_eq!(
+            buffer[glyph_position(&buffer)].fg,
+            ratatui::style::Color::Yellow
+        );
+        assert!(!app.attention_rows["waiting"].1);
+    }
+
+    #[test]
+    fn posting_a_message_registers_a_fade_in_once() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        app.message = Some("stop signal sent to source".to_string());
+
+        let _ = render_app(&mut app, 120, 12);
+        assert!(app.effects.is_running());
+        assert_eq!(
+            app.rendered_message.as_deref(),
+            Some("stop signal sent to source")
+        );
+    }
+
+    #[test]
+    fn opening_a_dialog_registers_a_fade_in() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+
+        let _ = render_app(&mut app, 120, 30);
+        assert!(!app.effects.is_running());
+        assert_eq!(app.rendered_dialog, None);
+
+        route_key(&mut app, ctrl(KeyCode::Char('d')), None);
+        let _ = render_app(&mut app, 120, 30);
+        assert_eq!(app.rendered_dialog, Some("clone-fade"));
+        assert!(app.effects.is_running());
+    }
+
+    #[test]
+    fn footer_keeps_help_visible_alongside_a_message() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        app.message = Some("stop signal sent to source".to_string());
+
+        let rendered = render_app(&mut app, 120, 12);
+        let footer = rendered.lines().last().unwrap_or_default().to_string();
+
+        // The warning no longer replaces the key hints — both are visible.
+        assert!(footer.contains("stop signal sent to source"));
+        assert!(footer.contains("^N new"));
+    }
+
+    #[test]
+    fn wide_mode_columns_follow_the_same_order_as_narrow_modes() {
+        let mut app = App::default();
+        let mut item = session("wide1234");
+        item.title = Some("ordered".to_string());
+        app.replace_sessions(vec![item]);
+
+        let rendered = render_app(&mut app, 120, 12);
+        let header = rendered
+            .lines()
+            .find(|line| line.contains("COMMAND"))
+            .expect("wide header rendered");
+        let position = |label: &str| header.find(label).expect("column header present");
+
+        // status, ID, SESSION, PID, STATE, AGE, RATE, OUTPUT, COMMAND
+        assert!(position("ID") < position("SESSION"));
+        assert!(position("SESSION") < position("PID"));
+        assert!(position("PID") < position("STATE"));
+        assert!(position("STATE") < position("AGE"));
+        assert!(position("AGE") < position("RATE"));
+        assert!(position("RATE") < position("OUTPUT"));
+        assert!(position("OUTPUT") < position("COMMAND"));
     }
 
     fn render_app(app: &mut App, width: u16, height: u16) -> String {
@@ -3063,6 +3977,52 @@ mod tests {
         let rendered = render_app(&mut app, 120, 30);
         assert!(rendered.contains("New Session"));
         assert!(!rendered.contains("Duplicate source"));
+    }
+
+    #[test]
+    fn clone_dialog_uses_sections_placeholders_and_focused_input_styles() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("source")]);
+        route_key(&mut app, ctrl(KeyCode::Char('n')), None);
+        let _ = render_app_buffer(&mut app, 100, 30);
+        // Let the dialog fade-in finish so style assertions see final colors.
+        app.last_frame_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1000));
+        let buffer = render_app_buffer(&mut app, 100, 30);
+        let text: String = buffer
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("PROCESS"));
+        assert!(text.contains("METADATA"));
+        assert!(text.contains("OPTIONS"));
+        assert!(text.contains("‹auto›"));
+        assert!(text.contains("‹local›"));
+        assert!(text.contains("╭"));
+
+        // The active field row is marked with ▸, a cyan label, and an input-box bg.
+        let marker = (5..buffer.area().height)
+            .flat_map(|y| (0..buffer.area().width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buffer[(x, y)].symbol() == "▸"
+                    && buffer[(x + 2, y)].symbol() == "C"
+                    && buffer[(x + 3, y)].symbol() == "o"
+            })
+            .expect("active Command field marker");
+        assert_eq!(
+            buffer[(marker.0 + 2, marker.1)].fg,
+            ratatui::style::Color::Cyan
+        );
+        let value_x = marker.0 + 2 + super::DIALOG_LABEL_WIDTH as u16 + 2;
+        assert_eq!(buffer[(value_x, marker.1)].bg, super::DIALOG_FIELD_BG);
+
+        // Inactive checkboxes read [x]/[ ]; the enabled one is green.
+        let checked = (0..buffer.area().height)
+            .flat_map(|y| (0..buffer.area().width).map(move |x| (x, y)))
+            .find(|&(x, y)| buffer[(x, y)].symbol() == "[" && buffer[(x + 1, y)].symbol() == "x")
+            .expect("checked box");
+        assert_eq!(buffer[checked].fg, ratatui::style::Color::Green);
     }
 
     #[test]
@@ -3172,15 +4132,15 @@ mod tests {
         assert!(editable_line.to_string().contains("Title"));
         assert!(!editable_line.to_string().contains("editable"));
         assert_eq!(
-            editable_line.spans[0].style.fg,
-            Some(ratatui::style::Color::Yellow)
+            editable_line.spans[1].style.fg,
+            Some(ratatui::style::Color::Cyan)
         );
         let read_only_line = super::update_read_only_line("ID", "source", 80);
         assert!(read_only_line.to_string().contains("ID"));
         assert!(!read_only_line.to_string().contains("read-only"));
         assert!(read_only_line.to_string().contains("source"));
         assert_eq!(
-            read_only_line.spans[0].style.fg,
+            read_only_line.spans[1].style.fg,
             Some(ratatui::style::Color::DarkGray)
         );
         assert!(app.clone_dialog.is_none());
@@ -3315,7 +4275,7 @@ mod tests {
     }
 
     #[test]
-    fn dialog_boolean_fields_use_emoji_indicators() {
+    fn dialog_boolean_fields_use_box_indicators() {
         let mut app = App::default();
         app.replace_sessions(vec![session("source")]);
         route_key(&mut app, ctrl(KeyCode::Char('u')), None);
@@ -3323,16 +4283,16 @@ mod tests {
 
         let disabled =
             super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
-        assert!(disabled.to_string().contains("❌"));
+        assert!(disabled.to_string().contains("[ ]"));
         assert!(!disabled.to_string().contains("disabled"));
 
         dialog.notifications_enabled = true;
         let enabled = super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
-        assert!(enabled.to_string().contains("✅"));
+        assert!(enabled.to_string().contains("[x]"));
         assert!(!enabled.to_string().contains("enabled"));
 
-        assert_eq!(super::checkbox(true), "✅");
-        assert_eq!(super::checkbox(false), "❌");
+        assert_eq!(super::checkbox(true), "[x]");
+        assert_eq!(super::checkbox(false), "[ ]");
     }
 
     #[test]
@@ -3346,17 +4306,16 @@ mod tests {
     }
 
     #[test]
-    fn list_and_dialog_tips_render_with_top_dividers() {
+    fn list_tips_are_compact_and_dialog_tips_keep_their_top_divider() {
         let mut app = App::default();
         app.replace_sessions(vec![session("source")]);
 
+        // The list footer is a single borderless line so the table gets the
+        // extra row; it must still carry the key hints.
         let list = render_app(&mut app, 120, 30);
-        let list_lines = list.lines().collect::<Vec<_>>();
-        let help_index = list_lines
-            .iter()
-            .position(|line| line.contains("Ctrl+D duplicate"))
-            .unwrap();
-        assert!(list_lines[help_index - 1].contains('\u{2500}'));
+        let last_line = list.lines().last().unwrap_or_default();
+        assert!(last_line.contains("^D duplicate"));
+        assert!(!last_line.contains('\u{2500}'));
 
         route_key(&mut app, ctrl(KeyCode::Char('d')), None);
         let dialog = render_app(&mut app, 120, 30);
@@ -3988,13 +4947,13 @@ mod tests {
             vec![
                 Alignment::Left,
                 Alignment::Left,
-                Alignment::Right,
-                Alignment::Left,
-                Alignment::Left,
-                Alignment::Left,
-                Alignment::Left,
                 Alignment::Left,
                 Alignment::Right,
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Left,
+                Alignment::Right,
+                Alignment::Left,
             ]
         );
 

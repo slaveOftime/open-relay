@@ -62,6 +62,12 @@ pub struct SessionMeta {
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub notifications_enabled: bool,
+    /// Default foreground colour the child last set via OSC 10, as the raw
+    /// colour spec payload. `None` when the session never set one.
+    pub foreground_color: Option<String>,
+    /// Default background colour the child last set via OSC 11, as the raw
+    /// colour spec payload. `None` when the session never set one.
+    pub background_color: Option<String>,
 }
 
 pub struct StartSpec {

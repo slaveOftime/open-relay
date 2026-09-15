@@ -474,6 +474,23 @@ trade-off: a bare title flip usually announces an input-required prompt rather
 than real progress, and genuine progress almost always comes with regular
 screen output that still counts as activity.
 
+### Signals Adopted as Session Metadata
+
+Two families of stripped/one-way signals are also mirrored into
+`SessionMeta` by the reader thread (`SessionRuntime::publish_terminal_signals`),
+which broadcasts a `SessionEvent::SessionUpdated` whenever they change:
+
+- **Title** (`OSC 0/1/2`): adopted as `meta.title` only while the user has not
+  chosen one themselves (`title_user_set`); an explicit title always wins.
+- **Default colours** (`OSC 10` / `OSC 11` *set* forms): always terminal-owned,
+  mirrored into `meta.foreground_color` / `meta.background_color`.  Unlike
+  titles they are **not** forwarded to attached clients and **not** replayed
+  on attach — a session's colour scheme is host-specific state that must not
+  follow it onto another user's terminal.  An empty payload resets the slot.
+
+Both are persisted to SQLite (`foreground_color` / `background_color` columns)
+with the rest of the metadata when the session completes.
+
 ### ConPTY Bare Forms
 
 Windows ConPTY sometimes drops the introducing `ESC`, so a cursor report can

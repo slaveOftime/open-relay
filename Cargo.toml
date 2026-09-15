@@ -80,6 +80,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 gpui = { version = "0.2.2", optional = true }
 gpui-terminal = { version = "0.1.0", optional = true }
+tachyonfx = { version = "0.25", default-features = false, features = ["std"] }
 
 [target.'cfg(not(windows))'.dependencies]
 mimalloc = { version = "0.1.48", features = ["v3"] }
