@@ -399,6 +399,7 @@ struct App {
     search_text: Vec<String>,
     visible: Vec<usize>,
     status_filter: StatusFilter,
+    sort_strategy: SortStrategy,
     clone_dialog: Option<CloneDialog>,
     update_dialog: Option<UpdateDialog>,
     show_node: bool,
@@ -1007,6 +1008,10 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             app.toggle_status_filter();
             AppAction::None
         }
+        KeyCode::Char('o' | 'O') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cycle_sort_strategy();
+            AppAction::None
+        }
         KeyCode::Esc => {
             app.clear_filter();
             AppAction::None
@@ -1213,6 +1218,58 @@ fn is_active_status(status: &str) -> bool {
     matches!(status, "created" | "running" | "stopping")
 }
 
+/// A session is "active" for sorting while it is alive (created/running/
+/// stopping) or waiting for input, so attention-needed rows never sink below
+/// finished ones.
+fn session_is_active(session: &SessionSummary) -> bool {
+    is_active_status(&session.status) || session.input_needed
+}
+
+/// Row ordering strategies for the session list, cycled with Ctrl+O.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SortStrategy {
+    /// Active sessions (running, waiting for input, …) first, then stopped/
+    /// failed ones; each group sorted by creation time, newest first.
+    #[default]
+    ActiveFirst,
+    /// All sessions by creation time, newest first.
+    CreatedDesc,
+    /// All sessions by creation time, oldest first.
+    CreatedAsc,
+}
+
+impl SortStrategy {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ActiveFirst => "active first",
+            Self::CreatedDesc => "newest",
+            Self::CreatedAsc => "oldest",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::ActiveFirst => Self::CreatedDesc,
+            Self::CreatedDesc => Self::CreatedAsc,
+            Self::CreatedAsc => Self::ActiveFirst,
+        }
+    }
+}
+
+fn sort_sessions(sessions: &mut [SessionSummary], strategy: SortStrategy) {
+    match strategy {
+        SortStrategy::ActiveFirst => sessions.sort_by(|a, b| {
+            session_is_active(b)
+                .cmp(&session_is_active(a))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        }),
+        SortStrategy::CreatedDesc => {
+            sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at))
+        }
+        SortStrategy::CreatedAsc => sessions.sort_by_key(|session| session.created_at),
+    }
+}
+
 impl StatusFilter {
     fn label(self) -> &'static str {
         match self {
@@ -1298,7 +1355,8 @@ fn session_key(session: &SessionSummary) -> String {
 }
 
 impl App {
-    fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
+    fn replace_sessions(&mut self, mut sessions: Vec<SessionSummary>) {
+        sort_sessions(&mut sessions, self.sort_strategy);
         let selected_key = self.sessions.get(self.selected).map(session_key);
         let now = Instant::now();
         let session_keys = sessions.iter().map(session_key).collect::<HashSet<_>>();
@@ -1475,6 +1533,27 @@ impl App {
     fn clear_filter(&mut self) {
         self.filter.clear();
         self.update_text_filter();
+    }
+
+    fn cycle_sort_strategy(&mut self) {
+        self.sort_strategy = self.sort_strategy.next();
+        let selected_key = self.sessions.get(self.selected).map(session_key);
+        sort_sessions(&mut self.sessions, self.sort_strategy);
+        // The search text is indexed parallel to `sessions`, so re-derive it
+        // after reordering.
+        self.search_text = self.sessions.iter().map(session_search_text).collect();
+        self.selected = selected_key
+            .and_then(|key| {
+                self.sessions
+                    .iter()
+                    .position(|session| session_key(session) == key)
+            })
+            .unwrap_or(0);
+        self.rebuild_visible();
+        self.message = Some(format!(
+            "sorted by {} · Ctrl+O cycle",
+            self.sort_strategy.label()
+        ));
     }
 
     fn toggle_status_filter(&mut self) {
@@ -1869,10 +1948,11 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         ),
         Span::styled(
             format!(
-                " {} sessions · {} live · {}",
+                " {} sessions · {} live · {} · sort:{}",
                 app.sessions.len(),
                 running,
-                app.status_filter.label()
+                app.status_filter.label(),
+                app.sort_strategy.label()
             ),
             Style::default().fg(Color::Gray),
         ),
@@ -2014,12 +2094,14 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     // mode, so nothing is ever truncated.
     let help = if app.filter.is_empty() {
         match mode {
-            LayoutMode::Narrow => " filter ^N new ^D dup ^K stop ⏎ open ^C quit".to_string(),
+            LayoutMode::Narrow => {
+                " filter ^N new ^D dup ^K stop ^O sort ⏎ open ^C quit".to_string()
+            }
             LayoutMode::Medium => {
-                " filter · ^N new · ^D dup · ^K stop · ⏎ open · ^C quit".to_string()
+                " filter · ^N new · ^D dup · ^K stop · ^O sort · ⏎ open · ^C quit".to_string()
             }
             LayoutMode::Wide => {
-                " filter · ^N new · ^D duplicate · ^U update · ^K stop · ^S status · ⏎ open · ^⏎ window · ^C quit"
+                " filter · ^N new · ^D duplicate · ^U update · ^K stop · ^S status · ^O sort · ⏎ open · ^⏎ window · ^C quit"
                     .to_string()
             }
         }
@@ -4777,6 +4859,93 @@ mod tests {
         assert_eq!(app.visible.clone(), [1]);
         app.toggle_status_filter();
         assert_eq!(app.visible.clone(), [0, 1]);
+    }
+
+    fn session_ids(app: &App) -> Vec<&str> {
+        app.sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn active_sessions_sort_before_inactive_then_newest_first_by_default() {
+        let mut app = App::default();
+        let mut old_running = session("old-running");
+        old_running.created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut new_running = session("new-running");
+        new_running.created_at = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let mut new_stopped = session("new-stopped");
+        new_stopped.status = "stopped".to_string();
+        new_stopped.created_at = Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap();
+        let mut old_failed = session("old-failed");
+        old_failed.status = "failed".to_string();
+        old_failed.created_at = Utc.with_ymd_and_hms(2025, 12, 31, 0, 0, 0).unwrap();
+
+        app.replace_sessions(vec![old_failed, new_stopped, old_running, new_running]);
+
+        assert_eq!(
+            session_ids(&app),
+            ["new-running", "old-running", "new-stopped", "old-failed"]
+        );
+    }
+
+    #[test]
+    fn attention_needed_session_sorts_with_the_active_group() {
+        let mut app = App::default();
+        let mut waiting = session("waiting");
+        waiting.input_needed = true;
+        waiting.created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut stopped = session("stopped");
+        stopped.status = "stopped".to_string();
+        stopped.created_at = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+
+        app.replace_sessions(vec![stopped, waiting]);
+
+        assert_eq!(session_ids(&app), ["waiting", "stopped"]);
+    }
+
+    #[test]
+    fn ctrl_o_cycles_sort_strategies_and_keeps_selection() {
+        let mut app = App::default();
+        let mut old_running = session("old-running");
+        old_running.created_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let mut new_stopped = session("new-stopped");
+        new_stopped.status = "stopped".to_string();
+        new_stopped.created_at = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+
+        app.replace_sessions(vec![new_stopped, old_running]);
+        // Default: active sessions first.
+        assert_eq!(session_ids(&app), ["old-running", "new-stopped"]);
+        app.selected = 1;
+
+        route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+        assert_eq!(session_ids(&app), ["new-stopped", "old-running"]);
+        assert_eq!(
+            app.selected_session().map(|session| session.id.as_str()),
+            Some("new-stopped")
+        );
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.contains("newest"))
+        );
+
+        route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+        assert_eq!(session_ids(&app), ["old-running", "new-stopped"]);
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.contains("oldest"))
+        );
+
+        route_key(&mut app, ctrl(KeyCode::Char('o')), None);
+        assert_eq!(session_ids(&app), ["old-running", "new-stopped"]);
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|message| message.contains("active first"))
+        );
     }
 
     #[test]
