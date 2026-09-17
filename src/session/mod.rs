@@ -2,7 +2,12 @@
 //! metadata types the rest of the daemon speaks in.
 
 pub(crate) mod file;
+// M1 groundwork (PLAN.md §6.1): record format, segment writer/reader and
+// torn-tail recovery. Nothing reads or writes it at runtime yet.
+#[allow(dead_code)]
+pub(crate) mod journal;
 pub mod logs;
+mod m0_probes;
 pub(crate) mod persist;
 pub mod pty;
 pub(crate) mod resize;

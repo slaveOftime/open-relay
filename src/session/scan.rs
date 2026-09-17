@@ -1319,4 +1319,51 @@ mod tests {
         assert_eq!(harness.filter_text(text), text);
         assert!(harness.pending().is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // M0 measurement harness (PLAN.md §11.1): informal hot-path baselines
+    // for the §11.2 throughput targets (≥20 MiB/s plain, ≥5 MiB/s VT-heavy,
+    // recording + one client). Ignored by default: these print baselines for
+    // the M0 evidence pack and are not CI gates. Run with:
+    //   cargo test --release -- --ignored --nocapture probe_scan
+    // -----------------------------------------------------------------------
+
+    fn probe_throughput(label: &str, chunk: &[u8], total_bytes: usize) {
+        let mut harness = Harness::new();
+        let started = std::time::Instant::now();
+        let mut fed = 0usize;
+        while fed < total_bytes {
+            let n = chunk.len().min(total_bytes - fed);
+            harness.scanner.scan(&chunk[..n], &mut harness.out);
+            fed += n;
+        }
+        let elapsed = started.elapsed();
+        let mib = total_bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "probe {label}: {mib:.1} MiB in {elapsed:?} ({:.1} MiB/s)",
+            mib / elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "M0 measurement probe (PLAN §11.1): baseline evidence, not a CI gate"]
+    fn probe_scan_throughput_plain_text() {
+        // 64 KiB read-buffer-sized chunks of plain text, 256 MiB total.
+        let chunk = vec![b'x'; 64 * 1024];
+        probe_throughput("plain", &chunk, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    #[ignore = "M0 measurement probe (PLAN §11.1): baseline evidence, not a CI gate"]
+    fn probe_scan_throughput_vt_heavy() {
+        // Representative TUI repaint traffic: SGR colour churn, cursor
+        // motion, progress OSC and a CPR probe per line, 64 MiB total.
+        let mut chunk = Vec::new();
+        while chunk.len() < 64 * 1024 {
+            chunk.extend_from_slice(
+                b"\x1b[38;5;123mstatus\x1b[0m \x1b[2K\x1b[Gworking\x1b]9;4;3;40\x07 \x1b[6n\n",
+            );
+        }
+        probe_throughput("vt-heavy", &chunk, 64 * 1024 * 1024);
+    }
 }

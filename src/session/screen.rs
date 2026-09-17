@@ -242,6 +242,138 @@ mod tests {
         );
     }
 
+    /// M0 reproduction (PLAN.md §5.3/§6.4): `safe_resize_parser` re-feeds
+    /// scrollback rows trimmed to `min(old_cols, new_cols)`, so shrinking
+    /// permanently destroys the right-hand side of retained history — it
+    /// does not come back when the terminal is widened again. The 1.0
+    /// terminal engine must preserve logical lines across resize; this test
+    /// pins that behaviour and stays ignored until it lands.
+    #[test]
+    #[ignore = "M0 reproduction (PLAN §5.3): shrink-then-widen loses history text; fixed by the M2 terminal engine"]
+    fn repro_shrink_then_widen_preserves_history() {
+        let mut parser = vt100::Parser::new(6, 80, TEST_SCROLLBACK_ROWS);
+        let mut lines = String::new();
+        for i in 1..=20 {
+            // Marker at column 70+ so a 40-column trim cuts it off.
+            lines.push_str(&format!("line {i:02}{}MARKER{i:02}\r\n", "y".repeat(62)));
+        }
+        parser.process(lines.as_bytes());
+
+        safe_resize_parser(&mut parser, 6, 40, TEST_SCROLLBACK_ROWS);
+        safe_resize_parser(&mut parser, 6, 80, TEST_SCROLLBACK_ROWS);
+
+        let dump = scrollback_dump(parser.screen(), 80);
+        let history = String::from_utf8_lossy(&dump);
+        assert!(
+            history.contains("MARKER01"),
+            "history text beyond the shrunken width must survive a shrink/widen cycle: {history:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // M0 engine evaluation (PLAN.md §5.3, ADR-0001): can the incumbent
+    // vt100 snapshot (`state_formatted`) restore a parser so that
+    // *subsequent* output continues identically to an uninterrupted parser?
+    // Passing probes document current capability; failing ones are ignored
+    // reproductions that pin the checkpoint requirements for whichever
+    // engine M2 selects.
+    // -------------------------------------------------------------------
+
+    /// Snapshot the parser mid-stream, restore into a fresh parser, feed the
+    /// remaining bytes, and compare against an uninterrupted reference.
+    fn restore_and_continue(before: &[u8], after: &[u8], rows: u16, cols: u16) -> (String, String) {
+        let mut reference = vt100::Parser::new(rows, cols, TEST_SCROLLBACK_ROWS);
+        reference.process(before);
+        reference.process(after);
+
+        let mut snapshotted = vt100::Parser::new(rows, cols, TEST_SCROLLBACK_ROWS);
+        snapshotted.process(before);
+        let snapshot = snapshotted.screen().state_formatted();
+        let mut restored = vt100::Parser::new(rows, cols, TEST_SCROLLBACK_ROWS);
+        restored.process(&snapshot);
+        restored.process(after);
+
+        (reference.screen().contents(), restored.screen().contents())
+    }
+
+    #[test]
+    fn restore_continuation_matches_reference_for_committed_text_and_styles() {
+        // Committed state — finished text, SGR attributes, cursor position —
+        // is what `state_formatted` is designed to carry.
+        let (reference, restored) =
+            restore_and_continue(b"plain \x1b[1;31mred\x1b[0m done\r\n", b"next line", 24, 80);
+        assert_eq!(reference, restored);
+    }
+
+    /// M0 engine-eval reproduction: an escape sequence split across the
+    /// snapshot boundary. The pending bytes live in parser state that
+    /// `state_formatted` does not carry, so the restored parser sees the
+    /// remainder as literal text.
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0001): partial escape at snapshot boundary; requires checkpoint parser state"]
+    fn repro_restore_continuation_after_partial_escape() {
+        let (reference, restored) = restore_and_continue(b"abc\x1b[31", b";1mX", 24, 80);
+        assert_eq!(
+            reference, restored,
+            "continuation after restore must match the uninterrupted parser"
+        );
+    }
+
+    /// M0 engine-eval reproduction: a multi-byte UTF-8 character split
+    /// across the snapshot boundary.
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0001): partial UTF-8 at snapshot boundary; requires checkpoint parser state"]
+    fn repro_restore_continuation_after_partial_utf8() {
+        // '中' is E4 B8 AD; split after the second byte.
+        let (reference, restored) = restore_and_continue(b"a\xe4\xb8", b"\xadb", 24, 80);
+        assert_eq!(
+            reference, restored,
+            "continuation after restore must match the uninterrupted parser"
+        );
+    }
+
+    /// M0 engine-eval finding: the wrap-pending flag (last column written,
+    /// not yet wrapped) *does* survive a `state_formatted` snapshot in the
+    /// incumbent vt100 — keep this as a regression probe for whichever
+    /// engine M2 selects.
+    #[test]
+    fn restore_continuation_preserves_wrap_pending() {
+        // Fill a 5-column row exactly, then print one more character.
+        let (reference, restored) = restore_and_continue(b"abcde", b"f", 4, 5);
+        assert_eq!(
+            reference, restored,
+            "'f' must wrap to the next row exactly as the uninterrupted parser does"
+        );
+    }
+
+    /// M0 engine-eval reproduction: alternate-screen residency does not
+    /// survive a `state_formatted` restore. After restore the parser is on
+    /// the main screen, so the snapshot's bytes paint the TUI frame onto the
+    /// main buffer and a later `\x1b[?1049l` can no longer bring back the
+    /// underlying main screen.
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0001): alt-screen residency lost at snapshot boundary; requires checkpointing parser modes"]
+    fn repro_restore_continuation_preserves_alt_screen_residency() {
+        let mut reference = vt100::Parser::new(24, 80, TEST_SCROLLBACK_ROWS);
+        reference.process(b"MAIN\x1b[?1049h\x1b[2J\x1b[HTUI");
+        let reference_state = reference.screen().state_formatted();
+
+        let mut restored = vt100::Parser::new(24, 80, TEST_SCROLLBACK_ROWS);
+        restored.process(&reference_state);
+        // Leaving the alternate screen must reveal the preserved main
+        // buffer, exactly as it does for the uninterrupted parser.
+        restored.process(b"\x1b[?1049l");
+
+        let mut expected = vt100::Parser::new(24, 80, TEST_SCROLLBACK_ROWS);
+        expected.process(b"MAIN\x1b[?1049h\x1b[2J\x1b[HTUI\x1b[?1049l");
+
+        assert_eq!(
+            expected.screen().contents(),
+            restored.screen().contents(),
+            "restoring mid-alternate-screen then leaving it must match the uninterrupted parser"
+        );
+    }
+
     #[test]
     fn safe_resize_handles_wide_glyph_at_new_right_edge() {
         let mut parser = vt100::Parser::new(42, 120, 0);

@@ -1251,6 +1251,97 @@ mod tests {
         );
     }
 
+    /// M0 reproduction (PLAN.md invariant I5): the reader thread collects
+    /// the probes in a chunk, pushes the whole filtered chunk into the
+    /// screen, and only then answers every probe with the *final* cursor
+    /// position. A child that writes `A`, asks for the cursor, writes `B`
+    /// and asks again — all coalesced into one PTY read — gets the same
+    /// answer twice. The 1.0 query broker must answer each probe at its own
+    /// position in the stream; this test pins that behaviour and stays
+    /// ignored until the broker lands.
+    #[test]
+    #[ignore = "M0 reproduction (PLAN I5): queries answered with final chunk cursor; fixed by the M2 query broker"]
+    fn repro_queries_are_answered_at_their_own_stream_position() {
+        let mut rt = new_runtime();
+        let mut scanner = PtyScanner::new();
+        let mut out = ScanOut::default();
+
+        scanner.scan(b"A\x1b[6nB\x1b[6n", &mut out);
+        assert_eq!(out.queries.len(), 2, "both CPR probes must be detected");
+
+        // Mirror the reader thread: process the whole chunk, then answer
+        // every collected query with the resulting cursor.
+        let final_cursor = rt.push_output(&out.filtered, out.meaningful_bytes());
+        let replies: Vec<Vec<u8>> = out
+            .queries
+            .iter()
+            .map(|query| query.response(final_cursor))
+            .collect();
+
+        assert_ne!(
+            replies[0], replies[1],
+            "the first CPR was issued before 'B' was printed and must report \
+             an earlier column than the second: {replies:?}"
+        );
+    }
+
+    /// M0 reproduction (PLAN.md invariant I2): the reader thread runs
+    /// `push_output` (screen + counters), file append and broadcast as three
+    /// separate steps, and `attach_snapshot_init` reads the screen snapshot
+    /// and the file length in a different lock scope. A chunk caught between
+    /// "pushed" and "appended" is inside the snapshot but *outside* the
+    /// returned resume offset — a client that then replays the file from
+    /// that offset receives the chunk a second time. The M1 sequencer plus
+    /// the M3 C/C+1 attach boundary must make snapshot content and resume
+    /// cursor agree exactly; this test pins that and stays ignored until
+    /// they land.
+    #[test]
+    #[ignore = "M0 reproduction (PLAN I2): snapshot/file/broadcast boundary is not atomic; fixed by M1+M3"]
+    fn repro_snapshot_boundary_can_overlap_live_stream() {
+        use crate::session::persist::{
+            append_output_raw, create_output_log, current_output_offset,
+        };
+
+        let dir = std::env::temp_dir().join(format!("oly_repro_snapshot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        create_output_log(&dir).unwrap();
+
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+
+        // Committed prefix: pushed and appended, as the reader does.
+        rt.push_output(b"stable", 6);
+        append_output_raw(&dir, b"stable").unwrap();
+
+        // The reader is now between steps for the next chunk: pushed into
+        // the screen/counters, not yet appended or broadcast.
+        rt.push_output(b"RACY", 4);
+
+        // attach_snapshot_init's view: snapshot + resume offset.
+        let snapshot = rt.attach_snapshot_bytes();
+        let end_offset = current_output_offset(&dir);
+
+        assert!(
+            snapshot.windows(4).any(|window| window == b"RACY"),
+            "snapshot must contain the pushed chunk"
+        );
+        assert_eq!(
+            end_offset, 6,
+            "the file does not cover the pushed chunk yet (reader order: push → append → broadcast)"
+        );
+        // Desired: the snapshot's coverage and the resume cursor describe
+        // the same boundary, so replay-from-cursor can neither lose nor
+        // duplicate the chunk.
+        assert_eq!(
+            end_offset, rt.raw_total_bytes,
+            "snapshot covers {} stream bytes but the resume cursor is {end_offset}: \
+             replaying from the cursor re-delivers 'RACY' to the client",
+            rt.raw_total_bytes
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------
     // push_output — last_output_epoch tracking
     // -----------------------------------------------------------------------

@@ -1463,4 +1463,123 @@ mod tests {
         );
         assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<24;1;1M");
     }
+
+    // -------------------------------------------------------------------
+    // M0 input-codec evidence (PLAN.md §8, ADR-0003). Passing tests pin
+    // the incumbent baseline; ignored repros pin the complete, standard
+    // encoding the 1.0 raw/semantic codec must provide.
+    // -------------------------------------------------------------------
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn map_key_baseline_documents_current_coverage() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Char('a'), KeyModifiers::NONE), false),
+            Some("a".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Enter, KeyModifiers::NONE), false),
+            Some("\r".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Backspace, KeyModifiers::CONTROL), false),
+            Some("\x08".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Backspace, KeyModifiers::NONE), false),
+            Some("\x7f".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
+            Some("\x03".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Left, KeyModifiers::NONE), true),
+            Some("\x1bOD".into())
+        );
+    }
+
+    /// Every paste-candidate key (ordinary text, Enter, unshifted Tab) is
+    /// buffered as a suspected paste burst, and each subsequent candidate
+    /// **resets** the 30 ms `PASTE_BURST_WAIT` deadline — so continuous
+    /// typing faster than one key per 30 ms accumulates in the buffer and
+    /// reaches the wire only when the user pauses for a full burst window.
+    /// A single key still waits ~30 ms. This documents the incumbent
+    /// behavior; the 1.0 codec (ADR-0003) removes timing-based typing
+    /// classification while keeping explicit paste coalescing.
+    #[test]
+    fn typing_is_held_until_a_full_pause_in_the_paste_burst_window() {
+        let mut pending = None;
+        assert!(push_pending_key_burst(
+            &mut pending,
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            false,
+        ));
+        assert_eq!(pending.as_ref().unwrap().data, "a");
+        let first_deadline = pending.as_ref().unwrap().deadline;
+        // A follow-up candidate does not flush; it extends the deadline.
+        // (Instant is monotonic, so the second deadline is strictly later.)
+        assert!(push_pending_key_burst(
+            &mut pending,
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            false,
+        ));
+        assert_eq!(pending.as_ref().unwrap().data, "ab");
+        assert!(pending.as_ref().unwrap().deadline > first_deadline);
+    }
+
+    /// Legacy/xterm-compatible profile (ADR-0001 stable profiles): the
+    /// encoding an xterm-class terminal sends. Enhanced keyboard profiles
+    /// (kitty protocol) are a separate negotiated capability.
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): Alt+<char> must be ESC-prefixed"]
+    fn repro_alt_char_is_esc_prefixed() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Char('x'), KeyModifiers::ALT), false),
+            Some("\x1bx".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): modifiers on arrow keys must be parameterized"]
+    fn repro_ctrl_arrow_is_parameterized() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Up, KeyModifiers::CONTROL), false),
+            Some("\x1b[1;5A".to_string())
+        );
+    }
+
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): the Ctrl+@/digit family must send its legacy control bytes"]
+    fn repro_ctrl_digit_family_sends_legacy_control_bytes() {
+        // Ctrl+2 through Ctrl+8 duplicate the C0 control characters in
+        // every mainstream terminal (NUL, ESC, FS, GS, RS, US, DEL).
+        for (digit, expected) in [
+            ('2', '\0'),
+            ('3', '\x1b'),
+            ('4', '\x1c'),
+            ('5', '\x1d'),
+            ('6', '\x1e'),
+            ('7', '\x1f'),
+            ('8', '\x7f'),
+        ] {
+            assert_eq!(
+                map_key_to_input(key(KeyCode::Char(digit), KeyModifiers::CONTROL), false),
+                Some(expected.to_string()),
+                "Ctrl+{digit}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): function keys must not be silently dropped"]
+    fn repro_function_keys_are_mapped() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::F(5), KeyModifiers::NONE), false),
+            Some("\x1b[15~".to_string())
+        );
+    }
 }
