@@ -69,15 +69,16 @@ pub fn render_screen(
 /// the client's scrollback.  Rows keep the session's PTY width so the
 /// attaching terminal wraps them natively.  Returns `None` when nothing has
 /// scrolled off yet.
+///
+/// Only the last `tail` rows are collected and formatted (see
+/// [`crate::session::screen::scrollback_rows_tail`]), so a deep seed stays
+/// cheap even when the parser retains its full scrollback capacity.
 pub fn render_screen_history(screen: &vt100::Screen, tail: usize) -> Option<Vec<u8>> {
-    let rows = crate::session::screen::scrollback_rows(screen);
-    // Trim surrounding blank rows before applying the tail limit so padding
-    // (e.g. blank rows scrolled off by empty prompts) does not crowd out
-    // content rows.
+    let rows = crate::session::screen::scrollback_rows_tail(screen, tail, u16::MAX);
+    // Trim surrounding blank rows so padding (e.g. blank rows scrolled off by
+    // empty prompts) does not crowd out content rows in the seed.
     let (first, last) = content_bounds(&rows)?;
-    let rows = &rows[first..=last];
-    let skip = rows.len().saturating_sub(tail);
-    Some(format_rows_for_output(&rows[skip..], true))
+    Some(format_rows_for_output(&rows[first..=last], true))
 }
 
 fn collect_rows(screen: &vt100::Screen, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
