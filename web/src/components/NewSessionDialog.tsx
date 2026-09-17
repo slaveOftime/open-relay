@@ -40,7 +40,7 @@ export default function NewSessionDialog({
     setTitle(initialValues?.title ?? '')
     setTags(initialValues?.tags ?? '')
     setCwd(initialValues?.cwd ?? '')
-    setNotificationsEnabled(true)
+    setNotificationsEnabled(initialValues?.notifications_enabled ?? true)
     setLoading(false)
     setError(null)
   }, [initialValues, open])

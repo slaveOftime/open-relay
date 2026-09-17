@@ -616,12 +616,6 @@ function SessionRow({
           <TableCell key={columnKey} className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-1">
               {isRunning && (
-                <SessionPinButton
-                  pinned={pinned ?? false}
-                  onToggle={() => onTogglePin(session)}
-                />
-              )}
-              {isRunning && (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button asChild variant="link" size="icon" className="shrink-0">
@@ -666,6 +660,10 @@ function SessionRow({
                     disabled={!isRunning}
                     pending={notificationsPending}
                     onToggle={() => onToggleNotifications(session)}
+                  />
+                  <SessionPinButton
+                    pinned={pinned ?? false}
+                    onToggle={() => onTogglePin(session)}
                   />
                 </>
               )}
@@ -841,12 +839,6 @@ function SessionCard({
           onClick={(e) => e.stopPropagation()}
         >
           {isRunning && (
-            <SessionPinButton
-              pinned={pinned ?? false}
-              onToggle={() => onTogglePin(session)}
-            />
-          )}
-          {isRunning && (
             <Button
               asChild
               variant="outline"
@@ -882,6 +874,10 @@ function SessionCard({
                 disabled={!isRunning}
                 pending={notificationsPending}
                 onToggle={() => onToggleNotifications(session)}
+              />
+              <SessionPinButton
+                pinned={pinned ?? false}
+                onToggle={() => onTogglePin(session)}
               />
             </>
           )}
