@@ -2048,12 +2048,15 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
         // Record where each waiting session's row actually landed (one line
         // below the header, offset by the scroll position) so the attention
-        // pulse can be scoped to exactly those rows.
+        // pulse can be scoped to exactly those rows. A session with
+        // notifications disabled never pulses, even while it waits for
+        // input: the animation is an attention signal, and the user opted
+        // out of attention signals for that session.
         for (position, index) in visible.iter().enumerate() {
             let Some(session) = app.sessions.get(*index) else {
                 continue;
             };
-            if !session.input_needed {
+            if !session.input_needed || !session.notifications_enabled {
                 continue;
             }
             let Some(row_offset) = position.checked_sub(viewport_start) else {
@@ -3530,7 +3533,8 @@ mod tests {
             ended_at: None,
             cwd: None,
             input_needed: false,
-            notifications_enabled: false,
+            // Mirrors the daemon default: notifications on unless disabled.
+            notifications_enabled: true,
             node: None,
             last_total_bytes: 0,
             last_output_epoch: None,
@@ -3752,6 +3756,30 @@ mod tests {
         assert!(app.effects.is_running());
 
         app.sessions[0].input_needed = false;
+        let _ = render_app(&mut app, 120, 12);
+        assert!(app.attention_rows.is_empty());
+        assert!(!app.effects.is_running());
+    }
+
+    #[test]
+    fn attention_pulse_skips_sessions_with_notifications_disabled() {
+        let mut app = App::default();
+        let mut muted = session("muted");
+        muted.input_needed = true;
+        muted.notifications_enabled = false;
+        let mut waiting = session("waiting");
+        waiting.input_needed = true;
+        app.replace_sessions(vec![muted, waiting]);
+
+        let _ = render_app(&mut app, 120, 12);
+        // The muted session never gets an attention row even though it
+        // waits for input; the unmuted one pulses as usual.
+        assert_eq!(app.attention_rows.len(), 1);
+        assert!(app.attention_rows.contains_key("waiting"));
+        assert!(!app.attention_rows.contains_key("muted"));
+
+        // Muting a pulsing session cancels its animation.
+        app.sessions[1].notifications_enabled = false;
         let _ = render_app(&mut app, 120, 12);
         assert!(app.attention_rows.is_empty());
         assert!(!app.effects.is_running());
@@ -4333,12 +4361,12 @@ mod tests {
             app.update_dialog.as_ref().unwrap().active_field(),
             super::UpdateField::Notifications
         );
-        assert!(!app.update_dialog.as_ref().unwrap().notifications_enabled);
+        assert!(app.update_dialog.as_ref().unwrap().notifications_enabled);
         assert_eq!(
             route_key(&mut app, key(KeyCode::Char(' ')), None),
             AppAction::None
         );
-        assert!(app.update_dialog.as_ref().unwrap().notifications_enabled);
+        assert!(!app.update_dialog.as_ref().unwrap().notifications_enabled);
         assert_eq!(
             route_key(&mut app, ctrl(KeyCode::Tab), None),
             AppAction::None
@@ -4363,15 +4391,15 @@ mod tests {
         route_key(&mut app, ctrl(KeyCode::Char('u')), None);
         let dialog = app.update_dialog.as_mut().unwrap();
 
+        let enabled = super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
+        assert!(enabled.to_string().contains("[x]"));
+        assert!(!enabled.to_string().contains("enabled"));
+
+        dialog.notifications_enabled = false;
         let disabled =
             super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
         assert!(disabled.to_string().contains("[ ]"));
         assert!(!disabled.to_string().contains("disabled"));
-
-        dialog.notifications_enabled = true;
-        let enabled = super::update_field_line(dialog, super::UpdateField::Notifications, 80, true);
-        assert!(enabled.to_string().contains("[x]"));
-        assert!(!enabled.to_string().contains("enabled"));
 
         assert_eq!(super::checkbox(true), "[x]");
         assert_eq!(super::checkbox(false), "[ ]");
@@ -4481,7 +4509,7 @@ mod tests {
         let dialog = app.update_dialog.as_mut().unwrap();
         dialog.title = super::EditText::new(String::new());
         dialog.tags = super::EditText::new(r#"beta "two words""#.to_string());
-        dialog.notifications_enabled = true;
+        dialog.notifications_enabled = false;
         let AppAction::Update(update) = route_key(&mut app, key(KeyCode::Enter), None) else {
             panic!("expected update action");
         };
@@ -4490,7 +4518,7 @@ mod tests {
             update.tags,
             Some(vec!["beta".to_string(), "two words".to_string()])
         );
-        assert_eq!(update.notifications_enabled, Some(true));
+        assert_eq!(update.notifications_enabled, Some(false));
         match update.request() {
             RpcRequest::NodeProxy { node, inner } => {
                 assert_eq!(node, "worker-a");
@@ -4500,7 +4528,7 @@ mod tests {
                         ref id,
                         title: Some(ref title),
                         tags: Some(ref tags),
-                        notifications_enabled: Some(true),
+                        notifications_enabled: Some(false),
                     } if id == "source" && title.is_empty() && tags == &["beta", "two words"]
                 ));
             }
