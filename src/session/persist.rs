@@ -155,7 +155,6 @@ pub fn current_output_offset_by_id(dir: &Path, session_id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         let dir =

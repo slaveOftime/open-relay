@@ -3,10 +3,11 @@
 
 pub(crate) mod file;
 // M1 groundwork (PLAN.md §6.1): record format, segment writer/reader,
-// torn-tail recovery and the per-session sequencer. Wired in as a shadow
-// journal behind `OLY_JOURNAL=1` (development-only); the remaining APIs
-// (durable cursors, scan consumers, lifecycle/policy records) land as M1
-// continues, and the allow comes off with them.
+// torn-tail recovery, the in-memory sequencing core and the bounded
+// journal appender. Wired in as a shadow journal behind `OLY_JOURNAL=1`
+// (development-only); the remaining APIs (cursor consumers, ordered
+// resize/lifecycle records, policy records) land as M1 continues, and
+// the allow comes off with them.
 #[allow(dead_code)]
 pub(crate) mod journal;
 pub mod logs;

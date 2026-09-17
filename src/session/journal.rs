@@ -115,42 +115,42 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 // Writer
 // ---------------------------------------------------------------------------
 
-/// Append handle for one journal segment. Sequences are allocated here, in
-/// append order, starting at the `first_seq` chosen by the caller. Event
-/// timing is **not** owned by the writer: the sequencer passes `elapsed_ms`
-/// in, so reopening an active segment can never move event time backwards.
+/// Append handle for one journal segment. The writer is a pure serializer:
+/// the **sequencer** assigns `seq` and `elapsed_ms` before the event is
+/// published, and the writer writes what it is given. It never allocates
+/// sequences and never invents timestamps, so reopening an active segment
+/// can never move event time backwards and publication never waits on disk.
 pub struct SegmentWriter {
     file: fs::File,
-    next_seq: u64,
     /// Bytes written so far; the authoritative segment length.
     written: u64,
 }
 
 impl SegmentWriter {
-    pub fn create(path: &Path, first_seq: u64) -> io::Result<Self> {
+    pub fn create(path: &Path) -> io::Result<Self> {
         Ok(Self {
             file: fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .open(path)?,
-            next_seq: first_seq,
             written: 0,
         })
     }
 
-    pub fn open_append(path: &Path, next_seq: u64) -> io::Result<Self> {
+    pub fn open_append(path: &Path) -> io::Result<Self> {
         let file = fs::OpenOptions::new().append(true).open(path)?;
         let written = file.metadata()?.len();
-        Ok(Self {
-            file,
-            next_seq,
-            written,
-        })
+        Ok(Self { file, written })
     }
 
-    /// Append one record, returning its sequence number. `elapsed_ms` is the
-    /// sequencer's monotonic time since incarnation start.
-    pub fn append(&mut self, kind: RecordKind, elapsed_ms: u64, payload: &[u8]) -> io::Result<u64> {
+    /// Append one already-sequenced record.
+    pub fn append_record(
+        &mut self,
+        kind: RecordKind,
+        seq: u64,
+        elapsed_ms: u64,
+        payload: &[u8],
+    ) -> io::Result<()> {
         if payload.len() > MAX_PAYLOAD_LEN as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -161,7 +161,6 @@ impl SegmentWriter {
                 ),
             ));
         }
-        let seq = self.next_seq;
 
         let mut header = [0u8; HEADER_LEN];
         header[0..4].copy_from_slice(RECORD_MAGIC);
@@ -177,8 +176,7 @@ impl SegmentWriter {
         self.file.write_all(&header)?;
         self.file.write_all(payload)?;
         self.written += (HEADER_LEN + payload.len()) as u64;
-        self.next_seq += 1;
-        Ok(seq)
+        Ok(())
     }
 
     /// Push appended records to the storage device. Callers decide the
@@ -195,11 +193,6 @@ impl SegmentWriter {
 
     pub fn is_empty(&self) -> bool {
         self.written == 0
-    }
-
-    /// Sequence number the next appended record will get.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
     }
 }
 
@@ -252,110 +245,465 @@ pub struct RecoveryReport {
     pub rewound: bool,
 }
 
-/// The per-session sequencing authority (PLAN.md §4.2, invariants I1/I3/I8).
-///
-/// One `Sequencer` owns one session for one daemon incarnation: it assigns
-/// monotonic `seq` numbers in append order, assigns monotonic `elapsed_ms`
-/// from the incarnation's start, and owns the active segment writer. A
-/// daemon restart opens a **new** incarnation (a new `seg-NNNNNNNN.ojrn`
-/// file) rather than appending past possibly-published sequences; the
-/// previous incarnation is recovered (torn tail rewound, corruption
-/// reported) before the new one starts.
-///
-/// M1 wires this as a shadow journal behind [`shadow_enabled`]: it sees
-/// output records only. Ordered resize/lifecycle records land when the
-/// sequencer moves onto the session ingest path proper.
-pub struct Sequencer {
+/// A journal that has been opened for appending: the new incarnation's
+/// segment writer plus the recovery report for the previous incarnation.
+pub struct OpenedJournal {
+    pub incarnation: u64,
+    pub report: Option<RecoveryReport>,
+    pub writer: SegmentWriter,
+}
+
+/// Open (creating if needed) the journal for `session_dir`, recover the
+/// newest existing incarnation, and create a new one. A daemon restart
+/// opens a **new** incarnation (a new `seg-NNNNNNNN.ojrn` file) rather
+/// than appending past possibly-published sequences; the previous
+/// incarnation's torn tail is rewound, corruption is reported and left
+/// untouched.
+pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    fs::create_dir_all(&journal_dir)?;
+
+    let latest = latest_incarnation(&journal_dir)?;
+    let mut report = None;
+    if let Some(previous) = latest {
+        let path = segment_path(&journal_dir, previous);
+        let outcome = scan_segment(&path)?;
+        let rewound = outcome.stop.may_rewind();
+        if rewound {
+            // A torn tail can only mean the previous incarnation died
+            // mid-append; truncate so no reader ever sees it again.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(outcome.valid_len)?;
+        }
+        report = Some(RecoveryReport {
+            incarnation: previous,
+            records: outcome.records.len() as u64,
+            last_seq: outcome.records.last().map(|record| record.seq),
+            stop: outcome.stop,
+            valid_len: outcome.valid_len,
+            rewound,
+        });
+    }
+
+    let incarnation = latest.unwrap_or(0) + 1;
+    let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation))?;
+    Ok(OpenedJournal {
+        incarnation,
+        report,
+        writer,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Ordered events and the in-memory sequencing core (M1)
+// ---------------------------------------------------------------------------
+
+/// Durable cursor for one journal record: `{session_id, incarnation, seq}`
+/// (the session id is implicit in the journal's location).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct JournalCursor {
+    pub incarnation: u64,
+    pub seq: u64,
+}
+
+/// One immutable, already-sequenced session event. Sequence and timing are
+/// assigned **before** publication (PLAN.md §4.1 item 3); the payload is
+/// reference-counted so live delivery, the recent replay cache and the
+/// journal queue share one allocation.
+#[derive(Debug, Clone)]
+pub struct OrderedEvent {
+    pub cursor: JournalCursor,
+    pub elapsed_ms: u64,
+    pub kind: RecordKind,
+    pub payload: bytes::Bytes,
+}
+
+/// Default byte budget for a session's recent replay cache.
+pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+/// Default message bound for one session's journal queue.
+pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
+/// Default byte bound for one session's journal queue. A stalled appender
+/// can therefore hold at most this many bytes of session output before
+/// submission is rejected and the session degrades explicitly — memory
+/// cannot grow indefinitely (PLAN.md §4.2).
+pub const DEFAULT_QUEUE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// The in-memory sequencing authority (PLAN.md §4.1/§4.2, invariants
+/// I1/I8). Allocates monotonic `seq` and monotonic `elapsed_ms` **before**
+/// an event is published, retains recent events in a byte-bounded cache
+/// until the journal makes them replayable, and tracks the
+/// `head_seq`/`journal_seq`/`durable_seq` cursors separately. It performs
+/// no I/O; persistence is the [`JournalAppender`]'s job.
+pub struct SequencerCore {
     incarnation: u64,
     next_seq: u64,
     started: std::time::Instant,
-    /// Sequence of the most recent record covered by a completed `sync()`.
+    journal_seq: u64,
     durable_seq: u64,
-    writer: SegmentWriter,
+    degraded: Option<String>,
+    cache: std::collections::VecDeque<OrderedEvent>,
+    cache_bytes: usize,
+    cache_budget_bytes: usize,
 }
 
-impl Sequencer {
-    /// Open (creating if needed) the journal for `session_dir`, recover the
-    /// newest existing incarnation, and start a new one. Returns the
-    /// sequencer and, when a previous incarnation existed, its recovery
-    /// report.
-    pub fn open(session_dir: &Path) -> io::Result<(Self, Option<RecoveryReport>)> {
-        let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
-        fs::create_dir_all(&journal_dir)?;
+impl SequencerCore {
+    pub fn new(incarnation: u64) -> Self {
+        Self::with_budget(incarnation, DEFAULT_CACHE_BUDGET_BYTES)
+    }
 
-        let latest = latest_incarnation(&journal_dir)?;
-        let mut report = None;
-        if let Some(previous) = latest {
-            let path = segment_path(&journal_dir, previous);
-            let outcome = scan_segment(&path)?;
-            let rewound = outcome.stop.may_rewind();
-            if rewound {
-                // A torn tail can only mean the previous incarnation died
-                // mid-append; truncate so no reader ever sees it again.
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)?
-                    .set_len(outcome.valid_len)?;
-            }
-            report = Some(RecoveryReport {
-                incarnation: previous,
-                records: outcome.records.len() as u64,
-                last_seq: outcome.records.last().map(|record| record.seq),
-                stop: outcome.stop,
-                valid_len: outcome.valid_len,
-                rewound,
-            });
+    pub fn with_budget(incarnation: u64, cache_budget_bytes: usize) -> Self {
+        Self {
+            incarnation,
+            next_seq: 1,
+            started: std::time::Instant::now(),
+            journal_seq: 0,
+            durable_seq: 0,
+            degraded: None,
+            cache: std::collections::VecDeque::new(),
+            cache_bytes: 0,
+            cache_budget_bytes,
         }
+    }
 
-        let incarnation = latest.unwrap_or(0) + 1;
-        let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation), 1)?;
-        Ok((
-            Self {
-                incarnation,
-                next_seq: 1,
-                started: std::time::Instant::now(),
-                durable_seq: 0,
-                writer,
+    /// Assign the next sequence number and monotonic elapsed time, retain
+    /// the event in the recent cache, and return it for publication.
+    ///
+    /// If the cache is over budget, journaled events are evicted first. If
+    /// it is *still* over budget, the event is retained anyway — an event
+    /// is never silently dropped — and [`Self::over_budget`] reports the
+    /// backpressure condition so the caller can slow ingestion.
+    pub fn publish(&mut self, kind: RecordKind, payload: bytes::Bytes) -> OrderedEvent {
+        let event = OrderedEvent {
+            cursor: JournalCursor {
+                incarnation: self.incarnation,
+                seq: self.next_seq,
             },
-            report,
-        ))
+            elapsed_ms: self.started.elapsed().as_millis() as u64,
+            kind,
+            payload,
+        };
+        self.next_seq += 1;
+        self.cache_bytes += event.payload.len();
+        if self.cache_bytes > self.cache_budget_bytes {
+            self.evict_journaled();
+        }
+        self.cache.push_back(event.clone());
+        event
     }
 
-    /// Append one event, assigning its sequence number and monotonic
-    /// elapsed time. Returns the assigned `seq`.
-    pub fn append(&mut self, kind: RecordKind, payload: &[u8]) -> io::Result<u64> {
-        let seq = self
-            .writer
-            .append(kind, self.started.elapsed().as_millis() as u64, payload)?;
-        self.next_seq = seq + 1;
-        Ok(seq)
+    /// Drop cached events the journal already serves (`seq <= journal_seq`).
+    fn evict_journaled(&mut self) {
+        while let Some(front) = self.cache.front() {
+            if front.cursor.seq > self.journal_seq {
+                break;
+            }
+            self.cache_bytes -= front.payload.len();
+            self.cache.pop_front();
+        }
     }
 
-    /// Push appended records to the storage device and advance
-    /// `durable_seq` past everything written so far.
-    pub fn sync(&mut self) -> io::Result<()> {
-        self.writer.sync()?;
-        self.durable_seq = self.next_seq - 1;
-        Ok(())
+    /// The cache holds events beyond its byte budget because the journal
+    /// has not caught up. Callers should backpressure ingestion.
+    pub fn over_budget(&self) -> bool {
+        self.cache_bytes > self.cache_budget_bytes
     }
 
-    pub fn incarnation(&self) -> u64 {
-        self.incarnation
+    /// The appender confirmed records through `seq` are readable from
+    /// storage. Advances `journal_seq`; never moves it backwards.
+    pub fn note_journaled(&mut self, seq: u64) {
+        self.journal_seq = self.journal_seq.max(seq);
     }
 
-    /// Sequence number the next appended event will get.
-    pub fn next_seq(&self) -> u64 {
-        self.next_seq
+    /// A completed sync covers records through `seq`.
+    pub fn note_durable(&mut self, seq: u64) {
+        self.durable_seq = self.durable_seq.max(seq);
     }
 
-    /// Highest sequence published so far, if any (`head_seq` in PLAN terms).
+    /// Persistence failed; the session is explicitly degraded (PLAN.md
+    /// §4.2). Subsequent `publish` calls still sequence — publication must
+    /// not silently continue pretending durability is on track.
+    pub fn degrade(&mut self, reason: impl Into<String>) {
+        if self.degraded.is_none() {
+            self.degraded = Some(reason.into());
+        }
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.is_some()
+    }
+
+    pub fn degraded_reason(&self) -> Option<&str> {
+        self.degraded.as_deref()
+    }
+
+    /// Highest sequence published so far, if any.
     pub fn head_seq(&self) -> Option<u64> {
         (self.next_seq > 1).then_some(self.next_seq - 1)
     }
 
-    /// Highest sequence known durable on storage.
+    /// Highest sequence contiguously readable from the journal.
+    pub fn journal_seq(&self) -> u64 {
+        self.journal_seq
+    }
+
+    /// Highest sequence covered by a completed sync.
     pub fn durable_seq(&self) -> u64 {
         self.durable_seq
+    }
+
+    /// Number of events currently retained in the recent cache.
+    pub fn cached_events(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn cache_bytes(&self) -> usize {
+        self.cache_bytes
+    }
+}
+
+/// Acknowledgement stream from the journal appender back to the sequencer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalAck {
+    /// Records through this sequence are appended and readable.
+    Journaled(u64),
+    /// A completed sync covers records through this sequence.
+    Durable(u64),
+    /// Appending failed (I/O error or a contiguity violation); the
+    /// appender is dead and rejects further records with the same error.
+    Failed(String),
+}
+
+enum AppenderMsg {
+    Record(Box<OrderedEvent>),
+    Sync,
+    Shutdown,
+}
+
+/// The journal appender: sole owner of the active [`SegmentWriter`],
+/// running on its own thread so sequencing and live publication never
+/// perform disk I/O (PLAN.md §4.2). It validates contiguity, appends in
+/// assigned order, group-syncs on request, and reports progress through
+/// [`JournalAck`]s. The queue is bounded in both messages and bytes.
+pub struct JournalAppender {
+    tx: std::sync::mpsc::SyncSender<AppenderMsg>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queue_budget_bytes: usize,
+}
+
+impl JournalAppender {
+    /// Open the journal under `session_dir` (recovering the previous
+    /// incarnation) and spawn the appender thread for the new one.
+    pub fn spawn(
+        session_dir: &Path,
+    ) -> io::Result<(
+        Self,
+        u64,
+        Option<RecoveryReport>,
+        std::sync::mpsc::Receiver<JournalAck>,
+    )> {
+        let opened = open(session_dir)?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(DEFAULT_QUEUE_CAPACITY);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_queued = std::sync::Arc::clone(&queued_bytes);
+        std::thread::Builder::new()
+            .name("journal-appender".to_string())
+            .spawn(move || appender_loop(opened.writer, rx, ack_tx, worker_queued))?;
+        Ok((
+            Self {
+                tx,
+                queued_bytes,
+                queue_budget_bytes: DEFAULT_QUEUE_BUDGET_BYTES,
+            },
+            opened.incarnation,
+            opened.report,
+            ack_rx,
+        ))
+    }
+
+    /// Queue an already-sequenced event for append. Fails without
+    /// enqueueing when the queue is full or the byte budget is exhausted;
+    /// the caller must degrade/backpressure, never drop silently.
+    pub fn try_submit(&self, event: OrderedEvent) -> Result<(), JournalSubmitError> {
+        use std::sync::atomic::Ordering;
+        let len = event.payload.len();
+        let queued = self.queued_bytes.fetch_add(len, Ordering::Relaxed);
+        if queued + len > self.queue_budget_bytes {
+            self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+            return Err(JournalSubmitError::QueueBudgetExhausted);
+        }
+        match self.tx.try_send(AppenderMsg::Record(Box::new(event))) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                Err(JournalSubmitError::QueueFull)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                Err(JournalSubmitError::AppenderDead)
+            }
+        }
+    }
+
+    /// Ask the appender to group-sync everything written so far; the
+    /// resulting [`JournalAck::Durable`] advances `durable_seq`.
+    pub fn request_sync(&self) {
+        // A full queue delays the sync rather than dropping it silently:
+        // block briefly is wrong on a hot path, so skip and let the next
+        // cadence tick retry.
+        let _ = self.tx.try_send(AppenderMsg::Sync);
+    }
+
+    /// Stop the appender thread after draining queued records.
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(AppenderMsg::Shutdown);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalSubmitError {
+    /// Message bound reached.
+    QueueFull,
+    /// Byte bound reached — the appender is stalled or the session is
+    /// producing faster than storage can absorb.
+    QueueBudgetExhausted,
+    /// The appender thread is gone.
+    AppenderDead,
+}
+
+impl std::fmt::Display for JournalSubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "journal queue is full"),
+            Self::QueueBudgetExhausted => write!(f, "journal queue byte budget exhausted"),
+            Self::AppenderDead => write!(f, "journal appender is dead"),
+        }
+    }
+}
+
+fn appender_loop(
+    mut writer: SegmentWriter,
+    rx: std::sync::mpsc::Receiver<AppenderMsg>,
+    ack_tx: std::sync::mpsc::Sender<JournalAck>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut expected_seq = 1u64;
+    let mut last_written = 0u64;
+    let mut dead: Option<String> = None;
+
+    let fail = |ack_tx: &std::sync::mpsc::Sender<JournalAck>,
+                dead: &mut Option<String>,
+                reason: String| {
+        *dead = Some(reason.clone());
+        let _ = ack_tx.send(JournalAck::Failed(reason));
+    };
+
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            AppenderMsg::Shutdown => break,
+            AppenderMsg::Sync => {
+                if let Some(reason) = &dead {
+                    let _ = ack_tx.send(JournalAck::Failed(reason.clone()));
+                } else if let Err(err) = writer.sync() {
+                    fail(&ack_tx, &mut dead, format!("journal sync failed: {err}"));
+                } else {
+                    let _ = ack_tx.send(JournalAck::Durable(last_written));
+                }
+            }
+            AppenderMsg::Record(event) => {
+                queued_bytes.fetch_sub(event.payload.len(), Ordering::Relaxed);
+                if let Some(reason) = &dead {
+                    let _ = ack_tx.send(JournalAck::Failed(reason.clone()));
+                    continue;
+                }
+                if event.cursor.seq != expected_seq {
+                    fail(
+                        &ack_tx,
+                        &mut dead,
+                        format!(
+                            "journal contiguity violation: expected seq {expected_seq}, got {}",
+                            event.cursor.seq
+                        ),
+                    );
+                    continue;
+                }
+                match writer.append_record(
+                    event.kind,
+                    event.cursor.seq,
+                    event.elapsed_ms,
+                    &event.payload,
+                ) {
+                    Ok(()) => {
+                        last_written = event.cursor.seq;
+                        expected_seq += 1;
+                        let _ = ack_tx.send(JournalAck::Journaled(event.cursor.seq));
+                    }
+                    Err(err) => {
+                        fail(&ack_tx, &mut dead, format!("journal append failed: {err}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// M1 shadow journal: bundles the sequencing core with the appender for
+/// the reader-thread-only shadow wiring behind [`shadow_enabled`].
+pub struct ShadowJournal {
+    pub core: SequencerCore,
+    appender: JournalAppender,
+    acks: std::sync::mpsc::Receiver<JournalAck>,
+}
+
+impl ShadowJournal {
+    pub fn open(session_dir: &Path) -> io::Result<(Self, u64, Option<RecoveryReport>)> {
+        let (appender, incarnation, report, acks) = JournalAppender::spawn(session_dir)?;
+        Ok((
+            Self {
+                core: SequencerCore::new(incarnation),
+                appender,
+                acks,
+            },
+            incarnation,
+            report,
+        ))
+    }
+
+    /// Sequence an output chunk, retain it in the recent cache and submit
+    /// it to the appender. Returns the assigned cursor; a submission
+    /// failure degrades the core and returns the error for the caller to
+    /// log.
+    pub fn record_output(
+        &mut self,
+        payload: bytes::Bytes,
+    ) -> Result<JournalCursor, JournalSubmitError> {
+        self.poll_acks();
+        let event = self.core.publish(RecordKind::Output, payload);
+        let cursor = event.cursor;
+        if let Err(err) = self.appender.try_submit(event) {
+            self.core.degrade(err.to_string());
+            return Err(err);
+        }
+        Ok(cursor)
+    }
+
+    /// Drain pending acknowledgements into the cursors.
+    pub fn poll_acks(&mut self) {
+        while let Ok(ack) = self.acks.try_recv() {
+            match ack {
+                JournalAck::Journaled(seq) => self.core.note_journaled(seq),
+                JournalAck::Durable(seq) => self.core.note_durable(seq),
+                JournalAck::Failed(reason) => self.core.degrade(reason),
+            }
+        }
+    }
+
+    /// Request a group sync (durability cadence; see PLAN.md §4.2).
+    pub fn request_sync(&self) {
+        self.appender.request_sync();
     }
 }
 
@@ -567,12 +915,16 @@ mod tests {
         let path = test_path("roundtrip.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 7).unwrap();
-        assert_eq!(writer.append(RecordKind::Output, 0, b"hello").unwrap(), 7);
+        let mut writer = SegmentWriter::create(&path).unwrap();
         writer
-            .append(RecordKind::Resize, 1, &24u16.to_le_bytes())
+            .append_record(RecordKind::Output, 7, 0, b"hello")
             .unwrap();
-        writer.append(RecordKind::Lifecycle, 1, b"").unwrap();
+        writer
+            .append_record(RecordKind::Resize, 8, 1, &24u16.to_le_bytes())
+            .unwrap();
+        writer
+            .append_record(RecordKind::Lifecycle, 9, 1, b"")
+            .unwrap();
         writer.sync().unwrap();
         drop(writer);
 
@@ -595,11 +947,17 @@ mod tests {
         let path = test_path("torn.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 0).unwrap();
-        writer.append(RecordKind::Output, 0, b"first").unwrap();
-        writer.append(RecordKind::Output, 0, b"second").unwrap();
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer
+            .append_record(RecordKind::Output, 1, 0, b"first")
+            .unwrap();
+        writer
+            .append_record(RecordKind::Output, 2, 0, b"second")
+            .unwrap();
         let valid_len = writer.len();
-        writer.append(RecordKind::Output, 0, b"third-torn").unwrap();
+        writer
+            .append_record(RecordKind::Output, 3, 0, b"third-torn")
+            .unwrap();
         drop(writer);
 
         // Simulate a crash mid-write: keep only half of the third record.
@@ -624,11 +982,17 @@ mod tests {
         let path = test_path("corrupt.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 0).unwrap();
-        writer.append(RecordKind::Output, 0, b"good").unwrap();
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer
+            .append_record(RecordKind::Output, 1, 0, b"good")
+            .unwrap();
         let first_len = writer.len();
-        writer.append(RecordKind::Output, 0, b"bad").unwrap();
-        writer.append(RecordKind::Output, 0, b"after").unwrap();
+        writer
+            .append_record(RecordKind::Output, 2, 0, b"bad")
+            .unwrap();
+        writer
+            .append_record(RecordKind::Output, 3, 0, b"after")
+            .unwrap();
         drop(writer);
 
         // Flip one payload byte of the middle record.
@@ -653,10 +1017,14 @@ mod tests {
         let path = test_path("seqgap.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 0).unwrap();
-        writer.append(RecordKind::Output, 0, b"a").unwrap();
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer
+            .append_record(RecordKind::Output, 1, 0, b"a")
+            .unwrap();
         let first_len = writer.len();
-        writer.append(RecordKind::Output, 0, b"b").unwrap();
+        writer
+            .append_record(RecordKind::Output, 2, 0, b"b")
+            .unwrap();
         drop(writer);
 
         // Rewrite the second record's seq as if a later segment tail had
@@ -685,11 +1053,14 @@ mod tests {
         let path = test_path("oversized.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 0).unwrap();
+        let mut writer = SegmentWriter::create(&path).unwrap();
         let huge = vec![0u8; MAX_PAYLOAD_LEN as usize + 1];
-        assert!(writer.append(RecordKind::Output, 0, &huge).is_err());
+        assert!(
+            writer
+                .append_record(RecordKind::Output, 1, 0, &huge)
+                .is_err()
+        );
         assert_eq!(writer.len(), 0, "rejected record must not write bytes");
-        assert_eq!(writer.next_seq(), 0, "rejected record must not spend a seq");
 
         let _ = fs::remove_file(&path);
     }
@@ -701,8 +1072,10 @@ mod tests {
         let path = test_path("garbage_len.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 0).unwrap();
-        writer.append(RecordKind::Output, 0, b"only").unwrap();
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer
+            .append_record(RecordKind::Output, 1, 0, b"only")
+            .unwrap();
         let valid_len = writer.len();
         drop(writer);
 
@@ -732,9 +1105,11 @@ mod tests {
         let path = test_path("elapsed.seg");
         let _ = fs::remove_file(&path);
 
-        let mut writer = SegmentWriter::create(&path, 0).unwrap();
+        let mut writer = SegmentWriter::create(&path).unwrap();
         for elapsed in 0..16u64 {
-            writer.append(RecordKind::Output, elapsed, b"x").unwrap();
+            writer
+                .append_record(RecordKind::Output, elapsed + 1, elapsed, b"x")
+                .unwrap();
         }
         drop(writer);
 
@@ -747,65 +1122,116 @@ mod tests {
     }
 
     #[test]
-    fn sequencer_assigns_monotonic_seq_and_elapsed() {
-        let dir = test_session_dir("seq_monotonic");
-        let (mut sequencer, report) = Sequencer::open(&dir).unwrap();
-        assert!(report.is_none());
-        assert_eq!(sequencer.incarnation(), 1);
-        assert_eq!(sequencer.head_seq(), None);
+    fn core_allocates_monotonic_seq_and_elapsed_before_publication() {
+        let mut core = SequencerCore::new(1);
+        assert_eq!(core.head_seq(), None);
 
-        let first = sequencer.append(RecordKind::Output, b"one").unwrap();
-        let second = sequencer.append(RecordKind::Output, b"two").unwrap();
-        assert_eq!((first, second), (1, 2));
-        assert_eq!(sequencer.head_seq(), Some(2));
-        assert_eq!(sequencer.durable_seq(), 0);
-        sequencer.sync().unwrap();
-        assert_eq!(sequencer.durable_seq(), 2);
-        drop(sequencer);
-
-        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
-        assert!(outcome.is_clean());
+        let first = core.publish(RecordKind::Output, bytes::Bytes::from_static(b"one"));
+        let second = core.publish(RecordKind::Output, bytes::Bytes::from_static(b"two"));
         assert_eq!(
-            outcome
-                .records
-                .iter()
-                .map(|r| r.payload.clone())
-                .collect::<Vec<_>>(),
-            vec![b"one".to_vec(), b"two".to_vec()]
+            first.cursor,
+            JournalCursor {
+                incarnation: 1,
+                seq: 1
+            }
         );
-        assert!(outcome.records[1].elapsed_ms >= outcome.records[0].elapsed_ms);
-
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(
+            second.cursor,
+            JournalCursor {
+                incarnation: 1,
+                seq: 2
+            }
+        );
+        assert!(second.elapsed_ms >= first.elapsed_ms);
+        assert_eq!(core.head_seq(), Some(2));
+        assert_eq!(core.journal_seq(), 0);
+        assert_eq!(core.durable_seq(), 0);
+        assert_eq!(core.cached_events(), 2);
+        assert!(!core.is_degraded());
     }
 
     #[test]
-    fn reopen_recovers_previous_incarnation_and_starts_a_new_one() {
+    fn cache_eviction_respects_journal_availability() {
+        // Tiny budget forces eviction attempts on every publish.
+        let mut core = SequencerCore::with_budget(1, 10);
+        for seq in 1..=4u64 {
+            core.publish(RecordKind::Output, bytes::Bytes::from_static(b"12345"));
+            assert_eq!(core.head_seq(), Some(seq));
+        }
+        // Nothing is journaled yet: eviction must not drop unjournaled
+        // events even over budget — it signals backpressure instead.
+        assert!(core.over_budget());
+        assert_eq!(core.cached_events(), 4);
+
+        core.note_journaled(3);
+        core.publish(RecordKind::Output, bytes::Bytes::from_static(b"12345"));
+        // The publish re-evicted records 1..=3; 4 and 5 remain.
+        assert_eq!(core.cached_events(), 2);
+        assert!(!core.over_budget());
+        assert_eq!(core.journal_seq(), 3);
+        // Cursors never move backwards.
+        core.note_journaled(1);
+        assert_eq!(core.journal_seq(), 3);
+    }
+
+    #[test]
+    fn degradation_is_explicit_and_sticky() {
+        let mut core = SequencerCore::new(1);
+        core.degrade("journal append failed: disk full");
+        core.degrade("a second failure must not hide the first");
+        assert!(core.is_degraded());
+        assert_eq!(
+            core.degraded_reason(),
+            Some("journal append failed: disk full")
+        );
+        // Publication continues to sequence — never a silent gap.
+        let event = core.publish(RecordKind::Output, bytes::Bytes::from_static(b"x"));
+        assert_eq!(event.cursor.seq, 1);
+    }
+
+    #[test]
+    fn open_recovers_previous_incarnation_and_starts_a_new_one() {
         let dir = test_session_dir("seq_reopen");
-        let (mut first, _) = Sequencer::open(&dir).unwrap();
-        first.append(RecordKind::Output, b"a").unwrap();
-        first.append(RecordKind::Resize, b"80x24").unwrap();
-        first.append(RecordKind::Output, b"b").unwrap();
+        let mut first = open(&dir).unwrap();
+        assert_eq!(first.incarnation, 1);
+        assert!(first.report.is_none());
+        first
+            .writer
+            .append_record(RecordKind::Output, 1, 0, b"a")
+            .unwrap();
+        first
+            .writer
+            .append_record(RecordKind::Resize, 2, 0, b"80x24")
+            .unwrap();
+        first
+            .writer
+            .append_record(RecordKind::Output, 3, 0, b"b")
+            .unwrap();
         drop(first);
 
-        let (mut second, report) = Sequencer::open(&dir).unwrap();
-        let report = report.expect("previous incarnation must be recovered");
+        let mut second = open(&dir).unwrap();
+        let report = second
+            .report
+            .take()
+            .expect("previous incarnation must be recovered");
         assert_eq!(report.incarnation, 1);
         assert_eq!(report.records, 3);
         assert_eq!(report.last_seq, Some(3));
         assert_eq!(report.stop, ScanStop::CleanEof);
         assert!(!report.rewound);
-        assert_eq!(second.incarnation(), 2);
-        assert_eq!(
-            second.next_seq(),
-            1,
-            "seq restarts within the new incarnation"
-        );
+        assert_eq!(second.incarnation, 2);
 
-        second.append(RecordKind::Output, b"c").unwrap();
+        second
+            .writer
+            .append_record(RecordKind::Output, 1, 0, b"c")
+            .unwrap();
         drop(second);
         let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000002.ojrn")).unwrap();
         assert_eq!(outcome.records.len(), 1);
-        assert_eq!(outcome.records[0].seq, 1);
+        assert_eq!(
+            outcome.records[0].seq, 1,
+            "seq restarts within the new incarnation"
+        );
         assert_eq!(outcome.records[0].payload, b"c".to_vec());
 
         let _ = fs::remove_dir_all(&dir);
@@ -814,8 +1240,11 @@ mod tests {
     #[test]
     fn reopen_rewinds_a_torn_tail_before_starting_the_new_incarnation() {
         let dir = test_session_dir("seq_torn");
-        let (mut first, _) = Sequencer::open(&dir).unwrap();
-        first.append(RecordKind::Output, b"kept").unwrap();
+        let mut first = open(&dir).unwrap();
+        first
+            .writer
+            .append_record(RecordKind::Output, 1, 0, b"kept")
+            .unwrap();
         let kept_len = first.writer.len();
         drop(first);
 
@@ -828,8 +1257,7 @@ mod tests {
             .write_all(b"\xde\xad\xbe\xefpartial")
             .unwrap();
 
-        let (_, report) = Sequencer::open(&dir).unwrap();
-        let report = report.unwrap();
+        let report = open(&dir).unwrap().report.unwrap();
         assert_eq!(report.stop, ScanStop::PartialTail);
         assert!(report.rewound);
         assert_eq!(report.records, 1);
@@ -846,9 +1274,15 @@ mod tests {
     #[test]
     fn reopen_reports_interior_corruption_without_rewinding() {
         let dir = test_session_dir("seq_corrupt");
-        let (mut first, _) = Sequencer::open(&dir).unwrap();
-        first.append(RecordKind::Output, b"good").unwrap();
-        first.append(RecordKind::Output, b"corrupted").unwrap();
+        let mut first = open(&dir).unwrap();
+        first
+            .writer
+            .append_record(RecordKind::Output, 1, 0, b"good")
+            .unwrap();
+        first
+            .writer
+            .append_record(RecordKind::Output, 2, 0, b"corrupted")
+            .unwrap();
         let full_len = first.writer.len();
         drop(first);
 
@@ -859,8 +1293,7 @@ mod tests {
         bytes[second_payload] ^= 0xFF;
         fs::write(&segment, &bytes).unwrap();
 
-        let (_, report) = Sequencer::open(&dir).unwrap();
-        let report = report.unwrap();
+        let report = open(&dir).unwrap().report.unwrap();
         assert_eq!(report.stop, ScanStop::CrcMismatch);
         assert!(
             !report.rewound,
@@ -868,6 +1301,162 @@ mod tests {
         );
         assert_eq!(report.records, 1);
         assert_eq!(fs::metadata(&segment).unwrap().len(), full_len);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Appender boundary tests (PLAN.md §4.2) --
+
+    fn event(seq: u64, payload: &'static [u8]) -> OrderedEvent {
+        OrderedEvent {
+            cursor: JournalCursor {
+                incarnation: 1,
+                seq,
+            },
+            elapsed_ms: 0,
+            kind: RecordKind::Output,
+            payload: bytes::Bytes::from_static(payload),
+        }
+    }
+
+    fn recv_ack(acks: &std::sync::mpsc::Receiver<JournalAck>) -> JournalAck {
+        acks.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("appender acknowledgement timed out")
+    }
+
+    #[test]
+    fn appender_writes_in_order_and_acks_journal_and_durable_cursors() {
+        let dir = test_session_dir("appender_ok");
+        let (appender, incarnation, report, acks) = JournalAppender::spawn(&dir).unwrap();
+        assert_eq!(incarnation, 1);
+        assert!(report.is_none());
+
+        for seq in 1..=3u64 {
+            appender.try_submit(event(seq, b"chunk")).unwrap();
+            assert_eq!(recv_ack(&acks), JournalAck::Journaled(seq));
+        }
+        appender.request_sync();
+        assert_eq!(recv_ack(&acks), JournalAck::Durable(3));
+        appender.shutdown();
+        drop(appender);
+
+        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        assert!(outcome.is_clean());
+        assert_eq!(outcome.records.len(), 3);
+        assert_eq!(
+            outcome.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appender_rejects_out_of_order_records_without_a_silent_hole() {
+        let dir = test_session_dir("appender_ooo");
+        let (appender, _, _, acks) = JournalAppender::spawn(&dir).unwrap();
+
+        appender.try_submit(event(1, b"one")).unwrap();
+        assert_eq!(recv_ack(&acks), JournalAck::Journaled(1));
+        appender.try_submit(event(3, b"three")).unwrap();
+        match recv_ack(&acks) {
+            JournalAck::Failed(reason) => {
+                assert!(
+                    reason.contains("contiguity"),
+                    "unexpected failure: {reason}"
+                );
+            }
+            other => panic!("expected contiguity failure, got {other:?}"),
+        }
+        // After a contiguity violation the appender is dead: further
+        // records fail fast rather than writing past a hole.
+        appender.try_submit(event(2, b"two")).unwrap();
+        assert!(matches!(recv_ack(&acks), JournalAck::Failed(_)));
+        appender.shutdown();
+        drop(appender);
+
+        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        assert_eq!(
+            outcome.records.len(),
+            1,
+            "only the valid prefix may be written"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Build an appender whose queue is never drained, so budget and
+    /// capacity behaviour is deterministic.
+    fn undrained_appender(capacity: usize, budget: usize) -> JournalAppender {
+        let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+        // Leak the receiver so the channel never disconnects and never
+        // drains; the test process exits with it.
+        std::mem::forget(rx);
+        JournalAppender {
+            tx,
+            queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queue_budget_bytes: budget,
+        }
+    }
+
+    #[test]
+    fn queue_byte_budget_rejects_submission_without_dropping() {
+        let appender = undrained_appender(64, 8);
+        // Each record is 4 bytes; exactly two fit the 8-byte budget.
+        appender.try_submit(event(1, b"1234")).unwrap();
+        appender.try_submit(event(2, b"1234")).unwrap();
+        assert_eq!(
+            appender.try_submit(event(3, b"1234")),
+            Err(JournalSubmitError::QueueBudgetExhausted)
+        );
+        // The rejected record is not enqueued: budget accounting is exact.
+        assert_eq!(
+            appender
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            8
+        );
+    }
+
+    #[test]
+    fn queue_message_capacity_rejects_submission_without_dropping() {
+        let appender = undrained_appender(1, DEFAULT_QUEUE_BUDGET_BYTES);
+        appender.try_submit(event(1, b"a")).unwrap();
+        assert_eq!(
+            appender.try_submit(event(2, b"b")),
+            Err(JournalSubmitError::QueueFull)
+        );
+    }
+
+    #[test]
+    fn shadow_journal_orders_caches_and_journals_output() {
+        let dir = test_session_dir("shadow_journal");
+        let (mut shadow, incarnation, report) = ShadowJournal::open(&dir).unwrap();
+        assert_eq!(incarnation, 1);
+        assert!(report.is_none());
+
+        let first = shadow
+            .record_output(bytes::Bytes::from_static(b"one"))
+            .unwrap();
+        let second = shadow
+            .record_output(bytes::Bytes::from_static(b"two"))
+            .unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(second.seq, 2);
+
+        shadow.request_sync();
+        // Wait for the durable ack to arrive.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.durable_seq() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable ack timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            shadow.poll_acks();
+        }
+        assert_eq!(shadow.core.journal_seq(), 2);
+        assert!(!shadow.core.is_degraded());
 
         let _ = fs::remove_dir_all(&dir);
     }

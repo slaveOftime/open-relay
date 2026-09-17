@@ -149,13 +149,11 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
 
 ## M1 progress (post-gate)
 
-- `Sequencer` (in `src/session/journal.rs`): per-session, per-incarnation
-  sequencing authority. Assigns monotonic `seq` and monotonic
-  `elapsed_ms`, owns the active segment writer, tracks `head_seq`/
-  `durable_seq`. `Sequencer::open` recovers the newest existing
-  incarnation first: torn tails are rewound (truncated), interior
-  corruption is reported (`ScanStop::CrcMismatch`, …) and left untouched,
-  then a new incarnation (`journal/seg-NNNNNNNN.ojrn`) starts at seq 1.
+- Increment 1 (superseded by increment 2): a fused `Sequencer` owned
+  both sequence allocation and the segment writer. Replaced in
+  increment 2 — sequence allocation is now in-memory (`SequencerCore`)
+  and disk writes belong to a bounded `JournalAppender` thread, with
+  incarnation recovery in `journal::open()`.
 - Wired as a **shadow journal** behind dev-only `OLY_JOURNAL=1`: the PTY
   reader thread journals every canonical filtered output chunk it also
   appends to `output.log`. Failures log and do not affect the session.
@@ -164,6 +162,39 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
   torn-tail rewind, corruption reporting) + `probe_shadow_journal_records_output_in_order`
   (ignored dev probe; real PTY session, clean scan, contiguous seqs).
   Suite: 508 passed, 16 ignored.
+
+### Increment 2: ordering split from persistence
+
+- The fused `Sequencer` was split per PLAN.md §4.2 before any further
+  record types were wired, so the wrong abstraction never hardens:
+  - `SegmentWriter` is now a pure serializer (`append_record` takes a
+    caller-assigned `seq`); it no longer allocates sequences.
+  - `journal::open()` performs incarnation recovery (torn-tail rewind,
+    corruption reporting) and returns the new incarnation's writer.
+  - `SequencerCore`: in-memory sequencing authority — allocates
+    monotonic `seq` + `elapsed_ms` **before publication**, keeps a
+    byte-bounded recent replay cache that may only evict journaled
+    records (never silently drops; `over_budget()` signals
+    backpressure), tracks `head_seq`/`journal_seq`/`durable_seq`
+    separately, and has an explicit sticky `degraded` state.
+  - `JournalAppender`: dedicated thread, sole owner of the segment
+    writer. Queue bounded in messages (256) **and** bytes (32 MiB) — a
+    stalled disk cannot grow session memory. Validates contiguity
+    (`expected_seq`), acks `Journaled`/`Durable` cursors, group-syncs on
+    request, and after any failure (I/O or contiguity) is dead and
+    fails fast instead of writing past a hole.
+  - `OrderedEvent { cursor: JournalCursor { incarnation, seq },
+    elapsed_ms, kind, payload: Bytes }` — one immutable allocation
+    shared by live delivery, replay cache and journal queue.
+- The reader-thread shadow wiring (`OLY_JOURNAL=1`) now goes through
+  `ShadowJournal` (core + appender): the PTY reader no longer performs
+  synchronous disk writes.
+- Verified: 19 journal tests including the appender boundary tests
+  (in-order acks, contiguity violation kills the appender without a
+  hole, queue byte/message budgets reject without dropping, eviction
+  never precedes journal availability, sticky degradation) + the real-PTY
+  shadow probe re-run. Suite: 515 passed, 16 ignored; clippy baseline
+  unchanged (81 with `--all-targets`).
 - [x] Capability/CLI/API/config/auth inventory for the compatibility break
       — see [M0_INVENTORY.md](M0_INVENTORY.md).
 - [x] ADR ratification at the M0 exit gate: ADR-0002/0003/0006/0007
