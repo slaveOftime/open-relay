@@ -24,7 +24,7 @@
 use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 const RECORD_MAGIC: &[u8; 4] = b"OJRN";
@@ -201,6 +201,169 @@ impl SegmentWriter {
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-session sequencer (M1)
+// ---------------------------------------------------------------------------
+
+/// Directory inside `sessions/<id>/` holding the journal segments.
+pub const JOURNAL_DIR_NAME: &str = "journal";
+const SEGMENT_PREFIX: &str = "seg-";
+const SEGMENT_SUFFIX: &str = ".ojrn";
+
+fn segment_path(journal_dir: &Path, incarnation: u64) -> PathBuf {
+    journal_dir.join(format!("{SEGMENT_PREFIX}{incarnation:08}{SEGMENT_SUFFIX}"))
+}
+
+/// Newest incarnation number present in `journal_dir`, if any.
+fn latest_incarnation(journal_dir: &Path) -> io::Result<Option<u64>> {
+    let mut latest = None;
+    for entry in fs::read_dir(journal_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(number) = name
+            .strip_prefix(SEGMENT_PREFIX)
+            .and_then(|rest| rest.strip_suffix(SEGMENT_SUFFIX))
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        latest = Some(latest.map_or(number, |current: u64| current.max(number)));
+    }
+    Ok(latest)
+}
+
+/// What recovery found in the previous incarnation's segment.
+#[derive(Debug)]
+pub struct RecoveryReport {
+    /// Incarnation the recovered segment belongs to.
+    pub incarnation: u64,
+    /// Valid records recovered.
+    pub records: u64,
+    /// Highest valid sequence in that incarnation, if any.
+    pub last_seq: Option<u64>,
+    /// Why the scan stopped.
+    pub stop: ScanStop,
+    /// Offset of the first byte that is not a valid record.
+    pub valid_len: u64,
+    /// Whether a torn tail was rewound (file truncated to `valid_len`).
+    pub rewound: bool,
+}
+
+/// The per-session sequencing authority (PLAN.md §4.2, invariants I1/I3/I8).
+///
+/// One `Sequencer` owns one session for one daemon incarnation: it assigns
+/// monotonic `seq` numbers in append order, assigns monotonic `elapsed_ms`
+/// from the incarnation's start, and owns the active segment writer. A
+/// daemon restart opens a **new** incarnation (a new `seg-NNNNNNNN.ojrn`
+/// file) rather than appending past possibly-published sequences; the
+/// previous incarnation is recovered (torn tail rewound, corruption
+/// reported) before the new one starts.
+///
+/// M1 wires this as a shadow journal behind [`shadow_enabled`]: it sees
+/// output records only. Ordered resize/lifecycle records land when the
+/// sequencer moves onto the session ingest path proper.
+pub struct Sequencer {
+    incarnation: u64,
+    next_seq: u64,
+    started: std::time::Instant,
+    /// Sequence of the most recent record covered by a completed `sync()`.
+    durable_seq: u64,
+    writer: SegmentWriter,
+}
+
+impl Sequencer {
+    /// Open (creating if needed) the journal for `session_dir`, recover the
+    /// newest existing incarnation, and start a new one. Returns the
+    /// sequencer and, when a previous incarnation existed, its recovery
+    /// report.
+    pub fn open(session_dir: &Path) -> io::Result<(Self, Option<RecoveryReport>)> {
+        let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+        fs::create_dir_all(&journal_dir)?;
+
+        let latest = latest_incarnation(&journal_dir)?;
+        let mut report = None;
+        if let Some(previous) = latest {
+            let path = segment_path(&journal_dir, previous);
+            let outcome = scan_segment(&path)?;
+            let rewound = outcome.stop.may_rewind();
+            if rewound {
+                // A torn tail can only mean the previous incarnation died
+                // mid-append; truncate so no reader ever sees it again.
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)?
+                    .set_len(outcome.valid_len)?;
+            }
+            report = Some(RecoveryReport {
+                incarnation: previous,
+                records: outcome.records.len() as u64,
+                last_seq: outcome.records.last().map(|record| record.seq),
+                stop: outcome.stop,
+                valid_len: outcome.valid_len,
+                rewound,
+            });
+        }
+
+        let incarnation = latest.unwrap_or(0) + 1;
+        let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation), 1)?;
+        Ok((
+            Self {
+                incarnation,
+                next_seq: 1,
+                started: std::time::Instant::now(),
+                durable_seq: 0,
+                writer,
+            },
+            report,
+        ))
+    }
+
+    /// Append one event, assigning its sequence number and monotonic
+    /// elapsed time. Returns the assigned `seq`.
+    pub fn append(&mut self, kind: RecordKind, payload: &[u8]) -> io::Result<u64> {
+        let seq = self
+            .writer
+            .append(kind, self.started.elapsed().as_millis() as u64, payload)?;
+        self.next_seq = seq + 1;
+        Ok(seq)
+    }
+
+    /// Push appended records to the storage device and advance
+    /// `durable_seq` past everything written so far.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.writer.sync()?;
+        self.durable_seq = self.next_seq - 1;
+        Ok(())
+    }
+
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    /// Sequence number the next appended event will get.
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    /// Highest sequence published so far, if any (`head_seq` in PLAN terms).
+    pub fn head_seq(&self) -> Option<u64> {
+        (self.next_seq > 1).then_some(self.next_seq - 1)
+    }
+
+    /// Highest sequence known durable on storage.
+    pub fn durable_seq(&self) -> u64 {
+        self.durable_seq
+    }
+}
+
+/// Development-only switch for the M1 shadow journal: when set (and not
+/// `0`), the PTY reader thread also journals output records. Off by
+/// default until M3 makes the journal the canonical stream.
+pub fn shadow_enabled() -> bool {
+    std::env::var_os("OLY_JOURNAL").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn crc32_two(first: &[u8], second: &[u8]) -> u32 {
@@ -384,6 +547,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oly_journal_test_{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    fn test_session_dir(name: &str) -> std::path::PathBuf {
+        let dir = test_path(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
@@ -574,5 +744,131 @@ mod tests {
         }
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sequencer_assigns_monotonic_seq_and_elapsed() {
+        let dir = test_session_dir("seq_monotonic");
+        let (mut sequencer, report) = Sequencer::open(&dir).unwrap();
+        assert!(report.is_none());
+        assert_eq!(sequencer.incarnation(), 1);
+        assert_eq!(sequencer.head_seq(), None);
+
+        let first = sequencer.append(RecordKind::Output, b"one").unwrap();
+        let second = sequencer.append(RecordKind::Output, b"two").unwrap();
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(sequencer.head_seq(), Some(2));
+        assert_eq!(sequencer.durable_seq(), 0);
+        sequencer.sync().unwrap();
+        assert_eq!(sequencer.durable_seq(), 2);
+        drop(sequencer);
+
+        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        assert!(outcome.is_clean());
+        assert_eq!(
+            outcome
+                .records
+                .iter()
+                .map(|r| r.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![b"one".to_vec(), b"two".to_vec()]
+        );
+        assert!(outcome.records[1].elapsed_ms >= outcome.records[0].elapsed_ms);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_recovers_previous_incarnation_and_starts_a_new_one() {
+        let dir = test_session_dir("seq_reopen");
+        let (mut first, _) = Sequencer::open(&dir).unwrap();
+        first.append(RecordKind::Output, b"a").unwrap();
+        first.append(RecordKind::Resize, b"80x24").unwrap();
+        first.append(RecordKind::Output, b"b").unwrap();
+        drop(first);
+
+        let (mut second, report) = Sequencer::open(&dir).unwrap();
+        let report = report.expect("previous incarnation must be recovered");
+        assert_eq!(report.incarnation, 1);
+        assert_eq!(report.records, 3);
+        assert_eq!(report.last_seq, Some(3));
+        assert_eq!(report.stop, ScanStop::CleanEof);
+        assert!(!report.rewound);
+        assert_eq!(second.incarnation(), 2);
+        assert_eq!(
+            second.next_seq(),
+            1,
+            "seq restarts within the new incarnation"
+        );
+
+        second.append(RecordKind::Output, b"c").unwrap();
+        drop(second);
+        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000002.ojrn")).unwrap();
+        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.records[0].seq, 1);
+        assert_eq!(outcome.records[0].payload, b"c".to_vec());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_rewinds_a_torn_tail_before_starting_the_new_incarnation() {
+        let dir = test_session_dir("seq_torn");
+        let (mut first, _) = Sequencer::open(&dir).unwrap();
+        first.append(RecordKind::Output, b"kept").unwrap();
+        let kept_len = first.writer.len();
+        drop(first);
+
+        // Simulate a crash mid-append: garbage bytes after the last record.
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(b"\xde\xad\xbe\xefpartial")
+            .unwrap();
+
+        let (_, report) = Sequencer::open(&dir).unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.stop, ScanStop::PartialTail);
+        assert!(report.rewound);
+        assert_eq!(report.records, 1);
+        assert_eq!(report.last_seq, Some(1));
+        assert_eq!(
+            fs::metadata(&segment).unwrap().len(),
+            kept_len,
+            "torn tail must be truncated to the last valid record"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_reports_interior_corruption_without_rewinding() {
+        let dir = test_session_dir("seq_corrupt");
+        let (mut first, _) = Sequencer::open(&dir).unwrap();
+        first.append(RecordKind::Output, b"good").unwrap();
+        first.append(RecordKind::Output, b"corrupted").unwrap();
+        let full_len = first.writer.len();
+        drop(first);
+
+        // Corrupt one payload byte of the second record (not the tail).
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn");
+        let mut bytes = fs::read(&segment).unwrap();
+        let second_payload = HEADER_LEN + 4 + HEADER_LEN;
+        bytes[second_payload] ^= 0xFF;
+        fs::write(&segment, &bytes).unwrap();
+
+        let (_, report) = Sequencer::open(&dir).unwrap();
+        let report = report.unwrap();
+        assert_eq!(report.stop, ScanStop::CrcMismatch);
+        assert!(
+            !report.rewound,
+            "corruption is reported, never silently truncated"
+        );
+        assert_eq!(report.records, 1);
+        assert_eq!(fs::metadata(&segment).unwrap().len(), full_len);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

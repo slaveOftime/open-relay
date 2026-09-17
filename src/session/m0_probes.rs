@@ -182,3 +182,80 @@ fn probe_daemon_backend_echo_roundtrip() {
     runtime.write().pty.kill().ok();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// M1 dev verification: with `OLY_JOURNAL=1` the reader thread journals
+/// every output chunk it also appends to `output.log`, in order.
+///
+/// Ignored and run individually — it mutates the process-global
+/// `OLY_JOURNAL` env var, which is only safe when this probe runs alone:
+/// `cargo test --release -- --ignored --nocapture probe_shadow_journal`.
+#[test]
+#[ignore = "M1 dev verification: mutates OLY_JOURNAL; run individually"]
+fn probe_shadow_journal_records_output_in_order() {
+    // SAFETY: this probe is documented to run alone (see the ignore note),
+    // so no other thread can observe the env mutation mid-test.
+    unsafe { std::env::set_var("OLY_JOURNAL", "1") };
+
+    let dir = std::env::temp_dir().join(format!("oly_probe_journal_{}", uuid::Uuid::new_v4()));
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<SessionEvent>(16);
+    let mut meta = session_meta("journal1");
+    let runtime = spawn_session(&mut meta, dir.clone(), 24, 80, false, 100, event_tx)
+        .expect("spawn probe session");
+
+    let mut broadcast_rx = runtime.read().broadcast_tx.subscribe();
+    let (echo_tx, echo_rx) = std_mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        loop {
+            match broadcast_rx.blocking_recv() {
+                Ok(bytes) => {
+                    if echo_tx.send(bytes.to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    // Distinctive marker chunks, echoed back by `cat`.
+    for marker in [b"JRN-AAAA\r", b"JRN-BBBB\r", b"JRN-CCCC\r"] {
+        runtime
+            .read()
+            .pty
+            .try_write_input(marker.to_vec())
+            .expect("queue probe input");
+        'wait: loop {
+            let chunk = echo_rx.recv_timeout(ECHO_TIMEOUT).expect("echo timed out");
+            if chunk
+                .windows(marker.len() - 1)
+                .any(|w| w == &marker[..marker.len() - 1])
+            {
+                break 'wait;
+            }
+        }
+    }
+    runtime.write().pty.kill().ok();
+
+    let outcome = super::journal::scan_segment(
+        &dir.join(super::journal::JOURNAL_DIR_NAME)
+            .join("seg-00000001.ojrn"),
+    )
+    .expect("journal segment scans");
+    assert!(outcome.is_clean(), "shadow journal segment must scan clean");
+    assert!(
+        outcome.records.len() >= 3,
+        "expected at least the three marker echoes, got {}",
+        outcome.records.len()
+    );
+    let seqs: Vec<u64> = outcome.records.iter().map(|r| r.seq).collect();
+    assert_eq!(
+        seqs,
+        (1..=seqs.len() as u64).collect::<Vec<_>>(),
+        "seqs contiguous from 1"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: same single-threaded-probe justification as the set above.
+    unsafe { std::env::remove_var("OLY_JOURNAL") };
+}

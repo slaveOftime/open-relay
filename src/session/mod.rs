@@ -2,8 +2,11 @@
 //! metadata types the rest of the daemon speaks in.
 
 pub(crate) mod file;
-// M1 groundwork (PLAN.md §6.1): record format, segment writer/reader and
-// torn-tail recovery. Nothing reads or writes it at runtime yet.
+// M1 groundwork (PLAN.md §6.1): record format, segment writer/reader,
+// torn-tail recovery and the per-session sequencer. Wired in as a shadow
+// journal behind `OLY_JOURNAL=1` (development-only); the remaining APIs
+// (durable cursors, scan consumers, lifecycle/policy records) land as M1
+// continues, and the allow comes off with them.
 #[allow(dead_code)]
 pub(crate) mod journal;
 pub mod logs;

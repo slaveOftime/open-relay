@@ -146,6 +146,24 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
       to crates.io). Alacritty core is the selected engine candidate
       (ADR-0001); final ratification awaits the M2 checkpoint prototype.
 - [ ] Raw/event-driven input prototype per platform (ADR-0003).
+
+## M1 progress (post-gate)
+
+- `Sequencer` (in `src/session/journal.rs`): per-session, per-incarnation
+  sequencing authority. Assigns monotonic `seq` and monotonic
+  `elapsed_ms`, owns the active segment writer, tracks `head_seq`/
+  `durable_seq`. `Sequencer::open` recovers the newest existing
+  incarnation first: torn tails are rewound (truncated), interior
+  corruption is reported (`ScanStop::CrcMismatch`, …) and left untouched,
+  then a new incarnation (`journal/seg-NNNNNNNN.ojrn`) starts at seq 1.
+- Wired as a **shadow journal** behind dev-only `OLY_JOURNAL=1`: the PTY
+  reader thread journals every canonical filtered output chunk it also
+  appends to `output.log`. Failures log and do not affect the session.
+  Ordered resize/lifecycle records and cursor consumers land next.
+- Verified: unit tests (monotonic seq/elapsed, incarnation reopen,
+  torn-tail rewind, corruption reporting) + `probe_shadow_journal_records_output_in_order`
+  (ignored dev probe; real PTY session, clean scan, contiguous seqs).
+  Suite: 508 passed, 16 ignored.
 - [x] Capability/CLI/API/config/auth inventory for the compatibility break
       — see [M0_INVENTORY.md](M0_INVENTORY.md).
 - [x] ADR ratification at the M0 exit gate: ADR-0002/0003/0006/0007

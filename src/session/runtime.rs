@@ -26,6 +26,7 @@ use crate::{
     session::persist::create_output_log,
 };
 
+use super::journal::{self, Sequencer};
 use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
 use super::scan::{PtyScanner, ScanOut};
 
@@ -723,6 +724,41 @@ pub fn spawn_session(
         let mut scanner = PtyScanner::new();
         let mut scan_out = ScanOut::default();
         let mut output_log = OutputLog::open(&reader_dir);
+        // M1 shadow journal (dev-only, `OLY_JOURNAL=1`): sequence output
+        // records alongside `output.log` without making them canonical yet.
+        let mut shadow_journal = if journal::shadow_enabled() {
+            match Sequencer::open(&reader_dir) {
+                Ok((sequencer, report)) => {
+                    if let Some(report) = &report {
+                        debug!(
+                            session_id = %reader_session_id,
+                            incarnation = report.incarnation,
+                            records = report.records,
+                            last_seq = ?report.last_seq,
+                            stop = ?report.stop,
+                            rewound = report.rewound,
+                            "recovered previous journal incarnation"
+                        );
+                    }
+                    info!(
+                        session_id = %reader_session_id,
+                        incarnation = sequencer.incarnation(),
+                        "shadow journal opened"
+                    );
+                    Some(sequencer)
+                }
+                Err(err) => {
+                    warn!(
+                        session_id = %reader_session_id,
+                        %err,
+                        "failed to open shadow journal; continuing without it"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -780,6 +816,16 @@ pub fn spawn_session(
 
                     if let Err(err) = output_log.append(&filtered) {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
+                    }
+
+                    if let Some(journal) = shadow_journal.as_mut()
+                        && let Err(err) = journal.append(journal::RecordKind::Output, &filtered)
+                    {
+                        warn!(
+                            session_id = %reader_session_id,
+                            %err,
+                            "failed to append output to shadow journal"
+                        );
                     }
 
                     // Broadcast canonical filtered output to all live
