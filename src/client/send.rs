@@ -263,7 +263,7 @@ pub fn parse_key_spec(spec: &str) -> Result<String> {
     }
 
     Err(AppError::Protocol(format!(
-        "unsupported key `{spec}`; use named keys (enter, tab, esc, backspace, up/down/left/right, home/end, pgup/pgdn, del/ins), ctrl+<char>, alt+<char|key>, shift+tab, or hex:<bytes>"
+        "unsupported key `{spec}`; use named keys (enter, tab, esc, backspace, up/down/left/right, home/end, pgup/pgdn, del/ins, f1-f12), ctrl+<char>, alt+<char|key>, shift+tab, or hex:<bytes>"
     )))
 }
 
@@ -284,6 +284,19 @@ pub fn named_key_sequence(normalized: &str) -> Option<&'static str> {
         "insert" | "ins" => Some("\x1b[2~"),
         "pageup" | "pgup" => Some("\x1b[5~"),
         "pagedown" | "pgdn" => Some("\x1b[6~"),
+        // xterm-compatible profile (ADR-0003): F1–F4 SS3, F5+ tilde forms.
+        "f1" => Some("\x1bOP"),
+        "f2" => Some("\x1bOQ"),
+        "f3" => Some("\x1bOR"),
+        "f4" => Some("\x1bOS"),
+        "f5" => Some("\x1b[15~"),
+        "f6" => Some("\x1b[17~"),
+        "f7" => Some("\x1b[18~"),
+        "f8" => Some("\x1b[19~"),
+        "f9" => Some("\x1b[20~"),
+        "f10" => Some("\x1b[21~"),
+        "f11" => Some("\x1b[23~"),
+        "f12" => Some("\x1b[24~"),
         _ => None,
     }
 }
@@ -543,6 +556,16 @@ mod tests {
         assert_eq!(parse_key_spec("tab").unwrap(), "\t");
     }
 
+    #[test]
+    fn test_function_keys_via_parse_key_spec() {
+        // Same xterm-compatible profile as the interactive codec.
+        assert_eq!(parse_key_spec("f1").unwrap(), "\x1bOP");
+        assert_eq!(parse_key_spec("f4").unwrap(), "\x1bOS");
+        assert_eq!(parse_key_spec("f5").unwrap(), "\x1b[15~");
+        assert_eq!(parse_key_spec("F12").unwrap(), "\x1b[24~");
+        assert_eq!(parse_key_spec("alt+f5").unwrap(), "\x1b\x1b[15~");
+    }
+
     // -----------------------------------------------------------------------
     // parse_key_spec – error paths
     // -----------------------------------------------------------------------
@@ -563,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_unsupported_key_is_error() {
-        assert!(parse_key_spec("f1").is_err());
+        assert!(parse_key_spec("f13").is_err());
         assert!(parse_key_spec("ctrl+ab").is_err());
     }
 }

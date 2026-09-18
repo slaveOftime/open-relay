@@ -704,41 +704,161 @@ fn is_clipboard_paste_key(key: KeyEvent) -> bool {
 // Key input mapping
 // ---------------------------------------------------------------------------
 
+/// Encode a key event into the bytes an xterm-compatible terminal would
+/// send (ADR-0003 legacy profile; enhanced keyboard profiles such as the
+/// kitty protocol are a separate negotiated capability and never enabled
+/// implicitly).
+///
+/// Coverage contract: no common key is silently dropped. Modifier
+/// combinations use xterm's parameterized forms; Alt on byte-like keys is
+/// an ESC prefix; the Ctrl+@/digit family sends its legacy control bytes.
 fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
+    let mods = key.modifiers;
+    let alt = mods.contains(KeyModifiers::ALT);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+
+    // xterm's modifier parameter: 1 + Shift(1) + Alt(2) + Ctrl(4).
+    let modifier_param = || -> Option<u8> {
+        let mut value = 1u8;
+        if shift {
+            value += 1;
+        }
+        if alt {
+            value += 2;
+        }
+        if ctrl {
+            value += 4;
+        }
+        (value > 1).then_some(value)
+    };
+
+    // Alt on byte-like keys is an ESC prefix.
+    let alt_prefix = |data: &str| -> String {
+        if alt {
+            format!("\x1b{data}")
+        } else {
+            data.to_string()
+        }
+    };
+
     match key.code {
-        KeyCode::Enter => Some("\r".to_string()),
-        KeyCode::Tab => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                Some("\x1b[Z".to_string())
+        KeyCode::Enter => Some(alt_prefix("\r")),
+        KeyCode::Tab if shift => Some(alt_prefix("\x1b[Z")),
+        KeyCode::Tab => Some(alt_prefix("\t")),
+        KeyCode::BackTab => Some(alt_prefix("\x1b[Z")),
+        KeyCode::Backspace if ctrl => {
+            // Ctrl+Backspace → ASCII BS (0x08) for apps that do not handle DEL.
+            Some(alt_prefix("\x08"))
+        }
+        KeyCode::Backspace => Some(alt_prefix("\x7f")),
+        KeyCode::Esc => Some(if alt {
+            "\x1b\x1b".to_string()
+        } else {
+            "\x1b".to_string()
+        }),
+        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => {
+            let letter = match key.code {
+                KeyCode::Up => 'A',
+                KeyCode::Down => 'B',
+                KeyCode::Right => 'C',
+                _ => 'D',
+            };
+            // Modified arrows are always CSI 1;{mod}{letter} — including
+            // under DECCKM; only the unmodified forms honor the SS3 mode.
+            if let Some(param) = modifier_param() {
+                Some(format!("\x1b[1;{param}{letter}"))
+            } else if app_cursor_keys {
+                Some(format!("\x1bO{letter}"))
             } else {
-                Some("\t".to_string())
+                Some(format!("\x1b[{letter}"))
             }
         }
-        KeyCode::BackTab => Some("\x1b[Z".to_string()),
-        KeyCode::Backspace => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // Ctrl+Backspace → ASCII BS (0x08) for better compatibility with apps that do not handle DEL.
-                Some("\x08".to_string())
+        KeyCode::Home | KeyCode::End => {
+            let letter = if matches!(key.code, KeyCode::Home) {
+                'H'
             } else {
-                // Backspace → ASCII DEL (0x7f) by default, which is what most terminals send and what most apps expect for the Backspace key.
-                Some("\x7f".to_string())
+                'F'
+            };
+            if let Some(param) = modifier_param() {
+                Some(format!("\x1b[1;{param}{letter}"))
+            } else {
+                Some(format!("\x1b[{letter}"))
             }
         }
-        KeyCode::Esc => Some("\x1b".to_string()),
-        KeyCode::Up => Some(if app_cursor_keys { "\x1bOA" } else { "\x1b[A" }.to_string()),
-        KeyCode::Down => Some(if app_cursor_keys { "\x1bOB" } else { "\x1b[B" }.to_string()),
-        KeyCode::Right => Some(if app_cursor_keys { "\x1bOC" } else { "\x1b[C" }.to_string()),
-        KeyCode::Left => Some(if app_cursor_keys { "\x1bOD" } else { "\x1b[D" }.to_string()),
-        KeyCode::Home => Some("\x1b[H".to_string()),
-        KeyCode::End => Some("\x1b[F".to_string()),
-        KeyCode::Delete => Some("\x1b[3~".to_string()),
-        KeyCode::Insert => Some("\x1b[2~".to_string()),
-        KeyCode::PageUp => Some("\x1b[5~".to_string()),
-        KeyCode::PageDown => Some("\x1b[6~".to_string()),
+        KeyCode::Delete | KeyCode::Insert | KeyCode::PageUp | KeyCode::PageDown => {
+            let number = match key.code {
+                KeyCode::Insert => 2,
+                KeyCode::Delete => 3,
+                KeyCode::PageUp => 5,
+                _ => 6,
+            };
+            if let Some(param) = modifier_param() {
+                Some(format!("\x1b[{number};{param}~"))
+            } else {
+                Some(format!("\x1b[{number}~"))
+            }
+        }
+        KeyCode::F(n) => {
+            // F1–F4 use SS3 final bytes unmodified and CSI 1;{mod}{P..S}
+            // modified; F5+ use the tilde forms.
+            let ss3_letter = match n {
+                1 => Some('P'),
+                2 => Some('Q'),
+                3 => Some('R'),
+                4 => Some('S'),
+                _ => None,
+            };
+            if let Some(letter) = ss3_letter {
+                if let Some(param) = modifier_param() {
+                    Some(format!("\x1b[1;{param}{letter}"))
+                } else {
+                    Some(format!("\x1bO{letter}"))
+                }
+            } else {
+                let number = match n {
+                    5 => 15,
+                    6 => 17,
+                    7 => 18,
+                    8 => 19,
+                    9 => 20,
+                    10 => 21,
+                    11 => 23,
+                    _ => 24,
+                };
+                if let Some(param) = modifier_param() {
+                    Some(format!("\x1b[{number};{param}~"))
+                } else {
+                    Some(format!("\x1b[{number}~"))
+                }
+            }
+        }
         KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                let code = (c.to_ascii_lowercase() as u8) & 0x1f;
-                Some((code as char).to_string())
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                // The Ctrl+@/digit family carries legacy control bytes in
+                // every mainstream terminal (NUL, ESC, FS, GS, RS, US, DEL);
+                // `ch & 0x1f` on digit glyphs would send the wrong bytes.
+                let legacy = match lower {
+                    '2' | ' ' => Some('\0'),
+                    '3' | '[' => Some('\x1b'),
+                    '4' | '\\' => Some('\x1c'),
+                    '5' | ']' => Some('\x1d'),
+                    '6' | '^' | '~' => Some('\x1e'),
+                    '7' | '_' => Some('\x1f'),
+                    '8' => Some('\x7f'),
+                    _ => None,
+                };
+                if let Some(byte) = legacy {
+                    return Some(alt_prefix(&byte.to_string()));
+                }
+                if !c.is_ascii() {
+                    return None;
+                }
+                let byte = (lower as u8) & 0x1f;
+                Some(alt_prefix(&(byte as char).to_string()))
+            } else if alt {
+                Some(format!("\x1b{c}"))
             } else {
                 Some(c.to_string())
             }
@@ -1315,7 +1435,6 @@ mod tests {
     /// encoding an xterm-class terminal sends. Enhanced keyboard profiles
     /// (kitty protocol) are a separate negotiated capability.
     #[test]
-    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): Alt+<char> must be ESC-prefixed"]
     fn repro_alt_char_is_esc_prefixed() {
         assert_eq!(
             map_key_to_input(key(KeyCode::Char('x'), KeyModifiers::ALT), false),
@@ -1324,7 +1443,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): modifiers on arrow keys must be parameterized"]
     fn repro_ctrl_arrow_is_parameterized() {
         assert_eq!(
             map_key_to_input(key(KeyCode::Up, KeyModifiers::CONTROL), false),
@@ -1333,7 +1451,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): the Ctrl+@/digit family must send its legacy control bytes"]
     fn repro_ctrl_digit_family_sends_legacy_control_bytes() {
         // Ctrl+2 through Ctrl+8 duplicate the C0 control characters in
         // every mainstream terminal (NUL, ESC, FS, GS, RS, US, DEL).
@@ -1355,11 +1472,109 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M0 reproduction (ADR-0003, xterm-compatible profile): function keys must not be silently dropped"]
     fn repro_function_keys_are_mapped() {
         assert_eq!(
             map_key_to_input(key(KeyCode::F(5), KeyModifiers::NONE), false),
             Some("\x1b[15~".to_string())
+        );
+    }
+
+    #[test]
+    fn alt_prefixes_byte_like_keys() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Enter, KeyModifiers::ALT), false),
+            Some("\x1b\r".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Tab, KeyModifiers::ALT), false),
+            Some("\x1b\t".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Esc, KeyModifiers::ALT), false),
+            Some("\x1b\x1b".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Backspace, KeyModifiers::ALT), false),
+            Some("\x1b\x7f".to_string())
+        );
+    }
+
+    #[test]
+    fn modifiers_parameterize_home_delete_page_keys() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Home, KeyModifiers::SHIFT), false),
+            Some("\x1b[1;2H".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Delete, KeyModifiers::CONTROL), false),
+            Some("\x1b[3;5~".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::PageUp, KeyModifiers::ALT), false),
+            Some("\x1b[5;3~".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(
+                key(KeyCode::End, KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+                false
+            ),
+            Some("\x1b[1;6F".to_string())
+        );
+    }
+
+    #[test]
+    fn modified_arrows_ignore_app_cursor_keys_mode() {
+        // DECCKM selects the SS3 form only for unmodified arrows; modified
+        // arrows are always CSI 1;{mod}{letter} (xterm behavior).
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Left, KeyModifiers::CONTROL), true),
+            Some("\x1b[1;5D".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Up, KeyModifiers::NONE), true),
+            Some("\x1bOA".to_string())
+        );
+    }
+
+    #[test]
+    fn function_keys_cover_f1_through_f12_with_modifiers() {
+        let unmodified = [
+            "\x1bOP",   // F1
+            "\x1bOQ",   // F2
+            "\x1bOR",   // F3
+            "\x1bOS",   // F4
+            "\x1b[15~", // F5
+            "\x1b[17~", // F6
+            "\x1b[18~", // F7
+            "\x1b[19~", // F8
+            "\x1b[20~", // F9
+            "\x1b[21~", // F10
+            "\x1b[23~", // F11
+            "\x1b[24~", // F12
+        ];
+        for (n, expected) in (1u8..=12).zip(unmodified) {
+            assert_eq!(
+                map_key_to_input(key(KeyCode::F(n), KeyModifiers::NONE), false),
+                Some(expected.to_string()),
+                "F{n}"
+            );
+        }
+        // Modified low F-keys switch to the parameterized CSI form,
+        // modified high F-keys add the modifier parameter.
+        assert_eq!(
+            map_key_to_input(key(KeyCode::F(1), KeyModifiers::SHIFT), false),
+            Some("\x1b[1;2P".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(
+                key(KeyCode::F(5), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                false
+            ),
+            Some("\x1b[15;6~".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::F(12), KeyModifiers::ALT), false),
+            Some("\x1b[24;3~".to_string())
         );
     }
 }
