@@ -221,6 +221,29 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
   JRN-AAAA → JRN-BBBB → Resize(40,120) → JRN-CCCC → … → Killed` with
   contiguous seqs and a clean scan. Suite: 519 passed, 16 ignored;
   clippy baseline unchanged (80 with `--all-targets`).
+
+### Increment 4: fixed-range reads + group-sync cadence
+
+- `journal::read_range(session_dir, incarnation, from_seq, to_seq,
+  max_bytes)` (I3): the internal fixed-range read API. Returns the
+  in-window records contiguous and in order; validates integrity and
+  continuity of the whole consumed **prefix** (corruption before the
+  window surfaces instead of presenting a hole); stops early once the
+  window completes; the byte budget always includes the first in-window
+  record so callers can always make progress, and `truncated` tells the
+  caller to resume at `last_seq + 1`. On a live segment
+  `ScanStop::PartialTail` simply means "append in progress".
+- The appender now group-syncs on a cadence (default
+  `DEFAULT_SYNC_INTERVAL = 50ms`, ADR-0002's deferred 20/50/100 decision
+  — configurable via `spawn_with_sync_interval` /
+  `ShadowJournal::open_with_sync_interval` for the eventual probe), so
+  `durable_seq` advances in production without per-record `fsync` on the
+  ingest path. Explicit `request_sync` remains for immediate flushes.
+- Verified: window exactness, past-end clamping, invalid-arg/NotFound
+  rejection, budget truncation + resume, prefix-corruption surfacing on
+  out-of-window reads, and cadence-driven `durable_seq` progress with no
+  explicit sync. Suite: 524 passed, 16 ignored; clippy baseline
+  unchanged (80); real-PTY shadow probe re-run.
 - [x] Capability/CLI/API/config/auth inventory for the compatibility break
       — see [M0_INVENTORY.md](M0_INVENTORY.md).
 - [x] ADR ratification at the M0 exit gate: ADR-0002/0003/0006/0007

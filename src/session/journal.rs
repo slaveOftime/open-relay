@@ -329,6 +329,10 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 /// submission is rejected and the session degrades explicitly — memory
 /// cannot grow indefinitely (PLAN.md §4.2).
 pub const DEFAULT_QUEUE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Default group-sync cadence: the appender syncs at most this long after
+/// the last unsynced append, bounding the crash-loss window without
+/// per-record `fsync` latency on the ingest path (ADR-0002).
+pub const DEFAULT_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The in-memory sequencing authority (PLAN.md §4.1/§4.2, invariants
 /// I1/I8). Allocates monotonic `seq` and monotonic `elapsed_ms` **before**
@@ -503,6 +507,20 @@ impl JournalAppender {
         Option<RecoveryReport>,
         std::sync::mpsc::Receiver<JournalAck>,
     )> {
+        Self::spawn_with_sync_interval(session_dir, DEFAULT_SYNC_INTERVAL)
+    }
+
+    /// Like [`Self::spawn`], with an explicit group-sync cadence (tests,
+    /// and the cadence probe that feeds the ADR-0002 decision).
+    pub fn spawn_with_sync_interval(
+        session_dir: &Path,
+        sync_interval: std::time::Duration,
+    ) -> io::Result<(
+        Self,
+        u64,
+        Option<RecoveryReport>,
+        std::sync::mpsc::Receiver<JournalAck>,
+    )> {
         let opened = open(session_dir)?;
         let (tx, rx) = std::sync::mpsc::sync_channel(DEFAULT_QUEUE_CAPACITY);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
@@ -510,7 +528,9 @@ impl JournalAppender {
         let worker_queued = std::sync::Arc::clone(&queued_bytes);
         std::thread::Builder::new()
             .name("journal-appender".to_string())
-            .spawn(move || appender_loop(opened.writer, rx, ack_tx, worker_queued))?;
+            .spawn(move || {
+                appender_loop(opened.writer, rx, ack_tx, worker_queued, sync_interval)
+            })?;
         Ok((
             Self {
                 tx,
@@ -588,10 +608,12 @@ fn appender_loop(
     rx: std::sync::mpsc::Receiver<AppenderMsg>,
     ack_tx: std::sync::mpsc::Sender<JournalAck>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    sync_interval: std::time::Duration,
 ) {
     use std::sync::atomic::Ordering;
     let mut expected_seq = 1u64;
     let mut last_written = 0u64;
+    let mut last_durable = 0u64;
     let mut dead: Option<String> = None;
 
     let fail = |ack_tx: &std::sync::mpsc::Sender<JournalAck>,
@@ -601,19 +623,36 @@ fn appender_loop(
         let _ = ack_tx.send(JournalAck::Failed(reason));
     };
 
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            AppenderMsg::Shutdown => break,
-            AppenderMsg::Sync => {
+    loop {
+        match rx.recv_timeout(sync_interval) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Group-sync cadence: flush whatever accumulated since the
+                // last sync. Idle periods cost nothing.
+                if dead.is_none() && last_written > last_durable {
+                    match writer.sync() {
+                        Ok(()) => {
+                            last_durable = last_written;
+                            let _ = ack_tx.send(JournalAck::Durable(last_durable));
+                        }
+                        Err(err) => {
+                            fail(&ack_tx, &mut dead, format!("journal sync failed: {err}"));
+                        }
+                    }
+                }
+            }
+            Ok(AppenderMsg::Shutdown) => break,
+            Ok(AppenderMsg::Sync) => {
                 if let Some(reason) = &dead {
                     let _ = ack_tx.send(JournalAck::Failed(reason.clone()));
                 } else if let Err(err) = writer.sync() {
                     fail(&ack_tx, &mut dead, format!("journal sync failed: {err}"));
                 } else {
-                    let _ = ack_tx.send(JournalAck::Durable(last_written));
+                    last_durable = last_written;
+                    let _ = ack_tx.send(JournalAck::Durable(last_durable));
                 }
             }
-            AppenderMsg::Record(event) => {
+            Ok(AppenderMsg::Record(event)) => {
                 queued_bytes.fetch_sub(event.payload.len(), Ordering::Relaxed);
                 if let Some(reason) = &dead {
                     let _ = ack_tx.send(JournalAck::Failed(reason.clone()));
@@ -733,7 +772,15 @@ pub struct ShadowJournal {
 
 impl ShadowJournal {
     pub fn open(session_dir: &Path) -> io::Result<(Self, u64, Option<RecoveryReport>)> {
-        let (appender, incarnation, report, acks) = JournalAppender::spawn(session_dir)?;
+        Self::open_with_sync_interval(session_dir, DEFAULT_SYNC_INTERVAL)
+    }
+
+    pub fn open_with_sync_interval(
+        session_dir: &Path,
+        sync_interval: std::time::Duration,
+    ) -> io::Result<(Self, u64, Option<RecoveryReport>)> {
+        let (appender, incarnation, report, acks) =
+            JournalAppender::spawn_with_sync_interval(session_dir, sync_interval)?;
         Ok((
             Self {
                 core: SequencerCore::new(incarnation),
@@ -888,9 +935,80 @@ impl ScanOutcome {
 /// (`ScanStop::PartialTail`). Anything else is corruption, not a tear — the
 /// caller quarantines and reports it instead of silently continuing.
 pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
+    Ok(scan_impl(path, None)?.0)
+}
+
+/// Result of a fixed-range read: the in-window records (contiguous, in
+/// order), the integrity status of the consumed prefix, and whether the
+/// byte budget cut the window short.
+///
+/// `stop` reports stream integrity of everything read up to the stopping
+/// point. On a **live** segment `ScanStop::PartialTail` is normal — it
+/// means "more is being appended right now", not corruption. When
+/// `truncated` is set, retry with `from_seq = last_returned_seq + 1`.
+#[derive(Debug)]
+pub struct RangeRead {
+    pub records: Vec<Record>,
+    pub stop: ScanStop,
+    pub truncated: bool,
+}
+
+/// Read the records of one incarnation whose sequences fall inside
+/// `from_seq..=to_seq`, buffering at most `max_bytes` of payload (the
+/// first in-window record is always included, even if it alone exceeds
+/// the budget). Continuity and integrity of the whole consumed prefix are
+/// still validated — a range read never presents a silent hole (I3).
+pub fn read_range(
+    session_dir: &Path,
+    incarnation: u64,
+    from_seq: u64,
+    to_seq: u64,
+    max_bytes: usize,
+) -> io::Result<RangeRead> {
+    if from_seq == 0 || from_seq > to_seq {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid journal range {from_seq}..={to_seq}"),
+        ));
+    }
+    let path = segment_path(&session_dir.join(JOURNAL_DIR_NAME), incarnation);
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no journal segment for incarnation {incarnation}"),
+        ));
+    }
+    let (outcome, truncated) = scan_impl(
+        &path,
+        Some(CollectWindow {
+            from_seq,
+            to_seq,
+            max_buffered_bytes: max_bytes,
+        }),
+    )?;
+    Ok(RangeRead {
+        records: outcome.records,
+        stop: outcome.stop,
+        truncated,
+    })
+}
+
+/// Window/budget for a range read; `None` collects everything.
+struct CollectWindow {
+    from_seq: u64,
+    to_seq: u64,
+    max_buffered_bytes: usize,
+}
+
+fn scan_impl(
+    path: &Path,
+    window: Option<CollectWindow>,
+) -> io::Result<(ScanOutcome, bool /* truncated */)> {
     let mut file = fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut records = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut truncated = false;
     let mut offset = 0u64;
     let mut expected_seq: Option<u64> = None;
 
@@ -898,58 +1016,88 @@ pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
         let mut header = [0u8; HEADER_LEN];
         match read_exact_or_partial(&mut file, &mut header)? {
             ReadPiece::Complete => {}
-            ReadPiece::Partial => return Ok(outcome(records, offset, ScanStop::PartialTail)),
+            ReadPiece::Partial => {
+                return Ok((outcome(records, offset, ScanStop::PartialTail), truncated));
+            }
             ReadPiece::Empty => {
                 debug_assert_eq!(offset, file_len, "EOF only at the real end");
-                return Ok(outcome(records, offset, ScanStop::CleanEof));
+                return Ok((outcome(records, offset, ScanStop::CleanEof), truncated));
             }
         }
 
         if &header[..4] != RECORD_MAGIC {
-            return Ok(outcome(records, offset, ScanStop::InvalidHeader));
+            return Ok((outcome(records, offset, ScanStop::InvalidHeader), truncated));
         }
         if u16::from_le_bytes(header[4..6].try_into().unwrap()) != RECORD_VERSION {
-            return Ok(outcome(records, offset, ScanStop::UnsupportedVersion));
+            return Ok((
+                outcome(records, offset, ScanStop::UnsupportedVersion),
+                truncated,
+            ));
         }
         let kind = match RecordKind::from_u16(u16::from_le_bytes(header[6..8].try_into().unwrap()))
         {
             Some(kind) => kind,
-            None => return Ok(outcome(records, offset, ScanStop::UnknownKind)),
+            None => return Ok((outcome(records, offset, ScanStop::UnknownKind), truncated)),
         };
         let payload_len = u32::from_le_bytes(header[28..32].try_into().unwrap());
         if payload_len > MAX_PAYLOAD_LEN {
-            return Ok(outcome(records, offset, ScanStop::OversizeLength));
+            return Ok((
+                outcome(records, offset, ScanStop::OversizeLength),
+                truncated,
+            ));
+        }
+
+        let seq = u64::from_le_bytes(header[12..20].try_into().unwrap());
+        if let Some(window) = &window
+            && seq > window.to_seq
+        {
+            // Past the requested window: the whole window was present and
+            // contiguous. Nothing beyond it needs validation here.
+            return Ok((outcome(records, offset, ScanStop::CleanEof), truncated));
         }
 
         let mut payload = vec![0u8; payload_len as usize];
         match read_exact_or_partial(&mut file, &mut payload)? {
             ReadPiece::Complete => {}
             ReadPiece::Partial | ReadPiece::Empty => {
-                return Ok(outcome(records, offset, ScanStop::PartialTail));
+                return Ok((outcome(records, offset, ScanStop::PartialTail), truncated));
             }
         }
 
         let stored_crc = u32::from_le_bytes(header[32..36].try_into().unwrap());
         if crc32_two(&header[..32], &payload) != stored_crc {
-            return Ok(outcome(records, offset, ScanStop::CrcMismatch));
+            return Ok((outcome(records, offset, ScanStop::CrcMismatch), truncated));
         }
 
-        let seq = u64::from_le_bytes(header[12..20].try_into().unwrap());
         if let Some(expected) = expected_seq
             && seq != expected
         {
             // A sequence gap means an earlier record was lost or the tail was
             // aliased: stop here so recovery never presents a silent hole.
-            return Ok(outcome(records, offset, ScanStop::SequenceDiscontinuity));
+            return Ok((
+                outcome(records, offset, ScanStop::SequenceDiscontinuity),
+                truncated,
+            ));
         }
         expected_seq = Some(seq + 1);
 
-        records.push(Record {
-            kind,
-            seq,
-            elapsed_ms: u64::from_le_bytes(header[20..28].try_into().unwrap()),
-            payload,
-        });
+        let in_window = window.as_ref().is_none_or(|window| seq >= window.from_seq);
+        if in_window {
+            let over_budget = window.as_ref().is_some_and(|window| {
+                !records.is_empty() && buffered_bytes + payload.len() > window.max_buffered_bytes
+            });
+            if over_budget {
+                truncated = true;
+                return Ok((outcome(records, offset, ScanStop::CleanEof), truncated));
+            }
+            buffered_bytes += payload.len();
+            records.push(Record {
+                kind,
+                seq,
+                elapsed_ms: u64::from_le_bytes(header[20..28].try_into().unwrap()),
+                payload,
+            });
+        }
         offset += (HEADER_LEN + payload_len as usize) as u64;
         file.seek(SeekFrom::Start(offset))?;
     }
@@ -1625,6 +1773,131 @@ mod tests {
             decode_lifecycle_payload(&outcome.records[5].payload),
             Some((LifecycleCode::Stopped, Some(0), "exit"))
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Fixed-range reads (I3) --
+
+    fn write_ten_record_segment(dir: &Path) {
+        let mut opened = open(dir).unwrap();
+        for seq in 1..=10u64 {
+            opened
+                .writer
+                .append_record(
+                    RecordKind::Output,
+                    seq,
+                    seq,
+                    format!("payload-{seq:02}").as_bytes(),
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn read_range_returns_exactly_the_requested_window() {
+        let dir = test_session_dir("range_window");
+        write_ten_record_segment(&dir);
+
+        let read = read_range(&dir, 1, 3, 5, usize::MAX).unwrap();
+        assert!(!read.truncated);
+        assert_eq!(read.stop, ScanStop::CleanEof);
+        assert_eq!(
+            read.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        assert_eq!(read.records[0].payload, b"payload-03".to_vec());
+
+        // A window past the end clamps to what exists.
+        let read = read_range(&dir, 1, 8, 100, usize::MAX).unwrap();
+        assert_eq!(
+            read.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_range_rejects_invalid_arguments_and_missing_incarnations() {
+        let dir = test_session_dir("range_args");
+        write_ten_record_segment(&dir);
+
+        assert!(read_range(&dir, 1, 0, 5, usize::MAX).is_err());
+        assert!(read_range(&dir, 1, 6, 5, usize::MAX).is_err());
+        let missing = read_range(&dir, 2, 1, 5, usize::MAX).unwrap_err();
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_range_byte_budget_truncates_without_a_hole() {
+        let dir = test_session_dir("range_budget");
+        write_ten_record_segment(&dir);
+
+        // Each payload is 10 bytes; a 25-byte budget fits two records.
+        let read = read_range(&dir, 1, 1, 10, 25).unwrap();
+        assert!(read.truncated);
+        assert_eq!(
+            read.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        // Resume where the budget cut the window.
+        let rest = read_range(&dir, 1, 3, 10, usize::MAX).unwrap();
+        assert!(!rest.truncated);
+        assert_eq!(rest.records.len(), 8);
+
+        // The first in-window record is always included, even when it
+        // alone exceeds the budget, so callers can always make progress.
+        let read = read_range(&dir, 1, 1, 10, 1).unwrap();
+        assert!(read.truncated);
+        assert_eq!(read.records.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_range_validates_the_prefix_before_the_window() {
+        let dir = test_session_dir("range_prefix");
+        write_ten_record_segment(&dir);
+
+        // Corrupt record 2's payload, then read a later window: the
+        // corruption is in the consumed prefix and must surface.
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn");
+        let mut bytes = fs::read(&segment).unwrap();
+        let record_len = HEADER_LEN + 10;
+        bytes[record_len + HEADER_LEN] ^= 0xFF;
+        fs::write(&segment, &bytes).unwrap();
+
+        let read = read_range(&dir, 1, 5, 7, usize::MAX).unwrap();
+        assert_eq!(read.stop, ScanStop::CrcMismatch);
+        assert!(read.records.is_empty(), "no window data past corruption");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_cadence_advances_durable_seq_without_explicit_requests() {
+        let dir = test_session_dir("sync_cadence");
+        let (mut shadow, _, _) =
+            ShadowJournal::open_with_sync_interval(&dir, std::time::Duration::from_millis(10))
+                .unwrap();
+        shadow
+            .record_output(bytes::Bytes::from_static(b"tick"))
+            .unwrap();
+
+        // No request_sync: the cadence tick must flush on its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.durable_seq() < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cadence sync timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            shadow.poll_acks();
+        }
+        assert_eq!(shadow.core.durable_seq(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
