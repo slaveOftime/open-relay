@@ -97,6 +97,30 @@ clients keep receiving bytes the log will never contain.
   20/50/100 ms). Default is 50 ms (`DEFAULT_SYNC_INTERVAL`); revisit with
   production workloads in M3.
 
+## Addendum (post-M4 audit): retention tombstones and self-healing open
+
+The M2–M4 audit found that checkpoint-gated retention, the sealed-part
+manifest, and `oly doctor` verification were not mutually coherent: deleting
+an incarnation's part files left no record, so a crash mid-retention was
+indistinguishable from tampering, and a crashed rotation could leave an
+unmanifested part that doctor could not classify. Two rules close the gap:
+
+1. **Tombstone before delete.** `retain_before` appends a
+   `{"retired": N}` manifest line *before* removing incarnation N's part
+   files (newest-first, so concurrent readers only ever see a prefix,
+   never a hole). Verification skips tombstoned incarnations but reports
+   leftover part files as incomplete retention; `open` completes the
+   interrupted retention itself. Tombstoned incarnation numbers are never
+   reused — the next incarnation is bounded by the highest tombstone even
+   when no segment files remain. Manifest lines are an untagged enum;
+   sealed-part entries keep their original bare JSON shape, so journals
+   written before tombstones parse unchanged (no migration).
+2. **Seal-at-open reconciliation.** After the existing tail recovery, `open`
+   seals any validated unmanifested part (clean EOF or torn tail), removes
+   empty crash-leftover parts, and leaves genuinely invalid parts for
+   doctor to report. After a clean `open`, every non-active part on disk
+   is manifested — the invariant doctor verifies.
+
 ## Migration
 
 0.x `output.log`/`events.log` import as provenance-labeled legacy recordings;

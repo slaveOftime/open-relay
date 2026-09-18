@@ -816,3 +816,117 @@ fn e2e_list_empty_shows_no_sessions_hint() {
         "expected 'No sessions' hint.\nstdout:\n{stdout}"
     );
 }
+
+/// W4 protocol evidence: a real WS attach against a live daemon — INIT frame
+/// layout, controller role, gated input, contiguously offset DATA frames
+/// (I2), ping/pong, graceful detach — with the canonical journal staying
+/// doctor-clean throughout.
+#[test]
+fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_ws_attach_frames");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http(&tmp, port);
+    // `cat` echoes input back: send bytes, expect them back in DATA frames.
+    let id = start_session(&tmp, &["cat"]);
+
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let ws_url = format!("ws://127.0.0.1:{port}/api/sessions/{id}/attach");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .expect("connect attach websocket");
+
+        // INIT: [1][flags][endOffset u64be][incarnation u64be][running u8]
+        //       [attachmentId u64be][role u8][data]
+        let init = timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("init frame timeout")
+            .expect("ws open")
+            .expect("ws read");
+        let WsMessage::Binary(init) = init else {
+            panic!("expected binary INIT frame, got: {init:?}")
+        };
+        assert_eq!(init[0], 1, "first frame must be INIT");
+        assert!(init.len() >= 28, "INIT header is 28 bytes");
+        let mut expected_offset = u64::from_be_bytes(init[2..10].try_into().unwrap());
+        let incarnation = u64::from_be_bytes(init[10..18].try_into().unwrap());
+        assert!(
+            incarnation >= 1,
+            "a journaled session reports its incarnation in INIT"
+        );
+        assert_eq!(init[18], 1, "session is running");
+        let attachment_id = u64::from_be_bytes(init[19..27].try_into().unwrap());
+        assert!(attachment_id >= 1, "attachment fencing token is assigned");
+        assert_eq!(init[27], 1, "the sole attacher is the controller");
+
+        // Controller input flows; the echoed bytes arrive in DATA frames
+        // whose offsets continue the init cursor exactly (I2).
+        ws.send(WsMessage::Text(
+            r#"{"type":"input","data":"hello-ws\n","waitForChange":false}"#.into(),
+        ))
+        .await
+        .expect("send input");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut echoed: Vec<u8> = Vec::new();
+        while !echoed.windows(b"hello-ws".len()).any(|w| w == b"hello-ws") {
+            assert!(
+                Instant::now() < deadline,
+                "echoed input did not arrive in DATA frames; got: {}",
+                String::from_utf8_lossy(&echoed)
+            );
+            let frame = timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("data frame timeout")
+                .expect("ws open")
+                .expect("ws read");
+            let WsMessage::Binary(bytes) = frame else {
+                panic!("expected binary frame, got: {frame:?}")
+            };
+            match bytes[0] {
+                2 => {
+                    let offset = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
+                    assert_eq!(
+                        offset, expected_offset,
+                        "DATA offsets must continue the stream cursor exactly (I2)"
+                    );
+                    expected_offset += (bytes.len() - 9) as u64;
+                    echoed.extend_from_slice(&bytes[9..]);
+                }
+                // mode/resize/control notices are legitimate interleavings.
+                3 | 4 | 8 => {}
+                other => panic!("unexpected frame tag {other}"),
+            }
+        }
+
+        // Liveness: ping is answered with a PONG frame.
+        ws.send(WsMessage::Text(r#"{"type":"ping"}"#.into()))
+            .await
+            .expect("send ping");
+        let pong = timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("pong timeout")
+            .expect("ws open")
+            .expect("ws read");
+        let WsMessage::Binary(pong) = pong else {
+            panic!("expected binary PONG frame, got: {pong:?}")
+        };
+        assert_eq!(pong[0], 7, "ping must be answered with PONG");
+
+        ws.send(WsMessage::Text(r#"{"type":"detach"}"#.into()))
+            .await
+            .expect("send detach");
+    });
+
+    // The whole exchange ran against the canonical journal: doctor is clean.
+    let doctor = oly_cmd(&tmp)
+        .args(["doctor", &id])
+        .output()
+        .expect("run doctor");
+    assert!(
+        doctor.status.success(),
+        "doctor must stay clean after the WS attach.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+}

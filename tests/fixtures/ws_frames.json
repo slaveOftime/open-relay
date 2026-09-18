@@ -1,0 +1,85 @@
+{
+  "version": 1,
+  "description": "Shared WS server-frame conformance vectors (ADR-0004). The Rust encoder test (src/http/ws.rs) builds each ServerMessage from `expect` and asserts the encoded bytes equal `hex`; the web decoder test (web/src/api/ws-frames.test.ts) parses `hex` and asserts the decoded fields equal `expect`. Update both sides together; never edit `hex` without regenerating from the Rust encoder.",
+  "frames": [
+    {
+      "name": "init_controller_with_data",
+      "hex": "01030000000000001000000000000000000901000000000000002a0168656c6c6f",
+      "expect": {
+        "type": "init",
+        "app_cursor_keys": true,
+        "bracketed_paste_mode": true,
+        "end_offset": 4096,
+        "incarnation": 9,
+        "running": true,
+        "attachment_id": 42,
+        "role": "controller",
+        "data_hex": "68656c6c6f"
+      }
+    },
+    {
+      "name": "init_observer_empty",
+      "hex": "01000000000000000000000000000000000100000000000000000700",
+      "expect": {
+        "type": "init",
+        "app_cursor_keys": false,
+        "bracketed_paste_mode": false,
+        "end_offset": 0,
+        "incarnation": 1,
+        "running": false,
+        "attachment_id": 7,
+        "role": "observer",
+        "data_hex": ""
+      }
+    },
+    {
+      "name": "data",
+      "hex": "020000000000001000776f726c640a",
+      "expect": { "type": "data", "offset": 4096, "data_hex": "776f726c640a" }
+    },
+    {
+      "name": "mode_changed",
+      "hex": "0302",
+      "expect": {
+        "type": "mode_changed",
+        "app_cursor_keys": false,
+        "bracketed_paste_mode": true
+      }
+    },
+    {
+      "name": "resized",
+      "hex": "0400180050",
+      "expect": { "type": "resized", "rows": 24, "cols": 80 }
+    },
+    {
+      "name": "session_ended_with_code",
+      "hex": "0501000000070000000000003039",
+      "expect": { "type": "session_ended", "exit_code": 7, "final_offset": 12345 }
+    },
+    {
+      "name": "session_ended_without_code",
+      "hex": "05000000000000000000",
+      "expect": { "type": "session_ended", "exit_code": null, "final_offset": 0 }
+    },
+    {
+      "name": "error",
+      "hex": "06626f6f6d",
+      "expect": { "type": "error", "message": "boom" }
+    },
+    {
+      "name": "control_controller",
+      "hex": "0801",
+      "expect": { "type": "control", "role": "controller" }
+    },
+    {
+      "name": "control_observer",
+      "hex": "0800",
+      "expect": { "type": "control", "role": "observer" }
+    },
+    {
+      "name": "pong",
+      "hex": "07",
+      "expect": { "type": "pong" }
+    }
+  ]
+}

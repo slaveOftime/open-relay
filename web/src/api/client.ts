@@ -15,6 +15,7 @@ import type {
   UpdateSessionMetadataSpec,
 } from './types.ts'
 import { AuthRequiredError, TooManyAttemptsError } from './types.ts'
+import { parseServerFrame } from './ws-frames.ts'
 
 const BASE = '/api'
 
@@ -432,29 +433,15 @@ export function subscribeEvents(
 // WebSocket PTY attach
 // ---------------------------------------------------------------------------
 
-const textDecoder = new TextDecoder()
 // Binary attach frames (M3-3): every data-carrying frame names its stream
 // cursor so the client can verify the C/C+1 boundary — contiguous,
 // gap-free application of the canonical stream (PLAN §7.2, invariant I2).
-//   INIT:   [tag=1][flags:1][endOffset:u64be][incarnation:u64be][running:u8][data]
-//   DATA:   [tag=2][offset:u64be][data]
-//   ENDED:  [tag=5][hasExitCode:u8][exitCode:i32be][finalOffset:u64be]
-const WS_FRAME_INIT = 1
-const WS_FRAME_DATA = 2
-const WS_FRAME_MODE_CHANGED = 3
-const WS_FRAME_RESIZED = 4
-const WS_FRAME_SESSION_ENDED = 5
-const WS_FRAME_ERROR = 6
-const WS_FRAME_PONG = 7
-const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
-const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
-const WS_INIT_HEADER_LEN = 28
-const WS_FRAME_CONTROL = 8
+// Decoding lives in ./ws-frames.ts so the wire format is pinned against the
+// shared fixture tests/fixtures/ws_frames.json (encoder and decoder can
+// never drift apart without a test failing).
 
 /** Applied-cursor credit cadence (M3-5): at most one ack per MiB. */
 const WS_ACK_STRIDE_BYTES = 1024 * 1024
-const WS_DATA_HEADER_LEN = 9
-const WS_ENDED_LEN = 14
 
 export interface AttachOptions {
   /** Called with decoded terminal bytes that recreate the current visible session state. */
@@ -515,42 +502,29 @@ export class AttachSocket {
     this.ws.onmessage = (e) => {
       try {
         if (!(e.data instanceof ArrayBuffer)) return
+        const frame = parseServerFrame(new Uint8Array(e.data))
+        if (!frame) return
 
-        const bytes = new Uint8Array(e.data)
-        if (bytes.length === 0) return
-        const tag = bytes[0]
-        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-
-        switch (tag) {
-          case WS_FRAME_INIT: {
-            if (bytes.length < WS_INIT_HEADER_LEN) return
-            const flags = bytes[1]
-            const endOffset = Number(view.getBigUint64(2, false))
-            this.expectedOffset = endOffset
-            // [19..27] attachment id, [27] role — M3-4 control lease fields.
-            this.role = bytes[27] === 1 ? 'controller' : 'observer'
+        switch (frame.type) {
+          case 'init': {
+            this.expectedOffset = frame.endOffset
+            this.role = frame.role
             opts.onControl?.(this.role)
-            opts.onInit(
-              bytes.subarray(WS_INIT_HEADER_LEN),
-              (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
-              (flags & WS_FLAG_BRACKETED_PASTE_MODE) !== 0
-            )
+            opts.onInit(frame.data, frame.appCursorKeys, frame.bracketedPasteMode)
             return
           }
-          case WS_FRAME_DATA: {
-            if (bytes.length < WS_DATA_HEADER_LEN) return
-            const offset = Number(view.getBigUint64(1, false))
-            if (this.expectedOffset !== null && offset !== this.expectedOffset) {
+          case 'data': {
+            if (this.expectedOffset !== null && frame.offset !== this.expectedOffset) {
               // A gap or overlap means the rendered screen would be corrupt;
               // abort loudly instead of applying out-of-order bytes (I2).
               opts.onError(
-                `attach stream cursor mismatch: expected offset ${this.expectedOffset}, chunk starts at ${offset}`
+                `attach stream cursor mismatch: expected offset ${this.expectedOffset}, chunk starts at ${frame.offset}`
               )
               this.ws.close()
               return
             }
-            this.expectedOffset = offset + (bytes.length - WS_DATA_HEADER_LEN)
-            opts.onData(bytes.subarray(WS_DATA_HEADER_LEN))
+            this.expectedOffset = frame.offset + frame.data.length
+            opts.onData(frame.data)
             // Applied-cursor credit (M3-5): bytes handed to the renderer
             // count as applied; credit at most once per MiB.
             if (this.expectedOffset >= this.lastAckedOffset + WS_ACK_STRIDE_BYTES) {
@@ -559,46 +533,34 @@ export class AttachSocket {
             }
             return
           }
-          case WS_FRAME_MODE_CHANGED: {
-            const flags = bytes[1] ?? 0
-            opts.onModeChanged(
-              (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
-              (flags & WS_FLAG_BRACKETED_PASTE_MODE) !== 0
-            )
+          case 'modeChanged':
+            opts.onModeChanged(frame.appCursorKeys, frame.bracketedPasteMode)
             return
-          }
-          case WS_FRAME_RESIZED:
-            if (bytes.length >= 5) {
-              opts.onResized?.(view.getUint16(1, false), view.getUint16(3, false))
-            }
+          case 'resized':
+            opts.onResized?.(frame.rows, frame.cols)
             return
-          case WS_FRAME_SESSION_ENDED: {
-            const hasExitCode = bytes[1] === 1
-            const exitCode = hasExitCode && bytes.length >= 6 ? view.getInt32(2, false) : null
-            const finalOffset =
-              bytes.length >= WS_ENDED_LEN ? Number(view.getBigUint64(6, false)) : 0
+          case 'sessionEnded': {
             if (
-              finalOffset !== 0 &&
+              frame.finalOffset !== 0 &&
               this.expectedOffset !== null &&
-              finalOffset !== this.expectedOffset
+              frame.finalOffset !== this.expectedOffset
             ) {
               opts.onError(
-                `attach stream ended at offset ${finalOffset} but the client applied up to ${this.expectedOffset}`
+                `attach stream ended at offset ${frame.finalOffset} but the client applied up to ${this.expectedOffset}`
               )
             }
-            opts.onSessionEnded(exitCode)
+            opts.onSessionEnded(frame.exitCode)
             return
           }
-          case WS_FRAME_ERROR:
-            opts.onError(textDecoder.decode(bytes.subarray(1)))
+          case 'error':
+            opts.onError(frame.message)
             return
-          case WS_FRAME_CONTROL: {
-            // [8][role] — control handoff notice for this attachment.
-            this.role = bytes[1] === 1 ? 'controller' : 'observer'
+          case 'control':
+            // Control handoff notice for this attachment.
+            this.role = frame.role
             opts.onControl?.(this.role)
             return
-          }
-          case WS_FRAME_PONG:
+          case 'pong':
             return
         }
       } catch {

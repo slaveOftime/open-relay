@@ -847,6 +847,79 @@ mod tests {
         assert_eq!(panic_payload_message(payload.as_ref()), "attach panic");
     }
 
+    /// Protocol evidence (post-review corrective increment, W4): the shared
+    /// fixture tests/fixtures/ws_frames.json pins the wire format for BOTH
+    /// endpoints. Here: encoding each `expect` description reproduces the
+    /// pinned bytes exactly. The web decoder test decodes the same bytes
+    /// back to the same description — encoder and decoder can never drift
+    /// from each other without one side failing.
+    #[test]
+    fn ws_frame_fixture_matches_the_encoder() {
+        fn decode_hex(hex: &str) -> Vec<u8> {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
+                .collect()
+        }
+        fn to_hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ws_frames.json");
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read ws_frames.json"))
+                .expect("parse ws_frames.json");
+        let frames = fixture["frames"].as_array().expect("frames array");
+        assert!(frames.len() >= 10, "the fixture covers every frame kind");
+
+        for frame in frames {
+            let name = frame["name"].as_str().expect("name");
+            let pinned = frame["hex"].as_str().expect("hex");
+            let expect = &frame["expect"];
+            let kind = expect["type"].as_str().expect("expect.type");
+            let role = match expect["role"].as_str() {
+                Some("controller") => "controller",
+                _ => "observer",
+            };
+            let message = match kind {
+                "init" => ServerMessage::Init {
+                    data: decode_hex(expect["data_hex"].as_str().unwrap_or("")),
+                    end_offset: expect["end_offset"].as_u64().expect("end_offset"),
+                    incarnation: expect["incarnation"].as_u64().expect("incarnation"),
+                    running: expect["running"].as_bool().expect("running"),
+                    app_cursor_keys: expect["app_cursor_keys"].as_bool().expect("ack"),
+                    bracketed_paste_mode: expect["bracketed_paste_mode"].as_bool().expect("bpm"),
+                    attachment_id: expect["attachment_id"].as_u64().expect("attachment_id"),
+                    role,
+                },
+                "data" => ServerMessage::Data {
+                    offset: expect["offset"].as_u64().expect("offset"),
+                    data: decode_hex(expect["data_hex"].as_str().unwrap_or("")),
+                },
+                "mode_changed" => ServerMessage::ModeChanged {
+                    app_cursor_keys: expect["app_cursor_keys"].as_bool().expect("ack"),
+                    bracketed_paste_mode: expect["bracketed_paste_mode"].as_bool().expect("bpm"),
+                },
+                "resized" => ServerMessage::Resized {
+                    rows: expect["rows"].as_u64().expect("rows") as u16,
+                    cols: expect["cols"].as_u64().expect("cols") as u16,
+                },
+                "session_ended" => ServerMessage::SessionEnded {
+                    exit_code: expect["exit_code"].as_i64().map(|c| c as i32),
+                    final_offset: expect["final_offset"].as_u64().expect("final_offset"),
+                },
+                "error" => ServerMessage::Error {
+                    message: expect["message"].as_str().expect("message").to_string(),
+                },
+                "control" => ServerMessage::Control { role },
+                "pong" => ServerMessage::Pong,
+                other => panic!("{name}: unknown frame type {other}"),
+            };
+            let encoded = to_hex(&encode_server_message(&message));
+            assert_eq!(encoded, pinned, "frame {name} diverged from the fixture");
+        }
+    }
+
     /// Frame-layout golden checks: the TypeScript decoder
     /// (web/src/api/client.ts) must read exactly these bytes.
     #[test]

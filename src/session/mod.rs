@@ -26,6 +26,7 @@ pub(crate) mod screen;
 mod store;
 #[cfg(test)]
 pub(crate) mod store;
+pub use runtime::SequencedChunk;
 pub use store::pump::{AttachEvent, AttachPump};
 
 use chrono::{DateTime, Utc};

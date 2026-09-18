@@ -915,6 +915,365 @@ mod tests {
             assert!(matches!(stale, RpcResponse::Error { .. }));
         }
     }
+
+    // ---------------------------------------------------------------
+    // Post-review protocol evidence (corrective increment, W4): the
+    // complete IPC attach path over a REAL local socket — production
+    // framed codec, `handle_client` dispatch, streaming state machine,
+    // incarnation fencing, and control-lease gating — served from the
+    // canonical journal.
+    // ---------------------------------------------------------------
+
+    mod ipc_conformance {
+        use super::super::handle_client;
+        use crate::{
+            config::LiveConfig,
+            ipc,
+            node::registry::NodeRegistry,
+            notification::dispatcher::Notifier,
+            protocol::{RpcRequest, RpcResponse},
+            session::{
+                SequencedChunk, SessionStatus,
+                journal::ShadowJournal,
+                store::testsupport::{
+                    make_runtime_writable, make_test_config, make_test_db, store_with,
+                },
+            },
+        };
+        use bytes::Bytes;
+        use interprocess::local_socket::traits::tokio::Listener as _;
+        use std::{collections::HashMap, sync::Arc, time::Duration};
+        use tokio::{
+            io::BufReader,
+            sync::{Mutex, broadcast, mpsc},
+        };
+
+        #[tokio::test]
+        async fn attach_stream_conforms_end_to_end_over_a_real_socket() {
+            // A session whose canonical stream is the journal: "hello world"
+            // recorded, synced, and the writer shut down — durability is
+            // asserted, never assumed from timing.
+            let (rt, mut writer_rx) = make_runtime_writable("ipcconf1", SessionStatus::Running);
+            let dir = rt.read().dir.clone();
+            let (mut journal, incarnation, _) =
+                ShadowJournal::open_with_options(&dir, Duration::from_secs(3600), 1 << 20)
+                    .expect("open journal");
+            assert_eq!(incarnation, 1);
+            journal
+                .record_output(Bytes::from_static(b"hello world"))
+                .expect("record output");
+            journal.request_sync();
+            journal.shutdown();
+            rt.write().filtered_total_bytes = 11;
+            let db = make_test_db().await;
+            let store = Arc::new(store_with(vec![Arc::clone(&rt)], db.clone()));
+
+            // Production socket: bind once, accept loop runs the real
+            // per-connection dispatcher for every test connection.
+            let mut config = make_test_config(4);
+            config.socket_name = format!("oly-ipcconf-{}.sock", uuid::Uuid::new_v4());
+            let config = Arc::new(config);
+            let listener = ipc::bind(&config).expect("bind test socket");
+            let server = {
+                let config = Arc::clone(&config);
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    loop {
+                        let stream = listener.accept().await.expect("accept");
+                        let config = Arc::clone(&config);
+                        let live_config = LiveConfig::from_arc(Arc::clone(&config));
+                        let store = Arc::clone(&store);
+                        let db = db.clone();
+                        tokio::spawn(async move {
+                            let (shutdown_tx, _rx) = mpsc::unbounded_channel();
+                            let (session_event_tx, _) = broadcast::channel(4);
+                            let (notification_tx, _) = broadcast::channel(4);
+                            let notifier = Arc::new(arc_swap::ArcSwap::from_pointee(
+                                Notifier::with_channels(vec![]),
+                            ));
+                            let _ = handle_client(
+                                stream,
+                                config,
+                                live_config,
+                                store,
+                                shutdown_tx,
+                                Arc::new(NodeRegistry::new()),
+                                db,
+                                Arc::new(Mutex::new(HashMap::new())),
+                                session_event_tx,
+                                notification_tx,
+                                notifier,
+                            )
+                            .await;
+                        });
+                    }
+                })
+            };
+
+            // --- Connection A: resume from 0 in the current incarnation ---
+            let (read_a, mut writer_a) =
+                tokio::io::split(ipc::connect(&config).await.expect("connect A"));
+            let mut reader_a = BufReader::new(read_a);
+            ipc::write_request_to_writer(
+                &mut writer_a,
+                RpcRequest::AttachSubscribe {
+                    id: "ipcconf1".into(),
+                    from_byte_offset: Some(0),
+                    incarnation: Some(1),
+                    rows: None,
+                    cols: None,
+                    role: None,
+                },
+            )
+            .await
+            .expect("subscribe A");
+            let init = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_a),
+            )
+            .await
+            .expect("init frame timeout")
+            .expect("init frame");
+            let RpcResponse::AttachStreamInit {
+                data,
+                end_offset,
+                running,
+                incarnation,
+                attachment_id,
+                role,
+                ..
+            } = init
+            else {
+                panic!("expected AttachStreamInit, got {init:?}");
+            };
+            assert_eq!(data, b"hello world");
+            assert_eq!(end_offset, 11);
+            assert!(running);
+            assert_eq!(incarnation, 1);
+            assert_eq!(role, "controller");
+            assert!(attachment_id >= 1);
+
+            // The control lease gates input over the wire: the lease token
+            // writes; a foreign token is rejected with a visible error.
+            ipc::write_request_to_writer(
+                &mut writer_a,
+                RpcRequest::AttachInput {
+                    id: "ipcconf1".into(),
+                    data: "ls".into(),
+                    wait_for_change: false,
+                    attachment_id: Some(attachment_id),
+                },
+            )
+            .await
+            .expect("write input");
+            let typed = tokio::time::timeout(Duration::from_secs(5), writer_rx.recv())
+                .await
+                .expect("input delivered")
+                .expect("writer open");
+            assert_eq!(&typed[..], b"ls");
+
+            // Streaming authorization is by CONNECTION identity: the token
+            // field inside a streamed frame is ignored (the connection's own
+            // registered attachment governs), so even a bogus token writes.
+            ipc::write_request_to_writer(
+                &mut writer_a,
+                RpcRequest::AttachInput {
+                    id: "ipcconf1".into(),
+                    data: "x".into(),
+                    wait_for_change: false,
+                    attachment_id: Some(attachment_id + 1_000),
+                },
+            )
+            .await
+            .expect("write second input");
+            let typed = tokio::time::timeout(Duration::from_secs(5), writer_rx.recv())
+                .await
+                .expect("second input delivered")
+                .expect("writer open");
+            assert_eq!(&typed[..], b"x");
+
+            // Live output arrives as an offset-sequenced chunk continuing the
+            // init cursor exactly (I2: no gaps, no duplication).
+            {
+                let mut rt = rt.write();
+                rt.feed_engine(b"\n");
+                rt.push_output(b"\n", 1);
+                let offset = rt.filtered_stream_len() - 1;
+                let _ = rt.broadcast_tx.send(SequencedChunk {
+                    cursor: None,
+                    offset,
+                    bytes: Bytes::from_static(b"\n"),
+                });
+            }
+            let chunk = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_a),
+            )
+            .await
+            .expect("chunk frame")
+            .expect("chunk response");
+            let RpcResponse::AttachStreamChunk { offset, data } = chunk else {
+                panic!("expected AttachStreamChunk, got {chunk:?}");
+            };
+            assert_eq!(offset, 11);
+            assert_eq!(data, b"\n");
+
+            // --- Connection B: a resume from the wrong incarnation is fenced ---
+            let (read_b, mut writer_b) =
+                tokio::io::split(ipc::connect(&config).await.expect("connect B"));
+            let mut reader_b = BufReader::new(read_b);
+            ipc::write_request_to_writer(
+                &mut writer_b,
+                RpcRequest::AttachSubscribe {
+                    id: "ipcconf1".into(),
+                    from_byte_offset: Some(0),
+                    incarnation: Some(42),
+                    rows: None,
+                    cols: None,
+                    role: None,
+                },
+            )
+            .await
+            .expect("subscribe B");
+            let fenced = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_b),
+            )
+            .await
+            .expect("fencing error timeout")
+            .expect("fencing error");
+            assert!(
+                matches!(fenced, RpcResponse::Error { .. }),
+                "cross-incarnation cursors must be rejected, got {fenced:?}"
+            );
+
+            // --- Connection C: a valid mid-stream resume continues exactly ---
+            let (read_c, mut writer_c) =
+                tokio::io::split(ipc::connect(&config).await.expect("connect C"));
+            let mut reader_c = BufReader::new(read_c);
+            ipc::write_request_to_writer(
+                &mut writer_c,
+                RpcRequest::AttachSubscribe {
+                    id: "ipcconf1".into(),
+                    from_byte_offset: Some(6),
+                    incarnation: Some(1),
+                    rows: None,
+                    cols: None,
+                    role: None,
+                },
+            )
+            .await
+            .expect("subscribe C");
+            let resumed = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_c),
+            )
+            .await
+            .expect("resume init timeout")
+            .expect("resume init");
+            let RpcResponse::AttachStreamInit {
+                data, end_offset, ..
+            } = resumed
+            else {
+                panic!("expected AttachStreamInit, got {resumed:?}");
+            };
+            assert_eq!(data, b"world");
+            assert_eq!(end_offset, 11);
+
+            // --- Connection D: observers are input-gated until takeover ---
+            let (read_d, mut writer_d) =
+                tokio::io::split(ipc::connect(&config).await.expect("connect D"));
+            let mut reader_d = BufReader::new(read_d);
+            ipc::write_request_to_writer(
+                &mut writer_d,
+                RpcRequest::AttachSubscribe {
+                    id: "ipcconf1".into(),
+                    from_byte_offset: None,
+                    incarnation: None,
+                    rows: None,
+                    cols: None,
+                    role: Some("observer".into()),
+                },
+            )
+            .await
+            .expect("subscribe D");
+            let init_d = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_d),
+            )
+            .await
+            .expect("observer init timeout")
+            .expect("observer init");
+            let RpcResponse::AttachStreamInit { role, .. } = init_d else {
+                panic!("expected AttachStreamInit, got {init_d:?}");
+            };
+            assert_eq!(role, "observer");
+
+            // Observer input is rejected with a client-visible error (I6).
+            ipc::write_request_to_writer(
+                &mut writer_d,
+                RpcRequest::AttachInput {
+                    id: "ipcconf1".into(),
+                    data: "nope".into(),
+                    wait_for_change: false,
+                    attachment_id: None,
+                },
+            )
+            .await
+            .expect("write observer input");
+            let rejected = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_d),
+            )
+            .await
+            .expect("observer rejection timeout")
+            .expect("observer rejection");
+            assert!(
+                matches!(rejected, RpcResponse::Error { .. }),
+                "observer input must be rejected, got {rejected:?}"
+            );
+
+            // Takeover publishes the handoff and unlocks input.
+            ipc::write_request_to_writer(
+                &mut writer_d,
+                RpcRequest::AttachAcquireControl {
+                    id: "ipcconf1".into(),
+                },
+            )
+            .await
+            .expect("acquire control");
+            let handoff = tokio::time::timeout(
+                Duration::from_secs(5),
+                ipc::read_response_from_reader(&mut reader_d),
+            )
+            .await
+            .expect("handoff notice timeout")
+            .expect("handoff notice");
+            let RpcResponse::AttachControlChanged { role } = handoff else {
+                panic!("expected AttachControlChanged, got {handoff:?}");
+            };
+            assert_eq!(role, "controller");
+            ipc::write_request_to_writer(
+                &mut writer_d,
+                RpcRequest::AttachInput {
+                    id: "ipcconf1".into(),
+                    data: "go".into(),
+                    wait_for_change: false,
+                    attachment_id: None,
+                },
+            )
+            .await
+            .expect("write post-takeover input");
+            let typed = tokio::time::timeout(Duration::from_secs(5), writer_rx.recv())
+                .await
+                .expect("post-takeover input delivered")
+                .expect("writer open");
+            assert_eq!(&typed[..], b"go");
+
+            server.abort();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
 }
 
 async fn handle_logs_pagination(
