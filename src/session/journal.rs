@@ -356,7 +356,23 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     fs::create_dir_all(&journal_dir)?;
 
+    // Complete any retention interrupted by a crash: the tombstone lands
+    // in the manifest before deletion starts, so leftover parts of a
+    // retired incarnation are intentional deletions, finished here. The
+    // retired set is also a lower bound for the next incarnation number:
+    // a tombstoned incarnation must never be reused, even when retention
+    // removed its every file.
+    let retired = retired_incarnations(&journal_dir)?;
+    complete_retired_retention(&journal_dir, &retired)?;
+
     let segments = list_segments(&journal_dir)?;
+    // The manifest is read at open for reconciliation (post-review
+    // corrective increment): a malformed manifest is genuine corruption
+    // and fails the open loudly instead of risking duplicate entries.
+    let manifested: std::collections::HashSet<(u64, u64)> = read_manifest(&journal_dir)?
+        .into_iter()
+        .map(|entry| (entry.incarnation, entry.part))
+        .collect();
     let mut report = None;
     if let Some(&(previous, part)) = segments.last() {
         let path = segment_path(&journal_dir, previous, part);
@@ -388,6 +404,26 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
                 .set_len(stats.valid_len)?;
             sync_dir(&journal_dir)?;
         }
+        // Recovery just validated (and possibly rewound) this part. If a
+        // crash killed the appender between part sync and manifest
+        // append, seal it now so every non-active part is manifested and
+        // `verify_manifest` stays strictly truthful.
+        if !manifested.contains(&(previous, part)) {
+            match (expected_first, stats.last_seq, stats.stop) {
+                (Some(first), Some(last), ScanStop::CleanEof | ScanStop::PartialTail) => {
+                    seal_validated_part(&journal_dir, previous, part, first, last)?;
+                }
+                // An empty crash-leftover tail (rollover created the file
+                // but no record ever landed): remove it; nothing is lost.
+                (None, None, ScanStop::CleanEof) if stats.valid_len == 0 => {
+                    fs::remove_file(&path)?;
+                    sync_dir(&journal_dir)?;
+                }
+                // Anything else is corruption: reported above, left
+                // untouched for `verify_manifest` to flag.
+                _ => {}
+            }
+        }
         report = Some(RecoveryReport {
             incarnation: previous,
             records: stats.records,
@@ -397,11 +433,40 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
             rewound,
         });
     }
+    // Reconcile any other unmanifested part: the crash window between a
+    // rotated part's sync and its manifest append can also leave older
+    // parts unsealed. Validated parts are sealed; empty leftovers are
+    // removed; anything invalid is left for verification to report.
+    let previous_tail = segments.last().copied();
+    for &(incarnation, part) in &segments {
+        if Some((incarnation, part)) == previous_tail || manifested.contains(&(incarnation, part)) {
+            continue;
+        }
+        let path = segment_path(&journal_dir, incarnation, part);
+        let expected_first = match part_first_seq(&path) {
+            Ok(first) => first,
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => continue,
+            Err(err) => return Err(err),
+        };
+        let stats = scan_segment_stats_from(&path, expected_first)?;
+        match (expected_first, stats.last_seq, stats.stop) {
+            (Some(first), Some(last), ScanStop::CleanEof) => {
+                seal_validated_part(&journal_dir, incarnation, part, first, last)?;
+            }
+            (None, None, ScanStop::CleanEof) if stats.valid_len == 0 => {
+                fs::remove_file(&path)?;
+                sync_dir(&journal_dir)?;
+            }
+            _ => {}
+        }
+    }
 
+    let highest_retired = retired.iter().copied().max().unwrap_or(0);
     let incarnation = segments
         .last()
         .map(|&(incarnation, _)| incarnation)
         .unwrap_or(0)
+        .max(highest_retired)
         + 1;
     let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation, 1))?;
     // Make the new segment's directory entry durable alongside the file;
@@ -413,6 +478,54 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
         writer,
         journal_dir,
     })
+}
+
+/// Finish deleting any leftover parts of tombstoned (retired)
+/// incarnations. Called at open so a crash mid-retention is self-healing
+/// rather than a permanent verification failure.
+fn complete_retired_retention(
+    journal_dir: &Path,
+    retired: &std::collections::HashSet<u64>,
+) -> io::Result<()> {
+    if retired.is_empty() {
+        return Ok(());
+    }
+    let mut removed_any = false;
+    for (incarnation, part) in list_segments(journal_dir)? {
+        if retired.contains(&incarnation) {
+            fs::remove_file(segment_path(journal_dir, incarnation, part))?;
+            removed_any = true;
+        }
+    }
+    if removed_any {
+        sync_dir(journal_dir)?;
+    }
+    Ok(())
+}
+
+/// Seal a part that recovery/reconciliation has just fully validated but
+/// the appender never committed to the manifest (crash between part sync
+/// and manifest append). Reads the part in full; only called at open for
+/// the rare unmanifested case, never on the hot path.
+fn seal_validated_part(
+    journal_dir: &Path,
+    incarnation: u64,
+    part: u64,
+    first_seq: u64,
+    last_seq: u64,
+) -> io::Result<()> {
+    let path = segment_path(journal_dir, incarnation, part);
+    let bytes = fs::read(&path)?;
+    let entry = SegmentManifestEntry {
+        incarnation,
+        part,
+        first_seq,
+        last_seq,
+        bytes: bytes.len() as u64,
+        crc32: Crc32::of(&bytes),
+    };
+    entry.append_to(journal_dir)?;
+    sync_dir(journal_dir)
 }
 
 /// Best-effort directory sync so segment creation/truncation survives a
@@ -1343,25 +1456,56 @@ pub struct SegmentManifestEntry {
     pub crc32: u32,
 }
 
+/// Retention tombstone (post-review corrective increment): written to the
+/// manifest BEFORE an incarnation's parts are deleted, so intentional
+/// deletion is distinguishable from corruption. A crash between the
+/// tombstone and the last unlink leaves leftover part files, which
+/// [`open`] finishes deleting and [`verify_manifest`] reports until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetiredIncarnation {
+    /// Incarnation whose parts checkpoint-gated retention removed.
+    pub retired: u64,
+}
+
+/// One line of `manifest.log`: either a sealed-part entry or a retention
+/// tombstone. Sealed entries keep their original bare-JSON shape, so
+/// journals written before tombstones existed still parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ManifestLine {
+    Sealed(SegmentManifestEntry),
+    Retired(RetiredIncarnation),
+}
+
 impl SegmentManifestEntry {
     /// Append this entry to `journal_dir/manifest.log` and fsync it.
     fn append_to(&self, journal_dir: &Path) -> io::Result<()> {
-        let mut line = serde_json::to_vec(self)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        line.push(b'\n');
-        let mut manifest = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(journal_dir.join(MANIFEST_FILE_NAME))?;
-        manifest.write_all(&line)?;
-        manifest.sync_data()
+        append_manifest_line(journal_dir, &ManifestLine::Sealed(*self))
     }
 }
 
-/// Read every manifest entry, in file order. A malformed line fails the
+impl RetiredIncarnation {
+    fn append_to(&self, journal_dir: &Path) -> io::Result<()> {
+        append_manifest_line(journal_dir, &ManifestLine::Retired(*self))
+    }
+}
+
+fn append_manifest_line(journal_dir: &Path, line: &ManifestLine) -> io::Result<()> {
+    let mut bytes =
+        serde_json::to_vec(line).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    bytes.push(b'\n');
+    let mut manifest = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(journal_dir.join(MANIFEST_FILE_NAME))?;
+    manifest.write_all(&bytes)?;
+    manifest.sync_data()
+}
+
+/// Read every manifest line, in file order. A malformed line fails the
 /// whole read: the manifest is written by us and never edited, so
 /// corruption must surface, not be skipped.
-pub fn read_manifest(journal_dir: &Path) -> io::Result<Vec<SegmentManifestEntry>> {
+pub fn read_manifest_lines(journal_dir: &Path) -> io::Result<Vec<ManifestLine>> {
     let path = journal_dir.join(MANIFEST_FILE_NAME);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -1381,17 +1525,49 @@ pub fn read_manifest(journal_dir: &Path) -> io::Result<Vec<SegmentManifestEntry>
         .collect()
 }
 
-/// Verify sealed parts against the manifest (M3-6): presence, exact
-/// length, and content CRC-32. Returns one issue per mismatch; an empty
-/// vec means every sealed part is intact. The newest part of the newest
-/// incarnation is the active tail and is skipped. This reads every sealed
-/// part in full — call it from integrity tooling/compaction, not from the
-/// daemon hot path. Only clean rotation/shutdown seals a part, so a live
-/// daemon's tail never has an entry.
+/// Read every sealed-part manifest entry (retention tombstones filtered
+/// out), in file order.
+pub fn read_manifest(journal_dir: &Path) -> io::Result<Vec<SegmentManifestEntry>> {
+    Ok(read_manifest_lines(journal_dir)?
+        .into_iter()
+        .filter_map(|line| match line {
+            ManifestLine::Sealed(entry) => Some(entry),
+            ManifestLine::Retired(_) => None,
+        })
+        .collect())
+}
+
+/// Incarnations retired by checkpoint-gated retention, per the manifest.
+fn retired_incarnations(journal_dir: &Path) -> io::Result<std::collections::HashSet<u64>> {
+    Ok(read_manifest_lines(journal_dir)?
+        .into_iter()
+        .filter_map(|line| match line {
+            ManifestLine::Retired(retired) => Some(retired.retired),
+            ManifestLine::Sealed(_) => None,
+        })
+        .collect())
+}
+
+/// Verify the journal's segments against the manifest. Returns one issue
+/// per mismatch; an empty vec means the journal is intact. Checks:
+///
+/// - every non-retired sealed entry's part exists with its exact length
+///   and CRC-32;
+/// - no duplicate sealed entries;
+/// - every part file on disk is either manifested or the active tail (the
+///   newest part of the newest incarnation — being written by a live
+///   daemon, or the not-yet-recovered tail after a crash). Anything else
+///   is a part the appender never committed, reported instead of guessed;
+/// - a retired (tombstoned) incarnation has no leftover part files —
+///   leftovers mean a crash interrupted retention (`open` finishes the
+///   deletion, so this only fires when doctor runs before any reopen).
+///
+/// This reads every sealed part in full — call it from integrity
+/// tooling/compaction, never from the daemon hot path.
 pub fn verify_manifest(journal_dir: &Path) -> Vec<String> {
     let mut issues = Vec::new();
-    let entries = match read_manifest(journal_dir) {
-        Ok(entries) => entries,
+    let lines = match read_manifest_lines(journal_dir) {
+        Ok(lines) => lines,
         Err(err) => {
             issues.push(format!(
                 "{}: {err}",
@@ -1401,15 +1577,30 @@ pub fn verify_manifest(journal_dir: &Path) -> Vec<String> {
         }
     };
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
-    for entry in entries {
-        let key = (entry.incarnation, entry.part);
-        if !seen.insert(key) {
-            issues.push(format!(
-                "manifest: duplicate entry for incarnation {} part {}",
-                entry.incarnation, entry.part
-            ));
-            continue;
+    let mut retired: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut sealed = Vec::new();
+    for line in lines {
+        match line {
+            ManifestLine::Sealed(entry) => {
+                let key = (entry.incarnation, entry.part);
+                if !seen.insert(key) {
+                    issues.push(format!(
+                        "manifest: duplicate entry for incarnation {} part {}",
+                        entry.incarnation, entry.part
+                    ));
+                    continue;
+                }
+                sealed.push(entry);
+            }
+            ManifestLine::Retired(tombstone) => {
+                retired.insert(tombstone.retired);
+            }
         }
+    }
+    for entry in sealed
+        .into_iter()
+        .filter(|e| !retired.contains(&e.incarnation))
+    {
         let path = segment_path(journal_dir, entry.incarnation, entry.part);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -1435,6 +1626,30 @@ pub fn verify_manifest(journal_dir: &Path) -> Vec<String> {
                 entry.crc32,
                 crc
             ));
+        }
+    }
+    // Orphan / incomplete-retention scan over what is actually on disk.
+    match list_segments(journal_dir) {
+        Ok(segments) => {
+            let active_tail = segments.last().copied();
+            for (incarnation, part) in segments {
+                if retired.contains(&incarnation) {
+                    issues.push(format!(
+                        "{}: retention tombstoned incarnation {incarnation} but part files remain on disk",
+                        segment_path(journal_dir, incarnation, part).display()
+                    ));
+                } else if !seen.contains(&(incarnation, part))
+                    && Some((incarnation, part)) != active_tail
+                {
+                    issues.push(format!(
+                        "{}: segment part has no manifest entry (not the active tail)",
+                        segment_path(journal_dir, incarnation, part).display()
+                    ));
+                }
+            }
+        }
+        Err(err) => {
+            issues.push(format!("{}: {err}", journal_dir.display()));
         }
     }
     issues
@@ -2149,7 +2364,43 @@ pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec
     let Some(gate) = latest_checkpoint_incarnation(session_dir)? else {
         return Ok(Vec::new());
     };
-    retain_before_unchecked(session_dir, min_incarnation.min(gate))
+    let min_incarnation = min_incarnation.min(gate);
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    let incarnations = list_incarnations(&journal_dir)?;
+    let latest = incarnations.last().copied();
+    let already_retired = retired_incarnations(&journal_dir)?;
+    let mut deleted = Vec::new();
+    for incarnation in incarnations {
+        if incarnation >= min_incarnation
+            || Some(incarnation) == latest
+            || already_retired.contains(&incarnation)
+        {
+            continue;
+        }
+        // Tombstone FIRST: the manifest records the intent before any
+        // bytes disappear, so a crash mid-retention is distinguishable
+        // from corruption (verification treats a missing tombstoned part
+        // as intended, and `open` finishes an interrupted deletion).
+        RetiredIncarnation {
+            retired: incarnation,
+        }
+        .append_to(&journal_dir)?;
+        // Delete newest-part-first: a concurrent reader can then only
+        // ever observe a prefix of the incarnation (cursors stay
+        // truthful), never a hole in the middle.
+        for (_, part) in list_segments(&journal_dir)?
+            .into_iter()
+            .filter(|&(inc, _)| inc == incarnation)
+            .rev()
+        {
+            fs::remove_file(segment_path(&journal_dir, incarnation, part))?;
+        }
+        deleted.push(incarnation);
+    }
+    if !deleted.is_empty() {
+        sync_dir(&journal_dir)?;
+    }
+    Ok(deleted)
 }
 
 /// Unchecked retention primitive: delete **all parts** of the sealed
@@ -3502,7 +3753,10 @@ mod tests {
         shadow
             .record_output(bytes::Bytes::from_static(b"inc1"))
             .unwrap();
-        drop(shadow);
+        // Seal incarnation 1 durably: an empty crash-leftover part would
+        // be cleaned up by the next `open`, which is not what this test
+        // exercises.
+        shadow.shutdown();
         // Without any checkpoint on record, retention deletes nothing.
         assert!(retain_before(&dir, u64::MAX).unwrap().is_empty());
         assert_eq!(
@@ -3568,7 +3822,8 @@ mod tests {
         shadow
             .record_checkpoint(&test_checkpoint(b"restore"))
             .unwrap();
-        drop(shadow);
+        // Seal incarnation 1 durably (see the gated-retention test above).
+        shadow.shutdown();
         let (mut shadow2, _, _) = ShadowJournal::open(&dir).unwrap();
         shadow2
             .record_checkpoint(&test_checkpoint(b"restore2"))
@@ -4036,5 +4291,201 @@ mod tests {
         assert!(!shadow.core.is_degraded());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------
+    // Manifest / retention / verification coherence (corrective increment)
+    // ------------------------------------------------------------------
+
+    /// Write one incarnation of output records and seal it (clean
+    /// shutdown), returning the incarnation number.
+    fn append_incarnation(session_dir: &Path, chunks: &[&[u8]], max_part_bytes: u64) -> u64 {
+        let (mut journal, incarnation, _report) = ShadowJournal::open_with_options(
+            session_dir,
+            std::time::Duration::from_secs(3600),
+            max_part_bytes,
+        )
+        .unwrap();
+        for chunk in chunks {
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(chunk))
+                .unwrap();
+        }
+        journal.shutdown();
+        incarnation
+    }
+
+    fn checkpoint_payload() -> Checkpoint {
+        Checkpoint {
+            rows: 24,
+            cols: 80,
+            cursor: (1, 1),
+            alt_screen: false,
+            app_cursor_keys: false,
+            bracketed_paste: false,
+            program: bytes::Bytes::from_static(b"\x1b[2Jrestored"),
+        }
+    }
+
+    /// Drop the last `count` lines of `manifest.log`, simulating a crash
+    /// that lost the final manifest appends.
+    fn truncate_manifest_lines(journal_dir: &Path, count: usize) {
+        let path = journal_dir.join(MANIFEST_FILE_NAME);
+        let lines: Vec<String> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let keep = lines.len() - count;
+        let mut text = lines[..keep].join("\n");
+        if keep > 0 {
+            text.push('\n');
+        }
+        fs::write(&path, text).unwrap();
+    }
+
+    /// The cross-feature lifecycle (mandatory corrective-increment gate):
+    /// write → checkpoint → seal → retain → reopen → replay/resume →
+    /// verify (the `oly doctor` core). Intentional retention must be
+    /// distinguishable from corruption end to end.
+    #[test]
+    fn retention_checkpoint_manifest_and_verification_stay_coherent() {
+        let session_dir = test_session_dir("retain-coherent");
+        let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+
+        assert_eq!(
+            append_incarnation(&session_dir, &[b"one", b"two"], 1 << 20),
+            1
+        );
+        // Incarnation 2 carries the checkpoint that gates retention.
+        let (mut journal, incarnation, _report) = ShadowJournal::open_with_options(
+            &session_dir,
+            std::time::Duration::from_secs(3600),
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(incarnation, 2);
+        journal
+            .record_output(bytes::Bytes::from_static(b"three"))
+            .unwrap();
+        journal.record_checkpoint(&checkpoint_payload()).unwrap();
+        journal.shutdown();
+
+        assert!(verify_manifest(&journal_dir).is_empty());
+        let deleted = retain_before(&session_dir, u64::MAX).unwrap();
+        assert_eq!(deleted, vec![1]);
+        assert!(!segment_path(&journal_dir, 1, 1).exists());
+        // The tombstone makes the deletion intentional and auditable.
+        assert!(
+            read_manifest_lines(&journal_dir)
+                .unwrap()
+                .iter()
+                .any(|line| matches!(line, ManifestLine::Retired(r) if r.retired == 1))
+        );
+        assert!(verify_manifest(&journal_dir).is_empty());
+        // The checkpoint gate is unaffected by the deletion it permitted.
+        assert_eq!(
+            latest_checkpoint_incarnation(&session_dir).unwrap(),
+            Some(2)
+        );
+
+        // Replay/resume reads the surviving (newest) incarnation from its
+        // start — before any reopen creates a newer, empty one.
+        let resumed =
+            crate::session::replay::filtered_stream_window(&session_dir, 0, 1 << 20).unwrap();
+        assert_eq!(resumed, b"three");
+
+        // Reopen: a new incarnation above the tombstoned one.
+        let opened = open(&session_dir).unwrap();
+        assert_eq!(opened.incarnation, 3);
+        drop(opened.writer);
+        assert!(verify_manifest(&journal_dir).is_empty());
+
+        let _ = fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
+    fn open_completes_interrupted_retention_and_never_reuses_incarnations() {
+        let session_dir = test_session_dir("retain-crash");
+        let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+        append_incarnation(&session_dir, &[b"one", b"two"], 1 << 20);
+        append_incarnation(&session_dir, &[b"three"], 1 << 20);
+
+        // Crash after the tombstone landed but before the unlinks.
+        RetiredIncarnation { retired: 1 }
+            .append_to(&journal_dir)
+            .unwrap();
+        let issues = verify_manifest(&journal_dir);
+        assert_eq!(issues.len(), 1, "unexpected issues: {issues:?}");
+        assert!(issues[0].contains("tombstoned incarnation 1"));
+
+        // A tombstone bounds future incarnation numbers even when it names
+        // an incarnation with no files on disk.
+        RetiredIncarnation { retired: 7 }
+            .append_to(&journal_dir)
+            .unwrap();
+        let opened = open(&session_dir).unwrap();
+        assert_eq!(opened.incarnation, 8);
+        drop(opened.writer);
+        assert!(!segment_path(&journal_dir, 1, 1).exists());
+        assert!(verify_manifest(&journal_dir).is_empty());
+
+        let _ = fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
+    fn open_seals_validated_parts_orphaned_by_a_crash() {
+        let session_dir = test_session_dir("orphan-seal");
+        let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+        // 48-byte records with a 64-byte cap rotate every record.
+        append_incarnation(
+            &session_dir,
+            &[b"aaaaaaaaaaaa", b"bbbbbbbbbbbb", b"cccccccccccc"],
+            64,
+        );
+        assert_eq!(list_segments(&journal_dir).unwrap().len(), 3);
+
+        // Crash between part sync and manifest append, twice: parts 2 and
+        // 3 lost their entries. Part 3 is the active tail (skipped by
+        // verification); part 2 is an unmanifested non-tail (flagged).
+        truncate_manifest_lines(&journal_dir, 2);
+        let issues = verify_manifest(&journal_dir);
+        assert_eq!(issues.len(), 1, "unexpected issues: {issues:?}");
+        assert!(issues[0].contains("no manifest entry"));
+        // The unmanifested bytes are still readable: replay sees every
+        // chunk even before any repair.
+        let resumed =
+            crate::session::replay::filtered_stream_window(&session_dir, 0, 1 << 20).unwrap();
+        assert_eq!(resumed, b"aaaaaaaaaaaabbbbbbbbbbbbcccccccccccc");
+
+        // Reopen validates both and seals them; verification is clean.
+        let opened = open(&session_dir).unwrap();
+        assert_eq!(opened.incarnation, 2);
+        drop(opened.writer);
+        assert!(verify_manifest(&journal_dir).is_empty());
+        assert_eq!(read_manifest(&journal_dir).unwrap().len(), 3);
+
+        let _ = fs::remove_dir_all(&session_dir);
+    }
+
+    #[test]
+    fn open_removes_empty_crash_leftover_parts() {
+        let session_dir = test_session_dir("empty-leftover");
+        let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+        append_incarnation(&session_dir, &[b"data"], 1 << 20);
+        // A crash between rollover-create and the first append leaves an
+        // empty newest part of the next incarnation.
+        SegmentWriter::create(&segment_path(&journal_dir, 2, 1)).unwrap();
+        // It is the active tail, so verification does not flag it (a live
+        // daemon may legitimately hold one).
+        assert!(verify_manifest(&journal_dir).is_empty());
+
+        let opened = open(&session_dir).unwrap();
+        assert_eq!(opened.incarnation, 3);
+        drop(opened.writer);
+        assert!(!segment_path(&journal_dir, 2, 1).exists());
+        assert!(verify_manifest(&journal_dir).is_empty());
+
+        let _ = fs::remove_dir_all(&session_dir);
     }
 }
