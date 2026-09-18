@@ -131,6 +131,26 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 /// published, and the writer writes what it is given. It never allocates
 /// sequences and never invents timestamps, so reopening an active segment
 /// can never move event time backwards and publication never waits on disk.
+/// Encode one record header (including its CRC) for `payload`.
+fn encode_record_header(
+    kind: RecordKind,
+    seq: u64,
+    elapsed_ms: u64,
+    payload: &[u8],
+) -> io::Result<[u8; HEADER_LEN]> {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(RECORD_MAGIC);
+    header[4..6].copy_from_slice(&RECORD_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
+    // flags [8..12] stay zero until a feature needs them.
+    header[12..20].copy_from_slice(&seq.to_le_bytes());
+    header[20..28].copy_from_slice(&elapsed_ms.to_le_bytes());
+    header[28..32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    let crc = crc32_two(&header[..32], payload);
+    header[32..36].copy_from_slice(&crc.to_le_bytes());
+    Ok(header)
+}
+
 pub struct SegmentWriter {
     file: fs::File,
     /// Bytes written so far; the authoritative segment length.
@@ -173,18 +193,16 @@ impl SegmentWriter {
             ));
         }
 
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(RECORD_MAGIC);
-        header[4..6].copy_from_slice(&RECORD_VERSION.to_le_bytes());
-        header[6..8].copy_from_slice(&(kind as u16).to_le_bytes());
-        // flags [8..12] stay zero until a feature needs them.
-        header[12..20].copy_from_slice(&seq.to_le_bytes());
-        header[20..28].copy_from_slice(&elapsed_ms.to_le_bytes());
-        header[28..32].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        let crc = crc32_two(&header[..32], payload);
-        header[32..36].copy_from_slice(&crc.to_le_bytes());
+        let header = encode_record_header(kind, seq, elapsed_ms, payload)?;
+        self.write_encoded(&header, payload)
+    }
 
-        self.file.write_all(&header)?;
+    /// Append one pre-encoded record (header built by
+    /// [`encode_record_header`]). The rolling writer uses this so it can
+    /// checksum the exact bytes for the sealed-part manifest without
+    /// re-reading the file.
+    pub fn write_encoded(&mut self, header: &[u8; HEADER_LEN], payload: &[u8]) -> io::Result<()> {
+        self.file.write_all(header)?;
         self.file.write_all(payload)?;
         self.written += (HEADER_LEN + payload.len()) as u64;
         Ok(())
@@ -214,6 +232,11 @@ impl SegmentWriter {
 /// Directory inside `sessions/<id>/` holding the journal segments.
 pub const JOURNAL_DIR_NAME: &str = "journal";
 const SEGMENT_PREFIX: &str = "seg-";
+/// Append-only manifest of sealed segment parts (M3-6): one JSON line per
+/// sealed part, written after the part itself is durable. Compaction (M4)
+/// and integrity tooling verify parts against these entries; the active
+/// tail part never has one.
+pub const MANIFEST_FILE_NAME: &str = "manifest.log";
 const SEGMENT_SUFFIX: &str = ".ojrn";
 
 /// Maximum size of one segment part before the appender rolls over to the
@@ -607,6 +630,9 @@ pub struct JournalAppender {
     tx: std::sync::mpsc::SyncSender<AppenderMsg>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queue_budget_bytes: usize,
+    /// Joined on [`JournalAppender::shutdown`] so a clean stop guarantees
+    /// the final barrier (sync + tail-part seal) has actually run (I10).
+    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl JournalAppender {
@@ -660,7 +686,7 @@ impl JournalAppender {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_queued = std::sync::Arc::clone(&queued_bytes);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("journal-appender".to_string())
             .spawn(move || appender_loop(writer, rx, ack_tx, worker_queued, sync_interval))?;
         Ok((
@@ -668,6 +694,7 @@ impl JournalAppender {
                 tx,
                 queued_bytes,
                 queue_budget_bytes: DEFAULT_QUEUE_BUDGET_BYTES,
+                worker: std::sync::Mutex::new(Some(worker)),
             },
             opened.incarnation,
             opened.report,
@@ -708,9 +735,13 @@ impl JournalAppender {
         let _ = self.tx.try_send(AppenderMsg::Sync);
     }
 
-    /// Stop the appender thread after draining queued records.
+    /// Stop the appender thread after draining queued records and wait for
+    /// the final barrier (last group-sync + tail-part seal) to complete.
     pub fn shutdown(&self) {
         let _ = self.tx.send(AppenderMsg::Shutdown);
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -756,6 +787,12 @@ struct RollingSegmentWriter {
     writer: SegmentWriter,
     part_bytes: u64,
     max_part_bytes: u64,
+    /// First sequence in the active part; `None` while the part is empty.
+    part_first_seq: Option<u64>,
+    /// Last sequence appended to the active part.
+    part_last_seq: u64,
+    /// Running CRC-32 of the active part's exact bytes (M3-6 manifest).
+    part_crc: Crc32,
 }
 
 impl RollingSegmentWriter {
@@ -772,6 +809,9 @@ impl RollingSegmentWriter {
             writer,
             part_bytes: 0,
             max_part_bytes,
+            part_first_seq: None,
+            part_last_seq: 0,
+            part_crc: Crc32::new(),
         }
     }
 
@@ -786,7 +826,7 @@ impl RollingSegmentWriter {
         if self.part_bytes > 0 && self.part_bytes + record_bytes > self.max_part_bytes {
             // Seal the current part durable before moving on: after a
             // crash only the newest part may need recovery.
-            self.writer.sync()?;
+            self.seal_part()?;
             self.part += 1;
             self.writer = SegmentWriter::create(&segment_path(
                 &self.journal_dir,
@@ -796,13 +836,45 @@ impl RollingSegmentWriter {
             sync_dir(&self.journal_dir)?;
             self.part_bytes = 0;
         }
-        self.writer.append_record(kind, seq, elapsed_ms, payload)?;
+        let header = encode_record_header(kind, seq, elapsed_ms, payload)?;
+        self.part_crc.update(&header);
+        self.part_crc.update(payload);
+        self.writer.write_encoded(&header, payload)?;
+        if self.part_first_seq.is_none() {
+            self.part_first_seq = Some(seq);
+        }
+        self.part_last_seq = seq;
         self.part_bytes += record_bytes;
         Ok(())
     }
 
     fn sync(&mut self) -> io::Result<()> {
         self.writer.sync()
+    }
+
+    /// Seal the active part: sync it durable, then append its entry to the
+    /// incarnation manifest (M3-6). The manifest entry lands after the part
+    /// itself is durable, so a manifest line always names a complete part;
+    /// a crash between part sync and manifest append leaves a sealed part
+    /// without an entry, which verification reports instead of guessing.
+    /// Empty parts (no records) are never sealed.
+    fn seal_part(&mut self) -> io::Result<()> {
+        let Some(first_seq) = self.part_first_seq.take() else {
+            return Ok(());
+        };
+        self.writer.sync()?;
+        let entry = SegmentManifestEntry {
+            incarnation: self.incarnation,
+            part: self.part,
+            first_seq,
+            last_seq: self.part_last_seq,
+            bytes: self.part_bytes,
+            crc32: self.part_crc.finish(),
+        };
+        entry.append_to(&self.journal_dir)?;
+        sync_dir(&self.journal_dir)?;
+        self.part_crc = Crc32::new();
+        Ok(())
     }
 }
 
@@ -947,6 +1019,13 @@ fn appender_loop(
             &mut sync_deadline,
         );
     }
+    // Seal the tail part into the manifest (M3-6): a clean shutdown leaves
+    // every part checksummed; only a crash leaves an unsealed tail.
+    if dead.is_none()
+        && let Err(err) = writer.seal_part()
+    {
+        fail(&ack_tx, &mut dead, format!("journal seal failed: {err}"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1129,14 @@ pub struct ShadowJournal {
     pub core: SequencerCore,
     appender: JournalAppender,
     acks: std::sync::mpsc::Receiver<JournalAck>,
+}
+
+impl ShadowJournal {
+    /// Drain queued records and stop the appender (sealing the tail part
+    /// into the manifest, M3-6).
+    pub fn shutdown(&self) {
+        self.appender.shutdown();
+    }
 }
 
 impl ShadowJournal {
@@ -1192,11 +1279,165 @@ pub fn shadow_enabled() -> bool {
 }
 
 fn crc32_two(first: &[u8], second: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in first.iter().chain(second) {
-        crc = CRC32_TABLE[((crc ^ u32::from(byte)) & 0xFF) as usize] ^ (crc >> 8);
+    let mut crc = Crc32::new();
+    crc.update(first);
+    crc.update(second);
+    crc.finish()
+}
+
+/// Resumable CRC-32 (same polynomial/table as [`crc32`]): sealed-part
+/// manifests checksum a segment incrementally as records are appended, so
+/// sealing never re-reads the part (M3-6).
+#[derive(Clone, Copy)]
+pub struct Crc32 {
+    state: u32,
+}
+
+impl Crc32 {
+    pub fn new() -> Self {
+        Self { state: !0 }
     }
-    !crc
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.state =
+                CRC32_TABLE[((self.state ^ u32::from(byte)) & 0xFF) as usize] ^ (self.state >> 8);
+        }
+    }
+
+    pub fn finish(&self) -> u32 {
+        !self.state
+    }
+
+    /// CRC-32 of a whole byte slice.
+    pub fn of(bytes: &[u8]) -> u32 {
+        let mut crc = Self::new();
+        crc.update(bytes);
+        crc.finish()
+    }
+}
+
+impl Default for Crc32 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sealed-part manifest (M3-6)
+// ---------------------------------------------------------------------------
+
+/// One sealed segment part, checksummed at seal time. JSON-line in
+/// `journal/manifest.log`; readers/compaction verify a part against its
+/// entry before trusting or dropping it (I3/I8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SegmentManifestEntry {
+    pub incarnation: u64,
+    pub part: u64,
+    pub first_seq: u64,
+    pub last_seq: u64,
+    /// Exact byte length of the sealed part file.
+    pub bytes: u64,
+    /// CRC-32 (IEEE) of the whole part file, computed incrementally as
+    /// records were appended.
+    pub crc32: u32,
+}
+
+impl SegmentManifestEntry {
+    /// Append this entry to `journal_dir/manifest.log` and fsync it.
+    fn append_to(&self, journal_dir: &Path) -> io::Result<()> {
+        let mut line = serde_json::to_vec(self)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        line.push(b'\n');
+        let mut manifest = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(journal_dir.join(MANIFEST_FILE_NAME))?;
+        manifest.write_all(&line)?;
+        manifest.sync_data()
+    }
+}
+
+/// Read every manifest entry, in file order. A malformed line fails the
+/// whole read: the manifest is written by us and never edited, so
+/// corruption must surface, not be skipped.
+pub fn read_manifest(journal_dir: &Path) -> io::Result<Vec<SegmentManifestEntry>> {
+    let path = journal_dir.join(MANIFEST_FILE_NAME);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: malformed manifest line: {err}", path.display()),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Verify sealed parts against the manifest (M3-6): presence, exact
+/// length, and content CRC-32. Returns one issue per mismatch; an empty
+/// vec means every sealed part is intact. The newest part of the newest
+/// incarnation is the active tail and is skipped. This reads every sealed
+/// part in full — call it from integrity tooling/compaction, not from the
+/// daemon hot path. Only clean rotation/shutdown seals a part, so a live
+/// daemon's tail never has an entry.
+pub fn verify_manifest(journal_dir: &Path) -> Vec<String> {
+    let mut issues = Vec::new();
+    let entries = match read_manifest(journal_dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            issues.push(format!(
+                "{}: {err}",
+                journal_dir.join(MANIFEST_FILE_NAME).display()
+            ));
+            return issues;
+        }
+    };
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    for entry in entries {
+        let key = (entry.incarnation, entry.part);
+        if !seen.insert(key) {
+            issues.push(format!(
+                "manifest: duplicate entry for incarnation {} part {}",
+                entry.incarnation, entry.part
+            ));
+            continue;
+        }
+        let path = segment_path(journal_dir, entry.incarnation, entry.part);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                issues.push(format!("{}: sealed part unreadable: {err}", path.display()));
+                continue;
+            }
+        };
+        if bytes.len() as u64 != entry.bytes {
+            issues.push(format!(
+                "{}: sealed part is {} bytes, manifest says {}",
+                path.display(),
+                bytes.len(),
+                entry.bytes
+            ));
+            continue;
+        }
+        let crc = Crc32::of(&bytes);
+        if crc != entry.crc32 {
+            issues.push(format!(
+                "{}: sealed part CRC-32 mismatch (manifest {:08x}, actual {:08x})",
+                path.display(),
+                entry.crc32,
+                crc
+            ));
+        }
+    }
+    issues
 }
 
 // ---------------------------------------------------------------------------
@@ -2689,6 +2930,7 @@ mod tests {
             tx,
             queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queue_budget_bytes: budget,
+            worker: std::sync::Mutex::new(None),
         }
     }
 
@@ -3104,6 +3346,55 @@ mod tests {
     /// Rollover: sequences continue across bounded parts, and history,
     /// range and tail reads transparently cross part boundaries.
     #[test]
+    fn sealed_part_manifest_covers_rotation_and_clean_shutdown() {
+        let dir = test_session_dir("manifest");
+        let (mut shadow, incarnation, _) =
+            ShadowJournal::open_with_options(&dir, std::time::Duration::from_secs(3600), 512)
+                .unwrap();
+        for _ in 0..20 {
+            shadow
+                .record_output(bytes::Bytes::from(vec![b'x'; 64]))
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.journal_seq() < 20 {
+            shadow.poll_acks();
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Clean shutdown seals the active tail part too.
+        shadow.shutdown();
+        drop(shadow);
+
+        let journal_dir = dir.join(JOURNAL_DIR_NAME);
+        let entries = read_manifest(&journal_dir).unwrap();
+        assert_eq!(entries.len(), 4, "3 rotated parts + sealed tail");
+        assert!(entries.iter().all(|entry| entry.incarnation == incarnation));
+        // Sequences are contiguous across sealed parts.
+        assert_eq!(entries[0].first_seq, 1);
+        for pair in entries.windows(2) {
+            assert_eq!(pair[0].last_seq + 1, pair[1].first_seq);
+        }
+        assert_eq!(entries.last().unwrap().last_seq, 20);
+        // Every entry matches its part exactly.
+        assert_eq!(
+            verify_manifest(&journal_dir),
+            Vec::<String>::new(),
+            "clean journal verifies"
+        );
+
+        // Tampering with a sealed part is detected by the CRC.
+        let part_path = segment_path(&journal_dir, incarnation, 2);
+        let mut bytes = std::fs::read(&part_path).unwrap();
+        bytes[40] ^= 0xFF;
+        std::fs::write(&part_path, &bytes).unwrap();
+        let issues = verify_manifest(&journal_dir);
+        assert_eq!(issues.len(), 1, "one tampered part, one issue");
+        assert!(issues[0].contains("CRC-32 mismatch"), "{}", issues[0]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn rollover_keeps_one_sequence_across_parts() {
         let dir = test_session_dir("rollover");
         // 100-byte records, 512-byte parts -> 5 records per part.
