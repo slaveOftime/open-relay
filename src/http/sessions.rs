@@ -17,7 +17,7 @@ use crate::{
     session::{
         SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
-        logs::{read_persisted_log_page, read_resize_events, render_log_file},
+        logs::{read_persisted_log_page, read_resize_events, render_log_session},
         persist::current_output_offset_by_id,
     },
 };
@@ -410,7 +410,17 @@ pub async fn get_session(
 
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
-            let total_bytes = current_output_offset_by_id(&state.config.get().sessions_dir, &id);
+            // M3-1c: journal-backed sessions report the derived filtered
+            // stream length; output.log stat remains for legacy sessions.
+            let session_dir = state.config.get().sessions_dir.join(&id);
+            let total_bytes = if session_dir
+                .join(crate::session::journal::JOURNAL_DIR_NAME)
+                .is_dir()
+            {
+                crate::session::replay::filtered_stream_len(&session_dir).unwrap_or(0)
+            } else {
+                current_output_offset_by_id(&state.config.get().sessions_dir, &id)
+            };
             Json(meta_to_summary(&meta, false, total_bytes)).into_response()
         }
         Ok(None) => {
@@ -1191,9 +1201,8 @@ pub async fn get_logs_tail(
         return logs_tail_binary_response(output.0, &output.1);
     }
 
-    // Fall back to persisted log file.
-    let log_path = session_dir.join("output.log");
-    match render_log_file(&log_path, tail, true, term_cols, None) {
+    // Fall back to the persisted stream (journal-derived since M3-1c).
+    match render_log_session(&session_dir, tail, true, term_cols, None) {
         Ok(output) => {
             let resizes = read_resize_events(&session_dir).unwrap_or_default();
             logs_tail_binary_response(output, &resizes)

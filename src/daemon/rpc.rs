@@ -14,7 +14,7 @@ use crate::{
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
-        logs::{read_persisted_log_page, read_resize_events, render_log_file},
+        logs::{read_persisted_log_page, read_resize_events, render_log_session},
     },
 };
 
@@ -507,8 +507,7 @@ async fn handle_logs_tail(
         }
     };
 
-    let log_path = session_dir.join("output.log");
-    let lines = match render_log_file(&log_path, tail, keep_color, term_cols, None) {
+    let lines = match render_log_session(&session_dir, tail, keep_color, term_cols, None) {
         Ok(output) => output,
         Err(err) => {
             return RpcResponse::Error {

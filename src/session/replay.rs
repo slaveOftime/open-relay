@@ -26,6 +26,88 @@ use super::scan::{PtyScanner, ScanOut};
 /// independent, so batch size never affects the derived stream.
 const REPLAY_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
+/// Latest journal incarnation for a session directory, if any.
+fn latest_incarnation(session_dir: &Path) -> io::Result<Option<u64>> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    match journal::list_incarnations(&journal_dir) {
+        Ok(incarnations) => Ok(incarnations.last().copied()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Lazy `io::Read` over the derived filtered display stream of the latest
+/// journal incarnation — the streaming replacement for opening
+/// `output.log`. Pulls bounded record batches, filters them through the
+/// scanner, and never buffers more than one batch.
+pub struct ReplayReader {
+    session_dir: std::path::PathBuf,
+    incarnation: Option<u64>,
+    next_seq: u64,
+    scanner: PtyScanner,
+    pending: std::collections::VecDeque<u8>,
+    done: bool,
+}
+
+impl ReplayReader {
+    pub fn new(session_dir: &Path) -> io::Result<Self> {
+        Ok(Self {
+            session_dir: session_dir.to_path_buf(),
+            incarnation: latest_incarnation(session_dir)?,
+            next_seq: 1,
+            scanner: PtyScanner::new(),
+            pending: std::collections::VecDeque::new(),
+            done: false,
+        })
+    }
+
+    fn fill(&mut self) -> io::Result<()> {
+        if self.done || !self.pending.is_empty() {
+            return Ok(());
+        }
+        let Some(incarnation) = self.incarnation else {
+            self.done = true;
+            return Ok(());
+        };
+        let range = journal::read_range(
+            &self.session_dir,
+            incarnation,
+            self.next_seq,
+            u64::MAX,
+            REPLAY_BATCH_BYTES,
+        )?;
+        if range.records.is_empty() {
+            self.done = true;
+            return Ok(());
+        }
+        let mut out = ScanOut::default();
+        for record in &range.records {
+            if record.kind == RecordKind::Output {
+                self.scanner.scan(&record.payload, &mut out);
+                self.pending.extend(out.filtered.iter().copied());
+            }
+            self.next_seq = record.seq + 1;
+        }
+        if !range.truncated {
+            self.done = true;
+        }
+        Ok(())
+    }
+}
+
+impl io::Read for ReplayReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pending.is_empty() {
+            self.fill()?;
+        }
+        let n = self.pending.len().min(buf.len());
+        for slot in &mut buf[..n] {
+            *slot = self.pending.pop_front().expect("len checked");
+        }
+        Ok(n)
+    }
+}
+
 /// Derive the filtered display stream of the session's latest journal
 /// incarnation, starting at filtered-stream offset `from_offset`.
 ///

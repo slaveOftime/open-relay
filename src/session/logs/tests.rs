@@ -88,6 +88,47 @@ fn temp_session_dir(prefix: &str) -> PathBuf {
 }
 
 #[test]
+fn journal_backed_session_logs_render_and_paginate() {
+    // M3-1c: with a journal present, `oly logs` and the HTTP logs endpoint
+    // read the derived filtered stream — never output.log (which is absent).
+    let dir = std::env::temp_dir().join(format!("oly-logs-journal-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    {
+        let (mut journal, _, _) = crate::session::journal::ShadowJournal::open(&dir).unwrap();
+        for i in 0..40 {
+            journal
+                .record_output(bytes::Bytes::from(format!("line {i:02}\r\n")))
+                .unwrap();
+        }
+        journal.request_sync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while journal.core.durable_seq() < 40 {
+            journal.poll_acks();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    assert!(!dir.join("output.log").exists());
+
+    // Render path (oly logs / RPC GetLogs / HTTP tail).
+    let output =
+        super::render::render_log_session(&dir, 10, false, 80, None).expect("render journal logs");
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("line 39"), "{text:?}");
+
+    // Pagination path (HTTP logs page endpoint).
+    let (records, total) =
+        super::index::read_persisted_log_page(&dir, 0, 5).expect("paginate journal logs");
+    // Records split on both \r and \n (legacy rule), so each line is two.
+    assert_eq!(total, 80);
+    assert_eq!(records.len(), 5);
+    assert!(records[0].contains("line 00"), "{records:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn renders_copilot_transcript_exactly() {
     let log_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

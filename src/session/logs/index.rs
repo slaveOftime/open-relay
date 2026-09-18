@@ -104,6 +104,19 @@ pub fn read_persisted_log_page(
     offset: usize,
     limit: usize,
 ) -> Option<(Vec<String>, usize)> {
+    // M3-1c: journal-backed sessions paginate the derived filtered stream
+    // (the on-disk offset index addressed output.log bytes and does not
+    // apply; checkpoint-anchored paging is M4 history-UX work).
+    if session_dir
+        .join(crate::session::journal::JOURNAL_DIR_NAME)
+        .is_dir()
+    {
+        let reader = crate::session::replay::ReplayReader::new(session_dir).ok()?;
+        let mut page = PaginatedLogRecords::new(offset, limit);
+        scan_persisted_log_records(reader, |record| page.push(record)).ok()?;
+        return Some(page.finish());
+    }
+
     let log_path = session_dir.join("output.log");
     if let Ok(index) = sync_persisted_log_index(&log_path)
         && let Ok(records) = read_persisted_log_page_from_index(&log_path, &index, offset, limit)
@@ -694,6 +707,41 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
         start_offset: position,
         end_offset: file_size,
     })
+}
+
+/// In-memory equivalent of [`read_tail_bytes`] for journal-derived
+/// streams (M3-1c): same tail-window and partial-line-drop semantics.
+pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
+    if bytes.is_empty() {
+        return TailBytes {
+            bytes: Vec::new(),
+            start_offset: 0,
+            end_offset: 0,
+        };
+    }
+    let ends_with_newline = bytes.last() == Some(&b'\n');
+    let lines_needed = (tail * 2).max(100) + usize::from(ends_with_newline);
+
+    let mut position = bytes.len();
+    let mut lines_found = 0usize;
+    for (i, &byte) in bytes.iter().enumerate().rev() {
+        if byte == b'\n' {
+            lines_found += 1;
+            if lines_found >= lines_needed {
+                position = i + 1;
+                break;
+            }
+        }
+    }
+    if lines_found < lines_needed {
+        position = 0;
+    }
+
+    TailBytes {
+        bytes: bytes[position..].to_vec(),
+        start_offset: position as u64,
+        end_offset: bytes.len() as u64,
+    }
 }
 
 pub fn read_resize_events(session_dir: &Path) -> Result<Vec<LogResize>> {

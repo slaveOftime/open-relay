@@ -7,7 +7,7 @@ use crate::{
     error::{AppError, Result},
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    session::logs::render_log_file,
+    session::logs::render_log_session,
 };
 
 pub async fn run_logs(
@@ -112,15 +112,17 @@ async fn run_logs_local(
     };
     let session_dir = config.sessions_dir.join(id);
 
-    let log_path = session_dir.join("output.log");
-    if !log_path.exists() {
+    let has_journal = session_dir
+        .join(crate::session::journal::JOURNAL_DIR_NAME)
+        .is_dir();
+    if !has_journal && !session_dir.join("output.log").exists() {
         return Err(AppError::Protocol(format!(
-            "log file not found: {}",
-            log_path.display()
+            "no journal or log file in {}",
+            session_dir.display()
         )));
     }
 
-    let output = render_log_file(&log_path, tail, keep_color, term_cols, None)?;
+    let output = render_log_session(&session_dir, tail, keep_color, term_cols, None)?;
 
     print_log_output(output, keep_color, id, Some(session.status.as_str()))
 }

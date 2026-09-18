@@ -19,6 +19,52 @@ const PARSER_COLS: u16 = 2000;
 /// is visible in the retained log tail.
 const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 
+/// Render a session's persisted output for `oly logs` / the HTTP tail
+/// endpoint. Journal-backed sessions render the derived filtered stream
+/// (M3-1c); legacy pre-journal sessions fall back to `output.log`.
+pub fn render_log_session(
+    session_dir: &Path,
+    tail: usize,
+    keep_color: bool,
+    term_cols: u16,
+    viewport: Option<ViewportSize>,
+) -> Result<Vec<u8>> {
+    if !session_dir
+        .join(crate::session::journal::JOURNAL_DIR_NAME)
+        .is_dir()
+    {
+        return render_log_file(
+            &session_dir.join("output.log"),
+            tail,
+            keep_color,
+            term_cols,
+            viewport,
+        );
+    }
+
+    let (bytes, end) = crate::session::replay::filtered_stream_from(session_dir, 0)?;
+    let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
+    debug_assert_eq!(tail_bytes.end_offset, end);
+    let viewport_plan = if viewport.is_some() {
+        ViewportReplayPlan::default()
+    } else {
+        read_relevant_resize_events(
+            &session_dir.join("output.log"),
+            tail_bytes.start_offset,
+            tail_bytes.end_offset,
+        )?
+    };
+
+    Ok(render_log_bytes(
+        &tail_bytes.bytes,
+        tail,
+        keep_color,
+        term_cols,
+        viewport,
+        &viewport_plan,
+    ))
+}
+
 pub fn render_log_file(
     log_path: &Path,
     tail: usize,
