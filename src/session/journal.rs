@@ -650,8 +650,81 @@ fn appender_loop(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Typed payload codecs for non-output records
+// ---------------------------------------------------------------------------
+
+/// Resize payload: `rows u16 LE | cols u16 LE`. Geometry is part of the
+/// ordered record (ADR-0003): replay applies resizes at their stream
+/// position instead of reconstructing them from side channels.
+pub fn encode_resize_payload(rows: u16, cols: u16) -> [u8; 4] {
+    let mut payload = [0u8; 4];
+    payload[0..2].copy_from_slice(&rows.to_le_bytes());
+    payload[2..4].copy_from_slice(&cols.to_le_bytes());
+    payload
+}
+
+pub fn decode_resize_payload(payload: &[u8]) -> Option<(u16, u16)> {
+    if payload.len() != 4 {
+        return None;
+    }
+    let rows = u16::from_le_bytes([payload[0], payload[1]]);
+    let cols = u16::from_le_bytes([payload[2], payload[3]]);
+    (rows > 0 && cols > 0).then_some((rows, cols))
+}
+
+/// Lifecycle facts worth ordering against the output stream. Only terminal
+/// transitions and the start fact are journaled; transient states
+/// (`running`, `stopping`) are observable from metadata, not stream facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LifecycleCode {
+    Started = 1,
+    Stopped = 2,
+    Killed = 3,
+    Failed = 4,
+}
+
+impl LifecycleCode {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Started),
+            2 => Some(Self::Stopped),
+            3 => Some(Self::Killed),
+            4 => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle payload: `code u8 | exit_code i32 LE | detail UTF-8`.
+/// `i32::MIN` is the sentinel for "no exit code" so `Some(0)` (a clean
+/// exit) stays distinguishable from an absent code.
+pub fn encode_lifecycle_payload(
+    code: LifecycleCode,
+    exit_code: Option<i32>,
+    detail: &str,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(5 + detail.len());
+    payload.push(code as u8);
+    payload.extend_from_slice(&exit_code.unwrap_or(i32::MIN).to_le_bytes());
+    payload.extend_from_slice(detail.as_bytes());
+    payload
+}
+
+pub fn decode_lifecycle_payload(payload: &[u8]) -> Option<(LifecycleCode, Option<i32>, &str)> {
+    if payload.len() < 5 {
+        return None;
+    }
+    let code = LifecycleCode::from_u8(payload[0])?;
+    let raw_exit = i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let exit_code = (raw_exit != i32::MIN).then_some(raw_exit);
+    let detail = std::str::from_utf8(&payload[5..]).ok()?;
+    Some((code, exit_code, detail))
+}
+
 /// M1 shadow journal: bundles the sequencing core with the appender for
-/// the reader-thread-only shadow wiring behind [`shadow_enabled`].
+/// the shadow wiring behind [`shadow_enabled`].
 pub struct ShadowJournal {
     pub core: SequencerCore,
     appender: JournalAppender,
@@ -672,22 +745,52 @@ impl ShadowJournal {
         ))
     }
 
-    /// Sequence an output chunk, retain it in the recent cache and submit
-    /// it to the appender. Returns the assigned cursor; a submission
-    /// failure degrades the core and returns the error for the caller to
-    /// log.
-    pub fn record_output(
+    /// Sequence an event, retain it in the recent cache and submit it to
+    /// the appender. Returns the assigned cursor; a submission failure
+    /// degrades the core and returns the error for the caller to log.
+    pub fn record(
         &mut self,
+        kind: RecordKind,
         payload: bytes::Bytes,
     ) -> Result<JournalCursor, JournalSubmitError> {
         self.poll_acks();
-        let event = self.core.publish(RecordKind::Output, payload);
+        let event = self.core.publish(kind, payload);
         let cursor = event.cursor;
         if let Err(err) = self.appender.try_submit(event) {
             self.core.degrade(err.to_string());
             return Err(err);
         }
         Ok(cursor)
+    }
+
+    pub fn record_output(
+        &mut self,
+        payload: bytes::Bytes,
+    ) -> Result<JournalCursor, JournalSubmitError> {
+        self.record(RecordKind::Output, payload)
+    }
+
+    pub fn record_resize(
+        &mut self,
+        rows: u16,
+        cols: u16,
+    ) -> Result<JournalCursor, JournalSubmitError> {
+        self.record(
+            RecordKind::Resize,
+            bytes::Bytes::copy_from_slice(&encode_resize_payload(rows, cols)),
+        )
+    }
+
+    pub fn record_lifecycle(
+        &mut self,
+        code: LifecycleCode,
+        exit_code: Option<i32>,
+        detail: &str,
+    ) -> Result<JournalCursor, JournalSubmitError> {
+        self.record(
+            RecordKind::Lifecycle,
+            bytes::Bytes::from(encode_lifecycle_payload(code, exit_code, detail)),
+        )
     }
 
     /// Drain pending acknowledgements into the cursors.
@@ -1426,6 +1529,104 @@ mod tests {
             appender.try_submit(event(2, b"b")),
             Err(JournalSubmitError::QueueFull)
         );
+    }
+
+    #[test]
+    fn resize_payload_roundtrips_and_rejects_malformed() {
+        let payload = encode_resize_payload(24, 80);
+        assert_eq!(decode_resize_payload(&payload), Some((24, 80)));
+        assert_eq!(decode_resize_payload(&payload[..3]), None);
+        assert_eq!(decode_resize_payload(&[]), None);
+        // Zero-sized geometry is invalid and must not decode.
+        assert_eq!(decode_resize_payload(&encode_resize_payload(0, 80)), None);
+        assert_eq!(decode_resize_payload(&encode_resize_payload(24, 0)), None);
+    }
+
+    #[test]
+    fn lifecycle_payload_roundtrips_and_rejects_malformed() {
+        let payload = encode_lifecycle_payload(LifecycleCode::Stopped, Some(0), "exit");
+        assert_eq!(
+            decode_lifecycle_payload(&payload),
+            Some((LifecycleCode::Stopped, Some(0), "exit"))
+        );
+        // A clean exit code 0 stays distinguishable from an absent code.
+        let payload = encode_lifecycle_payload(LifecycleCode::Failed, None, "signal");
+        assert_eq!(
+            decode_lifecycle_payload(&payload),
+            Some((LifecycleCode::Failed, None, "signal"))
+        );
+        let payload = encode_lifecycle_payload(LifecycleCode::Started, None, "");
+        assert_eq!(
+            decode_lifecycle_payload(&payload),
+            Some((LifecycleCode::Started, None, ""))
+        );
+        assert_eq!(decode_lifecycle_payload(&payload[..4]), None);
+        let mut bad = encode_lifecycle_payload(LifecycleCode::Killed, Some(-9), "x");
+        bad[0] = 0xEE;
+        assert_eq!(decode_lifecycle_payload(&bad), None);
+        let mut bad_utf8 = encode_lifecycle_payload(LifecycleCode::Killed, Some(-9), "x");
+        *bad_utf8.last_mut().unwrap() = 0xFF;
+        assert_eq!(decode_lifecycle_payload(&bad_utf8), None);
+    }
+
+    #[test]
+    fn shadow_journal_orders_output_resize_and_lifecycle_in_one_stream() {
+        let dir = test_session_dir("shadow_mixed_order");
+        let (mut shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+
+        shadow.record_resize(24, 80).unwrap();
+        shadow
+            .record_lifecycle(LifecycleCode::Started, None, "pid=1")
+            .unwrap();
+        shadow
+            .record_output(bytes::Bytes::from_static(b"before"))
+            .unwrap();
+        shadow.record_resize(40, 120).unwrap();
+        shadow
+            .record_output(bytes::Bytes::from_static(b"after"))
+            .unwrap();
+        shadow
+            .record_lifecycle(LifecycleCode::Stopped, Some(0), "exit")
+            .unwrap();
+        shadow.request_sync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.durable_seq() < 6 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durable ack timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            shadow.poll_acks();
+        }
+        drop(shadow);
+
+        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        assert!(outcome.is_clean());
+        assert_eq!(
+            outcome.records.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![
+                RecordKind::Resize,
+                RecordKind::Lifecycle,
+                RecordKind::Output,
+                RecordKind::Resize,
+                RecordKind::Output,
+                RecordKind::Lifecycle,
+            ]
+        );
+        assert_eq!(
+            decode_resize_payload(&outcome.records[0].payload),
+            Some((24, 80))
+        );
+        assert_eq!(
+            decode_resize_payload(&outcome.records[3].payload),
+            Some((40, 120))
+        );
+        assert_eq!(
+            decode_lifecycle_payload(&outcome.records[5].payload),
+            Some((LifecycleCode::Stopped, Some(0), "exit"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

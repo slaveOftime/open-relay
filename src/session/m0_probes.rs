@@ -183,8 +183,10 @@ fn probe_daemon_backend_echo_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// M1 dev verification: with `OLY_JOURNAL=1` the reader thread journals
-/// every output chunk it also appends to `output.log`, in order.
+/// M1 dev verification: with `OLY_JOURNAL=1` the runtime sequences every
+/// canonical output chunk it also appends to `output.log`, plus the
+/// initial geometry/start facts, mid-stream resizes and the end fact —
+/// all in one contiguous per-incarnation order.
 ///
 /// Ignored and run individually — it mutates the process-global
 /// `OLY_JOURNAL` env var, which is only safe when this probe runs alone:
@@ -218,8 +220,16 @@ fn probe_shadow_journal_records_output_in_order() {
         }
     });
 
-    // Distinctive marker chunks, echoed back by `cat`.
-    for marker in [b"JRN-AAAA\r", b"JRN-BBBB\r", b"JRN-CCCC\r"] {
+    // Distinctive marker chunks, echoed back by `cat`. Between the second
+    // and third marker, resize the PTY: the geometry change must land in
+    // the journal between the surrounding output records.
+    for (index, marker) in [b"JRN-AAAA\r", b"JRN-BBBB\r", b"JRN-CCCC\r"]
+        .iter()
+        .enumerate()
+    {
+        if index == 2 {
+            assert!(runtime.write().resize_pty(40, 120), "probe resize applies");
+        }
         runtime
             .read()
             .pty
@@ -236,6 +246,27 @@ fn probe_shadow_journal_records_output_in_order() {
         }
     }
     runtime.write().pty.kill().ok();
+    runtime.write().mark_completed(SessionStatus::Killed, None);
+
+    // Wait for the appender to journal everything the core published.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let caught_up = {
+            let rt = runtime.read();
+            let journal = rt.journal.as_ref().expect("shadow journal enabled");
+            let mut journal = journal.lock();
+            journal.poll_acks();
+            journal.core.journal_seq() >= journal.core.head_seq().unwrap_or(0)
+        };
+        if caught_up {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "journal drain timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 
     let outcome = super::journal::scan_segment(
         &dir.join(super::journal::JOURNAL_DIR_NAME)
@@ -243,16 +274,63 @@ fn probe_shadow_journal_records_output_in_order() {
     )
     .expect("journal segment scans");
     assert!(outcome.is_clean(), "shadow journal segment must scan clean");
-    assert!(
-        outcome.records.len() >= 3,
-        "expected at least the three marker echoes, got {}",
-        outcome.records.len()
-    );
     let seqs: Vec<u64> = outcome.records.iter().map(|r| r.seq).collect();
     assert_eq!(
         seqs,
         (1..=seqs.len() as u64).collect::<Vec<_>>(),
         "seqs contiguous from 1"
+    );
+
+    use super::journal::{
+        LifecycleCode, RecordKind, decode_lifecycle_payload, decode_resize_payload,
+    };
+    // The session opens with its initial geometry and the start fact.
+    assert_eq!(outcome.records[0].kind, RecordKind::Resize);
+    assert_eq!(
+        decode_resize_payload(&outcome.records[0].payload),
+        Some((24, 80))
+    );
+    assert_eq!(outcome.records[1].kind, RecordKind::Lifecycle);
+    assert_eq!(
+        decode_lifecycle_payload(&outcome.records[1].payload).map(|(code, ..)| code),
+        Some(LifecycleCode::Started)
+    );
+
+    // Exactly one resize to 40x120, ordered between the marker echoes.
+    let resize_seqs: Vec<u64> = outcome
+        .records
+        .iter()
+        .filter(|r| {
+            r.kind == RecordKind::Resize && decode_resize_payload(&r.payload) == Some((40, 120))
+        })
+        .map(|r| r.seq)
+        .collect();
+    assert_eq!(resize_seqs.len(), 1, "resize journaled exactly once");
+    let marker_seq = |needle: &[u8]| {
+        outcome
+            .records
+            .iter()
+            .filter(|r| r.kind == RecordKind::Output)
+            .find(|r| r.payload.windows(needle.len()).any(|w| w == needle))
+            .map(|r| r.seq)
+            .unwrap_or_else(|| panic!("marker {} not journaled", String::from_utf8_lossy(needle)))
+    };
+    let bbbb = marker_seq(b"JRN-BBBB");
+    let cccc = marker_seq(b"JRN-CCCC");
+    assert!(
+        bbbb < resize_seqs[0] && resize_seqs[0] < cccc,
+        "resize seq {} must sit between markers {} and {}",
+        resize_seqs[0],
+        bbbb,
+        cccc
+    );
+
+    // The end fact is the final record.
+    let last = outcome.records.last().unwrap();
+    assert_eq!(last.kind, RecordKind::Lifecycle);
+    assert_eq!(
+        decode_lifecycle_payload(&last.payload).map(|(code, ..)| code),
+        Some(LifecycleCode::Killed)
     );
 
     let _ = std::fs::remove_dir_all(&dir);

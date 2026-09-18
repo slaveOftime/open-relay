@@ -26,7 +26,7 @@ use crate::{
     session::persist::create_output_log,
 };
 
-use super::journal::{self, ShadowJournal};
+use super::journal::{self, LifecycleCode, ShadowJournal};
 use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
 use super::scan::{PtyScanner, ScanOut};
 
@@ -142,6 +142,13 @@ pub struct SessionRuntime {
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
     pub notifications_enabled: bool,
+    /// M1 shadow journal (dev-only `OLY_JOURNAL=1`): the per-session
+    /// sequencing point for output, resize and lifecycle facts. The mutex
+    /// only covers in-memory sequencing plus a bounded, non-blocking queue
+    /// submit — never disk I/O — so it is safe to take while the runtime
+    /// write lock is held (that lock is what orders mutation, sequencing
+    /// and publication against each other; PLAN.md §4.1 item 4).
+    pub journal: Option<parking_lot::Mutex<ShadowJournal>>,
 }
 
 /// Capacity of the queue between attach input and the PTY writer thread.
@@ -450,7 +457,8 @@ impl SessionRuntime {
     }
 
     pub fn mark_completed(&mut self, status: SessionStatus, exit_code: Option<i32>) {
-        if self.meta.ended_at.is_none() {
+        let newly_ended = self.meta.ended_at.is_none();
+        if newly_ended {
             self.meta.ended_at = Some(chrono::Utc::now());
         }
         self.meta.status = status;
@@ -486,6 +494,19 @@ impl SessionRuntime {
         if let Err(err) = append_event(&self.dir, &event) {
             warn!(session_id = %self.meta.id, %err, "failed to persist PTY session completion event");
         }
+        // The end fact is a stream-positioned event too: journal it once,
+        // after the final state is set.
+        if newly_ended {
+            let code = match self.meta.status {
+                SessionStatus::Stopped => Some(LifecycleCode::Stopped),
+                SessionStatus::Killed => Some(LifecycleCode::Killed),
+                SessionStatus::Failed => Some(LifecycleCode::Failed),
+                _ => None,
+            };
+            if let Some(code) = code {
+                self.journal_lifecycle(code, exit_code, &event);
+            }
+        }
     }
 
     pub fn is_completed(&self) -> bool {
@@ -493,6 +514,46 @@ impl SessionRuntime {
             self.meta.status,
             SessionStatus::Stopped | SessionStatus::Killed | SessionStatus::Failed
         )
+    }
+
+    /// Sequence one event into the shadow journal. No-op when the shadow
+    /// journal is disabled. Failures degrade the journal explicitly and
+    /// are logged once (on the transition into the degraded state) — the
+    /// session itself is never affected by shadow persistence.
+    fn journal_event(
+        &self,
+        record: impl FnOnce(
+            &mut ShadowJournal,
+        ) -> std::result::Result<(), super::journal::JournalSubmitError>,
+    ) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let mut journal = journal.lock();
+        let was_degraded = journal.core.is_degraded();
+        if record(&mut journal).is_err() && !was_degraded {
+            warn!(
+                session_id = %self.meta.id,
+                reason = journal.core.degraded_reason().unwrap_or("unknown"),
+                "shadow journal degraded; continuing without it"
+            );
+        }
+    }
+
+    fn journal_output(&self, payload: Bytes) {
+        self.journal_event(|journal| journal.record_output(payload).map(|_| ()));
+    }
+
+    fn journal_resize(&self, rows: u16, cols: u16) {
+        self.journal_event(|journal| journal.record_resize(rows, cols).map(|_| ()));
+    }
+
+    fn journal_lifecycle(&self, code: LifecycleCode, exit_code: Option<i32>, detail: &str) {
+        self.journal_event(|journal| {
+            journal
+                .record_lifecycle(code, exit_code, detail)
+                .map(|_| ())
+        });
     }
 
     pub fn resize_pty(&mut self, rows: u16, cols: u16) -> bool {
@@ -520,6 +581,9 @@ impl SessionRuntime {
                 rows,
                 cols,
             });
+            // Shadow-journal the geometry change at its ordered stream
+            // position (mutation and sequencing share this write lock).
+            self.journal_resize(rows, cols);
             // Notify all attached clients about the new size.
             let _ = self.resize_tx.send((rows, cols));
         }
@@ -642,6 +706,50 @@ pub fn spawn_session(
         .unwrap_or_else(|| "?".to_string());
     append_event(&full_dir, &format!("session started pid={started_pid}"))?;
 
+    // M1 shadow journal (dev-only, `OLY_JOURNAL=1`): one sequencing point
+    // per session, owned by the runtime. The runtime write lock orders
+    // mutation, sequencing and publication; the appender thread owns disk.
+    let shadow_journal = if journal::shadow_enabled() {
+        match ShadowJournal::open(&full_dir) {
+            Ok((mut shadow, incarnation, report)) => {
+                if let Some(report) = &report {
+                    debug!(
+                        session_id = %meta.id,
+                        incarnation = report.incarnation,
+                        records = report.records,
+                        last_seq = ?report.last_seq,
+                        stop = ?report.stop,
+                        rewound = report.rewound,
+                        "recovered previous journal incarnation"
+                    );
+                }
+                info!(
+                    session_id = %meta.id,
+                    incarnation,
+                    "shadow journal opened"
+                );
+                // The first ordered facts: initial geometry, then start.
+                let _ = shadow.record_resize(rows, cols);
+                let _ = shadow.record_lifecycle(
+                    LifecycleCode::Started,
+                    None,
+                    &format!("session started pid={started_pid}"),
+                );
+                Some(parking_lot::Mutex::new(shadow))
+            }
+            Err(err) => {
+                warn!(
+                    session_id = %meta.id,
+                    %err,
+                    "failed to open shadow journal; continuing without it"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Broadcast channel: each live attach subscriber holds a Receiver.
     let (broadcast_tx, _initial_rx) = broadcast::channel::<Bytes>(256);
 
@@ -706,6 +814,7 @@ pub fn spawn_session(
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
         notifications_enabled,
+        journal: shadow_journal,
     }));
 
     // PTY reader thread: reads raw bytes, derives one canonical filtered stream,
@@ -724,43 +833,6 @@ pub fn spawn_session(
         let mut scanner = PtyScanner::new();
         let mut scan_out = ScanOut::default();
         let mut output_log = OutputLog::open(&reader_dir);
-        // M1 shadow journal (dev-only, `OLY_JOURNAL=1`): sequence output
-        // records alongside `output.log` without making them canonical yet.
-        // Sequencing and publication happen in memory; a bounded appender
-        // thread owns the disk writes (PLAN.md §4.2).
-        let mut shadow_journal = if journal::shadow_enabled() {
-            match ShadowJournal::open(&reader_dir) {
-                Ok((shadow, incarnation, report)) => {
-                    if let Some(report) = &report {
-                        debug!(
-                            session_id = %reader_session_id,
-                            incarnation = report.incarnation,
-                            records = report.records,
-                            last_seq = ?report.last_seq,
-                            stop = ?report.stop,
-                            rewound = report.rewound,
-                            "recovered previous journal incarnation"
-                        );
-                    }
-                    info!(
-                        session_id = %reader_session_id,
-                        incarnation,
-                        "shadow journal opened"
-                    );
-                    Some(shadow)
-                }
-                Err(err) => {
-                    warn!(
-                        session_id = %reader_session_id,
-                        %err,
-                        "failed to open shadow journal; continuing without it"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -807,6 +879,11 @@ pub fn spawn_session(
                             false
                         };
                         let cursor = rt.push_output(&filtered, meaningful_len);
+                        // Sequence the canonical chunk into the shadow
+                        // journal inside the same write-lock section that
+                        // mutated the screen, so output, resize and
+                        // lifecycle records share one order (PLAN.md §4.1).
+                        rt.journal_output(filtered.clone());
                         (cursor, meta_changed.then(|| rt.to_summary()))
                     };
 
@@ -818,16 +895,6 @@ pub fn spawn_session(
 
                     if let Err(err) = output_log.append(&filtered) {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
-                    }
-
-                    if let Some(journal) = shadow_journal.as_mut()
-                        && let Err(err) = journal.record_output(filtered.clone())
-                    {
-                        warn!(
-                            session_id = %reader_session_id,
-                            %err,
-                            "failed to submit output to shadow journal"
-                        );
                     }
 
                     // Broadcast canonical filtered output to all live
@@ -1183,11 +1250,57 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             notifications_enabled: true,
+            journal: None,
         }
     }
 
     fn new_runtime() -> SessionRuntime {
         new_runtime_with(SessionStatus::Running, 0)
+    }
+
+    #[test]
+    fn mark_completed_journals_the_end_fact_exactly_once() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, incarnation, _) = ShadowJournal::open(&dir).unwrap();
+        assert_eq!(incarnation, 1);
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        rt.mark_completed(SessionStatus::Killed, Some(-9));
+        // Idempotent completion must not duplicate the end fact.
+        rt.mark_completed(SessionStatus::Killed, Some(-9));
+
+        // Wait for the appender to drain, then verify the journal holds
+        // exactly one lifecycle record.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.poll_acks();
+                if journal.core.journal_seq() >= 1 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "journal ack timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(rt);
+
+        let outcome = journal::scan_segment(
+            &dir.join(journal::JOURNAL_DIR_NAME)
+                .join("seg-00000001.ojrn"),
+        )
+        .unwrap();
+        assert_eq!(outcome.records.len(), 1, "the end fact is journaled once");
+        let record = &outcome.records[0];
+        assert_eq!(record.kind, journal::RecordKind::Lifecycle);
+        let (code, exit_code, detail) = journal::decode_lifecycle_payload(&record.payload).unwrap();
+        assert_eq!(code, LifecycleCode::Killed);
+        assert_eq!(exit_code, Some(-9));
+        assert!(detail.contains("killed"), "unexpected detail: {detail}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Drive one raw chunk through the reader thread's pipeline: scan it, then
@@ -1803,6 +1916,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             notifications_enabled: true,
+            journal: None,
         };
 
         assert!(rt.pty.try_write_input(b"before".to_vec()).is_ok());

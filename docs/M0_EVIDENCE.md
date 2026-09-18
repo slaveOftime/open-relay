@@ -195,6 +195,32 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
   never precedes journal availability, sticky degradation) + the real-PTY
   shadow probe re-run. Suite: 515 passed, 16 ignored; clippy baseline
   unchanged (81 with `--all-targets`).
+
+### Increment 3: ordered resize/lifecycle through one sequencing point
+
+- Typed payload codecs in `journal.rs`: resize (`rows|cols u16 LE`,
+  zero geometry rejected) and lifecycle (`code u8 | exit_code i32 LE,
+  `i32::MIN` = absent | detail UTF-8`; `LifecycleCode` =
+  Started/Stopped/Killed/Failed). Round-trip and malformed-input tests
+  included.
+- The `ShadowJournal` moved from the reader thread into
+  `SessionRuntime.journal: Option<Mutex<ShadowJournal>>` — one
+  sequencing point per session. The mutex only covers in-memory
+  sequencing + bounded non-blocking submit, so it can be taken while
+  the runtime write lock is held: that lock now orders mutation,
+  sequencing and publication against each other (PLAN.md §4.1 item 4).
+  Output is journaled inside the same write-lock section as
+  `push_output`; `resize_pty` journals the geometry change after the
+  mutation succeeds; `mark_completed` journals the end fact exactly
+  once (`newly_ended` guard); `spawn_session` journals initial
+  geometry + `Started`. Failure handling: degrade-and-log-once.
+- Verified: codec round-trips/malformed rejection, mixed-kind ordering
+  test (resize/lifecycle/output in one stream), runtime test that
+  `mark_completed` journals the end fact exactly once, and the extended
+  real-PTY probe asserting the full order: `Resize(24,80) → Started →
+  JRN-AAAA → JRN-BBBB → Resize(40,120) → JRN-CCCC → … → Killed` with
+  contiguous seqs and a clean scan. Suite: 519 passed, 16 ignored;
+  clippy baseline unchanged (80 with `--all-targets`).
 - [x] Capability/CLI/API/config/auth inventory for the compatibility break
       — see [M0_INVENTORY.md](M0_INVENTORY.md).
 - [x] ADR ratification at the M0 exit gate: ADR-0002/0003/0006/0007
