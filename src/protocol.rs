@@ -7,7 +7,10 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+// 12: attach streams carry PTY output as binary length-delimited frames
+// after the JSON init line (M6-3, ADR-0004); pre-12 peers expect base64
+// JSON chunks and are rejected.
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 

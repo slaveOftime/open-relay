@@ -264,6 +264,144 @@ pub async fn read_response_from_reader(
     Ok(envelope.payload)
 }
 
+// ── Binary attach-stream frames (M6-3, ADR-0004) ─────────────────────────
+//
+// After the `AttachStreamInit` JSON line, the server→client direction of an
+// attach stream switches to binary length-delimited frames: PTY output is
+// raw bytes, never base64. Client→server stays newline-delimited JSON
+// (low-volume control only).
+//
+//   [u32 LE payload_len][u8 tag][payload]
+//   tag 1 = output:  payload = [u64 LE offset][raw bytes]
+//   tag 2 = control: payload = bare JSON `RpcResponse` (modes / done /
+//                    control-changed / resize-broadcast / error notices)
+
+pub const ATTACH_FRAME_OUTPUT: u8 = 1;
+pub const ATTACH_FRAME_CONTROL: u8 = 2;
+
+/// Hard caps checked before any allocation (PLAN §7.4). Output frames carry
+/// one canonical chunk (at most 512 KiB by runtime batching); control frames
+/// carry small JSON notices only.
+const MAX_ATTACH_OUTPUT_FRAME_BYTES: u32 = 1024 * 1024 + 8;
+const MAX_ATTACH_CONTROL_FRAME_BYTES: u32 = 64 * 1024;
+const ATTACH_FRAME_HEADER_BYTES: usize = 5;
+
+/// One server→client attach-stream frame.
+#[derive(Debug)]
+pub enum AttachFrame {
+    Output { offset: u64, data: Vec<u8> },
+    // Boxed: RpcResponse is large and control frames are rare compared to
+    // output frames, so keep the enum small.
+    Control(Box<RpcResponse>),
+}
+
+/// Write one binary output chunk frame (single write: header + payload).
+pub async fn write_attach_output_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    offset: u64,
+    data: &[u8],
+) -> Result<()> {
+    let payload_len = 8 + data.len();
+    let mut frame = Vec::with_capacity(ATTACH_FRAME_HEADER_BYTES + payload_len);
+    frame.extend_from_slice(&(payload_len as u32).to_le_bytes());
+    frame.push(ATTACH_FRAME_OUTPUT);
+    frame.extend_from_slice(&offset.to_le_bytes());
+    frame.extend_from_slice(data);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Write one binary control frame (JSON `RpcResponse` payload).
+pub async fn write_attach_control_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    response: &RpcResponse,
+) -> Result<()> {
+    let payload = serde_json::to_vec(response)?;
+    if payload.len() as u32 > MAX_ATTACH_CONTROL_FRAME_BYTES {
+        return Err(AppError::Protocol(format!(
+            "attach control frame too large: {} bytes",
+            payload.len()
+        )));
+    }
+    let mut frame = Vec::with_capacity(ATTACH_FRAME_HEADER_BYTES + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.push(ATTACH_FRAME_CONTROL);
+    frame.extend_from_slice(&payload);
+    writer.write_all(&frame).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Read one attach-stream frame. Any EOF — clean or mid-frame — surfaces as
+/// an error; callers treat it as end-of-stream.
+pub async fn read_attach_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<AttachFrame> {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; ATTACH_FRAME_HEADER_BYTES];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| AppError::Protocol("daemon closed the connection".to_string()))?;
+    let payload_len = u32::from_le_bytes(header[0..4].try_into().expect("4-byte length"));
+    let tag = header[4];
+    let cap = match tag {
+        ATTACH_FRAME_OUTPUT => MAX_ATTACH_OUTPUT_FRAME_BYTES,
+        ATTACH_FRAME_CONTROL => MAX_ATTACH_CONTROL_FRAME_BYTES,
+        other => {
+            return Err(AppError::Protocol(format!(
+                "unknown attach frame tag {other}"
+            )));
+        }
+    };
+    if payload_len > cap {
+        return Err(AppError::Protocol(format!(
+            "attach frame too large: {payload_len} bytes (cap {cap})"
+        )));
+    }
+    let mut payload = vec![0u8; payload_len as usize];
+    reader
+        .read_exact(&mut payload)
+        .await
+        .map_err(|_| AppError::Protocol("attach frame truncated by peer".to_string()))?;
+
+    match tag {
+        ATTACH_FRAME_OUTPUT => {
+            if payload.len() < 8 {
+                return Err(AppError::Protocol(
+                    "attach output frame too short".to_string(),
+                ));
+            }
+            let offset = u64::from_le_bytes(payload[0..8].try_into().expect("8-byte offset"));
+            Ok(AttachFrame::Output {
+                offset,
+                data: payload.split_off(8),
+            })
+        }
+        ATTACH_FRAME_CONTROL => {
+            let response: RpcResponse = serde_json::from_slice(&payload)?;
+            Ok(AttachFrame::Control(Box::new(response)))
+        }
+        other => unreachable!("tag {other} was capped above"),
+    }
+}
+
+/// Read one attach frame, mapping control-frame errors to request failures
+/// (same semantics as [`read_checked_response_from_reader`]).
+pub async fn read_checked_attach_frame<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<AttachFrame> {
+    match read_attach_frame(reader).await? {
+        AttachFrame::Control(resp) => match *resp {
+            RpcResponse::Error { message } => Err(AppError::RequestFailed(message)),
+            other => Ok(AttachFrame::Control(Box::new(other))),
+        },
+        frame => Ok(frame),
+    }
+}
+
 pub async fn read_checked_response_from_reader(
     reader: &mut BufReader<ReadHalf<Stream>>,
 ) -> Result<RpcResponse> {
@@ -284,9 +422,12 @@ pub async fn write_request_to_writer(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_IPC_LINE_BYTES, ensure_success_response, read_line_bounded};
+    use super::{
+        AttachFrame, MAX_IPC_LINE_BYTES, ensure_success_response, read_attach_frame,
+        read_line_bounded, write_attach_control_frame, write_attach_output_frame,
+    };
     use crate::{error::AppError, protocol::RpcResponse};
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     /// `BufReader` with a tiny capacity reproduces the socket behaviour of
     /// handing back an arbitrary byte count per `fill_buf`.
@@ -359,5 +500,139 @@ mod tests {
             AppError::RequestFailed(ref message) if message == "session not running: demo"
         ));
         assert_eq!(err.to_string(), "session not running: demo");
+    }
+
+    /// ADR-0004 acceptance: frames survive arbitrary fragmentation and
+    /// coalescing on the wire, and mixed output/control sequences decode in
+    /// order with byte-identical payloads.
+    #[tokio::test]
+    async fn attach_frames_round_trip_through_fragmented_writes() {
+        let chunks: Vec<(u64, Vec<u8>)> = (0..6u8)
+            .map(|i| (i as u64 * 7, vec![b'0' + i; 1 << (i as usize + 4)]))
+            .collect();
+        let control = RpcResponse::AttachModeChanged {
+            app_cursor_keys: true,
+            bracketed_paste_mode: false,
+        };
+
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        let control_json = serde_json::to_vec(&control).unwrap();
+        let written = chunks.clone();
+        let writer = tokio::spawn(async move {
+            for (i, (offset, data)) in written.iter().enumerate() {
+                // Frame boundaries must not matter: write each frame in
+                // odd-sized pieces, then coalesce a control frame with the
+                // next output frame in one flush.
+                let mut frame = Vec::new();
+                frame.extend_from_slice(&((8 + data.len()) as u32).to_le_bytes());
+                frame.push(super::ATTACH_FRAME_OUTPUT);
+                frame.extend_from_slice(&offset.to_le_bytes());
+                frame.extend_from_slice(data);
+                let mut pos = 0;
+                while pos < frame.len() {
+                    let n = (pos % 13 + 1).min(frame.len() - pos);
+                    tx.write_all(&frame[pos..pos + n]).await.unwrap();
+                    pos += n;
+                }
+                if i == 2 {
+                    let mut ctl = Vec::new();
+                    ctl.extend_from_slice(&(control_json.len() as u32).to_le_bytes());
+                    ctl.push(super::ATTACH_FRAME_CONTROL);
+                    ctl.extend_from_slice(&control_json);
+                    tx.write_all(&ctl).await.unwrap();
+                }
+            }
+        });
+
+        let mut reader = BufReader::new(rx);
+        let mut seen_control = false;
+        for (offset, data) in &chunks {
+            match read_attach_frame(&mut reader).await.unwrap() {
+                AttachFrame::Output {
+                    offset: got_offset,
+                    data: got,
+                } => {
+                    assert_eq!((got_offset, &got), (*offset, data));
+                }
+                AttachFrame::Control(resp) => {
+                    assert!(matches!(
+                        *resp,
+                        RpcResponse::AttachModeChanged {
+                            app_cursor_keys: true,
+                            bracketed_paste_mode: false
+                        }
+                    ));
+                    seen_control = true;
+                    // Re-read to get the output frame for this iteration.
+                    match read_attach_frame(&mut reader).await.unwrap() {
+                        AttachFrame::Output {
+                            offset: got_offset,
+                            data: got,
+                        } => assert_eq!((got_offset, &got), (*offset, data)),
+                        other => panic!("expected output frame, got {other:?}"),
+                    }
+                }
+            }
+        }
+        assert!(seen_control);
+        writer.await.unwrap();
+    }
+
+    /// Oversize or unknown-tag frames are rejected from the header alone —
+    /// no payload-sized allocation happens first (PLAN §7.4).
+    #[tokio::test]
+    async fn attach_frame_caps_are_enforced_before_allocation() {
+        let (mut tx, rx) = tokio::io::duplex(1024);
+        tx.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
+        tx.write_all(&[super::ATTACH_FRAME_OUTPUT]).await.unwrap();
+        let mut reader = BufReader::new(rx);
+        let err = read_attach_frame(&mut reader).await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        let (mut tx, rx) = tokio::io::duplex(1024);
+        tx.write_all(&4u32.to_le_bytes()).await.unwrap();
+        tx.write_all(&[0xEE]).await.unwrap();
+        let mut reader = BufReader::new(rx);
+        let err = read_attach_frame(&mut reader).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unknown attach frame tag"),
+            "{err}"
+        );
+    }
+
+    /// The write helpers emit exactly the frame layout the reader expects.
+    #[tokio::test]
+    async fn attach_frame_writers_and_reader_agree() {
+        let (mut tx, rx) = tokio::io::duplex(64 * 1024);
+        write_attach_output_frame(&mut tx, 42, b"hello \x1b[31mred")
+            .await
+            .unwrap();
+        write_attach_control_frame(
+            &mut tx,
+            &RpcResponse::AttachResized {
+                rows: 40,
+                cols: 120,
+            },
+        )
+        .await
+        .unwrap();
+        drop(tx);
+
+        let mut reader = BufReader::new(rx);
+        match read_attach_frame(&mut reader).await.unwrap() {
+            AttachFrame::Output { offset, data } => {
+                assert_eq!(offset, 42);
+                assert_eq!(data, b"hello \x1b[31mred");
+            }
+            other => panic!("expected output frame, got {other:?}"),
+        }
+        match read_attach_frame(&mut reader).await.unwrap() {
+            AttachFrame::Control(resp) => {
+                assert!(
+                    matches!(*resp, RpcResponse::AttachResized { rows, cols } if (rows, cols) == (40, 120))
+                );
+            }
+            other => panic!("expected control frame, got {other:?}"),
+        }
     }
 }

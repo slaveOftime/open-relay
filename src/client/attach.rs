@@ -298,8 +298,10 @@ async fn run_attach_inner(
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         while running {
-            match ipc::read_checked_response_from_reader(&mut reader).await? {
-                RpcResponse::AttachStreamChunk { offset, data } => {
+            // M6-3: after the init line the stream is binary framed
+            // (ADR-0004); output arrives as raw bytes.
+            match ipc::read_checked_attach_frame(&mut reader).await? {
+                ipc::AttachFrame::Output { offset, data } => {
                     stream_cursor.accept(offset, data.len())?;
                     write_bytes_to_stdout(&data)?;
                     maybe_send_ack(
@@ -310,13 +312,15 @@ async fn run_attach_inner(
                     )
                     .await;
                 }
-                RpcResponse::AttachModeChanged { .. } => {}
-                RpcResponse::AttachControlChanged { .. } => {}
-                RpcResponse::AttachStreamDone { final_offset, .. } => {
-                    stream_cursor.finish(final_offset)?;
-                    running = false;
-                }
-                _ => {}
+                ipc::AttachFrame::Control(resp) => match *resp {
+                    RpcResponse::AttachModeChanged { .. } => {}
+                    RpcResponse::AttachControlChanged { .. } => {}
+                    RpcResponse::AttachStreamDone { final_offset, .. } => {
+                        stream_cursor.finish(final_offset)?;
+                        running = false;
+                    }
+                    _ => {}
+                },
             }
         }
 
@@ -359,18 +363,18 @@ async fn run_attach_inner(
         // before the main event loop.
         let _ = drain_pending_terminal_events();
 
-        // `read_response_from_reader` uses `read_line`, which is not safe to
-        // keep cancelling with timeouts. Read daemon frames in a dedicated task
-        // and receive them over a channel instead. The channel is bounded
-        // (M5-1): when the render loop falls behind, the reader task's send
-        // awaits, which backpressures the socket and — via the daemon's
-        // credit gate and broadcast-ring resync — never grows memory
-        // without bound. Worst case: 16 frames x ~700 KiB base64 lines.
+        // Frame reads are not safe to keep cancelling with timeouts. Read
+        // daemon frames in a dedicated task and receive them over a channel
+        // instead. The channel is bounded (M5-1): when the render loop falls
+        // behind, the reader task's send awaits, which backpressures the
+        // socket and — via the daemon's credit gate and broadcast-ring
+        // resync — never grows memory without bound. Worst case: 16 frames
+        // x at most ~1 MiB binary frames (M6-3).
         let (frame_tx, mut frame_rx) = mpsc::channel(ATTACH_FRAME_QUEUE_DEPTH);
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
             loop {
-                let frame = ipc::read_checked_response_from_reader(&mut reader).await;
+                let frame = ipc::read_checked_attach_frame(&mut reader).await;
                 let done = frame.is_err();
                 if frame_tx.send(frame).await.is_err() {
                     break;
@@ -566,6 +570,12 @@ async fn run_attach_inner(
                             let mut batch = Vec::new();
                             let mut response = Some(response);
                             while let Some(current) = response.take() {
+                                let current = match current {
+                                    ipc::AttachFrame::Output { offset, data } => {
+                                        RpcResponse::AttachStreamChunk { offset, data }
+                                    }
+                                    ipc::AttachFrame::Control(resp) => *resp,
+                                };
                                 match current {
                                     RpcResponse::AttachStreamChunk { offset, data } => {
                                         if let Err(err) =

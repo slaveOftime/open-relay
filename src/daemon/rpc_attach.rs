@@ -183,7 +183,7 @@ pub(super) async fn handle_attach_subscribe(
                                 // transport failures end the stream.
                                 if matches!(err, crate::session::SessionError::NotController | crate::session::SessionError::StaleAttachment) {
                                     let message = err.message(&id);
-                                    if ipc::write_response_to_writer(&mut writer, RpcResponse::Error { message }).await.is_err() {
+                                    if ipc::write_attach_control_frame(&mut writer, &RpcResponse::Error { message }).await.is_err() {
                                         break;
                                     }
                                 } else {
@@ -231,16 +231,13 @@ pub(super) async fn handle_attach_subscribe(
                 event = pump.next() => {
                     match event {
                         AttachEvent::Chunk { offset, data } => {
-                            ipc::write_response_to_writer(
-                                &mut writer,
-                                RpcResponse::AttachStreamChunk { offset, data },
-                            )
-                            .await?;
+                            // M6-3: raw binary frame, no base64 (ADR-0004).
+                            ipc::write_attach_output_frame(&mut writer, offset, &data).await?;
                         }
                         AttachEvent::Modes(modes) => {
-                            ipc::write_response_to_writer(
+                            ipc::write_attach_control_frame(
                                 &mut writer,
-                                RpcResponse::AttachModeChanged {
+                                &RpcResponse::AttachModeChanged {
                                     app_cursor_keys: modes.app_cursor_keys,
                                     bracketed_paste_mode: modes.bracketed_paste_mode,
                                 },
@@ -251,9 +248,9 @@ pub(super) async fn handle_attach_subscribe(
                             exit_code,
                             final_offset,
                         } => {
-                            let _ = ipc::write_response_to_writer(
+                            let _ = ipc::write_attach_control_frame(
                                 &mut writer,
-                                RpcResponse::AttachStreamDone {
+                                &RpcResponse::AttachStreamDone {
                                     exit_code,
                                     final_offset,
                                 },
@@ -285,7 +282,7 @@ pub(super) async fn handle_attach_subscribe(
                             let resp = RpcResponse::AttachControlChanged {
                                 role: current_role.as_str().to_owned(),
                             };
-                            if ipc::write_response_to_writer(&mut writer, resp).await.is_err() {
+                            if ipc::write_attach_control_frame(&mut writer, &resp).await.is_err() {
                                 break;
                             }
                         }
@@ -301,9 +298,9 @@ pub(super) async fn handle_attach_subscribe(
                         rows, cols,
                         "forwarding resize notification to IPC client"
                     );
-                    ipc::write_response_to_writer(
+                    ipc::write_attach_control_frame(
                         &mut writer,
-                        RpcResponse::AttachResized { rows, cols },
+                        &RpcResponse::AttachResized { rows, cols },
                     )
                     .await?;
                 }

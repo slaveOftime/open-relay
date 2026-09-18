@@ -1106,15 +1106,16 @@ mod tests {
                     bytes: Bytes::from_static(b"\n"),
                 });
             }
+            // M6-3: after the init line the stream is binary framed.
             let chunk = tokio::time::timeout(
                 Duration::from_secs(5),
-                ipc::read_response_from_reader(&mut reader_a),
+                ipc::read_attach_frame(&mut reader_a),
             )
             .await
             .expect("chunk frame")
             .expect("chunk response");
-            let RpcResponse::AttachStreamChunk { offset, data } = chunk else {
-                panic!("expected AttachStreamChunk, got {chunk:?}");
+            let ipc::AttachFrame::Output { offset, data } = chunk else {
+                panic!("expected output frame, got {chunk:?}");
             };
             assert_eq!(offset, 11);
             assert_eq!(data, b"\n");
@@ -1227,13 +1228,13 @@ mod tests {
             .expect("write observer input");
             let rejected = tokio::time::timeout(
                 Duration::from_secs(5),
-                ipc::read_response_from_reader(&mut reader_d),
+                ipc::read_attach_frame(&mut reader_d),
             )
             .await
             .expect("observer rejection timeout")
             .expect("observer rejection");
             assert!(
-                matches!(rejected, RpcResponse::Error { .. }),
+                matches!(&rejected, ipc::AttachFrame::Control(resp) if matches!(&**resp, RpcResponse::Error { .. })),
                 "observer input must be rejected, got {rejected:?}"
             );
 
@@ -1248,13 +1249,16 @@ mod tests {
             .expect("acquire control");
             let handoff = tokio::time::timeout(
                 Duration::from_secs(5),
-                ipc::read_response_from_reader(&mut reader_d),
+                ipc::read_attach_frame(&mut reader_d),
             )
             .await
             .expect("handoff notice timeout")
             .expect("handoff notice");
-            let RpcResponse::AttachControlChanged { role } = handoff else {
+            let ipc::AttachFrame::Control(resp) = handoff else {
                 panic!("expected AttachControlChanged, got {handoff:?}");
+            };
+            let RpcResponse::AttachControlChanged { role } = *resp else {
+                panic!("expected AttachControlChanged, got {resp:?}");
             };
             assert_eq!(role, "controller");
             ipc::write_request_to_writer(

@@ -371,6 +371,10 @@ async fn relay_streaming_rpc(
     // closes or the client detaches; afterwards we only drain frames until
     // the stream handler ends the stream.
     let mut msgs_open = true;
+    // M6-3: the nested IPC attach stream sends its init (or an error) as a
+    // JSON line, then switches to binary frames (ADR-0004). The relay
+    // re-encodes them into the node-WS `RpcResponse` shape.
+    let mut stream_binary = false;
     loop {
         tokio::select! {
             biased;
@@ -394,9 +398,25 @@ async fn relay_streaming_rpc(
                 }
             }
 
-            response = ipc::read_response_from_reader(&mut reader) => {
-                match response {
+            frame = async {
+                if stream_binary {
+                    ipc::read_attach_frame(&mut reader).await.map(|frame| {
+                        match frame {
+                            ipc::AttachFrame::Output { offset, data } => {
+                                RpcResponse::AttachStreamChunk { offset, data }
+                            }
+                            ipc::AttachFrame::Control(resp) => *resp,
+                        }
+                    })
+                } else {
+                    ipc::read_response_from_reader(&mut reader).await
+                }
+            } => {
+                match frame {
                     Ok(resp) => {
+                        if matches!(resp, RpcResponse::AttachStreamInit { .. }) {
+                            stream_binary = true;
+                        }
                         let is_done = matches!(
                             resp,
                             RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
@@ -587,6 +607,10 @@ pub(super) async fn handle_node_proxy_streaming(
         _ => String::new(),
     };
 
+    // M6-3: local IPC attach streams switch to binary frames after the
+    // init line (ADR-0004) — this relay is no exception.
+    let mut stream_binary = false;
+
     loop {
         tokio::select! {
             biased;
@@ -598,7 +622,22 @@ pub(super) async fn handle_node_proxy_streaming(
                             resp,
                             RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
                         );
-                        if ipc::write_response_to_writer(&mut writer, resp).await.is_err() {
+                        let written = if stream_binary {
+                            match resp {
+                                RpcResponse::AttachStreamChunk { offset, data } => {
+                                    ipc::write_attach_output_frame(&mut writer, offset, &data).await
+                                }
+                                other => {
+                                    ipc::write_attach_control_frame(&mut writer, &other).await
+                                }
+                            }
+                        } else {
+                            if matches!(resp, RpcResponse::AttachStreamInit { .. }) {
+                                stream_binary = true;
+                            }
+                            ipc::write_response_to_writer(&mut writer, resp).await
+                        };
+                        if written.is_err() {
                             break;
                         }
                         if is_done {
@@ -606,24 +645,26 @@ pub(super) async fn handle_node_proxy_streaming(
                         }
                     }
                     Some(Err(e)) => {
-                        let _ = ipc::write_response_to_writer(
-                            &mut writer,
-                            RpcResponse::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
+                        let resp = RpcResponse::Error {
+                            message: e.to_string(),
+                        };
+                        let _ = if stream_binary {
+                            ipc::write_attach_control_frame(&mut writer, &resp).await
+                        } else {
+                            ipc::write_response_to_writer(&mut writer, resp).await
+                        };
                         break;
                     }
                     None => {
-                        let _ = ipc::write_response_to_writer(
-                            &mut writer,
-                            RpcResponse::AttachStreamDone {
+                        let resp = RpcResponse::AttachStreamDone {
                             exit_code: None,
                             final_offset: 0,
-                        },
-                        )
-                        .await;
+                        };
+                        let _ = if stream_binary {
+                            ipc::write_attach_control_frame(&mut writer, &resp).await
+                        } else {
+                            ipc::write_response_to_writer(&mut writer, resp).await
+                        };
                         break;
                     }
                 }

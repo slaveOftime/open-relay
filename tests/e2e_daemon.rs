@@ -717,7 +717,7 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
     // Without the M5-2 relay channel these messages could not reach the
     // owning node's stream task at all.
     rt.block_on(async {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         // The daemon's IPC socket is abstract-namespaced on Linux: connect
         // with the same interprocess naming the client uses.
@@ -741,10 +741,12 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
             }
         };
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read_half).lines();
+        let mut reader = BufReader::new(read_half);
 
-        // IPC frames are versioned envelopes: {"version":11,"payload":{...}}.
-        let envelope = |payload: serde_json::Value| json!({"version": 11, "payload": payload});
+        // IPC control messages are versioned envelopes:
+        // {"version":12,"payload":{...}} (v12: attach streams carry output
+        // as binary frames after the JSON init line, M6-3).
+        let envelope = |payload: serde_json::Value| json!({"version": 12, "payload": payload});
         let subscribe = envelope(json!({
             "type": "node_proxy",
             "node": "worker1",
@@ -760,12 +762,14 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
             .await
             .expect("write subscribe");
 
-        // First frame must be the attach init.
-        let init_line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        // First frame must be the attach init (a JSON line; the stream
+        // switches to binary frames afterwards).
+        let mut init_line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut init_line))
             .await
             .expect("init read timed out")
-            .expect("init read failed")
-            .expect("stream closed before init");
+            .expect("init read failed");
+        assert!(!init_line.is_empty(), "stream closed before init");
         let init_envelope: serde_json::Value =
             serde_json::from_str(&init_line).expect("parse init");
         let init = &init_envelope["payload"];
@@ -797,36 +801,56 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
         // the owning node's credit gate sees our applied cursor.
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut echoed = false;
+        // Post-init frames are binary: [u32 LE payload_len][u8 tag][payload]
+        // with tag 1 = output ([u64 LE offset][raw bytes]) and tag 2 =
+        // control (bare JSON RpcResponse). Read them byte-exactly.
         while std::time::Instant::now() < deadline && !echoed {
-            let line = match tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await {
-                Ok(Ok(Some(line))) => line,
-                _ => break,
-            };
-            let frame_envelope: serde_json::Value =
-                serde_json::from_str(&line).expect("parse frame");
-            let frame = &frame_envelope["payload"];
-            match frame["type"].as_str() {
-                Some("attach_stream_chunk") => {
-                    let offset = frame["offset"].as_u64().expect("chunk offset");
-                    let data_b64 = frame["data"].as_str().unwrap_or_default();
-                    let len = base64_decode_len(data_b64) as u64;
+            let mut header = [0u8; 5];
+            if tokio::time::timeout(Duration::from_secs(5), reader.read_exact(&mut header))
+                .await
+                .map(|r| r.is_err())
+                .unwrap_or(true)
+            {
+                break;
+            }
+            let payload_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+            let tag = header[4];
+            assert!(payload_len <= 1 << 20, "frame too large: {payload_len}");
+            let mut payload = vec![0u8; payload_len];
+            reader
+                .read_exact(&mut payload)
+                .await
+                .expect("frame payload");
+            match tag {
+                1 => {
+                    let offset = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+                    let data = &payload[8..];
                     let ack = envelope(json!({
                         "type": "attach_applied_cursor",
                         "id": session_id,
-                        "cursor": offset + len
+                        "cursor": offset + data.len() as u64
                     }));
                     write_half
                         .write_all(format!("{ack}\n").as_bytes())
                         .await
                         .expect("write ack");
-                    if let Ok(text) = std::str::from_utf8(&base64_decode(data_b64))
+                    if let Ok(text) = std::str::from_utf8(data)
                         && text.contains(RELAY_MARKER)
                     {
                         echoed = true;
                     }
                 }
-                Some("attach_stream_done") | Some("error") => break,
-                _ => {}
+                2 => {
+                    let control: serde_json::Value =
+                        serde_json::from_slice(&payload).expect("parse control frame");
+                    if matches!(
+                        control["type"].as_str(),
+                        Some("attach_stream_done") | Some("error")
+                    ) {
+                        break;
+                    }
+                }
+                other => panic!("unknown attach frame tag {other}"),
             }
         }
 
@@ -850,19 +874,6 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
         "`oly doctor` failed after relayed attach.\nstderr: {}",
         String::from_utf8_lossy(&doctor.stderr)
     );
-}
-
-#[cfg(unix)]
-fn base64_decode(input: &str) -> Vec<u8> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(input)
-        .unwrap_or_default()
-}
-
-#[cfg(unix)]
-fn base64_decode_len(input: &str) -> usize {
-    base64_decode(input).len()
 }
 
 #[test]
