@@ -19,7 +19,9 @@ pub const DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS: usize = 1000;
 /// These are intentionally broad to cover common shells, REPLs, and CLI tools.
 ///
 /// To override, set `prompt_patterns` in your config file
-/// (`~/.local/share/oly/config.json` on Linux/macOS, `%LOCALAPPDATA%\oly\config.json` on Windows):
+/// (`~/.local/state/oly/config.json` on Linux,
+/// `~/Library/Application Support/oly/config.json` on macOS,
+/// `%LOCALAPPDATA%\oly\config.json` on Windows):
 ///
 /// ```json
 /// {
