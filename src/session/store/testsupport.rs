@@ -17,7 +17,7 @@ use crate::session::{SessionMeta, SessionStatus};
 
 use super::{SessionHandle, SessionStore};
 
-pub(super) fn make_runtime(
+pub(crate) fn make_runtime(
     id: &str,
     status: SessionStatus,
     excerpt: &str,
@@ -101,7 +101,7 @@ pub(super) fn make_runtime(
     }))
 }
 
-pub(super) fn make_dummy_child() -> (
+pub(crate) fn make_dummy_child() -> (
     super::super::pty::RuntimeChild,
     Box<dyn portable_pty::MasterPty + Send>,
 ) {
@@ -129,7 +129,7 @@ pub(super) fn make_dummy_child() -> (
     (super::super::pty::RuntimeChild::Pty(child), pty.master)
 }
 
-pub(super) async fn make_test_db() -> Arc<Database> {
+pub(crate) async fn make_test_db() -> Arc<Database> {
     // Use a unique per-test file-based DB in the temp directory so
     // concurrent tests don't interfere with each other.
     let path = std::env::temp_dir().join(format!("oly_test_{}.db", uuid::Uuid::new_v4()));
@@ -140,7 +140,7 @@ pub(super) async fn make_test_db() -> Arc<Database> {
     )
 }
 
-pub(super) fn store_with(
+pub(crate) fn store_with(
     runtimes: Vec<Arc<RwLock<super::super::runtime::SessionRuntime>>>,
     db: Arc<Database>,
 ) -> SessionStore {
@@ -161,7 +161,7 @@ pub(super) fn store_with(
 // silent_candidates
 // -----------------------------------------------------------------------
 
-pub(super) fn make_runtime_writable(
+pub(crate) fn make_runtime_writable(
     id: &str,
     status: SessionStatus,
 ) -> (
@@ -171,7 +171,7 @@ pub(super) fn make_runtime_writable(
     make_runtime_writable_with_capacity(id, status, 8)
 }
 
-pub(super) fn make_runtime_writable_with_capacity(
+pub(crate) fn make_runtime_writable_with_capacity(
     id: &str,
     status: SessionStatus,
     capacity: usize,
@@ -249,7 +249,7 @@ pub(super) fn make_runtime_writable_with_capacity(
     }));
     (rt, writer_rx)
 }
-pub(super) fn make_test_config(max_running_sessions: usize) -> AppConfig {
+pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
     use std::path::PathBuf;
     AppConfig {
         http_bind: "127.0.0.1".to_string(),
@@ -280,11 +280,11 @@ pub(super) fn make_test_config(max_running_sessions: usize) -> AppConfig {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+pub(crate) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
     vec![vec![0x03], vec![0x03], vec![0x1a, b'\r']]
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(super) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+pub(crate) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
     vec![vec![0x03], vec![0x03], vec![0x04]]
 }

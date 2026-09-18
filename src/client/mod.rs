@@ -1,3 +1,4 @@
+mod agent;
 mod attach;
 mod cursor;
 pub mod join;
@@ -6,6 +7,10 @@ mod list_tui;
 mod logs;
 mod send;
 
+pub use agent::{
+    WaitCondition, run_control_acquire, run_control_release, run_doctor, run_history, run_observe,
+    run_screen, run_wait,
+};
 pub use attach::{run_attach, run_attach_node};
 pub use join::{run_join, run_join_stop};
 pub use list::run_list;

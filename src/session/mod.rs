@@ -22,7 +22,10 @@ pub(crate) mod resize;
 mod runtime;
 pub(crate) mod scan;
 pub(crate) mod screen;
+#[cfg(not(test))]
 mod store;
+#[cfg(test)]
+pub(crate) mod store;
 pub use store::pump::{AttachEvent, AttachPump};
 
 use chrono::{DateTime, Utc};

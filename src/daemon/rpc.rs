@@ -22,7 +22,8 @@ use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, Session
 use super::{
     rpc_attach::{
         handle_attach_busy, handle_attach_detach, handle_attach_input, handle_attach_resize,
-        handle_attach_subscribe,
+        handle_attach_subscribe, handle_control_acquire, handle_control_release,
+        handle_observe_window, handle_session_cursor,
     },
     rpc_nodes::{
         handle_node_list, handle_node_proxy, handle_node_proxy_streaming, spawn_join_connector,
@@ -192,7 +193,19 @@ async fn dispatch_request(
             id,
             data,
             wait_for_change,
-        } => handle_attach_input(id, data, session_store, wait_for_change).await,
+            attachment_id,
+        } => handle_attach_input(id, data, session_store, wait_for_change, attachment_id).await,
+        RpcRequest::SessionCursor { id } => handle_session_cursor(id, session_store).await,
+        RpcRequest::ObserveWindow {
+            id,
+            from,
+            max_bytes,
+        } => handle_observe_window(id, from, max_bytes, session_store).await,
+        RpcRequest::ControlAcquire { id } => handle_control_acquire(id, session_store).await,
+        RpcRequest::ControlRelease { id, lease } => {
+            handle_control_release(id, lease, session_store).await
+        }
+        RpcRequest::Doctor { id } => handle_doctor(id, db).await,
         RpcRequest::AttachBusy { id } => handle_attach_busy(id, session_store).await,
         RpcRequest::UploadFile {
             id,
@@ -545,9 +558,94 @@ async fn handle_logs_tail(
     }
 }
 
+/// `oly doctor`: verify sealed-part journal manifests (M4). Reads the
+/// manifest written by the appender at rotation/clean shutdown and checks
+/// every sealed part's presence, exact length, and CRC-32.
+async fn handle_doctor(id: Option<String>, db: &Arc<Database>) -> RpcResponse {
+    use crate::protocol::{DoctorReport, ListQuery, ListSortField, SortOrder};
+
+    let ids: Vec<String> = match id {
+        Some(id) => vec![id],
+        None => {
+            match db
+                .list_summaries(&ListQuery {
+                    search: None,
+                    tags: vec![],
+                    statuses: vec![],
+                    since: None,
+                    until: None,
+                    limit: 100_000,
+                    offset: 0,
+                    sort: ListSortField::CreatedAt,
+                    order: SortOrder::Asc,
+                })
+                .await
+            {
+                Ok(summaries) => summaries.into_iter().map(|s| s.id).collect(),
+                Err(err) => {
+                    return RpcResponse::Error {
+                        message: err.to_string(),
+                    };
+                }
+            }
+        }
+    };
+
+    let mut results = Vec::new();
+    for id in ids {
+        let dir = match db.get_session_dir(&id).await {
+            Ok(Some(dir)) => dir,
+            Ok(None) => {
+                results.push(DoctorReport {
+                    id,
+                    sealed_parts: 0,
+                    issues: vec!["session not found".to_string()],
+                });
+                continue;
+            }
+            Err(err) => {
+                results.push(DoctorReport {
+                    id,
+                    sealed_parts: 0,
+                    issues: vec![err.to_string()],
+                });
+                continue;
+            }
+        };
+        let journal_dir = dir.join(crate::session::journal::JOURNAL_DIR_NAME);
+        if !journal_dir.exists() {
+            // Pre-journal (legacy 0.x) sessions have nothing to verify.
+            results.push(DoctorReport {
+                id,
+                sealed_parts: 0,
+                issues: vec![],
+            });
+            continue;
+        }
+        let entries = match crate::session::journal::read_manifest(&journal_dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                results.push(DoctorReport {
+                    id,
+                    sealed_parts: 0,
+                    issues: vec![format!("manifest unreadable: {err}")],
+                });
+                continue;
+            }
+        };
+        results.push(DoctorReport {
+            id,
+            sealed_parts: entries.len(),
+            issues: crate::session::journal::verify_manifest(&journal_dir),
+        });
+    }
+
+    RpcResponse::Doctor { results }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::handle_logs_tail;
+    use super::{handle_doctor, handle_logs_tail};
     use crate::{
         db::Database,
         protocol::RpcResponse,
@@ -625,6 +723,197 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&sessions_dir);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_sealed_parts_and_detects_tampering() {
+        let db_path = temp_path("oly-doctor", "db");
+        let sessions_dir = temp_path("oly-doctor-sessions", "dir");
+        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        let db = Arc::new(
+            Database::open(&db_path, sessions_dir.clone())
+                .await
+                .expect("open test db"),
+        );
+
+        let meta = SessionMeta {
+            id: "doctor01".to_string(),
+            title: None,
+            tags: vec![],
+            command: "cmd".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: Some(Utc::now()),
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code: Some(0),
+            notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
+        };
+        db.insert_session(&meta).await.expect("insert session");
+
+        // Write a two-part journal with a sealed manifest.
+        let session_dir = sessions_dir.join(&meta.id);
+        {
+            let (mut journal, _inc, _report) =
+                crate::session::journal::ShadowJournal::open_with_options(
+                    &session_dir,
+                    std::time::Duration::from_secs(3600),
+                    512,
+                )
+                .expect("open journal");
+            for i in 0..20u8 {
+                journal
+                    .record(
+                        crate::session::journal::RecordKind::Output,
+                        bytes::Bytes::from(vec![b'x'; 64]),
+                    )
+                    .unwrap_or_else(|err| panic!("record {i}: {err}"));
+            }
+            journal.shutdown();
+        }
+
+        let response = handle_doctor(Some(meta.id.clone()), &db).await;
+        let RpcResponse::Doctor { results } = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(results.len(), 1);
+        assert!(results[0].sealed_parts >= 2, "expected rotation seals");
+        assert!(results[0].issues.is_empty(), "clean: {:?}", results[0]);
+
+        // Tamper one byte in the first part: doctor must flag exactly that.
+        let journal_dir = session_dir.join(crate::session::journal::JOURNAL_DIR_NAME);
+        let part = std::fs::read_dir(&journal_dir)
+            .expect("read journal dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "ojrn"))
+            .expect("a sealed part exists");
+        let mut bytes = std::fs::read(&part).expect("read part");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&part, bytes).expect("write tampered part");
+
+        let response = handle_doctor(Some(meta.id.clone()), &db).await;
+        let RpcResponse::Doctor { results } = response else {
+            panic!("unexpected response: {response:?}");
+        };
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].issues.len(), 1);
+        assert!(results[0].issues[0].contains("CRC-32 mismatch"));
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_dir_all(&sessions_dir);
+    }
+
+    // ---------------------------------------------------------------
+    // M4-1 agent surface handlers
+    // ---------------------------------------------------------------
+
+    mod agent_surfaces {
+        use crate::daemon::rpc_attach::{
+            handle_attach_input, handle_control_acquire, handle_control_release,
+            handle_observe_window, handle_session_cursor,
+        };
+        use crate::protocol::RpcResponse;
+        use crate::session::SessionStatus;
+        use crate::session::store::testsupport::{make_runtime_writable, make_test_db, store_with};
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn session_cursor_reports_offset_and_liveness() {
+            let (rt, _writer_rx) = make_runtime_writable("cursor01", SessionStatus::Running);
+            crate::session::persist::append_output_raw(&rt.read().dir, b"hello world")
+                .expect("seed output");
+            rt.write().filtered_total_bytes = 11;
+            let store = Arc::new(store_with(vec![rt], make_test_db().await));
+
+            let response = handle_session_cursor("cursor01".into(), &store).await;
+            let RpcResponse::SessionCursor {
+                running,
+                exit_code,
+                offset,
+                incarnation,
+            } = response
+            else {
+                panic!("unexpected response: {response:?}");
+            };
+            assert!(running);
+            assert_eq!(exit_code, None);
+            assert_eq!(offset, 11);
+            // No journal on the legacy-fallback fixture: no incarnation.
+            assert_eq!(incarnation, None);
+
+            let missing = handle_session_cursor("nope".into(), &store).await;
+            assert!(matches!(missing, RpcResponse::Error { .. }));
+        }
+
+        #[tokio::test]
+        async fn observe_window_returns_bounded_slice_and_resume_offset() {
+            let (rt, _writer_rx) = make_runtime_writable("window01", SessionStatus::Running);
+            crate::session::persist::append_output_raw(&rt.read().dir, b"hello world")
+                .expect("seed output");
+            rt.write().filtered_total_bytes = 11;
+            let store = Arc::new(store_with(vec![rt], make_test_db().await));
+
+            let response = handle_observe_window("window01".into(), 6, 4, &store).await;
+            let RpcResponse::ObserveWindow {
+                data,
+                next_offset,
+                running,
+                ..
+            } = response
+            else {
+                panic!("unexpected response: {response:?}");
+            };
+            assert_eq!(data, b"worl");
+            assert_eq!(next_offset, 10);
+            assert!(running);
+
+            // Window past the end returns empty data at the requested offset.
+            let response = handle_observe_window("window01".into(), 11, 64, &store).await;
+            let RpcResponse::ObserveWindow {
+                data, next_offset, ..
+            } = response
+            else {
+                panic!("unexpected response: {response:?}");
+            };
+            assert!(data.is_empty());
+            assert_eq!(next_offset, 11);
+        }
+
+        #[tokio::test]
+        async fn control_lease_gates_agent_input_until_release() {
+            let (rt, mut writer_rx) = make_runtime_writable("lease01", SessionStatus::Running);
+            let store = Arc::new(store_with(vec![rt], make_test_db().await));
+
+            // Acquire: a parked controller attachment is registered.
+            let acquired = handle_control_acquire("lease01".into(), &store).await;
+            let RpcResponse::ControlAcquired { lease } = acquired else {
+                panic!("unexpected response: {acquired:?}");
+            };
+
+            // Input carrying the lease token is authorized.
+            let ok =
+                handle_attach_input("lease01".into(), "x".into(), &store, false, Some(lease)).await;
+            assert!(matches!(ok, RpcResponse::Ack));
+            assert_eq!(writer_rx.try_recv().expect("input written"), b"x");
+
+            // Input carrying a foreign token is rejected as not-controller.
+            let foreign =
+                handle_attach_input("lease01".into(), "y".into(), &store, false, Some(999)).await;
+            assert!(matches!(foreign, RpcResponse::Error { .. }));
+
+            // Release detaches the parked controller; the lease goes stale.
+            let released = handle_control_release("lease01".into(), lease, &store).await;
+            assert!(matches!(released, RpcResponse::Ack));
+            let stale =
+                handle_attach_input("lease01".into(), "z".into(), &store, false, Some(lease)).await;
+            assert!(matches!(stale, RpcResponse::Error { .. }));
+        }
     }
 }
 

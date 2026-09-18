@@ -206,6 +206,36 @@ pub enum RpcRequest {
         id: String,
         data: String,
         wait_for_change: bool,
+        /// Held control lease for agent-driven sends (`oly send --lease`);
+        /// `None` is the ungated operator one-shot path.
+        #[serde(default)]
+        attachment_id: Option<u64>,
+    },
+    /// Machine-readable session cursor (M4 agent surface): incarnation,
+    /// current filtered-stream offset, and liveness in one cheap call.
+    SessionCursor {
+        id: String,
+    },
+    /// Bounded window read of the filtered stream (M4): never unbounded,
+    /// resumable via the returned `next_offset`.
+    ObserveWindow {
+        id: String,
+        from: u64,
+        max_bytes: u32,
+    },
+    /// Acquire the control lease without a streaming attach (M4): a parked
+    /// controller attachment whose id is the lease token for gated sends.
+    ControlAcquire {
+        id: String,
+    },
+    /// Release a lease previously taken with [`RpcRequest::ControlAcquire`].
+    ControlRelease {
+        id: String,
+        lease: u64,
+    },
+    /// Verify sealed-part journal manifests (M4 doctor): `None` = all sessions.
+    Doctor {
+        id: Option<String>,
     },
     AttachBusy {
         id: String,
@@ -324,6 +354,11 @@ impl RpcRequest {
             RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
+            RpcRequest::SessionCursor { .. } => "session_cursor",
+            RpcRequest::ObserveWindow { .. } => "observe_window",
+            RpcRequest::ControlAcquire { .. } => "control_acquire",
+            RpcRequest::ControlRelease { .. } => "control_release",
+            RpcRequest::Doctor { .. } => "doctor",
             RpcRequest::AttachBusy { .. } => "attach_busy",
             RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
@@ -352,6 +387,32 @@ impl RpcRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
+    /// Machine-readable session cursor answer (M4).
+    SessionCursor {
+        running: bool,
+        exit_code: Option<i32>,
+        /// Canonical filtered-stream length (bytes available to read).
+        offset: u64,
+        incarnation: Option<u64>,
+    },
+    /// One bounded filtered-stream window (M4).
+    ObserveWindow {
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        next_offset: u64,
+        running: bool,
+        exit_code: Option<i32>,
+        incarnation: Option<u64>,
+    },
+    /// Control lease acquired without a streaming attach (M4); `lease` is
+    /// the attachment id token for gated sends.
+    ControlAcquired {
+        lease: u64,
+    },
+    /// Journal verification report (M4 doctor).
+    Doctor {
+        results: Vec<DoctorReport>,
+    },
     Empty,
     Health {
         daemon_pid: u32,
@@ -776,6 +837,16 @@ pub struct ListQuery {
     pub offset: usize,
     pub sort: ListSortField,
     pub order: SortOrder,
+}
+
+/// Per-session journal verification result (M4 doctor).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub id: String,
+    /// Number of sealed parts covered by the manifest.
+    pub sealed_parts: usize,
+    /// Integrity issues found (empty = clean).
+    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

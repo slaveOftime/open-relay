@@ -745,6 +745,7 @@ async fn handle_ws_proxied_streaming(
                                     id: id.to_string(),
                                     data,
                                     wait_for_change,
+                                    attachment_id: None,
                                 };
                                 if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket input");

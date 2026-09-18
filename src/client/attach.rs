@@ -327,6 +327,7 @@ async fn run_attach_inner(
                                             child_bracketed_paste_mode,
                                         ),
                                         wait_for_change: false,
+                                        attachment_id: None,
                                     },
                                 )
                                 .await?
@@ -379,6 +380,7 @@ async fn run_attach_inner(
                                                 id: id_owned.clone(),
                                                 data,
                                                 wait_for_change: true,
+                                                                      attachment_id: None,
                                             },
                                         )
                                         .await?;
@@ -410,6 +412,7 @@ async fn run_attach_inner(
                                             id: id_owned.clone(),
                                             data,
                                             wait_for_change: false,
+                                                                   attachment_id: None,
                                         },
                                     )
                                     .await?;
@@ -426,6 +429,7 @@ async fn run_attach_inner(
                                         id: id_owned.clone(),
                                         data,
                                         wait_for_change: false,
+                                                               attachment_id: None,
                                     },
                                 )
                                 .await?

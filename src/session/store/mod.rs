@@ -9,7 +9,8 @@ mod lifecycle;
 mod notify;
 pub mod pump;
 mod query;
-mod testsupport;
+#[cfg(test)]
+pub(crate) mod testsupport;
 
 use std::{
     collections::{HashMap, HashSet},

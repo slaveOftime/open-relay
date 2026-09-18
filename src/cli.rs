@@ -69,6 +69,18 @@ pub enum Commands {
     List(ListArgs),
     /// Start a new session from an existing session's persisted launch metadata.
     Restart(RestartArgs),
+    /// Machine-readable session cursor (liveness + canonical stream offset).
+    Observe(SessionRefArgs),
+    /// Bounded window read of the session's output stream.
+    History(HistoryArgs),
+    /// Current terminal screen contents (plain text).
+    Screen(ScreenArgs),
+    /// Wait for output after a cursor, an exit, silence, or a pattern.
+    Wait(WaitArgs),
+    /// Acquire or release the session's control lease (agent drives).
+    Control(ControlArgs),
+    /// Verify journal integrity (sealed-part manifests) for one or all sessions.
+    Doctor(DoctorArgs),
     /// Stop a session by ID.
     Stop(StopArgs),
     /// Delete a session and its files. Stopped sessions are removed directly; use --force to also remove a running one.
@@ -424,6 +436,123 @@ pub struct LogsArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct DoctorArgs {
+    /// Session ID to verify. If omitted, verifies all sessions.
+    pub id: Option<String>,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SessionRefArgs {
+    /// Session ID. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Emit one JSON object instead of tab-separated text.
+    #[arg(long)]
+    pub json: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct HistoryArgs {
+    /// Session ID. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Filtered-stream offset to read from (0 = start; use `oly observe`
+    /// to get the current end).
+    #[arg(long, default_value_t = 0)]
+    pub from: u64,
+    /// Maximum bytes to read per window (bounded; larger spans need
+    /// multiple calls).
+    #[arg(long, default_value_t = 131072)]
+    pub limit: u32,
+    /// Emit one JSON line (agent-friendly) instead of raw bytes.
+    #[arg(long)]
+    pub json: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ScreenArgs {
+    /// Session ID. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Override the render width (defaults to the session's PTY width).
+    #[arg(long)]
+    pub cols: Option<u32>,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct WaitArgs {
+    /// Session ID. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Wait for output after this filtered-stream offset.
+    #[arg(long, default_value_t = 0)]
+    pub after: u64,
+    /// Wait for the session to exit.
+    #[arg(long)]
+    pub exit: bool,
+    /// Wait until no output appears for this many milliseconds
+    /// (heuristic: likely idle or waiting for input).
+    #[arg(long)]
+    pub idle_ms: Option<u64>,
+    /// Wait until a regex matches output produced after --after.
+    #[arg(long)]
+    pub pattern: Option<String>,
+    /// Overall timeout in seconds (0 = no timeout).
+    #[arg(long, default_value_t = 30)]
+    pub timeout: u64,
+    /// Emit one JSON object instead of tab-separated text.
+    #[arg(long)]
+    pub json: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ControlArgs {
+    #[command(subcommand)]
+    pub command: ControlCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ControlCommand {
+    /// Take the session's control lease; prints the lease token to use
+    /// with `oly send --lease`.
+    Acquire(ControlOpArgs),
+    /// Release a previously acquired lease.
+    Release(ControlReleaseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ControlOpArgs {
+    /// Session ID. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ControlReleaseArgs {
+    /// Session ID. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Lease token from `oly control acquire`.
+    #[arg(long)]
+    pub lease: u64,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct SendArgs {
     /// Session ID to send input to. If omitted, uses the most recently created session.
     pub id: Option<String>,
@@ -442,6 +571,10 @@ pub struct SendArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+    /// Control lease token from `oly control acquire`; required when a
+    /// session has a registered controller (agent-driven sends are gated).
+    #[arg(long)]
+    pub lease: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -940,6 +940,7 @@ pub async fn send_input(
             id: id.clone(),
             data: body.data.clone(),
             wait_for_change: body.wait_for_change,
+            attachment_id: None,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::Ack) => Json(serde_json::json!({ "ok": true })).into_response(),

@@ -159,7 +159,7 @@ pub(super) async fn handle_attach_subscribe(
                             warn!(session_id = %id, %err, "IPC client request read failed");
                             break;
                         }
-                        Some(Ok(RpcRequest::AttachInput { id: req_id, data, wait_for_change })) if req_id == id => {
+                        Some(Ok(RpcRequest::AttachInput { id: req_id, data, wait_for_change, .. })) if req_id == id => {
                             trace!(session_id = %id, bytes = data.len(), "IPC client input received");
                             if let Err(err) = session_store.attach_input(&req_id, Some(attachment_id), &data, wait_for_change).await {
                                 // Control-gate violations are client-visible,
@@ -308,11 +308,13 @@ pub(super) async fn handle_attach_input(
     data: String,
     session_store: &SessionStoreHandle,
     wait_for_change: bool,
+    attachment_id: Option<u64>,
 ) -> RpcResponse {
     debug!(session_id = %id, bytes = data.len(), "handling one-shot IPC input request");
-    // One-shot operator input (`oly send`): not an attachment, ungated.
+    // `attachment_id = None` is the ungated operator one-shot (`oly send`);
+    // `Some(lease)` is an agent send gated on a held control lease.
     match session_store
-        .attach_input(&id, None, &data, wait_for_change)
+        .attach_input(&id, attachment_id, &data, wait_for_change)
         .await
     {
         Ok(()) => RpcResponse::Ack,
@@ -360,4 +362,101 @@ pub(super) async fn handle_attach_detach(
     // one-shot detach has nothing anonymous to remove.
     let _ = session_store;
     RpcResponse::Ack
+}
+
+// ---------------------------------------------------------------------------
+// M4 agent surfaces: cursor, bounded observe windows, parked control leases
+// ---------------------------------------------------------------------------
+
+/// Machine-readable session cursor: liveness + canonical filtered offset.
+pub(super) async fn handle_session_cursor(
+    id: String,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    let offset = match session_store.attach_filtered_len(&id).await {
+        Some(offset) => offset,
+        None => {
+            return RpcResponse::Error {
+                message: format!("session not found or no output recorded: {id}"),
+            };
+        }
+    };
+    let (running, _, exit_code) = session_store
+        .attach_stream_status(&id)
+        .await
+        .unwrap_or((false, true, None));
+    RpcResponse::SessionCursor {
+        running,
+        exit_code,
+        offset,
+        incarnation: session_store.journal_incarnation(&id),
+    }
+}
+
+/// One bounded filtered-stream window (agent `observe`/`history`).
+pub(super) async fn handle_observe_window(
+    id: String,
+    from: u64,
+    max_bytes: u32,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    // Hard cap regardless of what the client asked for: reads stay
+    // memory-bounded (I7).
+    let max_bytes = (max_bytes as usize).clamp(1, 8 * 1024 * 1024);
+    let data = match session_store
+        .attach_resync_window(&id, from, max_bytes)
+        .await
+    {
+        Ok(data) => data,
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.message(&id),
+            };
+        }
+    };
+    let next_offset = from + data.len() as u64;
+    let (running, _, exit_code) = session_store
+        .attach_stream_status(&id)
+        .await
+        .unwrap_or((false, true, None));
+    RpcResponse::ObserveWindow {
+        data,
+        next_offset,
+        running,
+        exit_code,
+        incarnation: session_store.journal_incarnation(&id),
+    }
+}
+
+/// Acquire the control lease without a streaming attach: a parked
+/// controller attachment whose id is the lease token for gated agent sends.
+pub(super) async fn handle_control_acquire(
+    id: String,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match session_store
+        .attach_register(&id, AttachKind::Cli, ControlRequest::Takeover, None)
+        .await
+    {
+        Ok(registration) => RpcResponse::ControlAcquired {
+            lease: registration.attachment_id,
+        },
+        Err(err) => RpcResponse::Error {
+            message: err.message(&id),
+        },
+    }
+}
+
+/// Release a parked control lease.
+pub(super) async fn handle_control_release(
+    id: String,
+    lease: u64,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match session_store.attach_detach(&id, lease).await {
+        Ok(()) => RpcResponse::Ack,
+        Err(err) => RpcResponse::Error {
+            message: err.message(&id),
+        },
+    }
 }

@@ -402,8 +402,56 @@ async fn run() -> Result<()> {
         Commands::Send(send_args) => {
             let id =
                 resolve_session_id(&config, send_args.id.clone(), send_args.node.as_ref()).await?;
-            client::run_send(&config, &id, send_args.node, send_args.chunks).await
+            client::run_send(
+                &config,
+                &id,
+                send_args.node,
+                send_args.chunks,
+                send_args.lease,
+            )
+            .await
         }
+
+        Commands::Observe(args) => {
+            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+            client::run_observe(&config, &id, args.node, args.json).await
+        }
+        Commands::History(args) => {
+            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+            client::run_history(&config, &id, args.from, args.limit, args.json, args.node).await
+        }
+        Commands::Screen(args) => {
+            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+            client::run_screen(&config, &id, args.cols, args.node).await
+        }
+        Commands::Wait(args) => {
+            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
+            client::run_wait(
+                &config,
+                &id,
+                client::WaitCondition {
+                    after: args.after,
+                    exit: args.exit,
+                    idle_ms: args.idle_ms,
+                    pattern: args.pattern,
+                    timeout_secs: args.timeout,
+                },
+                args.node,
+            )
+            .await
+        }
+        Commands::Control(args) => match args.command {
+            crate::cli::ControlCommand::Acquire(op) => {
+                let id = resolve_session_id(&config, op.id.clone(), op.node.as_ref()).await?;
+                client::run_control_acquire(&config, &id, op.node).await
+            }
+            crate::cli::ControlCommand::Release(op) => {
+                let id = resolve_session_id(&config, op.id.clone(), op.node.as_ref()).await?;
+                client::run_control_release(&config, &id, op.lease, op.node).await
+            }
+        },
+
+        Commands::Doctor(args) => client::run_doctor(&config, args.id, args.node).await,
 
         // ── API key management (primary side) ────────────────────────────────
         Commands::ApiKey(api_key_args) => match api_key_args.command {
