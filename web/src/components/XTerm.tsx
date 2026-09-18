@@ -137,11 +137,17 @@ interface Props {
   onPaste?: (event: ClipboardEvent) => void
   /** Called when the terminal is resized by FitAddon (cols, rows) */
   onResize?: (cols: number, rows: number) => void
+  /**
+   * Called when the user's pinned-to-bottom state changes (M4-2): live
+   * output may only auto-scroll while the user is already at the bottom —
+   * scrolling up to read history must never be stolen by new output.
+   */
+  onScrollBottomChange?: (atBottom: boolean) => void
   className?: string
 }
 
 const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
-  { autoFit, onData, onPaste, onResize, className },
+  { autoFit, onData, onPaste, onResize, onScrollBottomChange, className },
   ref
 ) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -150,6 +156,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   const onDataRef = useRef(onData)
   const onPasteRef = useRef(onPaste)
   const onResizeRef = useRef(onResize)
+  const onScrollBottomChangeRef = useRef(onScrollBottomChange)
   const lastResizeRef = useRef<{ cols: number; rows: number } | null>(null)
   const scrollDragRef = useRef<{
     anchorY: number
@@ -171,6 +178,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   useEffect(() => {
     onResizeRef.current = onResize
   }, [onResize])
+  useEffect(() => {
+    onScrollBottomChangeRef.current = onScrollBottomChange
+  }, [onScrollBottomChange])
 
   useImperativeHandle(ref, () => ({
     write(data: string | Uint8Array, callback?: () => void) {
@@ -302,6 +312,15 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     })
 
     // Forward keyboard data
+    // Track whether the user is pinned to the bottom; live writes use this
+    // to avoid stealing scroll position/selection.
+    const reportBottomState = () => {
+      const buffer = term.buffer.active
+      onScrollBottomChangeRef.current?.(buffer.viewportY >= buffer.baseY)
+    }
+    const scrollDisposable = term.onScroll(reportBottomState)
+    const writeDisposable = term.onWriteParsed(reportBottomState)
+
     const dataDisposable = term.onData((data) => {
       onDataRef.current?.(data)
     })
@@ -427,6 +446,8 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       if (fontLoadRaf) cancelAnimationFrame(fontLoadRaf)
       if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
       dataDisposable.dispose()
+      scrollDisposable.dispose()
+      writeDisposable.dispose()
       ro.disconnect()
       container.removeEventListener('touchend', handleTouchEnd)
       term.textarea?.removeEventListener('focus', handleTerminalFocus)

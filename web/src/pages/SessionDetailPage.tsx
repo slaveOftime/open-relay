@@ -11,6 +11,7 @@ import {
   AttachSocket,
 } from '@/api/client'
 import { formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
+import { HistoryAnchorError, HistoryController } from '@/lib/history-controller'
 import {
   encodeLogChunks,
   initialLogReplayState,
@@ -167,16 +168,18 @@ function SessionDetailPageContent() {
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
   const replayTimerRef = useRef<number | null>(null)
-  const logChunksRef = useRef<Uint8Array[]>([])
+  // History paging/anchoring lives in the extracted HistoryController (M4-2);
+  // the page only keeps the xterm-facing replay state.
+  const historyRef = useRef<HistoryController | null>(null)
+  const historyKeyRef = useRef('')
+  // Live output may only auto-scroll while the user is pinned to the
+  // bottom (M4-2): scrolling up to read history must never be stolen.
+  const userAtBottomRef = useRef(true)
   const replaySpeedRef = useRef(0.5)
   const isPausedRef = useRef(false)
   const isRunningRef = useRef(false)
   const isReplayingRef = useRef(false)
-  const totalChunksRef = useRef(0)
   const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
-  const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
-  const loadedLogCountRef = useRef(0)
-  const isFetchingMoreRef = useRef(false)
   const termContainerRef = useRef<HTMLDivElement>(null)
   const isMounted = useRef(true)
   const replayIdxRef = useRef(0)
@@ -286,9 +289,12 @@ function SessionDetailPageContent() {
       off += c.length
     }
     outputWriteInFlightRef.current = true
+    const wasAtBottom = userAtBottomRef.current
     term.write(merged, () => {
       outputWriteInFlightRef.current = false
-      term.scrollToBottom()
+      if (wasAtBottom) {
+        term.scrollToBottom()
+      }
       if (
         (pendingResetRef.current || outputBufferRef.current.length > 0) &&
         outputFlushRafRef.current === null
@@ -505,39 +511,41 @@ function SessionDetailPageContent() {
     previousLiveSessionRef.current = liveSession
   }, [clearAttachIdleTimer, disarmAttachIdleAnimation, liveSession, noteVisibleSessionActivity])
 
-  const fetchMoreLogs = useCallback(async () => {
-    if (!id || isFetchingMoreRef.current) return false
-    const requestOffset = loadedLogCountRef.current
-    if (requestOffset >= totalChunksRef.current && totalChunksRef.current !== 0) return false
-    isFetchingMoreRef.current = true
-    try {
-      const res = await fetchLogs(
-        id,
-        { offset: requestOffset, limit: DEFAULT_LOG_TAIL },
-        node ?? undefined
-      )
-      if (!isMounted.current) return false
-      logResizesRef.current = res.resizes
-      const encodedChunks = encodeLogChunks(res.chunks)
-      if (res.chunks.length > 0) {
-        const next = [...logChunksRef.current, ...encodedChunks]
-        logChunksRef.current = next
-        loadedLogCountRef.current = res.offset + encodedChunks.length
-        setScrubberMax(next.length)
-      } else {
-        loadedLogCountRef.current = res.offset
-      }
-      if (res.total !== totalChunksRef.current) {
-        totalChunksRef.current = res.total
-        setTotalChunks(res.total)
-      }
-      return encodedChunks.length > 0
-    } catch {
-      return false
-    } finally {
-      isFetchingMoreRef.current = false
+  // One HistoryController per (id, node): owns anchored paging state.
+  const getHistory = useCallback((): HistoryController | null => {
+    if (!id) return null
+    const key = `${node ?? ''}:${id}`
+    if (historyRef.current === null || historyKeyRef.current !== key) {
+      historyKeyRef.current = key
+      historyRef.current = new HistoryController(async (offset, limit) => {
+        const res = await fetchLogs(id, { offset, limit }, node ?? undefined)
+        return {
+          offset: res.offset,
+          chunks: encodeLogChunks(res.chunks),
+          total: res.total,
+          resizes: res.resizes,
+        }
+      }, DEFAULT_LOG_TAIL)
     }
+    return historyRef.current
   }, [id, node])
+
+  const fetchMoreLogs = useCallback(async () => {
+    const history = getHistory()
+    if (!history || history.isFetching) return false
+    try {
+      const loaded = await history.loadMore()
+      if (!isMounted.current) return false
+      setScrubberMax(history.chunkCount)
+      setTotalChunks(history.totalChunks)
+      return loaded > 0
+    } catch (err) {
+      // Anchor mismatches must be loud: retained history is never silently
+      // duplicated or truncated (M4 exit criterion).
+      if (err instanceof HistoryAnchorError) console.error(err)
+      return false
+    }
+  }, [getHistory])
 
   const fetchMoreLogsRef = useRef<(() => Promise<boolean>) | null>(null)
   useEffect(() => {
@@ -554,14 +562,15 @@ function SessionDetailPageContent() {
       return
     }
 
+    const history = historyRef.current
     const targetIdx = currentIdx + delta
-    if (targetIdx <= logChunksRef.current.length) {
+    if (!history || targetIdx <= history.chunkCount) {
       handleScrubRef.current?.(targetIdx)
       return
     }
 
     const loaded = await fetchMoreLogsRef.current?.()
-    handleScrubRef.current?.(Math.min(targetIdx, loaded ? logChunksRef.current.length : currentIdx))
+    handleScrubRef.current?.(Math.min(targetIdx, loaded ? history.chunkCount : currentIdx))
   }, [])
   useEffect(() => {
     stepReplayRef.current = stepReplay
@@ -614,7 +623,7 @@ function SessionDetailPageContent() {
           ingestSessionSummary(s)
           if (!cancelled && isMounted.current) setSession(s)
         })
-        .catch(() => { })
+        .catch(() => {})
     })
     return () => {
       cancelled = true
@@ -766,7 +775,7 @@ function SessionDetailPageContent() {
                 ingestSessionSummary(s)
                 if (isMounted.current) setSession(s)
               })
-              .catch(() => { })
+              .catch(() => {})
           },
           onError: (msg) => {
             lastWsFrameAtRef.current = Date.now()
@@ -940,13 +949,9 @@ function SessionDetailPageContent() {
       clearTimeout(replayTimerRef.current)
       replayTimerRef.current = null
     }
-    logChunksRef.current = []
+    getHistory()?.reset()
     setScrubberMax(0)
-    loadedLogCountRef.current = 0
-    totalChunksRef.current = 0
     logReplayStateRef.current = initialLogReplayState()
-    logResizesRef.current = []
-    isFetchingMoreRef.current = false
     setTotalChunks(0)
 
     let cancelled = false
@@ -970,9 +975,9 @@ function SessionDetailPageContent() {
                 ingestSessionSummary(s)
                 if (!cancelled && isMounted.current) setSession(s)
               })
-              .catch(() => { })
+              .catch(() => {})
           })
-          .catch(() => { })
+          .catch(() => {})
       })
       return () => {
         cancelled = true
@@ -980,38 +985,40 @@ function SessionDetailPageContent() {
       }
     }
 
-    // Replay mode: fetch paginated chunks.
+    // Replay mode: fetch paginated chunks through the history controller.
+    const history = getHistory()
+    if (!history) return
     const raf = requestAnimationFrame(() => {
       if (cancelled) return
-      fetchLogs(id!, { limit: DEFAULT_LOG_TAIL }, node ?? undefined)
-        .then((res) => {
+      history
+        .loadInitial()
+        .then(() => {
           if (cancelled || !isMounted.current) return
-          const encodedChunks = encodeLogChunks(res.chunks)
-          logChunksRef.current = encodedChunks
-          loadedLogCountRef.current = res.offset + encodedChunks.length
-          logResizesRef.current = res.resizes
-          totalChunksRef.current = res.total
-          setTotalChunks(res.total)
-          setScrubberMax(res.chunks.length)
+          setTotalChunks(history.totalChunks)
+          setScrubberMax(history.chunkCount)
           if (termRef.current) {
-            logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
+            logReplayStateRef.current = replayLogChunks(
+              termRef.current,
+              [...history.getChunks()],
+              [...history.getResizes()]
+            )
           }
-          commitReplayIdx(res.chunks.length, { force: true })
+          commitReplayIdx(history.chunkCount, { force: true })
           fetchSession(id!, node ?? undefined)
             .then((s) => {
               ingestSessionSummary(s)
               if (!cancelled && isMounted.current) setSession(s)
             })
-            .catch(() => { })
+            .catch(() => {})
         })
-        .catch(() => { })
+        .catch(() => {})
     })
 
     return () => {
       cancelled = true
       cancelAnimationFrame(raf)
     }
-  }, [mode, id, node, reloadTick, commitReplayIdx, isTailMode, tailLimit])
+  }, [mode, id, node, reloadTick, commitReplayIdx, isTailMode, tailLimit, getHistory])
 
   const isScrubbingRef = useRef(false)
   const wasPlayingBeforeScrubRef = useRef(false)
@@ -1029,11 +1036,12 @@ function SessionDetailPageContent() {
     isPausedRef.current = true
 
     commitReplayIdx(val, { force: true })
-    if (termRef.current) {
+    const history = historyRef.current
+    if (termRef.current && history) {
       logReplayStateRef.current = seekLogChunks(
         termRef.current,
-        logChunksRef.current,
-        logResizesRef.current,
+        [...history.getChunks()],
+        [...history.getResizes()],
         logReplayStateRef.current,
         val
       )
@@ -1054,11 +1062,15 @@ function SessionDetailPageContent() {
       commitReplayIdx(0, { force: true })
       logReplayStateRef.current = initialLogReplayState()
       termRef.current?.reset()
-    } else if (termRef.current && logReplayStateRef.current.chunkCount !== fromIdx) {
+    } else if (
+      termRef.current &&
+      historyRef.current &&
+      logReplayStateRef.current.chunkCount !== fromIdx
+    ) {
       logReplayStateRef.current = seekLogChunks(
         termRef.current,
-        logChunksRef.current,
-        logResizesRef.current,
+        [...historyRef.current.getChunks()],
+        [...historyRef.current.getResizes()],
         logReplayStateRef.current,
         fromIdx
       )
@@ -1069,11 +1081,12 @@ function SessionDetailPageContent() {
         replayTimerRef.current = null
         return
       }
-      const chunks = logChunksRef.current
+      const history = historyRef.current
+      const chunks = history ? [...history.getChunks()] : []
       const idx = logReplayStateRef.current.chunkCount
       if (idx >= chunks.length) {
-        if (chunks.length < totalChunksRef.current) {
-          if (isFetchingMoreRef.current) {
+        if (history && history.hasMore && history.totalChunks !== 0) {
+          if (history.isFetching) {
             replayTimerRef.current = window.setTimeout(step, 30)
             return
           }
@@ -1130,7 +1143,7 @@ function SessionDetailPageContent() {
         logReplayStateRef.current = playNextBatch(
           termRef.current,
           chunks,
-          logResizesRef.current,
+          history ? [...history.getResizes()] : [],
           logReplayStateRef.current,
           adjustedMaxBytes,
           () => {
@@ -1227,23 +1240,23 @@ function SessionDetailPageContent() {
 
   async function handleStop() {
     if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => { })
+    await stopSession(id, undefined, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         ingestSessionSummary(s)
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
   async function handleKill() {
     if (!id) return
-    await killSession(id, node ?? undefined).catch(() => { })
+    await killSession(id, node ?? undefined).catch(() => {})
     fetchSession(id, node ?? undefined)
       .then((s) => {
         ingestSessionSummary(s)
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
+      .catch(() => {})
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -1524,163 +1537,170 @@ function SessionDetailPageContent() {
             id="main-container"
             className={`h-full ${isAttachPanelOpen ? 'overflow-y-visible' : 'overflow-y-hidden'} sm:flex sm:overflow-y-hidden`}
           >
-          {/* Terminal area */}
-          <div
-            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
-          >
+            {/* Terminal area */}
             <div
-              aria-hidden="true"
-              className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
-            />
-            <div
-              ref={termContainerRef}
-              className="flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full overflow-x-auto"
+              className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
             >
-              <XTerm
-                key={mode === 'logs' ? `logs-${logsView}` : mode}
-                ref={termRef}
-                autoFit={mode === 'attach' || isTailMode}
-                onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
-                onPaste={mode === 'attach' ? handleTerminalPaste : undefined}
-                onResize={mode === 'attach' ? handleTermResize : undefined}
-                className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
+              <div
+                aria-hidden="true"
+                className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
               />
-            </div>
-
-            {/* Tail mode controls */}
-            {mode === 'logs' && isTailMode && (
-              <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
-                <span className="text-xs text-[hsl(var(--muted-foreground))]">Tail</span>
-                <input
-                  type="number"
-                  className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
-                  value={tailLimitInput}
-                  min={1}
-                  max={5000}
-                  onChange={(e) => setTailLimitInput(e.target.value)}
-                  onBlur={() => commitTailLimit(tailLimitInput)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      commitTailLimit(tailLimitInput)
-                    }
-                  }}
-                  aria-label="Tail line limit"
+              <div
+                ref={termContainerRef}
+                className="flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full overflow-x-auto"
+              >
+                <XTerm
+                  key={mode === 'logs' ? `logs-${logsView}` : mode}
+                  ref={termRef}
+                  autoFit={mode === 'attach' || isTailMode}
+                  onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
+                  onPaste={mode === 'attach' ? handleTerminalPaste : undefined}
+                  onResize={mode === 'attach' ? handleTermResize : undefined}
+                  onScrollBottomChange={
+                    mode === 'attach'
+                      ? (atBottom) => {
+                          userAtBottomRef.current = atBottom
+                        }
+                      : undefined
+                  }
+                  className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
                 />
-                <span className="text-xs text-[hsl(var(--muted-foreground))]">lines</span>
-                <div className="flex-1" />
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="secondary" size="icon" onClick={handleReplayButton}>
-                      <PlayIcon className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Replay from start</TooltipContent>
-                </Tooltip>
               </div>
-            )}
 
-            {/* Scrubber (replay mode) */}
-            {mode === 'logs' && !isTailMode && scrubberMax > 0 && (
-              <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
-                <div className="flex flex-1 items-center gap-2">
-                  <Slider
-                    className="flex-1"
-                    min={0}
-                    max={scrubberMax}
-                    value={[replayIdx]}
-                    onValueChange={handleSliderChange}
-                    onValueCommit={handleSliderCommit}
-                    aria-label="Replay scrubber"
+              {/* Tail mode controls */}
+              {mode === 'logs' && isTailMode && (
+                <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+                  <span className="text-xs text-[hsl(var(--muted-foreground))]">Tail</span>
+                  <input
+                    type="number"
+                    className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    value={tailLimitInput}
+                    min={1}
+                    max={5000}
+                    onChange={(e) => setTailLimitInput(e.target.value)}
+                    onBlur={() => commitTailLimit(tailLimitInput)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        commitTailLimit(tailLimitInput)
+                      }
+                    }}
+                    aria-label="Tail line limit"
                   />
-                  <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
-                    {totalChunks > scrubberMax
-                      ? `${replayIdx}/${scrubberMax} loaded (${totalChunks} total)`
-                      : `${replayIdx}/${scrubberMax}`}
-                  </span>
+                  <span className="text-xs text-[hsl(var(--muted-foreground))]">lines</span>
+                  <div className="flex-1" />
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button variant="secondary" size="icon" onClick={handleReplayButton}>
+                        <PlayIcon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Replay from start</TooltipContent>
+                  </Tooltip>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="secondary"
-                        size="icon"
-                        onClick={() => void stepReplayRef.current?.(-10)}
-                      >
-                        <ChevronLeftIcon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Back 10 chunks</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="secondary"
-                        size="icon"
-                        onClick={() => void stepReplayRef.current?.(10)}
-                      >
-                        <ChevronRightIcon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Forward 10 chunks</TooltipContent>
-                  </Tooltip>
-                  <div className="flex items-center gap-1 ml-auto">
+              )}
+
+              {/* Scrubber (replay mode) */}
+              {mode === 'logs' && !isTailMode && scrubberMax > 0 && (
+                <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+                  <div className="flex flex-1 items-center gap-2">
+                    <Slider
+                      className="flex-1"
+                      min={0}
+                      max={scrubberMax}
+                      value={[replayIdx]}
+                      onValueChange={handleSliderChange}
+                      onValueCommit={handleSliderCommit}
+                      aria-label="Replay scrubber"
+                    />
+                    <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
+                      {totalChunks > scrubberMax
+                        ? `${replayIdx}/${scrubberMax} loaded (${totalChunks} total)`
+                        : `${replayIdx}/${scrubberMax}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button variant="secondary" size="icon" onClick={handleReplayButton}>
-                          {!isReplaying ? (
-                            <PlayIcon className="h-4 w-4" />
-                          ) : isPaused ? (
-                            <PlayIcon className="h-4 w-4" />
-                          ) : (
-                            <PauseIcon className="h-4 w-4" />
-                          )}
+                        <Button
+                          variant="secondary"
+                          size="icon"
+                          onClick={() => void stepReplayRef.current?.(-10)}
+                        >
+                          <ChevronLeftIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>
-                        {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
-                      </TooltipContent>
+                      <TooltipContent>Back 10 chunks</TooltipContent>
                     </Tooltip>
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button variant="secondary" size="sm" onClick={handleSwitchToTail}>
-                          <TrackNextIcon className="h-4 w-4" />
-                          Tail
+                        <Button
+                          variant="secondary"
+                          size="icon"
+                          onClick={() => void stepReplayRef.current?.(10)}
+                        >
+                          <ChevronRightIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>Switch to tail view</TooltipContent>
+                      <TooltipContent>Forward 10 chunks</TooltipContent>
                     </Tooltip>
+                    <div className="flex items-center gap-1 ml-auto">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button variant="secondary" size="icon" onClick={handleReplayButton}>
+                            {!isReplaying ? (
+                              <PlayIcon className="h-4 w-4" />
+                            ) : isPaused ? (
+                              <PlayIcon className="h-4 w-4" />
+                            ) : (
+                              <PauseIcon className="h-4 w-4" />
+                            )}
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
+                        </TooltipContent>
+                      </Tooltip>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button variant="secondary" size="sm" onClick={handleSwitchToTail}>
+                            <TrackNextIcon className="h-4 w-4" />
+                            Tail
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Switch to tail view</TooltipContent>
+                      </Tooltip>
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
 
-          {mode === 'attach' && (
-            <>
-              <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
-                <AttachPanel
-                  sessionId={id ?? ''}
-                  sendInput={(x) => sendInput(x, true)}
-                  sendBusy={sendBusy}
-                  showKeyError={showKeyError}
-                  uploadFile={handleUploadFile}
-                  onDrawerOpenChange={setIsAttachPanelOpen}
-                />
-              </div>
-              <div className="sm:hidden flex items-center justify-center h-8 relative">
-                {session &&
-                  <SessionActivitySparkline
-                    sessionId={session.id}
-                    isRunning={isSessionRunning(session)}
-                    fullWidth
-                    height={24}
-                    className="absolute left-0 bottom-0 right-0 opacity-50"
+            {mode === 'attach' && (
+              <>
+                <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
+                  <AttachPanel
+                    sessionId={id ?? ''}
+                    sendInput={(x) => sendInput(x, true)}
+                    sendBusy={sendBusy}
+                    showKeyError={showKeyError}
+                    uploadFile={handleUploadFile}
+                    onDrawerOpenChange={setIsAttachPanelOpen}
                   />
-                }
-                {attachedState}
-              </div>
-            </>
-          )}
+                </div>
+                <div className="sm:hidden flex items-center justify-center h-8 relative">
+                  {session && (
+                    <SessionActivitySparkline
+                      sessionId={session.id}
+                      isRunning={isSessionRunning(session)}
+                      fullWidth
+                      height={24}
+                      className="absolute left-0 bottom-0 right-0 opacity-50"
+                    />
+                  )}
+                  {attachedState}
+                </div>
+              </>
+            )}
           </div>
         </ScrollArea>
 
