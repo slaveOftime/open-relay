@@ -231,6 +231,13 @@ pub enum RpcRequest {
     AttachAcquireControl {
         id: String,
     },
+    /// Report the applied-cursor credit for this attach connection (M3-5,
+    /// I7): the highest stream offset the client has rendered. Handled on
+    /// the streaming path only.
+    AttachAppliedCursor {
+        id: String,
+        cursor: u64,
+    },
     Stop {
         id: String,
         grace_seconds: u64,
@@ -322,6 +329,7 @@ impl RpcRequest {
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
             RpcRequest::AttachAcquireControl { .. } => "attach_acquire_control",
+            RpcRequest::AttachAppliedCursor { .. } => "attach_applied_cursor",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Restart { .. } => "restart",
             RpcRequest::Kill { .. } => "kill",

@@ -196,6 +196,11 @@ pub(super) async fn handle_attach_subscribe(
                                 Err(err) => warn!(session_id = %id, error = err.message(&id), "control takeover failed"),
                             }
                         }
+                        Some(Ok(RpcRequest::AttachAppliedCursor { id: req_id, cursor })) if req_id == id => {
+                            session_store
+                                .attach_report_applied(&req_id, attachment_id, cursor)
+                                .await;
+                        }
                         Some(Ok(RpcRequest::AttachDetach { id: req_id })) if req_id == id => {
                             debug!(session_id = %id, "IPC client requested detach");
                             break;

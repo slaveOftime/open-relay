@@ -180,10 +180,12 @@ async fn dispatch_request(
             )
             .await
         }
-        RpcRequest::AttachSubscribe { .. } | RpcRequest::AttachAcquireControl { .. } => {
+        RpcRequest::AttachSubscribe { .. }
+        | RpcRequest::AttachAcquireControl { .. }
+        | RpcRequest::AttachAppliedCursor { .. } => {
             // Handled before dispatch in handle_client; should not reach here.
             RpcResponse::Error {
-                message: "AttachSubscribe must be handled on the streaming path".into(),
+                message: "attach streaming request must be handled on the streaming path".into(),
             }
         }
         RpcRequest::AttachInput {

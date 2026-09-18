@@ -193,6 +193,7 @@ async fn run_attach_inner(
     // Every chunk must continue exactly at the cursor the init frame left
     // us at; gaps/duplicates abort the attach loudly (I2, M3-3).
     let mut stream_cursor = StreamCursor::new(stream_end_offset);
+    let mut last_acked: u64 = 0;
 
     // When stdio is piped, interactive terminal control fails across platforms,
     // so fall back to a plain stream replay instead of raw-mode attach.
@@ -205,6 +206,13 @@ async fn run_attach_inner(
                 RpcResponse::AttachStreamChunk { offset, data } => {
                     stream_cursor.accept(offset, data.len())?;
                     write_bytes_to_stdout(&data)?;
+                    maybe_send_ack(
+                        &mut write_half,
+                        &id_owned,
+                        stream_cursor.current(),
+                        &mut last_acked,
+                    )
+                    .await;
                 }
                 RpcResponse::AttachModeChanged { .. } => {}
                 RpcResponse::AttachControlChanged { .. } => {}
@@ -513,6 +521,13 @@ async fn run_attach_inner(
                                 write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
                                 #[cfg(not(windows))]
                                 write_bytes_to_stdout(&batch)?;
+                                maybe_send_ack(
+                                    &mut write_half,
+                                    &id_owned,
+                                    stream_cursor.current(),
+                                    &mut last_acked,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -971,6 +986,32 @@ fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
         'M'
     };
     format!("\x1b[<{cb};{cx};{cy}{suffix}")
+}
+
+/// Applied-cursor credit cadence (M3-5, I7): credits are backpressure
+/// signals, not per-chunk chatter, so they go out at most once per MiB of
+/// newly applied output.
+const ACK_STRIDE_BYTES: u64 = 1024 * 1024;
+
+/// Send an applied-cursor credit if the cursor advanced past the stride
+/// since the last credit. Best-effort: send failures are ignored.
+async fn maybe_send_ack(
+    writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    id: &str,
+    cursor: u64,
+    last_acked: &mut u64,
+) {
+    if cursor >= *last_acked + ACK_STRIDE_BYTES {
+        let _ = ipc::write_request_to_writer(
+            writer,
+            RpcRequest::AttachAppliedCursor {
+                id: id.to_string(),
+                cursor,
+            },
+        )
+        .await;
+        *last_acked = cursor;
+    }
 }
 
 fn is_ctrl_t(key: KeyEvent) -> bool {

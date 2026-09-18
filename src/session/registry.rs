@@ -181,10 +181,11 @@ impl AttachmentRegistry {
     }
 
     /// Record a client-reported applied cursor (drives credits in M3-5).
-    #[allow(dead_code)]
     pub fn report_applied(&mut self, id: u64, cursor: u64) {
         if let Some(attachment) = self.attachments.get_mut(&id) {
-            attachment.applied_cursor = cursor;
+            // Credits are monotonic: a stale or duplicated report never
+            // moves the cursor backwards (I7 bookkeeping stays conservative).
+            attachment.applied_cursor = attachment.applied_cursor.max(cursor);
         }
     }
 
@@ -204,9 +205,8 @@ impl AttachmentRegistry {
         self.attachments.is_empty()
     }
 
-    /// All live attachments, for status surfaces.
     /// M3 status surface: enumerate live attachments.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn attachments(&self) -> impl Iterator<Item = &Attachment> {
         self.attachments.values()
     }

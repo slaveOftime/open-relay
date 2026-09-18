@@ -184,6 +184,7 @@ export type WsClientMessage =
   | { type: 'busy' }
   | { type: 'resize'; rows: number; cols: number }
   | { type: 'acquire_control' }
+  | { type: 'ack'; offset: number }
   | { type: 'detach' }
 
 // ---------------------------------------------------------------------------

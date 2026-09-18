@@ -100,6 +100,11 @@ enum ClientMessage {
     },
     /// Take over the control lease from an observer position.
     AcquireControl,
+    /// Applied-cursor credit (M3-5, I7): highest stream offset the client
+    /// has rendered.
+    Ack {
+        offset: u64,
+    },
     Detach,
     Ping,
 }
@@ -491,6 +496,12 @@ async fn handle_ws_streaming(
                                     }
                                 }
                             }
+                            Ok(ClientMessage::Ack { offset }) => {
+                                state
+                                    .store
+                                    .attach_report_applied(&id, attachment_id, offset)
+                                    .await;
+                            }
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, "WS client detached");
                                 let _ = state.store.attach_detach(&id, attachment_id).await;
@@ -764,6 +775,11 @@ async fn handle_ws_proxied_streaming(
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket control takeover");
                                 }
                             }
+                            // Applied-cursor credits are best-effort and
+                            // local to the owning node; the node relay
+                            // carries one request per stream, so mid-stream
+                            // credits cannot reach the remote attachment.
+                            Ok(ClientMessage::Ack { .. }) => {}
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, node = %node, "proxied WebSocket detach requested");
                                 let rpc = RpcRequest::AttachDetach { id: id.to_string() };

@@ -22,6 +22,12 @@ impl StreamCursor {
         }
     }
 
+    /// The next expected offset (bytes applied so far from the snapshot
+    /// boundary).
+    pub fn current(&self) -> u64 {
+        self.expected
+    }
+
     /// Verify and apply one chunk: `offset` must be exactly the next expected
     /// offset (no gap, no duplication).
     pub fn accept(&mut self, offset: u64, len: usize) -> Result<(), AppError> {

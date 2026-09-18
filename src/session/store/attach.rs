@@ -157,6 +157,63 @@ impl SessionStore {
 
     /// Initialise an attach stream from the current rendered terminal state
     /// instead of replaying persisted PTY history from byte offset 0.
+    /// Read one bounded window of the persisted filtered stream starting at
+    /// `from` (I7): at most `max_bytes`, so a lagged attachment resyncs in
+    /// slices instead of one unbounded allocation.
+    pub async fn attach_resync_window(
+        &self,
+        id: &str,
+        from: u64,
+        max_bytes: usize,
+    ) -> std::result::Result<Vec<u8>, SessionError> {
+        let handle = self.lookup_runtime(id).await?;
+        let dir = { handle.read().dir.clone() };
+        // Same journal/legacy split as attach_subscribe_init (removed in M6).
+        let result: Result<Vec<u8>, String> =
+            if dir.join(crate::session::journal::JOURNAL_DIR_NAME).is_dir() {
+                crate::session::replay::filtered_stream_window(&dir, from, max_bytes)
+                    .map_err(|err| err.to_string())
+            } else {
+                crate::session::persist::read_output_window(&dir, from, max_bytes)
+                    .map_err(|err| err.to_string())
+            };
+        result.map_err(|err| {
+            warn!(session_id = id, %err, "attach resync window read failed");
+            SessionError::Evicted
+        })
+    }
+
+    /// Record a client's applied-cursor credit (M3-5, I7). Stale attachment
+    /// tokens and non-advancing cursors are ignored: credits are
+    /// best-effort backpressure signals, not correctness gates.
+    pub async fn attach_report_applied(&self, id: &str, attachment_id: u64, cursor: u64) {
+        if let Ok(handle) = self.lookup_runtime(id).await {
+            let mut rt = handle.write();
+            rt.attachments.report_applied(attachment_id, cursor);
+        }
+    }
+
+    /// Slowest applied cursor across registered attachments that have
+    /// reported (backpressure signal; `None` when none have).
+    #[cfg(test)]
+    pub async fn attach_min_applied_cursor(&self, id: &str) -> Option<u64> {
+        let handle = self.lookup_runtime(id).await.ok()?;
+        let rt = handle.read();
+        rt.attachments
+            .attachments()
+            .map(|a| a.applied_cursor)
+            .filter(|&cursor| cursor > 0)
+            .min()
+    }
+
+    /// In-memory filtered-stream length (M3-5): counts bytes the journal
+    /// appender may not have flushed yet, so the pump's completion drain
+    /// knows when the persisted tail has caught up.
+    pub async fn attach_filtered_len(&self, id: &str) -> Option<u64> {
+        let handle = self.lookup_runtime(id).await.ok()?;
+        Some(handle.read().filtered_stream_len())
+    }
+
     pub async fn attach_snapshot_init(
         &self,
         id: &str,
@@ -771,6 +828,45 @@ mod tests {
             locked.last_attach_activity_at.is_some(),
             "final detach should still keep the last-seen activity timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn attach_applied_cursor_credits_register_per_attachment() {
+        use crate::session::registry::{AttachKind, ControlRequest};
+
+        let (rt, _writer_rx) = make_runtime_writable("ack0001", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let reg_a = store
+            .attach_register("ack0001", AttachKind::Cli, ControlRequest::Controller, None)
+            .await
+            .expect("attach A");
+        let reg_b = store
+            .attach_register("ack0001", AttachKind::Web, ControlRequest::Observer, None)
+            .await
+            .expect("attach B");
+
+        // Credits advance monotonically per attachment (M3-5, I7).
+        store
+            .attach_report_applied("ack0001", reg_a.attachment_id, 4096)
+            .await;
+        store
+            .attach_report_applied("ack0001", reg_b.attachment_id, 1024)
+            .await;
+        store
+            .attach_report_applied("ack0001", reg_a.attachment_id, 128)
+            .await; // non-advancing: ignored
+        assert_eq!(
+            store.attach_min_applied_cursor("ack0001").await,
+            Some(1024),
+            "slowest attachment bounds the applied cursor"
+        );
+        // A stale token (detached attachment) is ignored, not an error.
+        let _ = store.attach_detach("ack0001", reg_b.attachment_id).await;
+        store
+            .attach_report_applied("ack0001", reg_b.attachment_id, 8192)
+            .await;
+        assert_eq!(store.attach_min_applied_cursor("ack0001").await, Some(4096));
     }
 
     #[tokio::test]

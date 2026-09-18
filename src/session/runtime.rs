@@ -89,6 +89,10 @@ impl SharedModes {
 #[derive(Debug, Clone)]
 pub struct SequencedChunk {
     pub cursor: Option<journal::JournalCursor>,
+    /// Filtered-stream offset of the first byte (I2): the attach pump
+    /// trims overlaps and detects gaps against this instead of trusting
+    /// broadcast delivery order blindly.
+    pub offset: u64,
     pub bytes: Bytes,
 }
 
@@ -1164,7 +1168,7 @@ pub fn spawn_session(
                     // positions), advance the stream counters, and publish
                     // any changed notifications (adopting a terminal-emitted
                     // title while the session has no user-chosen one).
-                    let (query_responses, meta_update, chunk_cursor, journal_stop) = {
+                    let (query_responses, meta_update, chunk_cursor, chunk_offset, journal_stop) = {
                         let mut rt = runtime_reader.write();
                         // Journal the exact bytes read from the PTY —
                         // pre-filter — so replay and post-mortems never lose
@@ -1178,6 +1182,7 @@ pub fn spawn_session(
                             false
                         };
                         rt.push_output(&filtered, meaningful_len);
+                        let chunk_offset = rt.filtered_stream_len() - filtered.len() as u64;
                         // A mode flip lands immediately after the output
                         // that caused it, in the same order a replay sees.
                         rt.journal_modes_if_changed();
@@ -1194,6 +1199,7 @@ pub fn spawn_session(
                             query_responses,
                             meta_changed.then(|| rt.to_summary()),
                             chunk_cursor,
+                            chunk_offset,
                             journal_stop,
                         )
                     };
@@ -1221,6 +1227,7 @@ pub fn spawn_session(
                     if !filtered.is_empty()
                         && let Ok(receiver_count) = broadcast_tx_reader.send(SequencedChunk {
                             cursor: chunk_cursor,
+                            offset: chunk_offset,
                             bytes: filtered.clone(),
                         })
                     {

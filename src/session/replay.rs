@@ -169,6 +169,67 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
     Ok((collected, filtered_pos))
 }
 
+/// Bounded variant of [`filtered_stream_from`] (M3-5, I7): returns at most
+/// `max_bytes` of the filtered display stream starting at `from_offset`.
+/// Attach pumps use this to resync a lagged client in bounded windows
+/// instead of materializing the whole lag in memory at once; a short
+/// result means the persisted stream is exhausted at the moment of the
+/// read.
+pub fn filtered_stream_window(
+    session_dir: &Path,
+    from_offset: u64,
+    max_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    let incarnations = match journal::list_incarnations(&journal_dir) {
+        Ok(incarnations) => incarnations,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let Some(&incarnation) = incarnations.last() else {
+        return Ok(Vec::new());
+    };
+
+    let mut scanner = PtyScanner::new();
+    let mut out = ScanOut::default();
+    let mut filtered_pos = 0u64;
+    let mut collected: Vec<u8> = Vec::new();
+    let mut next_seq = 1u64;
+
+    loop {
+        let range = journal::read_range(
+            session_dir,
+            incarnation,
+            next_seq,
+            u64::MAX,
+            REPLAY_BATCH_BYTES,
+        )?;
+        if range.records.is_empty() {
+            break;
+        }
+        for record in &range.records {
+            if record.kind == RecordKind::Output {
+                scanner.scan(&record.payload, &mut out);
+                let batch = &out.filtered;
+                let batch_start = filtered_pos;
+                filtered_pos = filtered_pos.saturating_add(batch.len() as u64);
+                if filtered_pos > from_offset && collected.len() < max_bytes {
+                    let skip = from_offset.saturating_sub(batch_start) as usize;
+                    let take = batch.len().saturating_sub(skip.min(batch.len()));
+                    let take = take.min(max_bytes - collected.len());
+                    collected.extend_from_slice(&batch[skip.min(batch.len())..][..take]);
+                }
+            }
+            next_seq = record.seq + 1;
+        }
+        if !range.truncated || collected.len() >= max_bytes {
+            break;
+        }
+    }
+
+    Ok(collected)
+}
+
 /// Filtered-stream end offset of the latest incarnation (what
 /// `current_output_offset` reported from `output.log`).
 pub fn filtered_stream_len(session_dir: &Path) -> io::Result<u64> {
@@ -231,6 +292,34 @@ mod tests {
         // they did into output.log.
         assert!(text.contains("\x1b[?25l"), "{text:?}");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn filtered_stream_window_bounds_the_returned_bytes() {
+        let dir = journal_dir("window");
+        {
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            for chunk in [b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()] {
+                journal
+                    .record_output(bytes::Bytes::copy_from_slice(chunk))
+                    .unwrap();
+            }
+            flush(&mut journal, 3);
+        }
+        // Full stream: "alphabetagamma" (14 bytes).
+        let window = filtered_stream_window(&dir, 0, 8).unwrap();
+        assert_eq!(window, b"alphabet", "bounded at max_bytes");
+        let window = filtered_stream_window(&dir, 8, 8).unwrap();
+        assert_eq!(
+            window, b"agamma",
+            "continues exactly where the last window ended"
+        );
+        let window = filtered_stream_window(&dir, 14, 8).unwrap();
+        assert!(
+            window.is_empty(),
+            "short/empty window = persisted end reached"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

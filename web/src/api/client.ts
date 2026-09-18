@@ -450,6 +450,9 @@ const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
 const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
 const WS_INIT_HEADER_LEN = 28
 const WS_FRAME_CONTROL = 8
+
+/** Applied-cursor credit cadence (M3-5): at most one ack per MiB. */
+const WS_ACK_STRIDE_BYTES = 1024 * 1024
 const WS_DATA_HEADER_LEN = 9
 const WS_ENDED_LEN = 14
 
@@ -476,6 +479,7 @@ export class AttachSocket {
   private closed = false
   /** Next expected stream offset (from the init frame's snapshot boundary). */
   private expectedOffset: number | null = null
+  private lastAckedOffset = 0
   /** Granted control role; observers never send input or resize (I6). */
   role: 'controller' | 'observer' = 'controller'
 
@@ -547,6 +551,12 @@ export class AttachSocket {
             }
             this.expectedOffset = offset + (bytes.length - WS_DATA_HEADER_LEN)
             opts.onData(bytes.subarray(WS_DATA_HEADER_LEN))
+            // Applied-cursor credit (M3-5): bytes handed to the renderer
+            // count as applied; credit at most once per MiB.
+            if (this.expectedOffset >= this.lastAckedOffset + WS_ACK_STRIDE_BYTES) {
+              this.lastAckedOffset = this.expectedOffset
+              this.sendAck(this.expectedOffset)
+            }
             return
           }
           case WS_FRAME_MODE_CHANGED: {
@@ -610,6 +620,11 @@ export class AttachSocket {
   /** Request the control lease (observer → controller takeover). */
   sendAcquireControl() {
     this.send({ type: 'acquire_control' })
+  }
+
+  /** Send an applied-cursor credit (M3-5, I7); throttled by the caller. */
+  sendAck(offset: number) {
+    this.send({ type: 'ack', offset })
   }
   sendBusy() {
     this.send({ type: 'busy' })

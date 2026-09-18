@@ -81,6 +81,14 @@ pub fn read_output_from(dir: &Path, from_offset: u64) -> Result<(Vec<u8>, u64)> 
     Ok((bytes, end_offset))
 }
 
+/// Bounded variant of [`read_output_from`] (M3-5, I7): at most `max_bytes`
+/// from `from_offset`. Used by attach-pump resync windows on pre-journal
+/// sessions (legacy fallback; removed in M6).
+pub fn read_output_window(dir: &Path, from_offset: u64, max_bytes: usize) -> Result<Vec<u8>> {
+    let (bytes, _end) = read_output_from(dir, from_offset)?;
+    Ok(bytes.into_iter().take(max_bytes).collect())
+}
+
 pub fn current_output_offset_by_id(dir: &Path, session_id: &str) -> u64 {
     current_output_offset(&dir.join(session_id))
 }
