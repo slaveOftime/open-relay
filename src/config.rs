@@ -76,6 +76,10 @@ pub struct AppConfig {
     pub notification_min_interval_seconds: u64,
     pub session_eviction_seconds: u64,
     pub max_running_sessions: usize,
+    /// Retired (M3-1c2): the 0.x `output.log` size-cap truncation destroyed
+    /// history (PLAN I3); growth is now bounded by checkpoint-gated journal
+    /// retention. Parsed for config compatibility; no longer consulted.
+    ///
     /// Maximum size in bytes an individual session's `output.log` may reach
     /// before the daemon truncates it in place. `0` disables the cap.
     pub max_output_log_bytes: u64,

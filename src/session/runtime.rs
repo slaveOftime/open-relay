@@ -23,7 +23,6 @@ use uuid::Uuid;
 use crate::{
     error::{AppError, Result},
     protocol::{LogResize, SessionSummary},
-    session::persist::create_output_log,
 };
 
 use super::journal::{self, LifecycleCode, ShadowJournal};
@@ -32,7 +31,7 @@ use super::scan::{PtyScanner, ScanOut};
 
 use super::{
     MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus,
-    persist::{OutputLog, append_event, append_resize_event},
+    persist::{append_event, append_resize_event},
 };
 use crate::terminal::{EngineEvent, Terminal};
 
@@ -948,7 +947,8 @@ pub fn spawn_session(
     let runtime_child = RuntimeChild::Pty(child);
     meta.pid = runtime_child.process_id();
 
-    create_output_log(&full_dir)?;
+    // M3-1c2: output.log is retired; the journal (opened above) is the
+    // canonical persisted stream.
     append_event(&full_dir, "session created")?;
     append_resize_event(&full_dir, 0, rows, cols)?;
 
@@ -1073,7 +1073,6 @@ pub fn spawn_session(
         let mut reader = reader;
         let mut scanner = PtyScanner::new();
         let mut scan_out = ScanOut::default();
-        let mut output_log = OutputLog::open(&reader_dir);
         // Every exit path funnels into one close-out so the runtime
         // observes — and the shadow journal records — exactly one
         // `OutputClosed` fact, regardless of how the stream ended (I10).
@@ -1154,11 +1153,9 @@ pub fn spawn_session(
                         let _ = reader_event_tx.send(SessionEvent::SessionUpdated(summary));
                     }
 
-                    if !filtered.is_empty()
-                        && let Err(err) = output_log.append(&filtered)
-                    {
-                        warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
-                    }
+                    // The raw chunk is already journaled (canonical); the
+                    // filtered stream is derived from the journal on read
+                    // (M3-1b) — output.log is no longer written.
 
                     // Broadcast canonical filtered output to all live
                     // subscribers (non-blocking; lagged receivers re-sync from
@@ -1987,47 +1984,35 @@ mod tests {
     /// cursor agree exactly; this test pins that and stays ignored until
     /// they land.
     #[test]
-    #[ignore = "M0 reproduction (PLAN I2): snapshot/file/broadcast boundary is not atomic; fixed by M1+M3"]
-    fn repro_snapshot_boundary_can_overlap_live_stream() {
-        use crate::session::persist::{
-            append_output_raw, create_output_log, current_output_offset,
-        };
-
+    fn snapshot_boundary_matches_the_live_stream_cursor() {
+        // Fixed in M3-1 (was M0 repro PLAN I2): the snapshot and the resume
+        // cursor now come from the SAME in-memory state under the runtime
+        // lock — no file offset can lag the screen. Snapshot coverage and
+        // resume cursor describe the same boundary, so replay-from-cursor
+        // can neither lose nor duplicate a chunk.
         let dir = std::env::temp_dir().join(format!("oly_repro_snapshot_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        create_output_log(&dir).unwrap();
 
         let mut rt = new_runtime();
         rt.dir = dir.clone();
 
-        // Committed prefix: pushed and appended, as the reader does.
+        rt.feed_engine(b"stable");
         rt.push_output(b"stable", 6);
-        append_output_raw(&dir, b"stable").unwrap();
-
-        // The reader is now between steps for the next chunk: pushed into
-        // the screen/counters, not yet appended or broadcast.
+        // The reader is between steps for the next chunk: pushed into the
+        // screen/counters, not yet broadcast.
+        rt.feed_engine(b"RACY");
         rt.push_output(b"RACY", 4);
 
-        // attach_snapshot_init's view: snapshot + resume offset.
         let snapshot = rt.attach_snapshot_bytes();
-        let end_offset = current_output_offset(&dir);
+        let end_offset = rt.filtered_stream_len();
 
         assert!(
             snapshot.windows(4).any(|window| window == b"RACY"),
             "snapshot must contain the pushed chunk"
         );
         assert_eq!(
-            end_offset, 6,
-            "the file does not cover the pushed chunk yet (reader order: push → append → broadcast)"
-        );
-        // Desired: the snapshot's coverage and the resume cursor describe
-        // the same boundary, so replay-from-cursor can neither lose nor
-        // duplicate the chunk.
-        assert_eq!(
             end_offset, rt.filtered_total_bytes,
-            "snapshot covers {} stream bytes but the resume cursor is {end_offset}: \
-             replaying from the cursor re-delivers 'RACY' to the client",
-            rt.filtered_total_bytes
+            "snapshot coverage and resume cursor describe the same boundary"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

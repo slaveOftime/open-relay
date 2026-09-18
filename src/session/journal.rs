@@ -27,7 +27,7 @@
 //! `crc32` (IEEE) covers the header bytes before the CRC field plus the
 //! payload. `seq` is strictly monotonic and never reused **within an
 //! incarnation**; the full cursor is `{session_id, incarnation, seq}` —
-//! unlike the `output.log` offsets that `truncate_output_log` reuses today.
+//! unlike the `output.log` offsets that 0.x size-cap truncation reused.
 //! `elapsed_ms` is assigned by the sequencer (monotonic time since the
 //! incarnation started); the session's wall-clock launch time lives in the
 //! manifest, not per record.

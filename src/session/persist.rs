@@ -1,8 +1,9 @@
-//! On-disk session state: the output log, the event log and their offsets.
+//! On-disk session state helpers: the event log and legacy output-log reads.
 //!
-//! A session directory holds `output.log` (the canonical filtered PTY byte
-//! stream), `events.log` (lifecycle and resize records) and the index sidecars
-//! maintained by [`super::logs`].
+//! Since M3-1 the journal is the canonical persisted stream; `output.log`
+//! remains only as a legacy fallback for sessions created before the journal
+//! became always-on (retired fully in M6). `events.log` (lifecycle and
+//! resize records) is still written and read for resize replays.
 
 use crate::error::Result;
 use std::{
@@ -11,69 +12,20 @@ use std::{
     path::Path,
 };
 
-/// Create an empty `output.log` so readers can open it before the child has
-/// produced anything.
-pub fn create_output_log(dir: &Path) -> Result<()> {
-    fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(dir.join("output.log"))?;
-    Ok(())
-}
-
 /// Append raw PTY bytes to `output.log` in one shot.
 ///
 /// The reader thread uses [`OutputLog`] instead; this is for callers that write
 /// a single chunk and do not amortise the open.
 #[cfg(test)]
 pub fn append_output_raw(dir: &Path, data: &[u8]) -> Result<()> {
-    OutputLog::open(dir).append(data)
-}
-
-/// A persistent append handle for a session's `output.log`.
-///
-/// The PTY reader thread writes one chunk per read syscall, so reopening the
-/// file each time costs an `open`/`close` pair per chunk — a significant share
-/// of the per-chunk budget during a large paste. The handle is opened in append
-/// mode and never buffered in user space, so bytes are visible to the replay
-/// readers (`read_output_from`) as soon as `append` returns.
-pub struct OutputLog {
-    file: Option<fs::File>,
-    path: std::path::PathBuf,
-}
-
-impl OutputLog {
-    pub fn open(dir: &Path) -> Self {
-        let path = dir.join("output.log");
-        let file = fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-            .ok();
-        Self { file, path }
-    }
-
-    /// Append one chunk, transparently reopening the file if the handle was
-    /// lost (for example because the previous write failed).
-    pub fn append(&mut self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        if self.file.is_none() {
-            self.file = Some(
-                fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&self.path)?,
-            );
-        }
-        let file = self.file.as_mut().expect("handle opened above");
-        if let Err(err) = file.write_all(data) {
-            self.file = None;
-            return Err(err.into());
-        }
-        Ok(())
-    }
+    let path = dir.join("output.log");
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?;
+    use std::io::Write;
+    file.write_all(data)?;
+    Ok(())
 }
 
 pub fn append_event(dir: &Path, event: &str) -> Result<()> {
@@ -103,25 +55,6 @@ pub fn current_output_offset(dir: &Path) -> u64 {
     fs::metadata(dir.join("output.log"))
         .map(|meta| meta.len())
         .unwrap_or(0)
-}
-
-/// Truncate a session's `output.log` back to zero length.
-///
-/// The reader thread's [`OutputLog`] handle is opened in append mode, so it
-/// keeps writing at the new end-of-file after truncation without needing to
-/// be reopened. Callers must also reset the persisted log index (via
-/// [`super::logs::discard_persisted_log_index`]) and the runtime byte counters
-/// so downstream offsets stay consistent.
-pub fn truncate_output_log(dir: &Path) -> Result<()> {
-    let path = dir.join("output.log");
-    match fs::OpenOptions::new().write(true).open(&path) {
-        Ok(file) => {
-            file.set_len(0)?;
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 pub fn read_output_from(dir: &Path, from_offset: u64) -> Result<(Vec<u8>, u64)> {
@@ -213,48 +146,6 @@ mod tests {
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
             appender.join().unwrap();
         });
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// M0 reproduction (PLAN.md invariant I3): `truncate_oversized_logs`
-    /// resets `output.log` to zero length, so a client cursor captured before
-    /// truncation silently aliases the *new* stream. A reader at offset 75
-    /// after the file was truncated and rewritten to 50 bytes gets an empty
-    /// `Ok` — indistinguishable from "no new output" — and a reader at
-    /// offset 10 gets bytes that were never at offset 10 of the stream it
-    /// subscribed to. The 1.0 segmented journal must surface
-    /// `HistoryExpired` instead; this test pins the desired behaviour and
-    /// stays ignored until the journal lands.
-    ///
-    /// M1: the journal-backed equivalent
-    /// (`journal::tests::history_cursors_never_alias_across_restart_and_retention`)
-    /// passes un-ignored. This 0.x reproduction stays ignored as
-    /// documentation of the old failure mode until `output.log` stops
-    /// being canonical in M3.
-    #[test]
-    #[ignore = "M0 reproduction (PLAN I3): offset reuse after truncation; superseded by journal cursors in M1, output.log retires in M3"]
-    fn repro_truncated_log_reuses_offsets() {
-        let dir = test_dir("offset_reuse");
-        append_output_raw(&dir, &[b'x'; 100]).unwrap();
-        truncate_output_log(&dir).unwrap();
-        append_output_raw(&dir, &[b'y'; 50]).unwrap();
-
-        // Desired: a cursor beyond the rewritten length is an explicit
-        // expiry error, not a silent empty success.
-        let stale_cursor = read_output_from(&dir, 75);
-        assert!(
-            stale_cursor.is_err(),
-            "a cursor invalidated by retention must fail loudly, got {stale_cursor:?}"
-        );
-
-        // Desired: a cursor inside the rewritten range must not alias new
-        // bytes onto the old stream position.
-        let (bytes, _) = read_output_from(&dir, 10).unwrap();
-        assert!(
-            bytes.iter().all(|byte| *byte == b'x'),
-            "offset 10 of the pre-truncation stream must not return post-truncation bytes"
-        );
 
         let _ = fs::remove_dir_all(&dir);
     }

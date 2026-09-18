@@ -665,9 +665,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 break;
             }
             _ = session_maintenance_tick.tick() => {
-                session_store
-                    .run_maintenance(live_config.get().max_output_log_bytes)
-                    .await;
+                session_store.run_maintenance().await;
             }
             incoming = listener.accept() => {
                 match incoming {

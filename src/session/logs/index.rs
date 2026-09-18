@@ -561,19 +561,6 @@ fn log_index_meta_path(log_path: &Path) -> PathBuf {
 /// Used after `output.log` is truncated: the cached record offsets and meta
 /// no longer match the file, so they are removed and the index is rebuilt
 /// lazily on the next pagination read. Missing sidecars are not an error.
-pub fn discard_persisted_log_index(dir: &Path) {
-    let log_path = dir.join("output.log");
-    for path in [
-        log_index_offsets_path(&log_path),
-        log_index_meta_path(&log_path),
-    ] {
-        if let Err(err) = fs::remove_file(&path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(?path, %err, "failed to remove stale log index sidecar");
-            }
-        }
-    }
-}
 
 fn find_special_record_byte(bytes: &[u8]) -> Option<usize> {
     bytes

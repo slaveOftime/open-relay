@@ -31,54 +31,16 @@ use super::{
 };
 
 impl SessionStore {
-    /// Persist and evict completed sessions that have aged past the in-memory
-    /// retention window, and cap oversized live output logs.
+    /// Maintenance sweep: prune evicted completed sessions past the
+    /// retention window.
     ///
-    /// `max_output_log_bytes` of `0` disables the size cap.
-    pub async fn run_maintenance(&self, max_output_log_bytes: u64) {
-        if max_output_log_bytes > 0 {
-            self.truncate_oversized_logs(max_output_log_bytes);
-        }
+    /// The 0.x `output.log` size-cap truncation is gone (M3-1c2):
+    /// truncating the canonical stream silently renumbered cursors and
+    /// destroyed history (PLAN I3). Growth is bounded instead by
+    /// checkpoint-gated journal retention (ADR-0002), which runs at
+    /// checkpoint cadence in the runtime.
+    pub async fn run_maintenance(&self) {
         self.prune_evicted_sessions().await;
-    }
-
-    /// Truncate any session `output.log` that has grown past
-    /// `max_output_log_bytes`, resetting the persisted log index and the
-    /// runtime byte counters so live attach/tail/pagination stay consistent.
-    ///
-    /// The in-memory rendered screen (`screen_parser`) is untouched, so an
-    /// attached client keeps seeing the correct current screen; only the
-    /// on-disk scrollback history is dropped.
-    fn truncate_oversized_logs(&self, max_output_log_bytes: u64) {
-        use crate::session::persist::{append_event, current_output_offset, truncate_output_log};
-
-        let sessions = self.sessions.load_full();
-        for (id, handle) in sessions.iter() {
-            let mut rt = handle.write();
-            // Only cap sessions that are still producing output; a completed
-            // session's log is frozen and about to be evicted anyway.
-            if rt.is_completed() {
-                continue;
-            }
-            if current_output_offset(&rt.dir) <= max_output_log_bytes {
-                continue;
-            }
-
-            if let Err(err) = truncate_output_log(&rt.dir) {
-                warn!(session_id = %id, %err, "failed to truncate oversized output.log");
-                continue;
-            }
-            crate::session::logs::discard_persisted_log_index(&rt.dir);
-            rt.filtered_total_bytes = 0;
-            rt.last_total_bytes = 0;
-            rt.resize_history.clear();
-            let _ = append_event(&rt.dir, "output.log truncated (size cap reached)");
-            info!(
-                session_id = %id,
-                max_output_log_bytes,
-                "truncated oversized output.log"
-            );
-        }
     }
 
     /// Load session history from the SQLite database on daemon startup.
@@ -752,7 +714,7 @@ mod tests {
             next
         });
 
-        store.run_maintenance(0).await;
+        store.run_maintenance().await;
 
         let sessions = store.sessions.load();
         assert!(
@@ -767,50 +729,6 @@ mod tests {
                 .evicted_sessions
                 .contains_key("evict001"),
             "evicted sessions should leave a tombstone for follow-up lookups"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_maintenance_truncates_oversized_live_log() {
-        use crate::session::persist::{append_output_raw, current_output_offset};
-
-        let rt = make_runtime("big01", SessionStatus::Running, "", None);
-        let dir = rt.read().dir.clone();
-        // Write well past the cap we will set.
-        append_output_raw(&dir, &vec![b'x'; 4096]).expect("seed oversized log");
-        assert!(current_output_offset(&dir) >= 4096);
-
-        let store = store_with(vec![rt.clone()], make_test_db().await);
-        store.run_maintenance(1024).await;
-
-        assert_eq!(
-            current_output_offset(&dir),
-            0,
-            "oversized live log should be truncated to zero"
-        );
-        let locked = rt.read();
-        assert_eq!(locked.filtered_total_bytes, 0, "attach offset should reset");
-        assert_eq!(
-            locked.last_total_bytes, 0,
-            "meaningful counter should reset"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_maintenance_leaves_small_log_untouched() {
-        use crate::session::persist::{append_output_raw, current_output_offset};
-
-        let rt = make_runtime("small1", SessionStatus::Running, "", None);
-        let dir = rt.read().dir.clone();
-        append_output_raw(&dir, b"hello").expect("seed small log");
-
-        let store = store_with(vec![rt], make_test_db().await);
-        store.run_maintenance(1024).await;
-
-        assert_eq!(
-            current_output_offset(&dir),
-            5,
-            "a log under the cap must not be truncated"
         );
     }
 

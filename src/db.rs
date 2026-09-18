@@ -172,6 +172,15 @@ impl Database {
     }
 
     pub fn session_output_offset(&self, id: &str) -> u64 {
+        let session_dir = self.sessions_dir.join(id);
+        // M3-1c: journal-backed sessions report the derived filtered stream
+        // length; output.log stat remains for legacy sessions.
+        if session_dir
+            .join(crate::session::journal::JOURNAL_DIR_NAME)
+            .is_dir()
+        {
+            return crate::session::replay::filtered_stream_len(&session_dir).unwrap_or(0);
+        }
         current_output_offset_by_id(&self.sessions_dir, id)
     }
 
