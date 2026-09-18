@@ -1122,6 +1122,15 @@ impl ShadowJournal {
         )
     }
 
+    /// Record a checkpoint anchoring this stream position: restore and
+    /// retention may both start from it (PLAN §5.3).
+    pub fn record_checkpoint(
+        &mut self,
+        checkpoint: &Checkpoint,
+    ) -> Result<JournalCursor, JournalSubmitError> {
+        self.record(RecordKind::CheckpointRef, encode_checkpoint(checkpoint))
+    }
+
     /// Record a terminal-relevant revision (e.g. a mode flip) at its
     /// ordered stream position, right after the output that caused it.
     pub fn record_policy(
@@ -1741,17 +1750,171 @@ fn recovered_tail(journal_dir: &Path, incarnation: u64) -> io::Result<u64> {
     Ok(0)
 }
 
+// ---------------------------------------------------------------------------
+// Checkpoints (RecordKind::CheckpointRef)
+//
+// A checkpoint payload is a versioned, self-describing restore anchor
+// (PLAN §5.3): it carries the terminal geometry, cursor, modes, and a
+// side-effect-free *restore program* (styled scrollback + clear + styled
+// screen + cursor report) that repaints equivalent state into a fresh
+// engine. Retention is gated on checkpoints: everything older than the
+// newest checkpoint's incarnation may be deleted, because replay can
+// start at the checkpoint instead.
+// ---------------------------------------------------------------------------
+
+pub const CHECKPOINT_VERSION: u16 = 1;
+const CHECKPOINT_MAGIC: &[u8; 4] = b"OJCK";
+
+/// One checkpoint payload, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub rows: u16,
+    pub cols: u16,
+    /// 1-based (row, col) cursor position.
+    pub cursor: (u16, u16),
+    pub alt_screen: bool,
+    pub app_cursor_keys: bool,
+    pub bracketed_paste: bool,
+    /// Side-effect-free restore program (repaint escape stream).
+    pub program: bytes::Bytes,
+}
+
+pub fn encode_checkpoint(checkpoint: &Checkpoint) -> bytes::Bytes {
+    let mut out = Vec::with_capacity(19 + checkpoint.program.len());
+    out.extend_from_slice(CHECKPOINT_MAGIC);
+    out.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
+    out.extend_from_slice(&checkpoint.rows.to_le_bytes());
+    out.extend_from_slice(&checkpoint.cols.to_le_bytes());
+    out.extend_from_slice(&checkpoint.cursor.0.to_le_bytes());
+    out.extend_from_slice(&checkpoint.cursor.1.to_le_bytes());
+    let flags = u8::from(checkpoint.alt_screen)
+        | u8::from(checkpoint.app_cursor_keys) << 1
+        | u8::from(checkpoint.bracketed_paste) << 2;
+    out.push(flags);
+    out.extend_from_slice(&(checkpoint.program.len() as u32).to_le_bytes());
+    out.extend_from_slice(&checkpoint.program);
+    bytes::Bytes::from(out)
+}
+
+pub fn decode_checkpoint(payload: &[u8]) -> io::Result<Checkpoint> {
+    fn take<'a>(payload: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
+        if payload.len() < n {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated checkpoint payload",
+            ));
+        }
+        let (head, tail) = payload.split_at(n);
+        *payload = tail;
+        Ok(head)
+    }
+    let mut rest = payload;
+    if take(&mut rest, 4)? != CHECKPOINT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad checkpoint magic",
+        ));
+    }
+    let version = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+    if version != CHECKPOINT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported checkpoint version {version}"),
+        ));
+    }
+    let rows = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+    let cols = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+    let cursor_row = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+    let cursor_col = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
+    let flags = take(&mut rest, 1)?[0];
+    let program_len = u32::from_le_bytes(take(&mut rest, 4)?.try_into().unwrap()) as usize;
+    let program = take(&mut rest, program_len)?;
+    if !rest.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes after checkpoint program",
+        ));
+    }
+    Ok(Checkpoint {
+        rows,
+        cols,
+        cursor: (cursor_row, cursor_col),
+        alt_screen: flags & 1 != 0,
+        app_cursor_keys: flags & 2 != 0,
+        bracketed_paste: flags & 4 != 0,
+        program: bytes::Bytes::copy_from_slice(program),
+    })
+}
+
+/// The incarnation holding the newest checkpoint record, if any. Scans
+/// incarnations newest-first, header-only, stopping at torn tails — this
+/// runs at retention time, never on the hot path.
+pub fn latest_checkpoint_incarnation(session_dir: &Path) -> io::Result<Option<u64>> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    for incarnation in list_incarnations(&journal_dir)?.into_iter().rev() {
+        if incarnation_has_checkpoint(&journal_dir, incarnation)? {
+            return Ok(Some(incarnation));
+        }
+    }
+    Ok(None)
+}
+
+fn incarnation_has_checkpoint(journal_dir: &Path, incarnation: u64) -> io::Result<bool> {
+    let mut parts: Vec<u64> = list_segments(journal_dir)?
+        .into_iter()
+        .filter(|&(inc, _)| inc == incarnation)
+        .map(|(_, part)| part)
+        .collect();
+    parts.sort_unstable();
+    for part in parts {
+        let mut file = fs::File::open(segment_path(journal_dir, incarnation, part))?;
+        let mut header = [0u8; HEADER_LEN];
+        loop {
+            match file.read_exact(&mut header) {
+                Ok(()) => {}
+                // Torn tail / EOF: nothing usable further in this part.
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err),
+            }
+            if &header[0..4] != RECORD_MAGIC {
+                break;
+            }
+            let kind = u16::from_le_bytes(header[6..8].try_into().unwrap());
+            let payload_len = u32::from_le_bytes(header[28..32].try_into().unwrap()) as u64;
+            if kind == RecordKind::CheckpointRef as u16 {
+                return Ok(true);
+            }
+            if file.seek_relative(payload_len as i64).is_err() {
+                break;
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Checkpoint-gated retention (ADR-0002): delete sealed incarnations
+/// below `min_incarnation`, but never past the newest checkpoint — the
+/// checkpoint's restore program reconstructs the first exposed boundary,
+/// and it lives in its own incarnation, so strictly older incarnations
+/// are the only ones ever removed. With no checkpoint on record nothing
+/// is deleted. Returns the deleted incarnation numbers.
+pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec<u64>> {
+    let Some(gate) = latest_checkpoint_incarnation(session_dir)? else {
+        return Ok(Vec::new());
+    };
+    retain_before_unchecked(session_dir, min_incarnation.min(gate))
+}
+
 /// Unchecked retention primitive: delete **all parts** of the sealed
 /// incarnations below `min_incarnation`. The latest incarnation is never
 /// deleted (it may be active). Returns the deleted incarnation numbers.
 /// Cursors into removed incarnations fail loudly on read (see
 /// [`read_history`]); they never alias newer bytes.
 ///
-/// **Test/dev plumbing only.** ADR-0002 requires production retention to
-/// delete a sealed segment only *after a retained checkpoint can
-/// reconstruct the first exposed boundary*. Until M2 introduces
-/// checkpoint records, no production caller may invoke this; the
-/// checkpoint-gated policy lands with M2/M3.
+/// **Test/dev plumbing only.** Production retention goes through
+/// [`retain_before`], which clamps the deletion horizon to the newest
+/// checkpoint (ADR-0002: a sealed incarnation is deleted only once a
+/// retained checkpoint can reconstruct the first exposed boundary).
 pub fn retain_before_unchecked(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec<u64>> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     let incarnations = list_incarnations(&journal_dir)?;
@@ -2982,6 +3145,139 @@ mod tests {
         assert_eq!(
             tail.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
             (11..=20).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Checkpoints and checkpoint-gated retention (PLAN §5.3, ADR-0002) --
+
+    fn test_checkpoint(program: &[u8]) -> Checkpoint {
+        Checkpoint {
+            rows: 24,
+            cols: 80,
+            cursor: (7, 3),
+            alt_screen: false,
+            app_cursor_keys: true,
+            bracketed_paste: false,
+            program: bytes::Bytes::copy_from_slice(program),
+        }
+    }
+
+    #[test]
+    fn checkpoint_codec_roundtrips_and_rejects_garbage() {
+        let checkpoint = test_checkpoint(b"\x1b[2J\x1b[Hpainted");
+        let encoded = encode_checkpoint(&checkpoint);
+        assert_eq!(decode_checkpoint(&encoded).unwrap(), checkpoint);
+
+        // Bad magic, wrong version, truncation, trailing bytes.
+        let mut bad = encoded.to_vec();
+        bad[0] = b'X';
+        assert!(decode_checkpoint(&bad).is_err());
+        let mut bad = encoded.to_vec();
+        bad[4] = 0xEE;
+        assert!(decode_checkpoint(&bad).is_err());
+        assert!(decode_checkpoint(&encoded[..encoded.len() - 1]).is_err());
+        let mut bad = encoded.to_vec();
+        bad.push(0);
+        assert!(decode_checkpoint(&bad).is_err());
+    }
+
+    #[test]
+    fn retention_is_gated_on_the_newest_checkpoint() {
+        let dir = test_session_dir("retention_gate");
+        // Incarnation 1: plain output, no checkpoint.
+        let (mut shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        shadow
+            .record_output(bytes::Bytes::from_static(b"inc1"))
+            .unwrap();
+        drop(shadow);
+        // Without any checkpoint on record, retention deletes nothing.
+        assert!(retain_before(&dir, u64::MAX).unwrap().is_empty());
+        assert_eq!(
+            latest_checkpoint_incarnation(&dir).unwrap(),
+            None,
+            "no checkpoint yet"
+        );
+
+        // Incarnation 2: one output record and a checkpoint.
+        let (mut shadow2, incarnation2, _) = ShadowJournal::open(&dir).unwrap();
+        assert_eq!(incarnation2, 2);
+        shadow2
+            .record_output(bytes::Bytes::from_static(b"inc2"))
+            .unwrap();
+        shadow2
+            .record_checkpoint(&test_checkpoint(b"restore"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            shadow2.request_sync();
+            shadow2.poll_acks();
+            if shadow2.core.durable_seq() >= 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(latest_checkpoint_incarnation(&dir).unwrap(), Some(2));
+
+        // Gated retention now deletes incarnation 1 (older than the
+        // checkpoint's incarnation) but never the checkpoint's own.
+        assert_eq!(retain_before(&dir, u64::MAX).unwrap(), vec![1]);
+        assert_eq!(
+            list_incarnations(&dir.join(JOURNAL_DIR_NAME)).unwrap(),
+            vec![2]
+        );
+        // The checkpoint survives and stays decodable.
+        let outcome = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 2,
+                seq: 1,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|event| event.kind == RecordKind::CheckpointRef)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit retention horizon below the gate still wins: the gate
+    /// permits, it does not force.
+    #[test]
+    fn retention_horizon_below_the_gate_is_respected() {
+        let dir = test_session_dir("retention_clamp");
+        let (mut shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        shadow
+            .record_checkpoint(&test_checkpoint(b"restore"))
+            .unwrap();
+        drop(shadow);
+        let (mut shadow2, _, _) = ShadowJournal::open(&dir).unwrap();
+        shadow2
+            .record_checkpoint(&test_checkpoint(b"restore2"))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            shadow2.request_sync();
+            shadow2.poll_acks();
+            if shadow2.core.durable_seq() >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Gate would allow deleting incarnation 1, but the caller's
+        // horizon says keep everything from incarnation 1 on.
+        assert!(retain_before(&dir, 1).unwrap().is_empty());
+        assert_eq!(
+            list_incarnations(&dir.join(JOURNAL_DIR_NAME)).unwrap(),
+            vec![1, 2]
         );
 
         let _ = fs::remove_dir_all(&dir);

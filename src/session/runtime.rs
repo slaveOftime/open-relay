@@ -93,6 +93,11 @@ pub struct SequencedChunk {
     pub bytes: Bytes,
 }
 
+/// Raw-output interval between journal checkpoints. Bounds the bytes a
+/// replay must re-consume after the newest checkpoint (PLAN §5.3); sized
+/// so a checkpoint is taken roughly every other journal part.
+pub(crate) const JOURNAL_CHECKPOINT_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
+
 pub struct SessionRuntime {
     pub meta: SessionMeta,
     /// Absolute path to the session's working directory (`sessions/<id>/`).
@@ -161,6 +166,8 @@ pub struct SessionRuntime {
     /// facts (PLAN.md I10): completion must be sequenced after the final
     /// retained output, never at the moment `try_wait` noticed the exit.
     pub(crate) pending_journal_completion: Option<(LifecycleCode, Option<i32>, String)>,
+    /// Raw-output counter value at the last journal checkpoint.
+    pub(crate) last_journal_checkpoint_raw: u64,
     /// Last terminal mode state journaled as a Policy record this
     /// incarnation; `None` until the baseline revision is recorded.
     pub(crate) journaled_modes: Option<ModeSnapshot>,
@@ -601,8 +608,65 @@ impl SessionRuntime {
         }
         self.output_closed = true;
         self.journal_lifecycle(LifecycleCode::OutputClosed, None, &detail);
+        // Anchor the final state so retention and replay can start from
+        // the checkpoint instead of the raw prefix (PLAN §5.3).
+        self.journal_checkpoint();
         if let Some((code, exit_code, completion_detail)) = self.pending_journal_completion.take() {
             self.journal_terminal_end(code, exit_code, &completion_detail);
+        }
+    }
+
+    /// Journal a checkpoint of the current engine state, then run
+    /// checkpoint-gated retention off the write lock. No-op when the
+    /// shadow journal is disabled.
+    fn journal_checkpoint(&mut self) {
+        if self.journal.is_none() {
+            return;
+        }
+        let (rows, cols) = self.engine.size();
+        let modes = self.engine.modes();
+        // The restore program repaints scrollback, then the screen: rows
+        // scrolled off are replayed as styled lines, then the snapshot
+        // clears and paints the visible grid and cursor.
+        let mut program = Vec::new();
+        for row in self.engine.styled_history_rows(self.screen_scrollback_rows) {
+            program.extend_from_slice(&row);
+            program.extend_from_slice(b"\r\n");
+        }
+        program.extend_from_slice(&self.engine.snapshot_stream());
+        let checkpoint = journal::Checkpoint {
+            rows,
+            cols,
+            cursor: self.engine.cursor_position(),
+            alt_screen: modes.alt_screen,
+            app_cursor_keys: modes.app_cursor_keys,
+            bracketed_paste: modes.bracketed_paste,
+            program: Bytes::from(program),
+        };
+        self.journal_event(|journal| journal.record_checkpoint(&checkpoint).map(|_| ()));
+        self.last_journal_checkpoint_raw = self.raw_total_bytes;
+        // Retention never runs under the write lock (disk I/O).
+        let dir = self.dir.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = journal::retain_before(&dir, u64::MAX) {
+                warn!(
+                    error = %err,
+                    "checkpoint-gated journal retention failed; retrying at the next checkpoint"
+                );
+            }
+        });
+    }
+
+    /// Emit a checkpoint once the session has journaled another
+    /// `JOURNAL_CHECKPOINT_INTERVAL_BYTES` of raw output — this bounds
+    /// replay-from-checkpoint work (PLAN §5.3 cadence).
+    fn journal_checkpoint_if_due(&mut self) {
+        if self
+            .raw_total_bytes
+            .saturating_sub(self.last_journal_checkpoint_raw)
+            >= JOURNAL_CHECKPOINT_INTERVAL_BYTES
+        {
+            self.journal_checkpoint();
         }
     }
 
@@ -957,6 +1021,7 @@ pub fn spawn_session(
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
         pending_journal_completion: None,
+        last_journal_checkpoint_raw: 0,
         journaled_modes: None,
         notifications_enabled,
         journal: shadow_journal,
@@ -1028,6 +1093,8 @@ pub fn spawn_session(
                         // A mode flip lands immediately after the output
                         // that caused it, in the same order a replay sees.
                         rt.journal_modes_if_changed();
+                        // Checkpoint past the configured raw-byte interval.
+                        rt.journal_checkpoint_if_due();
                         (
                             query_responses,
                             meta_changed.then(|| rt.to_summary()),
@@ -1408,6 +1475,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             pending_journal_completion: None,
+            last_journal_checkpoint_raw: 0,
             journaled_modes: None,
             notifications_enabled: true,
             journal: None,
@@ -1435,13 +1503,14 @@ mod tests {
         rt.mark_completed(SessionStatus::Killed, Some(-9));
 
         // Wait for the appender to drain, then verify the journal holds
-        // exactly the close and completion records.
+        // exactly the close, the final-state checkpoint, and the
+        // completion record — in that order (I10 + PLAN §5.3).
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             {
                 let mut journal = rt.journal.as_ref().unwrap().lock();
                 journal.poll_acks();
-                if journal.core.journal_seq() >= 2 {
+                if journal.core.journal_seq() >= 3 {
                     break;
                 }
             }
@@ -1457,18 +1526,119 @@ mod tests {
         .unwrap();
         assert_eq!(
             outcome.records.len(),
-            2,
-            "OutputClosed and the end fact are journaled once each"
+            3,
+            "OutputClosed, checkpoint and the end fact are journaled once each"
         );
         let (close_code, ..) =
             journal::decode_lifecycle_payload(&outcome.records[0].payload).unwrap();
         assert_eq!(close_code, LifecycleCode::OutputClosed);
-        let record = &outcome.records[1];
+        assert_eq!(outcome.records[1].kind, journal::RecordKind::CheckpointRef);
+        journal::decode_checkpoint(&outcome.records[1].payload).expect("valid checkpoint");
+        let record = &outcome.records[2];
         assert_eq!(record.kind, journal::RecordKind::Lifecycle);
         let (code, exit_code, detail) = journal::decode_lifecycle_payload(&record.payload).unwrap();
         assert_eq!(code, LifecycleCode::Killed);
         assert_eq!(exit_code, Some(-9));
         assert!(detail.contains("killed"), "unexpected detail: {detail}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5.3: a checkpoint's restore program repaints equivalent state —
+    /// scrollback, screen text, and cursor — into a fresh engine.
+    #[test]
+    fn checkpoint_program_repaints_equivalent_state() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // Fill scrollback and leave styled text plus a cursor position.
+        let mut stream = Vec::new();
+        for i in 1..=30 {
+            stream.extend_from_slice(format!("history line {i:02}\r\n").as_bytes());
+        }
+        stream.extend_from_slice(b"\x1b[1;31mred screen text\x1b[0m");
+        rt.feed_engine(&stream);
+        let expected_screen = rt.engine.screen_lines();
+        let expected_history_len = rt.engine.history_size();
+        assert!(expected_history_len > 0, "content must have scrolled off");
+
+        rt.close_output_stream("pty output closed (eof)".to_string());
+
+        // Drain until the checkpoint is durable.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.request_sync();
+                journal.poll_acks();
+                if journal.core.durable_seq() >= 2 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "journal ack timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let outcome = journal::scan_segment(
+            &dir.join(journal::JOURNAL_DIR_NAME)
+                .join("seg-00000001-0001.ojrn"),
+        )
+        .unwrap();
+        let checkpoint_record = outcome
+            .records
+            .iter()
+            .find(|record| record.kind == journal::RecordKind::CheckpointRef)
+            .expect("checkpoint journaled at stream close");
+        let checkpoint = journal::decode_checkpoint(&checkpoint_record.payload).unwrap();
+
+        // Replay the restore program into a fresh engine of the recorded
+        // geometry: the result must match the source engine's state.
+        let mut restored = crate::terminal::Terminal::new(
+            checkpoint.rows,
+            checkpoint.cols,
+            rt.screen_scrollback_rows,
+        );
+        restored.feed(&checkpoint.program);
+        assert_eq!(restored.screen_lines(), expected_screen);
+        assert_eq!(restored.history_size(), expected_history_len);
+        assert_eq!(restored.cursor_position(), rt.engine.cursor_position());
+        let expected_modes = rt.engine.modes();
+        let restored_modes = restored.modes();
+        assert_eq!(restored_modes.alt_screen, expected_modes.alt_screen);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The byte-cadence checkpoint fires once the journaled raw output
+    /// crosses the configured interval, and not before.
+    #[test]
+    fn checkpoint_cadence_follows_journaled_bytes() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // Below the interval: nothing.
+        rt.raw_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES - 1;
+        rt.journal_checkpoint_if_due();
+        // Crossing the interval: a checkpoint is sequenced.
+        rt.raw_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES;
+        rt.journal_checkpoint_if_due();
+        assert_eq!(rt.last_journal_checkpoint_raw, rt.raw_total_bytes);
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(1));
+        }
+        // And not again until another interval passes.
+        rt.raw_total_bytes += 1;
+        rt.journal_checkpoint_if_due();
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(1));
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2207,6 +2377,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             pending_journal_completion: None,
+            last_journal_checkpoint_raw: 0,
             journaled_modes: None,
             notifications_enabled: true,
             journal: None,

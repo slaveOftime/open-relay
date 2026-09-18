@@ -191,6 +191,15 @@ impl Terminal {
     }
 
     /// Cursor position as (row, column), zero-based, visible screen.
+    /// Current geometry as (rows, cols).
+    pub fn size(&self) -> (u16, u16) {
+        (
+            self.term.grid().screen_lines().max(1) as u16,
+            self.term.grid().columns().max(1) as u16,
+        )
+    }
+
+    /// Current cursor as 1-based (row, col).
     pub fn cursor_position(&self) -> (u16, u16) {
         let point = self.term.grid().cursor.point;
         (
