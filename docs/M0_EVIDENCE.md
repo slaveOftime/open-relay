@@ -291,3 +291,27 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
       repros still gate their milestones). ADR-0001 direction accepted
       (Alacritty candidate), final selection awaits the M2 checkpoint
       prototype. ADR-0004/0005 remain Proposed pending M3/M4 prototypes.
+
+## M1 corrective increment (post-review)
+
+The first M1 review (after `005694d`) found the exit criteria **not met**:
+six blocking correctness findings and two goal-drift items. The corrective
+increment landed as five commits on `feature/poc`:
+
+| Commit | Fix | Review finding addressed |
+|---|---|---|
+| `e4a4486` | Absolute sync deadline (continuous producers cannot starve durability), shutdown final barrier, degradation = hard publication stop (bounded memory after failure), O(1)-memory stats recovery scan, incarnation first-seq enforcement | Unbounded cache growth after degradation; sync starvation under continuous output; unbounded recovery memory |
+| `a87ad1a` | I10 ordered ending: completion parked until the output stream closes (`OutputClosed` lifecycle record), terminal-end persistence barrier, idle ack polling | Completion could be journaled before final output |
+| `dcb572f` | Bounded segment parts with continuous sequences, sparse-index tail seeks, cross-part range/history reads, cursor-beyond-tail loudness, newest-part-first retention with contiguous-part validation | Unbounded tail reads / O(history) recovery; silent cursor slide past the recovered tail; retention primitive violated its own ADR |
+| `232246f` | Raw-source journaling (exact PTY bytes, pre-filter) + Policy records for terminal-mode revisions | Journal replay could miss data the scan pipeline dropped; mode transitions invisible to replay |
+| `7cdb87a` | `SequencedChunk`: live broadcast tagged with journal cursors, sent in the sequencing write-lock section | Live stream and journal order were unverifiable against each other |
+
+Post-increment gate: 541 unit tests passed, 17 ignored, clippy baseline
+unchanged (80), all four release probes green — including the extended
+shadow probe asserting broadcast cursors strictly increase and name real
+journaled output records.
+
+Still open (tracked in PLAN.md): checkpoint-gated retention (M2, with
+checkpoint records), deep validation of sealed parts (M3 manifests),
+journal-becomes-canonical and `output.log` retirement (M3), real
+backpressure replacing permanent degradation on transient queue-full (M3).

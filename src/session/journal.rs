@@ -1,10 +1,21 @@
 //! Segmented session journal: typed, checksummed records with stable
-//! sequence numbers (PLAN.md §6.1, invariants I1/I3/I8).
+//! sequence numbers (PLAN.md §6.1, invariants I1/I3/I8/I10).
 //!
-//! This module is M1 groundwork: it implements the record format, segment
-//! writer/reader and torn-tail recovery. Nothing wires it into the live
-//! session pipeline yet — `output.log` remains the canonical store until the
-//! sequencer lands and the attach path reads exact committed ranges.
+//! M1 wires this as a **shadow journal** (dev-gated by `OLY_JOURNAL`):
+//! every raw PTY chunk, resize, mode revision (Policy) and lifecycle fact
+//! is sequenced under the session write lock and appended by a dedicated
+//! thread with a group-sync cadence. `output.log` remains the canonical
+//! store until M3.
+//!
+//! One incarnation spans bounded parts (`seg-NNNNNNNN-PPPP.ojrn`) with a
+//! continuous sequence — cursors never name parts. Only the newest part
+//! can be torn by a crash, so recovery scans just it (O(part) stats scan,
+//! never O(history), never buffering the recording). Tail reads select
+//! sealed parts newest-first and sparse-seek (1 MiB stride) into the
+//! oldest selected part, bounding memory and work by the budget, not by
+//! total history. Reads validate cross-part continuity, fail loudly on
+//! cursors past the recovered tail (incomplete capture), and never see a
+//! hole from concurrent retention (newest-part-first deletion).
 //!
 //! Format (all integers little-endian):
 //!
