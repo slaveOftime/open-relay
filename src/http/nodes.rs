@@ -143,8 +143,23 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     }
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
+    // Keepalive (M5-3): protocol-level pings detect a silently dead
+    // connection; any inbound frame (tungstenite auto-pongs included)
+    // resets the liveness clock. Without this a half-open TCP connection
+    // would leave proxied callers hanging until the next write fails.
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_inbound = std::time::Instant::now();
     let disconnect_reason = loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if last_inbound.elapsed() > std::time::Duration::from_secs(45) {
+                    break "node keepalive timeout (no inbound frames for 45s)".to_string();
+                }
+                if let Err(err) = ws_tx.send(Message::Ping(Vec::new().into())).await {
+                    break format!("failed to ping node WebSocket: {err}");
+                }
+            }
             // Outgoing: channel → WS
             msg = send_rx.recv() => {
                 let Some(ws_msg) = msg else {
@@ -158,6 +173,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(frame)) => {
+                        last_inbound = std::time::Instant::now();
                         let message = match frame {
                             Message::Close(frame) => {
                                 break close_frame_disconnect_reason(frame);
