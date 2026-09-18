@@ -18,8 +18,9 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Line;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode, test::TermSize};
-use alacritty_terminal::vte::ansi::Processor;
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
 /// Events the engine raised while feeding one chunk, in stream order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,11 +45,37 @@ pub struct EngineModes {
     pub alt_screen: bool,
 }
 
+/// The colours the engine reports for `OSC 10 ; ?` / `OSC 11 ; ?` probes.
+///
+/// Defaults to the conservative white-on-black pair the pre-engine daemon
+/// answered with; the daemon overrides it from the environment (COLORFGBG)
+/// at session spawn. Palette-index colour queries (`OSC 4 ; .. ; ?`) stay
+/// unanswered, matching the pre-engine behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportColors {
+    pub foreground: Rgb,
+    pub background: Rgb,
+}
+
+impl Default for ReportColors {
+    fn default() -> Self {
+        Self {
+            foreground: Rgb {
+                r: 0xff,
+                g: 0xff,
+                b: 0xff,
+            },
+            background: Rgb { r: 0, g: 0, b: 0 },
+        }
+    }
+}
+
 /// Listener handed to `Term`; events fired during `advance` are queued and
 /// drained by the adapter after the feed returns.
 #[derive(Clone, Default)]
 struct QueueListener {
     events: Arc<Mutex<VecDeque<EngineEvent>>>,
+    colors: Arc<Mutex<ReportColors>>,
 }
 
 impl EventListener for QueueListener {
@@ -58,10 +85,25 @@ impl EventListener for QueueListener {
             Event::Title(title) => Some(EngineEvent::Title(Some(title))),
             Event::ResetTitle => Some(EngineEvent::Title(None)),
             Event::Bell => Some(EngineEvent::Bell),
-            // ClipboardLoad / ColorRequest / TextAreaSizeRequest are
-            // permission-gated queries (PLAN.md §5.4): the M2 query policy
-            // decides what may be answered; until then they stay
-            // unanswered, exactly like a terminal with the feature off.
+            Event::ColorRequest(index, formatter) => {
+                // Foreground/background probes are answered with the
+                // daemon's configured colours; the engine formats the reply
+                // with the query's own terminator, and the event fires while
+                // the chunk is consumed, so the reply lands at the query's
+                // exact stream position — interleaved correctly with DA/CPR
+                // replies (PLAN.md §5.1/I5).
+                let colors = *self.colors.lock().expect("report colors poisoned");
+                let color = match index {
+                    i if i == NamedColor::Foreground as usize => Some(colors.foreground),
+                    i if i == NamedColor::Background as usize => Some(colors.background),
+                    // Palette-index queries stay unanswered, as pre-M2.
+                    _ => None,
+                };
+                color.map(|c| EngineEvent::Respond(formatter(c).into_bytes()))
+            }
+            // ClipboardLoad / TextAreaSizeRequest are permission-gated
+            // queries (PLAN.md §5.4): they stay unanswered, exactly like a
+            // terminal with the feature off.
             _ => None,
         };
         if let Some(event) = mapped {
@@ -80,6 +122,7 @@ pub struct Terminal {
     term: Term<QueueListener>,
     processor: Processor,
     listener: QueueListener,
+    report_colors: Arc<Mutex<ReportColors>>,
 }
 
 // Methods not yet consumed outside tests are consumed by the M2-2
@@ -92,7 +135,11 @@ impl Terminal {
             scrolling_history: scrollback,
             ..Config::default()
         };
-        let listener = QueueListener::default();
+        let report_colors = Arc::new(Mutex::new(ReportColors::default()));
+        let listener = QueueListener {
+            colors: report_colors.clone(),
+            ..QueueListener::default()
+        };
         Self {
             term: Term::new(
                 config,
@@ -101,7 +148,13 @@ impl Terminal {
             ),
             processor: Processor::new(),
             listener,
+            report_colors,
         }
+    }
+
+    /// Set the colours reported for `OSC 10 ; ?` / `OSC 11 ; ?` probes.
+    pub fn set_report_colors(&mut self, colors: ReportColors) {
+        *self.report_colors.lock().expect("report colors poisoned") = colors;
     }
 
     /// Advance the terminal over one raw PTY chunk. Query responses and
@@ -178,6 +231,183 @@ impl Terminal {
     /// Number of retained scrollback lines.
     pub fn history_size(&self) -> usize {
         self.term.grid().history_size()
+    }
+
+    /// Styled visible rows (SGR-encoded, trailing blanks trimmed), top to
+    /// bottom. This is the renderer restore adapter's row source: engine
+    /// state rendered into a plain xterm-compatible byte stream.
+    pub fn styled_screen_rows(&self) -> Vec<Vec<u8>> {
+        let grid = self.term.grid();
+        (0..grid.screen_lines())
+            .map(|line| styled_row(&grid[Line(line as i32)]))
+            .collect()
+    }
+
+    /// Styled scrollback rows (oldest first, newest last), limited to the
+    /// newest `tail` retained rows. Excludes the visible screen.
+    pub fn styled_history_rows(&self, tail: usize) -> Vec<Vec<u8>> {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let start = history.saturating_sub(tail);
+        (start..history)
+            .map(|h| styled_row(&grid[Line(-(history as i32) + h as i32)]))
+            .collect()
+    }
+
+    /// Renderer restoration stream (ADR-0001 #4): a fresh xterm-compatible
+    /// parser fed these bytes displays the current visible screen — clear,
+    /// styled rows, SGR reset, cursor position and visibility. Deliberately
+    /// a *renderer* artifact, not an engine checkpoint: parser fragments,
+    /// wrap-pending and mode stacks are not encoded (the M3 checkpoint
+    /// covers exact continuation).
+    pub fn snapshot_stream(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Home + erase below (and the scrollback purge): the attaching
+        // client's current screen is replaced, not appended to.
+        out.extend_from_slice(b"\x1b[H\x1b[2J");
+        let rows = self.styled_screen_rows();
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(row);
+        }
+        out.extend_from_slice(b"\x1b[0m");
+        let (row, col) = self.cursor_position();
+        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        out.extend_from_slice(if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            b"\x1b[?25h"
+        } else {
+            b"\x1b[?25l"
+        });
+        out
+    }
+}
+
+/// SGR-encode one grid row: runs of cells with identical rendition become
+/// one SGR sequence plus text; trailing unwritten cells are trimmed and
+/// wide-char spacers are elided (their leading cell already emitted the
+/// glyph).
+fn styled_row(row: &alacritty_terminal::grid::Row<Cell>) -> Vec<u8> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Rendition {
+        fg: Color,
+        bg: Color,
+        attrs: Flags,
+    }
+
+    const ATTRS: Flags = Flags::from_bits_retain(
+        Flags::BOLD.bits()
+            | Flags::DIM.bits()
+            | Flags::ITALIC.bits()
+            | Flags::UNDERLINE.bits()
+            | Flags::INVERSE.bits()
+            | Flags::STRIKEOUT.bits()
+            | Flags::HIDDEN.bits(),
+    );
+
+    let default = Rendition {
+        fg: Color::Named(NamedColor::Foreground),
+        bg: Color::Named(NamedColor::Background),
+        attrs: Flags::empty(),
+    };
+    let mut out = Vec::new();
+    // Rows are concatenated after a reset, so the parser starts each row in
+    // the default rendition; default runs emit no SGR at all.
+    let mut current = Some(default);
+    // End of the last cell that carries visible content; trailing
+    // default-rendition blanks are padding and are trimmed off.
+    let mut content_end = 0;
+    let mut reset_needed_at_end = false;
+    for cell in row.into_iter() {
+        if cell
+            .flags
+            .contains(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            continue;
+        }
+        let next = Rendition {
+            fg: cell.fg,
+            bg: cell.bg,
+            attrs: cell.flags & ATTRS,
+        };
+        if current != Some(next) {
+            write_sgr(&mut out, next.fg, next.bg, next.attrs);
+            current = Some(next);
+        }
+        out.extend_from_slice(cell.c.encode_utf8(&mut [0u8; 4]).as_bytes());
+        let visible_blank = cell.c == ' '
+            && next.bg == Color::Named(NamedColor::Background)
+            && next.attrs.is_empty();
+        if !visible_blank {
+            content_end = out.len();
+            reset_needed_at_end = current != Some(default);
+        }
+    }
+    out.truncate(content_end);
+    // Never emit trailing SGR state: a plain reset closes the row.
+    if reset_needed_at_end {
+        out.extend_from_slice(b"\x1b[0m");
+    }
+    out
+}
+
+fn write_sgr(out: &mut Vec<u8>, fg: Color, bg: Color, attrs: Flags) {
+    let mut codes: Vec<String> = vec!["0".to_string()];
+    if attrs.contains(Flags::BOLD) {
+        codes.push("1".into());
+    }
+    if attrs.contains(Flags::DIM) {
+        codes.push("2".into());
+    }
+    if attrs.contains(Flags::ITALIC) {
+        codes.push("3".into());
+    }
+    if attrs.contains(Flags::UNDERLINE) {
+        codes.push("4".into());
+    }
+    if attrs.contains(Flags::INVERSE) {
+        codes.push("7".into());
+    }
+    if attrs.contains(Flags::HIDDEN) {
+        codes.push("8".into());
+    }
+    if attrs.contains(Flags::STRIKEOUT) {
+        codes.push("9".into());
+    }
+    push_color(&mut codes, fg, false);
+    push_color(&mut codes, bg, true);
+    out.extend_from_slice(format!("\x1b[{}m", codes.join(";")).as_bytes());
+}
+
+fn push_color(codes: &mut Vec<String>, color: Color, background: bool) {
+    let (base, bright_base) = if background { (40, 100) } else { (30, 90) };
+    match color {
+        Color::Spec(rgb) => codes.push(format!(
+            "{};2;{};{};{}",
+            if background { 48 } else { 38 },
+            rgb.r,
+            rgb.g,
+            rgb.b
+        )),
+        Color::Indexed(index) => {
+            codes.push(format!("{};5;{}", if background { 48 } else { 38 }, index))
+        }
+        Color::Named(named) => {
+            let value = named as usize;
+            if value < 8 {
+                codes.push(format!("{}", base + value));
+            } else if value < 16 {
+                codes.push(format!("{}", bright_base + value - 8));
+            } else if (NamedColor::DimBlack as usize..=NamedColor::DimWhite as usize)
+                .contains(&value)
+            {
+                codes.push("2".into());
+                codes.push(format!("{}", base + value - NamedColor::DimBlack as usize));
+            }
+            // Foreground/Background/Cursor (and anything unknown) map to the
+            // terminal default — no code needed after the reset.
+        }
     }
 }
 
@@ -310,6 +540,82 @@ mod tests {
         }
     }
 
+    /// The `Respond` payloads raised by feeding `bytes` in one chunk.
+    fn responses(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut term = Terminal::new(24, 80, 100);
+        term.feed(bytes);
+        term.drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::Respond(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// I5 across query kinds: DA, OSC colour probes, and CPR in one chunk
+    /// are answered in the order they appear in the stream. A colour-detect
+    /// helper that reads replies until the DA sentinel (e.g. termbg /
+    /// terminal-light, used by real TUIs) breaks if the DA reply overtakes
+    /// the colour replies it precedes.
+    #[test]
+    fn mixed_queries_answer_in_stream_order() {
+        let stream = b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b[cA\x1b[6n\x1b[5n";
+        assert_eq!(
+            responses(stream),
+            vec![
+                b"\x1b]10;rgb:ffff/ffff/ffff\x07".to_vec(),
+                b"\x1b]11;rgb:0000/0000/0000\x1b\\".to_vec(),
+                b"\x1b[?6c".to_vec(),
+                b"\x1b[1;2R".to_vec(),
+                b"\x1b[0n".to_vec(),
+            ],
+            "every reply at its own stream position, in stream order"
+        );
+    }
+
+    /// The reported colours are configurable (the daemon derives them from
+    /// the COLORFGBG environment at session spawn).
+    #[test]
+    fn colour_queries_use_configured_report_colors() {
+        let mut term = Terminal::new(24, 80, 100);
+        term.set_report_colors(ReportColors {
+            foreground: Rgb {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+            },
+            background: Rgb {
+                r: 0x44,
+                g: 0x55,
+                b: 0x66,
+            },
+        });
+        term.feed(b"\x1b]10;?\x07\x1b]11;?\x07");
+        let responses: Vec<Vec<u8>> = term
+            .drain_events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::Respond(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            responses,
+            vec![
+                b"\x1b]10;rgb:1111/2222/3333\x07".to_vec(),
+                b"\x1b]11;rgb:4444/5555/6666\x07".to_vec(),
+            ]
+        );
+    }
+
+    /// Palette-index colour queries stay unanswered (pre-M2 parity): the
+    /// session only ever answered foreground/background probes.
+    #[test]
+    fn palette_colour_queries_stay_unanswered() {
+        assert!(responses(b"\x1b]4;1;?\x07").is_empty());
+    }
+
     /// The engine-level fix for PLAN.md I5 / the ignored
     /// `repro_queries_are_answered_at_their_own_stream_position`: each
     /// query is answered at its own stream position, by construction —
@@ -391,6 +697,54 @@ mod tests {
                 EngineEvent::Bell,
             ]
         );
+    }
+
+    #[test]
+    fn snapshot_stream_restores_screen_in_a_fresh_parser() {
+        let mut term = Terminal::new(6, 40, 100);
+        term.feed(b"plain\r\n\x1b[1;31mred bold\x1b[0m\r\n\x1b[?25lhidden cursor");
+
+        // A fresh xterm-ish client (vt100 as the oracle renderer) fed the
+        // snapshot must show the same visible text.
+        let snapshot = term.snapshot_stream();
+        let mut client = vt100::Parser::new(6, 40, 0);
+        client.process(&snapshot);
+        let restored: Vec<String> = client
+            .screen()
+            .contents()
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        assert_eq!(
+            trim_blank_edges(restored),
+            trim_blank_edges(term.screen_lines()),
+            "snapshot restores the visible text"
+        );
+        // Styling is encoded and cursor state restored.
+        let text = String::from_utf8_lossy(&snapshot);
+        assert!(text.contains("\x1b[0;1;31m"), "bold red run: {text:?}");
+        assert!(text.ends_with("\x1b[?25l"), "cursor hidden: {text:?}");
+        assert_eq!(
+            client.screen().cursor_position(),
+            term.cursor_position(),
+            "cursor lands at the engine position"
+        );
+    }
+
+    #[test]
+    fn styled_history_rows_returns_newest_tail_only() {
+        let mut term = Terminal::new(3, 20, 100);
+        let stream: Vec<u8> = (0..10)
+            .map(|i| format!("row {i:02}\r\n"))
+            .collect::<String>()
+            .into_bytes();
+        term.feed(&stream);
+        let tail = term.styled_history_rows(3);
+        let text: Vec<String> = tail
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect();
+        assert_eq!(text, vec!["row 05", "row 06", "row 07"]);
     }
 
     #[test]

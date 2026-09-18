@@ -51,10 +51,10 @@ pub(super) fn make_runtime(
     };
 
     let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
-    let mut screen_parser =
-        vt100::Parser::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS);
+    let mut engine =
+        crate::terminal::Terminal::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS);
     if !excerpt.is_empty() {
-        screen_parser.process(excerpt.as_bytes());
+        engine.feed(excerpt.as_bytes());
     }
 
     let (broadcast_tx, _rx) = broadcast::channel(4);
@@ -85,7 +85,7 @@ pub(super) fn make_runtime(
         attach_count: 0,
         last_notified_at: None,
         notified_output_epoch: None,
-        screen_parser,
+        engine,
         screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         terminal_signals: Default::default(),
         title_user_set: false,
@@ -225,7 +225,11 @@ pub(super) fn make_runtime_writable_with_capacity(
         attach_count: 0,
         last_notified_at: None,
         notified_output_epoch: None,
-        screen_parser: vt100::Parser::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS),
+        engine: crate::terminal::Terminal::new(
+            24,
+            80,
+            crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
+        ),
         screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         terminal_signals: Default::default(),
         title_user_set: false,

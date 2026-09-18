@@ -265,9 +265,8 @@ mod tests {
         );
         {
             let mut rt = runtime.write();
-            rt.screen_parser = vt100::Parser::new(24, 80, 0);
-            rt.screen_parser
-                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
         }
         let store = store_with(vec![runtime], make_test_db().await);
 
@@ -311,9 +310,8 @@ mod tests {
         );
         {
             let mut rt = runtime.write();
-            rt.screen_parser = vt100::Parser::new(24, 80, 0);
-            rt.screen_parser
-                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
         }
         let store = store_with(vec![runtime], make_test_db().await);
 
@@ -344,9 +342,8 @@ mod tests {
         );
         {
             let mut rt = runtime.write();
-            rt.screen_parser = vt100::Parser::new(24, 80, 0);
-            rt.screen_parser
-                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
         }
         let store = store_with(vec![runtime], make_test_db().await);
 

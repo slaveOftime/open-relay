@@ -45,13 +45,33 @@ pub fn render_log_file(
     ))
 }
 
-pub fn render_screen(
-    parser: &vt100::Parser,
+/// Render the live session engine's visible screen with the same
+/// content-bounded, tail-limited semantics as [`render_screen`]. Plain
+/// rows are truncated to `term_cols` characters; styled rows keep the
+/// session's PTY width so an SGR sequence is never split.
+pub fn render_engine_screen(
+    engine: &crate::terminal::Terminal,
     tail: usize,
     keep_color: bool,
     term_cols: u16,
 ) -> Vec<u8> {
-    let content_rows = collect_rows(parser.screen(), keep_color, term_cols);
+    let content_rows: Vec<Vec<u8>> = if keep_color {
+        engine.styled_screen_rows()
+    } else {
+        engine
+            .screen_lines()
+            .into_iter()
+            .map(|row| truncate_chars(&row, usize::from(term_cols)).into_bytes())
+            .collect()
+    };
+    finish_rows_for_display(content_rows, tail, keep_color)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn finish_rows_for_display(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: bool) -> Vec<u8> {
     let rows = if let Some((first, last)) = content_bounds(&content_rows) {
         let visible_rows = &content_rows[first..=last];
         let skip = visible_rows.len().saturating_sub(tail);
@@ -62,34 +82,13 @@ pub fn render_screen(
     format_rows_for_output(&rows, keep_color)
 }
 
-/// Render up to `tail` of the parser's retained scrollback rows as formatted
-/// `\n`-terminated lines, for seeding a freshly attached terminal's
-/// scrollback.  Only scrolled-off rows are included: the visible screen is
-/// covered by the attach snapshot, so seeding it would duplicate content in
-/// the client's scrollback.  Rows keep the session's PTY width so the
-/// attaching terminal wraps them natively.  Returns `None` when nothing has
-/// scrolled off yet.
-///
-/// Only the last `tail` rows are collected and formatted (see
-/// [`crate::session::screen::scrollback_rows_tail`]), so a deep seed stays
-/// cheap even when the parser retains its full scrollback capacity.
-pub fn render_screen_history(screen: &vt100::Screen, tail: usize) -> Option<Vec<u8>> {
-    let rows = crate::session::screen::scrollback_rows_tail(screen, tail, u16::MAX);
-    // Trim surrounding blank rows so padding (e.g. blank rows scrolled off by
-    // empty prompts) does not crowd out content rows in the seed.
+/// Shared scrollback-seed formatting (engine or vt100 rows): trim
+/// surrounding blank rows so padding (e.g. blank rows scrolled off by
+/// empty prompts) does not crowd out content rows, keep colour, join as
+/// `\n`-terminated lines. `None` when nothing has scrolled off yet.
+pub fn format_history_rows(rows: Vec<Vec<u8>>) -> Option<Vec<u8>> {
     let (first, last) = content_bounds(&rows)?;
     Some(format_rows_for_output(&rows[first..=last], true))
-}
-
-fn collect_rows(screen: &vt100::Screen, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
-    if keep_color {
-        screen.rows_formatted(0, term_cols).collect()
-    } else {
-        screen
-            .rows(0, term_cols)
-            .map(|row| row.into_bytes())
-            .collect()
-    }
 }
 
 /// Parse raw log bytes through a virtual terminal and collect

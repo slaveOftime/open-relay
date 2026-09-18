@@ -11,8 +11,8 @@ use super::index::{
     split_persisted_log_records, split_rendered_log_output, sync_persisted_log_index,
 };
 use super::render::{
-    parser_cols, parser_rows, render_log_bytes, render_log_file, render_screen,
-    render_screen_history,
+    format_history_rows, parser_cols, parser_rows, render_engine_screen, render_log_bytes,
+    render_log_file,
 };
 use super::{ViewportReplayPlan, ViewportSize};
 use crate::protocol::LogResize;
@@ -144,10 +144,10 @@ fn keeps_visible_rows_below_cursor() {
 
 #[test]
 fn render_screen_respects_tail_limit() {
-    let mut parser = vt100::Parser::new(4, 80, 0);
-    parser.process(b"\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour");
+    let mut engine = crate::terminal::Terminal::new(4, 80, 0);
+    engine.feed(b"\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour");
 
-    let output = render_screen(&parser, 2, false, 80);
+    let output = render_engine_screen(&engine, 2, false, 80);
 
     assert_eq!(String::from_utf8_lossy(&output), "three\nfour\n");
 }
@@ -450,10 +450,10 @@ fn read_persisted_log_total_counts_indexed_records() {
 
 #[test]
 fn screen_history_renders_scrolled_off_rows_only() {
-    let mut parser = vt100::Parser::new(3, 80, 100);
-    parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+    let mut engine = crate::terminal::Terminal::new(3, 80, 100);
+    engine.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
 
-    let output = render_screen_history(parser.screen(), 200).expect("has content");
+    let output = format_history_rows(engine.styled_history_rows(200)).expect("has content");
     let text = String::from_utf8_lossy(&output);
     for row in ["one", "two", "three"] {
         assert!(text.contains(row), "missing row {row} in {text:?}");
@@ -466,14 +466,14 @@ fn screen_history_renders_scrolled_off_rows_only() {
 #[test]
 fn screen_history_respects_tail_limit() {
     // 10 lines on a 3-row screen: scrollback holds rows 1-8.
-    let mut parser = vt100::Parser::new(3, 80, 100);
+    let mut engine = crate::terminal::Terminal::new(3, 80, 100);
     let mut lines = String::new();
     for i in 1..=10 {
         lines.push_str(&format!("row {i:02}\r\n"));
     }
-    parser.process(lines.as_bytes());
+    engine.feed(lines.as_bytes());
 
-    let output = render_screen_history(parser.screen(), 3).expect("has content");
+    let output = format_history_rows(engine.styled_history_rows(3)).expect("has content");
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("row 05"));
     assert!(text.contains("row 06"));
@@ -483,13 +483,13 @@ fn screen_history_respects_tail_limit() {
 
 #[test]
 fn screen_history_is_none_without_content() {
-    let parser = vt100::Parser::new(3, 80, 100);
-    assert!(render_screen_history(parser.screen(), 10).is_none());
+    let engine = crate::terminal::Terminal::new(3, 80, 100);
+    assert!(format_history_rows(engine.styled_history_rows(10)).is_none());
 }
 
 #[test]
 fn screen_history_is_none_when_nothing_scrolled_off() {
-    let mut parser = vt100::Parser::new(5, 80, 100);
-    parser.process(b"still visible\r\n");
-    assert!(render_screen_history(parser.screen(), 10).is_none());
+    let mut engine = crate::terminal::Terminal::new(5, 80, 100);
+    engine.feed(b"still visible\r\n");
+    assert!(format_history_rows(engine.styled_history_rows(10)).is_none());
 }

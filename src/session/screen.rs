@@ -242,28 +242,28 @@ mod tests {
         );
     }
 
-    /// M0 reproduction (PLAN.md §5.3/§6.4): `safe_resize_parser` re-feeds
-    /// scrollback rows trimmed to `min(old_cols, new_cols)`, so shrinking
-    /// permanently destroys the right-hand side of retained history — it
-    /// does not come back when the terminal is widened again. The 1.0
-    /// terminal engine must preserve logical lines across resize; this test
-    /// pins that behaviour and stays ignored until it lands.
+    /// M0 reproduction (PLAN.md §5.3/§6.4), now fixed: vt100's
+    /// `safe_resize_parser` re-fed scrollback rows trimmed to
+    /// `min(old_cols, new_cols)`, permanently destroying history right of
+    /// the shrunken width. The daemon's session state now lives in the
+    /// alacritty engine (M2, ADR-0001) whose native reflow preserves
+    /// logical lines; this test drives the same scenario through the
+    /// engine and must keep passing. (`safe_resize_parser` survives only
+    /// in the client-side preview renderer until M3 retires it.)
     #[test]
-    #[ignore = "M0 reproduction (PLAN §5.3): shrink-then-widen loses history text; fixed by the M2 terminal engine"]
     fn repro_shrink_then_widen_preserves_history() {
-        let mut parser = vt100::Parser::new(6, 80, TEST_SCROLLBACK_ROWS);
+        let mut engine = crate::terminal::Terminal::new(6, 80, TEST_SCROLLBACK_ROWS);
         let mut lines = String::new();
         for i in 1..=20 {
-            // Marker at column 70+ so a 40-column trim cuts it off.
+            // Marker at column 70+ so a 40-column trim would cut it off.
             lines.push_str(&format!("line {i:02}{}MARKER{i:02}\r\n", "y".repeat(62)));
         }
-        parser.process(lines.as_bytes());
+        engine.feed(lines.as_bytes());
 
-        safe_resize_parser(&mut parser, 6, 40, TEST_SCROLLBACK_ROWS);
-        safe_resize_parser(&mut parser, 6, 80, TEST_SCROLLBACK_ROWS);
+        engine.resize(6, 40);
+        engine.resize(6, 80);
 
-        let dump = scrollback_dump(parser.screen(), 80);
-        let history = String::from_utf8_lossy(&dump);
+        let history = engine.full_lines().join("\n");
         assert!(
             history.contains("MARKER01"),
             "history text beyond the shrunken width must survive a shrink/widen cycle: {history:?}"

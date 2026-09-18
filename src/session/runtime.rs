@@ -33,8 +33,8 @@ use super::scan::{PtyScanner, ScanOut};
 use super::{
     MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus,
     persist::{OutputLog, append_event, append_resize_event},
-    screen::safe_resize_parser,
 };
+use crate::terminal::{EngineEvent, Terminal};
 
 // ---------------------------------------------------------------------------
 // SessionRuntime
@@ -135,7 +135,10 @@ pub struct SessionRuntime {
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
     /// Live rendered terminal state for attach snapshot restoration.
-    pub screen_parser: vt100::Parser,
+    /// The session's terminal engine (ADR-0001): fed the exact raw PTY
+    /// stream inside the write lock, it owns screen state, modes, reflow
+    /// resize and exact-position query responses.
+    pub engine: Terminal,
     /// How many scrolled-off rows `screen_parser` retains; applied at spawn
     /// and on every resize rebuild.  From `AppConfig::screen_scrollback_rows`.
     pub screen_scrollback_rows: usize,
@@ -189,11 +192,32 @@ const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 impl SessionRuntime {
     /// Current terminal mode snapshot (DECCKM, bracketed paste).
     pub fn mode_snapshot(&self) -> ModeSnapshot {
-        let screen = self.screen_parser.screen();
+        let modes = self.engine.modes();
         ModeSnapshot {
-            app_cursor_keys: screen.application_cursor(),
-            bracketed_paste_mode: screen.bracketed_paste(),
+            app_cursor_keys: modes.app_cursor_keys,
+            bracketed_paste_mode: modes.bracketed_paste,
         }
+    }
+
+    /// Feed one raw PTY chunk to the terminal engine and return the query
+    /// responses it generated — each produced at the query's exact stream
+    /// position while the chunk advanced (PLAN.md I5). Title/bell events
+    /// stay on the scanner's signal path; the engine's duplicates are
+    /// drained and ignored there.
+    ///
+    /// Must be called under the same write-lock section that journals the
+    /// chunk so engine state, journal and broadcast never disagree.
+    pub fn feed_engine(&mut self, raw: &[u8]) -> Vec<Vec<u8>> {
+        self.engine.feed(raw);
+        let mut responses = Vec::new();
+        for event in self.engine.drain_events() {
+            match event {
+                EngineEvent::Respond(bytes) => responses.push(bytes),
+                EngineEvent::Title(_) | EngineEvent::Bell => {}
+            }
+        }
+        self.shared_modes.store(self.mode_snapshot());
+        responses
     }
 
     /// Push a filtered PTY chunk into the canonical retained stream.
@@ -202,22 +226,19 @@ impl SessionRuntime {
     /// user can see, as measured by the reader thread's scanner during the same
     /// pass that produced `filtered_data`.
     ///
-    /// Returns the current cursor position so the caller can answer terminal
-    /// queries without re-locking.
-    pub fn push_output(&mut self, filtered_data: &[u8], meaningful_len: usize) -> (u16, u16) {
+    /// Screen state is *not* advanced here: the engine is fed the raw chunk
+    /// separately via [`SessionRuntime::feed_engine`], so queries stripped
+    /// from the display stream still get answered at their exact position.
+    pub fn push_output(&mut self, filtered_data: &[u8], meaningful_len: usize) {
         if !filtered_data.is_empty() {
             self.raw_total_bytes = self
                 .raw_total_bytes
                 .saturating_add(filtered_data.len() as u64);
-            self.screen_parser.process(filtered_data);
             if meaningful_len > 0 {
                 self.last_total_bytes = self.last_total_bytes.saturating_add(meaningful_len as u64);
                 self.last_output_epoch = Some(Instant::now());
             }
-            self.shared_modes.store(self.mode_snapshot());
         }
-
-        self.screen_parser.screen().cursor_position()
     }
 
     /// The output epoch used for silence/notification bookkeeping.
@@ -348,16 +369,17 @@ impl SessionRuntime {
     }
 
     /// Bytes that restore the session's visible terminal state on a freshly
-    /// attached client: the rendered screen plus the window/icon title and
-    /// progress notifications the terminal parser does not model.
+    /// attached client: the engine-rendered screen (renderer restore
+    /// adapter, ADR-0001 #4) plus the window/icon title and progress
+    /// notifications the renderer stream does not model.
     pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
-        let mut snapshot = self.screen_parser.screen().state_formatted();
+        let mut snapshot = self.engine.snapshot_stream();
         snapshot.extend_from_slice(&self.terminal_signals.restore_bytes());
         snapshot
     }
 
     pub fn render_logs(&self, tail: usize, keep_color: bool, term_cols: u16) -> Vec<u8> {
-        super::logs::render_screen(&self.screen_parser, tail, keep_color, term_cols)
+        super::logs::render_engine_screen(&self.engine, tail, keep_color, term_cols)
     }
 
     pub fn register_attach_client(&mut self) {
@@ -678,12 +700,9 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
-            safe_resize_parser(
-                &mut self.screen_parser,
-                rows,
-                cols,
-                self.screen_scrollback_rows,
-            );
+            // Native reflow: logical lines survive shrink/widen cycles
+            // (PLAN.md §5.3); no trimmed-row rebuild anymore.
+            self.engine.resize(rows, cols);
             self.resize_history.push(LogResize {
                 offset: self.raw_total_bytes,
                 rows,
@@ -913,7 +932,23 @@ pub fn spawn_session(
         attach_count: 0,
         notified_output_epoch: None,
         last_notified_at: None,
-        screen_parser: vt100::Parser::new(rows, cols, screen_scrollback_rows),
+        engine: {
+            let mut engine = Terminal::new(rows, cols, screen_scrollback_rows);
+            let (foreground, background) = super::pty::terminal_report_rgb();
+            engine.set_report_colors(crate::terminal::ReportColors {
+                foreground: alacritty_terminal::vte::ansi::Rgb {
+                    r: foreground.0,
+                    g: foreground.1,
+                    b: foreground.2,
+                },
+                background: alacritty_terminal::vte::ansi::Rgb {
+                    r: background.0,
+                    g: background.1,
+                    b: background.2,
+                },
+            });
+            engine
+        },
         screen_scrollback_rows,
         terminal_signals: TerminalSignals::default(),
         // A title present at creation was chosen by the caller, so terminal
@@ -971,27 +1006,33 @@ pub fn spawn_session(
                     let changed_signals = scanner.take_changed_signals();
 
                     // Single write lock: journal the raw PTY bytes, advance
-                    // the rendered screen and the stream counters, publish
-                    // any changed notifications (and adopt a terminal-emitted
-                    // title while the session has no user-chosen one), and
-                    // read back the cursor position for query replies.
-                    let (cursor_position, meta_update, chunk_cursor) = {
+                    // the terminal engine on the same raw stream (query
+                    // responses come back generated at their exact stream
+                    // positions), advance the stream counters, and publish
+                    // any changed notifications (adopting a terminal-emitted
+                    // title while the session has no user-chosen one).
+                    let (query_responses, meta_update, chunk_cursor) = {
                         let mut rt = runtime_reader.write();
                         // Journal the exact bytes read from the PTY —
                         // pre-filter — so replay and post-mortems never lose
                         // data the scan pipeline dropped (PLAN.md I4). This
                         // happens even when the filtered chunk is empty.
                         let chunk_cursor = rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
+                        let query_responses = rt.feed_engine(&buf[..n]);
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
                         } else {
                             false
                         };
-                        let cursor = rt.push_output(&filtered, meaningful_len);
+                        rt.push_output(&filtered, meaningful_len);
                         // A mode flip lands immediately after the output
                         // that caused it, in the same order a replay sees.
                         rt.journal_modes_if_changed();
-                        (cursor, meta_changed.then(|| rt.to_summary()), chunk_cursor)
+                        (
+                            query_responses,
+                            meta_changed.then(|| rt.to_summary()),
+                            chunk_cursor,
+                        )
                     };
 
                     // Let live clients know session metadata (title and/or
@@ -1022,26 +1063,31 @@ pub fn spawn_session(
                         );
                     }
 
-                    // Answer the capability probes that have a session-global
-                    // reply (CPR/DSR and the OSC colour queries).
+                    // Position queries (CPR/DSR/DA/DECRQM) were answered by
+                    // the engine at their exact stream positions; only the
+                    // session-global OSC colour queries keep the scanner
+                    // path (their answers are position-independent).
                     let mut writer_closed = false;
-                    for query in scan_out.queries.drain(..) {
-                        let resp = query.response(cursor_position);
+                    for resp in query_responses {
                         trace!(
                             session_id = %reader_session_id,
-                            ?query,
                             bytes = resp.len(),
-                            "responding to detached terminal capability query"
+                            "answering engine terminal query at its stream position"
                         );
                         if writer_tx.blocking_send(resp).is_err() {
                             warn!(
                                 session_id = %reader_session_id,
-                                "failed to queue detached terminal query response because PTY writer closed"
+                                "failed to queue engine query response because PTY writer closed"
                             );
                             writer_closed = true;
                             break;
                         }
                     }
+                    // Every query the scanner stripped (CPR/DSR and the OSC
+                    // colour probes — DA/DECRQM are only observed) was already
+                    // answered by the engine above, in exact stream order; the
+                    // scanner's list only drives the display filtering.
+                    scan_out.queries.clear();
                     if writer_closed {
                         break "pty writer channel closed".to_string();
                     }
@@ -1355,7 +1401,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            screen_parser: vt100::Parser::new(24, 80, 1000),
+            engine: Terminal::new(24, 80, 1000),
             screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
             title_user_set: false,
@@ -1439,9 +1485,10 @@ mod tests {
         rt.journal = Some(parking_lot::Mutex::new(shadow));
 
         // Raw bytes journaled first (as the reader loop does), then the
-        // filtered bytes mutate the screen and the mode revision follows.
+        // engine consumes the raw chunk and the mode revision follows.
         let raw = b"\x1b[?2004h";
         rt.journal_output(Bytes::from_static(raw));
+        rt.feed_engine(raw);
         rt.push_output(raw, raw.len());
         assert!(rt.mode_snapshot().bracketed_paste_mode);
         rt.journal_modes_if_changed();
@@ -1542,8 +1589,9 @@ mod tests {
     }
 
     /// Drive one raw chunk through the reader thread's pipeline: scan it, then
-    /// push the filtered result into the runtime the way the reader does.
-    fn push_scanned(rt: &mut SessionRuntime, raw: &[u8]) -> (u16, u16) {
+    /// Feed a raw chunk into the runtime the way the reader thread does:
+    /// engine on the raw stream, counters on the filtered stream.
+    fn push_scanned(rt: &mut SessionRuntime, raw: &[u8]) {
         let mut scanner = PtyScanner::new();
         push_scanned_with(rt, &mut scanner, raw)
     }
@@ -1551,18 +1599,15 @@ mod tests {
     /// Same as [`push_scanned`] but reuses a scanner across chunks, the way
     /// the reader thread does — required when a later chunk is only a change
     /// relative to the scanner's carried signal state (e.g. a colour reset).
-    fn push_scanned_with(
-        rt: &mut SessionRuntime,
-        scanner: &mut PtyScanner,
-        raw: &[u8],
-    ) -> (u16, u16) {
+    fn push_scanned_with(rt: &mut SessionRuntime, scanner: &mut PtyScanner, raw: &[u8]) {
         let mut out = ScanOut::default();
         scanner.scan(raw, &mut out);
+        rt.feed_engine(raw);
         if let Some(signals) = scanner.take_changed_signals() {
             rt.publish_terminal_signals(signals);
         }
         let meaningful = out.meaningful_bytes();
-        rt.push_output(&out.filtered, meaningful)
+        rt.push_output(&out.filtered, meaningful);
     }
 
     fn refresh_until_completed(rt: &mut SessionRuntime) {
@@ -1659,29 +1704,34 @@ mod tests {
     /// position in the stream; this test pins that behaviour and stays
     /// ignored until the broker lands.
     #[test]
-    #[ignore = "M0 reproduction (PLAN I5): queries answered with final chunk cursor; fixed by the M2 query broker"]
     fn repro_queries_are_answered_at_their_own_stream_position() {
+        // Fixed by the M2 engine integration: the engine answers each query
+        // while advancing the raw chunk, i.e. at its own stream position.
+        let stream = b"A\x1b[6nB\x1b[6n";
         let mut rt = new_runtime();
+        let responses = rt.feed_engine(stream);
+        assert_eq!(
+            responses,
+            vec![b"\x1b[1;2R".to_vec(), b"\x1b[1;3R".to_vec()],
+            "the first CPR predates 'B' and must report an earlier column"
+        );
+
+        // Identical answers when the stream is split at every byte boundary.
+        for split in 1..stream.len() {
+            let mut rt = new_runtime();
+            let first = rt.feed_engine(&stream[..split]);
+            let mut all = first;
+            all.extend(rt.feed_engine(&stream[split..]));
+            assert_eq!(all, responses, "split at byte {split}");
+        }
+
+        // The scanner still strips the probes from the display stream so
+        // attached renderers cannot answer them a second time.
         let mut scanner = PtyScanner::new();
         let mut out = ScanOut::default();
-
-        scanner.scan(b"A\x1b[6nB\x1b[6n", &mut out);
-        assert_eq!(out.queries.len(), 2, "both CPR probes must be detected");
-
-        // Mirror the reader thread: process the whole chunk, then answer
-        // every collected query with the resulting cursor.
-        let final_cursor = rt.push_output(&out.filtered, out.meaningful_bytes());
-        let replies: Vec<Vec<u8>> = out
-            .queries
-            .iter()
-            .map(|query| query.response(final_cursor))
-            .collect();
-
-        assert_ne!(
-            replies[0], replies[1],
-            "the first CPR was issued before 'B' was printed and must report \
-             an earlier column than the second: {replies:?}"
-        );
+        scanner.scan(stream, &mut out);
+        assert_eq!(out.queries.len(), 2);
+        assert_eq!(out.filtered, b"AB");
     }
 
     /// M0 reproduction (PLAN.md invariant I2): the reader thread runs
@@ -1773,9 +1823,10 @@ mod tests {
 
         push_scanned(&mut rt, filtered.as_ref());
 
-        assert_eq!(
-            rt.screen_parser.screen().contents().trim_end(),
-            "beforeafter"
+        assert!(
+            rt.engine.screen_lines().iter().any(|l| l == "beforeafter"),
+            "screen holds the pushed text: {:?}",
+            rt.engine.screen_lines()
         );
         assert_eq!(rt.last_total_bytes, 11);
     }
@@ -1796,7 +1847,7 @@ mod tests {
         let mut rt = new_runtime();
         push_scanned(&mut rt, &[]);
 
-        assert!(rt.screen_parser.screen().contents().trim().is_empty());
+        assert!(rt.engine.screen_lines().iter().all(|l| l.is_empty()));
         assert_eq!(rt.last_total_bytes, 0);
         assert_eq!(rt.raw_total_bytes, 0);
     }
@@ -2011,7 +2062,12 @@ mod tests {
         assert!(contains(b"\x1b]0;relay build\x07"));
         assert!(contains(b"\x1b]9;4;3;0\x07"));
         assert!(contains(b"\x1b[6 q"));
-        assert!(rt.screen_parser.screen().contents().contains("building"));
+        assert!(
+            rt.engine
+                .screen_lines()
+                .iter()
+                .any(|l| l.contains("building"))
+        );
     }
 
     #[test]
@@ -2020,10 +2076,7 @@ mod tests {
 
         push_scanned(&mut rt, b"plain output");
 
-        assert_eq!(
-            rt.attach_snapshot_bytes(),
-            rt.screen_parser.screen().state_formatted()
-        );
+        assert_eq!(rt.attach_snapshot_bytes(), rt.engine.snapshot_stream());
     }
 
     #[test]
@@ -2147,7 +2200,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
-            screen_parser: vt100::Parser::new(24, 80, 1000),
+            engine: Terminal::new(24, 80, 1000),
             screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
             title_user_set: false,

@@ -144,8 +144,7 @@ impl SessionStore {
     pub async fn attach_scrollback_seed(&self, id: &str, rows: u16) -> Option<Vec<u8>> {
         let handle = self.lookup_runtime(id).await.ok()?;
         let rt = handle.read();
-        let screen = rt.screen_parser.screen();
-        if screen.alternate_screen() {
+        if rt.engine.modes().alt_screen {
             return None;
         }
         // At least `DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS` rows when available,
@@ -153,7 +152,7 @@ impl SessionStore {
         let depth = usize::from(rows)
             .max(crate::config::DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS)
             .min(rt.screen_scrollback_rows);
-        crate::session::logs::render_screen_history(screen, depth)
+        crate::session::logs::format_history_rows(rt.engine.styled_history_rows(depth))
     }
 
     /// Subscribe to resize notifications for a session.
@@ -410,7 +409,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
             let mut locked = rt.write();
-            locked.screen_parser.process(b"\x1b[?1h");
+            locked.feed_engine(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
 
@@ -431,7 +430,7 @@ mod tests {
         let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
         {
             let mut locked = rt.write();
-            locked.screen_parser.process(b"\x1b[?1h");
+            locked.feed_engine(b"\x1b[?1h");
         }
         let store = store_with(vec![rt], make_test_db().await);
 
@@ -721,9 +720,7 @@ mod tests {
     #[tokio::test]
     async fn attach_scrollback_seed_skips_alternate_screen_sessions() {
         let rt = make_runtime("seedalt", SessionStatus::Running, "plain\n", None);
-        rt.write()
-            .screen_parser
-            .process(b"\x1b[?1049h\x1b[2J\x1b[Htui");
+        rt.write().feed_engine(b"\x1b[?1049h\x1b[2J\x1b[Htui");
         let store = store_with(vec![rt], make_test_db().await);
 
         assert!(store.attach_scrollback_seed("seedalt", 24).await.is_none());
