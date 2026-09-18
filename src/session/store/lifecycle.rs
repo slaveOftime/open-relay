@@ -69,7 +69,7 @@ impl SessionStore {
                 continue;
             }
             crate::session::logs::discard_persisted_log_index(&rt.dir);
-            rt.raw_total_bytes = 0;
+            rt.filtered_total_bytes = 0;
             rt.last_total_bytes = 0;
             rt.resize_history.clear();
             let _ = append_event(&rt.dir, "output.log truncated (size cap reached)");
@@ -789,7 +789,7 @@ mod tests {
             "oversized live log should be truncated to zero"
         );
         let locked = rt.read();
-        assert_eq!(locked.raw_total_bytes, 0, "attach offset should reset");
+        assert_eq!(locked.filtered_total_bytes, 0, "attach offset should reset");
         assert_eq!(
             locked.last_total_bytes, 0,
             "meaningful counter should reset"

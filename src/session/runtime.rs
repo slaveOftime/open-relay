@@ -119,7 +119,10 @@ pub struct SessionRuntime {
     pub persisted: bool,
     pub requested_final_status: Option<SessionStatus>,
     /// Total length of the canonical filtered PTY output stream for persistence and replay.
-    pub raw_total_bytes: u64,
+    /// Total bytes of the canonical FILTERED display stream (what
+    /// `output.log` held before M3; attach offsets index this stream).
+    /// Raw pre-filter bytes live in the journal.
+    pub filtered_total_bytes: u64,
     /// Total length of meaningful PTY output bytes that changed the terminal state.
     pub last_total_bytes: u64,
     /// Timestamp the runtime was created (PTY spawned). Used as a fallback
@@ -167,7 +170,7 @@ pub struct SessionRuntime {
     /// retained output, never at the moment `try_wait` noticed the exit.
     pub(crate) pending_journal_completion: Option<(LifecycleCode, Option<i32>, String)>,
     /// Raw-output counter value at the last journal checkpoint.
-    pub(crate) last_journal_checkpoint_raw: u64,
+    pub(crate) last_journal_checkpoint_at: u64,
     /// Last terminal mode state journaled as a Policy record this
     /// incarnation; `None` until the baseline revision is recorded.
     pub(crate) journaled_modes: Option<ModeSnapshot>,
@@ -244,14 +247,20 @@ impl SessionRuntime {
     /// from the display stream still get answered at their exact position.
     pub fn push_output(&mut self, filtered_data: &[u8], meaningful_len: usize) {
         if !filtered_data.is_empty() {
-            self.raw_total_bytes = self
-                .raw_total_bytes
+            self.filtered_total_bytes = self
+                .filtered_total_bytes
                 .saturating_add(filtered_data.len() as u64);
             if meaningful_len > 0 {
                 self.last_total_bytes = self.last_total_bytes.saturating_add(meaningful_len as u64);
                 self.last_output_epoch = Some(Instant::now());
             }
         }
+    }
+
+    /// Current filtered-stream end offset (M3-1b: replaces stating
+    /// `output.log` for live sessions).
+    pub fn filtered_stream_len(&self) -> u64 {
+        self.filtered_total_bytes
     }
 
     /// The output epoch used for silence/notification bookkeeping.
@@ -650,7 +659,7 @@ impl SessionRuntime {
             program: Bytes::from(program),
         };
         self.journal_event(|journal| journal.record_checkpoint(&checkpoint).map(|_| ()));
-        self.last_journal_checkpoint_raw = self.raw_total_bytes;
+        self.last_journal_checkpoint_at = self.filtered_total_bytes;
         // Retention never runs under the write lock (disk I/O).
         let dir = self.dir.clone();
         std::thread::spawn(move || {
@@ -663,13 +672,14 @@ impl SessionRuntime {
         });
     }
 
-    /// Emit a checkpoint once the session has journaled another
-    /// `JOURNAL_CHECKPOINT_INTERVAL_BYTES` of raw output — this bounds
-    /// replay-from-checkpoint work (PLAN §5.3 cadence).
+    /// Emit a checkpoint once the session has produced another
+    /// `JOURNAL_CHECKPOINT_INTERVAL_BYTES` of filtered output (a
+    /// conservative proxy for raw journaled bytes: filtered <= raw) —
+    /// this bounds replay-from-checkpoint work (PLAN §5.3 cadence).
     fn journal_checkpoint_if_due(&mut self) {
         if self
-            .raw_total_bytes
-            .saturating_sub(self.last_journal_checkpoint_raw)
+            .filtered_total_bytes
+            .saturating_sub(self.last_journal_checkpoint_at)
             >= JOURNAL_CHECKPOINT_INTERVAL_BYTES
         {
             self.journal_checkpoint();
@@ -785,7 +795,7 @@ impl SessionRuntime {
             // (PLAN.md §5.3); no trimmed-row rebuild anymore.
             self.engine.resize(rows, cols);
             self.resize_history.push(LogResize {
-                offset: self.raw_total_bytes,
+                offset: self.filtered_total_bytes,
                 rows,
                 cols,
             });
@@ -996,7 +1006,7 @@ pub fn spawn_session(
         meta: meta.clone(),
         dir: full_dir,
         last_total_bytes: 0,
-        raw_total_bytes: 0,
+        filtered_total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
         pty: pty_handle,
@@ -1041,7 +1051,7 @@ pub fn spawn_session(
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
         pending_journal_completion: None,
-        last_journal_checkpoint_raw: 0,
+        last_journal_checkpoint_at: 0,
         journaled_modes: None,
         notifications_enabled,
         journal: shadow_journal,
@@ -1484,7 +1494,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             last_total_bytes: 0,
-            raw_total_bytes: 0,
+            filtered_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -1511,7 +1521,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             pending_journal_completion: None,
-            last_journal_checkpoint_raw: 0,
+            last_journal_checkpoint_at: 0,
             journaled_modes: None,
             notifications_enabled: true,
             journal: None,
@@ -1683,18 +1693,18 @@ mod tests {
         rt.journal = Some(parking_lot::Mutex::new(shadow));
 
         // Below the interval: nothing.
-        rt.raw_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES - 1;
+        rt.filtered_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES - 1;
         rt.journal_checkpoint_if_due();
         // Crossing the interval: a checkpoint is sequenced.
-        rt.raw_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES;
+        rt.filtered_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES;
         rt.journal_checkpoint_if_due();
-        assert_eq!(rt.last_journal_checkpoint_raw, rt.raw_total_bytes);
+        assert_eq!(rt.last_journal_checkpoint_at, rt.filtered_total_bytes);
         {
             let journal = rt.journal.as_ref().unwrap().lock();
             assert_eq!(journal.core.head_seq(), Some(1));
         }
         // And not again until another interval passes.
-        rt.raw_total_bytes += 1;
+        rt.filtered_total_bytes += 1;
         rt.journal_checkpoint_if_due();
         {
             let journal = rt.journal.as_ref().unwrap().lock();
@@ -2014,10 +2024,10 @@ mod tests {
         // the same boundary, so replay-from-cursor can neither lose nor
         // duplicate the chunk.
         assert_eq!(
-            end_offset, rt.raw_total_bytes,
+            end_offset, rt.filtered_total_bytes,
             "snapshot covers {} stream bytes but the resume cursor is {end_offset}: \
              replaying from the cursor re-delivers 'RACY' to the client",
-            rt.raw_total_bytes
+            rt.filtered_total_bytes
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2071,7 +2081,7 @@ mod tests {
         push_scanned(&mut rt, filtered.as_ref());
 
         assert_eq!(rt.last_total_bytes, 11);
-        assert_eq!(rt.raw_total_bytes, 11);
+        assert_eq!(rt.filtered_total_bytes, 11);
     }
 
     #[test]
@@ -2081,7 +2091,7 @@ mod tests {
 
         assert!(rt.engine.screen_lines().iter().all(|l| l.is_empty()));
         assert_eq!(rt.last_total_bytes, 0);
-        assert_eq!(rt.raw_total_bytes, 0);
+        assert_eq!(rt.filtered_total_bytes, 0);
     }
 
     #[test]
@@ -2092,7 +2102,7 @@ mod tests {
 
         assert!(rt.last_output_epoch.is_none());
         assert_eq!(rt.last_total_bytes, 0);
-        assert_eq!(rt.raw_total_bytes, b"\x1b]9;4;3;0\x07".len() as u64);
+        assert_eq!(rt.filtered_total_bytes, b"\x1b]9;4;3;0\x07".len() as u64);
     }
 
     #[test]
@@ -2103,7 +2113,10 @@ mod tests {
 
         assert!(rt.last_output_epoch.is_some());
         assert_eq!(rt.last_total_bytes, 5);
-        assert_eq!(rt.raw_total_bytes, b"hello\x1b]9;4;3;0\x07".len() as u64);
+        assert_eq!(
+            rt.filtered_total_bytes,
+            b"hello\x1b]9;4;3;0\x07".len() as u64
+        );
     }
 
     #[test]
@@ -2118,7 +2131,7 @@ mod tests {
 
         assert!(rt.last_output_epoch.is_none());
         assert_eq!(rt.last_total_bytes, 0);
-        assert_eq!(rt.raw_total_bytes, chunk.len() as u64);
+        assert_eq!(rt.filtered_total_bytes, chunk.len() as u64);
     }
 
     #[test]
@@ -2324,7 +2337,7 @@ mod tests {
         push_scanned(&mut rt, &chunk);
 
         assert_eq!(rt.last_total_bytes, 4096);
-        assert_eq!(rt.raw_total_bytes, chunk.len() as u64);
+        assert_eq!(rt.filtered_total_bytes, chunk.len() as u64);
     }
 
     // -----------------------------------------------------------------------
@@ -2412,7 +2425,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
             last_total_bytes: 0,
-            raw_total_bytes: 0,
+            filtered_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -2439,7 +2452,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             pending_journal_completion: None,
-            last_journal_checkpoint_raw: 0,
+            last_journal_checkpoint_at: 0,
             journaled_modes: None,
             notifications_enabled: true,
             journal: None,

@@ -6,14 +6,17 @@ pub(crate) mod file;
 // recovery, the in-memory sequencing core, the bounded journal appender,
 // ordered resize/lifecycle records, fixed-range/tail/history reads and
 // retention. Wired in as a shadow journal behind `OLY_JOURNAL=1`
-// (development-only); the journal becomes canonical in M3. The allow
-// covers the pieces only M3 consumers will use (read APIs, retention).
+// Always on since M3-1a; the journal becomes canonical in M3. The allow
+// covers the pieces only later-M3 consumers will use.
 #[allow(dead_code)]
 pub(crate) mod journal;
 pub mod logs;
 mod m0_probes;
 pub(crate) mod persist;
 pub mod pty;
+// M3-1b: derive the canonical filtered display stream from the raw
+// journal (the read path that replaces `output.log`).
+pub(crate) mod replay;
 pub(crate) mod resize;
 mod runtime;
 pub(crate) mod scan;

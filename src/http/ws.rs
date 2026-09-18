@@ -397,23 +397,23 @@ async fn handle_ws_streaming(
 
                         // Check for mode changes.
                         let current_modes = shared_modes.as_ref().map(|shared| shared.load());
-                        if let Some(modes) = current_modes {
-                            if modes != last_modes {
-                                debug!(
-                                    session_id = %id,
-                                    app_cursor_keys = modes.app_cursor_keys,
-                                    bracketed_paste_mode = modes.bracketed_paste_mode,
-                                    "local WebSocket terminal mode changed"
-                                );
-                                if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
-                                    app_cursor_keys: modes.app_cursor_keys,
-                                    bracketed_paste_mode: modes.bracketed_paste_mode,
-                                }).await {
-                                    let _ = state.store.attach_detach(&id).await;
-                                    return;
-                                }
-                                last_modes = modes;
+                        if let Some(modes) = current_modes
+                            && modes != last_modes
+                        {
+                            debug!(
+                                session_id = %id,
+                                app_cursor_keys = modes.app_cursor_keys,
+                                bracketed_paste_mode = modes.bracketed_paste_mode,
+                                "local WebSocket terminal mode changed"
+                            );
+                            if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
+                                app_cursor_keys: modes.app_cursor_keys,
+                                bracketed_paste_mode: modes.bracketed_paste_mode,
+                            }).await {
+                                let _ = state.store.attach_detach(&id).await;
+                                return;
                             }
+                            last_modes = modes;
                         }
                     }
                     Err(RecvError::Lagged(skipped)) => {

@@ -12,8 +12,9 @@ use tracing::{debug, warn};
 use crate::session::{SessionEvent, runtime::SequencedChunk};
 
 use super::super::{
-    SessionError,
-    persist::{append_resize_event, current_output_offset, read_output_from},
+    SessionError, journal,
+    persist::{append_resize_event, read_output_from},
+    replay,
 };
 use super::{
     ATTACH_INPUT_OUTPUT_POLL_INTERVAL, ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT, SessionHandle,
@@ -65,10 +66,20 @@ impl SessionStore {
             )
         };
         let offset = from_byte_offset.unwrap_or(0);
-        let (data, end_offset) = read_output_from(&dir, offset).map_err(|err| {
-            warn!(session_id = id, %err, "failed to read persisted attach output");
-            SessionError::Evicted
-        })?;
+        // M3-1b: the filtered display stream is derived from the raw
+        // journal; `output.log` is only a legacy fallback for sessions
+        // started before the journal became always-on (removed in M6).
+        let (data, end_offset) = if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
+            replay::filtered_stream_from(&dir, offset).map_err(|err| {
+                warn!(session_id = id, %err, "failed to derive attach output from the journal");
+                SessionError::Evicted
+            })?
+        } else {
+            read_output_from(&dir, offset).map_err(|err| {
+                warn!(session_id = id, %err, "failed to read persisted attach output");
+                SessionError::Evicted
+            })?
+        };
         let chunks = if data.is_empty() {
             Vec::new()
         } else {
@@ -109,7 +120,7 @@ impl SessionStore {
         let handle = self.lookup_runtime(id).await?;
         let rt = handle.read();
         let snapshot = rt.attach_snapshot_bytes();
-        let end_offset = current_output_offset(&rt.dir);
+        let end_offset = rt.filtered_stream_len();
         let rx = rt.broadcast_tx.subscribe();
         let modes = rt.mode_snapshot();
         debug!(
@@ -191,7 +202,7 @@ impl SessionStore {
         // try_write_input() is a non-blocking channel send that only needs &self.
         let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
             let rt = handle.read();
-            let initial_total_bytes = rt.raw_total_bytes;
+            let initial_total_bytes = rt.filtered_total_bytes;
             let modes = rt.mode_snapshot();
             let cooked;
             let transformed = modes.app_cursor_keys
@@ -283,7 +294,7 @@ impl SessionStore {
     ) -> bool {
         let started = Instant::now();
         loop {
-            let current_total_bytes = handle.read().raw_total_bytes;
+            let current_total_bytes = handle.read().filtered_total_bytes;
 
             if current_total_bytes != initial_total_bytes {
                 debug!(
@@ -329,7 +340,7 @@ impl SessionStore {
         );
         if resized {
             let rt = handle.read();
-            let offset = current_output_offset(&rt.dir);
+            let offset = rt.filtered_stream_len();
             let _ = append_resize_event(&rt.dir, offset, rows, cols);
             Ok(())
         } else {
@@ -504,7 +515,7 @@ mod tests {
         let updater = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let mut locked = rt_clone.write();
-            locked.raw_total_bytes += 1;
+            locked.filtered_total_bytes += 1;
             locked.last_total_bytes += 1;
             locked.last_output_epoch = Some(Instant::now());
         });
