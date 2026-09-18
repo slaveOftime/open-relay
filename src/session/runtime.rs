@@ -1728,7 +1728,8 @@ mod tests {
             {
                 let mut journal = rt.journal.as_ref().unwrap().lock();
                 journal.poll_acks();
-                if journal.core.journal_seq() >= 3 {
+                // output(1) → OutputClosed(2) → checkpoint(3) → Stopped(4).
+                if journal.core.journal_seq() >= 4 {
                     break;
                 }
             }

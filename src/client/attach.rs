@@ -1,7 +1,4 @@
-use std::{
-    io::{IsTerminal, Write},
-    time::{Duration, Instant},
-};
+use std::io::{IsTerminal, Write};
 
 use crossterm::{
     event::{
@@ -20,19 +17,11 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
 };
 
-const PASTE_BURST_WAIT: Duration = Duration::from_millis(30);
-const PASTE_KEY_SUPPRESS_WINDOW: Duration = Duration::from_millis(150);
-
 /// Upper bound on how many bytes of already-queued server output are written
 /// to the terminal in one go. Batching turns a burst of frames into a single
 /// blocking write plus flush; the cap keeps the terminal painting
 /// incrementally rather than freezing on one very large write.
 const MAX_BATCHED_FRAME_BYTES: usize = 1024 * 1024;
-
-struct PendingKeyBurst {
-    data: String,
-    deadline: Instant,
-}
 
 #[cfg(windows)]
 struct AttachRenderer {
@@ -247,293 +236,224 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             }
         });
 
-        let mut pending_key_burst: Option<PendingKeyBurst> = None;
-        let mut suppress_paste_keys_until: Option<Instant> = None;
         let mut shutdown_rx = spawn_attach_shutdown_listener();
 
-        while running {
-            if shutdown_rx.try_recv().is_ok() {
-                detached = true;
-                break;
-            }
-
-            // Drain all pending keyboard/resize events first.
-            loop {
-                match event::poll(pending_key_burst_poll_timeout(pending_key_burst.as_ref())) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        break;
-                    }
-                    Err(err) => {
-                        stream_error = Some(err.into());
-                        running = false;
-                        break;
-                    }
+        // Terminal events are produced by a dedicated blocking thread
+        // (crossterm's `event::read` blocks); the async loop selects over
+        // terminal events, daemon frames, and the shutdown signal. Input is
+        // fully event-driven: no polling timeouts, no key-burst deadlines,
+        // no paste-detection windows (PLAN.md §5.1/§5.2 — paste boundaries
+        // come from bracketed-paste markers or the explicit clipboard
+        // shortcut, never from typing speed).
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let event_reader = std::thread::spawn(move || {
+            // stdin closed or unreadable ends the stream.
+            while let Ok(ev) = event::read() {
+                if event_tx.send(ev).is_err() {
+                    break;
                 }
-                match event::read()? {
-                    Event::Paste(data) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
-                        ipc::write_request_to_writer(
-                            &mut write_half,
-                            RpcRequest::AttachInput {
-                                id: id_owned.clone(),
-                                data: wrap_paste_input(
-                                    normalize_paste_text(data),
-                                    child_bracketed_paste_mode,
-                                ),
-                                wait_for_change: false,
-                            },
-                        )
-                        .await?
+            }
+        });
+
+        while running {
+            tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        detached = true;
+                        break;
                     }
-                    Event::Resize(cols, rows) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        // Re-read the actual terminal size — the event may
-                        // carry stale dimensions on some platforms.
-                        let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
-                        if (actual_cols, actual_rows) != last_sent_size {
-                            last_sent_size = (actual_cols, actual_rows);
+                    maybe_event = event_rx.recv() => {
+                        let Some(ev) = maybe_event else {
+                            stream_error = Some(AppError::Protocol(
+                                "terminal input stream ended".to_string(),
+                            ));
+                            break;
+                        };
+                        match ev {
+                            Event::Paste(data) => {
+                                // Explicit bracketed-paste boundaries: send the
+                                // paste as one bounded transaction.
+                                ipc::write_request_to_writer(
+                                    &mut write_half,
+                                    RpcRequest::AttachInput {
+                                        id: id_owned.clone(),
+                                        data: wrap_paste_input(
+                                            normalize_paste_text(data),
+                                            child_bracketed_paste_mode,
+                                        ),
+                                        wait_for_change: false,
+                                    },
+                                )
+                                .await?
+                            }
+                            Event::Resize(cols, rows) => {
+                                // Re-read the actual terminal size — the event may
+                                // carry stale dimensions on some platforms.
+                                let (actual_cols, actual_rows) =
+                                    terminal::size().unwrap_or((cols, rows));
+                                if (actual_cols, actual_rows) != last_sent_size {
+                                    last_sent_size = (actual_cols, actual_rows);
 
-                            #[cfg(windows)]
-                            renderer.resize(actual_rows, actual_cols);
+                                    #[cfg(windows)]
+                                    renderer.resize(actual_rows, actual_cols);
 
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachResize {
-                                    id: id_owned.clone(),
-                                    rows: actual_rows,
-                                    cols: actual_cols,
-                                },
-                            )
-                            .await?
-                        }
-                    }
-                    Event::Key(key) => {
-                        if should_suppress_paste_followup_key(key, suppress_paste_keys_until) {
-                            continue;
-                        }
-
-                        if let Some(data) = maybe_collect_clipboard_paste(
-                            config,
-                            id,
-                            node,
-                            key,
-                            child_bracketed_paste_mode,
-                        )
-                        .await?
-                        {
-                            pending_key_burst = None;
-                            suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: true,
-                                },
-                            )
-                            .await?;
-                            continue;
-                        }
-
-                        if !matches!(key.kind, KeyEventKind::Press) {
-                            continue;
-                        }
-
-                        if is_ctrl_d(key) {
-                            if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst)
-                            {
+                                    ipc::write_request_to_writer(
+                                        &mut write_half,
+                                        RpcRequest::AttachResize {
+                                            id: id_owned.clone(),
+                                            rows: actual_rows,
+                                            cols: actual_cols,
+                                        },
+                                    )
+                                    .await?
+                                }
+                            }
+                            Event::Key(key) => {
+                                if is_clipboard_paste_key(key) {
+                                    // Explicit paste shortcut: read the clipboard
+                                    // and send the paste in one bounded
+                                    // transaction. An empty or unavailable
+                                    // clipboard swallows the shortcut rather than
+                                    // leaking a stray ^V into the session.
+                                    if let Some(data) = maybe_collect_clipboard_paste(
+                                        config,
+                                        id,
+                                        node,
+                                        key,
+                                        child_bracketed_paste_mode,
+                                    )
+                                    .await?
+                                    {
+                                        ipc::write_request_to_writer(
+                                            &mut write_half,
+                                            RpcRequest::AttachInput {
+                                                id: id_owned.clone(),
+                                                data,
+                                                wait_for_change: true,
+                                            },
+                                        )
+                                        .await?;
+                                    }
+                                } else if !matches!(key.kind, KeyEventKind::Press) {
+                                    // Key release/repeat events: not sent.
+                                } else if is_ctrl_d(key) {
+                                    detached = true;
+                                    running = false;
+                                } else if let Some(data) = map_key_to_input(key, child_app_cursor_keys)
+                                {
+                                    // Every ordinary key is sent the moment it
+                                    // arrives — no burst buffering.
+                                    ipc::write_request_to_writer(
+                                        &mut write_half,
+                                        RpcRequest::AttachInput {
+                                            id: id_owned.clone(),
+                                            data,
+                                            wait_for_change: false,
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Event::Mouse(mouse) => {
+                                let data = map_mouse_to_sgr_input(mouse);
                                 ipc::write_request_to_writer(
                                     &mut write_half,
                                     RpcRequest::AttachInput {
                                         id: id_owned.clone(),
                                         data,
-                                        wait_for_change: true,
+                                        wait_for_change: false,
                                     },
                                 )
-                                .await?;
-                            }
-                            detached = true;
-                            running = false;
-                            break;
-                        }
-
-                        if push_pending_key_burst(
-                            &mut pending_key_burst,
-                            key,
-                            child_app_cursor_keys,
-                        ) {
-                            continue;
-                        }
-
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-
-                        if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                    Event::Mouse(mouse) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        let data = map_mouse_to_sgr_input(mouse);
-                        ipc::write_request_to_writer(
-                            &mut write_half,
-                            RpcRequest::AttachInput {
-                                id: id_owned.clone(),
-                                data,
-                                wait_for_change: false,
-                            },
-                        )
-                        .await?;
-                    }
-                    _ => {}
-                }
-            }
-            if !running {
-                break;
-            }
-
-            // Wait for next server frame (with a timeout so we keep draining input).
-            let frame =
-                tokio::time::timeout(std::time::Duration::from_millis(60), frame_rx.recv()).await;
-            match frame {
-                Err(_timeout) => continue,
-                Ok(None) => {
-                    stream_error = Some(AppError::Protocol(
-                        "daemon closed the connection".to_string(),
-                    ));
-                    break;
-                }
-                Ok(Some(Err(err))) => {
-                    stream_error = Some(err);
-                    break;
-                }
-                Ok(Some(Ok(response))) => {
-                    // Drain every frame the daemon has already queued and
-                    // concatenate the output chunks into one buffer. A burst of
-                    // output (an echoed paste, a full-screen redraw) otherwise
-                    // costs one blocking write plus one flush of the unbuffered
-                    // stdout handle per frame, which is what makes a large
-                    // paste visibly crawl across the screen.
-                    let mut batch = Vec::new();
-                    let mut response = Some(response);
-                    loop {
-                        let Some(current) = response.take() else {
-                            break;
-                        };
-                        match current {
-                            RpcResponse::AttachStreamChunk { data, .. } => {
-                                if batch.is_empty() {
-                                    batch = data;
-                                } else {
-                                    batch.extend_from_slice(&data);
-                                }
-                            }
-                            RpcResponse::AttachModeChanged {
-                                app_cursor_keys,
-                                bracketed_paste_mode,
-                            } => {
-                                child_app_cursor_keys = app_cursor_keys;
-                                child_bracketed_paste_mode = bracketed_paste_mode;
-                            }
-                            RpcResponse::AttachResized { rows: _, cols: _ } => {
-                                // Another client resized the PTY.  We cannot
-                                // programmatically resize the terminal window (only the
-                                // screen buffer on Windows, which corrupts the display).
-                                // Instead, update last_sent_size to the actual terminal
-                                // size so that the dedup guard in Event::Resize prevents
-                                // echoing our unchanged dimensions back to the server.
-                                let (actual_cols, actual_rows) =
-                                    terminal::size().unwrap_or((80, 24));
-                                last_sent_size = (actual_cols, actual_rows);
-                            }
-                            RpcResponse::AttachStreamDone { .. } => {
-                                running = false;
+                                .await?
                             }
                             _ => {}
                         }
-
-                        if !running || batch.len() >= MAX_BATCHED_FRAME_BYTES {
+                        if !running {
                             break;
                         }
-                        match frame_rx.try_recv() {
-                            Ok(Ok(next)) => response = Some(next),
-                            Ok(Err(err)) => {
-                                stream_error = Some(err);
-                                running = false;
-                            }
-                            Err(_) => break,
-                        }
                     }
+                    maybe_frame = frame_rx.recv() => {
+                        match maybe_frame {
+                            None => {
+                                stream_error = Some(AppError::Protocol(
+                                    "daemon closed the connection".to_string(),
+                                ));
+                                break;
+                            }
+                            Some(Err(err)) => {
+                                stream_error = Some(err);
+                                break;
+                            }
+                            Some(Ok(response)) => {
+                            // Drain every frame the daemon has already queued and
+                            // concatenate the output chunks into one buffer. A burst of
+                            // output (an echoed paste, a full-screen redraw) otherwise
+                            // costs one blocking write plus one flush of the unbuffered
+                            // stdout handle per frame, which is what makes a large
+                            // paste visibly crawl across the screen.
+                            let mut batch = Vec::new();
+                            let mut response = Some(response);
+                            while let Some(current) = response.take() {
+                                match current {
+                                    RpcResponse::AttachStreamChunk { data, .. } => {
+                                        if batch.is_empty() {
+                                            batch = data;
+                                        } else {
+                                            batch.extend_from_slice(&data);
+                                        }
+                                    }
+                                    RpcResponse::AttachModeChanged {
+                                        app_cursor_keys,
+                                        bracketed_paste_mode,
+                                    } => {
+                                        child_app_cursor_keys = app_cursor_keys;
+                                        child_bracketed_paste_mode = bracketed_paste_mode;
+                                    }
+                                    RpcResponse::AttachResized { rows: _, cols: _ } => {
+                                        // Another client resized the PTY.  We cannot
+                                        // programmatically resize the terminal window (only the
+                                        // screen buffer on Windows, which corrupts the display).
+                                        // Instead, update last_sent_size to the actual terminal
+                                        // size so that the dedup guard in Event::Resize prevents
+                                        // echoing our unchanged dimensions back to the server.
+                                        let (actual_cols, actual_rows) =
+                                            terminal::size().unwrap_or((80, 24));
+                                        last_sent_size = (actual_cols, actual_rows);
+                                    }
+                                    RpcResponse::AttachStreamDone { .. } => {
+                                        running = false;
+                                    }
+                                    _ => {}
+                                }
 
-                    if !batch.is_empty() {
-                        #[cfg(windows)]
-                        write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
-                        #[cfg(not(windows))]
-                        write_bytes_to_stdout(&batch)?;
+                                if !running || batch.len() >= MAX_BATCHED_FRAME_BYTES {
+                                    break;
+                                }
+                                match frame_rx.try_recv() {
+                                    Ok(Ok(next)) => response = Some(next),
+                                    Ok(Err(err)) => {
+                                        stream_error = Some(err);
+                                        running = false;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            if !batch.is_empty() {
+                                #[cfg(windows)]
+                                write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
+                                #[cfg(not(windows))]
+                                write_bytes_to_stdout(&batch)?;
+                            }
+                        }
                     }
                 }
             }
         }
+
+        // The terminal-event reader thread may still be parked in a blocking
+        // read; it exits with the process. Nothing may join it here.
+        drop(event_reader);
 
         if detached {
             // Detach while raw mode is still active, then consume any queued
@@ -710,77 +630,6 @@ fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
 
 fn normalize_paste_text(data: String) -> String {
     data.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-fn next_pending_key_burst_deadline() -> Instant {
-    Instant::now() + PASTE_BURST_WAIT
-}
-
-fn next_paste_key_suppression_deadline() -> Instant {
-    Instant::now() + PASTE_KEY_SUPPRESS_WINDOW
-}
-
-fn pending_key_burst_poll_timeout(pending: Option<&PendingKeyBurst>) -> Duration {
-    pending.map_or(Duration::from_millis(0), |pending| {
-        pending.deadline.saturating_duration_since(Instant::now())
-    })
-}
-
-fn should_suppress_paste_followup_key(key: KeyEvent, deadline: Option<Instant>) -> bool {
-    let Some(deadline) = deadline else {
-        return false;
-    };
-
-    if Instant::now() >= deadline {
-        return false;
-    }
-
-    is_clipboard_paste_key(key)
-        || matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
-}
-
-fn take_pending_key_burst_data(pending: &mut Option<PendingKeyBurst>) -> Option<String> {
-    pending.take().map(|pending| pending.data)
-}
-
-fn push_pending_key_burst(
-    pending: &mut Option<PendingKeyBurst>,
-    key: KeyEvent,
-    app_cursor_keys: bool,
-) -> bool {
-    let Some(data) = paste_candidate_key_data(key, app_cursor_keys) else {
-        return false;
-    };
-
-    match pending {
-        Some(pending) => {
-            pending.data.push_str(&data);
-            pending.deadline = next_pending_key_burst_deadline();
-        }
-        None => {
-            *pending = Some(PendingKeyBurst {
-                data,
-                deadline: next_pending_key_burst_deadline(),
-            });
-        }
-    }
-
-    true
-}
-
-fn paste_candidate_key_data(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
-    match key.code {
-        KeyCode::Enter => Some("\r".to_string()),
-        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => Some("\t".to_string()),
-        KeyCode::Char(_)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            map_key_to_input(key, app_cursor_keys)
-        }
-        _ => None,
-    }
 }
 
 async fn maybe_collect_clipboard_paste(
@@ -1169,46 +1018,6 @@ mod tests {
         assert!(is_clipboard_paste_key(press(KeyCode::Char('\u{16}'))));
     }
 
-    #[test]
-    fn test_paste_candidate_key_data_accepts_plain_text_keys() {
-        assert_eq!(
-            paste_candidate_key_data(press(KeyCode::Char('a')), false),
-            Some("a".to_string())
-        );
-        assert_eq!(
-            paste_candidate_key_data(press(KeyCode::Enter), false),
-            Some("\r".to_string())
-        );
-    }
-
-    #[test]
-    fn test_paste_candidate_key_data_rejects_control_keys() {
-        assert_eq!(
-            paste_candidate_key_data(ctrl_press(KeyCode::Char('c')), false),
-            None
-        );
-        assert_eq!(paste_candidate_key_data(press(KeyCode::Left), false), None);
-    }
-
-    #[test]
-    fn test_push_pending_key_burst_appends_text() {
-        let mut pending = None;
-        assert!(push_pending_key_burst(
-            &mut pending,
-            press(KeyCode::Char('a')),
-            false
-        ));
-        assert!(push_pending_key_burst(
-            &mut pending,
-            press(KeyCode::Char('b')),
-            false
-        ));
-        assert_eq!(
-            take_pending_key_burst_data(&mut pending),
-            Some("ab".to_string())
-        );
-    }
-
     // -----------------------------------------------------------------------
     // map_key_to_input – shift+tab produces backtab sequence
     // -----------------------------------------------------------------------
@@ -1500,35 +1309,6 @@ mod tests {
             map_key_to_input(key(KeyCode::Left, KeyModifiers::NONE), true),
             Some("\x1bOD".into())
         );
-    }
-
-    /// Every paste-candidate key (ordinary text, Enter, unshifted Tab) is
-    /// buffered as a suspected paste burst, and each subsequent candidate
-    /// **resets** the 30 ms `PASTE_BURST_WAIT` deadline — so continuous
-    /// typing faster than one key per 30 ms accumulates in the buffer and
-    /// reaches the wire only when the user pauses for a full burst window.
-    /// A single key still waits ~30 ms. This documents the incumbent
-    /// behavior; the 1.0 codec (ADR-0003) removes timing-based typing
-    /// classification while keeping explicit paste coalescing.
-    #[test]
-    fn typing_is_held_until_a_full_pause_in_the_paste_burst_window() {
-        let mut pending = None;
-        assert!(push_pending_key_burst(
-            &mut pending,
-            key(KeyCode::Char('a'), KeyModifiers::NONE),
-            false,
-        ));
-        assert_eq!(pending.as_ref().unwrap().data, "a");
-        let first_deadline = pending.as_ref().unwrap().deadline;
-        // A follow-up candidate does not flush; it extends the deadline.
-        // (Instant is monotonic, so the second deadline is strictly later.)
-        assert!(push_pending_key_burst(
-            &mut pending,
-            key(KeyCode::Char('b'), KeyModifiers::NONE),
-            false,
-        ));
-        assert_eq!(pending.as_ref().unwrap().data, "ab");
-        assert!(pending.as_ref().unwrap().deadline > first_deadline);
     }
 
     /// Legacy/xterm-compatible profile (ADR-0001 stable profiles): the
