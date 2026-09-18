@@ -570,11 +570,13 @@ Develop vertical slices behind development-only switches, then delete replaced c
 
 **Exit:** measured baseline; failing reproductions of highest-risk problems; demonstrated continuation after restore on both buffers; selected engine or funded dependency fix. No wholesale rewrite before this gate.
 
-### M1 — Stable journal and ordering (P0; after M0)
+### M1 — Stable journal and ordering (P0; after M0) ✅ **(shadow-journal form)**
 
 **Deliver** sequence/incarnation types, sequencer, immutable publication, bounded cache; segments/checksums/fixed-range reads; availability/durability cursors; checkpoint/recovery/non-resetting retention; ordered resize/end; off-loop history work; persistence failure state.
 
 **Exit:** I1/I3/I8/I10 and crash/retention faults pass; bounded tail/seek; disk stall cannot grow memory indefinitely. One internal read API serves live/completed history.
+
+**Status (corrective increment complete):** met in shadow-journal form — the journal runs alongside `output.log` (dev-gated by `OLY_JOURNAL`) and every exit criterion is exercised against it: contiguous ordered stream with raw PTY bytes, resize, mode (Policy) and lifecycle records; bounded part rollover with sparse-index tail seeks; cursor-validated history reads; torn-tail/disk-full/retention-race faults; shutdown durability barrier; bounded memory after degradation. The first-pass review's six blocking findings were fixed in `e4a4486`…`431fc09` (see docs/M0_EVIDENCE.md → "M1 corrective increment"). Deliberately deferred per plan: checkpoint-gated retention (M2 — M1 ships only the test-only `retain_before_unchecked`), journal-becomes-canonical + `output.log` retirement (M3), real backpressure on transient queue-full (M3), sealed-part deep validation (M3 manifests). Gate: 541 unit + 47 integration tests passed, 17 ignored repros/probes, release probes 4/4, clippy baseline unchanged (80), fmt clean.
 
 ### M2 — Terminal/input fidelity core (P0; after M0, integrates with M1)
 
