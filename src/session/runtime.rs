@@ -427,6 +427,7 @@ impl SessionRuntime {
         // Attaching is itself user activity: someone just opened this
         // session and saw its current state.
         self.last_attach_activity_at = Some(Instant::now());
+        self.purge_expired_leases_at(Instant::now());
         let (id, outcome) = self.attachments.register(kind, request, viewport);
         let mut resized = false;
         if outcome.role == AttachRole::Controller
@@ -480,11 +481,49 @@ impl SessionRuntime {
         }
     }
 
+    /// Acquire the control lease without a streaming attach: a parked
+    /// agent controller whose lease carries a TTL (post-review corrective
+    /// increment — a crashed agent's lease expires instead of gating the
+    /// session, or growing the attachment map, forever). `None` when the
+    /// parked-lease cap is genuinely exhausted.
+    pub fn register_parked_attachment(
+        &mut self,
+        kind: super::registry::AttachKind,
+        ttl: std::time::Duration,
+    ) -> Option<(u64, super::registry::ControlOutcome)> {
+        self.last_attach_activity_at = Some(Instant::now());
+        self.purge_expired_leases_at(Instant::now());
+        let (id, outcome) = self
+            .attachments
+            .register_parked(kind, ttl, Instant::now())?;
+        let _ = self.control_tx.send(self.attachments.controller_id());
+        Some((id, outcome))
+    }
+
+    /// Drop parked agent leases whose TTL elapsed; publishes a control
+    /// notice when the lease holder vanished.
+    pub fn purge_expired_leases_at(&mut self, now: Instant) -> usize {
+        let was_controller = self.attachments.controller_id();
+        let removed = self.attachments.purge_expired(now);
+        if !removed.is_empty() {
+            debug!(
+                session_id = %self.meta.id,
+                purged = removed.len(),
+                "expired parked control leases purged"
+            );
+            if was_controller.is_some_and(|old| removed.contains(&old)) {
+                let _ = self.control_tx.send(None);
+            }
+        }
+        removed.len()
+    }
+
     /// Explicit control takeover by an attached observer.
     pub fn acquire_control(
         &mut self,
         attachment_id: u64,
     ) -> Option<super::registry::ControlOutcome> {
+        self.purge_expired_leases_at(Instant::now());
         let outcome = self.attachments.acquire_control(attachment_id)?;
         self.last_attach_activity_at = Some(Instant::now());
         let _ = self.control_tx.send(self.attachments.controller_id());

@@ -184,6 +184,13 @@ impl Database {
         current_output_offset_by_id(&self.sessions_dir, id)
     }
 
+    /// `<sessions_dir>/<id>` without an existence check — the sync
+    /// companion of [`get_session_dir`](Self::get_session_dir) for
+    /// lock-free readers (e.g. `journal_incarnation`).
+    pub fn session_dir_by_id(&self, id: &str) -> PathBuf {
+        self.sessions_dir.join(id)
+    }
+
     /// Returns `<sessions_dir>/<id>` if the session exists in the database, else `None`.
     pub async fn get_session_dir(&self, id: &str) -> Result<Option<PathBuf>> {
         if self.session_exists(id).await {

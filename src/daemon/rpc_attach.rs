@@ -429,13 +429,16 @@ pub(super) async fn handle_observe_window(
 }
 
 /// Acquire the control lease without a streaming attach: a parked
-/// controller attachment whose id is the lease token for gated agent sends.
+/// controller attachment whose id is the lease token for gated agent
+/// sends. The lease carries a TTL (post-review corrective increment): an
+/// agent that crashes without releasing stops gating the session after
+/// the TTL instead of leaking the lease forever.
 pub(super) async fn handle_control_acquire(
     id: String,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     match session_store
-        .attach_register(&id, AttachKind::Cli, ControlRequest::Takeover, None)
+        .attach_register_parked(&id, AttachKind::Cli)
         .await
     {
         Ok(registration) => RpcResponse::ControlAcquired {

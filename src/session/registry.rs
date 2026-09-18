@@ -65,6 +65,17 @@ impl AttachRole {
     }
 }
 
+/// TTL for parked agent control leases (post-review corrective
+/// increment): a parked lease belongs to an agent that may crash without
+/// ever releasing it, so it expires instead of gating the session — or
+/// the attachment map — forever. Gated sends renew it (activity proves
+/// liveness). Principal-bound revocation arrives with auth scopes in M5.
+pub const PARKED_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Bound on simultaneously parked leases per session (I7: no unbounded
+/// growth, even within the TTL).
+pub const MAX_PARKED_LEASES: usize = 8;
+
 /// One identified attachment. Some fields are consumed by later M3 surfaces
 /// (applied-cursor ACKs in M3-5, attached-client status listings), hence the
 /// allow.
@@ -81,6 +92,9 @@ pub struct Attachment {
     /// Last stream cursor the client reported as fully applied (feeds
     /// credits/backpressure; informational until M3-5).
     pub applied_cursor: u64,
+    /// Expiry for parked agent leases (`None` for streaming attachments,
+    /// whose lifetime is their connection).
+    pub lease_expires_at: Option<Instant>,
 }
 
 /// Per-session registry. Lives inside the session runtime so every
@@ -134,9 +148,66 @@ impl AttachmentRegistry {
                 connected_at: Instant::now(),
                 viewport,
                 applied_cursor: 0,
+                lease_expires_at: None,
             },
         );
         (id, ControlOutcome { role, demoted })
+    }
+
+    /// Register a parked agent control lease: takeover semantics plus a
+    /// TTL. `None` when the parked-lease cap is reached — callers purge
+    /// expired leases first, so a refusal means genuinely concurrent
+    /// agents, not accumulated corpses.
+    pub fn register_parked(
+        &mut self,
+        kind: AttachKind,
+        ttl: std::time::Duration,
+        now: Instant,
+    ) -> Option<(u64, ControlOutcome)> {
+        let parked = self
+            .attachments
+            .values()
+            .filter(|attachment| attachment.lease_expires_at.is_some())
+            .count();
+        if parked >= MAX_PARKED_LEASES {
+            return None;
+        }
+        let (id, outcome) = self.register(kind, ControlRequest::Takeover, None);
+        self.attachments
+            .get_mut(&id)
+            .expect("just registered")
+            .lease_expires_at = Some(now + ttl);
+        Some((id, outcome))
+    }
+
+    /// Remove every parked lease whose TTL has elapsed, releasing the
+    /// control lease if an expired attachment held it. Returns the removed
+    /// attachment ids. Streaming attachments (no expiry) are never purged.
+    pub fn purge_expired(&mut self, now: Instant) -> Vec<u64> {
+        let expired: Vec<u64> = self
+            .attachments
+            .values()
+            .filter(|attachment| {
+                attachment
+                    .lease_expires_at
+                    .is_some_and(|expires_at| expires_at <= now)
+            })
+            .map(|attachment| attachment.id)
+            .collect();
+        for id in &expired {
+            self.unregister(*id);
+        }
+        expired
+    }
+
+    /// Extend a parked lease's TTL on activity (a gated send proves the
+    /// agent is alive). No-op for streaming attachments and unknown ids.
+    pub fn renew_lease(&mut self, id: u64, now: Instant) {
+        if let Some(attachment) = self.attachments.get_mut(&id)
+            && attachment.lease_expires_at.is_some()
+        {
+            attachment.lease_expires_at = Some(now + PARKED_LEASE_TTL);
+        }
     }
 
     /// Remove an attachment, releasing the lease if it held it. Returns the
@@ -279,5 +350,95 @@ mod tests {
         // Re-acquiring while holding the lease demotes nobody.
         let outcome = registry.acquire_control(b).expect("still attached");
         assert_eq!(outcome.demoted, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Parked agent lease lifecycle (post-review corrective increment)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parked_lease_expires_and_frees_the_controller_lease() {
+        use std::time::Duration;
+        let mut registry = AttachmentRegistry::default();
+        let t0 = Instant::now();
+        let (stream, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
+        let (parked, outcome) = registry
+            .register_parked(AttachKind::Cli, PARKED_LEASE_TTL, t0)
+            .expect("parked lease");
+        assert_eq!(outcome.role, AttachRole::Controller);
+        assert_eq!(outcome.demoted, Some(stream));
+
+        // Alive just before the TTL, gone at it.
+        assert!(
+            registry
+                .purge_expired(t0 + PARKED_LEASE_TTL - Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(registry.purge_expired(t0 + PARKED_LEASE_TTL), vec![parked]);
+        assert!(!registry.contains(parked));
+        assert_eq!(registry.controller_id(), None);
+
+        // The demoted streaming attachment survives and can retake the
+        // now-free lease.
+        assert!(registry.contains(stream));
+        let outcome = registry
+            .acquire_control(stream)
+            .expect("takeover after expiry");
+        assert_eq!(outcome.role, AttachRole::Controller);
+    }
+
+    #[test]
+    fn parked_lease_renewal_extends_expiry() {
+        use std::time::Duration;
+        let mut registry = AttachmentRegistry::default();
+        let t0 = Instant::now();
+        let (parked, _) = registry
+            .register_parked(AttachKind::Cli, PARKED_LEASE_TTL, t0)
+            .expect("parked lease");
+        // Activity one second before expiry renews the lease from then.
+        let renew_at = t0 + PARKED_LEASE_TTL - Duration::from_secs(1);
+        registry.renew_lease(parked, renew_at);
+        assert!(registry.purge_expired(t0 + PARKED_LEASE_TTL).is_empty());
+        assert_eq!(
+            registry.purge_expired(renew_at + PARKED_LEASE_TTL),
+            vec![parked]
+        );
+    }
+
+    #[test]
+    fn parked_lease_cap_refuses_growth_until_purged() {
+        let mut registry = AttachmentRegistry::default();
+        let t0 = Instant::now();
+        for _ in 0..MAX_PARKED_LEASES {
+            registry
+                .register_parked(AttachKind::Cli, PARKED_LEASE_TTL, t0)
+                .expect("under the cap");
+        }
+        assert!(
+            registry
+                .register_parked(AttachKind::Cli, PARKED_LEASE_TTL, t0)
+                .is_none(),
+            "the cap refuses unbounded parked-lease growth"
+        );
+        // Purging the corpses frees capacity.
+        registry.purge_expired(t0 + PARKED_LEASE_TTL);
+        assert!(
+            registry
+                .register_parked(AttachKind::Cli, PARKED_LEASE_TTL, t0 + PARKED_LEASE_TTL)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn streaming_attachments_are_never_purged() {
+        let mut registry = AttachmentRegistry::default();
+        let t0 = Instant::now();
+        let (stream, _) = registry.register(AttachKind::Web, ControlRequest::Observer, None);
+        let (parked, _) = registry
+            .register_parked(AttachKind::Cli, PARKED_LEASE_TTL, t0)
+            .expect("parked lease");
+        let removed = registry.purge_expired(t0 + 10 * PARKED_LEASE_TTL);
+        assert_eq!(removed, vec![parked]);
+        assert!(registry.contains(stream));
     }
 }

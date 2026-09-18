@@ -59,6 +59,12 @@ pub(super) type SessionMap = HashMap<String, Arc<SessionHandle>>;
 pub(super) struct StoreMutableState {
     pub(super) starting_sessions: HashSet<String>,
     pub(super) evicted_sessions: HashMap<String, Instant>,
+    /// Persisted filtered-stream lengths for sessions without a live
+    /// runtime, keyed by session id: `(incarnation, len)`. The incarnation
+    /// component invalidates the entry when the journal advances (M4
+    /// corrective increment: keeps `oly wait` polling cheap against
+    /// completed sessions with large journals).
+    pub(super) persisted_stream_len_cache: HashMap<String, (u64, u64)>,
 }
 
 pub(super) struct SessionHandle {
@@ -118,6 +124,7 @@ impl SessionStore {
             mutable: TokioMutex::new(StoreMutableState {
                 starting_sessions: HashSet::new(),
                 evicted_sessions: HashMap::new(),
+                persisted_stream_len_cache: HashMap::new(),
             }),
             eviction_ttl_secs: std::sync::atomic::AtomicU64::new(eviction_seconds.max(1)),
             db,

@@ -3,7 +3,11 @@
 //! This is the latency-sensitive surface. Lock scopes are deliberately narrow
 //! and the input path never holds a write lock across an await.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc::error::TrySendError};
@@ -13,7 +17,7 @@ use crate::session::{SessionEvent, runtime::SequencedChunk};
 
 use super::super::{
     SessionError, journal,
-    persist::{append_resize_event, read_output_from},
+    persist::{self, append_resize_event, read_output_from},
     replay,
 };
 use super::{
@@ -26,9 +30,29 @@ impl SessionStore {
         &self,
         id: &str,
     ) -> std::result::Result<(bool, bool, Option<i32>), SessionError> {
-        let handle = self.lookup_runtime(id).await?;
-        let rt = handle.read();
-        Ok((!rt.is_completed(), rt.output_closed, rt.meta.exit_code))
+        match self.lookup_runtime(id).await {
+            Ok(handle) => {
+                let rt = handle.read();
+                Ok((!rt.is_completed(), rt.output_closed, rt.meta.exit_code))
+            }
+            // Persisted fallback (post-review corrective increment): a
+            // session keeps an answerable stream status after eviction or
+            // daemon restart, so `oly wait`/`observe`/`history` keep
+            // working against the canonical store.
+            Err(err) => match self.db.get_session(id).await {
+                Ok(Some(meta)) => Ok((false, true, meta.exit_code)),
+                _ => Err(err),
+            },
+        }
+    }
+
+    /// Persisted session dir for a session with no live runtime (evicted
+    /// or post-restart); `None` when the id is unknown entirely.
+    async fn persisted_session_dir(&self, id: &str) -> Option<PathBuf> {
+        match self.db.get_session_dir(id).await {
+            Ok(Some(dir)) if dir.is_dir() => Some(dir),
+            _ => None,
+        }
     }
 
     /// Register an identified attachment and grant control per the registry
@@ -64,6 +88,28 @@ impl SessionStore {
             attachment_id,
             role: outcome.role,
         })
+    }
+
+    /// Acquire the control lease without a streaming attach: a parked
+    /// agent controller whose lease expires after
+    /// [`PARKED_LEASE_TTL`](crate::session::registry::PARKED_LEASE_TTL)
+    /// without activity (post-review corrective increment — crashed agents
+    /// must not leak leases). Gated sends renew the lease. Refused with
+    /// [`SessionError::Busy`] when the parked-lease cap is genuinely
+    /// exhausted (i.e. that many agents are concurrently active).
+    pub async fn attach_register_parked(
+        &self,
+        id: &str,
+        kind: crate::session::registry::AttachKind,
+    ) -> std::result::Result<AttachRegistration, SessionError> {
+        let handle = self.lookup_runtime(id).await?;
+        let mut rt = handle.write();
+        rt.register_parked_attachment(kind, crate::session::registry::PARKED_LEASE_TTL)
+            .map(|(attachment_id, outcome)| AttachRegistration {
+                attachment_id,
+                role: outcome.role,
+            })
+            .ok_or(SessionError::Busy)
     }
 
     /// Explicit control takeover by an attached observer.
@@ -166,18 +212,16 @@ impl SessionStore {
         from: u64,
         max_bytes: usize,
     ) -> std::result::Result<Vec<u8>, SessionError> {
-        let handle = self.lookup_runtime(id).await?;
-        let dir = { handle.read().dir.clone() };
-        // Same journal/legacy split as attach_subscribe_init (removed in M6).
-        let result: Result<Vec<u8>, String> =
-            if dir.join(crate::session::journal::JOURNAL_DIR_NAME).is_dir() {
-                crate::session::replay::filtered_stream_window(&dir, from, max_bytes)
-                    .map_err(|err| err.to_string())
-            } else {
-                crate::session::persist::read_output_window(&dir, from, max_bytes)
-                    .map_err(|err| err.to_string())
-            };
-        result.map_err(|err| {
+        let dir = match self.lookup_runtime(id).await {
+            Ok(handle) => handle.read().dir.clone(),
+            // Persisted fallback (post-review corrective increment):
+            // bounded resync windows work after eviction/restart too.
+            Err(err) => match self.persisted_session_dir(id).await {
+                Some(dir) => dir,
+                None => return Err(err),
+            },
+        };
+        read_filtered_window(&dir, from, max_bytes).map_err(|err| {
             warn!(session_id = id, %err, "attach resync window read failed");
             SessionError::Evicted
         })
@@ -206,12 +250,53 @@ impl SessionStore {
             .min()
     }
 
-    /// In-memory filtered-stream length (M3-5): counts bytes the journal
-    /// appender may not have flushed yet, so the pump's completion drain
-    /// knows when the persisted tail has caught up.
+    /// Filtered-stream length (M3-5): the in-memory count for live
+    /// sessions (it counts bytes the journal appender may not have flushed
+    /// yet, so the pump's completion drain knows when the persisted tail
+    /// has caught up); the persisted, incarnation-cached derivation for
+    /// sessions without a live runtime (post-review corrective increment).
     pub async fn attach_filtered_len(&self, id: &str) -> Option<u64> {
-        let handle = self.lookup_runtime(id).await.ok()?;
-        Some(handle.read().filtered_stream_len())
+        if let Ok(handle) = self.lookup_runtime(id).await {
+            return Some(handle.read().filtered_stream_len());
+        }
+        self.persisted_filtered_len(id).await
+    }
+
+    /// Filtered-stream end offset derived from the persisted journal (or
+    /// legacy `output.log`) for a session with no live runtime. The scan
+    /// is O(journal), so results are cached per incarnation: a completed
+    /// session's stream never changes within one incarnation, and polling
+    /// callers (`oly wait`) must not re-scan the whole journal every tick.
+    async fn persisted_filtered_len(&self, id: &str) -> Option<u64> {
+        let dir = self.persisted_session_dir(id).await?;
+        if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
+            let incarnation = journal::list_incarnations(&dir.join(journal::JOURNAL_DIR_NAME))
+                .ok()?
+                .last()
+                .copied()?;
+            {
+                let state = self.mutable.lock().await;
+                if let Some(&(cached_incarnation, len)) = state.persisted_stream_len_cache.get(id)
+                    && cached_incarnation == incarnation
+                {
+                    return Some(len);
+                }
+            }
+            let len = replay::filtered_stream_len(&dir).ok()?;
+            let mut state = self.mutable.lock().await;
+            // Completed sessions accumulate; bound the cache.
+            if state.persisted_stream_len_cache.len() >= 1024 {
+                state.persisted_stream_len_cache.clear();
+            }
+            state
+                .persisted_stream_len_cache
+                .insert(id.to_string(), (incarnation, len));
+            Some(len)
+        } else if dir.join("output.log").is_file() {
+            Some(persist::current_output_offset(&dir))
+        } else {
+            None
+        }
     }
 
     pub async fn attach_snapshot_init(
@@ -371,11 +456,15 @@ impl SessionStore {
             }
         }?;
 
-        // Brief write lock: only touch the two timestamp fields.
+        // Brief write lock: touch the timestamp fields and renew a parked
+        // agent lease (a successful gated send proves the agent is alive).
         {
             let mut rt = handle.write();
             rt.mark_attach_activity();
             rt.last_input_at = Some(Instant::now());
+            if let Some(attachment_id) = attachment_id {
+                rt.attachments.renew_lease(attachment_id, Instant::now());
+            }
         }
 
         debug!(
@@ -476,6 +565,22 @@ impl SessionStore {
         } else {
             Err(SessionError::Evicted)
         }
+    }
+}
+
+/// One bounded window of the persisted filtered display stream (I7).
+/// Shared by the live-runtime and persisted fallback paths so both read
+/// the same canonical bytes: the journal when present, legacy
+/// `output.log` otherwise (the split is removed in M6).
+fn read_filtered_window(
+    dir: &Path,
+    from: u64,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
+        replay::filtered_stream_window(dir, from, max_bytes).map_err(|err| err.to_string())
+    } else {
+        persist::read_output_window(dir, from, max_bytes).map_err(|err| err.to_string())
     }
 }
 
@@ -1062,5 +1167,193 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         assert!(store.attach_scrollback_seed("seednone", 24).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Persisted agent surfaces (post-review corrective increment): cursor,
+    // history windows and stream status stay answerable for sessions with no
+    // live runtime — after eviction or a daemon restart.
+    // -----------------------------------------------------------------------
+
+    /// A completed session that exists only on disk: db row plus a sealed
+    /// one-incarnation journal, with no runtime in any store.
+    async fn persisted_journal_session(
+        id: &str,
+        chunks: &[&[u8]],
+        exit_code: Option<i32>,
+    ) -> (Arc<crate::db::Database>, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("oly_persisted_{id}_{}", uuid::Uuid::new_v4()));
+        let sessions_dir = base.join("sessions");
+        let session_dir = sessions_dir.join(id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let db = Arc::new(
+            crate::db::Database::open(&base.join("oly.db"), sessions_dir)
+                .await
+                .expect("open test db"),
+        );
+        let (mut journal, _incarnation, _report) =
+            crate::session::journal::ShadowJournal::open_with_options(
+                &session_dir,
+                Duration::from_secs(3600),
+                1 << 20,
+            )
+            .expect("open journal");
+        for chunk in chunks {
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(chunk))
+                .expect("record output");
+        }
+        journal.shutdown();
+        db.insert_session(&crate::session::SessionMeta {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "sh".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            ended_at: Some(chrono::Utc::now()),
+            status: SessionStatus::Stopped,
+            pid: None,
+            exit_code,
+            notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
+        })
+        .await
+        .expect("insert session row");
+        (db, session_dir)
+    }
+
+    #[tokio::test]
+    async fn agent_surfaces_fall_back_to_persisted_state_without_runtime() {
+        let (db, _dir) =
+            persisted_journal_session("persist1", &[b"hello ", b"world"], Some(7)).await;
+        let store = store_with(Vec::new(), db);
+
+        // The session-cursor trio backs `oly observe`/`history`/`wait`.
+        assert_eq!(store.attach_filtered_len("persist1").await, Some(11));
+        assert_eq!(
+            store
+                .attach_resync_window("persist1", 0, 1024)
+                .await
+                .expect("resync window"),
+            b"hello world"
+        );
+        assert_eq!(
+            store
+                .attach_resync_window("persist1", 6, 3)
+                .await
+                .expect("offset window"),
+            b"wor"
+        );
+        assert_eq!(
+            store
+                .attach_stream_status("persist1")
+                .await
+                .expect("stream status"),
+            (false, true, Some(7))
+        );
+        assert_eq!(store.journal_incarnation("persist1"), Some(1));
+        // The incarnation-keyed cache serves repeat polls consistently.
+        assert_eq!(store.attach_filtered_len("persist1").await, Some(11));
+    }
+
+    #[tokio::test]
+    async fn persisted_fallback_preserves_unknown_session_errors() {
+        let store = SessionStore::new(900, make_test_db().await);
+        assert!(matches!(
+            store.attach_stream_status("nope000").await,
+            Err(SessionError::NotRunning)
+        ));
+        assert_eq!(store.attach_filtered_len("nope000").await, None);
+        assert!(store.attach_resync_window("nope000", 0, 64).await.is_err());
+        assert_eq!(store.journal_incarnation("nope000"), None);
+    }
+
+    #[tokio::test]
+    async fn parked_control_leases_drive_input_are_capped_and_releasable() {
+        use crate::session::registry::{AttachKind, MAX_PARKED_LEASES};
+
+        let (rt, mut writer_rx) = make_runtime_writable("parked01", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        // A parked lease is a controller: gated input flows.
+        let lease = store
+            .attach_register_parked("parked01", AttachKind::Cli)
+            .await
+            .expect("parked acquire")
+            .attachment_id;
+        store
+            .attach_input("parked01", Some(lease), "agent-bytes", false)
+            .await
+            .expect("parked controller drives input");
+        assert_eq!(writer_rx.recv().await.expect("written"), b"agent-bytes");
+
+        // The cap refuses unbounded growth (crashed-agent protection).
+        let mut leases = vec![lease];
+        for _ in 1..MAX_PARKED_LEASES {
+            leases.push(
+                store
+                    .attach_register_parked("parked01", AttachKind::Cli)
+                    .await
+                    .expect("under the cap")
+                    .attachment_id,
+            );
+        }
+        let err = store
+            .attach_register_parked("parked01", AttachKind::Cli)
+            .await
+            .expect_err("the cap refuses further parked leases");
+        assert!(matches!(err, SessionError::Busy));
+
+        // Releasing a lease frees a slot; a stale token fails precisely.
+        store
+            .attach_detach("parked01", leases[0])
+            .await
+            .expect("release");
+        store
+            .attach_register_parked("parked01", AttachKind::Cli)
+            .await
+            .expect("released slot is reusable");
+        let err = store
+            .attach_input("parked01", Some(leases[0]), "x", false)
+            .await
+            .expect_err("released lease token is stale");
+        assert!(matches!(err, SessionError::StaleAttachment));
+    }
+
+    #[tokio::test]
+    async fn persisted_filtered_len_cache_tracks_incarnation_changes() {
+        let (db, session_dir) = persisted_journal_session("persist2", &[b"first"], Some(0)).await;
+        let store = store_with(Vec::new(), db);
+        assert_eq!(store.attach_filtered_len("persist2").await, Some(5));
+
+        // A restart appends a fresh incarnation; the per-incarnation cache
+        // must not go stale, and resync windows follow the newest stream.
+        let (mut journal, incarnation, _report) =
+            crate::session::journal::ShadowJournal::open_with_options(
+                &session_dir,
+                Duration::from_secs(3600),
+                1 << 20,
+            )
+            .expect("reopen journal");
+        assert_eq!(incarnation, 2);
+        journal
+            .record_output(bytes::Bytes::from_static(b"second"))
+            .expect("record output");
+        journal.shutdown();
+
+        assert_eq!(store.journal_incarnation("persist2"), Some(2));
+        assert_eq!(store.attach_filtered_len("persist2").await, Some(6));
+        assert_eq!(
+            store
+                .attach_resync_window("persist2", 0, 64)
+                .await
+                .expect("resync after restart"),
+            b"second"
+        );
     }
 }

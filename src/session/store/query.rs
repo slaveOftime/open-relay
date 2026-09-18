@@ -165,12 +165,24 @@ impl SessionStore {
             .get(id)
             .map(|handle| Arc::clone(&handle.read().shared_modes))
     }
-    /// Current journal incarnation of a live session, if journaled.
+    /// Current journal incarnation of a session, if journaled: the live
+    /// runtime's counter, or — for sessions without a runtime (evicted or
+    /// post-restart, post-review corrective increment) — the newest
+    /// incarnation on disk. `None` for unknown or non-journaled sessions.
     pub fn journal_incarnation(&self, id: &str) -> Option<u64> {
         let sessions = self.sessions.load();
-        sessions
-            .get(id)
-            .and_then(|handle| handle.read().journal_incarnation())
+        if let Some(handle) = sessions.get(id) {
+            // Prefer the live writer's incarnation; a runtime without a
+            // live journal (legacy or test fixture) falls through to the
+            // on-disk journal, which is also where `attach_subscribe_init`
+            // reads the stream from — fencing must name the same source.
+            if let Some(incarnation) = handle.read().journal_incarnation() {
+                return Some(incarnation);
+            }
+            let dir = handle.read().dir.clone();
+            return disk_incarnation(&dir);
+        }
+        disk_incarnation(&self.db.session_dir_by_id(id))
     }
 
     pub async fn render_live_logs(
@@ -252,6 +264,15 @@ impl SessionStore {
         );
         Ok(())
     }
+}
+
+/// Latest journal incarnation on disk for a session directory, if any.
+fn disk_incarnation(session_dir: &std::path::Path) -> Option<u64> {
+    let journal_dir = session_dir.join(super::super::journal::JOURNAL_DIR_NAME);
+    super::super::journal::list_incarnations(&journal_dir)
+        .ok()?
+        .last()
+        .copied()
 }
 
 #[cfg(test)]
