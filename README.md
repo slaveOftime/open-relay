@@ -17,7 +17,7 @@ Start a command once, detach, close your terminal, come back later, inspect logs
 
 If `oly` saves you time, please star the repo. That helps more people discover it.
 
-For deep implementation details, see [ARCHITECTURE.md](./ARCHITECTURE.md), [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md).
+Upgrading from 0.x? Read [MIGRATION.md](./MIGRATION.md) first — 1.0 is a clean break. For internals, see [ARCHITECTURE.md](./ARCHITECTURE.md) and the [ADRs](./docs/adrs/).
 
 ---
 
@@ -186,6 +186,13 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
+| `oly doctor [id]` | Verify journal integrity (sealed-part manifests) |
+| `oly wait [id]` | Wait for output after a cursor, an exit, silence, or a pattern |
+| `oly screen [id]` | Print the session's current terminal screen (plain text) |
+| `oly history [id]` | Bounded window read of the session's output stream |
+| `oly observe [id]` | Machine-readable session cursor (liveness + canonical stream offset) |
+| `oly control acquire [id]` / `oly control release [id]` | Acquire or release the session's control lease |
+| `oly update <id> ...` | Override a session's title, tags, and notification setting |
 | `oly skill` | Print the bundled `oly` skill markdown |
 
 The interactive view can monitor several nodes at once, for example `oly ls --follow --node worker-a --node worker-b`. Add `--node-local` to include sessions from the current daemon (or the primary itself); the table shows a node column when multiple sources are selected. `Ctrl+D` opens a clone editor prefilled from the selected session, while `Ctrl+U` opens an update editor for the selected session's title, tags, and notification setting. `Tab`/`Ctrl+Tab` move between dialog fields, `Space` toggles notifications, and `Enter` submits the current dialog. Use `Ctrl+K` to stop the selected running session, `Enter` to open it inline, `Ctrl+Enter` to open it in another terminal window, and `Ctrl+C` to exit the list view.
@@ -274,7 +281,7 @@ Inside that directory, `oly` stores:
 
 - the SQLite database
 - daemon logs
-- session logs and metadata
+- per-session journals and metadata
 - generated default `config.json`
 - saved join configs on secondary nodes
 - optional `wwwroot` static content
@@ -287,7 +294,12 @@ These keys can be set in `config.json` (runtime overrides win over the file). Se
 | --- | --- | --- |
 | `silence_seconds` | `10` | Idle time before a session is considered silent for `input_needed` detection |
 | `notification_min_interval_seconds` | `10` | Minimum seconds between repeat `input_needed` notifications for the same session |
-| `max_output_log_bytes` | `0` (unlimited) | Cap on a session's `output.log`; when exceeded, the daemon safely truncates it in place |
+| `screen_scrollback_rows` | engine default | Scrollback rows kept in memory per live session screen |
+
+Session recordings live in a per-session journal (raw bytes, resizes,
+lifecycle, checkpoints); there is no size cap key — retention is
+checkpoint-gated. Inspect a session's journal with `oly doctor <id>`; export
+raw bytes with `oly logs --raw <id>`.
 
 ---
 
@@ -303,9 +315,9 @@ These keys can be set in `config.json` (runtime overrides win over the file). Se
 
 ## Learn more
 
+- [MIGRATION.md](./MIGRATION.md) for the 0.x → 1.0 transition
 - [SPEC.md](./SPEC.md) for the implementation-aligned product spec
 - [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview
-- [ARCHITECTURE_PTY.md](./ARCHITECTURE_PTY.md) for PTY behavior
-- [ARCHITECTURE_NOTES.md](./ARCHITECTURE_NOTES.md) for edge cases and operational notes
+- [docs/adrs/](./docs/adrs/) for the architecture decision records
 
 If you are building agent workflows and want durable, inspectable terminal sessions, `oly` is for you.

@@ -414,4 +414,4 @@ Current non-goals or intentionally externalized concerns:
 - [`src/main.rs`](./src/main.rs)
 - [`src/config.rs`](./src/config.rs)
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md)
-- [`ARCHITECTURE_PTY.md`](./ARCHITECTURE_PTY.md)
+- [`docs/adrs/`](./docs/adrs/) — architecture decision records

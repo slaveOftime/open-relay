@@ -14,7 +14,7 @@ The more reproducible the report, the easier it is to help.
 ## Before opening an issue
 
 - Read `README.md`
-- Check `ARCHITECTURE.md` or `ARCHITECTURE_PTY.md` for deeper implementation detail
+- Check `ARCHITECTURE.md` and `docs/adrs/` for deeper implementation detail
 - Search existing issues first to avoid duplicates
 
 ## Best fit for issues
