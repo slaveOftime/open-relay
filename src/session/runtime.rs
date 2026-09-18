@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -179,6 +179,12 @@ pub struct SessionRuntime {
     /// write lock is held (that lock is what orders mutation, sequencing
     /// and publication against each other; PLAN.md §4.1 item 4).
     pub journal: Option<parking_lot::Mutex<ShadowJournal>>,
+    /// Set the first time a journal record fails (M3-1, ADR-0006): the
+    /// journal is becoming canonical, so a session whose history can no
+    /// longer be recorded is stopped (marked `Failed`) instead of
+    /// continuing to run unrecorded. Atomic because `journal_event` only
+    /// holds `&self`.
+    pub journal_failed: std::sync::atomic::AtomicBool,
 }
 
 /// Capacity of the queue between attach input and the PTY writer thread.
@@ -677,10 +683,10 @@ impl SessionRuntime {
         )
     }
 
-    /// Sequence one event into the shadow journal. No-op when the shadow
-    /// journal is disabled. Failures degrade the journal explicitly and
-    /// are logged once (on the transition into the degraded state) — the
-    /// session itself is never affected by shadow persistence.
+    /// Sequence one event into the journal. Failures degrade the journal
+    /// explicitly and are logged once (on the transition into the degraded
+    /// state); since M3-1 the journal is becoming canonical, so a failure
+    /// also sets the fail-loud flag that stops the session (ADR-0006).
     fn journal_event(
         &self,
         record: impl FnOnce(
@@ -693,12 +699,23 @@ impl SessionRuntime {
         let mut journal = journal.lock();
         let was_degraded = journal.core.is_degraded();
         if record(&mut journal).is_err() && !was_degraded {
-            warn!(
+            // ADR-0006: never run a session whose history can no longer be
+            // recorded. Flag it; the reader loop turns this into a clean
+            // `Failed` stop (kill child, close stream, persist state).
+            error!(
                 session_id = %self.meta.id,
                 reason = journal.core.degraded_reason().unwrap_or("unknown"),
-                "shadow journal degraded; continuing without it"
+                "journal failed; stopping session rather than running unrecorded"
             );
+            self.journal_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Whether a journal record has failed (ADR-0006 fail-loud flag).
+    pub fn journal_failed(&self) -> bool {
+        self.journal_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Journal one raw PTY chunk; returns its cursor when recorded.
@@ -828,6 +845,40 @@ pub fn spawn_session(
     );
     std::fs::create_dir_all(&full_dir)?;
 
+    // M3-1 (ADR-0002/ADR-0006): the journal is becoming the canonical
+    // stream, so it must exist before the child starts — a session whose
+    // history cannot be recorded must fail loudly, not run unrecorded.
+    // One sequencing point per session, owned by the runtime: the runtime
+    // write lock orders mutation, sequencing and publication; the appender
+    // thread owns disk.
+    let shadow_journal = match ShadowJournal::open(&full_dir) {
+        Ok((shadow, incarnation, report)) => {
+            if let Some(report) = &report {
+                debug!(
+                    session_id = %meta.id,
+                    incarnation = report.incarnation,
+                    records = report.records,
+                    last_seq = ?report.last_seq,
+                    stop = ?report.stop,
+                    rewound = report.rewound,
+                    "recovered previous journal incarnation"
+                );
+            }
+            info!(
+                session_id = %meta.id,
+                incarnation,
+                "session journal opened"
+            );
+            Some(parking_lot::Mutex::new(shadow))
+        }
+        Err(err) => {
+            return Err(AppError::Protocol(format!(
+                "failed to open session journal in {}: {err}",
+                full_dir.display()
+            )));
+        }
+    };
+
     let spawn_env = load_spawn_environment();
     let command_cwd = meta
         .cwd
@@ -897,49 +948,18 @@ pub fn spawn_session(
         .unwrap_or_else(|| "?".to_string());
     append_event(&full_dir, &format!("session started pid={started_pid}"))?;
 
-    // M1 shadow journal (dev-only, `OLY_JOURNAL=1`): one sequencing point
-    // per session, owned by the runtime. The runtime write lock orders
-    // mutation, sequencing and publication; the appender thread owns disk.
-    let shadow_journal = if journal::shadow_enabled() {
-        match ShadowJournal::open(&full_dir) {
-            Ok((mut shadow, incarnation, report)) => {
-                if let Some(report) = &report {
-                    debug!(
-                        session_id = %meta.id,
-                        incarnation = report.incarnation,
-                        records = report.records,
-                        last_seq = ?report.last_seq,
-                        stop = ?report.stop,
-                        rewound = report.rewound,
-                        "recovered previous journal incarnation"
-                    );
-                }
-                info!(
-                    session_id = %meta.id,
-                    incarnation,
-                    "shadow journal opened"
-                );
-                // The first ordered facts: initial geometry, then start.
-                let _ = shadow.record_resize(rows, cols);
-                let _ = shadow.record_lifecycle(
-                    LifecycleCode::Started,
-                    None,
-                    &format!("session started pid={started_pid}"),
-                );
-                Some(parking_lot::Mutex::new(shadow))
-            }
-            Err(err) => {
-                warn!(
-                    session_id = %meta.id,
-                    %err,
-                    "failed to open shadow journal; continuing without it"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // M3-1: the journal is becoming the canonical stream (ADR-0002), so it
+    // was opened — loudly — before the PTY spawn above; here we only record
+    // the first ordered facts: initial geometry, then start.
+    if let Some(journal) = &shadow_journal {
+        let mut journal = journal.lock();
+        let _ = journal.record_resize(rows, cols);
+        let _ = journal.record_lifecycle(
+            LifecycleCode::Started,
+            None,
+            &format!("session started pid={started_pid}"),
+        );
+    }
 
     // Broadcast channel: each live attach subscriber holds a Receiver.
     let (broadcast_tx, _initial_rx) = broadcast::channel::<SequencedChunk>(256);
@@ -1025,6 +1045,7 @@ pub fn spawn_session(
         journaled_modes: None,
         notifications_enabled,
         journal: shadow_journal,
+        journal_failed: std::sync::atomic::AtomicBool::new(false),
     }));
 
     // PTY reader thread: reads raw bytes, derives one canonical filtered stream,
@@ -1076,7 +1097,7 @@ pub fn spawn_session(
                     // positions), advance the stream counters, and publish
                     // any changed notifications (adopting a terminal-emitted
                     // title while the session has no user-chosen one).
-                    let (query_responses, meta_update, chunk_cursor) = {
+                    let (query_responses, meta_update, chunk_cursor, journal_stop) = {
                         let mut rt = runtime_reader.write();
                         // Journal the exact bytes read from the PTY —
                         // pre-filter — so replay and post-mortems never lose
@@ -1095,12 +1116,27 @@ pub fn spawn_session(
                         rt.journal_modes_if_changed();
                         // Checkpoint past the configured raw-byte interval.
                         rt.journal_checkpoint_if_due();
+                        // ADR-0006: a journal failure stops the session
+                        // cleanly (Failed) instead of running unrecorded.
+                        let journal_stop = rt.journal_failed().then(|| {
+                            rt.requested_final_status = Some(SessionStatus::Failed);
+                            let _ = rt.pty.kill();
+                            "journal failed; stopping session (ADR-0006)".to_string()
+                        });
                         (
                             query_responses,
                             meta_changed.then(|| rt.to_summary()),
                             chunk_cursor,
+                            journal_stop,
                         )
                     };
+
+                    if let Some(detail) = journal_stop {
+                        if let Err(err) = append_event(&reader_dir, &detail) {
+                            warn!(session_id = %reader_session_id, %err, "failed to persist journal-failure event");
+                        }
+                        break detail;
+                    }
 
                     // Let live clients know session metadata (title and/or
                     // colours) was adopted from the child's notifications.
@@ -1479,11 +1515,36 @@ mod tests {
             journaled_modes: None,
             notifications_enabled: true,
             journal: None,
+            journal_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     fn new_runtime() -> SessionRuntime {
         new_runtime_with(SessionStatus::Running, 0)
+    }
+
+    #[test]
+    fn journal_failure_sets_the_fail_loud_flag() {
+        // ADR-0006: once a journal record fails, the runtime is flagged so
+        // the reader loop stops the session (Failed) instead of running
+        // unrecorded. Force the failure deterministically with an oversized
+        // payload (rejected before writing; the journal degrades).
+        let dir = std::env::temp_dir().join(format!("oly-jfail-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (journal, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.journal = Some(parking_lot::Mutex::new(journal));
+
+        assert!(!rt.journal_failed());
+        let huge = Bytes::from(vec![0u8; 65 * 1024 * 1024]);
+        assert!(rt.journal_output(huge).is_none());
+        assert!(
+            rt.journal_failed(),
+            "a failed journal record must set the fail-loud flag"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2382,6 +2443,7 @@ mod tests {
             journaled_modes: None,
             notifications_enabled: true,
             journal: None,
+            journal_failed: std::sync::atomic::AtomicBool::new(false),
         };
 
         assert!(rt.pty.try_write_input(b"before".to_vec()).is_ok());

@@ -1178,11 +1178,12 @@ impl ShadowJournal {
     }
 }
 
-/// Development-only switch for the M1 shadow journal: when set (and not
-/// `0`), the PTY reader thread also journals output records. Off by
-/// default until M3 makes the journal the canonical stream.
+/// M1/M2 kept the journal behind the `OLY_JOURNAL` dev switch; since
+/// M3-1 the journal is always on — it is becoming the canonical stream
+/// (ADR-0002). The switch is gone; the function remains only so call
+/// sites read intentionally.
 pub fn shadow_enabled() -> bool {
-    std::env::var_os("OLY_JOURNAL").is_some_and(|value| !value.is_empty() && value != "0")
+    true
 }
 
 fn crc32_two(first: &[u8], second: &[u8]) -> u32 {
@@ -2316,6 +2317,20 @@ mod tests {
         assert_eq!(scanned.valid_len, first_len);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_fails_loudly_when_the_journal_dir_is_not_a_directory() {
+        // M3-1 (ADR-0006): sessions fail to start when their journal cannot
+        // be opened. Pin the open-level error the runtime propagates.
+        let dir = std::env::temp_dir().join(format!("oly-jopen-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(JOURNAL_DIR_NAME), b"not a directory").unwrap();
+
+        assert!(ShadowJournal::open(&dir).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

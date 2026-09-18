@@ -95,6 +95,7 @@ pub(super) fn make_runtime(
         last_journal_checkpoint_raw: 0,
         journaled_modes: None,
         journal: None,
+        journal_failed: std::sync::atomic::AtomicBool::new(false),
         notifications_enabled: true,
     }))
 }
@@ -240,6 +241,7 @@ pub(super) fn make_runtime_writable_with_capacity(
         last_journal_checkpoint_raw: 0,
         journaled_modes: None,
         journal: None,
+        journal_failed: std::sync::atomic::AtomicBool::new(false),
         notifications_enabled: true,
     }));
     (rt, writer_rx)
