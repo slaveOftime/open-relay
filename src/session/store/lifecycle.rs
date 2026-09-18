@@ -116,7 +116,7 @@ impl SessionStore {
         if result.is_err() {
             {
                 let mut rt = cleanup_runtime.write();
-                let _ = rt.pty.kill();
+                let _ = rt.pty.kill_process_tree();
                 rt.mark_completed(SessionStatus::Failed, None);
             }
             let _ = store_handle.abort_started_session(&session_id).await;
@@ -479,6 +479,13 @@ impl SessionStore {
         let deadline = start + grace;
         let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
         let mut next_soft_stop_index = 0usize;
+        // M5-5 graceful drain escalation: the app interrupt (soft-stop
+        // input) owns the first half of the grace window; at the midpoint we
+        // ask the whole process group to exit (POSIX SIGTERM — injected
+        // Ctrl-C is not one), and at the deadline the tree is killed.
+        let mut group_sigterm_at = (matches!(requested_final_status, SessionStatus::Stopped)
+            && !grace.is_zero())
+        .then_some(start + grace / 2);
         debug!(
             session_id = %session_id,
             requested_final_status = requested_final_status.as_str(),
@@ -533,6 +540,19 @@ impl SessionStore {
                     return true;
                 }
             }
+            // Process-group SIGTERM at the grace midpoint.
+            if let Some(at) = group_sigterm_at
+                && Instant::now() >= at
+            {
+                group_sigterm_at = None;
+                let pid = handle.read().pty.process_id();
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    use crate::session::pty::{SIGTERM, signal_process_group};
+                    debug!(session_id = %session_id, pid, "grace midpoint: SIGTERM to process group");
+                    signal_process_group(pid, SIGTERM);
+                }
+            }
             // Read lock: send any due staged soft-stop inputs.
             {
                 let rt = handle.read();
@@ -571,7 +591,7 @@ impl SessionStore {
             grace_seconds,
             "session did not stop within grace window; forcing termination"
         );
-        if rt.pty.kill().is_ok() {
+        if rt.pty.kill_process_tree().is_ok() {
             let _ = rt.refresh_status();
             info!(
                 session_id = %session_id,
@@ -1088,7 +1108,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         assert!(
-            store.stop_session("stp0002", 1).await,
+            store.stop_session("stp0002", 2).await,
             "running session should be stoppable"
         );
 
@@ -1097,7 +1117,14 @@ mod tests {
             writes.push(bytes);
         }
 
-        assert_eq!(writes, expected_soft_stop_inputs());
+        // M5-5 escalation semantics: the dummy child is a real `sleep` that
+        // never sees the soft-stop input bytes (they land in the test's
+        // channel, not the PTY). Stages due before the grace midpoint are
+        // sent; the midpoint process-group SIGTERM then ends the session
+        // before the final stage comes due. Poll slack: stage 3 is due at
+        // 1333ms, midpoint at 1000ms, poll interval 100ms — no race.
+        let all = expected_soft_stop_inputs();
+        assert_eq!(writes, all[..all.len() - 1]);
     }
 
     #[tokio::test]

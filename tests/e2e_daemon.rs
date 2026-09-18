@@ -5,6 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::{
     fs,
+    path::Path,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -1136,4 +1137,127 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
         String::from_utf8_lossy(&doctor.stdout),
         String::from_utf8_lossy(&doctor.stderr)
     );
+}
+
+/// Minimal std-only HTTP POST returning the status code — keeps this test
+/// synchronous so the e2e lock is never held across an `.await`.
+#[cfg(not(target_os = "windows"))]
+fn http_post_kill(port: u16, id: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut stream =
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to test http port");
+    let request = format!(
+        "POST /api/sessions/{id}/kill HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write kill request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read kill response");
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("malformed HTTP response: {response:?}"))
+}
+
+/// M5-5: killing a session must terminate the whole process tree, not just
+/// the direct child — a backgrounded grandchild must not leak.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_kill_terminates_the_whole_process_tree() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_tree_kill");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http(&tmp, port);
+
+    let pidfile = tmp.join("grandchild.pid");
+    let script = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
+    let id = start_session(&tmp, &["sh", "-c", &script]);
+
+    // Wait until the grandchild pid is known and the process is alive.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut grandchild_pid = String::new();
+    while Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(&pidfile) {
+            let pid = contents.trim();
+            if !pid.is_empty() && Path::new(&format!("/proc/{pid}")).exists() {
+                grandchild_pid = pid.to_string();
+                break;
+            }
+        }
+        sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !grandchild_pid.is_empty(),
+        "grandchild pidfile never appeared or process not alive"
+    );
+    let grandchild_proc = std::path::PathBuf::from(format!("/proc/{grandchild_pid}"));
+
+    let status = http_post_kill(port, &id);
+    assert!(
+        (200..300).contains(&status),
+        "kill request should succeed, got HTTP {status}"
+    );
+
+    // The grandchild (reparented once its shell dies) must be reaped.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && grandchild_proc.exists() {
+        sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !grandchild_proc.exists(),
+        "grandchild process {grandchild_pid} survived the session kill"
+    );
+}
+
+/// M5-5: `oly daemon stop` drains sessions with the same process-tree
+/// semantics — a backgrounded grandchild must not survive the shutdown.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_daemon_stop_kills_process_trees() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_daemon_stop_tree");
+    let _daemon = start_daemon(&tmp);
+
+    let pidfile = tmp.join("grandchild.pid");
+    let script = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
+    let id = start_session(&tmp, &["sh", "-c", &script]);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut grandchild_pid = String::new();
+    while Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(&pidfile) {
+            let pid = contents.trim();
+            if !pid.is_empty() && Path::new(&format!("/proc/{pid}")).exists() {
+                grandchild_pid = pid.to_string();
+                break;
+            }
+        }
+        sleep(Duration::from_millis(100));
+    }
+    assert!(!grandchild_pid.is_empty(), "grandchild never started");
+    let grandchild_proc = std::path::PathBuf::from(format!("/proc/{grandchild_pid}"));
+
+    let stop = oly_cmd(&tmp)
+        .args(["daemon", "stop"])
+        .output()
+        .expect("`oly daemon stop` failed to execute");
+    assert!(
+        stop.status.success(),
+        "`oly daemon stop` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && grandchild_proc.exists() {
+        sleep(Duration::from_millis(200));
+    }
+    assert!(
+        !grandchild_proc.exists(),
+        "grandchild process {grandchild_pid} survived `oly daemon stop`"
+    );
+    let _ = id;
 }

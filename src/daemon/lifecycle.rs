@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    JoinHandles, NotifierHandle,
+    JoinHandles, NotifierHandle, SessionStoreHandle,
     auth::{confirm_no_auth_risk, prompt_and_hash_password},
     crash,
     rpc::handle_client,
@@ -651,13 +651,32 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         let _ = event_tx.send(event.into_session_event(0, true));
     }
 
+    // M5-5: service managers stop daemons with SIGTERM; give it the same
+    // graceful drain as ctrl-c and the RPC stop path. (cfg'd out on Windows:
+    // select! arms can't carry cfg attributes, so the future pends forever.)
+    #[cfg(unix)]
+    let sigterm_recv = {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        async move { sigterm.recv().await }
+    };
+    #[cfg(not(unix))]
+    let sigterm_recv = std::future::pending::<Option<()>>();
+    tokio::pin!(sigterm_recv);
+
     let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
     session_maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("daemon received ctrl-c, shutting down");
+                info!("daemon received ctrl-c, draining sessions before shutdown");
+                drain_sessions_for_shutdown(&session_store).await;
+                break;
+            }
+            _ = &mut sigterm_recv => {
+                info!("daemon received SIGTERM, draining sessions before shutdown");
+                drain_sessions_for_shutdown(&session_store).await;
                 break;
             }
             _ = shutdown_rx.recv() => {
@@ -708,6 +727,23 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     info!("daemon stopped");
     Ok(())
+}
+
+/// Grace window for the signal-driven shutdown drain. Matches the
+/// `oly daemon stop` default so both shutdown paths behave identically.
+const DAEMON_SHUTDOWN_GRACE_SECONDS: u64 = 15;
+
+/// M5-5: signal-driven shutdown must not orphan managed children — drain
+/// every session (soft stop, process-group SIGTERM, tree kill) before the
+/// daemon exits. `oly daemon stop` drains in the RPC handler before the
+/// shutdown signal even arrives, so both paths converge here.
+async fn drain_sessions_for_shutdown(session_store: &SessionStoreHandle) {
+    let drained = session_store
+        .stop_all_sessions(DAEMON_SHUTDOWN_GRACE_SECONDS)
+        .await;
+    if !drained {
+        warn!("shutdown drain finished with sessions still running");
+    }
 }
 
 #[cfg(test)]
