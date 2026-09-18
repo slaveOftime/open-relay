@@ -250,7 +250,7 @@ pub(super) async fn handle_attach_subscribe(
 
                 chunk = broadcast_rx.recv() => {
                     match chunk {
-                        Ok(mut filtered) => {
+                        Ok(mut chunk) => {
                             // Coalesce every chunk the reader has already
                             // produced into one IPC frame. A large paste echoes
                             // back as a burst of 64 KiB reads; forwarding them
@@ -258,23 +258,23 @@ pub(super) async fn handle_attach_subscribe(
                             // encode and one base64 pass each, which is what
                             // made pasting feel sluggish.
                             let mut coalesced: Option<Vec<u8>> = None;
-                            while coalesced.as_ref().map_or(filtered.len(), Vec::len)
+                            while coalesced.as_ref().map_or(chunk.bytes.len(), Vec::len)
                                 < MAX_COALESCED_CHUNK_BYTES
                             {
                                 let Ok(next) = broadcast_rx.try_recv() else {
                                     break;
                                 };
                                 let buffer = coalesced
-                                    .get_or_insert_with(|| filtered.as_ref().to_vec());
-                                buffer.extend_from_slice(&next);
+                                    .get_or_insert_with(|| chunk.bytes.as_ref().to_vec());
+                                buffer.extend_from_slice(&next.bytes);
                             }
                             let batch_len = coalesced
                                 .as_ref()
-                                .map_or(filtered.len(), Vec::len);
+                                .map_or(chunk.bytes.len(), Vec::len);
 
                             if batch_len > 0 {
                                 let data = coalesced
-                                    .unwrap_or_else(|| std::mem::take(&mut filtered).into());
+                                    .unwrap_or_else(|| std::mem::take(&mut chunk.bytes).into());
                                 ipc::write_response_to_writer(
                                     &mut writer,
                                     RpcResponse::AttachStreamChunk {
@@ -289,6 +289,7 @@ pub(super) async fn handle_attach_subscribe(
                                 session_id = %id,
                                 filtered_bytes = batch_len,
                                 current_offset,
+                                journal_cursor = ?chunk.cursor,
                                 "forwarded live PTY output over IPC stream"
                             );
 

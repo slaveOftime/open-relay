@@ -81,6 +81,18 @@ impl SharedModes {
     }
 }
 
+/// One broadcast unit of the canonical filtered stream, tagged with the
+/// journal cursor of the raw PTY chunk it came from when the shadow
+/// journal recorded it; `None` when no journal is enabled (or it is
+/// degraded), in which case consumers fall back to offset-based replay.
+/// Sent inside the same write-lock section that sequenced the journal
+/// record, so cursor order and broadcast order agree (PLAN.md §4.1).
+#[derive(Debug, Clone)]
+pub struct SequencedChunk {
+    pub cursor: Option<journal::JournalCursor>,
+    pub bytes: Bytes,
+}
+
 pub struct SessionRuntime {
     pub meta: SessionMeta,
     /// Absolute path to the session's working directory (`sessions/<id>/`).
@@ -88,7 +100,7 @@ pub struct SessionRuntime {
     /// Sends canonical filtered PTY output chunks to all live attach
     /// subscribers. `Bytes` is already reference counted, so subscribers share
     /// one allocation without an extra `Arc` indirection.
-    pub broadcast_tx: broadcast::Sender<Bytes>,
+    pub broadcast_tx: broadcast::Sender<SequencedChunk>,
     /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
     pub resize_tx: broadcast::Sender<(u16, u16)>,
     /// PTY ownership: master fd, writer channel, child process.
@@ -603,8 +615,17 @@ impl SessionRuntime {
         }
     }
 
-    fn journal_output(&self, payload: Bytes) {
-        self.journal_event(|journal| journal.record_output(payload).map(|_| ()));
+    /// Journal one raw PTY chunk; returns its cursor when recorded.
+    fn journal_output(&self, payload: Bytes) -> Option<journal::JournalCursor> {
+        let mut sequenced = None;
+        self.journal_event(|journal| {
+            let result = journal.record_output(payload.clone());
+            if let Ok(cursor) = &result {
+                sequenced = Some(*cursor);
+            }
+            result.map(|_| ())
+        });
+        sequenced
     }
 
     fn journal_policy(&self, key: &str, value: &str) {
@@ -838,7 +859,7 @@ pub fn spawn_session(
     };
 
     // Broadcast channel: each live attach subscriber holds a Receiver.
-    let (broadcast_tx, _initial_rx) = broadcast::channel::<Bytes>(256);
+    let (broadcast_tx, _initial_rx) = broadcast::channel::<SequencedChunk>(256);
 
     // Resize broadcast channel: notifies all attached clients of PTY resize.
     let (resize_tx, _initial_resize_rx) = broadcast::channel::<(u16, u16)>(16);
@@ -954,13 +975,13 @@ pub fn spawn_session(
                     // any changed notifications (and adopt a terminal-emitted
                     // title while the session has no user-chosen one), and
                     // read back the cursor position for query replies.
-                    let (cursor_position, meta_update) = {
+                    let (cursor_position, meta_update, chunk_cursor) = {
                         let mut rt = runtime_reader.write();
                         // Journal the exact bytes read from the PTY —
                         // pre-filter — so replay and post-mortems never lose
                         // data the scan pipeline dropped (PLAN.md I4). This
                         // happens even when the filtered chunk is empty.
-                        rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
+                        let chunk_cursor = rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
                         } else {
@@ -970,7 +991,7 @@ pub fn spawn_session(
                         // A mode flip lands immediately after the output
                         // that caused it, in the same order a replay sees.
                         rt.journal_modes_if_changed();
-                        (cursor, meta_changed.then(|| rt.to_summary()))
+                        (cursor, meta_changed.then(|| rt.to_summary()), chunk_cursor)
                     };
 
                     // Let live clients know session metadata (title and/or
@@ -989,7 +1010,10 @@ pub fn spawn_session(
                     // subscribers (non-blocking; lagged receivers re-sync from
                     // the persisted log on the next tick).
                     if !filtered.is_empty()
-                        && let Ok(receiver_count) = broadcast_tx_reader.send(filtered)
+                        && let Ok(receiver_count) = broadcast_tx_reader.send(SequencedChunk {
+                            cursor: chunk_cursor,
+                            bytes: filtered.clone(),
+                        })
                     {
                         trace!(
                             session_id = %reader_session_id,

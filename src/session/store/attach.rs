@@ -9,7 +9,7 @@ use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc::error::TrySendError};
 use tracing::{debug, warn};
 
-use crate::session::SessionEvent;
+use crate::session::{SessionEvent, runtime::SequencedChunk};
 
 use super::super::{
     SessionError,
@@ -49,7 +49,7 @@ impl SessionStore {
         (
             Vec<(u64, Bytes)>,
             u64,
-            broadcast::Receiver<Bytes>,
+            broadcast::Receiver<SequencedChunk>,
             bool,
             bool,
         ),
@@ -96,8 +96,16 @@ impl SessionStore {
     pub async fn attach_snapshot_init(
         &self,
         id: &str,
-    ) -> std::result::Result<(Vec<u8>, u64, broadcast::Receiver<Bytes>, bool, bool), SessionError>
-    {
+    ) -> std::result::Result<
+        (
+            Vec<u8>,
+            u64,
+            broadcast::Receiver<SequencedChunk>,
+            bool,
+            bool,
+        ),
+        SessionError,
+    > {
         let handle = self.lookup_runtime(id).await?;
         let rt = handle.read();
         let snapshot = rt.attach_snapshot_bytes();

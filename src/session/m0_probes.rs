@@ -147,8 +147,8 @@ fn probe_daemon_backend_echo_roundtrip() {
     std::thread::spawn(move || {
         loop {
             match broadcast_rx.blocking_recv() {
-                Ok(bytes) => {
-                    if echo_tx.send(bytes.to_vec()).is_err() {
+                Ok(chunk) => {
+                    if echo_tx.send(chunk.bytes.to_vec()).is_err() {
                         break;
                     }
                 }
@@ -205,12 +205,20 @@ fn probe_shadow_journal_records_output_in_order() {
         .expect("spawn probe session");
 
     let mut broadcast_rx = runtime.read().broadcast_tx.subscribe();
+    // Every broadcast chunk must carry the cursor of its journal record,
+    // strictly increasing (one read = one record = one chunk).
+    let seen_cursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let bridge_cursors = seen_cursors.clone();
     let (echo_tx, echo_rx) = std_mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         loop {
             match broadcast_rx.blocking_recv() {
-                Ok(bytes) => {
-                    if echo_tx.send(bytes.to_vec()).is_err() {
+                Ok(chunk) => {
+                    let cursor = chunk
+                        .cursor
+                        .expect("journaled session tags every broadcast chunk");
+                    bridge_cursors.lock().unwrap().push(cursor.seq);
+                    if echo_tx.send(chunk.bytes.to_vec()).is_err() {
                         break;
                     }
                 }
@@ -360,6 +368,24 @@ fn probe_shadow_journal_records_output_in_order() {
     assert!(
         last_output_seq < close.seq,
         "all output must be sequenced before the stream close"
+    );
+
+    // Broadcast cursors name real output records, in broadcast order.
+    let output_seqs: std::collections::BTreeSet<u64> = outcome
+        .records
+        .iter()
+        .filter(|r| r.kind == RecordKind::Output)
+        .map(|r| r.seq)
+        .collect();
+    let cursors = seen_cursors.lock().unwrap();
+    assert!(!cursors.is_empty(), "probe received broadcast chunks");
+    assert!(
+        cursors.windows(2).all(|w| w[0] < w[1]),
+        "broadcast cursors strictly increase: {cursors:?}"
+    );
+    assert!(
+        cursors.iter().all(|seq| output_seqs.contains(seq)),
+        "every broadcast cursor names a journaled output record"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

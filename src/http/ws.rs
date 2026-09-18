@@ -361,26 +361,26 @@ async fn handle_ws_streaming(
             // PTY output from broadcast channel.
             chunk = broadcast_rx.recv() => {
                 match chunk {
-                    Ok(mut filtered) => {
+                    Ok(mut chunk) => {
                         // Coalesce every chunk the reader has already produced
                         // into one WebSocket frame, so a burst of output costs
                         // one send instead of one per 64 KiB read.
                         let mut coalesced: Option<Vec<u8>> = None;
-                        while coalesced.as_ref().map_or(filtered.len(), Vec::len)
+                        while coalesced.as_ref().map_or(chunk.bytes.len(), Vec::len)
                             < MAX_COALESCED_CHUNK_BYTES
                         {
                             let Ok(next) = broadcast_rx.try_recv() else {
                                 break;
                             };
                             let buffer = coalesced
-                                .get_or_insert_with(|| filtered.as_ref().to_vec());
-                            buffer.extend_from_slice(&next);
+                                .get_or_insert_with(|| chunk.bytes.as_ref().to_vec());
+                            buffer.extend_from_slice(&next.bytes);
                         }
-                        let batch_len = coalesced.as_ref().map_or(filtered.len(), Vec::len);
+                        let batch_len = coalesced.as_ref().map_or(chunk.bytes.len(), Vec::len);
 
                         if batch_len > 0 {
                             let data = coalesced
-                                .unwrap_or_else(|| std::mem::take(&mut filtered).into());
+                                .unwrap_or_else(|| std::mem::take(&mut chunk.bytes).into());
                             let msg = ServerMessage::Data { data };
                             if !send_server_message(&mut socket, &msg).await {
                                 let _ = state.store.attach_detach(&id).await;
