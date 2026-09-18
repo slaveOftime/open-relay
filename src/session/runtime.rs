@@ -29,10 +29,7 @@ use super::journal::{self, LifecycleCode, ShadowJournal};
 use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
 use super::scan::{PtyScanner, ScanOut};
 
-use super::{
-    MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus,
-    persist::{append_event, append_resize_event},
-};
+use super::{MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus};
 use crate::terminal::{EngineEvent, Terminal};
 
 // ---------------------------------------------------------------------------
@@ -556,18 +553,6 @@ impl SessionRuntime {
             notifications_enabled = enabled,
             "session notification setting updated"
         );
-        let event = if enabled {
-            "notifications enabled"
-        } else {
-            "notifications disabled"
-        };
-        if let Err(err) = append_event(&self.dir, event) {
-            warn!(
-                session_id = %self.meta.id,
-                %err,
-                "failed to persist notification-setting event"
-            );
-        }
     }
 
     /// Returns `true` when at least one attach subscriber is currently live.
@@ -652,9 +637,8 @@ impl SessionRuntime {
             ),
             other => format!("session ended status={}", other.as_str()),
         };
-        if let Err(err) = append_event(&self.dir, &event) {
-            warn!(session_id = %self.meta.id, %err, "failed to persist PTY session completion event");
-        }
+        // M6-2: the completion fact lives only in the journal (events.log
+        // is retired); `event` remains the human-readable detail below.
         // The end fact is a stream-positioned event too: journal it once,
         // after the final state is set.
         if newly_ended {
@@ -941,7 +925,6 @@ pub fn spawn_session(
 ) -> Result<Arc<RwLock<SessionRuntime>>> {
     meta.notifications_enabled = notifications_enabled;
     let full_dir = session_dir;
-    let reader_dir = full_dir.clone();
     info!(
         session_id = %meta.id,
         command = %meta.command,
@@ -1047,16 +1030,12 @@ pub fn spawn_session(
     let runtime_child = RuntimeChild::Pty(child);
     meta.pid = runtime_child.process_id();
 
-    // M3-1c2: output.log is retired; the journal (opened above) is the
-    // canonical persisted stream.
-    append_event(&full_dir, "session created")?;
-    append_resize_event(&full_dir, 0, rows, cols)?;
-
+    // The journal (opened above) is the canonical persisted stream
+    // (M3-1c2 retired output.log; M6-2 retired events.log).
     let started_pid = meta
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "?".to_string());
-    append_event(&full_dir, &format!("session started pid={started_pid}"))?;
 
     // M3-1: the journal is becoming the canonical stream (ADR-0002), so it
     // was opened — loudly — before the PTY spawn above; here we only record
@@ -1167,9 +1146,6 @@ pub fn spawn_session(
     let reader_session_id = meta.id.clone();
     std::thread::spawn(move || {
         debug!(session_id = %reader_session_id, "PTY reader thread started");
-        if let Err(err) = append_event(&reader_dir, "pty reader started") {
-            warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader start event");
-        }
         let mut buf = vec![0u8; PTY_READ_BUFFER_BYTES];
         let mut reader = reader;
         let mut scanner = PtyScanner::new();
@@ -1181,9 +1157,6 @@ pub fn spawn_session(
             match reader.read(&mut buf) {
                 Ok(0) => {
                     debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
-                    if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
-                        warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
-                    }
                     break "pty output closed (eof)".to_string();
                 }
                 Ok(n) => {
@@ -1244,9 +1217,7 @@ pub fn spawn_session(
                     };
 
                     if let Some(detail) = journal_stop {
-                        if let Err(err) = append_event(&reader_dir, &detail) {
-                            warn!(session_id = %reader_session_id, %err, "failed to persist journal-failure event");
-                        }
+                        warn!(session_id = %reader_session_id, %detail, "journal failure closes the reader");
                         break detail;
                     }
 
@@ -1314,11 +1285,6 @@ pub fn spawn_session(
                 }
                 Err(err) => {
                     warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
-                    if let Err(append_err) =
-                        append_event(&reader_dir, &format!("pty reader error: {err}"))
-                    {
-                        warn!(session_id = %reader_session_id, %append_err, "failed to persist PTY reader error event");
-                    }
                     break format!("pty read error: {err}");
                 }
             }

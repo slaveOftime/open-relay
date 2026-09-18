@@ -183,10 +183,10 @@ fn probe_daemon_backend_echo_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// M1 dev verification: with `OLY_JOURNAL=1` the runtime sequences every
-/// canonical output chunk it also appends to `output.log`, plus the
-/// initial geometry/start facts, mid-stream resizes and the end fact —
-/// all in one contiguous per-incarnation order.
+/// M1 dev verification: the runtime sequences every canonical output
+/// chunk to the journal, plus the initial geometry/start facts,
+/// mid-stream resizes and the end fact — all in one contiguous
+/// per-incarnation order.
 ///
 /// Ignored and run individually — it mutates the process-global
 /// `OLY_JOURNAL` env var, which is only safe when this probe runs alone:

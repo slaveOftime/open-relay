@@ -15,11 +15,7 @@ use tracing::{debug, warn};
 
 use crate::session::{SessionEvent, runtime::SequencedChunk};
 
-use super::super::{
-    SessionError, journal,
-    persist::{self, append_resize_event, read_output_from},
-    replay,
-};
+use super::super::{SessionError, journal, replay};
 use super::{
     ATTACH_INPUT_OUTPUT_POLL_INTERVAL, ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT, SessionHandle,
     SessionStore,
@@ -67,17 +63,12 @@ impl SessionStore {
         viewport: Option<(u16, u16)>,
     ) -> std::result::Result<AttachRegistration, SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        let (attachment_id, outcome, resized) = {
+        let (attachment_id, outcome, _resized) = {
             let mut rt = handle.write();
             rt.register_attachment(kind, request, viewport)
         };
-        if resized {
-            let rt = handle.read();
-            let offset = rt.filtered_stream_len();
-            if let Some((rows, cols)) = viewport {
-                let _ = super::super::persist::append_resize_event(&rt.dir, offset, rows, cols);
-            }
-        }
+        // M6-2: resize geometry is journaled by resize_pty itself; no
+        // separate events.log record.
         debug!(
             session_id = id,
             attachment_id,
@@ -165,20 +156,20 @@ impl SessionStore {
             )
         };
         let offset = from_byte_offset.unwrap_or(0);
-        // M3-1b: the filtered display stream is derived from the raw
-        // journal; `output.log` is only a legacy fallback for sessions
-        // started before the journal became always-on (removed in M6).
-        let (data, end_offset) = if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
-            replay::filtered_stream_from(&dir, offset).map_err(|err| {
-                warn!(session_id = id, %err, "failed to derive attach output from the journal");
-                SessionError::Evicted
-            })?
-        } else {
-            read_output_from(&dir, offset).map_err(|err| {
-                warn!(session_id = id, %err, "failed to read persisted attach output");
-                SessionError::Evicted
-            })?
-        };
+        // The filtered display stream is derived from the raw journal
+        // (M3-1b); sessions without a journal are pre-1.0 and unsupported
+        // (M6-2 removed the output.log fallback; see MIGRATION.md).
+        if !dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
+            warn!(
+                session_id = id,
+                "session has no journal (pre-1.0 log format)"
+            );
+            return Err(SessionError::Evicted);
+        }
+        let (data, end_offset) = replay::filtered_stream_from(&dir, offset).map_err(|err| {
+            warn!(session_id = id, %err, "failed to derive attach output from the journal");
+            SessionError::Evicted
+        })?;
         let chunks = if data.is_empty() {
             Vec::new()
         } else {
@@ -306,8 +297,6 @@ impl SessionStore {
                 .persisted_stream_len_cache
                 .insert(id.to_string(), (incarnation, len));
             Some(len)
-        } else if dir.join("output.log").is_file() {
-            Some(persist::current_output_offset(&dir))
         } else {
             None
         }
@@ -572,9 +561,7 @@ impl SessionStore {
             rows, cols, resized, "attach resize requested"
         );
         if resized {
-            let rt = handle.read();
-            let offset = rt.filtered_stream_len();
-            let _ = append_resize_event(&rt.dir, offset, rows, cols);
+            // Geometry is journaled by resize_pty (M6-2: no events.log).
             Ok(())
         } else {
             Err(SessionError::Evicted)
@@ -582,20 +569,15 @@ impl SessionStore {
     }
 }
 
-/// One bounded window of the persisted filtered display stream (I7).
-/// Shared by the live-runtime and persisted fallback paths so both read
-/// the same canonical bytes: the journal when present, legacy
-/// `output.log` otherwise (the split is removed in M6).
+/// One bounded window of the persisted filtered display stream (I7),
+/// derived from the journal. Shared by the live-runtime and persisted
+/// fallback paths so both read the same canonical bytes.
 fn read_filtered_window(
     dir: &Path,
     from: u64,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, String> {
-    if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
-        replay::filtered_stream_window(dir, from, max_bytes).map_err(|err| err.to_string())
-    } else {
-        persist::read_output_window(dir, from, max_bytes).map_err(|err| err.to_string())
-    }
+    replay::filtered_stream_window(dir, from, max_bytes).map_err(|err| err.to_string())
 }
 
 /// The result of registering an attachment (M3-4).

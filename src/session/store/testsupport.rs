@@ -17,6 +17,36 @@ use crate::session::{SessionMeta, SessionStatus};
 
 use super::{SessionHandle, SessionStore};
 
+/// Seed a fresh session dir with a journal holding `data` as one output
+/// record — the M6-2 replacement for legacy `output.log` fixtures. For
+/// repeated appends keep one journal open and use [`sync_journal`]
+/// instead; each `ShadowJournal::open` starts a new incarnation.
+pub(crate) fn seed_journal_output(dir: &std::path::Path, data: &[u8]) {
+    let (mut journal, _, _) =
+        crate::session::journal::ShadowJournal::open(dir).expect("open seed journal");
+    journal
+        .record_output(bytes::Bytes::copy_from_slice(data))
+        .expect("record seed output");
+    sync_journal(&mut journal, 1);
+}
+
+/// Block until the journal is durable up to `expected_seq` (test helper).
+pub(crate) fn sync_journal(
+    journal: &mut crate::session::journal::ShadowJournal,
+    expected_seq: u64,
+) {
+    journal.request_sync();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while journal.core.durable_seq() < expected_seq {
+        journal.poll_acks();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seed journal sync timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 pub(crate) fn make_runtime(
     id: &str,
     status: SessionStatus,
@@ -28,8 +58,7 @@ pub(crate) fn make_runtime(
     let dir = std::env::temp_dir().join(format!("oly_store_test_{id}_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create runtime test dir");
     if !excerpt.is_empty() {
-        crate::session::persist::append_output_raw(&dir, excerpt.as_bytes())
-            .expect("persist runtime excerpt");
+        seed_journal_output(&dir, excerpt.as_bytes());
     }
 
     let meta = SessionMeta {
@@ -272,7 +301,6 @@ pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
         info_file: PathBuf::from("."),
         lock_file: PathBuf::from("."),
         max_running_sessions,
-        max_output_log_bytes: 0,
         screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         notification_hook: None,
         runtime_overrides: Default::default(),

@@ -12,7 +12,6 @@ pub(crate) mod file;
 pub(crate) mod journal;
 pub mod logs;
 mod m0_probes;
-pub(crate) mod persist;
 pub mod pty;
 // M3-1b: derive the canonical filtered display stream from the raw
 // journal (the read path that replaces `output.log`).

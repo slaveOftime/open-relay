@@ -22,7 +22,6 @@ use crate::{
 
 use super::super::{
     SessionMeta, SessionStatus, StartSpec,
-    persist::append_event,
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 use super::{
@@ -663,7 +662,6 @@ impl SessionStore {
                         age_seconds = now.duration_since(completed_at).as_secs(),
                         "evicting completed session from memory after eviction TTL"
                     );
-                    let _ = append_event(&rt.dir, "session evicted from memory");
                     evicted_ids.push(id.clone());
                 }
             }

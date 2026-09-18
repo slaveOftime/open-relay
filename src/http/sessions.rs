@@ -17,8 +17,7 @@ use crate::{
     session::{
         SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
-        logs::{read_persisted_log_page, read_resize_events, render_log_session},
-        persist::current_output_offset_by_id,
+        logs::{read_persisted_log_page, render_log_session},
     },
 };
 
@@ -411,15 +410,16 @@ pub async fn get_session(
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
             // M3-1c: journal-backed sessions report the derived filtered
-            // stream length; output.log stat remains for legacy sessions.
+            // stream length; pre-1.0 sessions report 0 (M6-2).
             let session_dir = state.config.get().sessions_dir.join(&id);
+            // M6-2: pre-1.0 sessions (no journal) report 0.
             let total_bytes = if session_dir
                 .join(crate::session::journal::JOURNAL_DIR_NAME)
                 .is_dir()
             {
                 crate::session::replay::filtered_stream_len(&session_dir).unwrap_or(0)
             } else {
-                current_output_offset_by_id(&state.config.get().sessions_dir, &id)
+                0
             };
             Json(meta_to_summary(&meta, false, total_bytes)).into_response()
         }
@@ -1116,7 +1116,7 @@ pub async fn get_logs(
             if let Ok(live_total) = state.store.read_live_log_chunk_count(&id).await {
                 total += live_total;
             }
-            let resizes = read_resize_events(&session_dir).unwrap_or_default();
+            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
             logs_response(LogsResponseBody {
                 offset,
                 chunks: lines,
@@ -1217,7 +1217,7 @@ pub async fn get_logs_tail(
     // Fall back to the persisted stream (journal-derived since M3-1c).
     match render_log_session(&session_dir, tail, true, term_cols, None) {
         Ok(output) => {
-            let resizes = read_resize_events(&session_dir).unwrap_or_default();
+            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
             logs_tail_binary_response(output, &resizes)
         }
         Err(err) => {

@@ -1010,7 +1010,6 @@ mod tests {
             notification_min_interval_seconds: 10,
             session_eviction_seconds: 15,
             max_running_sessions: 10,
-            max_output_log_bytes: 0,
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             notification_hook: None,
             runtime_overrides: Default::default(),

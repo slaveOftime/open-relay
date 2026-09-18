@@ -20,6 +20,7 @@ use std::path::Path;
 
 use super::journal::{self, JOURNAL_DIR_NAME, RecordKind};
 use super::scan::{PtyScanner, ScanOut};
+use crate::protocol::LogResize;
 
 /// Payload bytes of journal records consumed per derivation batch. Bounds
 /// memory while replaying; the scanner's concatenation is boundary
@@ -169,6 +170,61 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
     Ok((collected, filtered_pos))
 }
 
+/// Derive the resize history of the latest incarnation by walking the
+/// journal: one [`LogResize`] per resize record, where `offset` is the
+/// filtered-stream length at the moment the resize was recorded. This is
+/// the canonical resize source since M6-2 retired `events.log`; the
+/// journal is append-ordered with the output stream, so the offsets are
+/// derived, never stored, and cannot disagree with the stream.
+pub fn resize_events(session_dir: &Path) -> io::Result<Vec<LogResize>> {
+    let Some(incarnation) = latest_incarnation(session_dir)? else {
+        return Ok(Vec::new());
+    };
+
+    let mut scanner = PtyScanner::new();
+    let mut out = ScanOut::default();
+    let mut filtered_pos = 0u64;
+    let mut events = Vec::new();
+    let mut next_seq = 1u64;
+
+    loop {
+        let range = journal::read_range(
+            session_dir,
+            incarnation,
+            next_seq,
+            u64::MAX,
+            REPLAY_BATCH_BYTES,
+        )?;
+        if range.records.is_empty() {
+            break;
+        }
+        for record in &range.records {
+            match record.kind {
+                RecordKind::Output => {
+                    scanner.scan(&record.payload, &mut out);
+                    filtered_pos = filtered_pos.saturating_add(out.filtered.len() as u64);
+                }
+                RecordKind::Resize => {
+                    if let Some((rows, cols)) = journal::decode_resize_payload(&record.payload) {
+                        events.push(LogResize {
+                            offset: filtered_pos,
+                            rows,
+                            cols,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            next_seq = record.seq + 1;
+        }
+        if !range.truncated {
+            break;
+        }
+    }
+
+    Ok(events)
+}
+
 /// Bounded variant of [`filtered_stream_from`] (M3-5, I7): returns at most
 /// `max_bytes` of the filtered display stream starting at `from_offset`.
 /// Attach pumps use this to resync a lagged client in bounded windows
@@ -230,8 +286,8 @@ pub fn filtered_stream_window(
     Ok(collected)
 }
 
-/// Filtered-stream end offset of the latest incarnation (what
-/// `current_output_offset` reported from `output.log`).
+/// Filtered-stream end offset of the latest incarnation (the offset space
+/// attach cursors and resume tokens refer to).
 pub fn filtered_stream_len(session_dir: &Path) -> io::Result<u64> {
     Ok(filtered_stream_from(session_dir, u64::MAX)?.1)
 }

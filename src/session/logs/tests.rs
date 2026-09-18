@@ -7,8 +7,8 @@
 
 use super::index::LOG_RECORD_FALLBACK_BYTES;
 use super::index::{
-    parse_resize_event, read_persisted_log_page, read_relevant_resize_events, read_resize_events,
-    split_persisted_log_records, split_rendered_log_output, sync_persisted_log_index,
+    read_persisted_log_page, split_persisted_log_records, split_rendered_log_output,
+    sync_persisted_log_index, viewport_resize_plan,
 };
 use super::render::{
     format_history_rows, parser_cols, parser_rows, render_engine_screen, render_log_bytes,
@@ -16,7 +16,6 @@ use super::render::{
 };
 use super::{ViewportReplayPlan, ViewportSize};
 use crate::protocol::LogResize;
-use crate::session::persist::append_output_raw;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -240,43 +239,42 @@ fn falls_back_when_alt_screen_teardown_clears_final_output() {
 }
 
 #[test]
-fn parses_resize_events() {
-    let parsed = parse_resize_event("resize offset=42 rows=37 cols=105");
-
-    assert_eq!(
-        parsed,
-        Some(LogResize {
-            offset: 42,
-            rows: 37,
-            cols: 105,
-        })
-    );
-}
-
-#[test]
-fn reads_all_resize_events_from_events_log() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "oly-log-render-{}-{}",
+fn resize_events_are_derived_from_the_journal() {
+    let dir = std::env::temp_dir().join(format!(
+        "oly-resize-events-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos()
     ));
+    fs::create_dir_all(&dir).expect("create temp dir");
 
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    {
+        let (mut journal, _, _) =
+            crate::session::journal::ShadowJournal::open(&dir).expect("open journal");
+        journal.record_resize(24, 80).expect("initial resize");
+        journal
+            .record_output(bytes::Bytes::from_static(b"0123456789"))
+            .expect("output");
+        journal.record_resize(30, 90).expect("mid resize");
+        journal
+            .record_output(bytes::Bytes::from_static(b"0123456789"))
+            .expect("output");
+        journal.record_resize(37, 105).expect("late resize");
+        journal.request_sync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while journal.core.durable_seq() < 5 {
+            journal.poll_acks();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "journal sync timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
-    let log_path = temp_dir.join("output.log");
-    let events_path = temp_dir.join("events.log");
-
-    fs::write(&log_path, b"placeholder").expect("write output log");
-    fs::write(
-        &events_path,
-        b"resize offset=0 rows=24 cols=80\nresize offset=10 rows=30 cols=90\nresize offset=20 rows=37 cols=105\n",
-    )
-    .expect("write events log");
-
-    let resizes = read_resize_events(&temp_dir).expect("read resizes");
+    let resizes = crate::session::replay::resize_events(&dir).expect("read resizes");
 
     assert_eq!(
         resizes,
@@ -299,31 +297,35 @@ fn reads_all_resize_events_from_events_log() {
         ]
     );
 
-    let _ = fs::remove_dir_all(&temp_dir);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn keeps_last_resize_before_tail_and_future_resizes() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "oly-log-render-plan-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let events = vec![
+        LogResize {
+            offset: 0,
+            rows: 24,
+            cols: 80,
+        },
+        LogResize {
+            offset: 100,
+            rows: 30,
+            cols: 90,
+        },
+        LogResize {
+            offset: 140,
+            rows: 37,
+            cols: 105,
+        },
+        LogResize {
+            offset: 220,
+            rows: 50,
+            cols: 140,
+        },
+    ];
 
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-    let log_path = temp_dir.join("output.log");
-    let events_path = temp_dir.join("events.log");
-    fs::write(&log_path, b"placeholder").expect("write output log");
-    fs::write(
-        &events_path,
-        b"resize offset=0 rows=24 cols=80\nresize offset=100 rows=30 cols=90\nresize offset=140 rows=37 cols=105\nresize offset=220 rows=50 cols=140\n",
-    )
-    .expect("write events log");
-
-    let plan = read_relevant_resize_events(&log_path, 120, 200).expect("read relevant resizes");
+    let plan = viewport_resize_plan(&events, 120, 200);
 
     assert_eq!(
         plan,
@@ -340,8 +342,6 @@ fn keeps_last_resize_before_tail_and_future_resizes() {
             }],
         }
     );
-
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
@@ -446,12 +446,19 @@ fn persisted_log_page_rebuilds_index_after_append_output_raw() {
     let temp_dir = temp_session_dir("oly-log-index-lazy");
     fs::create_dir_all(&temp_dir).expect("create temp dir");
 
-    append_output_raw(&temp_dir, b"alpha").expect("write initial raw output");
+    fs::write(temp_dir.join("output.log"), b"alpha").expect("write initial raw output");
     let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial raw page");
     assert_eq!(lines, vec!["alpha".to_string()]);
     assert_eq!(total, 1);
 
-    append_output_raw(&temp_dir, b" beta\ngamma").expect("append raw output continuation");
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(temp_dir.join("output.log"))
+            .expect("open raw output");
+        file.write_all(b" beta\ngamma").expect("append raw output");
+    }
     let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended raw page");
     assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
     assert_eq!(total, 2);

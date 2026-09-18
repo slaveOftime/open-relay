@@ -6,7 +6,7 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use crate::{
     error::Result,
     protocol::{ListQuery, PushSubscriptionInput, PushSubscriptionRecord, SessionSummary},
-    session::{SessionMeta, SessionStatus, persist::current_output_offset_by_id},
+    session::{SessionMeta, SessionStatus},
 };
 
 // ---------------------------------------------------------------------------
@@ -173,15 +173,15 @@ impl Database {
 
     pub fn session_output_offset(&self, id: &str) -> u64 {
         let session_dir = self.sessions_dir.join(id);
-        // M3-1c: journal-backed sessions report the derived filtered stream
-        // length; output.log stat remains for legacy sessions.
+        // M6-2: only journal-backed sessions have a stream; pre-1.0
+        // sessions report 0 (see MIGRATION.md).
         if session_dir
             .join(crate::session::journal::JOURNAL_DIR_NAME)
             .is_dir()
         {
             return crate::session::replay::filtered_stream_len(&session_dir).unwrap_or(0);
         }
-        current_output_offset_by_id(&self.sessions_dir, id)
+        0
     }
 
     /// `<sessions_dir>/<id>` without an existence check — the sync

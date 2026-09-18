@@ -590,7 +590,6 @@ mod tests {
     use super::*;
     use crate::session::{
         SessionStatus,
-        persist::append_output_raw,
         runtime::{SequencedChunk, SessionRuntime},
     };
     use bytes::Bytes;
@@ -812,10 +811,10 @@ mod tests {
 
     #[tokio::test]
     async fn resume_with_stale_incarnation_is_rejected() {
-        let (store, _rt) = running_store("pump3", "x").await;
-        // The fixture runtime has no live journal, so every resume cursor is
-        // stale: both a wrong incarnation and a missing one are refused
-        // instead of streaming from an inferred offset.
+        // No seeded excerpt: the fixture has no journal at all, so every
+        // resume cursor is stale — both a wrong incarnation and a missing
+        // one are refused instead of streaming from an inferred offset.
+        let (store, _rt) = running_store("pump3", "").await;
         let result =
             AttachPump::subscribe(&store, "pump3", Some(0), Some(1), PumpCredit::Uncredited).await;
         let err = match result {
@@ -902,7 +901,7 @@ mod tests {
         // Bytes 0..5 exist only in the persisted stream (the ring entries
         // carrying them were lost); the next broadcast chunk starts at 5.
         let dir = rt.read().dir.clone();
-        append_output_raw(&dir, b"01234").unwrap();
+        super::super::testsupport::seed_journal_output(&dir, b"01234");
         let _ = rt.read().broadcast_tx.send(SequencedChunk {
             cursor: None,
             offset: 5,
@@ -943,11 +942,12 @@ mod tests {
 
         // Overflow the small broadcast ring (capacity 4 in the fixture) with
         // six chunks, each also persisted so the resync can replay them.
-        let dir = rt.read().dir.clone();
-        for i in 0..6u8 {
-            let bytes = [b'0' + i];
-            append_output_raw(&dir, &bytes).unwrap();
-            emit(&rt, &bytes);
+        {
+            let dir = rt.read().dir.clone();
+            super::super::testsupport::seed_journal_output(&dir, b"012345");
+            for i in 0..6u8 {
+                emit(&rt, &[b'0' + i]);
+            }
         }
 
         match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
@@ -1008,17 +1008,27 @@ mod tests {
             }
         }
 
-        /// Feed one chunk exactly as the reader does, and persist it so a
-        /// lagging pump can resync (the fixture uses the legacy output.log
-        /// fallback for reads).
-        fn emit_persisted(rt: &Arc<RwLock<SessionRuntime>>, bytes: &[u8]) {
-            let dir = rt.read().dir.clone();
-            append_output_raw(&dir, bytes).unwrap();
+        /// Feed one chunk exactly as the reader does: journal first
+        /// (durable before broadcast, ADR-0002), then broadcast.
+        fn emit_persisted(
+            journal: &mut crate::session::journal::ShadowJournal,
+            seq: &mut u64,
+            rt: &Arc<RwLock<SessionRuntime>>,
+            bytes: &[u8],
+        ) {
+            journal
+                .record_output(Bytes::copy_from_slice(bytes))
+                .expect("record output");
+            *seq += 1;
+            super::super::testsupport::sync_journal(journal, *seq);
             emit(rt, bytes);
         }
 
         let (rt, mut writer_rx) = make_runtime_writable("stress1", SessionStatus::Running);
         let store = Arc::new(store_with(vec![Arc::clone(&rt)], make_test_db().await));
+        let (mut journal, _, _) = crate::session::journal::ShadowJournal::open(&rt.read().dir)
+            .expect("open fixture journal");
+        let mut journal_seq = 0u64;
 
         // Ten attachments, alternating kinds: the first takes the control
         // lease, the rest join as observers (many observers, one
@@ -1054,7 +1064,7 @@ mod tests {
                     )
                     .into_bytes();
                     total.extend_from_slice(&chunk);
-                    emit_persisted(&rt, &chunk);
+                    emit_persisted(&mut journal, &mut journal_seq, &rt, &chunk);
                 }
             }
             let (pump, init) =
@@ -1082,7 +1092,7 @@ mod tests {
                 chunk.extend_from_slice(b"\x1b[?25l"); // mode flip mid-stream
             }
             total.extend_from_slice(&chunk);
-            emit_persisted(&rt, &chunk);
+            emit_persisted(&mut journal, &mut journal_seq, &rt, &chunk);
 
             // Group A (0..5) keeps up every step; group B (5..10) polls
             // only every 7 steps so its ring overflows and it resyncs from

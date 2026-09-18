@@ -11,7 +11,9 @@ use std::path::Path;
 use crate::error::Result;
 use crate::terminal::Terminal;
 
-use super::index::{read_relevant_resize_events, read_tail_bytes};
+#[cfg(test)]
+use super::index::read_tail_bytes;
+use super::index::viewport_resize_plan;
 use super::{OUTPUT_COLOR_RESET_SUFFIX, RenderBytes, ViewportReplayPlan, ViewportSize};
 
 /// Wide parser column count — prevents any line wrapping inside the engine
@@ -23,8 +25,9 @@ const PARSER_COLS: u16 = 2000;
 const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 
 /// Render a session's persisted output for `oly logs` / the HTTP tail
-/// endpoint. Journal-backed sessions render the derived filtered stream
-/// (M3-1c); legacy pre-journal sessions fall back to `output.log`.
+/// endpoint from the journal-derived filtered stream. Pre-1.0 sessions
+/// that only have `output.log` are rejected (M6-2 removed the fallback;
+/// see MIGRATION.md).
 pub fn render_log_session(
     session_dir: &Path,
     tail: usize,
@@ -36,13 +39,11 @@ pub fn render_log_session(
         .join(crate::session::journal::JOURNAL_DIR_NAME)
         .is_dir()
     {
-        return render_log_file(
-            &session_dir.join("output.log"),
-            tail,
-            keep_color,
-            term_cols,
-            viewport,
-        );
+        return Err(crate::error::AppError::Protocol(format!(
+            "session log in {} uses the pre-1.0 format (output.log) and is no \
+             longer readable; export it with a 0.x build first, see MIGRATION.md",
+            session_dir.display()
+        )));
     }
 
     let (bytes, end) = crate::session::replay::filtered_stream_from(session_dir, 0)?;
@@ -51,11 +52,10 @@ pub fn render_log_session(
     let viewport_plan = if viewport.is_some() {
         ViewportReplayPlan::default()
     } else {
-        read_relevant_resize_events(
-            &session_dir.join("output.log"),
-            tail_bytes.start_offset,
-            tail_bytes.end_offset,
-        )?
+        // M6-2: resize history is derived from the journal (append-ordered
+        // with output), not the retired events.log.
+        let resizes = crate::session::replay::resize_events(session_dir)?;
+        viewport_resize_plan(&resizes, tail_bytes.start_offset, tail_bytes.end_offset)
     };
 
     Ok(render_log_bytes(
@@ -68,6 +68,9 @@ pub fn render_log_session(
     ))
 }
 
+/// Renders a standalone stream file. Used by the transcript golden tests;
+/// kept because the byte pipeline is shared with journal rendering.
+#[cfg(test)]
 pub fn render_log_file(
     log_path: &Path,
     tail: usize,
@@ -78,11 +81,9 @@ pub fn render_log_file(
     // Step 1: seek to a position that gives `tail * 2` lines worth of bytes,
     // providing enough context for the replay engine even with heavy escape usage.
     let tail_bytes = read_tail_bytes(log_path, tail)?;
-    let viewport_plan = if viewport.is_some() {
-        ViewportReplayPlan::default()
-    } else {
-        read_relevant_resize_events(log_path, tail_bytes.start_offset, tail_bytes.end_offset)?
-    };
+    // A standalone stream file has no journal, hence no resize history.
+    let viewport_plan = ViewportReplayPlan::default();
+    let _ = viewport.is_some();
 
     Ok(render_log_bytes(
         &tail_bytes.bytes,

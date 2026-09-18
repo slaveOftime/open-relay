@@ -83,7 +83,7 @@ pub async fn run_logs(
 
 /// M5-6 safe export: the original output byte stream, exported only on
 /// explicit request. Rendered `oly logs` (plain or `--keep-color`) is
-/// sanitized by the vt100 round-trip — control sequences are interpreted,
+/// sanitized by the engine round-trip — control sequences are interpreted,
 /// never re-emitted, and hyperlink escape codes are dropped — while `--raw`
 /// returns the exact child bytes and therefore warns on a TTY. Local disk
 /// read: the journal is the source of truth and is written before output is
@@ -97,20 +97,15 @@ fn run_logs_raw(config: &AppConfig, id: &str, node: Option<String>) -> Result<()
 
     let session_dir = config.sessions_dir.join(id);
     let journal_dir = session_dir.join(crate::session::journal::JOURNAL_DIR_NAME);
-    let bytes = if journal_dir.is_dir() {
-        crate::session::replay::filtered_stream_from(&session_dir, 0)
-            .map_err(|err| AppError::Protocol(format!("raw export failed for {id}: {err}")))?
-            .0
-    } else {
-        // Legacy pre-journal session: the raw stream is output.log itself.
-        let log_path = session_dir.join("output.log");
-        std::fs::read(&log_path).map_err(|err| {
-            AppError::Protocol(format!(
-                "no journal or log file in {}: {err}",
-                session_dir.display()
-            ))
-        })?
-    };
+    if !journal_dir.is_dir() {
+        return Err(AppError::Protocol(format!(
+            "session {id} uses the pre-1.0 log format (output.log); export it \
+             with a 0.x build first, see MIGRATION.md"
+        )));
+    }
+    let bytes = crate::session::replay::filtered_stream_from(&session_dir, 0)
+        .map_err(|err| AppError::Protocol(format!("raw export failed for {id}: {err}")))?
+        .0;
 
     let mut stdout = std::io::stdout();
     if stdout.is_terminal() {
@@ -161,13 +156,12 @@ async fn run_logs_local(
     };
     let session_dir = config.sessions_dir.join(id);
 
-    let has_journal = session_dir
+    if !session_dir
         .join(crate::session::journal::JOURNAL_DIR_NAME)
-        .is_dir();
-    if !has_journal && !session_dir.join("output.log").exists() {
+        .is_dir()
+    {
         return Err(AppError::Protocol(format!(
-            "no journal or log file in {}",
-            session_dir.display()
+            "session {id} has no journal (pre-1.0 log format); see MIGRATION.md"
         )));
     }
 

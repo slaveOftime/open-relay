@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{error::Result, protocol::LogResize};
+#[cfg(test)]
+use crate::error::Result;
+use crate::protocol::LogResize;
 
 use super::{ESCAPE_BYTE, OUTPUT_COLOR_RESET_SUFFIX, ViewportReplayPlan};
 
@@ -635,6 +637,7 @@ fn is_alt_screen_toggle(params: &[u8], final_byte: u8) -> bool {
 /// If the seek position doesn't land at byte 0, the first partial line is
 /// dropped to avoid feeding truncated ANSI escape sequences into a downstream
 /// parser (which can corrupt subsequent color state).
+#[cfg(test)]
 pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes> {
     let mut file = File::open(log_path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
@@ -731,39 +734,20 @@ pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
     }
 }
 
-pub fn read_resize_events(session_dir: &Path) -> Result<Vec<LogResize>> {
-    let events_path = session_dir.join("events.log");
-    let Ok(file) = File::open(events_path) else {
-        return Ok(Vec::new());
-    };
-
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(event) = parse_resize_event(&line) {
-            events.push(event);
-        }
-    }
-
-    Ok(events)
-}
-
-pub(super) fn read_relevant_resize_events(
-    log_path: &Path,
+/// Pick the resize records relevant to replaying the stream window
+/// `[start_offset, end_offset)`: the geometry in effect at `start_offset`
+/// plus every resize inside the window, rebased to window-relative
+/// offsets. Pure derivation over journal-sourced resize events (M6-2).
+pub(super) fn viewport_resize_plan(
+    events: &[LogResize],
     start_offset: u64,
     end_offset: u64,
-) -> Result<ViewportReplayPlan> {
-    let Some(session_dir) = log_path.parent() else {
-        return Ok(ViewportReplayPlan::default());
-    };
-
+) -> ViewportReplayPlan {
     let mut initial = None;
     let mut resizes = Vec::new();
-    for event in read_resize_events(session_dir)? {
+    for event in events {
         if event.offset <= start_offset {
-            initial = Some(event);
+            initial = Some(*event);
         } else if event.offset <= end_offset {
             resizes.push(LogResize {
                 offset: event.offset.saturating_sub(start_offset),
@@ -775,32 +759,5 @@ pub(super) fn read_relevant_resize_events(
         }
     }
 
-    Ok(ViewportReplayPlan { initial, resizes })
-}
-
-pub(super) fn parse_resize_event(line: &str) -> Option<LogResize> {
-    let mut offset = None;
-    let mut rows = None;
-    let mut cols = None;
-
-    let mut parts = line.split_ascii_whitespace();
-    if parts.next()? != "resize" {
-        return None;
-    }
-
-    for part in parts {
-        let (key, value) = part.split_once('=')?;
-        match key {
-            "offset" => offset = value.parse::<u64>().ok(),
-            "rows" => rows = value.parse::<u16>().ok().map(|row| row.max(1)),
-            "cols" => cols = value.parse::<u16>().ok().map(|col| col.max(1)),
-            _ => {}
-        }
-    }
-
-    Some(LogResize {
-        offset: offset?,
-        rows: rows?,
-        cols: cols?,
-    })
+    ViewportReplayPlan { initial, resizes }
 }

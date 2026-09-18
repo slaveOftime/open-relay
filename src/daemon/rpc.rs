@@ -14,7 +14,7 @@ use crate::{
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
-        logs::{read_persisted_log_page, read_resize_events, render_log_session},
+        logs::{read_persisted_log_page, render_log_session},
     },
 };
 
@@ -537,7 +537,7 @@ async fn handle_logs_tail(
         }
     };
 
-    let resizes = match read_resize_events(&session_dir) {
+    let resizes = match crate::session::replay::resize_events(&session_dir) {
         Ok(resizes) => resizes,
         Err(err) => {
             return RpcResponse::Error {
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logs_tail_falls_back_to_persisted_file_for_stopped_sessions() {
+    async fn logs_tail_reads_the_journal_for_stopped_sessions() {
         let db_path = temp_path("oly-logs-tail", "db");
         let sessions_dir = temp_path("oly-logs-tail-sessions", "dir");
         std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
@@ -705,11 +705,11 @@ mod tests {
 
         let session_dir = sessions_dir.join(&meta.id);
         std::fs::create_dir_all(&session_dir).expect("create session dir");
-        std::fs::write(
-            session_dir.join("output.log"),
+        // M6-2: the persisted stream lives only in the journal.
+        crate::session::store::testsupport::seed_journal_output(
+            &session_dir,
             b"\x1b[1;1Hpersisted one\x1b[2;1Hpersisted two",
-        )
-        .expect("write output log");
+        );
 
         let response = handle_logs_tail(meta.id.clone(), 10, 80, false, false, &store, &db).await;
 
@@ -828,8 +828,7 @@ mod tests {
         #[tokio::test]
         async fn session_cursor_reports_offset_and_liveness() {
             let (rt, _writer_rx) = make_runtime_writable("cursor01", SessionStatus::Running);
-            crate::session::persist::append_output_raw(&rt.read().dir, b"hello world")
-                .expect("seed output");
+            crate::session::store::testsupport::seed_journal_output(&rt.read().dir, b"hello world");
             rt.write().filtered_total_bytes = 11;
             let store = Arc::new(store_with(vec![rt], make_test_db().await));
 
@@ -846,8 +845,8 @@ mod tests {
             assert!(running);
             assert_eq!(exit_code, None);
             assert_eq!(offset, 11);
-            // No journal on the legacy-fallback fixture: no incarnation.
-            assert_eq!(incarnation, None);
+            // The seeded fixture journal is incarnation 1.
+            assert_eq!(incarnation, Some(1));
 
             let missing = handle_session_cursor("nope".into(), &store).await;
             assert!(matches!(missing, RpcResponse::Error { .. }));
@@ -856,8 +855,7 @@ mod tests {
         #[tokio::test]
         async fn observe_window_returns_bounded_slice_and_resume_offset() {
             let (rt, _writer_rx) = make_runtime_writable("window01", SessionStatus::Running);
-            crate::session::persist::append_output_raw(&rt.read().dir, b"hello world")
-                .expect("seed output");
+            crate::session::store::testsupport::seed_journal_output(&rt.read().dir, b"hello world");
             rt.write().filtered_total_bytes = 11;
             let store = Arc::new(store_with(vec![rt], make_test_db().await));
 
@@ -1311,7 +1309,7 @@ async fn handle_logs_pagination(
             if let Ok(live_total) = session_store.read_live_log_chunk_count(&id).await {
                 total += live_total;
             }
-            let resizes = read_resize_events(&session_dir).unwrap_or_default();
+            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
             RpcResponse::LogsPagination {
                 offset,
                 lines,
