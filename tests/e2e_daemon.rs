@@ -657,6 +657,213 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     drop(secondary_restart);
 }
 
+#[cfg(unix)]
+#[test]
+fn e2e_federation_attach_streams_input_through_the_relay() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let primary_tmp = make_tmp_dir("e2e_fed_attach_primary");
+    let secondary_tmp = make_tmp_dir("e2e_fed_attach_secondary");
+    let port = pick_free_port();
+
+    let _primary = start_daemon_http(&primary_tmp, port);
+    let _secondary = start_daemon(&secondary_tmp);
+
+    let add = oly_cmd(&primary_tmp)
+        .args(["api-key", "add", "fedkey"])
+        .output()
+        .expect("`oly api-key add` failed to execute");
+    assert!(add.status.success());
+    let key = String::from_utf8_lossy(&add.stdout)
+        .lines()
+        .last()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+
+    let join = oly_cmd(&secondary_tmp)
+        .args([
+            "join",
+            "start",
+            "--name",
+            "worker1",
+            "--key",
+            &key,
+            &format!("http://127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("`oly join start` failed to execute");
+    assert!(join.status.success());
+
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    assert!(rt.block_on(wait_for_node_connected(port, "worker1", 10)));
+
+    // A live echo session on the secondary.
+    let start = oly_cmd(&primary_tmp)
+        .args(["start", "--detach", "--node", "worker1", "cat"])
+        .output()
+        .expect("`oly start --node` failed to execute");
+    assert!(
+        start.status.success(),
+        "`oly start --node cat` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let session_id = String::from_utf8_lossy(&start.stdout).trim().to_string();
+    assert_eq!(session_id.len(), 7);
+
+    // Drive the primary's streaming IPC directly: subscribe (controller,
+    // credited), then send input and applied-cursor credits mid-stream.
+    // Without the M5-2 relay channel these messages could not reach the
+    // owning node's stream task at all.
+    rt.block_on(async {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        // The daemon's IPC socket is abstract-namespaced on Linux: connect
+        // with the same interprocess naming the client uses.
+        use interprocess::local_socket::{
+            GenericNamespaced, prelude::*, traits::tokio::Stream as _,
+        };
+        let name = socket_name_for_tmp(&primary_tmp)
+            .to_ns_name::<GenericNamespaced>()
+            .expect("socket name");
+        let connect_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let stream = loop {
+            match interprocess::local_socket::tokio::Stream::connect(name.clone()).await {
+                Ok(stream) => break stream,
+                Err(err) => {
+                    assert!(
+                        std::time::Instant::now() < connect_deadline,
+                        "connect primary IPC socket: {err}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read_half).lines();
+
+        // IPC frames are versioned envelopes: {"version":11,"payload":{...}}.
+        let envelope = |payload: serde_json::Value| json!({"version": 11, "payload": payload});
+        let subscribe = envelope(json!({
+            "type": "node_proxy",
+            "node": "worker1",
+            "inner": {
+                "type": "attach_subscribe",
+                "id": session_id,
+                "role": "controller",
+                "credited": true
+            }
+        }));
+        write_half
+            .write_all(format!("{subscribe}\n").as_bytes())
+            .await
+            .expect("write subscribe");
+
+        // First frame must be the attach init.
+        let init_line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+            .await
+            .expect("init read timed out")
+            .expect("init read failed")
+            .expect("stream closed before init");
+        let init_envelope: serde_json::Value =
+            serde_json::from_str(&init_line).expect("parse init");
+        let init = &init_envelope["payload"];
+        assert_eq!(
+            init["type"].as_str(),
+            Some("attach_stream_init"),
+            "unexpected first frame: {init_line}"
+        );
+        assert!(
+            init["attachment_id"].as_u64().unwrap_or(0) >= 1,
+            "relayed init must carry the fencing token: {init_line}"
+        );
+        assert_eq!(init["role"].as_str(), Some("controller"));
+
+        // Mid-stream input through the relay.
+        const RELAY_MARKER: &str = "oly_fed_relay_echo_marker";
+        let input = envelope(json!({
+            "type": "attach_input",
+            "id": session_id,
+            "data": format!("echo {RELAY_MARKER}\n"),
+            "wait_for_change": false
+        }));
+        write_half
+            .write_all(format!("{input}\n").as_bytes())
+            .await
+            .expect("write input");
+
+        // Read chunks until the marker echoes back, acking every chunk so
+        // the owning node's credit gate sees our applied cursor.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut echoed = false;
+        while std::time::Instant::now() < deadline && !echoed {
+            let line = match tokio::time::timeout(Duration::from_secs(5), lines.next_line()).await {
+                Ok(Ok(Some(line))) => line,
+                _ => break,
+            };
+            let frame_envelope: serde_json::Value =
+                serde_json::from_str(&line).expect("parse frame");
+            let frame = &frame_envelope["payload"];
+            match frame["type"].as_str() {
+                Some("attach_stream_chunk") => {
+                    let offset = frame["offset"].as_u64().expect("chunk offset");
+                    let data_b64 = frame["data"].as_str().unwrap_or_default();
+                    let len = base64_decode_len(data_b64) as u64;
+                    let ack = envelope(json!({
+                        "type": "attach_applied_cursor",
+                        "id": session_id,
+                        "cursor": offset + len
+                    }));
+                    write_half
+                        .write_all(format!("{ack}\n").as_bytes())
+                        .await
+                        .expect("write ack");
+                    if let Ok(text) = std::str::from_utf8(&base64_decode(data_b64))
+                        && text.contains(RELAY_MARKER)
+                    {
+                        echoed = true;
+                    }
+                }
+                Some("attach_stream_done") | Some("error") => break,
+                _ => {}
+            }
+        }
+
+        // Detach rides the same relay channel and ends the stream.
+        let detach = envelope(json!({"type": "attach_detach", "id": session_id}));
+        write_half
+            .write_all(format!("{detach}\n").as_bytes())
+            .await
+            .expect("write detach");
+
+        assert!(echoed, "relayed attach never echoed the input marker");
+    });
+
+    // The owning node's journal stays clean after the relayed attach.
+    let doctor = oly_cmd(&secondary_tmp)
+        .args(["doctor", &session_id])
+        .output()
+        .expect("`oly doctor` failed to execute");
+    assert!(
+        doctor.status.success(),
+        "`oly doctor` failed after relayed attach.\nstderr: {}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn base64_decode(input: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn base64_decode_len(input: &str) -> usize {
+    base64_decode(input).len()
+}
+
 #[test]
 fn e2e_session_status_transitions_in_list() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());

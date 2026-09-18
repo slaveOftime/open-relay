@@ -1,7 +1,7 @@
 use interprocess::local_socket::tokio::Stream;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
-    io::BufReader,
+    io::{AsyncWriteExt, BufReader},
     sync::{broadcast, mpsc, watch},
 };
 
@@ -131,6 +131,12 @@ async fn connect_and_relay(
     }
 
     let (stream_frame_tx, mut stream_frame_rx) = mpsc::channel::<(String, RpcResponse, bool)>(256);
+    // Open streaming RPCs: rpc_id -> inbound client-message channel (M5-2).
+    // Mid-stream messages from the primary (input/resize/credits/detach)
+    // are routed into the stream's task, which writes them onto the
+    // nested local IPC connection so the owning daemon's attachment-scoped
+    // fencing and credit gate apply to remote clients exactly as local.
+    let mut streams: HashMap<String, mpsc::Sender<RpcRequest>> = HashMap::new();
     loop {
         tokio::select! {
             _ = stop_rx.changed() => {
@@ -141,6 +147,11 @@ async fn connect_and_relay(
             }
             frame = stream_frame_rx.recv() => {
                 let Some((id, response, done)) = frame else { break };
+                if done {
+                    // Stream finished: drop the inbound channel so a late
+                    // mid-stream message fails loudly instead of vanishing.
+                    streams.remove(&id);
+                }
                 let response_json = match serde_json::to_value(&response) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -189,9 +200,11 @@ async fn connect_and_relay(
                             let local_cfg = Arc::clone(&local_config);
                             let rpc_id = id.clone();
                             let frame_tx = stream_frame_tx.clone();
+                            let (msg_tx, msg_rx) = mpsc::channel::<RpcRequest>(64);
+                            streams.insert(rpc_id.clone(), msg_tx);
                             tokio::spawn(async move {
                                 if let Err(err) =
-                                    relay_streaming_rpc(&local_cfg, req, &rpc_id, &frame_tx).await
+                                    relay_streaming_rpc(&local_cfg, req, &rpc_id, &frame_tx, msg_rx).await
                                 {
                                     warn!(%err, id = %rpc_id, "streaming relay failed");
                                     let resp = RpcResponse::Error {
@@ -221,6 +234,30 @@ async fn connect_and_relay(
                         };
                         if !send_node_message(&mut ws_tx, &reply).await {
                             break;
+                        }
+                    }
+                    NodeWsMessage::RpcStreamMessage { id, request } => {
+                        match serde_json::from_value::<RpcRequest>(request) {
+                            Ok(req) if is_stream_message_relayable(&req) => {
+                                match streams.get(&id) {
+                                    Some(tx) => {
+                                        if tx.send(req).await.is_err() {
+                                            // Stream task ended without a done
+                                            // frame yet; drop the route.
+                                            streams.remove(&id);
+                                        }
+                                    }
+                                    None => {
+                                        debug!(%id, "mid-stream message for unknown/closed stream");
+                                    }
+                                }
+                            }
+                            Ok(other) => {
+                                warn!(%id, request_type = other.name(), "rejected non-attach mid-stream message");
+                            }
+                            Err(err) => {
+                                warn!(%id, %err, "failed to deserialise mid-stream message");
+                            }
                         }
                     }
                     NodeWsMessage::Ping => {
@@ -297,11 +334,32 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
     )
 }
 
+/// Mid-stream client messages the relay forwards into an open attach
+/// stream (M5-2). Everything else is rejected: the stream channel is not
+/// a general RPC tunnel.
+fn is_stream_message_relayable(request: &RpcRequest) -> bool {
+    matches!(
+        request,
+        RpcRequest::AttachInput { .. }
+            | RpcRequest::AttachResize { .. }
+            | RpcRequest::AttachAcquireControl { .. }
+            | RpcRequest::AttachAppliedCursor { .. }
+            | RpcRequest::AttachDetach { .. }
+    )
+}
+
+/// Serve a relayed streaming attach on the secondary: open a nested local
+/// IPC connection to this daemon (single implementation — the same
+/// streaming handler local clients use), forward its frames to the
+/// primary, and write mid-stream client messages from the primary onto
+/// the connection so attachment-scoped fencing, control leases, and
+/// applied-cursor credits apply to remote clients (M5-2).
 async fn relay_streaming_rpc(
     config: &AppConfig,
     request: RpcRequest,
     rpc_id: &str,
     frame_tx: &mpsc::Sender<(String, RpcResponse, bool)>,
+    mut msg_rx: mpsc::Receiver<RpcRequest>,
 ) -> Result<()> {
     let stream = ipc::connect(config).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -309,37 +367,65 @@ async fn relay_streaming_rpc(
 
     ipc::write_request_to_writer(&mut write_half, request).await?;
 
+    // Mid-stream inbound channel state: open until the primary's channel
+    // closes or the client detaches; afterwards we only drain frames until
+    // the stream handler ends the stream.
+    let mut msgs_open = true;
     loop {
-        let response = ipc::read_response_from_reader(&mut reader).await;
-        match response {
-            Ok(resp) => {
-                let is_done = matches!(
-                    resp,
-                    RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
-                );
-                if frame_tx
-                    .send((rpc_id.to_string(), resp, is_done))
-                    .await
-                    .is_err()
-                {
+        tokio::select! {
+            biased;
+
+            // Mid-stream client messages from the primary: write onto the
+            // nested connection. Channel closed = primary gone; closing
+            // the write half makes the stream handler see EOF and detach.
+            msg = msg_rx.recv(), if msgs_open => {
+                let Some(req) = msg else {
+                    msgs_open = false;
+                    let _ = write_half.shutdown().await;
+                    continue;
+                };
+                let is_detach = matches!(req, RpcRequest::AttachDetach { .. });
+                if ipc::write_request_to_writer(&mut write_half, req).await.is_err() {
                     break;
                 }
-                if is_done {
-                    break;
+                if is_detach {
+                    // The handler ends the stream; drain until it does.
+                    msgs_open = false;
                 }
             }
-            Err(_) => {
-                let _ = frame_tx
-                    .send((
-                        rpc_id.to_string(),
-                        RpcResponse::AttachStreamDone {
-                            exit_code: None,
-                            final_offset: 0,
-                        },
-                        true,
-                    ))
-                    .await;
-                break;
+
+            response = ipc::read_response_from_reader(&mut reader) => {
+                match response {
+                    Ok(resp) => {
+                        let is_done = matches!(
+                            resp,
+                            RpcResponse::AttachStreamDone { .. } | RpcResponse::Error { .. }
+                        );
+                        if frame_tx
+                            .send((rpc_id.to_string(), resp, is_done))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if is_done {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = frame_tx
+                            .send((
+                                rpc_id.to_string(),
+                                RpcResponse::AttachStreamDone {
+                                    exit_code: None,
+                                    final_offset: 0,
+                                },
+                                true,
+                            ))
+                            .await;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -349,39 +435,42 @@ async fn relay_streaming_rpc(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_supported_proxied_rpc, mark_relayed_subscription_uncredited};
+    use super::{is_stream_message_relayable, is_supported_proxied_rpc};
     use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
 
-    /// M5-1: relayed subscriptions are marked uncredited before crossing
-    /// the relay, because mid-stream applied-cursor credits cannot follow
-    /// them — fail-open (ungated) rather than stalling a healthy remote
-    /// stream at the credit budget. The serde default is `false` for the
-    /// same reason: an absent flag must never silently enable gating.
+    /// M5-2: only attach stream messages may ride the mid-stream channel
+    /// — it is not a general RPC tunnel.
     #[test]
-    fn relayed_subscriptions_are_marked_uncredited() {
-        let mut request = RpcRequest::AttachSubscribe {
-            id: "session-123".to_string(),
-            from_byte_offset: None,
-            incarnation: None,
-            rows: None,
-            cols: None,
-            role: None,
-            credited: true,
-        };
-        mark_relayed_subscription_uncredited(&mut request);
-        let RpcRequest::AttachSubscribe { credited, .. } = &request else {
-            panic!("request kind changed");
-        };
-        assert!(!credited, "relayed subscriptions must run uncredited");
+    fn only_attach_messages_are_relayable_mid_stream() {
+        for req in [
+            RpcRequest::AttachInput {
+                id: "s".into(),
+                data: "x".into(),
+                wait_for_change: false,
+                attachment_id: None,
+            },
+            RpcRequest::AttachResize {
+                id: "s".into(),
+                rows: 24,
+                cols: 80,
+            },
+            RpcRequest::AttachAcquireControl { id: "s".into() },
+            RpcRequest::AttachAppliedCursor {
+                id: "s".into(),
+                cursor: 7,
+            },
+            RpcRequest::AttachDetach { id: "s".into() },
+        ] {
+            assert!(is_stream_message_relayable(&req), "{req:?} must relay");
+        }
+        let other = RpcRequest::Kill { id: "s".into() };
+        assert!(!is_stream_message_relayable(&other));
+    }
 
-        // Non-subscribe requests are untouched.
-        let mut other = RpcRequest::AttachDetach {
-            id: "session-123".to_string(),
-        };
-        mark_relayed_subscription_uncredited(&mut other);
-        assert!(matches!(other, RpcRequest::AttachDetach { .. }));
-
-        // Serde: absent `credited` decodes to false (fail-open).
+    /// The serde default for `credited` is `false` (fail-open): an absent
+    /// flag must never silently enable gating.
+    #[test]
+    fn subscribe_credited_defaults_to_false() {
         let decoded: RpcRequest =
             serde_json::from_str(r#"{"type":"attach_subscribe","id":"s","from_byte_offset":null}"#)
                 .expect("decode without credited field");
@@ -448,29 +537,19 @@ pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcRe
     RpcResponse::NodeList { nodes }
 }
 
-/// M5-1: a subscription relayed through the node proxy cannot receive
-/// mid-stream applied-cursor credits (one request envelope per stream),
-/// so the owning node's pump must run it uncredited — fail-open rather
-/// than stalling a healthy remote stream at the credit budget. Direct
-/// remote attachment streams (M5-2) remove this limitation.
-fn mark_relayed_subscription_uncredited(request: &mut RpcRequest) {
-    if let RpcRequest::AttachSubscribe { credited, .. } = request {
-        *credited = false;
-    }
-}
-
 /// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the
 /// secondary node and relay all streaming frames back to the CLI via IPC.
-/// Also reads client messages (input/resize/detach) from the IPC reader and
-/// proxies them to the secondary node as one-shot RPCs.
+/// Client messages (input/resize/credits/control/detach) read from the IPC
+/// reader are forwarded as mid-stream messages on the same stream (M5-2),
+/// so the owning node's attachment-scoped fencing and credit gate apply to
+/// remote clients exactly as to local ones.
 pub(super) async fn handle_node_proxy_streaming(
     node: String,
-    mut inner: RpcRequest,
+    inner: RpcRequest,
     reader: BufReader<tokio::io::ReadHalf<Stream>>,
     mut writer: tokio::io::WriteHalf<Stream>,
     node_registry: &Arc<NodeRegistry>,
 ) -> Result<()> {
-    mark_relayed_subscription_uncredited(&mut inner);
     let (stream_rpc_id, mut stream_rx) = match node_registry.proxy_rpc_stream(&node, &inner).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -554,7 +633,9 @@ pub(super) async fn handle_node_proxy_streaming(
                 match client_msg {
                     Some(Ok(req)) => {
                         let is_detach = matches!(req, RpcRequest::AttachDetach { .. });
-                        let _ = node_registry.proxy_rpc(&node, &req).await;
+                        let _ = node_registry
+                            .proxy_rpc_stream_message(&node, &stream_rpc_id, &req)
+                            .await;
                         if is_detach {
                             break;
                         }
@@ -567,10 +648,15 @@ pub(super) async fn handle_node_proxy_streaming(
 
     client_reader_task.abort();
     // Clean up the pending entry so it doesn't linger if the secondary
-    // hasn't sent a done frame yet.
+    // hasn't sent a done frame yet, and ask the owning node to end the
+    // stream (which detaches the remote attachment).
     node_registry.remove_pending(&node, &stream_rpc_id).await;
     let _ = node_registry
-        .proxy_rpc(&node, &RpcRequest::AttachDetach { id: session_id })
+        .proxy_rpc_stream_message(
+            &node,
+            &stream_rpc_id,
+            &RpcRequest::AttachDetach { id: session_id },
+        )
         .await;
 
     Ok(())

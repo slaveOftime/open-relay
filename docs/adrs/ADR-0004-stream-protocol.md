@@ -61,16 +61,32 @@ Applied-cursor credits stopped being advisory signals and became gates:
    keeping `next()` cancel-safe. The cell initializes at the INIT boundary
    (the client is deemed to have applied everything up to `end_offset`),
    so only post-attach bytes count as in-flight.
-2. **Uncredited exception, fail-open.** Node-relayed subscriptions cannot
-   receive mid-stream credits (one request envelope per stream), so the
-   gateway rewrites `AttachSubscribe.credited = false` before relaying and
-   those pumps run ungated — the pre-M5-1 behavior — until direct remote
-   attachment streams (M5-2). The serde default is `false` for the same
-   reason: an absent flag never silently enables gating.
+2. **Uncredited exception, fail-open (superseded by M5-2).** Node-relayed
+   subscriptions initially could not receive mid-stream credits (one
+   request envelope per stream), so the gateway rewrote
+   `AttachSubscribe.credited = false` before relaying and those pumps ran
+   ungated. The serde default remains `false`: an absent flag must never
+   silently enable gating.
 3. **Client queues bounded.** The CLI attach loop's daemon-frame channel
    (16 frames ≈ 11 MiB worst case) and terminal-event channel (4096
    events) are bounded; the frame reader backpressures the socket and the
    input thread blocks — input is never dropped to relieve pressure.
 
-Known remaining gap (M5-2): relayed streams and their ack forwarding; the
-broadcast ring is message-bounded (256 chunks), not byte-bounded.
+## Addendum (M5-2): mid-stream relay channel — remote clients are first-class
+
+The node relay gained a reverse-direction channel:
+`NodeWsMessage::RpcStreamMessage { id, request }` carries mid-stream
+client messages (input, resize, applied-cursor credits, control takeover,
+detach) from the primary to the owning node's stream task. The secondary
+routes them onto the nested local IPC connection that serves the relayed
+stream, so attachment-scoped fencing, the single-controller lease, and the
+enforced credit gate apply to remote clients exactly as to local ones —
+single implementation, no duplicated streaming state machine. The M5-1
+uncredited fail-open for relayed streams is gone: proxied subscriptions
+are credited and their acks flow. Only attach message types may ride the
+channel (`is_stream_message_relayable`); it is not a general RPC tunnel.
+Detach and primary disconnect both end the remote attachment deterministi-
+cally (explicit detach message or nested-connection EOF).
+
+Known remaining gap: the broadcast ring is message-bounded (256 chunks),
+not byte-bounded.

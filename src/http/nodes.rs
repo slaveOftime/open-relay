@@ -126,7 +126,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     info!(node = %name, "secondary node connected");
 
     // ── Step 4: set up RPC relay channel and register node ───────────────
-    let (send_tx, mut send_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
+    let (send_tx, mut send_rx) = mpsc::channel::<NodeWsMessage>(64);
     let pending: Arc<Mutex<HashMap<String, PendingRpc>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_recv = Arc::clone(&pending);
 
@@ -147,10 +147,9 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
         tokio::select! {
             // Outgoing: channel → WS
             msg = send_rx.recv() => {
-                let Some((id, req_json)) = msg else {
+                let Some(ws_msg) = msg else {
                     break "node RPC relay channel closed".to_string();
                 };
-                let ws_msg = NodeWsMessage::Rpc { id, request: req_json };
                 if let Err(err) = send_node_message(&mut ws_tx, &ws_msg).await {
                     break format!("failed to send proxied RPC to node WebSocket: {err}");
                 }

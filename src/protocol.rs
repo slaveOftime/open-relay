@@ -137,6 +137,7 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
         NodeWsMessage::Rpc { .. } => "rpc",
         NodeWsMessage::RpcResponse { .. } => "rpc_response",
         NodeWsMessage::RpcStreamFrame { .. } => "rpc_stream_frame",
+        NodeWsMessage::RpcStreamMessage { .. } => "rpc_stream_message",
         NodeWsMessage::Notification { .. } => "notification",
         NodeWsMessage::SessionEvent { .. } => "session_event",
         NodeWsMessage::Ping => "ping",
@@ -615,6 +616,15 @@ pub enum NodeWsMessage {
         response: serde_json::Value,
         #[serde(default)]
         done: bool,
+    },
+    /// Primary → Secondary: one mid-stream client message for an open
+    /// streaming RPC (M5-2). Carries attach input, resize,
+    /// applied-cursor credits, control takeover, and detach to the owning
+    /// node's stream task, so remote attachments get the same
+    /// attachment-scoped fencing and enforced credits as local ones.
+    RpcStreamMessage {
+        id: String,
+        request: serde_json::Value,
     },
     /// Secondary -> Primary: notification event produced by the secondary daemon.
     Notification {

@@ -40,7 +40,7 @@ fn apply_state_env(cmd: &mut Command, tmp_dir: &PathBuf) {
     cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(tmp_dir));
 }
 
-fn socket_name_for_tmp(tmp_dir: &PathBuf) -> String {
+pub fn socket_name_for_tmp(tmp_dir: &PathBuf) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tmp_dir.to_string_lossy().hash(&mut hasher);

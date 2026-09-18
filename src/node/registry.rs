@@ -1,11 +1,10 @@
 use std::{collections::HashMap, sync::Arc};
 
-use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::{
     error::{AppError, Result},
-    protocol::RpcResponse,
+    protocol::{NodeWsMessage, RpcResponse},
 };
 
 /// A pending RPC response sender — either single-shot or streaming.
@@ -18,8 +17,9 @@ pub enum PendingRpc {
 
 /// A live connection to a secondary node.
 pub struct NodeHandle {
-    /// Send `(rpc_id, serialised_request_value)` here to forward an RPC over WS.
-    pub send_tx: mpsc::Sender<(String, Value)>,
+    /// Send relay-bound messages here (RPC envelopes and mid-stream
+    /// stream messages) for delivery over the node's WS connection.
+    pub send_tx: mpsc::Sender<NodeWsMessage>,
     /// Pending response channels, keyed by `rpc_id`.
     pub pending: Arc<Mutex<HashMap<String, PendingRpc>>>,
 }
@@ -72,7 +72,10 @@ impl NodeRegistry {
 
         let request_json = serde_json::to_value(request)?;
         send_tx
-            .send((id.clone(), request_json))
+            .send(NodeWsMessage::Rpc {
+                id: id.clone(),
+                request: request_json,
+            })
             .await
             .map_err(|_| AppError::NodeNotConnected(node.to_string()))?;
 
@@ -106,11 +109,43 @@ impl NodeRegistry {
 
         let request_json = serde_json::to_value(request)?;
         send_tx
-            .send((id.clone(), request_json))
+            .send(NodeWsMessage::Rpc {
+                id: id.clone(),
+                request: request_json,
+            })
             .await
             .map_err(|_| AppError::NodeNotConnected(node.to_string()))?;
 
         Ok((id, rx))
+    }
+
+    /// Send one mid-stream client message to an open streaming RPC on the
+    /// named secondary (M5-2): attach input, resize, applied-cursor
+    /// credits, control takeover, and detach all travel this way so the
+    /// owning node's stream task applies its attachment-scoped fencing
+    /// and credit gate to remote clients exactly as to local ones.
+    pub async fn proxy_rpc_stream_message(
+        &self,
+        node: &str,
+        rpc_id: &str,
+        request: &crate::protocol::RpcRequest,
+    ) -> Result<()> {
+        let send_tx = {
+            let nodes = self.nodes.lock().await;
+            nodes
+                .get(node)
+                .ok_or_else(|| AppError::NodeNotConnected(node.to_string()))?
+                .send_tx
+                .clone()
+        };
+        let request_json = serde_json::to_value(request)?;
+        send_tx
+            .send(NodeWsMessage::RpcStreamMessage {
+                id: rpc_id.to_string(),
+                request: request_json,
+            })
+            .await
+            .map_err(|_| AppError::NodeNotConnected(node.to_string()))
     }
 
     /// Returns `true` if `name` is currently connected.

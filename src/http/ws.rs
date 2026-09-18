@@ -587,9 +587,10 @@ async fn handle_ws_proxied_streaming(
 ) {
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
-    // Open streaming subscription via node proxy.
-    // Proxied streams are uncredited (M5-1): the node relay cannot
-    // forward mid-stream applied-cursor credits to the owning node's pump.
+    // Open streaming subscription via node proxy. Proxied streams are
+    // credited (M5-2): mid-stream messages — including applied-cursor
+    // acks — travel the relay as stream messages, so the owning node's
+    // credit gate applies to remote clients exactly as to local ones.
     let rpc = RpcRequest::AttachSubscribe {
         id: id.to_string(),
         from_byte_offset: None,
@@ -597,7 +598,7 @@ async fn handle_ws_proxied_streaming(
         rows: initial_rows.filter(|rows| *rows > 0),
         cols: initial_cols.filter(|cols| *cols > 0),
         role,
-        credited: false,
+        credited: true,
     };
     let (stream_rpc_id, mut stream_rx) = match state
         .node_registry
@@ -760,7 +761,10 @@ async fn handle_ws_proxied_streaming(
                                     wait_for_change,
                                     attachment_id: None,
                                 };
-                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                if let Err(err) = state.node_registry
+                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
+                                    .await
+                                {
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket input");
                                 }
                             }
@@ -778,26 +782,42 @@ async fn handle_ws_proxied_streaming(
                                     rows,
                                     cols,
                                 };
-                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                if let Err(err) = state.node_registry
+                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
+                                    .await
+                                {
                                     warn!(session_id = %id, node = %node, rows, cols, %err, "failed to proxy WebSocket resize");
                                 }
                             }
                             Ok(ClientMessage::AcquireControl) => {
                                 debug!(session_id = %id, node = %node, "proxied WebSocket control takeover requested");
                                 let rpc = RpcRequest::AttachAcquireControl { id: id.to_string() };
-                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                if let Err(err) = state.node_registry
+                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
+                                    .await
+                                {
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket control takeover");
                                 }
                             }
-                            // Applied-cursor credits are best-effort and
-                            // local to the owning node; the node relay
-                            // carries one request per stream, so mid-stream
-                            // credits cannot reach the remote attachment.
-                            Ok(ClientMessage::Ack { .. }) => {}
+                            Ok(ClientMessage::Ack { offset }) => {
+                                let rpc = RpcRequest::AttachAppliedCursor {
+                                    id: id.to_string(),
+                                    cursor: offset,
+                                };
+                                if let Err(err) = state.node_registry
+                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
+                                    .await
+                                {
+                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket applied-cursor credit");
+                                }
+                            }
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, node = %node, "proxied WebSocket detach requested");
                                 let rpc = RpcRequest::AttachDetach { id: id.to_string() };
-                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                if let Err(err) = state.node_registry
+                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
+                                    .await
+                                {
                                     warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket detach");
                                 }
                                 break;
@@ -814,7 +834,10 @@ async fn handle_ws_proxied_streaming(
                     Some(Ok(Message::Close(_))) | None => {
                         debug!(session_id = %id, node = %node, "proxied WebSocket client disconnected");
                         let rpc = RpcRequest::AttachDetach { id: id.to_string() };
-                        if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                        if let Err(err) = state.node_registry
+                            .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
+                            .await
+                        {
                             warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket disconnect cleanup");
                         }
                         break;
