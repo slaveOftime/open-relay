@@ -85,7 +85,32 @@ dependencies = [
  "rustix 1.1.4",
  "rustix-openpty",
  "serde",
- "signal-hook",
+ "signal-hook 0.3.18",
+ "unicode-width",
+ "vte",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "alacritty_terminal"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
+dependencies = [
+ "base64",
+ "bitflags 2.13.1",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling",
+ "regex-automata",
+ "rustix 1.1.4",
+ "rustix-openpty",
+ "serde",
+ "signal-hook 0.4.4",
  "unicode-width",
  "vte",
  "windows-sys 0.59.0",
@@ -1772,7 +1797,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 1.1.4",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
 ]
@@ -3124,7 +3149,7 @@ version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "103183282be6cce6ab00c5e3503664b927683e8a1474131e148eae3645746c80"
 dependencies = [
- "alacritty_terminal",
+ "alacritty_terminal 0.25.1",
  "anyhow",
  "arboard",
  "flume 0.12.0",
@@ -4910,6 +4935,7 @@ name = "oly"
 version = "0.3.3"
 dependencies = [
  "aes-gcm",
+ "alacritty_terminal 0.26.0",
  "arboard",
  "arc-swap",
  "argon2",
@@ -6833,6 +6859,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a0c28ca5908dbdbcd52e6fdaa00358ab88637f8ab33e1f188dd510eb44b53d"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-mio"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6840,7 +6876,7 @@ checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
  "mio",
- "signal-hook",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -7628,7 +7664,7 @@ dependencies = [
  "bitflags 2.13.1",
  "parking_lot",
  "rustix 1.1.4",
- "signal-hook",
+ "signal-hook 0.3.18",
  "windows-sys 0.61.2",
 ]
 
@@ -7679,7 +7715,7 @@ dependencies = [
  "pest_derive",
  "phf",
  "sha2 0.10.9",
- "signal-hook",
+ "signal-hook 0.3.18",
  "siphasher",
  "terminfo",
  "termios",

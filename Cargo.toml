@@ -53,6 +53,10 @@ crossterm = "0.29"
 ratatui = "0.30"
 unicode-width = "0.2"
 vt100 = "0.16.2"
+# 1.0 terminal engine (ADR-0001): non-destructive reflow resize, exact
+# query-position events, serializable grids for checkpoints. vt100 stays
+# until the M3 renderer switch retires it.
+alacritty_terminal = { version = "0.26.0", features = ["serde"] }
 which = "8.0.2"
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "compression-br", "compression-gzip"] }

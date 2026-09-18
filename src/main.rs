@@ -12,12 +12,12 @@ mod notification;
 mod protocol;
 mod session;
 mod storage;
+mod terminal;
 mod terminal_guards;
 mod utils;
 
 use clap::Parser;
 use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
-use crossterm::terminal;
 use error::{AppError, Result};
 use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
 use std::path::{Path, PathBuf};
@@ -211,7 +211,7 @@ async fn run() -> Result<()> {
             let (rows, cols) = if detach {
                 (None, None)
             } else {
-                let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 (Some(rows), Some(cols))
             };
             let inner = RpcRequest::Start {
