@@ -159,7 +159,7 @@ impl SessionStore {
     /// Attach relays hold this for the lifetime of the connection so they can
     /// detect DECCKM/bracketed-paste changes after every output chunk without
     /// taking the session lock.
-    pub fn shared_modes(&self, id: &str) -> Option<Arc<crate::session::SharedModes>> {
+    pub fn shared_modes(&self, id: &str) -> Option<Arc<crate::session::runtime::SharedModes>> {
         let sessions = self.sessions.load();
         sessions
             .get(id)

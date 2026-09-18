@@ -7,6 +7,7 @@
 mod attach;
 mod lifecycle;
 mod notify;
+pub mod pump;
 mod query;
 mod testsupport;
 

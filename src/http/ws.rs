@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
@@ -11,9 +9,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
-use crate::session::ModeSnapshot;
-use crate::session::pty::collect_chunk_bytes;
 use crate::session::resize::ResizeSubscriber;
+use crate::session::{AttachEvent, AttachPump};
 
 use super::AppState;
 
@@ -93,11 +90,6 @@ const WS_FRAME_ERROR: u8 = 6;
 const WS_FRAME_PONG: u8 = 7;
 const WS_FLAG_APP_CURSOR_KEYS: u8 = 1 << 0;
 const WS_FLAG_BRACKETED_PASTE_MODE: u8 = 1 << 1;
-
-/// Upper bound on how much already-queued PTY output one WebSocket data frame
-/// carries. Batching keeps a burst of output to one send instead of one per
-/// reader chunk, while the cap keeps the browser painting incrementally.
-const MAX_COALESCED_CHUNK_BYTES: usize = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -243,8 +235,6 @@ async fn handle_ws_streaming(
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
 ) {
-    use tokio::sync::broadcast::error::RecvError;
-
     if let (Some(rows), Some(cols)) = (initial_rows, initial_cols)
         && rows > 0
         && cols > 0
@@ -257,28 +247,25 @@ async fn handle_ws_streaming(
         }
     }
 
-    let subscribe_result = { state.store.attach_snapshot_init(&id).await };
-
-    let (snapshot_bytes, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
-        match subscribe_result {
-            Ok(t) => t,
-            Err(err) => {
-                warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
-                let _ = send_server_message(
-                    &mut socket,
-                    &ServerMessage::Error {
-                        message: err.message(&id),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
+    let (mut pump, init) = match AttachPump::subscribe(&state.store, &id, None).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
+            let _ = send_server_message(
+                &mut socket,
+                &ServerMessage::Error {
+                    message: err.message(&id),
+                },
+            )
+            .await;
+            return;
+        }
+    };
 
     let init_msg = ServerMessage::Init {
-        data: snapshot_bytes,
-        app_cursor_keys,
-        bracketed_paste_mode,
+        data: init.data,
+        app_cursor_keys: init.modes.app_cursor_keys,
+        bracketed_paste_mode: init.modes.bracketed_paste_mode,
     };
     if !send_server_message(&mut socket, &init_msg).await {
         debug!(session_id = %id, "local WebSocket closed before init frame could be sent");
@@ -294,176 +281,43 @@ async fn handle_ws_streaming(
     debug!(
         session_id = %id,
         snapshot_bytes = init_msg_data_len(&init_msg),
-        end_offset,
-        app_cursor_keys,
-        bracketed_paste_mode,
+        end_offset = init.end_offset,
+        app_cursor_keys = init.modes.app_cursor_keys,
+        bracketed_paste_mode = init.modes.bracketed_paste_mode,
         "local WebSocket stream initialized"
     );
-
-    // Track last known mode state to detect changes.
-    let mut last_modes = ModeSnapshot {
-        app_cursor_keys,
-        bracketed_paste_mode,
-    };
-    // Held for the lifetime of the stream so mode changes can be detected with
-    // a relaxed atomic load per chunk instead of a session read lock.
-    let shared_modes = state.store.shared_modes(&id);
-
-    let mut current_offset = end_offset;
-    let mut completion_check = tokio::time::interval(Duration::from_millis(200));
-    completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             biased;
 
-            // Check session completion periodically.
-            _ = completion_check.tick() => {
-                let status = state.store.attach_stream_status(&id).await;
-                match status {
-                    Ok((running, _output_closed, exit_code)) => {
-                        if !running {
-                            let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
-                            if let Ok((chunks, _new_end, _rx, _bpm, _ack)) = resync {
-                                let raw = collect_chunk_bytes(&chunks);
-                                if !raw.is_empty() {
-                                    debug!(
-                                        session_id = %id,
-                                        resync_chunks = chunks.len(),
-                                        resync_bytes = raw.len(),
-                                        current_offset,
-                                        "sending final buffered output before local WebSocket shutdown"
-                                    );
-                                    let msg = ServerMessage::Data {
-                                        data: raw,
-                                    };
-                                    if !send_server_message(&mut socket, &msg).await {
-                                        let _ = state.store.attach_detach(&id).await;
-                                        return;
-                                    }
-                                }
-                            }
-                            info!(session_id = %id, ?exit_code, "WS session ended");
-                            let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+            // Session output: the shared attach pump (M3-2) owns follow /
+            // coalesce / lag resync / completion flush / mode tracking.
+            event = pump.next() => {
+                match event {
+                    AttachEvent::Chunk { data, .. } => {
+                        if !send_server_message(&mut socket, &ServerMessage::Data { data }).await {
                             let _ = state.store.attach_detach(&id).await;
                             return;
                         }
                     }
-                    Err(_) => {
-                        warn!(session_id = %id, "local WebSocket stream status lookup failed");
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                    AttachEvent::Modes(modes) => {
+                        if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
+                            app_cursor_keys: modes.app_cursor_keys,
+                            bracketed_paste_mode: modes.bracketed_paste_mode,
+                        }).await {
+                            let _ = state.store.attach_detach(&id).await;
+                            return;
+                        }
+                    }
+                    AttachEvent::Done { exit_code } => {
+                        info!(session_id = %id, ?exit_code, "WS session ended");
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
                     }
-                }
-            }
-
-            // PTY output from broadcast channel.
-            chunk = broadcast_rx.recv() => {
-                match chunk {
-                    Ok(mut chunk) => {
-                        // Coalesce every chunk the reader has already produced
-                        // into one WebSocket frame, so a burst of output costs
-                        // one send instead of one per 64 KiB read.
-                        let mut coalesced: Option<Vec<u8>> = None;
-                        while coalesced.as_ref().map_or(chunk.bytes.len(), Vec::len)
-                            < MAX_COALESCED_CHUNK_BYTES
-                        {
-                            let Ok(next) = broadcast_rx.try_recv() else {
-                                break;
-                            };
-                            let buffer = coalesced
-                                .get_or_insert_with(|| chunk.bytes.as_ref().to_vec());
-                            buffer.extend_from_slice(&next.bytes);
-                        }
-                        let batch_len = coalesced.as_ref().map_or(chunk.bytes.len(), Vec::len);
-
-                        if batch_len > 0 {
-                            let data = coalesced
-                                .unwrap_or_else(|| std::mem::take(&mut chunk.bytes).into());
-                            let msg = ServerMessage::Data { data };
-                            if !send_server_message(&mut socket, &msg).await {
-                                let _ = state.store.attach_detach(&id).await;
-                                return;
-                            }
-                        }
-                        current_offset += batch_len as u64;
-                        trace!(
-                            session_id = %id,
-                            filtered_bytes = batch_len,
-                            current_offset,
-                            "forwarded live PTY output over local WebSocket"
-                        );
-
-                        // Check for mode changes.
-                        let current_modes = shared_modes.as_ref().map(|shared| shared.load());
-                        if let Some(modes) = current_modes
-                            && modes != last_modes
-                        {
-                            debug!(
-                                session_id = %id,
-                                app_cursor_keys = modes.app_cursor_keys,
-                                bracketed_paste_mode = modes.bracketed_paste_mode,
-                                "local WebSocket terminal mode changed"
-                            );
-                            if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
-                                app_cursor_keys: modes.app_cursor_keys,
-                                bracketed_paste_mode: modes.bracketed_paste_mode,
-                            }).await {
-                                let _ = state.store.attach_detach(&id).await;
-                                return;
-                            }
-                            last_modes = modes;
-                        }
-                    }
-                    Err(RecvError::Lagged(skipped)) => {
-                        warn!(
-                            session_id = %id,
-                            skipped,
-                            current_offset,
-                            "local WebSocket lagged behind broadcast output; replaying from persisted output"
-                        );
-                        // Re-sync from persisted output.
-                        let resync = state.store.attach_subscribe_init(&id, Some(current_offset)).await;
-                        match resync {
-                            Ok((chunks, new_end, rx, bpm, ack)) => {
-                                broadcast_rx = rx;
-                                let raw = collect_chunk_bytes(&chunks);
-                                if !raw.is_empty() {
-                                    debug!(
-                                        session_id = %id,
-                                        resync_chunks = chunks.len(),
-                                        resync_bytes = raw.len(),
-                                        from_offset = current_offset,
-                                        to_offset = new_end,
-                                        "replayed buffered PTY output for local WebSocket resync"
-                                    );
-                                    let msg = ServerMessage::Data {
-                                        data: raw,
-                                    };
-                                    if !send_server_message(&mut socket, &msg).await {
-                                        let _ = state.store.attach_detach(&id).await;
-                                        return;
-                                    }
-                                }
-                                current_offset = new_end;
-                                last_modes = ModeSnapshot {
-                                    app_cursor_keys: ack,
-                                    bracketed_paste_mode: bpm,
-                                };
-                            }
-                            Err(_) => {
-                                warn!(session_id = %id, "local WebSocket resync failed");
-                                let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
-                                let _ = state.store.attach_detach(&id).await;
-                                return;
-                            }
-                        }
-                    }
-                    Err(RecvError::Closed) => {
-                        let exit_code = state.store.get_exit_code(&id);
-                        info!(session_id = %id, ?exit_code, "local WebSocket broadcast channel closed");
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+                    AttachEvent::Closed => {
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
                     }

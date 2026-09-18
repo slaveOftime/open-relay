@@ -22,6 +22,7 @@ mod runtime;
 pub(crate) mod scan;
 pub(crate) mod screen;
 mod store;
+pub use store::pump::{AttachEvent, AttachPump};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,6 @@ use tokio::sync::broadcast;
 
 use crate::error::{AppError, Result};
 use crate::protocol::SessionSummary;
-pub(crate) use runtime::{ModeSnapshot, SharedModes};
 pub use store::SessionStore;
 pub use store::SilentCandidate;
 
