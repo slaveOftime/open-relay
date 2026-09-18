@@ -145,6 +145,10 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
     }
 }
 
+fn default_api_key_scopes() -> String {
+    "node".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcRequest {
@@ -326,6 +330,10 @@ pub enum RpcRequest {
     /// returns the one-time plaintext key.
     ApiKeyAdd {
         name: String,
+        /// Comma-separated scope list (ADR-0007). Defaults to `node` to
+        /// preserve the historical node-join use of API keys.
+        #[serde(default = "default_api_key_scopes")]
+        scopes: String,
     },
     /// List all registered API keys.
     ApiKeyList,
@@ -574,6 +582,9 @@ pub struct ApiKeySummary {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
+    /// Comma-separated scope list (ADR-0007).
+    #[serde(default)]
+    pub scopes: String,
 }
 
 /// A persisted join config as reported to `oly join list`.

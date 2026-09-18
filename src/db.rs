@@ -486,27 +486,34 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
 pub struct ApiKeyRecord {
     pub name: String,
     pub created_at: Option<DateTime<Utc>>,
+    /// Comma-separated scope list (ADR-0007). Legacy keys default to `node`.
+    pub scopes: String,
 }
 
 impl Database {
-    /// Insert a new API key with the given Argon2id-hashed value.
-    /// Returns an error if a key with that name already exists.
-    pub async fn add_api_key(&self, name: &str, api_key_hash: &str) -> Result<()> {
-        sqlx::query("INSERT INTO api_keys (name, api_key_hash) VALUES (?1, ?2)")
+    /// Insert a new API key with the given Argon2id-hashed value and scope
+    /// list. Returns an error if a key with that name already exists.
+    pub async fn add_api_key(&self, name: &str, api_key_hash: &str, scopes: &str) -> Result<()> {
+        sqlx::query("INSERT INTO api_keys (name, api_key_hash, scopes) VALUES (?1, ?2, ?3)")
             .bind(name)
             .bind(api_key_hash)
+            .bind(scopes)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    /// Return all stored Argon2id hashes — used to validate an incoming key
-    /// against any registered key (keys are independent of node names).
-    pub async fn list_api_key_hashes(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT api_key_hash FROM api_keys")
+    /// Return all stored (Argon2id hash, scopes) pairs — used to validate an
+    /// incoming key against any registered key and to read its granted
+    /// scopes (keys are independent of node names).
+    pub async fn list_api_key_entries(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT api_key_hash, scopes FROM api_keys")
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
+            .collect())
     }
 
     /// Delete an API key by name. Returns `true` if a row was deleted.
@@ -518,16 +525,18 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
-    /// List all registered API keys (names + creation timestamps).
+    /// List all registered API keys (names + creation timestamps + scopes).
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
-        let rows = sqlx::query("SELECT name, created_at FROM api_keys ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT name, created_at, scopes FROM api_keys ORDER BY created_at ASC")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows
             .into_iter()
             .map(|r| ApiKeyRecord {
                 name: r.get::<String, _>(0),
                 created_at: r.get::<Option<String>, _>(1).as_deref().and_then(parse_dt),
+                scopes: r.get::<String, _>(2),
             })
             .collect())
     }

@@ -456,8 +456,14 @@ async fn run() -> Result<()> {
         // ── API key management (primary side) ────────────────────────────────
         Commands::ApiKey(api_key_args) => match api_key_args.command {
             ApiKeyCommand::Add(args) => {
-                match ipc::send_request_checked(&config, RpcRequest::ApiKeyAdd { name: args.name })
-                    .await?
+                match ipc::send_request_checked(
+                    &config,
+                    RpcRequest::ApiKeyAdd {
+                        name: args.name,
+                        scopes: args.scopes.clone(),
+                    },
+                )
+                .await?
                 {
                     RpcResponse::ApiKeyAdd { plaintext_key } => {
                         println!(
@@ -475,13 +481,13 @@ async fn run() -> Result<()> {
                         if keys.is_empty() {
                             println!("No API keys registered.");
                         } else {
-                            println!("{:<24} {}", "NAME", "CREATED");
+                            println!("{:<24} {:<20} {}", "NAME", "SCOPES", "CREATED");
                             for k in keys {
                                 let created = k
                                     .created_at
                                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                                     .unwrap_or_else(|| "unknown".to_string());
-                                println!("{:<24} {}", k.name, created);
+                                println!("{:<24} {:<20} {}", k.name, k.scopes, created);
                             }
                         }
                         Ok(())

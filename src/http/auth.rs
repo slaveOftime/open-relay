@@ -12,32 +12,105 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
 
 use crate::http::AppState;
 
 const MAX_FAILED_ATTEMPTS: u32 = 3;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60); // 15 minutes
-/// How often the background task sweeps the lockout table for expired entries.
+/// How often the background task sweeps the lockout and session tables for
+/// expired entries.
 const LOCKOUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
-/// Session cookie lifetime. Browsers cap cookie lifetimes at ~400 days, so a
-/// 1-year value effectively means "until the password changes". The cookie is
-/// rewritten on every successful login, keeping it fresh.
-const AUTH_COOKIE_MAX_AGE: Duration = Duration::from_secs(365 * 24 * 60 * 60); // 1 year
+/// Browser session lifetime (ADR-0007): sessions are random, server-side,
+/// revocable, and expiring. The cookie mirrors this TTL.
+pub const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
 const AUTH_COOKIE_NAME: &str = "oly_auth_token";
-/// Domain-separation label for the deterministic session-token derivation.
-/// Bumping the version suffix invalidates all previously issued tokens.
-const TOKEN_DERIVATION_LABEL: &[u8] = b"oly-auth-session-token-v1";
+/// How long a verified API-key → scopes mapping is cached, so per-request
+/// Argon2 verification stays off the hot path. Revoking a key takes effect
+/// within this window.
+const API_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+// ── Authorization scopes (ADR-0007, M5-4) ────────────────────────────────────
+
+/// Read-only access: lists, session details, logs, SSE events, node list.
+pub const SCOPE_OBSERVE: &str = "observe";
+/// Interactive access: attach streams and session input/upload.
+pub const SCOPE_CONTROL: &str = "control";
+/// Administrative access: create/stop/kill sessions, metadata, notifications,
+/// push subscriptions, API-key management.
+pub const SCOPE_MANAGE: &str = "manage";
+/// Federation access: secondary node join.
+pub const SCOPE_NODE: &str = "node";
+/// Wildcard scope granted by legacy keys created before scopes existed.
+pub const SCOPE_ALL: &str = "all";
+
+const KNOWN_SCOPES: [&str; 5] = [
+    SCOPE_OBSERVE,
+    SCOPE_CONTROL,
+    SCOPE_MANAGE,
+    SCOPE_NODE,
+    SCOPE_ALL,
+];
+
+/// Validate a comma-separated scope list from the CLI. Returns an error
+/// naming the first unknown scope.
+pub fn validate_scope_list(scopes: &str) -> std::result::Result<(), String> {
+    if scopes.trim().is_empty() {
+        return Err("scope list must not be empty".to_string());
+    }
+    for scope in scopes.split(',').map(str::trim) {
+        if !KNOWN_SCOPES.contains(&scope) {
+            return Err(format!(
+                "unknown scope '{scope}' (known: {})",
+                KNOWN_SCOPES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Does the stored scope list grant `required`?
+pub fn scopes_allow(stored: &str, required: &str) -> bool {
+    stored
+        .split(',')
+        .map(str::trim)
+        .any(|scope| scope == required || scope == SCOPE_ALL)
+}
+
+/// Classify the scope a protected `/api/*` route requires.
+pub fn required_scope_for(method: &axum::http::Method, path: &str) -> &'static str {
+    if method == axum::http::Method::GET {
+        // The attach endpoint is a GET WebSocket upgrade but grants
+        // interactive control — classify by capability, not verb.
+        if path.ends_with("/attach") {
+            return SCOPE_CONTROL;
+        }
+        return SCOPE_OBSERVE;
+    }
+    // Mutating routes: input/upload touch a live child; the rest are
+    // lifecycle/admin operations.
+    if path.ends_with("/input") || path.ends_with("/upload") {
+        SCOPE_CONTROL
+    } else {
+        SCOPE_MANAGE
+    }
+}
 
 // ── AuthState ────────────────────────────────────────────────────────────────
 
 pub struct AuthState {
     password_hash: String,
-    /// The single deterministic session token (see `derive_session_token`).
-    /// It is valid for as long as the password hash is unchanged — no expiry,
-    /// no in-memory registry, and it survives daemon restarts.
-    expected_token: String,
+    /// Server-side session registry (ADR-0007): random token → expiry.
+    /// Sessions are revocable (removal) and expiring; a daemon restart
+    /// invalidates every session, requiring re-login.
+    sessions: Mutex<HashMap<String, Instant>>,
+    /// Epoch bumped on every revocation so open control streams (WebSocket
+    /// attach, SSE) can re-validate their token and close loudly.
+    revocations: watch::Sender<u64>,
+    /// Cache of verified API keys: sha256(presented key) hex → (scopes,
+    /// verified-at). Bounds per-request Argon2 verification cost.
+    api_key_cache: Mutex<HashMap<String, (String, Instant)>>,
     /// Per-IP lockout table. Each client is tracked independently so that a
     /// brute-force attempt from one IP cannot lock out legitimate users.
     lockout: Mutex<HashMap<IpAddr, LockoutRecord>>,
@@ -56,10 +129,12 @@ pub(crate) enum FailureOutcome {
 
 impl AuthState {
     pub fn new(password_hash: String) -> Arc<Self> {
-        let expected_token = derive_session_token(&password_hash);
+        let (revocations, _) = watch::channel(0u64);
         let state = Arc::new(Self {
             password_hash,
-            expected_token,
+            sessions: Mutex::new(HashMap::new()),
+            revocations,
+            api_key_cache: Mutex::new(HashMap::new()),
             lockout: Mutex::new(HashMap::new()),
         });
         state.spawn_cleanup_task();
@@ -90,15 +165,97 @@ impl AuthState {
                         "auth: background cleanup evicted expired lockout records"
                     );
                 }
+                drop(lockout);
+                let mut sessions = state.sessions.lock().await;
+                let before = sessions.len();
+                sessions.retain(|_, expires_at| now < *expires_at);
+                let evicted = before - sessions.len();
+                if evicted > 0 {
+                    debug!(evicted, "auth: background cleanup evicted expired sessions");
+                }
+                drop(sessions);
+                let mut cache = state.api_key_cache.lock().await;
+                cache.retain(|_, (_, verified_at)| now < *verified_at + API_KEY_CACHE_TTL);
             }
         });
     }
 
-    /// Validate a session token against the deterministic expected token.
-    /// No lock and no expiry: the token stays valid until the password hash
-    /// changes (daemon restart with a new password) or auth is disabled.
-    pub fn is_valid_token(&self, token: &str) -> bool {
-        constant_time_eq(token.as_bytes(), self.expected_token.as_bytes())
+    /// Issue a new random, expiring session token (ADR-0007).
+    pub async fn issue_session(&self) -> String {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.sessions
+            .lock()
+            .await
+            .insert(token.clone(), Instant::now() + SESSION_TTL);
+        token
+    }
+
+    /// Validate a session token against the server-side registry. Expired
+    /// sessions are evicted on observation and fail validation.
+    pub async fn validate_token(&self, token: &str) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get(token) {
+            Some(expires_at) if Instant::now() < *expires_at => true,
+            Some(_) => {
+                sessions.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Revoke a session token and notify open streams via the revocation
+    /// epoch so they re-validate and close loudly.
+    pub async fn revoke_token(&self, token: &str) {
+        if self.sessions.lock().await.remove(token).is_some() {
+            let epoch = *self.revocations.borrow() + 1;
+            let _ = self.revocations.send(epoch);
+        }
+    }
+
+    /// Watch handle for the revocation epoch (open streams select on it).
+    pub fn revocation_watch(&self) -> watch::Receiver<u64> {
+        self.revocations.subscribe()
+    }
+
+    /// Verify a presented API key against stored (hash, scopes) entries,
+    /// returning the granted scopes. Results are cached briefly so the hot
+    /// path does not pay Argon2 verification per request.
+    pub async fn verify_api_key_scopes(
+        &self,
+        presented: &str,
+        entries: &[(String, String)],
+    ) -> Option<String> {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(presented.as_bytes());
+        let cache_key: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        {
+            let cache = self.api_key_cache.lock().await;
+            if let Some((scopes, verified_at)) = cache.get(&cache_key)
+                && Instant::now() < *verified_at + API_KEY_CACHE_TTL
+            {
+                return Some(scopes.clone());
+            }
+        }
+        let presented = presented.to_string();
+        let entries = entries.to_vec();
+        let matched = tokio::task::spawn_blocking(move || {
+            entries
+                .into_iter()
+                .find(|(hash, _)| verify_api_key_hash(&presented, hash))
+                .map(|(_, scopes)| scopes)
+        })
+        .await
+        .ok()
+        .flatten()?;
+        self.api_key_cache
+            .lock()
+            .await
+            .insert(cache_key, (matched.clone(), Instant::now()));
+        Some(matched)
     }
 
     /// Returns `Some(locked_until)` if the IP is currently locked out.
@@ -143,40 +300,15 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
         .to_string())
 }
 
-/// Derive the deterministic session token for a password hash.
-///
-/// The token is `hex(HMAC-SHA256(key = password hash, msg = label))`:
-/// - Knowing the token does not reveal the password hash (HMAC is one-way).
-/// - Changing the password changes the hash, invalidating every previously
-///   issued token/cookie — that is the only revocation mechanism needed.
-/// - The token is stable across daemon restarts, so browsers stay logged in.
-/// - Every oly instance configured with the same password derives the same
-///   token, so cookies forwarded through the reverse proxy are accepted by
-///   upstream instances: proxy and normal access share one login.
-fn derive_session_token(password_hash: &str) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(password_hash.as_bytes())
-        .expect("HMAC-SHA256 accepts keys of any length");
-    mac.update(TOKEN_DERIVATION_LABEL);
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// Constant-time byte comparison so token checks do not leak how many leading
-/// characters of the expected token an attacker guessed correctly.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
+/// Verify a plaintext API key against a stored Argon2id hash.
+pub(crate) fn verify_api_key_hash(key: &str, hash: &str) -> bool {
+    use argon2::{Argon2, PasswordHash, PasswordVerifier};
+    let Ok(parsed) = PasswordHash::new(hash) else {
         return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |diff, (l, r)| diff | (l ^ r))
-        == 0
+    };
+    Argon2::default()
+        .verify_password(key.as_bytes(), &parsed)
+        .is_ok()
 }
 
 // ── Request / Response DTOs ──────────────────────────────────────────────────
@@ -289,7 +421,7 @@ pub async fn login(
 
     if verified.is_some() {
         auth.lockout.lock().await.remove(&client_ip);
-        let token = auth.expected_token.clone();
+        let token = auth.issue_session().await;
         info!(ip = %client_ip, "auth: login success — session token issued");
         let secure = request_is_tls(&headers);
         return (
@@ -338,9 +470,9 @@ pub async fn login(
 
 /// POST /api/auth/logout — clear the caller's auth cookie.
 ///
-/// Session tokens are deterministic (derived from the password hash), so they
-/// cannot be revoked server-side; logout clears the cookie client-side. A new
-/// password is the only way to invalidate a leaked token.
+/// Sessions are random and server-side (ADR-0007): logout revokes the
+/// caller's token, bumps the revocation epoch so open WebSocket/SSE streams
+/// close loudly, and clears the cookie client-side.
 pub async fn logout(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -356,7 +488,13 @@ pub async fn logout(
             .into_response();
     }
 
-    debug!(ip = %client_ip, "auth: logout — auth cookie cleared");
+    if let Some(auth) = &state.auth
+        && let Some(token) = extract_request_token_parts(&headers, None)
+    {
+        auth.revoke_token(&token).await;
+    }
+
+    info!(ip = %client_ip, "auth: logout — session revoked, cookie cleared");
 
     (
         StatusCode::OK,
@@ -389,8 +527,12 @@ pub async fn require_auth(
         None
     };
     let token = extract_request_token_parts(request.headers(), query);
+    let bearer = extract_bearer_token(request.headers());
+    let method = request.method().clone();
     let client_ip = extract_request_client_ip(&request);
-    if let Some(response) = authorize_request(&state, &path, token, client_ip).await {
+    if let Some(response) =
+        authorize_request(&state, &method, &path, token, bearer, client_ip).await
+    {
         return response;
     }
 
@@ -399,18 +541,55 @@ pub async fn require_auth(
 
 pub(super) async fn authorize_request(
     state: &AppState,
+    method: &axum::http::Method,
     path: &str,
     token: Option<String>,
+    bearer: Option<String>,
     client_ip: Option<String>,
 ) -> Option<Response> {
     let Some(auth) = state.auth.as_ref().map(Arc::clone) else {
         return None;
     };
 
-    if let Some(token) = token {
-        if auth.is_valid_token(&token) {
-            debug!(path = %path, "auth: authorized request");
-            return None;
+    if let Some(token) = token
+        && auth.validate_token(&token).await
+    {
+        debug!(path = %path, "auth: authorized request (session)");
+        return None;
+    }
+
+    // Scoped machine credentials (ADR-0007): an API key presented as a
+    // Bearer token authorizes routes matching its scope list. Query-string
+    // and cookie credentials are never treated as API keys.
+    if let Some(key) = bearer {
+        match state.db.list_api_key_entries().await {
+            Ok(entries) => {
+                if let Some(scopes) = auth.verify_api_key_scopes(&key, &entries).await {
+                    let required = required_scope_for(method, path);
+                    if scopes_allow(&scopes, required) {
+                        debug!(path = %path, scope = required, "auth: authorized request (api key)");
+                        return None;
+                    }
+                    warn!(
+                        path = %path,
+                        required_scope = required,
+                        "auth: API key lacks the required scope"
+                    );
+                    return Some(
+                        (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "insufficient_scope",
+                                "required_scope": required,
+                            })),
+                        )
+                            .into_response(),
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "auth: failed to list API keys");
+            }
         }
     }
 
@@ -454,6 +633,45 @@ pub(super) fn extract_request_token_parts(
         .or_else(|| extract_cookie_token(headers))
 }
 
+/// Extract only the Authorization: Bearer credential (never query/cookie),
+/// used when deciding whether a request carries machine credentials.
+pub(super) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_owned())
+}
+
+/// WebSocket Origin validation (ADR-0007): a browser cross-site WebSocket
+/// must not ride the ambient auth cookie. Non-browser clients (no Origin
+/// header) are unaffected; an Origin whose host[:port] does not match the
+/// Host header is rejected.
+pub fn ws_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let authority = origin
+        .split("://")
+        .nth(1)
+        .unwrap_or(origin)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    match host {
+        Some(host) => !authority.is_empty() && authority == host,
+        None => false,
+    }
+}
+
 fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::COOKIE)
@@ -472,7 +690,7 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
 
 fn build_auth_cookie(token: &str, secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
-    let max_age = AUTH_COOKIE_MAX_AGE.as_secs();
+    let max_age = SESSION_TTL.as_secs();
     format!(
         "{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure_flag}"
     )
@@ -494,53 +712,148 @@ fn request_is_tls(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COOKIE_NAME, AuthState, build_auth_cookie, clear_auth_cookie, constant_time_eq,
-        derive_session_token, extract_request_token_parts, hash_password,
+        AUTH_COOKIE_NAME, AuthState, SCOPE_CONTROL, SCOPE_MANAGE, SCOPE_NODE, SCOPE_OBSERVE,
+        SESSION_TTL, build_auth_cookie, clear_auth_cookie, extract_request_token_parts,
+        hash_password, required_scope_for, scopes_allow, validate_scope_list, ws_origin_allowed,
     };
-    use axum::http::{HeaderMap, header};
+    use axum::http::{HeaderMap, Method, header};
+
+    #[tokio::test]
+    async fn sessions_are_random_expiring_and_revocable() {
+        let state = AuthState::new(hash_password("hunter2").expect("password should hash"));
+
+        let token_a = state.issue_session().await;
+        let token_b = state.issue_session().await;
+        // Random: two logins never share a token.
+        assert_ne!(token_a, token_b);
+        assert_eq!(token_a.len(), 64);
+        assert!(token_a.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        assert!(state.validate_token(&token_a).await);
+        assert!(state.validate_token(&token_b).await);
+        assert!(!state.validate_token("not-the-token").await);
+        // Prefix of a real token is rejected.
+        assert!(!state.validate_token(&token_a[..token_a.len() - 1]).await);
+
+        // Revocation invalidates only the revoked token and bumps the epoch.
+        let mut watch = state.revocation_watch();
+        let epoch = *watch.borrow();
+        state.revoke_token(&token_a).await;
+        assert!(!state.validate_token(&token_a).await);
+        assert!(state.validate_token(&token_b).await);
+        watch.changed().await.expect("revocation epoch must bump");
+        assert_eq!(*watch.borrow(), epoch + 1);
+
+        // Re-issuing never collides with a revoked token.
+        let token_c = state.issue_session().await;
+        assert_ne!(token_a, token_c);
+    }
 
     #[test]
-    fn derived_token_is_stable_and_password_sensitive() {
-        let hash_a = hash_password("hunter2").expect("password should hash");
-        let hash_b = hash_password("hunter2").expect("password should hash");
-        let hash_c = hash_password("different").expect("password should hash");
+    fn cookie_lifetime_matches_session_ttl() {
+        assert_eq!(SESSION_TTL.as_secs(), 7 * 24 * 60 * 60);
+        let cookie = build_auth_cookie("abc123", false);
+        assert!(cookie.contains("Max-Age=604800"));
+    }
 
-        let token_a1 = derive_session_token(&hash_a);
-        let token_a2 = derive_session_token(&hash_a);
-        let token_b = derive_session_token(&hash_b);
-        let token_c = derive_session_token(&hash_c);
+    #[test]
+    fn scope_lists_parse_and_gate() {
+        assert!(validate_scope_list("observe,control").is_ok());
+        assert!(validate_scope_list("all").is_ok());
+        assert!(validate_scope_list("").is_err());
+        assert!(validate_scope_list("observe,root").is_err());
 
-        // Same hash → same token (deterministic, survives restarts).
-        assert_eq!(token_a1, token_a2);
-        // Same password, different salt → different token. This is expected:
-        // the daemon re-derives its own token at startup, and password changes
-        // always come with a new hash.
-        assert_ne!(token_a1, token_b);
-        // Different password → different token.
-        assert_ne!(token_a1, token_c);
-        // Token format: 32-byte HMAC output, hex-encoded.
-        assert_eq!(token_a1.len(), 64);
-        assert!(token_a1.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(scopes_allow("observe,control", SCOPE_OBSERVE));
+        assert!(scopes_allow("observe,control", SCOPE_CONTROL));
+        assert!(!scopes_allow("observe,control", SCOPE_MANAGE));
+        assert!(!scopes_allow("observe,control", SCOPE_NODE));
+        assert!(scopes_allow("all", SCOPE_MANAGE));
+        assert!(scopes_allow(" node ", SCOPE_NODE));
+    }
+
+    #[test]
+    fn routes_classify_into_scopes() {
+        assert_eq!(
+            required_scope_for(&Method::GET, "/api/sessions"),
+            SCOPE_OBSERVE
+        );
+        assert_eq!(
+            required_scope_for(&Method::GET, "/api/sessions/abc/logs"),
+            SCOPE_OBSERVE
+        );
+        // Attach is a GET upgrade but grants interactive control.
+        assert_eq!(
+            required_scope_for(&Method::GET, "/api/sessions/abc/attach"),
+            SCOPE_CONTROL
+        );
+        assert_eq!(
+            required_scope_for(&Method::POST, "/api/sessions/abc/input"),
+            SCOPE_CONTROL
+        );
+        assert_eq!(
+            required_scope_for(&Method::POST, "/api/sessions/abc/upload"),
+            SCOPE_CONTROL
+        );
+        assert_eq!(
+            required_scope_for(&Method::POST, "/api/sessions"),
+            SCOPE_MANAGE
+        );
+        assert_eq!(
+            required_scope_for(&Method::POST, "/api/sessions/abc/kill"),
+            SCOPE_MANAGE
+        );
+        assert_eq!(
+            required_scope_for(&Method::POST, "/api/sessions/abc/metadata"),
+            SCOPE_MANAGE
+        );
     }
 
     #[tokio::test]
-    async fn auth_state_validates_derived_token_without_expiry() {
+    async fn api_key_verification_returns_scopes_and_caches() {
         let state = AuthState::new(hash_password("hunter2").expect("password should hash"));
+        let key = "0123456789abcdef";
+        let hash = hash_password(key).expect("key should hash");
+        let entries = vec![(hash, "observe,node".to_string())];
 
-        assert!(state.is_valid_token(&state.expected_token));
-        assert!(!state.is_valid_token("not-the-token"));
-        // Prefix of the real token must be rejected (constant-time eq checks
-        // full length).
-        let truncated = &state.expected_token[..state.expected_token.len() - 1];
-        assert!(!state.is_valid_token(truncated));
+        let scopes = state
+            .verify_api_key_scopes(key, &entries)
+            .await
+            .expect("key must verify");
+        assert_eq!(scopes, "observe,node");
+        // Cached: second call succeeds even with an empty entry list.
+        let cached = state
+            .verify_api_key_scopes(key, &[])
+            .await
+            .expect("cached verification must succeed");
+        assert_eq!(cached, "observe,node");
+        // Wrong key never verifies.
+        assert!(
+            state
+                .verify_api_key_scopes("ffffffffffffffff", &entries)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
-    fn constant_time_comparison_behaves() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
+    fn websocket_origin_must_match_host() {
+        let mut headers = HeaderMap::new();
+        // No Origin header (non-browser client) is allowed.
+        assert!(ws_origin_allowed(&headers));
+
+        headers.insert(header::HOST, "localhost:7700".parse().unwrap());
+        assert!(ws_origin_allowed(&headers));
+
+        headers.insert(header::ORIGIN, "http://localhost:7700".parse().unwrap());
+        assert!(ws_origin_allowed(&headers));
+
+        headers.insert(header::ORIGIN, "https://evil.example.com".parse().unwrap());
+        assert!(!ws_origin_allowed(&headers));
+
+        // Origin without a Host header cannot be validated: reject.
+        let mut no_host = HeaderMap::new();
+        no_host.insert(header::ORIGIN, "http://localhost:7700".parse().unwrap());
+        assert!(!ws_origin_allowed(&no_host));
     }
 
     #[test]
@@ -585,7 +898,6 @@ mod tests {
 
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
-        assert!(set_cookie.contains("Max-Age=31536000"));
         assert!(!set_cookie.contains("Secure"));
         assert!(secure_cookie.contains("; Secure"));
         assert!(clear_cookie.contains("Max-Age=0"));

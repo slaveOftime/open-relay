@@ -1,6 +1,6 @@
 # ADR-0007: Auth scopes, browser sessions, proxy isolation, side effects
 
-- Status: Accepted (direction; expiration durations and admin UX deferred to M5)
+- Status: Accepted; M5-4 implemented items 1–4 (session registry, scopes, origin/CSRF posture, proxy isolation)
 - Plan reference: PLAN.md §10.3 (invariant I12)
 
 ## Context
@@ -46,3 +46,41 @@ into any renderer that replays them.
 
 1.0 upgrade requires re-login and credential reissue; insecure sessions are
 not carried over for convenience.
+
+## Addendum (M5-4): implemented authz
+
+1. **Random, revocable, expiring sessions**: login issues a 256-bit random
+   token stored server-side (7-day TTL; cookie mirrors it). Logout revokes
+   the token and bumps a revocation epoch; open WebSocket attach streams
+   (local and proxied) and SSE event streams select on the epoch, re-validate
+   their token, and close loudly on revocation. A daemon restart invalidates
+   all sessions (in-memory registry; re-login required). The deterministic
+   password-derived token is gone — and with it the cross-instance token
+   sharing that let one cookie authenticate to every upstream oly behind the
+   reverse proxy.
+2. **Scoped machine credentials**: API keys carry a comma-separated scope
+   list (`observe`, `control`, `manage`, `node`, `all`; migration 0007).
+   `oly api-key add NAME --scopes ...` (default `node`, preserving the
+   historical node-join use). Node join requires the `node` scope. Presented
+   as `Authorization: Bearer` on the HTTP API, a key authorizes routes
+   classified by capability: GETs are `observe` (attach upgrades are
+   `control`), `/input` and `/upload` are `control`, all other mutations are
+   `manage`. Verified key→scope mappings are cached for 60 s to keep Argon2
+   verification off the hot path. Query-string and cookie credentials are
+   never treated as API keys.
+3. **Origin/CSRF posture**: WebSocket attach upgrades reject an `Origin`
+   whose host does not match the `Host` header (non-browser clients without
+   `Origin` are unaffected). The session cookie is `HttpOnly; SameSite=Lax`
+   (`Secure` when TLS is detected), so cross-site POSTs cannot ride it.
+   Query-string tokens remain accepted only on the WS/SSE upgrade paths where
+   browsers cannot set headers; with random, expiring, revocable tokens the
+   leakage window is now bounded (accepted residual risk).
+4. **Proxy credential isolation**: the reverse proxy strips `Authorization`
+   and `Cookie` from requests and WebSocket handshakes forwarded to upstream
+   apps — oly credentials are never forwarded as implicit SSO. Upstream oly
+   instances behind the proxy now require their own login.
+
+Deferred: admin UX for session listing/revocation beyond logout; per-scope
+frontend affordances (a read-only UI flag is not access control, but the UI
+does not yet hide disallowed actions); item 5 (replay side-effect policy) is
+audited in M5-6.

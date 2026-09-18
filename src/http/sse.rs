@@ -157,6 +157,8 @@ pub(super) async fn run_session_poller(
 
 pub async fn events_handler(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     // Snapshot of all current sessions sent as the first event
     let initial = {
@@ -205,6 +207,27 @@ pub async fn events_handler(
                 None
             }
         }
+    });
+
+    // ADR-0007 (M5-4): a revoked session's event stream closes loudly.
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    if let (Some(auth), Some(token)) = (
+        state.auth.clone(),
+        crate::http::auth::extract_request_token_parts(&headers, query.as_deref()),
+    ) {
+        tokio::spawn(async move {
+            let mut revocations = auth.revocation_watch();
+            while revocations.changed().await.is_ok() {
+                if !auth.validate_token(&token).await {
+                    debug!("SSE stream closed — session token revoked");
+                    let _ = stop_tx.send(());
+                    return;
+                }
+            }
+        });
+    }
+    let live_stream = live_stream.take_until(async move {
+        let _ = stop_rx.await;
     });
 
     Sse::new(initial_stream.chain(live_stream)).keep_alive(KeepAlive::default())

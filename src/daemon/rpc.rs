@@ -254,7 +254,7 @@ async fn dispatch_request(
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
         }
-        RpcRequest::ApiKeyAdd { name } => handle_api_key_add(name, db).await,
+        RpcRequest::ApiKeyAdd { name, scopes } => handle_api_key_add(name, scopes, db).await,
         RpcRequest::ApiKeyList => handle_api_key_list(db).await,
         RpcRequest::ApiKeyRemove { name } => handle_api_key_remove(name, db).await,
         RpcRequest::JoinStart { url, name, key } => {
@@ -1381,14 +1381,17 @@ async fn handle_logs_wait(
     RpcResponse::Empty
 }
 
-async fn handle_api_key_add(name: String, db: &Arc<Database>) -> RpcResponse {
+async fn handle_api_key_add(name: String, scopes: String, db: &Arc<Database>) -> RpcResponse {
+    if let Err(message) = crate::http::auth::validate_scope_list(&scopes) {
+        return RpcResponse::Error { message };
+    }
     use rand::RngCore;
     let mut key_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key_bytes);
     let plaintext: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     match auth::hash_password(&plaintext) {
-        Ok(hash) => match db.add_api_key(&name, &hash).await {
+        Ok(hash) => match db.add_api_key(&name, &hash, &scopes).await {
             Ok(()) => {
                 info!(name, "api key registered");
                 RpcResponse::ApiKeyAdd {
@@ -1413,6 +1416,7 @@ async fn handle_api_key_list(db: &Arc<Database>) -> RpcResponse {
                 .map(|r| ApiKeySummary {
                     name: r.name,
                     created_at: r.created_at,
+                    scopes: r.scopes,
                 })
                 .collect(),
         },

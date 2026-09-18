@@ -190,15 +190,23 @@ async fn serve_static_or_proxy(
     let (parts, body) = request.into_parts();
     let uri = parts.uri.clone();
     let headers = parts.headers.clone();
+    let method = parts.method.clone();
     let wwwroot_dir = state.config.get().wwwroot_dir();
     let auth_token = auth::extract_request_token_parts(&headers, uri.query());
+    let bearer = auth::extract_bearer_token(&headers);
     let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
 
     match apps::resolve_app_request(&wwwroot_dir, &uri) {
         Ok(Some(apps::AppRequestTarget::LocalFile(candidate))) => {
-            if let Some(response) =
-                auth::authorize_request(&state, uri.path(), auth_token.clone(), client_ip.clone())
-                    .await
+            if let Some(response) = auth::authorize_request(
+                &state,
+                &method,
+                uri.path(),
+                auth_token.clone(),
+                bearer.clone(),
+                client_ip.clone(),
+            )
+            .await
             {
                 return response;
             }
@@ -212,9 +220,15 @@ async fn serve_static_or_proxy(
             }
         }
         Ok(Some(apps::AppRequestTarget::Proxy(target_urls))) => {
-            if let Some(response) =
-                auth::authorize_request(&state, uri.path(), auth_token.clone(), client_ip.clone())
-                    .await
+            if let Some(response) = auth::authorize_request(
+                &state,
+                &method,
+                uri.path(),
+                auth_token.clone(),
+                bearer.clone(),
+                client_ip.clone(),
+            )
+            .await
             {
                 return response;
             }
@@ -246,7 +260,8 @@ async fn serve_static_or_proxy(
     };
     if let Some(candidate) = local_candidate {
         if let Some(response) =
-            auth::authorize_request(&state, uri.path(), auth_token, client_ip).await
+            auth::authorize_request(&state, &method, uri.path(), auth_token, bearer, client_ip)
+                .await
         {
             return response;
         }

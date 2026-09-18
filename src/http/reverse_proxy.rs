@@ -301,8 +301,12 @@ enum AppWebsocketConnectError {
 }
 
 fn should_forward_http_header(header_name: &HeaderName, connection_headers: &[String]) -> bool {
+    // ADR-0007 credential isolation: oly's own credentials are never
+    // forwarded to arbitrary upstreams as implicit SSO.
     !header_name.as_str().eq_ignore_ascii_case("host")
         && !header_name.as_str().eq_ignore_ascii_case("content-length")
+        && !header_name.as_str().eq_ignore_ascii_case("authorization")
+        && !header_name.as_str().eq_ignore_ascii_case("cookie")
         && !HOP_BY_HOP_HEADERS
             .iter()
             .any(|candidate| header_name.as_str().eq_ignore_ascii_case(candidate))
@@ -312,7 +316,10 @@ fn should_forward_http_header(header_name: &HeaderName, connection_headers: &[St
 }
 
 fn should_forward_websocket_header(header_name: &HeaderName) -> bool {
+    // ADR-0007 credential isolation (see should_forward_http_header).
     !header_name.as_str().eq_ignore_ascii_case("host")
+        && !header_name.as_str().eq_ignore_ascii_case("authorization")
+        && !header_name.as_str().eq_ignore_ascii_case("cookie")
         && !header_name
             .as_str()
             .eq_ignore_ascii_case("sec-websocket-extensions")

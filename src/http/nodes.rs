@@ -92,8 +92,8 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     };
 
     // ── Step 2: validate API key against any registered key ──────────────
-    let hashes = match state.db.list_api_key_hashes().await {
-        Ok(h) => h,
+    let entries = match state.db.list_api_key_entries().await {
+        Ok(e) => e,
         Err(_) => {
             send_error(&mut ws_tx, "internal error").await;
             return;
@@ -101,10 +101,15 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     };
 
     // Run Argon2 verification on a blocking thread to avoid starving the
-    // async runtime with CPU-intensive work.
+    // async runtime with CPU-intensive work. Node join requires the `node`
+    // scope (ADR-0007, M5-4).
     let key_clone = key.clone();
     let verified = tokio::task::spawn_blocking(move || {
-        !hashes.is_empty() && hashes.iter().any(|h| verify_api_key(&key_clone, h))
+        !entries.is_empty()
+            && entries.iter().any(|(hash, scopes)| {
+                crate::http::auth::scopes_allow(scopes, crate::http::auth::SCOPE_NODE)
+                    && crate::http::auth::verify_api_key_hash(&key_clone, hash)
+            })
     })
     .await
     .unwrap_or(false);
@@ -379,16 +384,6 @@ async fn handle_forwarded_session_event(state: &AppState, node_name: &str, paylo
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn verify_api_key(key: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
-    let Ok(parsed) = PasswordHash::new(hash) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(key.as_bytes(), &parsed)
-        .is_ok()
-}
 
 async fn send_error(
     ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,

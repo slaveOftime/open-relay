@@ -128,8 +128,18 @@ pub async fn attach_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(params): Query<AttachParams>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    // ADR-0007 (M5-4): browser cross-site WebSockets must not ride the
+    // ambient auth cookie — Origin host must match the request Host.
+    if !crate::http::auth::ws_origin_allowed(&headers) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "websocket origin rejected",
+        )
+            .into_response();
+    }
     debug!(session_id = %id, "WebSocket upgrade requested");
     ws.on_upgrade(move |socket| async move {
         let panic_session_id = id.clone();
@@ -139,9 +149,12 @@ pub async fn attach_handler(
             state,
             id,
             params.node,
-            params.rows,
-            params.cols,
-            params.role,
+            AttachConnectionParams {
+                initial_rows: params.rows,
+                initial_cols: params.cols,
+                role: params.role,
+                headers,
+            },
         ))
         .catch_unwind()
         .await;
@@ -155,6 +168,7 @@ pub async fn attach_handler(
             );
         }
     })
+    .into_response()
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -260,32 +274,30 @@ async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> boo
         .is_ok()
 }
 
+/// Per-connection attach parameters bundled to keep handler signatures
+/// under clippy's argument limit.
+struct AttachConnectionParams {
+    initial_rows: Option<u16>,
+    initial_cols: Option<u16>,
+    role: Option<String>,
+    headers: axum::http::HeaderMap,
+}
+
 async fn handle_ws(
     socket: WebSocket,
     state: AppState,
     id: String,
     node: Option<String>,
-    initial_rows: Option<u16>,
-    initial_cols: Option<u16>,
-    role: Option<String>,
+    params: AttachConnectionParams,
 ) {
     debug!(session_id = %id, node = ?node, "WebSocket connected");
 
     if let Some(node_name) = node {
-        handle_ws_proxied_streaming(
-            socket,
-            state,
-            id,
-            node_name,
-            initial_rows,
-            initial_cols,
-            role,
-        )
-        .await;
+        handle_ws_proxied_streaming(socket, state, id, node_name, params).await;
         return;
     }
 
-    handle_ws_streaming(socket, state, id, initial_rows, initial_cols, role).await;
+    handle_ws_streaming(socket, state, id, params).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,10 +308,14 @@ async fn handle_ws_streaming(
     mut socket: WebSocket,
     state: AppState,
     id: String,
-    initial_rows: Option<u16>,
-    initial_cols: Option<u16>,
-    role: Option<String>,
+    params: AttachConnectionParams,
 ) {
+    let AttachConnectionParams {
+        initial_rows,
+        initial_cols,
+        role,
+        headers,
+    } = params;
     // M3-4: register the attachment (control lease + viewport) before the
     // snapshot, so a controller's authorized initial geometry is applied
     // through the sequencer and already reflected in the init.
@@ -377,6 +393,12 @@ async fn handle_ws_streaming(
     // Control-handoff notices for this session.
     let mut control_rx = state.store.subscribe_control(&id);
 
+    // ADR-0007 (M5-4): logout/revocation closes live control streams not
+    // just future requests — watch the revocation epoch and re-validate the
+    // connection's token.
+    let revoke_token = crate::http::auth::extract_request_token_parts(&headers, None);
+    let mut revocation_rx = state.auth.as_ref().map(|auth| auth.revocation_watch());
+
     // Subscribe to resize broadcasts so we can notify this client when
     // another attached client changes the PTY size.
     let mut resize_sub = ResizeSubscriber::new(state.store.subscribe_resize(&id), id.clone());
@@ -391,8 +413,35 @@ async fn handle_ws_streaming(
     );
 
     loop {
+        // Session revocation check armed only while auth is enabled and the
+        // connection carried a token.
+        let revoked = async {
+            match (&mut revocation_rx, &revoke_token) {
+                (Some(rx), Some(_)) => {
+                    let _ = rx.changed().await;
+                }
+                _ => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(revoked);
         tokio::select! {
             biased;
+
+            _ = &mut revoked => {
+                if let (Some(auth), Some(token)) = (&state.auth, &revoke_token)
+                    && !auth.validate_token(token).await
+                {
+                    info!(session_id = %id, "WebSocket closed — session token revoked");
+                    let _ = send_server_message(
+                        &mut socket,
+                        &ServerMessage::Error {
+                            message: "session revoked (logout)".to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
 
             // Session output: the shared attach pump (M3-2) owns follow /
             // coalesce / lag resync / completion flush / mode tracking.
@@ -581,10 +630,14 @@ async fn handle_ws_proxied_streaming(
     state: AppState,
     id: String,
     node: String,
-    initial_rows: Option<u16>,
-    initial_cols: Option<u16>,
-    role: Option<String>,
+    params: AttachConnectionParams,
 ) {
+    let AttachConnectionParams {
+        initial_rows,
+        initial_cols,
+        role,
+        headers,
+    } = params;
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
     // Open streaming subscription via node proxy. Proxied streams are
@@ -621,9 +674,38 @@ async fn handle_ws_proxied_streaming(
 
     let mut init_sent = false;
 
+    // ADR-0007 (M5-4): revocation closes live proxied streams too.
+    let revoke_token = crate::http::auth::extract_request_token_parts(&headers, None);
+    let mut revocation_rx = state.auth.as_ref().map(|auth| auth.revocation_watch());
+
     loop {
+        let revoked = async {
+            match (&mut revocation_rx, &revoke_token) {
+                (Some(rx), Some(_)) => {
+                    let _ = rx.changed().await;
+                }
+                _ => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(revoked);
         tokio::select! {
             biased;
+
+            _ = &mut revoked => {
+                if let (Some(auth), Some(token)) = (&state.auth, &revoke_token)
+                    && !auth.validate_token(token).await
+                {
+                    info!(session_id = %id, node = %node, "proxied WebSocket closed — session token revoked");
+                    let _ = send_server_message(
+                        &mut socket,
+                        &ServerMessage::Error {
+                            message: "session revoked (logout)".to_string(),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
 
             // Streaming frames from the node proxy.
             frame = stream_rx.recv() => {

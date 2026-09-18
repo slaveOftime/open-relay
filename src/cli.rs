@@ -600,6 +600,10 @@ pub enum ApiKeyCommand {
 
 #[derive(Debug, Args)]
 pub struct ApiKeyAddArgs {
+    /// Comma-separated scopes: observe,control,manage,node,all
+    /// (default: node — the historical node-join-only key).
+    #[arg(long, default_value = "node")]
+    pub scopes: String,
     /// Friendly label for this key (must be unique).
     pub name: String,
 }
