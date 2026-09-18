@@ -608,6 +608,8 @@ Develop vertical slices behind development-only switches, then delete replaced c
 
 **Deliver** direct remote stream adapters/credits/fairness/deadlines/cancel/connection fencing; revocable auth/scopes/origin/proxy isolation; process-tree/drain/shutdown/reconciliation; safe export/upload/privacy; current security audit.
 
+**Status (in progress):** M5-1 byte-bounded queues + enforced credits (ADR-0004 addendum): the pump gates every credited attachment to a 4 MiB in-flight budget against its shared applied-cursor cell (initialized at the INIT boundary), disconnecting stalled clients loudly after 30 s — no unbounded client queues remain on the streaming path; the CLI attach loop's frame (16×~700 KiB) and terminal-event (4096, blocking backpressure, input never dropped) channels are bounded; `AttachSubscribe.credited` marks ack-capable subscriptions and the node gateway rewrites relayed ones to uncredited (fail-open until direct remote streams). Tests: credit gate holds/resumes on acks, stalls close loudly, stale credited tokens fail, relay rewrite + serde default, shared-cell monotonicity. Deferred: relay ack forwarding + direct remote streams (M5-2), byte-bounded broadcast ring (tuning), authz/process-tree/export (M5-3+). Gate: 614 unit + 48 integration/e2e (662 total), clippy 57 (baseline), fmt clean.
+
 **Exit:** local/remote share conformance suite; stalled history does not stall control; revoked controllers cannot write; supported cleanup leaves no leaked managed processes/resources.
 
 ### M6 — Debt removal and release (P0; after M1–M5)

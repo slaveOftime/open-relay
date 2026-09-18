@@ -25,6 +25,18 @@ use super::cursor::StreamCursor;
 /// incrementally rather than freezing on one very large write.
 const MAX_BATCHED_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Daemon-frame queue depth between the socket reader task and the render
+/// loop (M5-1). Frames are coalesced server-side to at most 512 KiB raw
+/// (~700 KiB base64 on the wire), so 16 frames bound the queue at ~11 MiB
+/// worst case; backpressure flows to the socket, never to a dropped byte.
+const ATTACH_FRAME_QUEUE_DEPTH: usize = 16;
+
+/// Terminal-event queue depth between the blocking crossterm reader thread
+/// and the async event loop (M5-1). Full means the thread blocks — input
+/// is backpressured, never dropped. Paste bursts arrive as one
+/// `Event::Paste`, so this only needs to absorb key-burst jitter.
+const TERMINAL_EVENT_QUEUE_DEPTH: usize = 4096;
+
 #[cfg(windows)]
 struct AttachRenderer {
     parser: vt100::Parser,
@@ -145,6 +157,9 @@ async fn run_attach_inner(
                 rows: initial_size.map(|(_, rows)| rows),
                 cols: initial_size.map(|(cols, _)| cols),
                 role: role.map(str::to_owned),
+                // This client reports applied-cursor credits every
+                // ACK_STRIDE_BYTES; the daemon gates the stream on them.
+                credited: true,
             },
         ),
     )
@@ -265,14 +280,18 @@ async fn run_attach_inner(
 
         // `read_response_from_reader` uses `read_line`, which is not safe to
         // keep cancelling with timeouts. Read daemon frames in a dedicated task
-        // and receive them over a channel instead.
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        // and receive them over a channel instead. The channel is bounded
+        // (M5-1): when the render loop falls behind, the reader task's send
+        // awaits, which backpressures the socket and — via the daemon's
+        // credit gate and broadcast-ring resync — never grows memory
+        // without bound. Worst case: 16 frames x ~700 KiB base64 lines.
+        let (frame_tx, mut frame_rx) = mpsc::channel(ATTACH_FRAME_QUEUE_DEPTH);
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
             loop {
                 let frame = ipc::read_checked_response_from_reader(&mut reader).await;
                 let done = frame.is_err();
-                if frame_tx.send(frame).is_err() {
+                if frame_tx.send(frame).await.is_err() {
                     break;
                 }
                 if done {
@@ -290,11 +309,15 @@ async fn run_attach_inner(
         // no paste-detection windows (PLAN.md §5.1/§5.2 — paste boundaries
         // come from bracketed-paste markers or the explicit clipboard
         // shortcut, never from typing speed).
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        // Bounded (M5-1): the blocking reader thread applies backpressure
+        // via `blocking_send` — input events are NEVER dropped to relieve
+        // pressure (silent input loss is a release blocker), the producer
+        // simply waits until the event loop catches up.
+        let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_DEPTH);
         let event_reader = std::thread::spawn(move || {
             // stdin closed or unreadable ends the stream.
             while let Ok(ev) = event::read() {
-                if event_tx.send(ev).is_err() {
+                if event_tx.blocking_send(ev).is_err() {
                     break;
                 }
             }
@@ -585,14 +608,15 @@ fn attach_proxy(node: Option<&str>, req: RpcRequest) -> RpcRequest {
     }
 }
 
-fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
-    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+fn spawn_attach_shutdown_listener() -> mpsc::Receiver<()> {
+    // One-shot signal: a single-slot channel is enough (M5-1).
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
     {
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             }
         });
     }
@@ -605,7 +629,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = terminate.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -613,7 +637,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = hangup.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
     }
@@ -626,7 +650,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_break.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -634,7 +658,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_close.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -642,7 +666,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_logoff.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -650,7 +674,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_shutdown.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
     }

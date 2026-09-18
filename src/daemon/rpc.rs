@@ -57,6 +57,7 @@ pub(super) async fn handle_client(
         rows,
         cols,
         role,
+        credited,
     } = request
     {
         return handle_attach_subscribe(
@@ -66,6 +67,7 @@ pub(super) async fn handle_client(
             rows,
             cols,
             role,
+            credited,
             reader,
             write_half,
             &session_store,
@@ -1023,6 +1025,7 @@ mod tests {
                     rows: None,
                     cols: None,
                     role: None,
+                    credited: true,
                 },
             )
             .await
@@ -1131,6 +1134,7 @@ mod tests {
                     rows: None,
                     cols: None,
                     role: None,
+                    credited: true,
                 },
             )
             .await
@@ -1160,6 +1164,7 @@ mod tests {
                     rows: None,
                     cols: None,
                     role: None,
+                    credited: true,
                 },
             )
             .await
@@ -1193,6 +1198,7 @@ mod tests {
                     rows: None,
                     cols: None,
                     role: Some("observer".into()),
+                    credited: true,
                 },
             )
             .await

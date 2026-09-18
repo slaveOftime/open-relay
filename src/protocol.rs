@@ -187,6 +187,14 @@ pub enum RpcRequest {
     AttachSubscribe {
         id: String,
         from_byte_offset: Option<u64>,
+        /// Whether this stream reports applied-cursor credits and is
+        /// therefore gated on them (M5-1, I7). Local interactive clients
+        /// set `true` and ack; node-relayed subscriptions must set `false`
+        /// because the relay cannot forward mid-stream credits (fail-open
+        /// until direct remote streams land in M5-2). Defaults to `false`
+        /// (safe: no enforcement) when absent.
+        #[serde(default)]
+        credited: bool,
         /// Incarnation the `from_byte_offset` cursor was issued by. Resume is
         /// only valid within the same incarnation; a mismatch is rejected with
         /// a precise stale-cursor error (PLAN §7.3). Required when

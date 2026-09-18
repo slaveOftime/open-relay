@@ -227,14 +227,28 @@ impl SessionStore {
         })
     }
 
-    /// Record a client's applied-cursor credit (M3-5, I7). Stale attachment
-    /// tokens and non-advancing cursors are ignored: credits are
-    /// best-effort backpressure signals, not correctness gates.
+    /// Record a client's applied-cursor credit (I7). Stale attachment
+    /// tokens and non-advancing cursors are ignored. The report lands in
+    /// the attachment's shared cell, which its output pump gates on (M5-1:
+    /// credits are enforced, not advisory).
     pub async fn attach_report_applied(&self, id: &str, attachment_id: u64, cursor: u64) {
         if let Ok(handle) = self.lookup_runtime(id).await {
             let mut rt = handle.write();
             rt.attachments.report_applied(attachment_id, cursor);
         }
+    }
+
+    /// The shared applied-cursor cell for one registered attachment, used
+    /// by the output pump's credit gate (M5-1). `None` for stale/unknown
+    /// attachment tokens.
+    pub(crate) async fn attachment_credit_cell(
+        &self,
+        id: &str,
+        attachment_id: u64,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        let handle = self.lookup_runtime(id).await.ok()?;
+        let rt = handle.read();
+        rt.attachments.credit_cell(attachment_id)
     }
 
     /// Slowest applied cursor across registered attachments that have
@@ -245,7 +259,7 @@ impl SessionStore {
         let rt = handle.read();
         rt.attachments
             .attachments()
-            .map(|a| a.applied_cursor)
+            .map(|a| a.applied_cursor.load(std::sync::atomic::Ordering::Relaxed))
             .filter(|&cursor| cursor > 0)
             .min()
     }

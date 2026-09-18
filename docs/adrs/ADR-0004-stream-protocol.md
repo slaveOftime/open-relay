@@ -46,3 +46,31 @@ one stalled stream block unrelated heartbeats.
 
 Protocol major bump; CLI/daemon/node mismatches fail with precise upgrade
 errors. No permanent 0.x bridge.
+
+## Addendum (M5-1): credits are enforced, queues are byte-bounded
+
+Applied-cursor credits stopped being advisory signals and became gates:
+
+1. **Credit gate in the pump.** Each credited attachment carries a shared
+   applied-cursor cell (registry) that its `AttachPump` reads. The pump may
+   run at most 4 MiB (4x the 1 MiB ack stride, so one ack round-trip never
+   gates a healthy client) plus one frame ahead of the applied cursor;
+   beyond that it waits, and a client that never catches up is ended loudly
+   (`Closed`) after 30 s — never buffered without bound. The gate sits at
+   the top of `next()`, before any chunk is consumed or offset advanced,
+   keeping `next()` cancel-safe. The cell initializes at the INIT boundary
+   (the client is deemed to have applied everything up to `end_offset`),
+   so only post-attach bytes count as in-flight.
+2. **Uncredited exception, fail-open.** Node-relayed subscriptions cannot
+   receive mid-stream credits (one request envelope per stream), so the
+   gateway rewrites `AttachSubscribe.credited = false` before relaying and
+   those pumps run ungated — the pre-M5-1 behavior — until direct remote
+   attachment streams (M5-2). The serde default is `false` for the same
+   reason: an absent flag never silently enables gating.
+3. **Client queues bounded.** The CLI attach loop's daemon-frame channel
+   (16 frames ≈ 11 MiB worst case) and terminal-event channel (4096
+   events) are bounded; the frame reader backpressures the socket and the
+   input thread blocks — input is never dropped to relieve pressure.
+
+Known remaining gap (M5-2): relayed streams and their ack forwarding; the
+broadcast ring is message-bounded (256 chunks), not byte-bounded.

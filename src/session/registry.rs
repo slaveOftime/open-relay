@@ -11,6 +11,8 @@
 //! published so every client can see who drives (I6 visibility).
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// What kind of client an attachment belongs to (principal class).
@@ -89,9 +91,10 @@ pub struct Attachment {
     pub connected_at: Instant,
     /// Last geometry this attachment declared (its terminal size).
     pub viewport: Option<(u16, u16)>,
-    /// Last stream cursor the client reported as fully applied (feeds
-    /// credits/backpressure; informational until M3-5).
-    pub applied_cursor: u64,
+    /// Last stream cursor the client reported as fully applied. Shared
+    /// with the attachment's output pump, which gates sends on it (M5-1:
+    /// credits are enforced, not advisory — I7).
+    pub applied_cursor: Arc<AtomicU64>,
     /// Expiry for parked agent leases (`None` for streaming attachments,
     /// whose lifetime is their connection).
     pub lease_expires_at: Option<Instant>,
@@ -147,7 +150,7 @@ impl AttachmentRegistry {
                 role,
                 connected_at: Instant::now(),
                 viewport,
-                applied_cursor: 0,
+                applied_cursor: Arc::new(AtomicU64::new(0)),
                 lease_expires_at: None,
             },
         );
@@ -251,13 +254,24 @@ impl AttachmentRegistry {
         self.attachments.contains_key(&id)
     }
 
-    /// Record a client-reported applied cursor (drives credits in M3-5).
+    /// Record a client-reported applied cursor (drives the pump's credit
+    /// gate, M5-1).
     pub fn report_applied(&mut self, id: u64, cursor: u64) {
         if let Some(attachment) = self.attachments.get_mut(&id) {
             // Credits are monotonic: a stale or duplicated report never
             // moves the cursor backwards (I7 bookkeeping stays conservative).
-            attachment.applied_cursor = attachment.applied_cursor.max(cursor);
+            attachment
+                .applied_cursor
+                .fetch_max(cursor, Ordering::Relaxed);
         }
+    }
+
+    /// The shared applied-cursor cell for one attachment, so its output
+    /// pump can gate sends on applied + budget (M5-1, I7).
+    pub fn credit_cell(&self, id: u64) -> Option<Arc<AtomicU64>> {
+        self.attachments
+            .get(&id)
+            .map(|a| Arc::clone(&a.applied_cursor))
     }
 
     /// Record an attachment's current viewport.
@@ -286,6 +300,26 @@ impl AttachmentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M5-1: applied-cursor reports land in the attachment's shared cell
+    /// (which the output pump gates on) and never move it backwards.
+    #[test]
+    fn report_applied_advances_the_shared_credit_cell_monotonically() {
+        let mut registry = AttachmentRegistry::default();
+        let (id, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
+        let cell = registry.credit_cell(id).expect("credit cell");
+        assert_eq!(cell.load(Ordering::Relaxed), 0);
+
+        registry.report_applied(id, 4096);
+        assert_eq!(cell.load(Ordering::Relaxed), 4096);
+        // Stale/duplicate reports never move the cursor backwards.
+        registry.report_applied(id, 1024);
+        assert_eq!(cell.load(Ordering::Relaxed), 4096);
+        // Unknown tokens are ignored.
+        registry.report_applied(9999, 1 << 40);
+        assert_eq!(cell.load(Ordering::Relaxed), 4096);
+        assert!(registry.credit_cell(9999).is_none());
+    }
 
     #[test]
     fn first_controller_request_wins_second_joins_as_observer() {

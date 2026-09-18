@@ -333,7 +333,17 @@ async fn handle_ws_streaming(
     };
     let attachment_id = registration.attachment_id;
 
-    let (mut pump, init) = match AttachPump::subscribe(&state.store, &id, None, None).await {
+    // M5-1: local WebSocket clients ack applied cursors every 1 MiB, so
+    // their stream is credit-gated.
+    let (mut pump, init) = match AttachPump::subscribe(
+        &state.store,
+        &id,
+        None,
+        None,
+        crate::session::PumpCredit::Credited { attachment_id },
+    )
+    .await
+    {
         Ok(pair) => pair,
         Err(err) => {
             let _ = state.store.attach_detach(&id, attachment_id).await;
@@ -578,6 +588,8 @@ async fn handle_ws_proxied_streaming(
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
     // Open streaming subscription via node proxy.
+    // Proxied streams are uncredited (M5-1): the node relay cannot
+    // forward mid-stream applied-cursor credits to the owning node's pump.
     let rpc = RpcRequest::AttachSubscribe {
         id: id.to_string(),
         from_byte_offset: None,
@@ -585,6 +597,7 @@ async fn handle_ws_proxied_streaming(
         rows: initial_rows.filter(|rows| *rows > 0),
         cols: initial_cols.filter(|cols| *cols > 0),
         role,
+        credited: false,
     };
     let (stream_rpc_id, mut stream_rx) = match state
         .node_registry

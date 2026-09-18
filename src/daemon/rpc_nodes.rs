@@ -349,8 +349,47 @@ async fn relay_streaming_rpc(
 
 #[cfg(test)]
 mod tests {
-    use super::is_supported_proxied_rpc;
+    use super::{is_supported_proxied_rpc, mark_relayed_subscription_uncredited};
     use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
+
+    /// M5-1: relayed subscriptions are marked uncredited before crossing
+    /// the relay, because mid-stream applied-cursor credits cannot follow
+    /// them — fail-open (ungated) rather than stalling a healthy remote
+    /// stream at the credit budget. The serde default is `false` for the
+    /// same reason: an absent flag must never silently enable gating.
+    #[test]
+    fn relayed_subscriptions_are_marked_uncredited() {
+        let mut request = RpcRequest::AttachSubscribe {
+            id: "session-123".to_string(),
+            from_byte_offset: None,
+            incarnation: None,
+            rows: None,
+            cols: None,
+            role: None,
+            credited: true,
+        };
+        mark_relayed_subscription_uncredited(&mut request);
+        let RpcRequest::AttachSubscribe { credited, .. } = &request else {
+            panic!("request kind changed");
+        };
+        assert!(!credited, "relayed subscriptions must run uncredited");
+
+        // Non-subscribe requests are untouched.
+        let mut other = RpcRequest::AttachDetach {
+            id: "session-123".to_string(),
+        };
+        mark_relayed_subscription_uncredited(&mut other);
+        assert!(matches!(other, RpcRequest::AttachDetach { .. }));
+
+        // Serde: absent `credited` decodes to false (fail-open).
+        let decoded: RpcRequest =
+            serde_json::from_str(r#"{"type":"attach_subscribe","id":"s","from_byte_offset":null}"#)
+                .expect("decode without credited field");
+        let RpcRequest::AttachSubscribe { credited, .. } = decoded else {
+            panic!("wrong variant");
+        };
+        assert!(!credited, "absent credited must default to false");
+    }
 
     #[test]
     fn proxied_detach_cleanup_is_supported() {
@@ -409,17 +448,29 @@ pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcRe
     RpcResponse::NodeList { nodes }
 }
 
+/// M5-1: a subscription relayed through the node proxy cannot receive
+/// mid-stream applied-cursor credits (one request envelope per stream),
+/// so the owning node's pump must run it uncredited — fail-open rather
+/// than stalling a healthy remote stream at the credit budget. Direct
+/// remote attachment streams (M5-2) remove this limitation.
+fn mark_relayed_subscription_uncredited(request: &mut RpcRequest) {
+    if let RpcRequest::AttachSubscribe { credited, .. } = request {
+        *credited = false;
+    }
+}
+
 /// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the
 /// secondary node and relay all streaming frames back to the CLI via IPC.
 /// Also reads client messages (input/resize/detach) from the IPC reader and
 /// proxies them to the secondary node as one-shot RPCs.
 pub(super) async fn handle_node_proxy_streaming(
     node: String,
-    inner: RpcRequest,
+    mut inner: RpcRequest,
     reader: BufReader<tokio::io::ReadHalf<Stream>>,
     mut writer: tokio::io::WriteHalf<Stream>,
     node_registry: &Arc<NodeRegistry>,
 ) -> Result<()> {
+    mark_relayed_subscription_uncredited(&mut inner);
     let (stream_rpc_id, mut stream_rx) = match node_registry.proxy_rpc_stream(&node, &inner).await {
         Ok(pair) => pair,
         Err(e) => {

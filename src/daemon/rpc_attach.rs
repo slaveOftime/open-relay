@@ -29,6 +29,7 @@ pub(super) async fn handle_attach_subscribe(
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
     role: Option<String>,
+    credited: bool,
     mut reader: BufReader<tokio::io::ReadHalf<Stream>>,
     mut writer: tokio::io::WriteHalf<Stream>,
     session_store: &SessionStoreHandle,
@@ -70,18 +71,34 @@ pub(super) async fn handle_attach_subscribe(
     let attachment_id = registration.attachment_id;
     let mut current_role = registration.role;
 
-    let (mut pump, init) =
-        match AttachPump::subscribe(session_store, &id, from_byte_offset, incarnation).await {
-            Ok(pair) => pair,
-            Err(err) => {
-                debug!(session_id = %id, error = err.message(&id), "IPC attach init failed");
-                let _ = session_store.attach_detach(&id, attachment_id).await;
-                let resp = RpcResponse::Error {
-                    message: err.message(&id),
-                };
-                return ipc::write_response_to_writer(&mut writer, resp).await;
-            }
-        };
+    // M5-1: local IPC clients ack applied cursors, so their stream is
+    // credit-gated; node-relayed subscriptions arrive with `credited:
+    // false` and run ungated (the relay cannot forward mid-stream credits
+    // — documented limitation until direct remote streams, M5-2).
+    let credit = if credited {
+        crate::session::PumpCredit::Credited { attachment_id }
+    } else {
+        crate::session::PumpCredit::Uncredited
+    };
+    let (mut pump, init) = match AttachPump::subscribe(
+        session_store,
+        &id,
+        from_byte_offset,
+        incarnation,
+        credit,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            debug!(session_id = %id, error = err.message(&id), "IPC attach init failed");
+            let _ = session_store.attach_detach(&id, attachment_id).await;
+            let resp = RpcResponse::Error {
+                message: err.message(&id),
+            };
+            return ipc::write_response_to_writer(&mut writer, resp).await;
+        }
+    };
 
     // Seed scrollback only for fresh interactive attaches: offset-based
     // resumes already have their terminal history, and piped attaches have no

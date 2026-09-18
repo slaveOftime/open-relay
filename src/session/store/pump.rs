@@ -16,6 +16,7 @@
 use super::SessionStore;
 use crate::session::runtime::{ModeSnapshot, SequencedChunk, SharedModes};
 use crate::session::{SessionError, pty::collect_chunk_bytes};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::broadcast::{
     self,
@@ -43,6 +44,48 @@ const RESYNC_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 /// before giving up — loudly, never by skipping bytes (I2).
 const FLUSH_RETRY_MAX: u8 = 50;
 const FLUSH_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+/// Credit-gating policy for one attached client (M5-1, I7; PLAN §7.4).
+/// Credits are enforced, not advisory: the pump may run at most
+/// `budget_bytes` ahead of the cursor the client reports as applied, and a
+/// client that stops applying is disconnected loudly after
+/// `stall_timeout` — never buffered into an unbounded queue.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CreditPolicy {
+    /// Max in-flight bytes (pump cursor minus client-applied cursor). Both
+    /// 1.0 clients ack every 1 MiB, so the budget is 4x that stride: one
+    /// ack round-trip never gates a healthy client.
+    pub budget_bytes: u64,
+    /// How long the pump waits for credit before ending the stream loudly.
+    pub stall_timeout: Duration,
+    /// Poll cadence while waiting for credit. Acks land in a shared atomic
+    /// updated by the transport's own select arm, so the pump only needs a
+    /// cheap relaxed load per poll — no locks, no cross-task wakeups.
+    pub poll_interval: Duration,
+}
+
+impl CreditPolicy {
+    fn production() -> Self {
+        Self {
+            budget_bytes: 4 * 1024 * 1024,
+            stall_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(25),
+        }
+    }
+}
+
+/// Whether an attachment's stream is credit-gated (M5-1).
+///
+/// Local IPC and WebSocket clients report applied-cursor acks, so their
+/// streams are gated. Node-relayed subscriptions are the documented
+/// exception: the relay carries one request per stream and cannot forward
+/// mid-stream credits, so those pumps run uncredited (fail-open, same as
+/// pre-M5-1) until direct remote attachment streams land (M5-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpCredit {
+    Uncredited,
+    Credited { attachment_id: u64 },
+}
 
 /// One server→client output event from an attach stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +147,9 @@ pub struct AttachPump {
     completing: Option<Option<i32>>,
     /// Bounded waits for the async journal flush (see FLUSH_RETRY_MAX).
     flush_retries: u8,
+    /// Credit gate (M5-1): the client's shared applied-cursor cell plus the
+    /// enforcement policy. `None` for uncredited (node-relayed) streams.
+    credit: Option<(Arc<AtomicU64>, CreditPolicy)>,
 }
 
 impl AttachPump {
@@ -115,6 +161,26 @@ impl AttachPump {
         id: &str,
         from_offset: Option<u64>,
         incarnation: Option<u64>,
+        credit: PumpCredit,
+    ) -> Result<(Self, AttachInit), SessionError> {
+        Self::subscribe_with_policy(
+            store,
+            id,
+            from_offset,
+            incarnation,
+            credit,
+            CreditPolicy::production(),
+        )
+        .await
+    }
+
+    pub(crate) async fn subscribe_with_policy(
+        store: &Arc<SessionStore>,
+        id: &str,
+        from_offset: Option<u64>,
+        incarnation: Option<u64>,
+        credit: PumpCredit,
+        credit_policy: CreditPolicy,
     ) -> Result<(Self, AttachInit), SessionError> {
         // Incarnation fencing (PLAN §7.3): a resume cursor is only valid for
         // the incarnation that issued it. Anything else is rejected up front
@@ -173,6 +239,25 @@ impl AttachPump {
         let last_modes = init.modes;
         let mut completion = tokio::time::interval(COMPLETION_POLL_INTERVAL);
         completion.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // M5-1: arm the credit gate. The cell starts at the init boundary:
+        // the client is deemed to have applied everything up to
+        // `end_offset` once it processes INIT (whose payload is separately
+        // bounded), so only bytes streamed after attach count as in-flight.
+        // Client acks report absolute cursors >= end_offset, so fetch_max
+        // keeps the cell monotonic from here. A credited subscription
+        // requires a registered attachment; a stale token is a loud error,
+        // not a silent fallback to ungated streaming.
+        let credit = match credit {
+            PumpCredit::Uncredited => None,
+            PumpCredit::Credited { attachment_id } => {
+                let cell = store
+                    .attachment_credit_cell(id, attachment_id)
+                    .await
+                    .ok_or(SessionError::StaleAttachment)?;
+                cell.store(init.end_offset, Ordering::Relaxed);
+                Some((cell, credit_policy))
+            }
+        };
         Ok((
             Self {
                 id: id.to_string(),
@@ -187,15 +272,54 @@ impl AttachPump {
                 held: None,
                 completing: None,
                 flush_retries: 0,
+                credit,
             },
             init,
         ))
+    }
+
+    /// Credit gate (M5-1, I7): wait until the client's applied cursor is
+    /// within `budget_bytes` of the pump cursor. Bounded: a client that
+    /// stops applying is ended loudly with [`AttachEvent::Closed`] after
+    /// the stall timeout, never buffered without bound. Cancel-safe: no
+    /// pump state mutates while waiting.
+    async fn await_credit(&self) -> Option<AttachEvent> {
+        let (cell, policy) = self.credit.as_ref()?;
+        let in_flight = |applied: u64| self.current_offset.saturating_sub(applied);
+        if in_flight(cell.load(Ordering::Relaxed)) <= policy.budget_bytes {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + policy.stall_timeout;
+        loop {
+            tokio::time::sleep(policy.poll_interval).await;
+            let applied = cell.load(Ordering::Relaxed);
+            if in_flight(applied) <= policy.budget_bytes {
+                return None;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    session_id = %self.id,
+                    cursor = self.current_offset,
+                    applied,
+                    budget = policy.budget_bytes,
+                    "attach client stopped applying; closing stalled stream (credit gate)"
+                );
+                return Some(AttachEvent::Closed);
+            }
+        }
     }
 
     /// Wait for the next output event. Cancel-safe; ends the stream with
     /// [`AttachEvent::Done`] or [`AttachEvent::Closed`].
     pub async fn next(&mut self) -> AttachEvent {
         loop {
+            // Credit gate first (M5-1, I7): before consuming any broadcast
+            // chunk or advancing any offset. Placing the wait here — never
+            // after `forward_chunk` — keeps `next()` cancel-safe: a
+            // cancelled wait has consumed nothing, so no byte is lost.
+            if let Some(closed) = self.await_credit().await {
+                return closed;
+            }
             if let Some(event) = self.pending.pop_front() {
                 return event;
             }
@@ -496,12 +620,155 @@ mod tests {
         });
     }
 
+    /// M5-1: a credited pump may run at most `budget_bytes` ahead of the
+    /// client's applied cursor; output resumes the moment credits arrive.
+    #[tokio::test]
+    async fn credit_gate_holds_output_until_the_client_applies() {
+        let (store, rt) = running_store("credit1", "base").await;
+        let registration = store
+            .attach_register(
+                "credit1",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::ControlRequest::Controller,
+                None,
+            )
+            .await
+            .expect("register attachment");
+        let policy = CreditPolicy {
+            budget_bytes: 16,
+            stall_timeout: Duration::from_secs(30),
+            poll_interval: Duration::from_millis(5),
+        };
+        let (mut pump, init) = AttachPump::subscribe_with_policy(
+            &store,
+            "credit1",
+            None,
+            None,
+            PumpCredit::Credited {
+                attachment_id: registration.attachment_id,
+            },
+            policy,
+        )
+        .await
+        .expect("subscribe");
+        let cell = store
+            .attachment_credit_cell("credit1", registration.attachment_id)
+            .await
+            .expect("credit cell");
+        // The gate starts from the init boundary: bytes the client
+        // receives in INIT are not in flight.
+        assert_eq!(cell.load(Ordering::Relaxed), init.end_offset);
+
+        // First chunk (32 bytes) flows: credits bound in-flight bytes to
+        // budget + one frame (frames are never split), so the gate engages
+        // on the NEXT chunk while 32 bytes are unapplied.
+        emit(&rt, &[b'x'; 32]);
+        match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
+            Ok(AttachEvent::Chunk { offset, data }) => {
+                assert_eq!(offset, init.end_offset);
+                assert_eq!(data.len(), 32);
+            }
+            other => panic!("expected first chunk within budget+frame, got {other:?}"),
+        }
+
+        // 8 more bytes while the client has applied nothing: held.
+        emit(&rt, &[b'z'; 8]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), pump.next())
+                .await
+                .is_err(),
+            "the credit gate must hold output beyond the budget"
+        );
+
+        // The client applies the first chunk: the held output flows.
+        cell.store(init.end_offset + 32, Ordering::Relaxed);
+        match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
+            Ok(AttachEvent::Chunk { offset, data }) => {
+                assert_eq!(offset, init.end_offset + 32);
+                assert_eq!(data.len(), 8);
+            }
+            other => panic!("expected chunk after credit, got {other:?}"),
+        }
+    }
+
+    /// M5-1: a client that never applies is disconnected loudly after the
+    /// stall timeout — never buffered into an unbounded queue.
+    #[tokio::test]
+    async fn credit_gate_disconnects_a_stalled_client_loudly() {
+        let (store, rt) = running_store("credit2", "base").await;
+        let registration = store
+            .attach_register(
+                "credit2",
+                crate::session::registry::AttachKind::Web,
+                crate::session::registry::ControlRequest::Observer,
+                None,
+            )
+            .await
+            .expect("register attachment");
+        let policy = CreditPolicy {
+            budget_bytes: 8,
+            stall_timeout: Duration::from_millis(200),
+            poll_interval: Duration::from_millis(10),
+        };
+        let (mut pump, _init) = AttachPump::subscribe_with_policy(
+            &store,
+            "credit2",
+            None,
+            None,
+            PumpCredit::Credited {
+                attachment_id: registration.attachment_id,
+            },
+            policy,
+        )
+        .await
+        .expect("subscribe");
+
+        // The first 16 bytes flow (budget + one frame); with no acks the
+        // next chunk trips the gate and the stall deadline ends the stream.
+        emit(&rt, &[b'y'; 16]);
+        match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
+            Ok(AttachEvent::Chunk { data, .. }) => assert_eq!(data.len(), 16),
+            other => panic!("expected first chunk within budget+frame, got {other:?}"),
+        }
+        emit(&rt, &[b'q'; 8]);
+        match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
+            Ok(AttachEvent::Closed) => {}
+            other => panic!("a stalled client must be closed loudly, got {other:?}"),
+        }
+    }
+
+    /// M5-1: a credited subscription names its attachment fencing token; a
+    /// stale token fails loudly instead of degrading to ungated streaming.
+    #[tokio::test]
+    async fn credited_subscribe_rejects_a_stale_attachment_token() {
+        let (store, _rt) = running_store("credit3", "base").await;
+        let result = AttachPump::subscribe(
+            &store,
+            "credit3",
+            None,
+            None,
+            PumpCredit::Credited {
+                attachment_id: 4242,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SessionError::StaleAttachment)),
+            "stale attachment token must fail loudly, got: {}",
+            result
+                .err()
+                .map(|e| e.message("credit3"))
+                .unwrap_or_default()
+        );
+    }
+
     #[tokio::test]
     async fn pump_streams_chunks_modes_and_completion() {
         let (store, rt) = running_store("pump1", "hello\r\n").await;
-        let (mut pump, init) = AttachPump::subscribe(&store, "pump1", None, None)
-            .await
-            .expect("subscribe");
+        let (mut pump, init) =
+            AttachPump::subscribe(&store, "pump1", None, None, PumpCredit::Uncredited)
+                .await
+                .expect("subscribe");
         assert!(init.running, "a running session must attach as running");
 
         emit(&rt, b"chunk-one");
@@ -549,7 +816,8 @@ mod tests {
         // The fixture runtime has no live journal, so every resume cursor is
         // stale: both a wrong incarnation and a missing one are refused
         // instead of streaming from an inferred offset.
-        let result = AttachPump::subscribe(&store, "pump3", Some(0), Some(1)).await;
+        let result =
+            AttachPump::subscribe(&store, "pump3", Some(0), Some(1), PumpCredit::Uncredited).await;
         let err = match result {
             Err(err) => err,
             Ok(_) => panic!("wrong incarnation must be rejected"),
@@ -561,7 +829,8 @@ mod tests {
                 current: None
             }
         ));
-        let result = AttachPump::subscribe(&store, "pump3", Some(0), None).await;
+        let result =
+            AttachPump::subscribe(&store, "pump3", Some(0), None, PumpCredit::Uncredited).await;
         let err = match result {
             Err(err) => err,
             Ok(_) => panic!("resume without incarnation must be rejected"),
@@ -575,7 +844,7 @@ mod tests {
         ));
         // Fresh attaches carry no cursor and stay unaffected.
         assert!(
-            AttachPump::subscribe(&store, "pump3", None, None)
+            AttachPump::subscribe(&store, "pump3", None, None, PumpCredit::Uncredited)
                 .await
                 .is_ok()
         );
@@ -584,9 +853,10 @@ mod tests {
     #[tokio::test]
     async fn pump_trims_overlapping_broadcast_chunks() {
         let (store, rt) = running_store("pump4", "").await;
-        let (mut pump, _init) = AttachPump::subscribe(&store, "pump4", None, None)
-            .await
-            .expect("subscribe");
+        let (mut pump, _init) =
+            AttachPump::subscribe(&store, "pump4", None, None, PumpCredit::Uncredited)
+                .await
+                .expect("subscribe");
 
         emit(&rt, b"abc");
         match pump.next().await {
@@ -624,9 +894,10 @@ mod tests {
     #[tokio::test]
     async fn pump_resyncs_the_gap_before_a_far_ahead_chunk() {
         let (store, rt) = running_store("pump5", "").await;
-        let (mut pump, _init) = AttachPump::subscribe(&store, "pump5", None, None)
-            .await
-            .expect("subscribe");
+        let (mut pump, _init) =
+            AttachPump::subscribe(&store, "pump5", None, None, PumpCredit::Uncredited)
+                .await
+                .expect("subscribe");
 
         // Bytes 0..5 exist only in the persisted stream (the ring entries
         // carrying them were lost); the next broadcast chunk starts at 5.
@@ -664,9 +935,10 @@ mod tests {
     #[tokio::test]
     async fn pump_resyncs_from_persisted_stream_after_lag() {
         let (store, rt) = running_store("pump2", "").await;
-        let (mut pump, init) = AttachPump::subscribe(&store, "pump2", None, None)
-            .await
-            .expect("subscribe");
+        let (mut pump, init) =
+            AttachPump::subscribe(&store, "pump2", None, None, PumpCredit::Uncredited)
+                .await
+                .expect("subscribe");
         assert_eq!(init.end_offset, 0);
 
         // Overflow the small broadcast ring (capacity 4 in the fixture) with
@@ -785,9 +1057,10 @@ mod tests {
                     emit_persisted(&rt, &chunk);
                 }
             }
-            let (pump, init) = AttachPump::subscribe(&store, "stress1", None, None)
-                .await
-                .expect("subscribe");
+            let (pump, init) =
+                AttachPump::subscribe(&store, "stress1", None, None, PumpCredit::Uncredited)
+                    .await
+                    .expect("subscribe");
             clients.push(Client {
                 pump,
                 attachment_id,
@@ -865,9 +1138,15 @@ mod tests {
                         .attach_register("stress1", AttachKind::Web, ControlRequest::Observer, None)
                         .await
                         .expect("late observer");
-                    let (pump, init) = AttachPump::subscribe(&store, "stress1", None, None)
-                        .await
-                        .expect("late subscribe");
+                    let (pump, init) = AttachPump::subscribe(
+                        &store,
+                        "stress1",
+                        None,
+                        None,
+                        PumpCredit::Uncredited,
+                    )
+                    .await
+                    .expect("late subscribe");
                     clients.push(Client {
                         pump,
                         attachment_id: reg.attachment_id,
