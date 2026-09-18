@@ -205,35 +205,92 @@ pub const JOURNAL_DIR_NAME: &str = "journal";
 const SEGMENT_PREFIX: &str = "seg-";
 const SEGMENT_SUFFIX: &str = ".ojrn";
 
-fn segment_path(journal_dir: &Path, incarnation: u64) -> PathBuf {
-    journal_dir.join(format!("{SEGMENT_PREFIX}{incarnation:08}{SEGMENT_SUFFIX}"))
+/// Maximum size of one segment part before the appender rolls over to the
+/// next part of the same incarnation. Bounding part size bounds recovery
+/// work, per-read validation work and sparse-index memory (ADR-0002).
+pub const DEFAULT_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Segments are split into bounded parts within one incarnation:
+/// `seg-{incarnation:08}-{part:04}.ojrn`. Sequences continue across
+/// parts, so cursors stay `{incarnation, seq}` and never name parts.
+fn segment_path(journal_dir: &Path, incarnation: u64, part: u64) -> PathBuf {
+    journal_dir.join(format!(
+        "{SEGMENT_PREFIX}{incarnation:08}-{part:04}{SEGMENT_SUFFIX}"
+    ))
 }
 
-/// Newest incarnation number present in `journal_dir`, if any.
-fn latest_incarnation(journal_dir: &Path) -> io::Result<Option<u64>> {
-    let mut latest = None;
+fn parse_segment_name(name: &str) -> Option<(u64, u64)> {
+    let rest = name
+        .strip_prefix(SEGMENT_PREFIX)?
+        .strip_suffix(SEGMENT_SUFFIX)?;
+    let (incarnation, part) = rest.split_once('-')?;
+    Some((incarnation.parse().ok()?, part.parse().ok()?))
+}
+
+/// All `(incarnation, part)` pairs in a journal directory, ascending.
+pub fn list_segments(journal_dir: &Path) -> io::Result<Vec<(u64, u64)>> {
+    let mut segments = Vec::new();
+    if !journal_dir.exists() {
+        return Ok(segments);
+    }
     for entry in fs::read_dir(journal_dir)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(number) = name
-            .strip_prefix(SEGMENT_PREFIX)
-            .and_then(|rest| rest.strip_suffix(SEGMENT_SUFFIX))
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
+        let Some(pair) = parse_segment_name(name) else {
             continue;
         };
-        latest = Some(latest.map_or(number, |current: u64| current.max(number)));
+        segments.push(pair);
     }
-    Ok(latest)
+    segments.sort_unstable();
+    Ok(segments)
 }
 
-/// What recovery found in the previous incarnation's segment.
+/// All incarnation numbers present in a journal directory, ascending.
+pub fn list_incarnations(journal_dir: &Path) -> io::Result<Vec<u64>> {
+    let segments = list_segments(journal_dir)?;
+    let mut incarnations: Vec<u64> = segments
+        .iter()
+        .map(|&(incarnation, _)| incarnation)
+        .collect();
+    incarnations.dedup();
+    Ok(incarnations)
+}
+
+/// Sequence number of a segment part's first record, read from its header
+/// only (O(1)); `None` for an empty part (a crash between rollover and
+/// the first append can leave one as the newest part).
+fn part_first_seq(path: &Path) -> io::Result<Option<u64>> {
+    let mut file = fs::File::open(path)?;
+    let mut header = [0u8; HEADER_LEN];
+    match read_exact_or_partial(&mut file, &mut header)? {
+        ReadPiece::Empty => Ok(None),
+        ReadPiece::Partial => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: torn first record header", path.display()),
+        )),
+        ReadPiece::Complete => {
+            if header[0..4] != *RECORD_MAGIC {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: bad journal magic", path.display()),
+                ));
+            }
+            Ok(Some(u64::from_le_bytes(
+                header[12..20].try_into().expect("seq field"),
+            )))
+        }
+    }
+}
+
+/// What recovery found in the previous incarnation's newest segment part.
 #[derive(Debug)]
 pub struct RecoveryReport {
     /// Incarnation the recovered segment belongs to.
     pub incarnation: u64,
-    /// Valid records recovered.
+    /// Valid records recovered **in the newest part** (sequences continue
+    /// across parts, so this is a suffix count, not the incarnation's
+    /// total).
     pub records: u64,
     /// Highest valid sequence in that incarnation, if any.
     pub last_seq: Option<u64>,
@@ -251,6 +308,8 @@ pub struct OpenedJournal {
     pub incarnation: u64,
     pub report: Option<RecoveryReport>,
     pub writer: SegmentWriter,
+    /// `sessions/<id>/journal/` — where rollover creates the next parts.
+    pub journal_dir: PathBuf,
 }
 
 /// Open (creating if needed) the journal for `session_dir`, recover the
@@ -263,13 +322,28 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     fs::create_dir_all(&journal_dir)?;
 
-    let latest = latest_incarnation(&journal_dir)?;
+    let segments = list_segments(&journal_dir)?;
     let mut report = None;
-    if let Some(previous) = latest {
-        let path = segment_path(&journal_dir, previous);
-        // Recovery must not buffer the whole previous recording: the stats
-        // scan keeps memory O(1) while still validating every record.
-        let stats = scan_segment_stats(&path)?;
+    if let Some(&(previous, part)) = segments.last() {
+        let path = segment_path(&journal_dir, previous, part);
+        // Only the newest part of the newest incarnation can be torn by a
+        // crash; earlier parts were sealed by the appender. Recovery must
+        // not buffer the recording: the stats scan keeps memory O(1) while
+        // still validating every record of the part.
+        let expected_first = match part_first_seq(&path) {
+            Ok(first) => first,
+            // Torn/corrupt first header: let the scanner classify it
+            // (a torn tail rewinds; anything else is reported).
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => None,
+            Err(err) => return Err(err),
+        };
+        if part == 1 && expected_first.is_some_and(|first| first != 1) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: incarnation prefix must start at seq 1", path.display()),
+            ));
+        }
+        let stats = scan_segment_stats_from(&path, expected_first)?;
         let rewound = stats.stop.may_rewind();
         if rewound {
             // A torn tail can only mean the previous incarnation died
@@ -290,8 +364,12 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
         });
     }
 
-    let incarnation = latest.unwrap_or(0) + 1;
-    let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation))?;
+    let incarnation = segments
+        .last()
+        .map(|&(incarnation, _)| incarnation)
+        .unwrap_or(0)
+        + 1;
+    let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation, 1))?;
     // Make the new segment's directory entry durable alongside the file;
     // record durability is meaningless if the name can vanish on crash.
     sync_dir(&journal_dir)?;
@@ -299,6 +377,7 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
         incarnation,
         report,
         writer,
+        journal_dir,
     })
 }
 
@@ -539,16 +618,35 @@ impl JournalAppender {
         Option<RecoveryReport>,
         std::sync::mpsc::Receiver<JournalAck>,
     )> {
+        Self::spawn_with_options(session_dir, sync_interval, DEFAULT_SEGMENT_MAX_BYTES)
+    }
+
+    /// Spawn with an explicit segment-part size limit (tests use tiny
+    /// limits to exercise rollover).
+    pub fn spawn_with_options(
+        session_dir: &Path,
+        sync_interval: std::time::Duration,
+        max_part_bytes: u64,
+    ) -> io::Result<(
+        Self,
+        u64,
+        Option<RecoveryReport>,
+        std::sync::mpsc::Receiver<JournalAck>,
+    )> {
         let opened = open(session_dir)?;
+        let writer = RollingSegmentWriter::new(
+            opened.journal_dir.clone(),
+            opened.incarnation,
+            opened.writer,
+            max_part_bytes,
+        );
         let (tx, rx) = std::sync::mpsc::sync_channel(DEFAULT_QUEUE_CAPACITY);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_queued = std::sync::Arc::clone(&queued_bytes);
         std::thread::Builder::new()
             .name("journal-appender".to_string())
-            .spawn(move || {
-                appender_loop(opened.writer, rx, ack_tx, worker_queued, sync_interval)
-            })?;
+            .spawn(move || appender_loop(writer, rx, ack_tx, worker_queued, sync_interval))?;
         Ok((
             Self {
                 tx,
@@ -627,8 +725,69 @@ impl std::fmt::Display for JournalSubmitError {
     }
 }
 
+/// The appender's segment writer with rollover: when the active part
+/// reaches `max_part_bytes` it is sealed (synced) and the next part of
+/// the same incarnation begins. Sequences continue across parts, so
+/// cursors never name parts (ADR-0002).
+struct RollingSegmentWriter {
+    journal_dir: PathBuf,
+    incarnation: u64,
+    part: u64,
+    writer: SegmentWriter,
+    part_bytes: u64,
+    max_part_bytes: u64,
+}
+
+impl RollingSegmentWriter {
+    fn new(
+        journal_dir: PathBuf,
+        incarnation: u64,
+        writer: SegmentWriter,
+        max_part_bytes: u64,
+    ) -> Self {
+        Self {
+            journal_dir,
+            incarnation,
+            part: 1,
+            writer,
+            part_bytes: 0,
+            max_part_bytes,
+        }
+    }
+
+    fn append_record(
+        &mut self,
+        kind: RecordKind,
+        seq: u64,
+        elapsed_ms: u64,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let record_bytes = HEADER_LEN as u64 + payload.len() as u64;
+        if self.part_bytes > 0 && self.part_bytes + record_bytes > self.max_part_bytes {
+            // Seal the current part durable before moving on: after a
+            // crash only the newest part may need recovery.
+            self.writer.sync()?;
+            self.part += 1;
+            self.writer = SegmentWriter::create(&segment_path(
+                &self.journal_dir,
+                self.incarnation,
+                self.part,
+            ))?;
+            sync_dir(&self.journal_dir)?;
+            self.part_bytes = 0;
+        }
+        self.writer.append_record(kind, seq, elapsed_ms, payload)?;
+        self.part_bytes += record_bytes;
+        Ok(())
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        self.writer.sync()
+    }
+}
+
 fn appender_loop(
-    mut writer: SegmentWriter,
+    mut writer: RollingSegmentWriter,
     rx: std::sync::mpsc::Receiver<AppenderMsg>,
     ack_tx: std::sync::mpsc::Sender<JournalAck>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -652,7 +811,7 @@ fn appender_loop(
         let _ = ack_tx.send(JournalAck::Failed(reason));
     };
 
-    let do_sync = |writer: &mut SegmentWriter,
+    let do_sync = |writer: &mut RollingSegmentWriter,
                    ack_tx: &std::sync::mpsc::Sender<JournalAck>,
                    dead: &mut Option<String>,
                    last_written: u64,
@@ -865,8 +1024,18 @@ impl ShadowJournal {
         session_dir: &Path,
         sync_interval: std::time::Duration,
     ) -> io::Result<(Self, u64, Option<RecoveryReport>)> {
+        Self::open_with_options(session_dir, sync_interval, DEFAULT_SEGMENT_MAX_BYTES)
+    }
+
+    /// Open with explicit sync cadence and segment-part size (tests use
+    /// tiny part sizes to exercise rollover).
+    pub fn open_with_options(
+        session_dir: &Path,
+        sync_interval: std::time::Duration,
+        max_part_bytes: u64,
+    ) -> io::Result<(Self, u64, Option<RecoveryReport>)> {
         let (appender, incarnation, report, acks) =
-            JournalAppender::spawn_with_sync_interval(session_dir, sync_interval)?;
+            JournalAppender::spawn_with_options(session_dir, sync_interval, max_part_bytes)?;
         Ok((
             Self {
                 core: SequencerCore::new(incarnation),
@@ -1032,7 +1201,7 @@ pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
     // (recovery tooling, probes, tests). Stream-level reads enforce the
     // expected first sequence themselves via `scan_segment_stats*` and
     // the read APIs below.
-    Ok(scan_impl(path, ScanMode::All, None)?.outcome)
+    Ok(scan_impl(path, ScanMode::All, None, None)?.outcome)
 }
 
 /// Payload-free segment statistics: record count, last sequence, valid
@@ -1058,7 +1227,7 @@ pub fn scan_segment_stats_from(
     path: &Path,
     expected_first_seq: Option<u64>,
 ) -> io::Result<SegmentStats> {
-    let result = scan_impl(path, ScanMode::Stats, expected_first_seq)?;
+    let result = scan_impl(path, ScanMode::Stats, expected_first_seq, None)?;
     Ok(SegmentStats {
         records: result.record_count,
         last_seq: result.last_seq,
@@ -1100,27 +1269,85 @@ pub fn read_range(
             format!("invalid journal range {from_seq}..={to_seq}"),
         ));
     }
-    let path = segment_path(&session_dir.join(JOURNAL_DIR_NAME), incarnation);
-    if !path.exists() {
+    let parts = incarnation_parts(&session_dir.join(JOURNAL_DIR_NAME), incarnation)?;
+    let mut records = Vec::new();
+    let mut buffered_bytes = 0usize;
+    let mut truncated = false;
+    let mut stop = ScanStop::CleanEof;
+    // Cross-part continuity is enforced while reading: each part must
+    // begin exactly where the previous part's validated scan ended.
+    let mut expected_first: Option<u64> = Some(1);
+    for (_, path) in &parts {
+        if expected_first.is_some_and(|next| next > to_seq) {
+            break; // everything left is beyond the window
+        }
+        if buffered_bytes >= max_bytes && !records.is_empty() {
+            truncated = true;
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(buffered_bytes).max(1);
+        let result = scan_impl(
+            path,
+            ScanMode::Window(CollectWindow {
+                from_seq,
+                to_seq,
+                max_buffered_bytes: remaining,
+            }),
+            expected_first,
+            None,
+        )?;
+        expected_first = result.last_seq.map(|seq| seq + 1).or(expected_first);
+        truncated |= result.truncated;
+        buffered_bytes += result
+            .outcome
+            .records
+            .iter()
+            .map(|record| record.payload.len())
+            .sum::<usize>();
+        records.extend(result.outcome.records);
+        stop = result.outcome.stop;
+        if !matches!(stop, ScanStop::CleanEof) || truncated {
+            break; // corrupt or torn part: never scan past it silently
+        }
+    }
+    Ok(RangeRead {
+        records,
+        stop,
+        truncated,
+    })
+}
+
+/// All parts of one incarnation as `(part, path)`, ascending; `NotFound`
+/// when the incarnation is not retained. Part numbering must be
+/// contiguous from 1 — a hole means retention deleted the wrong thing or
+/// the directory is corrupt, and reads must fail rather than silently
+/// skip a range (I3). (Retention deletes newest-part-first, so a
+/// concurrent reader can observe a *prefix* of a being-deleted
+/// incarnation — cursors stay truthful — but never a hole. The M3
+/// manifest will make retention/reader coordination exact.)
+fn incarnation_parts(journal_dir: &Path, incarnation: u64) -> io::Result<Vec<(u64, PathBuf)>> {
+    let parts: Vec<(u64, PathBuf)> = list_segments(journal_dir)?
+        .into_iter()
+        .filter(|&(inc, _)| inc == incarnation)
+        .map(|(inc, part)| (part, segment_path(journal_dir, inc, part)))
+        .collect();
+    if parts.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("no journal segment for incarnation {incarnation}"),
         ));
     }
-    let result = scan_impl(
-        &path,
-        ScanMode::Window(CollectWindow {
-            from_seq,
-            to_seq,
-            max_buffered_bytes: max_bytes,
-        }),
-        Some(1),
-    )?;
-    Ok(RangeRead {
-        records: result.outcome.records,
-        stop: result.outcome.stop,
-        truncated: result.truncated,
-    })
+    if parts
+        .iter()
+        .enumerate()
+        .any(|(index, &(part, _))| part != index as u64 + 1)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("journal incarnation {incarnation} has a hole in its segment parts"),
+        ));
+    }
+    Ok(parts)
 }
 
 /// Window/budget for a range read.
@@ -1140,8 +1367,10 @@ pub struct IndexEntry {
     pub record_len: u64,
 }
 
-/// Payload-free segment index: bounded memory regardless of payload
-/// sizes, and the basis for bounded tail reads (and later O(1) seeks).
+/// Payload-free sparse segment index: one entry per at most
+/// [`SPARSE_INDEX_STRIDE_BYTES`] of data, so memory is bounded by part
+/// size / stride regardless of record count. Basis for bounded tail
+/// reads (and later persisted O(1) seeks).
 #[derive(Debug)]
 pub struct SegmentIndex {
     pub entries: Vec<IndexEntry>,
@@ -1149,10 +1378,34 @@ pub struct SegmentIndex {
     pub stop: ScanStop,
 }
 
-/// Scan a segment collecting only the record index (payloads are
+impl SegmentIndex {
+    /// Where to start reading so that the scanned region covers at least
+    /// the newest `max_bytes` bytes of the valid prefix. Returns
+    /// `(seq, offset)`; the region length is `valid_len - offset`, at
+    /// most `max_bytes + stride + one record`.
+    fn tail_start(&self, max_bytes: u64) -> Option<(u64, u64)> {
+        let first = self.entries.first()?;
+        if self.valid_len <= max_bytes {
+            return Some((first.seq, first.offset));
+        }
+        let target = self.valid_len - max_bytes;
+        let entry = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.offset <= target)
+            .unwrap_or(first);
+        Some((entry.seq, entry.offset))
+    }
+}
+
+/// Scan a segment collecting only the sparse record index (payloads are
 /// validated but not retained).
 pub fn scan_segment_index(path: &Path) -> io::Result<SegmentIndex> {
-    let result = scan_impl(path, ScanMode::Index, Some(1))?;
+    // Lenient on the first sequence: parts after the first continue the
+    // incarnation's sequence, and cross-part continuity is validated by
+    // the read assembly, not the per-part index.
+    let result = scan_impl(path, ScanMode::Index, None, None)?;
     Ok(SegmentIndex {
         entries: result.index,
         valid_len: result.outcome.valid_len,
@@ -1168,40 +1421,102 @@ pub struct TailRead {
 }
 
 /// Read the newest records of one incarnation whose payloads fit in
-/// `max_bytes` (the newest record is always included). Memory stays
-/// bounded regardless of segment size: an index scan locates the window,
-/// then [`read_range`] revalidates and returns it. On a live segment,
-/// records appended between the two passes may also be returned.
+/// `max_bytes` (the newest record is always included). Memory and work
+/// stay bounded by `max_bytes + part size limit`, never by the total
+/// recording: parts are bounded, the sparse index seeks directly to the
+/// tail region, and only that region is re-validated and buffered.
 pub fn read_tail(session_dir: &Path, incarnation: u64, max_bytes: usize) -> io::Result<TailRead> {
-    let path = segment_path(&session_dir.join(JOURNAL_DIR_NAME), incarnation);
-    if !path.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no journal segment for incarnation {incarnation}"),
-        ));
-    }
-    let index = scan_segment_index(&path)?;
-    let mut bytes = 0u64;
-    let mut start_seq = None;
-    for entry in index.entries.iter().rev() {
-        let payload_len = entry.record_len - HEADER_LEN as u64;
-        if start_seq.is_some() && bytes + payload_len > max_bytes as u64 {
-            break;
+    let parts = incarnation_parts(&session_dir.join(JOURNAL_DIR_NAME), incarnation)?;
+    // Select parts newest-first: whole parts while they fit the remaining
+    // budget, then sparse-seek into the oldest selected part.
+    let mut selected: Vec<(PathBuf, Option<ScanStart>)> = Vec::new();
+    let mut remaining = max_bytes.max(1) as u64;
+    for (index, (_, path)) in parts.iter().enumerate().rev() {
+        let len = fs::metadata(path)?.len();
+        if len <= remaining {
+            selected.push((path.clone(), None));
+            remaining -= len;
+            if remaining == 0 {
+                break;
+            }
+            continue;
         }
-        bytes += payload_len;
-        start_seq = Some(entry.seq);
+        // Part larger than the remaining budget: sparse-index it and seek
+        // straight to the tail region.
+        let part_index = scan_segment_index(path)?;
+        if index + 1 != parts.len() && !matches!(part_index.stop, ScanStop::CleanEof) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: sealed part is corrupt: {:?}",
+                    path.display(),
+                    part_index.stop
+                ),
+            ));
+        }
+        if let Some((seq, offset)) = part_index.tail_start(remaining) {
+            selected.push((path.clone(), Some(ScanStart { offset, seq })));
+        }
+        break; // budget covered by the seek region
     }
-    let Some(start_seq) = start_seq else {
-        return Ok(TailRead {
-            records: Vec::new(),
-            stop: index.stop,
-        });
-    };
-    let read = read_range(session_dir, incarnation, start_seq, u64::MAX, max_bytes)?;
-    Ok(TailRead {
-        records: read.records,
-        stop: read.stop,
-    })
+
+    // Assemble oldest-first, validating sequence continuity across part
+    // boundaries. Every scan is bounded: whole parts each fit the budget,
+    // the seek region is at most budget + stride + one record.
+    let scan_budget = max_bytes
+        .saturating_add(SPARSE_INDEX_STRIDE_BYTES as usize)
+        .saturating_add(MAX_PAYLOAD_LEN as usize);
+    let mut records: Vec<Record> = Vec::new();
+    let mut buffered = 0usize;
+    let mut stop = ScanStop::CleanEof;
+    let mut expected_first: Option<u64> = None;
+    let selected_len = selected.len();
+    // Selected newest-first above; assemble oldest-first.
+    for (n, (path, start)) in selected.into_iter().rev().enumerate() {
+        let result = scan_impl(
+            &path,
+            ScanMode::Window(CollectWindow {
+                from_seq: start.map(|start| start.seq).unwrap_or(1),
+                to_seq: u64::MAX,
+                max_buffered_bytes: scan_budget,
+            }),
+            if start.is_some() {
+                None
+            } else {
+                expected_first
+            },
+            start,
+        )?;
+        let is_newest_selected = n + 1 == selected_len;
+        if is_newest_selected {
+            stop = result.outcome.stop;
+        } else if !matches!(result.outcome.stop, ScanStop::CleanEof) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{}: sealed part is corrupt: {:?}",
+                    path.display(),
+                    result.outcome.stop
+                ),
+            ));
+        }
+        expected_first = result.last_seq.map(|seq| seq + 1).or(expected_first);
+        buffered += result
+            .outcome
+            .records
+            .iter()
+            .map(|record| record.payload.len())
+            .sum::<usize>();
+        records.extend(result.outcome.records);
+    }
+
+    // Trim from the front to fit the budget; the newest record is always
+    // kept even if it alone exceeds the budget.
+    while records.len() > 1 && buffered > max_bytes {
+        buffered -= records[0].payload.len();
+        records.remove(0);
+    }
+    Ok(TailRead { records, stop })
 }
 
 /// One event returned by [`read_history`], carrying its durable cursor.
@@ -1244,14 +1559,16 @@ pub fn read_history(
 ) -> io::Result<HistoryRead> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     let incarnations = list_incarnations(&journal_dir)?;
-    let Some(&earliest) = incarnations.first() else {
-        return Ok(HistoryRead {
-            events: Vec::new(),
-            next: None,
-            truncated: false,
-        });
-    };
-    if from.incarnation < earliest || !incarnations.contains(&from.incarnation) {
+    if incarnations.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "journal cursor {}:{} names a session with no journal history",
+                from.incarnation, from.seq
+            ),
+        ));
+    }
+    if !incarnations.contains(&from.incarnation) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
@@ -1259,6 +1576,33 @@ pub fn read_history(
                 from.incarnation, from.seq
             ),
         ));
+    }
+    // A cursor beyond the recovered valid tail of its incarnation must
+    // fail loudly (incomplete capture) — never silently slide into the
+    // next incarnation's bytes or return empty success.
+    if from.seq == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "journal cursor seq starts at 1",
+        ));
+    }
+    let recovered = recovered_tail(&journal_dir, from.incarnation)?;
+    if from.seq > recovered + 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal cursor {}:{} is beyond the recovered tail {}:{} — incomplete capture",
+                from.incarnation, from.seq, from.incarnation, recovered
+            ),
+        ));
+    }
+    // Caught up with the live tail: nothing to read.
+    if from.seq == recovered + 1 && from.incarnation == *incarnations.last().expect("nonempty") {
+        return Ok(HistoryRead {
+            events: Vec::new(),
+            next: None,
+            truncated: false,
+        });
     }
 
     let mut events = Vec::new();
@@ -1274,6 +1618,9 @@ pub fn read_history(
             break;
         }
         let from_seq = if incarnation == from.incarnation {
+            if from.seq == recovered + 1 {
+                continue; // sealed boundary: nothing left in this incarnation
+            }
             from.seq
         } else {
             1
@@ -1320,35 +1667,42 @@ pub fn read_history(
     })
 }
 
-/// All incarnation numbers present in a journal directory, ascending.
-fn list_incarnations(journal_dir: &Path) -> io::Result<Vec<u64>> {
-    let mut incarnations = Vec::new();
-    if !journal_dir.exists() {
-        return Ok(incarnations);
+/// Highest recovered valid sequence of an incarnation (0 = no records).
+/// Only the newest part can be torn by a crash, so this scans the newest
+/// non-empty part — O(part), never O(history).
+fn recovered_tail(journal_dir: &Path, incarnation: u64) -> io::Result<u64> {
+    let parts = incarnation_parts(journal_dir, incarnation)?;
+    let last_index = parts.len() - 1;
+    for (index, (_, path)) in parts.iter().enumerate().rev() {
+        let first = part_first_seq(path)?;
+        let stats = scan_segment_stats_from(path, first)?;
+        if let Some(last) = stats.last_seq {
+            return Ok(last);
+        }
+        // An empty part is only legal as the newest (crash between
+        // rollover and first append); an empty sealed part is corruption.
+        if index != last_index {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: empty sealed segment part", path.display()),
+            ));
+        }
     }
-    for entry in fs::read_dir(journal_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let Some(number) = name
-            .strip_prefix(SEGMENT_PREFIX)
-            .and_then(|rest| rest.strip_suffix(SEGMENT_SUFFIX))
-            .and_then(|digits| digits.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        incarnations.push(number);
-    }
-    incarnations.sort_unstable();
-    Ok(incarnations)
+    Ok(0)
 }
 
-/// Non-resetting retention (PLAN.md §6.1): delete the *sealed* incarnation
-/// segments below `min_incarnation`. The latest incarnation is never
+/// Unchecked retention primitive: delete **all parts** of the sealed
+/// incarnations below `min_incarnation`. The latest incarnation is never
 /// deleted (it may be active). Returns the deleted incarnation numbers.
 /// Cursors into removed incarnations fail loudly on read (see
 /// [`read_history`]); they never alias newer bytes.
-pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec<u64>> {
+///
+/// **Test/dev plumbing only.** ADR-0002 requires production retention to
+/// delete a sealed segment only *after a retained checkpoint can
+/// reconstruct the first exposed boundary*. Until M2 introduces
+/// checkpoint records, no production caller may invoke this; the
+/// checkpoint-gated policy lands with M2/M3.
+pub fn retain_before_unchecked(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec<u64>> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     let incarnations = list_incarnations(&journal_dir)?;
     let latest = incarnations.last().copied();
@@ -1357,9 +1711,19 @@ pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec
         if incarnation >= min_incarnation || Some(incarnation) == latest {
             continue;
         }
-        fs::remove_file(segment_path(&journal_dir, incarnation))?;
+        // Delete newest-part-first: a concurrent reader can then only
+        // ever observe a prefix of the incarnation (cursors stay
+        // truthful), never a hole in the middle.
+        for (_, part) in list_segments(&journal_dir)?
+            .into_iter()
+            .filter(|&(inc, _)| inc == incarnation)
+            .rev()
+        {
+            fs::remove_file(segment_path(&journal_dir, incarnation, part))?;
+        }
         deleted.push(incarnation);
     }
+    sync_dir(&journal_dir)?;
     Ok(deleted)
 }
 
@@ -1389,10 +1753,28 @@ struct ScanResult {
     last_seq: Option<u64>,
 }
 
+/// Byte offset and expected sequence to resume a scan from (sparse-index
+/// seek). The skipped prefix was validated when the segment part was
+/// sealed — or is being written by the appender for the live part — and
+/// is re-validated whenever a read needs it; CRC and continuity checks
+/// apply from `offset` onward.
+#[derive(Debug, Clone, Copy)]
+struct ScanStart {
+    offset: u64,
+    seq: u64,
+}
+
+/// Sparse index granularity: one entry per at most this many bytes of
+/// segment data. Keeps index memory O(part_size / stride) — 64 entries
+/// for a default 64 MiB part — while bounding a tail read's seek region
+/// to `max_bytes + stride`.
+const SPARSE_INDEX_STRIDE_BYTES: u64 = 1024 * 1024;
+
 fn scan_impl(
     path: &Path,
     mode: ScanMode,
     expected_first_seq: Option<u64>,
+    start: Option<ScanStart>,
 ) -> io::Result<ScanResult> {
     let mut file = fs::File::open(path)?;
     let mut records = Vec::new();
@@ -1401,6 +1783,11 @@ fn scan_impl(
     let mut truncated = false;
     let mut offset = 0u64;
     let mut expected_seq: Option<u64> = expected_first_seq;
+    if let Some(start) = start {
+        file.seek(SeekFrom::Start(start.offset))?;
+        offset = start.offset;
+        expected_seq = Some(start.seq);
+    }
     let mut record_count = 0u64;
     let mut last_seq: Option<u64> = None;
 
@@ -1504,11 +1891,16 @@ fn scan_impl(
                 }
             }
             ScanMode::Index => {
-                index_entries.push(IndexEntry {
-                    seq,
-                    offset,
-                    record_len: HEADER_LEN as u64 + payload_len as u64,
-                });
+                let due = index_entries
+                    .last()
+                    .is_none_or(|entry| offset >= entry.offset + SPARSE_INDEX_STRIDE_BYTES);
+                if due {
+                    index_entries.push(IndexEntry {
+                        seq,
+                        offset,
+                        record_len: HEADER_LEN as u64 + payload_len as u64,
+                    });
+                }
             }
             ScanMode::Stats => {}
         }
@@ -1891,7 +2283,8 @@ mod tests {
             .append_record(RecordKind::Output, 1, 0, b"c")
             .unwrap();
         drop(second);
-        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000002.ojrn")).unwrap();
+        let outcome =
+            scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000002-0001.ojrn")).unwrap();
         assert_eq!(outcome.records.len(), 1);
         assert_eq!(
             outcome.records[0].seq, 1,
@@ -1914,7 +2307,7 @@ mod tests {
         drop(first);
 
         // Simulate a crash mid-append: garbage bytes after the last record.
-        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn");
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn");
         fs::OpenOptions::new()
             .append(true)
             .open(&segment)
@@ -1952,7 +2345,7 @@ mod tests {
         drop(first);
 
         // Corrupt one payload byte of the second record (not the tail).
-        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn");
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn");
         let mut bytes = fs::read(&segment).unwrap();
         let second_payload = HEADER_LEN + 4 + HEADER_LEN;
         bytes[second_payload] ^= 0xFF;
@@ -2005,7 +2398,8 @@ mod tests {
         appender.shutdown();
         drop(appender);
 
-        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        let outcome =
+            scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn")).unwrap();
         assert!(outcome.is_clean());
         assert_eq!(outcome.records.len(), 3);
         assert_eq!(
@@ -2040,7 +2434,8 @@ mod tests {
         appender.shutdown();
         drop(appender);
 
-        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        let outcome =
+            scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn")).unwrap();
         assert_eq!(
             outcome.records.len(),
             1,
@@ -2162,7 +2557,8 @@ mod tests {
         }
         drop(shadow);
 
-        let outcome = scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn")).unwrap();
+        let outcome =
+            scan_segment(&dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn")).unwrap();
         assert!(outcome.is_clean());
         assert_eq!(
             outcome.records.iter().map(|r| r.kind).collect::<Vec<_>>(),
@@ -2278,7 +2674,7 @@ mod tests {
 
         // Corrupt record 2's payload, then read a later window: the
         // corruption is in the consumed prefix and must surface.
-        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001.ojrn");
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn");
         let mut bytes = fs::read(&segment).unwrap();
         let record_len = HEADER_LEN + 10;
         bytes[record_len + HEADER_LEN] ^= 0xFF;
@@ -2377,7 +2773,7 @@ mod tests {
         );
 
         // Retention removes the sealed first incarnation.
-        let deleted = retain_before(&dir, 2).unwrap();
+        let deleted = retain_before_unchecked(&dir, 2).unwrap();
         assert_eq!(deleted, vec![1]);
 
         // A cursor into the removed incarnation fails loudly — never an
@@ -2404,13 +2800,260 @@ mod tests {
     fn retention_never_deletes_the_active_incarnation() {
         let dir = test_session_dir("retention_active");
         let _first = open(&dir).unwrap();
-        let deleted = retain_before(&dir, 99).unwrap();
+        let deleted = retain_before_unchecked(&dir, 99).unwrap();
         assert!(deleted.is_empty(), "the only (active) segment stays");
         assert!(
             dir.join(JOURNAL_DIR_NAME)
-                .join("seg-00000001.ojrn")
+                .join("seg-00000001-0001.ojrn")
                 .exists()
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Rollover: sequences continue across bounded parts, and history,
+    /// range and tail reads transparently cross part boundaries.
+    #[test]
+    fn rollover_keeps_one_sequence_across_parts() {
+        let dir = test_session_dir("rollover");
+        // 100-byte records, 512-byte parts -> 5 records per part.
+        let (mut shadow, incarnation, _) =
+            ShadowJournal::open_with_options(&dir, std::time::Duration::from_secs(3600), 512)
+                .unwrap();
+        assert_eq!(incarnation, 1);
+        for _ in 0..20 {
+            shadow
+                .record_output(bytes::Bytes::from(vec![b'x'; 64]))
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.journal_seq() < 20 {
+            shadow.poll_acks();
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        let journal_dir = dir.join(JOURNAL_DIR_NAME);
+        let parts = list_segments(&journal_dir).unwrap();
+        assert_eq!(parts.len(), 4, "20 records roll over into 4 parts");
+        assert_eq!(parts[0], (1, 1));
+        assert_eq!(parts[3], (1, 4));
+
+        // History reads cross parts seamlessly and contiguously.
+        let history = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 1,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        let seqs: Vec<u64> = history
+            .events
+            .iter()
+            .map(|event| event.cursor.seq)
+            .collect();
+        assert_eq!(seqs, (1..=20).collect::<Vec<_>>());
+        assert!(!history.truncated);
+
+        // Range reads cross parts too.
+        let range = read_range(&dir, 1, 4, 8, usize::MAX).unwrap();
+        assert_eq!(
+            range.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![4, 5, 6, 7, 8]
+        );
+
+        // Tail reads seek within the newest part...
+        let tail = read_tail(&dir, 1, 200).unwrap();
+        assert_eq!(
+            tail.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![18, 19, 20]
+        );
+        // ...and cross into earlier parts when the budget demands it.
+        let tail = read_tail(&dir, 1, 700).unwrap();
+        assert_eq!(
+            tail.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            (11..=20).collect::<Vec<_>>()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A cursor beyond the recovered valid tail must fail loudly — never
+    /// silently return the next incarnation's bytes or empty success
+    /// (incomplete capture, PLAN.md §6.2).
+    #[test]
+    fn cursor_beyond_recovered_tail_fails_loudly() {
+        let dir = test_session_dir("cursor_tail");
+        write_ten_record_segment(&dir);
+
+        let err = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 12,
+            },
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("incomplete capture"),
+            "unexpected error: {err}"
+        );
+
+        // Exactly at the recovered tail: legitimately caught up.
+        let read = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 11,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(read.events.is_empty());
+        assert!(read.next.is_none());
+
+        // Tear the tail, recover, and confirm cursors into the lost
+        // region now fail while the rewound boundary still resumes.
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap()
+            .write_all(b"\xde\xadpartial")
+            .unwrap();
+        let recovered = open(&dir).unwrap();
+        assert_eq!(recovered.incarnation, 2);
+        assert!(recovered.report.unwrap().rewound);
+
+        let err = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 12,
+            },
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // The rewound boundary resumes into the next incarnation.
+        let read = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 11,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(read.events.is_empty());
+
+        // No journal at all is loud too.
+        let empty = test_session_dir("cursor_empty");
+        fs::create_dir_all(&empty).unwrap();
+        let err = read_history(
+            &empty,
+            JournalCursor {
+                incarnation: 1,
+                seq: 1,
+            },
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&empty);
+    }
+
+    /// Retention racing readers: readers observe either the complete
+    /// incarnation or a truthful prefix of it, but never a hole; once
+    /// deletion finishes, cursors into it fail loudly (I3).
+    #[test]
+    fn retention_concurrent_with_readers_never_shows_a_hole() {
+        let dir = test_session_dir("retention_race");
+        let (mut shadow, _, _) =
+            ShadowJournal::open_with_options(&dir, std::time::Duration::from_secs(3600), 512)
+                .unwrap();
+        for _ in 0..15 {
+            shadow
+                .record_output(bytes::Bytes::from(vec![b'y'; 64]))
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.journal_seq() < 15 {
+            shadow.poll_acks();
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(shadow);
+        // A second incarnation so retention may delete the first.
+        let (mut shadow2, incarnation2, _) = ShadowJournal::open(&dir).unwrap();
+        assert_eq!(incarnation2, 2);
+        shadow2
+            .record_output(bytes::Bytes::from_static(b"inc2"))
+            .unwrap();
+
+        let reader_dir = dir.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..200 {
+                let result = read_history(
+                    &reader_dir,
+                    JournalCursor {
+                        incarnation: 1,
+                        seq: 1,
+                    },
+                    usize::MAX,
+                );
+                match result {
+                    Ok(read) => {
+                        // Any observed incarnation-1 events must be a
+                        // contiguous prefix 1..=K (newest-part-first
+                        // deletion can only shorten from the tail).
+                        let mut expected = 1u64;
+                        for event in &read.events {
+                            if event.cursor.incarnation == 1 {
+                                assert_eq!(event.cursor.seq, expected, "hole in incarnation 1");
+                                expected += 1;
+                            }
+                        }
+                    }
+                    // Retention may legitimately win the race.
+                    Err(err) => assert!(
+                        matches!(
+                            err.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                        ),
+                        "unexpected read error: {err}"
+                    ),
+                }
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let deleted = retain_before_unchecked(&dir, 2).unwrap();
+        assert_eq!(deleted, vec![1]);
+        reader.join().unwrap();
+
+        assert!(
+            list_segments(&dir.join(JOURNAL_DIR_NAME))
+                .unwrap()
+                .iter()
+                .all(|&(incarnation, _)| incarnation == 2)
+        );
+        let err = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 1,
+            },
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2460,6 +3103,8 @@ mod tests {
         let Ok(writer) = SegmentWriter::open_append(full) else {
             return;
         };
+        let writer =
+            RollingSegmentWriter::new(PathBuf::from("/dev"), 1, writer, DEFAULT_SEGMENT_MAX_BYTES);
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let (ack_tx, acks) = std::sync::mpsc::channel();
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2522,12 +3167,18 @@ mod tests {
     fn shutdown_syncs_unsynced_records() {
         let dir = test_session_dir("shutdown_sync");
         let opened = open(&dir).unwrap();
+        let writer = RollingSegmentWriter::new(
+            opened.journal_dir.clone(),
+            opened.incarnation,
+            opened.writer,
+            DEFAULT_SEGMENT_MAX_BYTES,
+        );
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let (ack_tx, acks) = std::sync::mpsc::channel();
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker = std::thread::spawn(move || {
             appender_loop(
-                opened.writer,
+                writer,
                 rx,
                 ack_tx,
                 queued,
@@ -2551,7 +3202,7 @@ mod tests {
     fn stats_scan_counts_records_without_buffering() {
         let dir = test_session_dir("stats_scan");
         write_ten_record_segment(&dir);
-        let path = segment_path(&dir.join(JOURNAL_DIR_NAME), 1);
+        let path = segment_path(&dir.join(JOURNAL_DIR_NAME), 1, 1);
         let stats = scan_segment_stats(&path).unwrap();
         assert_eq!(stats.records, 10);
         assert_eq!(stats.last_seq, Some(10));
@@ -2565,7 +3216,7 @@ mod tests {
         let dir = test_session_dir("first_seq");
         let journal_dir = dir.join(JOURNAL_DIR_NAME);
         fs::create_dir_all(&journal_dir).unwrap();
-        let path = segment_path(&journal_dir, 1);
+        let path = segment_path(&journal_dir, 1, 1);
         let mut writer = SegmentWriter::create(&path).unwrap();
         writer
             .append_record(RecordKind::Output, 5, 0, b"orphan")

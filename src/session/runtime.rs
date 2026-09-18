@@ -1356,7 +1356,7 @@ mod tests {
 
         let outcome = journal::scan_segment(
             &dir.join(journal::JOURNAL_DIR_NAME)
-                .join("seg-00000001.ojrn"),
+                .join("seg-00000001-0001.ojrn"),
         )
         .unwrap();
         assert_eq!(
@@ -1417,7 +1417,7 @@ mod tests {
 
         let outcome = journal::scan_segment(
             &dir.join(journal::JOURNAL_DIR_NAME)
-                .join("seg-00000001.ojrn"),
+                .join("seg-00000001-0001.ojrn"),
         )
         .unwrap();
         let kinds: Vec<LifecycleCode> = outcome

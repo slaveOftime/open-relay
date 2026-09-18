@@ -268,7 +268,7 @@ fn probe_shadow_journal_records_output_in_order() {
         if caught_up {
             let outcome = super::journal::scan_segment(
                 &dir.join(super::journal::JOURNAL_DIR_NAME)
-                    .join("seg-00000001.ojrn"),
+                    .join("seg-00000001-0001.ojrn"),
             )
             .expect("journal segment scans");
             let ends_killed = outcome.records.last().is_some_and(|r| {
