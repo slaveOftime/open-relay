@@ -1,5 +1,5 @@
 use crossterm::terminal;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use crate::{
     config::AppConfig,
@@ -17,10 +17,16 @@ pub async fn run_logs(
     keep_color: bool,
     from_file: bool,
     no_truncate: bool,
+    raw: bool,
     node: Option<String>,
     wait_for_prompt: bool,
     timeout_ms: u64,
 ) -> Result<()> {
+    // ── --raw export path ─────────────────────────────────────────────────────
+    if raw {
+        return run_logs_raw(config, id, node);
+    }
+
     // ── --wait-for-prompt path ────────────────────────────────────────────────
     if wait_for_prompt {
         eprintln!("Waiting for session {id} to need input…");
@@ -73,6 +79,49 @@ pub async fn run_logs(
     }
 
     run_logs_local(config, id, tail, keep_color, term_cols, from_file).await
+}
+
+/// M5-6 safe export: the original output byte stream, exported only on
+/// explicit request. Rendered `oly logs` (plain or `--keep-color`) is
+/// sanitized by the vt100 round-trip — control sequences are interpreted,
+/// never re-emitted, and hyperlink escape codes are dropped — while `--raw`
+/// returns the exact child bytes and therefore warns on a TTY. Local disk
+/// read: the journal is the source of truth and is written before output is
+/// broadcast (ADR-0002/0006), so a visible byte is always exportable.
+fn run_logs_raw(config: &AppConfig, id: &str, node: Option<String>) -> Result<()> {
+    if node.is_some() {
+        return Err(AppError::Protocol(
+            "raw export is only available for local sessions".to_string(),
+        ));
+    }
+
+    let session_dir = config.sessions_dir.join(id);
+    let journal_dir = session_dir.join(crate::session::journal::JOURNAL_DIR_NAME);
+    let bytes = if journal_dir.is_dir() {
+        crate::session::replay::filtered_stream_from(&session_dir, 0)
+            .map_err(|err| AppError::Protocol(format!("raw export failed for {id}: {err}")))?
+            .0
+    } else {
+        // Legacy pre-journal session: the raw stream is output.log itself.
+        let log_path = session_dir.join("output.log");
+        std::fs::read(&log_path).map_err(|err| {
+            AppError::Protocol(format!(
+                "no journal or log file in {}: {err}",
+                session_dir.display()
+            ))
+        })?
+    };
+
+    let mut stdout = std::io::stdout();
+    if stdout.is_terminal() {
+        eprintln!(
+            "warning: `oly logs --raw` writes unfiltered child output, which may \
+             contain terminal control sequences; redirect to a file or pipe instead"
+        );
+    }
+    stdout.lock().write_all(&bytes)?;
+    stdout.flush()?;
+    Ok(())
 }
 
 async fn run_logs_local(

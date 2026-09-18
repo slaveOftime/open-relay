@@ -1261,3 +1261,52 @@ fn e2e_daemon_stop_kills_process_trees() {
     );
     let _ = id;
 }
+
+/// M5-6 safe export: `--raw` returns the exact child bytes (explicit
+/// opt-in), while the default rendered view never re-emits raw control
+/// sequences.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_logs_raw_exports_unfiltered_bytes() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_logs_raw");
+    let _daemon = start_daemon(&tmp);
+
+    let id = start_session(
+        &tmp,
+        &[
+            "sh",
+            "-c",
+            "printf 'plain-\\033[31mred\\033[0m\\n'; sleep 60",
+        ],
+    );
+    wait_for_log(&tmp, &id, |log| log.contains("red"), Duration::from_secs(5))
+        .expect("session produced no output within 5 s");
+
+    let raw = oly_cmd(&tmp)
+        .args(["logs", "--raw", &id])
+        .output()
+        .expect("`oly logs --raw` failed to execute");
+    assert!(
+        raw.status.success(),
+        "`oly logs --raw` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    assert!(
+        raw.stdout.windows(5).any(|window| window == b"\x1b[31m"),
+        "raw export must preserve the original escape bytes, got: {:?}",
+        String::from_utf8_lossy(&raw.stdout)
+    );
+
+    let plain = oly_cmd(&tmp)
+        .args(["logs", &id])
+        .output()
+        .expect("`oly logs` failed to execute");
+    assert!(plain.status.success());
+    let plain_text = String::from_utf8_lossy(&plain.stdout);
+    assert!(plain_text.contains("red"), "rendered logs lost content");
+    assert!(
+        !plain.stdout.windows(5).any(|window| window == b"\x1b[31m"),
+        "rendered logs must not re-emit raw SGR sequences"
+    );
+}

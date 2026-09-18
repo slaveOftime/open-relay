@@ -392,6 +392,7 @@ async fn run() -> Result<()> {
                 logs_args.keep_color,
                 logs_args.from_file,
                 logs_args.no_truncate,
+                logs_args.raw,
                 node,
                 logs_args.wait_for_prompt,
                 logs_args.timeout,

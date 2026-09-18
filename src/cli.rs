@@ -419,6 +419,15 @@ pub struct LogsArgs {
     /// Do not truncate columns.
     #[arg(long = "no-truncate")]
     pub no_truncate: bool,
+    /// Export the raw original output byte stream (journal-derived, unfiltered
+    /// by rendering). May contain terminal control sequences — meant for
+    /// pipes and files; a warning is printed when stdout is a terminal.
+    /// Local sessions only.
+    #[arg(
+        long = "raw",
+        conflicts_with_all = ["keep_color", "from_file", "no_truncate", "tail", "wait_for_prompt"]
+    )]
+    pub raw: bool,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
