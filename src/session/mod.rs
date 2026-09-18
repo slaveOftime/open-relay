@@ -21,7 +21,6 @@ pub(crate) mod replay;
 pub(crate) mod resize;
 mod runtime;
 pub(crate) mod scan;
-pub(crate) mod screen;
 #[cfg(not(test))]
 mod store;
 #[cfg(test)]

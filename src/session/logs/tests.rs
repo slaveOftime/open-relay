@@ -46,11 +46,9 @@ fn assert_fixture_or_update(name: &str, output: &[u8]) {
 }
 
 fn fixture_name(name: &str) -> &str {
-    #[cfg(windows)]
-    if name == "output-copilot.expected" {
-        return "output-copilot.expected.windows";
-    }
-
+    // M6-1: the engine renders identically on every platform, so there is
+    // one fixture per transcript (the retired parser needed a Windows
+    // variant for its platform-specific erase-sequence choices).
     name
 }
 

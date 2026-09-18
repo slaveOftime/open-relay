@@ -1,18 +1,21 @@
-//! Replaying raw log bytes through a `vt100` parser into displayable rows.
+//! Replaying raw log bytes through the terminal engine into displayable rows.
 //!
 //! The log is a raw PTY byte stream, so the only way to know what the user saw
-//! is to feed it to a terminal emulator and read the resulting grid.
+//! is to feed it to a terminal emulator and read the resulting grid. M6-1
+//! retired the second (`vt100`) parser: rendering uses the same
+//! [`crate::terminal::Terminal`] engine as live sessions, so what `oly logs`
+//! shows is exactly what the attached renderer saw.
 
 use std::path::Path;
 
 use crate::error::Result;
+use crate::terminal::Terminal;
 
-use super::super::screen::safe_resize_parser;
 use super::index::{read_relevant_resize_events, read_tail_bytes};
 use super::{OUTPUT_COLOR_RESET_SUFFIX, RenderBytes, ViewportReplayPlan, ViewportSize};
 
-/// Wide parser column count — prevents any line wrapping inside the vt100 grid
-/// for plain scrollback-style logs.
+/// Wide parser column count — prevents any line wrapping inside the engine
+/// grid for plain scrollback-style logs.
 const PARSER_COLS: u16 = 2000;
 
 /// Fallback viewport height for alt-screen TUIs when no absolute row movement
@@ -73,7 +76,7 @@ pub fn render_log_file(
     viewport: Option<ViewportSize>,
 ) -> Result<Vec<u8>> {
     // Step 1: seek to a position that gives `tail * 2` lines worth of bytes,
-    // providing enough context for the vt100 parser even with heavy escape usage.
+    // providing enough context for the replay engine even with heavy escape usage.
     let tail_bytes = read_tail_bytes(log_path, tail)?;
     let viewport_plan = if viewport.is_some() {
         ViewportReplayPlan::default()
@@ -128,7 +131,7 @@ fn finish_rows_for_display(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: 
     format_rows_for_output(&rows, keep_color)
 }
 
-/// Shared scrollback-seed formatting (engine or vt100 rows): trim
+/// Shared scrollback-seed formatting for engine rows: trim
 /// surrounding blank rows so padding (e.g. blank rows scrolled off by
 /// empty prompts) does not crowd out content rows, keep colour, join as
 /// `\n`-terminated lines. `None` when nothing has scrolled off yet.
@@ -157,7 +160,7 @@ fn render_rows(
     viewport: Option<ViewportSize>,
     viewport_plan: &ViewportReplayPlan,
 ) -> Vec<Vec<u8>> {
-    let mut parser = vt100::Parser::new(
+    let mut engine = Terminal::new(
         parser_rows(
             render_bytes.frame,
             render_bytes.frame_has_alt_screen,
@@ -173,14 +176,19 @@ fn render_rows(
         ),
         0,
     );
-    process_bytes_with_resizes(&mut parser, render_bytes.frame, viewport_plan);
+    process_bytes_with_resizes(&mut engine, render_bytes.frame, viewport_plan);
 
-    let screen = parser.screen();
-
+    // Plain rows are truncated to `term_cols` characters; styled rows keep
+    // the replay width so an SGR sequence is never split (same semantics as
+    // [`render_engine_screen`]).
     let content_rows: Vec<Vec<u8>> = if keep_color {
-        screen.rows_formatted(0, term_cols).collect()
+        engine.styled_screen_rows()
     } else {
-        screen.rows(0, term_cols).map(|s| s.into_bytes()).collect()
+        engine
+            .screen_lines()
+            .into_iter()
+            .map(|row| truncate_chars(&row, usize::from(term_cols)).into_bytes())
+            .collect()
     };
 
     // Take the last `tail` rows from the content region.
@@ -229,7 +237,7 @@ pub(super) fn parser_cols(
 }
 
 fn process_bytes_with_resizes(
-    parser: &mut vt100::Parser,
+    engine: &mut Terminal,
     bytes: &[u8],
     viewport_plan: &ViewportReplayPlan,
 ) {
@@ -238,16 +246,20 @@ fn process_bytes_with_resizes(
     for resize in &viewport_plan.resizes {
         let resize_offset = resize.offset.min(bytes.len() as u64) as usize;
         if resize_offset > processed {
-            parser.process(&bytes[processed..resize_offset]);
+            engine.feed(&bytes[processed..resize_offset]);
             processed = resize_offset;
         }
-        // Log replay parsers keep no scrollback: the replay only needs the
-        // final visible state at each size.
-        safe_resize_parser(parser, resize.rows, resize.cols, 0);
+        // Replay is side-effect-free: queued engine events (query answers,
+        // bells) are drained and discarded, never written anywhere. Replay
+        // engines keep no scrollback: only the final visible state matters.
+        let _ = engine.drain_events();
+        // Engine resize is a non-destructive reflow — no parser rebuild.
+        engine.resize(resize.rows, resize.cols);
     }
 
     if processed < bytes.len() {
-        parser.process(&bytes[processed..]);
+        engine.feed(&bytes[processed..]);
+        let _ = engine.drain_events();
     }
 }
 
@@ -335,9 +347,9 @@ pub(super) fn render_log_bytes(
     let mut fallback_output = None;
 
     for render_bytes in prepare_render_bytes(bytes) {
-        // Step 2: feed bytes into a vt100 parser sized to the inferred frame
-        // dimensions, then collect each visible row formatted and trimmed to
-        // the terminal width.
+        // Step 2: feed bytes into the terminal engine sized to the inferred
+        // frame dimensions, then collect each visible row formatted and
+        // trimmed to the terminal width.
         let rows = render_rows(
             &render_bytes,
             tail,
@@ -509,12 +521,12 @@ fn trim_repeated_trailing_suffix(
 }
 
 fn row_is_blank(row: &[u8]) -> bool {
-    row.is_empty() || row.iter().all(|byte| byte.is_ascii_whitespace())
+    trim_styled_row_end(row).is_empty()
 }
 
 fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
     if keep_color {
-        return row;
+        return trim_styled_row_end(row);
     }
 
     let end = row
@@ -522,4 +534,31 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
         .rposition(|&byte| !byte.is_ascii_whitespace())
         .map_or(0, |index| index + 1);
     &row[..end]
+}
+
+/// Trim trailing blank runs from a styled row: padding spaces and the SGR
+/// sequences between them are dropped, so log rows don't carry full-width
+/// background-color padding to the replay width. Trailing cells revert to
+/// the terminal's default background — the same display behavior the
+/// pre-M6 renderer had. Non-ASCII (UTF-8 continuation) bytes always count
+/// as content; only CSI sequences (`\x1b[` … final byte) are skipped as
+/// styling, which is all the engine's styled rows emit.
+fn trim_styled_row_end(row: &[u8]) -> &[u8] {
+    let mut last_content_end = 0;
+    let mut index = 0;
+    while index < row.len() {
+        if row[index] == 0x1b && row.get(index + 1) == Some(&b'[') {
+            let mut end = index + 2;
+            while end < row.len() && !(0x40..=0x7e).contains(&row[end]) {
+                end += 1;
+            }
+            index = (end + 1).min(row.len());
+            continue;
+        }
+        index += 1;
+        if !row[index - 1].is_ascii_whitespace() {
+            last_content_end = index;
+        }
+    }
+    &row[..last_content_end]
 }

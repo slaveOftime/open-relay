@@ -37,32 +37,54 @@ const ATTACH_FRAME_QUEUE_DEPTH: usize = 16;
 /// `Event::Paste`, so this only needs to absorb key-burst jitter.
 const TERMINAL_EVENT_QUEUE_DEPTH: usize = 4096;
 
-#[cfg(windows)]
+/// Windows-only attach renderer (M6-1: terminal-engine based; the second
+/// `vt100` parser is retired). The struct and its tests compile on every
+/// platform so the logic is type-checked and unit-tested on Linux; only the
+/// *construction* in the attach flow is `cfg(windows)`.
+///
+/// ConPTY output is wrap-dependent, so on Windows the client cannot forward
+/// daemon bytes raw: it maintains a canonical engine screen and emits
+/// row-diffs (or a full snapshot after a resize) wrapped in synchronized
+/// updates. This is the same [`crate::terminal::Terminal`] engine the
+/// daemon runs — one supported terminal policy (PLAN §16).
+#[cfg(any(windows, test))]
 struct AttachRenderer {
-    parser: vt100::Parser,
+    engine: crate::terminal::Terminal,
+    /// Styled rows of the last state emitted to the real terminal; the diff
+    /// source for incremental repaints.
+    prev_rows: Vec<Vec<u8>>,
+    prev_cursor: (u16, u16),
+    prev_cursor_visible: bool,
     needs_full_repaint: bool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl AttachRenderer {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+            engine: crate::terminal::Terminal::new(rows.max(1), cols.max(1), 0),
+            prev_rows: Vec::new(),
+            prev_cursor: (0, 0),
+            prev_cursor_visible: true,
             needs_full_repaint: false,
         }
     }
 
     fn render_initial(&mut self, data: &[u8]) -> Vec<u8> {
-        self.parser.process(data);
+        self.engine.feed(data);
+        let _ = self.engine.drain_events();
         self.needs_full_repaint = false;
         let mut rendered = passthrough_signals(data);
-        rendered.extend_from_slice(&self.parser.screen().state_formatted());
+        rendered.extend_from_slice(&self.engine.snapshot_stream());
+        self.remember_state();
         rendered
     }
 
     fn render_chunk(&mut self, data: &[u8]) -> Vec<u8> {
-        let previous = self.parser.screen().clone();
-        self.parser.process(data);
+        self.engine.feed(data);
+        // The renderer never answers queries: the daemon's engine already
+        // did (single responder). Queued events are dropped.
+        let _ = self.engine.drain_events();
 
         // The canonical screen state only models the grid, cursor and modes,
         // so window title and progress/busy notifications are forwarded from
@@ -70,13 +92,27 @@ impl AttachRenderer {
         let mut rendered = passthrough_signals(data);
 
         // Render from canonical screen state instead of forwarding ConPTY's
-        // wrap-dependent bytes. Once the initial snapshot is on screen, state
+        // wrap-dependent bytes. Once the initial snapshot is on screen, row
         // diffs preserve that exact baseline without full-screen flashing.
         let update = if self.needs_full_repaint {
             self.needs_full_repaint = false;
-            self.parser.screen().state_formatted()
+            let snapshot = self.engine.snapshot_stream();
+            self.remember_state();
+            snapshot
         } else {
-            self.parser.screen().state_diff(&previous)
+            let rows = self.engine.styled_screen_rows();
+            let cursor = self.engine.cursor_position();
+            let visible = self.engine.cursor_visible();
+            let update = screen_diff_bytes(
+                &self.prev_rows,
+                &rows,
+                (self.prev_cursor, cursor),
+                (self.prev_cursor_visible, visible),
+            );
+            self.prev_rows = rows;
+            self.prev_cursor = cursor;
+            self.prev_cursor_visible = visible;
+            update
         };
         if update.is_empty() {
             return rendered;
@@ -87,18 +123,63 @@ impl AttachRenderer {
         rendered
     }
 
+    fn remember_state(&mut self) {
+        self.prev_rows = self.engine.styled_screen_rows();
+        self.prev_cursor = self.engine.cursor_position();
+        self.prev_cursor_visible = self.engine.cursor_visible();
+    }
+
     fn resize(&mut self, rows: u16, cols: u16) {
+        // Non-destructive engine reflow; the repaint is a full snapshot.
         // The attach renderer repaints only the visible screen, so it keeps
         // no scrollback of its own.
-        crate::session::screen::safe_resize_parser(&mut self.parser, rows, cols, 0);
+        self.engine.resize(rows.max(1), cols.max(1));
         self.needs_full_repaint = true;
     }
+}
+
+/// Row-based screen diff: rewrite every changed row in place (SGR reset +
+/// styled row + erase-to-EOL for stale tails), then restore the cursor if
+/// it or its visibility changed. Empty when nothing visible changed, so a
+/// title-only chunk emits no repaint at all.
+#[cfg(any(windows, test))]
+fn screen_diff_bytes(
+    prev_rows: &[Vec<u8>],
+    next_rows: &[Vec<u8>],
+    cursors: ((u16, u16), (u16, u16)),
+    visibility: (bool, bool),
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let row_count = prev_rows.len().max(next_rows.len());
+    for index in 0..row_count {
+        let prev = prev_rows.get(index);
+        let next = next_rows.get(index);
+        if prev == next {
+            continue;
+        }
+        out.extend_from_slice(format!("\x1b[{};1H\x1b[0m", index + 1).as_bytes());
+        if let Some(row) = next {
+            out.extend_from_slice(row);
+        }
+        out.extend_from_slice(b"\x1b[K");
+    }
+    let cursor_changed = cursors.0 != cursors.1 || visibility.0 != visibility.1;
+    if out.is_empty() && !cursor_changed {
+        return out;
+    }
+    out.extend_from_slice(format!("\x1b[{};{}H", cursors.1.0 + 1, cursors.1.1 + 1).as_bytes());
+    out.extend_from_slice(if visibility.1 {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    });
+    out
 }
 
 /// Extract the semantic terminal signals (window title, progress and busy
 /// indicators, cursor shape) that the canonical screen state does not model,
 /// so they survive a repaint driven by that state.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn passthrough_signals(data: &[u8]) -> Vec<u8> {
     let mut signals = crate::session::scan::extract_passthrough_osc_sequences(data);
     if let Some(params) = crate::session::scan::last_cursor_style_params(data) {
@@ -1123,26 +1204,44 @@ mod tests {
         }
     }
 
+    /// Visible-screen contents of the renderer's canonical engine state.
+    fn renderer_contents(renderer: &AttachRenderer) -> String {
+        renderer
+            .engine
+            .screen_lines()
+            .iter()
+            .map(|line| line.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end_matches('\n')
+            .to_string()
+    }
+
+    /// vt100 is the test-only oracle renderer (M6-1: dev-dependency).
+    fn oracle_contents(rows: u16, cols: u16, stream: &[u8]) -> String {
+        let mut oracle = vt100::Parser::new(rows, cols, 0);
+        oracle.process(stream);
+        oracle.screen().contents()
+    }
+
     #[test]
-    #[cfg(windows)]
     fn windows_live_chunk_is_repainted_from_canonical_screen_state() {
         let mut renderer = AttachRenderer::new(4, 20);
         let initial = renderer.render_initial(b"\x1b[2;5Hbefore");
-        let mut replay = vt100::Parser::new(4, 20, 0);
-        replay.process(&initial);
+        let mut oracle_stream = initial.clone();
 
         let mut redraw = b"\x1b[H".to_vec();
-        redraw.extend_from_slice(&vec![b' '; 25]);
+        redraw.extend(std::iter::repeat_n(b' ', 25));
         redraw.extend_from_slice("工作目录".as_bytes());
 
         let rendered = renderer.render_chunk(&redraw);
 
         assert!(rendered.starts_with(b"\x1b[?2026h"));
         assert!(rendered.ends_with(b"\x1b[?2026l"));
-        replay.process(&rendered);
+        oracle_stream.extend_from_slice(&rendered);
         assert_eq!(
-            replay.screen().contents(),
-            renderer.parser.screen().contents()
+            oracle_contents(4, 20, &oracle_stream),
+            renderer_contents(&renderer)
         );
         assert!(
             !rendered
@@ -1152,7 +1251,22 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    fn windows_resize_repaints_a_full_snapshot() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"row one\r\nrow two");
+
+        renderer.resize(4, 10);
+        let rendered = renderer.render_chunk(b"");
+
+        assert!(rendered.starts_with(b"\x1b[?2026h"));
+        assert!(rendered.ends_with(b"\x1b[?2026l"));
+        let inner = &rendered[b"\x1b[?2026h".len()..rendered.len() - b"\x1b[?2026l".len()];
+        // The snapshot stream clears and repaints: a fresh oracle at the NEW
+        // geometry fed only the snapshot must match the engine's state.
+        assert_eq!(oracle_contents(4, 10, inner), renderer_contents(&renderer));
+    }
+
+    #[test]
     fn windows_live_chunk_forwards_title_and_progress_signals() {
         let mut renderer = AttachRenderer::new(4, 20);
         let _ = renderer.render_initial(b"\x1b[H");
@@ -1164,11 +1278,10 @@ mod tests {
         assert!(rendered.starts_with(expected_signals));
         assert!(rendered[expected_signals.len()..].starts_with(b"\x1b[?2026h"));
         assert!(rendered.ends_with(b"\x1b[?2026l"));
-        assert!(renderer.parser.screen().contents().contains("working"));
+        assert!(renderer_contents(&renderer).contains("working"));
     }
 
     #[test]
-    #[cfg(windows)]
     fn windows_title_only_chunk_is_forwarded_without_repaint() {
         let mut renderer = AttachRenderer::new(4, 20);
         let _ = renderer.render_initial(b"\x1b[Hidle");
@@ -1179,7 +1292,18 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    fn windows_cursor_only_chunk_moves_the_cursor() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[Hidle");
+
+        let rendered = renderer.render_chunk(b"\x1b[3;3H");
+
+        assert!(rendered.starts_with(b"\x1b[?2026h"));
+        let inner = &rendered[b"\x1b[?2026h".len()..rendered.len() - b"\x1b[?2026l".len()];
+        assert_eq!(inner, b"\x1b[3;3H\x1b[?25h");
+    }
+
+    #[test]
     fn windows_live_chunk_forwards_cursor_shape_changes() {
         // The canonical screen state does not model DECSCUSR, so an editor's
         // bar cursor would be lost on every repaint without this passthrough.
@@ -1189,18 +1313,17 @@ mod tests {
         let rendered = renderer.render_chunk(b"\x1b[6 q\x1b[Hediting");
 
         assert!(rendered.starts_with(b"\x1b[6 q"));
-        assert!(renderer.parser.screen().contents().contains("editing"));
+        assert!(renderer_contents(&renderer).contains("editing"));
     }
 
     #[test]
-    #[cfg(windows)]
     fn windows_initial_snapshot_forwards_restored_signals() {
         let mut renderer = AttachRenderer::new(4, 20);
 
         let rendered = renderer.render_initial(b"\x1b[Hready\x1b]0;relay\x07\x1b[6 q");
 
         assert!(rendered.starts_with(b"\x1b]0;relay\x07\x1b[6 q"));
-        assert!(renderer.parser.screen().contents().contains("ready"));
+        assert!(renderer_contents(&renderer).contains("ready"));
     }
 
     // -----------------------------------------------------------------------

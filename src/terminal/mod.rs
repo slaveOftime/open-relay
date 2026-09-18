@@ -199,13 +199,18 @@ impl Terminal {
         )
     }
 
-    /// Current cursor as 1-based (row, col).
+    /// Current cursor as zero-based (row, col) on the visible screen.
     pub fn cursor_position(&self) -> (u16, u16) {
         let point = self.term.grid().cursor.point;
         (
             point.line.0.clamp(0, i32::from(u16::MAX)) as u16,
             point.column.0.min(usize::from(u16::MAX)) as u16,
         )
+    }
+
+    /// Whether the cursor is visible (DECTCEM).
+    pub fn cursor_visible(&self) -> bool {
+        self.term.mode().contains(TermMode::SHOW_CURSOR)
     }
 
     /// Text of one row of the visible screen (`row` zero-based), trailing

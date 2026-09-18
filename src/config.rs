@@ -83,9 +83,9 @@ pub struct AppConfig {
     /// Maximum size in bytes an individual session's `output.log` may reach
     /// before the daemon truncates it in place. `0` disables the cap.
     pub max_output_log_bytes: u64,
-    /// Rows of scrolled-off output each session's live screen parser retains
-    /// in memory, rendered as scrollback history for freshly attaching
-    /// clients.  vt100 only keeps scrollback for the main screen, so
+    /// Rows of scrolled-off output each session's live engine retains in
+    /// memory, rendered as scrollback history for freshly attaching
+    /// clients. The engine keeps scrollback only for the main screen, so
     /// alternate-screen TUIs are unaffected.
     pub screen_scrollback_rows: usize,
     /// Optional path to an executable invoked on every local OS notification.

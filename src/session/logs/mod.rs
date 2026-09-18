@@ -8,7 +8,7 @@
 //!
 //! - [`index`] turns an `output.log` into addressable records: boundary
 //!   detection, the on-disk `output.log.idx` offset index, and pagination.
-//! - [`render`] replays raw bytes through a `vt100` parser to produce the rows
+//! - [`render`] replays raw bytes through the terminal engine to produce the rows
 //!   a human sees.
 
 mod index;
