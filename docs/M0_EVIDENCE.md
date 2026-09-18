@@ -244,6 +244,46 @@ Client-attach latency analysis (code-reading evidence, `src/client/attach.rs`):
   out-of-window reads, and cadence-driven `durable_seq` progress with no
   explicit sync. Suite: 524 passed, 16 ignored; clippy baseline
   unchanged (80); real-PTY shadow probe re-run.
+
+### Increment 5: history reads, retention, crash faults — M1 exit gate
+
+- `read_history(session_dir, from: JournalCursor, max_bytes)`: the one
+  internal read API for live and completed history — walks incarnation
+  segments from `from` upward, byte-bounded, `next` resume cursor,
+  `truncated` on budget; corruption in any consumed incarnation is an
+  `InvalidData` error (no silent holes); cursors into retained-away
+  incarnations fail loudly with `NotFound` (never alias, never empty
+  success).
+- `retain_before(session_dir, min_incarnation)`: non-resetting retention
+  over sealed segments; the latest (possibly active) incarnation is
+  never deleted.
+- Bounded tail/seek: `scan_segment_index` (payload-free index pass,
+  bounded memory) + `read_tail` (index-located window revalidated via
+  `read_range`).
+- Crash-fault coverage for ADR-0002 acceptance: torn-tail rewind (inc. 2),
+  interior-corruption quarantine, retention never deleting the active
+  incarnation, retention expiry failing loudly,
+  `disk_full_degrades_the_appender_without_a_hole` (`/dev/full`: Failed
+  ack, fail-fast afterwards, no partial writes), queue budgets (inc. 2),
+  contiguity enforcement (inc. 2). `journal_cursors_never_alias_across_
+  restart_and_retention` is the journal-backed equivalent of the M0 I3
+  repro and passes un-ignored.
+- Group-sync cadence measured (`probe_journal_sync_cadence_durable_lag`,
+  release): append→durable lag p95 ≈ 21.2 / 51.3 / 101.3 ms at
+  20/50/100 ms cadences — lag tracks the cadence with ~1 ms of overhead.
+  Default stays 50 ms; recorded in ADR-0002.
+- Deferred to M3 by design: sequence-tagged broadcast frames (belongs
+  with the ADR-0004 stream protocol) and making the journal canonical
+  (output.log/`read_output_from` retirement, which un-ignores the
+  original 0.x repro path).
+- **M1 exit status (PLAN.md §6.1):** I1 (one ordered stream — real-PTY
+  probe: geometry/start/output/resize/end contiguous), I3 (journal
+  cursors, fixed-range reads, loud expiry), I8 (head/journal/durable
+  cursors distinct; disk-stall byte budgets; explicit degraded state),
+  I10 (end fact journaled exactly once after final state; ordered after
+  final output) — all exercised against the shadow journal
+  (`OLY_JOURNAL=1`). Journal becomes canonical in M3 per plan. Suite:
+  529 passed, 17 ignored; clippy baseline unchanged (80).
 - [x] Capability/CLI/API/config/auth inventory for the compatibility break
       — see [M0_INVENTORY.md](M0_INVENTORY.md).
 - [x] ADR ratification at the M0 exit gate: ADR-0002/0003/0006/0007

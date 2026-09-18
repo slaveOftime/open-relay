@@ -337,3 +337,52 @@ fn probe_shadow_journal_records_output_in_order() {
     // SAFETY: same single-threaded-probe justification as the set above.
     unsafe { std::env::remove_var("OLY_JOURNAL") };
 }
+
+/// M1 dev probe (ADR-0002's deferred 20/50/100 ms decision): measure
+/// append→durable lag of the shadow journal at candidate group-sync
+/// cadences. Each sample records one small event and waits for the
+/// cadence-driven sync to cover it; expected lag is uniform in
+/// roughly `[0, cadence]` plus sync cost.
+///
+/// No env mutation (the appender cadence is parameterized directly), but
+/// still an ignored dev probe rather than a CI gate:
+/// `cargo test --release -- --ignored --nocapture probe_journal_sync_cadence`.
+#[test]
+#[ignore = "M1 dev probe: journal sync-cadence measurement; run individually"]
+fn probe_journal_sync_cadence_durable_lag() {
+    use super::journal::ShadowJournal;
+
+    const CADENCE_SAMPLES: usize = 60;
+    for cadence_ms in [20u64, 50, 100] {
+        let dir = std::env::temp_dir().join(format!("oly_probe_cadence_{}", uuid::Uuid::new_v4()));
+        let (mut shadow, _, _) =
+            ShadowJournal::open_with_sync_interval(&dir, Duration::from_millis(cadence_ms))
+                .expect("open shadow journal");
+
+        let mut lags_micros = Vec::with_capacity(CADENCE_SAMPLES);
+        for _ in 0..CADENCE_SAMPLES {
+            let start = Instant::now();
+            let cursor = shadow
+                .record_output(bytes::Bytes::from_static(b"cadence-sample"))
+                .expect("record sample");
+            let deadline = start + Duration::from_secs(5);
+            while shadow.core.durable_seq() < cursor.seq {
+                assert!(Instant::now() < deadline, "durable ack timed out");
+                std::thread::sleep(Duration::from_millis(1));
+                shadow.poll_acks();
+            }
+            lags_micros.push(start.elapsed().as_micros() as u64);
+        }
+        lags_micros.sort_unstable();
+        let p50 = lags_micros[CADENCE_SAMPLES / 2];
+        let p95 = lags_micros[CADENCE_SAMPLES * 95 / 100];
+        let max = lags_micros[CADENCE_SAMPLES - 1];
+        println!(
+            "journal sync cadence {cadence_ms:>3} ms: append→durable lag p50={p50}µs p95={p95}µs max={max}µs (n={CADENCE_SAMPLES})"
+        );
+        assert_eq!(shadow.core.head_seq(), Some(CADENCE_SAMPLES as u64));
+
+        drop(shadow);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

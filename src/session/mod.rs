@@ -2,12 +2,12 @@
 //! metadata types the rest of the daemon speaks in.
 
 pub(crate) mod file;
-// M1 groundwork (PLAN.md §6.1): record format, segment writer/reader,
-// torn-tail recovery, the in-memory sequencing core and the bounded
-// journal appender. Wired in as a shadow journal behind `OLY_JOURNAL=1`
-// (development-only); the remaining APIs (cursor consumers, ordered
-// resize/lifecycle records, policy records) land as M1 continues, and
-// the allow comes off with them.
+// M1 (PLAN.md §6.1): record format, segment writer/reader, torn-tail
+// recovery, the in-memory sequencing core, the bounded journal appender,
+// ordered resize/lifecycle records, fixed-range/tail/history reads and
+// retention. Wired in as a shadow journal behind `OLY_JOURNAL=1`
+// (development-only); the journal becomes canonical in M3. The allow
+// covers the pieces only M3 consumers will use (read APIs, retention).
 #[allow(dead_code)]
 pub(crate) mod journal;
 pub mod logs;

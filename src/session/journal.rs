@@ -935,7 +935,7 @@ impl ScanOutcome {
 /// (`ScanStop::PartialTail`). Anything else is corruption, not a tear — the
 /// caller quarantines and reports it instead of silently continuing.
 pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
-    Ok(scan_impl(path, None)?.0)
+    Ok(scan_impl(path, ScanMode::All)?.0)
 }
 
 /// Result of a fixed-range read: the in-window records (contiguous, in
@@ -978,9 +978,9 @@ pub fn read_range(
             format!("no journal segment for incarnation {incarnation}"),
         ));
     }
-    let (outcome, truncated) = scan_impl(
+    let (outcome, truncated, _) = scan_impl(
         &path,
-        Some(CollectWindow {
+        ScanMode::Window(CollectWindow {
             from_seq,
             to_seq,
             max_buffered_bytes: max_bytes,
@@ -993,80 +993,321 @@ pub fn read_range(
     })
 }
 
-/// Window/budget for a range read; `None` collects everything.
+/// Window/budget for a range read.
 struct CollectWindow {
     from_seq: u64,
     to_seq: u64,
     max_buffered_bytes: usize,
 }
 
+/// Where one record lives inside its segment file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub seq: u64,
+    /// Byte offset of the record header inside the segment.
+    pub offset: u64,
+    /// Header plus payload length.
+    pub record_len: u64,
+}
+
+/// Payload-free segment index: bounded memory regardless of payload
+/// sizes, and the basis for bounded tail reads (and later O(1) seeks).
+#[derive(Debug)]
+pub struct SegmentIndex {
+    pub entries: Vec<IndexEntry>,
+    pub valid_len: u64,
+    pub stop: ScanStop,
+}
+
+/// Scan a segment collecting only the record index (payloads are
+/// validated but not retained).
+pub fn scan_segment_index(path: &Path) -> io::Result<SegmentIndex> {
+    let (outcome, _, entries) = scan_impl(path, ScanMode::Index)?;
+    Ok(SegmentIndex {
+        entries,
+        valid_len: outcome.valid_len,
+        stop: outcome.stop,
+    })
+}
+
+/// Result of a bounded tail read.
+#[derive(Debug)]
+pub struct TailRead {
+    pub records: Vec<Record>,
+    pub stop: ScanStop,
+}
+
+/// Read the newest records of one incarnation whose payloads fit in
+/// `max_bytes` (the newest record is always included). Memory stays
+/// bounded regardless of segment size: an index scan locates the window,
+/// then [`read_range`] revalidates and returns it. On a live segment,
+/// records appended between the two passes may also be returned.
+pub fn read_tail(session_dir: &Path, incarnation: u64, max_bytes: usize) -> io::Result<TailRead> {
+    let path = segment_path(&session_dir.join(JOURNAL_DIR_NAME), incarnation);
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no journal segment for incarnation {incarnation}"),
+        ));
+    }
+    let index = scan_segment_index(&path)?;
+    let mut bytes = 0u64;
+    let mut start_seq = None;
+    for entry in index.entries.iter().rev() {
+        let payload_len = entry.record_len - HEADER_LEN as u64;
+        if start_seq.is_some() && bytes + payload_len > max_bytes as u64 {
+            break;
+        }
+        bytes += payload_len;
+        start_seq = Some(entry.seq);
+    }
+    let Some(start_seq) = start_seq else {
+        return Ok(TailRead {
+            records: Vec::new(),
+            stop: index.stop,
+        });
+    };
+    let read = read_range(session_dir, incarnation, start_seq, u64::MAX, max_bytes)?;
+    Ok(TailRead {
+        records: read.records,
+        stop: read.stop,
+    })
+}
+
+/// One event returned by [`read_history`], carrying its durable cursor.
+#[derive(Debug)]
+pub struct HistoryEvent {
+    pub cursor: JournalCursor,
+    pub elapsed_ms: u64,
+    pub kind: RecordKind,
+    pub payload: Vec<u8>,
+}
+
+/// Result of a cross-incarnation history read.
+#[derive(Debug)]
+pub struct HistoryRead {
+    pub events: Vec<HistoryEvent>,
+    /// Resume cursor (exclusive of the returned events). `None` when no
+    /// events were returned — the caller is caught up or `from` is past
+    /// the current head.
+    pub next: Option<JournalCursor>,
+    /// The byte budget cut the read short; resume from `next`.
+    pub truncated: bool,
+}
+
+/// The one internal read API for live and completed history (PLAN.md §6.1
+/// M1 exit): reads events with cursor >= `from` across incarnation
+/// segments, oldest first, buffering at most `max_bytes` of payload (the
+/// first event is always included).
+///
+/// Cursors never alias (I3): a restart opens a new incarnation, so a
+/// pre-restart cursor keeps addressing the pre-restart bytes. If `from`
+/// names an incarnation that retention has removed, the read fails loudly
+/// with `NotFound` instead of returning empty or aliased data.
+///
+/// Corruption inside any consumed incarnation is an `InvalidData` error —
+/// history reads never skip past a hole.
+pub fn read_history(
+    session_dir: &Path,
+    from: JournalCursor,
+    max_bytes: usize,
+) -> io::Result<HistoryRead> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    let incarnations = list_incarnations(&journal_dir)?;
+    let Some(&earliest) = incarnations.first() else {
+        return Ok(HistoryRead {
+            events: Vec::new(),
+            next: None,
+            truncated: false,
+        });
+    };
+    if from.incarnation < earliest || !incarnations.contains(&from.incarnation) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "journal cursor {}:{} expired: incarnation no longer retained",
+                from.incarnation, from.seq
+            ),
+        ));
+    }
+
+    let mut events = Vec::new();
+    let mut buffered = 0usize;
+    let mut truncated = false;
+    for incarnation in incarnations
+        .iter()
+        .copied()
+        .filter(|incarnation| *incarnation >= from.incarnation)
+    {
+        if buffered >= max_bytes && !events.is_empty() {
+            truncated = true;
+            break;
+        }
+        let from_seq = if incarnation == from.incarnation {
+            from.seq
+        } else {
+            1
+        };
+        let remaining = max_bytes.saturating_sub(buffered).max(1);
+        let read = read_range(session_dir, incarnation, from_seq, u64::MAX, remaining)?;
+        if !matches!(read.stop, ScanStop::CleanEof | ScanStop::PartialTail) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal incarnation {incarnation} is corrupt: {:?}",
+                    read.stop
+                ),
+            ));
+        }
+        truncated |= read.truncated;
+        buffered += read
+            .records
+            .iter()
+            .map(|record| record.payload.len())
+            .sum::<usize>();
+        events.extend(read.records.into_iter().map(|record| HistoryEvent {
+            cursor: JournalCursor {
+                incarnation,
+                seq: record.seq,
+            },
+            elapsed_ms: record.elapsed_ms,
+            kind: record.kind,
+            payload: record.payload,
+        }));
+        if truncated {
+            break;
+        }
+    }
+
+    let next = events.last().map(|event| JournalCursor {
+        incarnation: event.cursor.incarnation,
+        seq: event.cursor.seq + 1,
+    });
+    Ok(HistoryRead {
+        events,
+        next,
+        truncated,
+    })
+}
+
+/// All incarnation numbers present in a journal directory, ascending.
+fn list_incarnations(journal_dir: &Path) -> io::Result<Vec<u64>> {
+    let mut incarnations = Vec::new();
+    if !journal_dir.exists() {
+        return Ok(incarnations);
+    }
+    for entry in fs::read_dir(journal_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(number) = name
+            .strip_prefix(SEGMENT_PREFIX)
+            .and_then(|rest| rest.strip_suffix(SEGMENT_SUFFIX))
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        incarnations.push(number);
+    }
+    incarnations.sort_unstable();
+    Ok(incarnations)
+}
+
+/// Non-resetting retention (PLAN.md §6.1): delete the *sealed* incarnation
+/// segments below `min_incarnation`. The latest incarnation is never
+/// deleted (it may be active). Returns the deleted incarnation numbers.
+/// Cursors into removed incarnations fail loudly on read (see
+/// [`read_history`]); they never alias newer bytes.
+pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec<u64>> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    let incarnations = list_incarnations(&journal_dir)?;
+    let latest = incarnations.last().copied();
+    let mut deleted = Vec::new();
+    for incarnation in incarnations {
+        if incarnation >= min_incarnation || Some(incarnation) == latest {
+            continue;
+        }
+        fs::remove_file(segment_path(&journal_dir, incarnation))?;
+        deleted.push(incarnation);
+    }
+    Ok(deleted)
+}
+
+/// What a scan collects. All modes validate the consumed prefix fully
+/// (headers, CRCs, continuity) — they differ only in what they retain.
+enum ScanMode {
+    /// Keep every record (recovery; bounded by the caller's context).
+    All,
+    /// Keep only records inside the seq window, under a byte budget.
+    Window(CollectWindow),
+    /// Keep only per-record index entries (bounded tail/seek support).
+    Index,
+}
+
 fn scan_impl(
     path: &Path,
-    window: Option<CollectWindow>,
-) -> io::Result<(ScanOutcome, bool /* truncated */)> {
+    mode: ScanMode,
+) -> io::Result<(ScanOutcome, bool /* truncated */, Vec<IndexEntry>)> {
     let mut file = fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut records = Vec::new();
+    let mut index_entries = Vec::new();
     let mut buffered_bytes = 0usize;
     let mut truncated = false;
     let mut offset = 0u64;
     let mut expected_seq: Option<u64> = None;
 
+    macro_rules! stop {
+        ($reason:expr) => {
+            return Ok((outcome(records, offset, $reason), truncated, index_entries))
+        };
+    }
+
     loop {
         let mut header = [0u8; HEADER_LEN];
         match read_exact_or_partial(&mut file, &mut header)? {
             ReadPiece::Complete => {}
-            ReadPiece::Partial => {
-                return Ok((outcome(records, offset, ScanStop::PartialTail), truncated));
-            }
+            ReadPiece::Partial => stop!(ScanStop::PartialTail),
             ReadPiece::Empty => {
                 debug_assert_eq!(offset, file_len, "EOF only at the real end");
-                return Ok((outcome(records, offset, ScanStop::CleanEof), truncated));
+                stop!(ScanStop::CleanEof);
             }
         }
 
         if &header[..4] != RECORD_MAGIC {
-            return Ok((outcome(records, offset, ScanStop::InvalidHeader), truncated));
+            stop!(ScanStop::InvalidHeader);
         }
         if u16::from_le_bytes(header[4..6].try_into().unwrap()) != RECORD_VERSION {
-            return Ok((
-                outcome(records, offset, ScanStop::UnsupportedVersion),
-                truncated,
-            ));
+            stop!(ScanStop::UnsupportedVersion);
         }
         let kind = match RecordKind::from_u16(u16::from_le_bytes(header[6..8].try_into().unwrap()))
         {
             Some(kind) => kind,
-            None => return Ok((outcome(records, offset, ScanStop::UnknownKind), truncated)),
+            None => stop!(ScanStop::UnknownKind),
         };
         let payload_len = u32::from_le_bytes(header[28..32].try_into().unwrap());
         if payload_len > MAX_PAYLOAD_LEN {
-            return Ok((
-                outcome(records, offset, ScanStop::OversizeLength),
-                truncated,
-            ));
+            stop!(ScanStop::OversizeLength);
         }
 
         let seq = u64::from_le_bytes(header[12..20].try_into().unwrap());
-        if let Some(window) = &window
+        if let ScanMode::Window(window) = &mode
             && seq > window.to_seq
         {
             // Past the requested window: the whole window was present and
             // contiguous. Nothing beyond it needs validation here.
-            return Ok((outcome(records, offset, ScanStop::CleanEof), truncated));
+            stop!(ScanStop::CleanEof);
         }
 
         let mut payload = vec![0u8; payload_len as usize];
         match read_exact_or_partial(&mut file, &mut payload)? {
             ReadPiece::Complete => {}
-            ReadPiece::Partial | ReadPiece::Empty => {
-                return Ok((outcome(records, offset, ScanStop::PartialTail), truncated));
-            }
+            ReadPiece::Partial | ReadPiece::Empty => stop!(ScanStop::PartialTail),
         }
 
         let stored_crc = u32::from_le_bytes(header[32..36].try_into().unwrap());
         if crc32_two(&header[..32], &payload) != stored_crc {
-            return Ok((outcome(records, offset, ScanStop::CrcMismatch), truncated));
+            stop!(ScanStop::CrcMismatch);
         }
 
         if let Some(expected) = expected_seq
@@ -1074,29 +1315,43 @@ fn scan_impl(
         {
             // A sequence gap means an earlier record was lost or the tail was
             // aliased: stop here so recovery never presents a silent hole.
-            return Ok((
-                outcome(records, offset, ScanStop::SequenceDiscontinuity),
-                truncated,
-            ));
+            stop!(ScanStop::SequenceDiscontinuity);
         }
         expected_seq = Some(seq + 1);
 
-        let in_window = window.as_ref().is_none_or(|window| seq >= window.from_seq);
-        if in_window {
-            let over_budget = window.as_ref().is_some_and(|window| {
-                !records.is_empty() && buffered_bytes + payload.len() > window.max_buffered_bytes
-            });
-            if over_budget {
-                truncated = true;
-                return Ok((outcome(records, offset, ScanStop::CleanEof), truncated));
+        match &mode {
+            ScanMode::All => {
+                records.push(Record {
+                    kind,
+                    seq,
+                    elapsed_ms: u64::from_le_bytes(header[20..28].try_into().unwrap()),
+                    payload,
+                });
             }
-            buffered_bytes += payload.len();
-            records.push(Record {
-                kind,
-                seq,
-                elapsed_ms: u64::from_le_bytes(header[20..28].try_into().unwrap()),
-                payload,
-            });
+            ScanMode::Window(window) => {
+                if seq >= window.from_seq {
+                    let over_budget = !records.is_empty()
+                        && buffered_bytes + payload.len() > window.max_buffered_bytes;
+                    if over_budget {
+                        truncated = true;
+                        stop!(ScanStop::CleanEof);
+                    }
+                    buffered_bytes += payload.len();
+                    records.push(Record {
+                        kind,
+                        seq,
+                        elapsed_ms: u64::from_le_bytes(header[20..28].try_into().unwrap()),
+                        payload,
+                    });
+                }
+            }
+            ScanMode::Index => {
+                index_entries.push(IndexEntry {
+                    seq,
+                    offset,
+                    record_len: HEADER_LEN as u64 + payload_len as u64,
+                });
+            }
         }
         offset += (HEADER_LEN + payload_len as usize) as u64;
         file.seek(SeekFrom::Start(offset))?;
@@ -1875,6 +2130,204 @@ mod tests {
         assert!(read.records.is_empty(), "no window data past corruption");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -- Bounded tail, cross-incarnation history, retention (I3/I8) --
+
+    #[test]
+    fn read_tail_returns_the_newest_records_within_budget() {
+        let dir = test_session_dir("tail_budget");
+        write_ten_record_segment(&dir);
+
+        // Payloads are 10 bytes; a 25-byte budget covers the newest two.
+        let tail = read_tail(&dir, 1, 25).unwrap();
+        assert_eq!(
+            tail.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![9, 10]
+        );
+        let all = read_tail(&dir, 1, usize::MAX).unwrap();
+        assert_eq!(all.records.len(), 10);
+        // The newest record is always included, even over budget.
+        let one = read_tail(&dir, 1, 1).unwrap();
+        assert_eq!(one.records.len(), 1);
+        assert_eq!(one.records[0].seq, 10);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// ADR-0002 acceptance: the journal-backed equivalent of
+    /// `persist::tests::repro_truncated_log_reuses_offsets`. Cursors are
+    /// `(incarnation, seq)`, so a restart can never alias new bytes onto
+    /// an old cursor, and retention expiry fails loudly.
+    #[test]
+    fn history_cursors_never_alias_across_restart_and_retention() {
+        let dir = test_session_dir("history_alias");
+
+        let mut first = open(&dir).unwrap();
+        for (seq, payload) in [
+            (1, b"one".as_slice()),
+            (2, b"two".as_slice()),
+            (3, b"three".as_slice()),
+        ] {
+            first
+                .writer
+                .append_record(RecordKind::Output, seq, seq, payload)
+                .unwrap();
+        }
+        drop(first);
+
+        // "Crash"/restart: a new incarnation starts; old cursors keep
+        // addressing the pre-restart bytes.
+        let mut second = open(&dir).unwrap();
+        assert_eq!(second.incarnation, 2);
+        second
+            .writer
+            .append_record(RecordKind::Output, 1, 0, b"four")
+            .unwrap();
+        second
+            .writer
+            .append_record(RecordKind::Output, 2, 1, b"five")
+            .unwrap();
+        drop(second);
+
+        let from_old = JournalCursor {
+            incarnation: 1,
+            seq: 2,
+        };
+        let read = read_history(&dir, from_old, usize::MAX).unwrap();
+        assert!(!read.truncated);
+        assert_eq!(
+            read.events
+                .iter()
+                .map(|e| (e.cursor.incarnation, e.cursor.seq, e.payload.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 2, b"two".to_vec()),
+                (1, 3, b"three".to_vec()),
+                (2, 1, b"four".to_vec()),
+                (2, 2, b"five".to_vec()),
+            ],
+            "pre-restart cursors read pre-restart bytes, then continue across incarnations"
+        );
+        assert_eq!(
+            read.next,
+            Some(JournalCursor {
+                incarnation: 2,
+                seq: 3
+            })
+        );
+
+        // Retention removes the sealed first incarnation.
+        let deleted = retain_before(&dir, 2).unwrap();
+        assert_eq!(deleted, vec![1]);
+
+        // A cursor into the removed incarnation fails loudly — never an
+        // empty success, never aliased bytes.
+        let expired = read_history(&dir, from_old, usize::MAX).unwrap_err();
+        assert_eq!(expired.kind(), io::ErrorKind::NotFound);
+
+        // Cursors into the retained incarnation are unaffected.
+        let read = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 2,
+                seq: 1,
+            },
+            usize::MAX,
+        )
+        .unwrap();
+        assert_eq!(read.events.len(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retention_never_deletes_the_active_incarnation() {
+        let dir = test_session_dir("retention_active");
+        let _first = open(&dir).unwrap();
+        let deleted = retain_before(&dir, 99).unwrap();
+        assert!(deleted.is_empty(), "the only (active) segment stays");
+        assert!(
+            dir.join(JOURNAL_DIR_NAME)
+                .join("seg-00000001.ojrn")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_history_budget_truncates_and_resumes_exactly() {
+        let dir = test_session_dir("history_budget");
+        write_ten_record_segment(&dir);
+
+        let first = read_history(
+            &dir,
+            JournalCursor {
+                incarnation: 1,
+                seq: 1,
+            },
+            25,
+        )
+        .unwrap();
+        assert!(first.truncated);
+        assert_eq!(first.events.len(), 2);
+        let resume = first.next.unwrap();
+        assert_eq!(
+            resume,
+            JournalCursor {
+                incarnation: 1,
+                seq: 3
+            }
+        );
+
+        let rest = read_history(&dir, resume, usize::MAX).unwrap();
+        assert!(!rest.truncated);
+        assert_eq!(rest.events.len(), 8);
+        assert_eq!(rest.events[0].cursor.seq, 3);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Disk-full degradation (PLAN.md §6.1 M1 exit: "disk stall cannot
+    /// grow memory indefinitely" + explicit failure state): an appender
+    /// whose writes fail must surface `Failed`, reject further records
+    /// without writing past a hole, and leave the segment untouched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn disk_full_degrades_the_appender_without_a_hole() {
+        let full = Path::new("/dev/full");
+        // Some sandboxes lack /dev/full; skip instead of failing.
+        let Ok(writer) = SegmentWriter::open_append(full) else {
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let (ack_tx, acks) = std::sync::mpsc::channel();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = std::thread::spawn(move || {
+            appender_loop(
+                writer,
+                rx,
+                ack_tx,
+                queued,
+                std::time::Duration::from_millis(10),
+            )
+        });
+
+        tx.send(AppenderMsg::Record(Box::new(event(1, b"x"))))
+            .unwrap();
+        match recv_ack(&acks) {
+            JournalAck::Failed(reason) => {
+                assert!(reason.contains("append failed"), "unexpected: {reason}");
+            }
+            other => panic!("expected append failure, got {other:?}"),
+        }
+        // Fail-fast afterwards: no partial recovery, no silent hole.
+        tx.send(AppenderMsg::Record(Box::new(event(2, b"y"))))
+            .unwrap();
+        assert!(matches!(recv_ack(&acks), JournalAck::Failed(_)));
+        tx.send(AppenderMsg::Shutdown).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]

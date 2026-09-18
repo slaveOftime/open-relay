@@ -226,8 +226,14 @@ mod tests {
     /// subscribed to. The 1.0 segmented journal must surface
     /// `HistoryExpired` instead; this test pins the desired behaviour and
     /// stays ignored until the journal lands.
+    ///
+    /// M1: the journal-backed equivalent
+    /// (`journal::tests::history_cursors_never_alias_across_restart_and_retention`)
+    /// passes un-ignored. This 0.x reproduction stays ignored as
+    /// documentation of the old failure mode until `output.log` stops
+    /// being canonical in M3.
     #[test]
-    #[ignore = "M0 reproduction (PLAN I3): offset reuse after truncation; fixed by the segmented journal in M1"]
+    #[ignore = "M0 reproduction (PLAN I3): offset reuse after truncation; superseded by journal cursors in M1, output.log retires in M3"]
     fn repro_truncated_log_reuses_offsets() {
         let dir = test_dir("offset_reuse");
         append_output_raw(&dir, &[b'x'; 100]).unwrap();

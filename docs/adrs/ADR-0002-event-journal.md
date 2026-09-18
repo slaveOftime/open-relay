@@ -47,9 +47,21 @@ clients keep receiving bytes the log will never contain.
 ## Acceptance
 
 - `repro_truncated_log_reuses_offsets` passes un-ignored against the
-  journal-backed read API.
+  journal-backed read API. **Met (M1)** by
+  `journal::tests::history_cursors_never_alias_across_restart_and_retention`:
+  `(incarnation, seq)` cursors never alias after restart, and retention
+  expiry fails loudly with `NotFound`. The 0.x reproduction stays ignored
+  until `output.log` retires in M3.
 - Crash-fault tests: torn tail recovery, retention concurrent with readers,
   disk-full degradation — all without cursor reuse or silent holes.
+  **Met (M1)**: `reopen_rewinds_a_torn_tail_before_starting_the_new_incarnation`,
+  `retention_never_deletes_the_active_incarnation` + the retention half of
+  the alias test, `disk_full_degrades_the_appender_without_a_hole`
+  (`/dev/full`), plus the queue-budget and contiguity boundary tests.
+- Group-sync cadence: measured by `probe_journal_sync_cadence_durable_lag`
+  (M1): append→durable lag tracks the cadence (p95 ≈ cadence + ~1 ms at
+  20/50/100 ms). Default is 50 ms (`DEFAULT_SYNC_INTERVAL`); revisit with
+  production workloads in M3.
 
 ## Migration
 
