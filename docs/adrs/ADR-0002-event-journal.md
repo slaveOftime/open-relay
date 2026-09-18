@@ -40,9 +40,11 @@ clients keep receiving bytes the log will never contain.
 3. Retention deletes whole sealed incarnations only, after a retained
    checkpoint reconstructs the first exposed boundary. Sequences are
    never reused; obsolete cursors get `HistoryExpired { earliest_cursor }`.
-   **The checkpoint gate does not exist until M2** (checkpoint records
-   land with the engine integration): M1 ships only the unchecked
-   primitive, named `retain_before_unchecked` and marked test/dev-only.
+   The checkpoint gate landed in **M2-3** (checkpoint records land with
+   the engine integration): `journal::retain_before` refuses to delete
+   below the newest checkpoint's incarnation and deletes nothing when no
+   checkpoint exists; the test-only unchecked primitive remains
+   `retain_before_unchecked`.
    Deletion is newest-part-first so a concurrent reader can observe a
    truthful prefix of a being-deleted incarnation, never a hole; part
    numbering is validated contiguous from 1 on every read. Exact
