@@ -146,6 +146,9 @@ pub struct SessionRuntime {
     /// facts (PLAN.md I10): completion must be sequenced after the final
     /// retained output, never at the moment `try_wait` noticed the exit.
     pub(crate) pending_journal_completion: Option<(LifecycleCode, Option<i32>, String)>,
+    /// Last terminal mode state journaled as a Policy record this
+    /// incarnation; `None` until the baseline revision is recorded.
+    pub(crate) journaled_modes: Option<ModeSnapshot>,
     pub notifications_enabled: bool,
     /// M1 shadow journal (dev-only `OLY_JOURNAL=1`): the per-session
     /// sequencing point for output, resize and lifecycle facts. The mutex
@@ -604,6 +607,30 @@ impl SessionRuntime {
         self.journal_event(|journal| journal.record_output(payload).map(|_| ()));
     }
 
+    fn journal_policy(&self, key: &str, value: &str) {
+        self.journal_event(|journal| journal.record_policy(key, value).map(|_| ()));
+    }
+
+    /// Journal a Policy record whenever the terminal mode state observed
+    /// by the screen parser differs from the last journaled revision.
+    /// The first call of an incarnation always records the baseline, so
+    /// seeded replay knows the mode state near the start of the stream;
+    /// later revisions land immediately after the output that caused
+    /// them (both are sequenced under the same write lock).
+    fn journal_modes_if_changed(&mut self) {
+        let current = self.shared_modes.load();
+        if self.journaled_modes == Some(current) {
+            return;
+        }
+        let value = format!(
+            "app_cursor_keys={},bracketed_paste={}",
+            u8::from(current.app_cursor_keys),
+            u8::from(current.bracketed_paste_mode)
+        );
+        self.journal_policy("modes", &value);
+        self.journaled_modes = Some(current);
+    }
+
     fn journal_resize(&self, rows: u16, cols: u16) {
         self.journal_event(|journal| journal.record_resize(rows, cols).map(|_| ()));
     }
@@ -874,6 +901,7 @@ pub fn spawn_session(
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
         pending_journal_completion: None,
+        journaled_modes: None,
         notifications_enabled,
         journal: shadow_journal,
     }));
@@ -917,36 +945,31 @@ pub fn spawn_session(
 
                     // A chunk that only carries a stripped signal (e.g. a
                     // pure colour set) has no filtered bytes and no queries,
-                    // but its signals must still be published.
-                    if scan_out.filtered.is_empty()
-                        && scan_out.queries.is_empty()
-                        && !scanner.signals_changed()
-                    {
-                        continue;
-                    }
-
                     let filtered = Bytes::copy_from_slice(&scan_out.filtered);
                     let meaningful_len = scan_out.meaningful_bytes();
                     let changed_signals = scanner.take_changed_signals();
 
-                    // Single write lock: advance the rendered screen and the
-                    // stream counters, publish any changed notifications (and
-                    // adopt a terminal-emitted title while the session has no
-                    // user-chosen one), and read back the cursor position for
-                    // query replies.
+                    // Single write lock: journal the raw PTY bytes, advance
+                    // the rendered screen and the stream counters, publish
+                    // any changed notifications (and adopt a terminal-emitted
+                    // title while the session has no user-chosen one), and
+                    // read back the cursor position for query replies.
                     let (cursor_position, meta_update) = {
                         let mut rt = runtime_reader.write();
+                        // Journal the exact bytes read from the PTY —
+                        // pre-filter — so replay and post-mortems never lose
+                        // data the scan pipeline dropped (PLAN.md I4). This
+                        // happens even when the filtered chunk is empty.
+                        rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
                         } else {
                             false
                         };
                         let cursor = rt.push_output(&filtered, meaningful_len);
-                        // Sequence the canonical chunk into the shadow
-                        // journal inside the same write-lock section that
-                        // mutated the screen, so output, resize and
-                        // lifecycle records share one order (PLAN.md §4.1).
-                        rt.journal_output(filtered.clone());
+                        // A mode flip lands immediately after the output
+                        // that caused it, in the same order a replay sees.
+                        rt.journal_modes_if_changed();
                         (cursor, meta_changed.then(|| rt.to_summary()))
                     };
 
@@ -956,7 +979,9 @@ pub fn spawn_session(
                         let _ = reader_event_tx.send(SessionEvent::SessionUpdated(summary));
                     }
 
-                    if let Err(err) = output_log.append(&filtered) {
+                    if !filtered.is_empty()
+                        && let Err(err) = output_log.append(&filtered)
+                    {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
                     }
 
@@ -1313,6 +1338,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             pending_journal_completion: None,
+            journaled_modes: None,
             notifications_enabled: true,
             journal: None,
         }
@@ -1373,6 +1399,61 @@ mod tests {
         assert_eq!(code, LifecycleCode::Killed);
         assert_eq!(exit_code, Some(-9));
         assert!(detail.contains("killed"), "unexpected detail: {detail}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I4/§4.1: terminal-mode revisions are journaled as Policy records
+    /// immediately after the output that caused them, in one ordered
+    /// stream; unchanged modes never re-record.
+    #[test]
+    fn mode_flips_journal_a_policy_revision_after_the_output() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // Raw bytes journaled first (as the reader loop does), then the
+        // filtered bytes mutate the screen and the mode revision follows.
+        let raw = b"\x1b[?2004h";
+        rt.journal_output(Bytes::from_static(raw));
+        rt.push_output(raw, raw.len());
+        assert!(rt.mode_snapshot().bracketed_paste_mode);
+        rt.journal_modes_if_changed();
+        // No further change: nothing more is sequenced.
+        rt.journal_modes_if_changed();
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(2));
+        }
+
+        let segment = dir
+            .join(journal::JOURNAL_DIR_NAME)
+            .join("seg-00000001-0001.ojrn");
+        // Wait for the two records to be persisted before scanning.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.request_sync();
+                journal.poll_acks();
+                if journal.core.durable_seq() >= 2 {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let outcome = journal::scan_segment(&segment).unwrap();
+        assert_eq!(outcome.records.len(), 2);
+        assert_eq!(outcome.records[0].kind, journal::RecordKind::Output);
+        assert_eq!(&*outcome.records[0].payload, raw);
+        assert_eq!(outcome.records[1].kind, journal::RecordKind::Policy);
+        assert_eq!(
+            journal::parse_policy(&outcome.records[1].payload),
+            Some(("modes", "app_cursor_keys=0,bracketed_paste=1"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2049,6 +2130,7 @@ mod tests {
             shared_modes: Default::default(),
             output_closed: false,
             pending_journal_completion: None,
+            journaled_modes: None,
             notifications_enabled: true,
             journal: None,
         };

@@ -122,9 +122,9 @@ impl PtyScanner {
     /// Whether any retained signal changed since the last
     /// [`Self::take_changed_signals`], without clearing the flag.
     ///
-    /// The reader uses this to avoid skipping a chunk that carries only a
-    /// stripped signal (e.g. a pure colour set produces no filtered bytes but
-    /// still updates session metadata).
+    /// Test-only: the reader always processes every chunk now (raw
+    /// journaling must see fully-filtered chunks too).
+    #[cfg(test)]
     pub fn signals_changed(&self) -> bool {
         self.signals_dirty
     }

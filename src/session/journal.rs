@@ -698,7 +698,7 @@ impl JournalAppender {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalSubmitError {
     /// Message bound reached.
     QueueFull,
@@ -707,6 +707,9 @@ pub enum JournalSubmitError {
     QueueBudgetExhausted,
     /// The appender thread is gone.
     AppenderDead,
+    /// The event itself is malformed (e.g. a Policy key/value that does
+    /// not fit the codec). Refused before sequencing.
+    InvalidEvent(String),
     /// Persistence already failed for this incarnation. New events are
     /// refused (not cached) so a dead or stalled journal cannot grow
     /// memory indefinitely; the incomplete-capture boundary is the
@@ -721,6 +724,7 @@ impl std::fmt::Display for JournalSubmitError {
             Self::QueueBudgetExhausted => write!(f, "journal queue byte budget exhausted"),
             Self::AppenderDead => write!(f, "journal appender is dead"),
             Self::PersistenceDegraded => write!(f, "journal persistence is degraded"),
+            Self::InvalidEvent(reason) => write!(f, "invalid journal event: {reason}"),
         }
     }
 }
@@ -943,6 +947,23 @@ pub fn encode_resize_payload(rows: u16, cols: u16) -> [u8; 4] {
     payload
 }
 
+/// Policy record codec: one `key=value` line. Keys must be nonempty and
+/// free of `=` and newlines; values must be newline-free. That keeps
+/// policy payloads line-oriented and grep-able in a hexdump.
+pub fn policy_payload(key: &str, value: &str) -> Vec<u8> {
+    format!("{key}={value}").into_bytes()
+}
+
+/// Inverse of [`policy_payload`]; `None` for malformed payloads.
+pub fn parse_policy(payload: &[u8]) -> Option<(&str, &str)> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let (key, value) = text.split_once('=')?;
+    if key.is_empty() || value.contains('\n') {
+        return None;
+    }
+    Some((key, value))
+}
+
 pub fn decode_resize_payload(payload: &[u8]) -> Option<(u16, u16)> {
     if payload.len() != 4 {
         return None;
@@ -1087,6 +1108,24 @@ impl ShadowJournal {
         self.record(
             RecordKind::Resize,
             bytes::Bytes::copy_from_slice(&encode_resize_payload(rows, cols)),
+        )
+    }
+
+    /// Record a terminal-relevant revision (e.g. a mode flip) at its
+    /// ordered stream position, right after the output that caused it.
+    pub fn record_policy(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<JournalCursor, JournalSubmitError> {
+        if key.is_empty() || key.contains(['=', '\n']) || value.contains('\n') {
+            return Err(JournalSubmitError::InvalidEvent(format!(
+                "invalid policy key/value: {key:?}"
+            )));
+        }
+        self.record(
+            RecordKind::Policy,
+            bytes::Bytes::from(policy_payload(key, value)),
         )
     }
 
@@ -2486,6 +2525,63 @@ mod tests {
             appender.try_submit(event(2, b"b")),
             Err(JournalSubmitError::QueueFull)
         );
+    }
+
+    #[test]
+    fn policy_codec_roundtrips_and_rejects_malformed() {
+        let payload = policy_payload("modes", "app_cursor_keys=1,bracketed_paste=0");
+        assert_eq!(
+            parse_policy(&payload),
+            Some(("modes", "app_cursor_keys=1,bracketed_paste=0"))
+        );
+        assert_eq!(parse_policy(b"no-equals"), None);
+        assert_eq!(parse_policy(b"=value"), None);
+        assert_eq!(parse_policy(b"key=bad\nvalue"), None);
+        assert_eq!(parse_policy(&[0xff, 0xfe]), None);
+    }
+
+    #[test]
+    fn record_policy_validates_and_journals() {
+        let dir = test_session_dir("policy");
+        let (mut shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        assert!(matches!(
+            shadow.record_policy("", "x"),
+            Err(JournalSubmitError::InvalidEvent(_))
+        ));
+        assert!(matches!(
+            shadow.record_policy("a=b", "x"),
+            Err(JournalSubmitError::InvalidEvent(_))
+        ));
+        assert!(matches!(
+            shadow.record_policy("k", "x\ny"),
+            Err(JournalSubmitError::InvalidEvent(_))
+        ));
+        assert_eq!(
+            shadow.core.head_seq(),
+            None,
+            "invalid events never sequence"
+        );
+
+        shadow
+            .record_policy("modes", "app_cursor_keys=1,bracketed_paste=1")
+            .unwrap();
+        shadow.request_sync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while shadow.core.durable_seq() < 1 {
+            shadow.poll_acks();
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let segment = dir.join(JOURNAL_DIR_NAME).join("seg-00000001-0001.ojrn");
+        let outcome = scan_segment(&segment).unwrap();
+        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.records[0].kind, RecordKind::Policy);
+        assert_eq!(
+            parse_policy(&outcome.records[0].payload),
+            Some(("modes", "app_cursor_keys=1,bracketed_paste=1"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
