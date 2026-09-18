@@ -141,6 +141,11 @@ pub struct SessionRuntime {
     pub shared_modes: Arc<SharedModes>,
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
+    /// Terminal completion fact waiting for the output stream to drain
+    /// before it may be journaled. Process exit and PTY EOF are separate
+    /// facts (PLAN.md I10): completion must be sequenced after the final
+    /// retained output, never at the moment `try_wait` noticed the exit.
+    pub(crate) pending_journal_completion: Option<(LifecycleCode, Option<i32>, String)>,
     pub notifications_enabled: bool,
     /// M1 shadow journal (dev-only `OLY_JOURNAL=1`): the per-session
     /// sequencing point for output, resize and lifecycle facts. The mutex
@@ -422,6 +427,11 @@ impl SessionRuntime {
 
     /// Checks child exit status and updates `meta.status`. Returns `true` if completed.
     pub fn refresh_status(&mut self) -> bool {
+        // Also poll journal acks so `durable_seq` advances even when the
+        // session is idle (acks otherwise only arrive on the next record).
+        if let Some(journal) = &self.journal {
+            journal.lock().poll_acks();
+        }
         if self.is_completed() {
             if self.completed_at.is_none() {
                 self.completed_at = Some(Instant::now());
@@ -504,8 +514,58 @@ impl SessionRuntime {
                 _ => None,
             };
             if let Some(code) = code {
-                self.journal_lifecycle(code, exit_code, &event);
+                self.queue_journal_completion(code, exit_code, event);
             }
+        }
+    }
+
+    /// Journal the terminal end-of-life fact, but only once the output
+    /// stream has fully drained (I10's "ordered ending"). If the PTY
+    /// reader has not reported EOF yet, the fact is parked and flushed by
+    /// [`Self::close_output_stream`] so completion is never sequenced
+    /// before the final retained output.
+    fn queue_journal_completion(
+        &mut self,
+        code: LifecycleCode,
+        exit_code: Option<i32>,
+        detail: String,
+    ) {
+        if self.output_closed {
+            self.journal_terminal_end(code, exit_code, &detail);
+        } else {
+            self.pending_journal_completion = Some((code, exit_code, detail));
+        }
+    }
+
+    /// Record a terminal end-of-life fact and request the persistence
+    /// barrier: completion must be durable before the session is treated
+    /// as fully captured (I10's "persistence barrier").
+    fn journal_terminal_end(&mut self, code: LifecycleCode, exit_code: Option<i32>, detail: &str) {
+        self.journal_event(|journal| {
+            journal
+                .record_lifecycle(code, exit_code, detail)
+                .map(|_| ())
+        });
+        if let Some(journal) = &self.journal {
+            journal.lock().request_sync();
+        }
+    }
+
+    /// The PTY output stream ended (EOF, read error or writer teardown).
+    /// Journals the `OutputClosed` fact and then any parked completion,
+    /// so the journal order is always: final output → OutputClosed →
+    /// completion → durability barrier. If the drain or sync itself
+    /// fails, the journal's degraded state is the explicit
+    /// incomplete-capture boundary rather than a silently mis-ordered or
+    /// non-durable ending.
+    pub fn close_output_stream(&mut self, detail: String) {
+        if self.output_closed {
+            return;
+        }
+        self.output_closed = true;
+        self.journal_lifecycle(LifecycleCode::OutputClosed, None, &detail);
+        if let Some((code, exit_code, completion_detail)) = self.pending_journal_completion.take() {
+            self.journal_terminal_end(code, exit_code, &completion_detail);
         }
     }
 
@@ -813,6 +873,7 @@ pub fn spawn_session(
         title_user_set: meta.title.is_some(),
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
+        pending_journal_completion: None,
         notifications_enabled,
         journal: shadow_journal,
     }));
@@ -833,15 +894,17 @@ pub fn spawn_session(
         let mut scanner = PtyScanner::new();
         let mut scan_out = ScanOut::default();
         let mut output_log = OutputLog::open(&reader_dir);
-        loop {
+        // Every exit path funnels into one close-out so the runtime
+        // observes — and the shadow journal records — exactly one
+        // `OutputClosed` fact, regardless of how the stream ended (I10).
+        let close_detail = loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    runtime_reader.write().output_closed = true;
                     debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
                     if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
                         warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
                     }
-                    break;
+                    break "pty output closed (eof)".to_string();
                 }
                 Ok(n) => {
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
@@ -931,7 +994,7 @@ pub fn spawn_session(
                         }
                     }
                     if writer_closed {
-                        break;
+                        break "pty writer channel closed".to_string();
                     }
                 }
                 Err(err)
@@ -941,17 +1004,17 @@ pub fn spawn_session(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    runtime_reader.write().output_closed = true;
                     warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
                     if let Err(append_err) =
                         append_event(&reader_dir, &format!("pty reader error: {err}"))
                     {
                         warn!(session_id = %reader_session_id, %append_err, "failed to persist PTY reader error event");
                     }
-                    break;
+                    break format!("pty read error: {err}");
                 }
             }
-        }
+        };
+        runtime_reader.write().close_output_stream(close_detail);
         debug!(session_id = %reader_session_id, "PTY reader thread stopped");
     });
 
@@ -1249,6 +1312,7 @@ mod tests {
             title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
+            pending_journal_completion: None,
             notifications_enabled: true,
             journal: None,
         }
@@ -1267,18 +1331,21 @@ mod tests {
         rt.dir = dir.clone();
         rt.journal = Some(parking_lot::Mutex::new(shadow));
 
+        // The output stream has drained (EOF), so completion is journaled
+        // immediately, after the OutputClosed fact.
+        rt.close_output_stream("pty output closed (eof)".to_string());
         rt.mark_completed(SessionStatus::Killed, Some(-9));
         // Idempotent completion must not duplicate the end fact.
         rt.mark_completed(SessionStatus::Killed, Some(-9));
 
         // Wait for the appender to drain, then verify the journal holds
-        // exactly one lifecycle record.
+        // exactly the close and completion records.
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             {
                 let mut journal = rt.journal.as_ref().unwrap().lock();
                 journal.poll_acks();
-                if journal.core.journal_seq() >= 1 {
+                if journal.core.journal_seq() >= 2 {
                     break;
                 }
             }
@@ -1292,13 +1359,79 @@ mod tests {
                 .join("seg-00000001.ojrn"),
         )
         .unwrap();
-        assert_eq!(outcome.records.len(), 1, "the end fact is journaled once");
-        let record = &outcome.records[0];
+        assert_eq!(
+            outcome.records.len(),
+            2,
+            "OutputClosed and the end fact are journaled once each"
+        );
+        let (close_code, ..) =
+            journal::decode_lifecycle_payload(&outcome.records[0].payload).unwrap();
+        assert_eq!(close_code, LifecycleCode::OutputClosed);
+        let record = &outcome.records[1];
         assert_eq!(record.kind, journal::RecordKind::Lifecycle);
         let (code, exit_code, detail) = journal::decode_lifecycle_payload(&record.payload).unwrap();
         assert_eq!(code, LifecycleCode::Killed);
         assert_eq!(exit_code, Some(-9));
         assert!(detail.contains("killed"), "unexpected detail: {detail}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// I10: a completion observed before the PTY output stream has
+    /// drained must be parked and journaled only after the OutputClosed
+    /// fact — completion never precedes the final retained output.
+    #[test]
+    fn completion_is_journaled_only_after_output_eof() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        rt.journal_output(Bytes::from_static(b"final prompt bytes"));
+        rt.mark_completed(SessionStatus::Stopped, Some(0));
+        // Completion observed while the stream is still open: nothing is
+        // journaled beyond the output yet.
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(1));
+        }
+
+        rt.close_output_stream("pty output closed (eof)".to_string());
+        // A duplicate close must not re-record anything.
+        rt.close_output_stream("pty output closed (eof)".to_string());
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.poll_acks();
+                if journal.core.journal_seq() >= 3 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "journal ack timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(rt);
+
+        let outcome = journal::scan_segment(
+            &dir.join(journal::JOURNAL_DIR_NAME)
+                .join("seg-00000001.ojrn"),
+        )
+        .unwrap();
+        let kinds: Vec<LifecycleCode> = outcome
+            .records
+            .iter()
+            .filter(|r| r.kind == journal::RecordKind::Lifecycle)
+            .map(|r| journal::decode_lifecycle_payload(&r.payload).unwrap().0)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![LifecycleCode::OutputClosed, LifecycleCode::Stopped],
+            "ordered ending: output, then close, then completion"
+        );
+        assert_eq!(outcome.records[0].kind, journal::RecordKind::Output);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1915,6 +2048,7 @@ mod tests {
             title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
+            pending_journal_completion: None,
             notifications_enabled: true,
             journal: None,
         };

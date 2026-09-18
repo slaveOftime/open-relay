@@ -803,6 +803,10 @@ pub enum LifecycleCode {
     Stopped = 2,
     Killed = 3,
     Failed = 4,
+    /// The PTY output stream reached its end (EOF, read error or writer
+    /// teardown). Process exit and PTY EOF are separate facts (PLAN.md
+    /// I10): completion is only journaled after this record.
+    OutputClosed = 5,
 }
 
 impl LifecycleCode {
@@ -812,6 +816,7 @@ impl LifecycleCode {
             2 => Some(Self::Stopped),
             3 => Some(Self::Killed),
             4 => Some(Self::Failed),
+            5 => Some(Self::OutputClosed),
             _ => None,
         }
     }

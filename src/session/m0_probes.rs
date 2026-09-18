@@ -248,9 +248,16 @@ fn probe_shadow_journal_records_output_in_order() {
     runtime.write().pty.kill().ok();
     runtime.write().mark_completed(SessionStatus::Killed, None);
 
-    // Wait for the appender to journal everything the core published.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
+    use super::journal::{
+        LifecycleCode, RecordKind, decode_lifecycle_payload, decode_resize_payload,
+    };
+
+    // I10: completion is only journaled after the output stream drains
+    // (EOF processing lags the kill), and then the appender must journal
+    // everything the core published. Poll until the segment ends with the
+    // Killed record and the appender has caught up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let outcome = loop {
         let caught_up = {
             let rt = runtime.read();
             let journal = rt.journal.as_ref().expect("shadow journal enabled");
@@ -259,20 +266,26 @@ fn probe_shadow_journal_records_output_in_order() {
             journal.core.journal_seq() >= journal.core.head_seq().unwrap_or(0)
         };
         if caught_up {
-            break;
+            let outcome = super::journal::scan_segment(
+                &dir.join(super::journal::JOURNAL_DIR_NAME)
+                    .join("seg-00000001.ojrn"),
+            )
+            .expect("journal segment scans");
+            let ends_killed = outcome.records.last().is_some_and(|r| {
+                r.kind == RecordKind::Lifecycle
+                    && decode_lifecycle_payload(&r.payload).map(|(code, ..)| code)
+                        == Some(LifecycleCode::Killed)
+            });
+            if ends_killed {
+                break outcome;
+            }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "journal drain timed out"
+            "journal drain timed out waiting for the ordered ending"
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-
-    let outcome = super::journal::scan_segment(
-        &dir.join(super::journal::JOURNAL_DIR_NAME)
-            .join("seg-00000001.ojrn"),
-    )
-    .expect("journal segment scans");
+    };
     assert!(outcome.is_clean(), "shadow journal segment must scan clean");
     let seqs: Vec<u64> = outcome.records.iter().map(|r| r.seq).collect();
     assert_eq!(
@@ -281,9 +294,6 @@ fn probe_shadow_journal_records_output_in_order() {
         "seqs contiguous from 1"
     );
 
-    use super::journal::{
-        LifecycleCode, RecordKind, decode_lifecycle_payload, decode_resize_payload,
-    };
     // The session opens with its initial geometry and the start fact.
     assert_eq!(outcome.records[0].kind, RecordKind::Resize);
     assert_eq!(
@@ -325,12 +335,31 @@ fn probe_shadow_journal_records_output_in_order() {
         cccc
     );
 
-    // The end fact is the final record.
+    // I10 ordered ending: every output record precedes OutputClosed,
+    // which immediately precedes the Killed completion record.
     let last = outcome.records.last().unwrap();
     assert_eq!(last.kind, RecordKind::Lifecycle);
     assert_eq!(
         decode_lifecycle_payload(&last.payload).map(|(code, ..)| code),
         Some(LifecycleCode::Killed)
+    );
+    let close = &outcome.records[outcome.records.len() - 2];
+    assert_eq!(close.kind, RecordKind::Lifecycle);
+    assert_eq!(
+        decode_lifecycle_payload(&close.payload).map(|(code, ..)| code),
+        Some(LifecycleCode::OutputClosed),
+        "completion must be immediately preceded by OutputClosed"
+    );
+    let last_output_seq = outcome
+        .records
+        .iter()
+        .filter(|r| r.kind == RecordKind::Output)
+        .map(|r| r.seq)
+        .max()
+        .expect("probe journaled output");
+    assert!(
+        last_output_seq < close.seq,
+        "all output must be sequenced before the stream close"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

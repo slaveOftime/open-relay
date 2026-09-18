@@ -91,8 +91,9 @@ pub(super) fn make_runtime(
         title_user_set: false,
         shared_modes: Default::default(),
         output_closed: false,
-        notifications_enabled: true,
+        pending_journal_completion: None,
         journal: None,
+        notifications_enabled: true,
     }))
 }
 
@@ -229,8 +230,9 @@ pub(super) fn make_runtime_writable_with_capacity(
         title_user_set: false,
         shared_modes: Default::default(),
         output_closed: false,
-        notifications_enabled: true,
+        pending_journal_completion: None,
         journal: None,
+        notifications_enabled: true,
     }));
     (rt, writer_rx)
 }
