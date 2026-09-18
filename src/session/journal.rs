@@ -267,33 +267,51 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
     let mut report = None;
     if let Some(previous) = latest {
         let path = segment_path(&journal_dir, previous);
-        let outcome = scan_segment(&path)?;
-        let rewound = outcome.stop.may_rewind();
+        // Recovery must not buffer the whole previous recording: the stats
+        // scan keeps memory O(1) while still validating every record.
+        let stats = scan_segment_stats(&path)?;
+        let rewound = stats.stop.may_rewind();
         if rewound {
             // A torn tail can only mean the previous incarnation died
             // mid-append; truncate so no reader ever sees it again.
             fs::OpenOptions::new()
                 .write(true)
                 .open(&path)?
-                .set_len(outcome.valid_len)?;
+                .set_len(stats.valid_len)?;
+            sync_dir(&journal_dir)?;
         }
         report = Some(RecoveryReport {
             incarnation: previous,
-            records: outcome.records.len() as u64,
-            last_seq: outcome.records.last().map(|record| record.seq),
-            stop: outcome.stop,
-            valid_len: outcome.valid_len,
+            records: stats.records,
+            last_seq: stats.last_seq,
+            stop: stats.stop,
+            valid_len: stats.valid_len,
             rewound,
         });
     }
 
     let incarnation = latest.unwrap_or(0) + 1;
     let writer = SegmentWriter::create(&segment_path(&journal_dir, incarnation))?;
+    // Make the new segment's directory entry durable alongside the file;
+    // record durability is meaningless if the name can vanish on crash.
+    sync_dir(&journal_dir)?;
     Ok(OpenedJournal {
         incarnation,
         report,
         writer,
     })
+}
+
+/// Best-effort directory sync so segment creation/truncation survives a
+/// crash. Unsupported on non-Unix targets, where this is a no-op.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +609,11 @@ pub enum JournalSubmitError {
     QueueBudgetExhausted,
     /// The appender thread is gone.
     AppenderDead,
+    /// Persistence already failed for this incarnation. New events are
+    /// refused (not cached) so a dead or stalled journal cannot grow
+    /// memory indefinitely; the incomplete-capture boundary is the
+    /// degrade point recorded in the core (PLAN.md §6.1 exit).
+    PersistenceDegraded,
 }
 
 impl std::fmt::Display for JournalSubmitError {
@@ -599,6 +622,7 @@ impl std::fmt::Display for JournalSubmitError {
             Self::QueueFull => write!(f, "journal queue is full"),
             Self::QueueBudgetExhausted => write!(f, "journal queue byte budget exhausted"),
             Self::AppenderDead => write!(f, "journal appender is dead"),
+            Self::PersistenceDegraded => write!(f, "journal persistence is degraded"),
         }
     }
 }
@@ -611,10 +635,15 @@ fn appender_loop(
     sync_interval: std::time::Duration,
 ) {
     use std::sync::atomic::Ordering;
+    use std::time::Instant;
     let mut expected_seq = 1u64;
     let mut last_written = 0u64;
     let mut last_durable = 0u64;
     let mut dead: Option<String> = None;
+    // Absolute deadline for the next group sync. Set when the first
+    // unsynced record lands; a `recv_timeout` that restarts on every
+    // message would let a continuous producer starve durability forever.
+    let mut sync_deadline: Option<Instant> = None;
 
     let fail = |ack_tx: &std::sync::mpsc::Sender<JournalAck>,
                 dead: &mut Option<String>,
@@ -623,33 +652,69 @@ fn appender_loop(
         let _ = ack_tx.send(JournalAck::Failed(reason));
     };
 
+    let do_sync = |writer: &mut SegmentWriter,
+                   ack_tx: &std::sync::mpsc::Sender<JournalAck>,
+                   dead: &mut Option<String>,
+                   last_written: u64,
+                   last_durable: &mut u64,
+                   sync_deadline: &mut Option<Instant>| {
+        match writer.sync() {
+            Ok(()) => {
+                *last_durable = last_written;
+                *sync_deadline = None;
+                let _ = ack_tx.send(JournalAck::Durable(last_written));
+            }
+            Err(err) => {
+                fail(ack_tx, dead, format!("journal sync failed: {err}"));
+            }
+        }
+    };
+
     loop {
-        match rx.recv_timeout(sync_interval) {
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Group-sync cadence: flush whatever accumulated since the
-                // last sync. Idle periods cost nothing.
-                if dead.is_none() && last_written > last_durable {
-                    match writer.sync() {
-                        Ok(()) => {
-                            last_durable = last_written;
-                            let _ = ack_tx.send(JournalAck::Durable(last_durable));
-                        }
-                        Err(err) => {
-                            fail(&ack_tx, &mut dead, format!("journal sync failed: {err}"));
-                        }
-                    }
+        let dirty = dead.is_none() && last_written > last_durable;
+        let msg = if dirty {
+            // Sync at the absolute deadline no matter how busy the queue
+            // stays; never wait longer than the cadence.
+            let wait = sync_deadline
+                .unwrap_or_else(|| Instant::now() + sync_interval)
+                .saturating_duration_since(Instant::now());
+            rx.recv_timeout(wait)
+        } else {
+            match rx.recv() {
+                Ok(msg) => Ok(msg),
+                Err(std::sync::mpsc::RecvError) => {
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
                 }
             }
-            Ok(AppenderMsg::Shutdown) => break,
+        };
+        match msg {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) | Ok(AppenderMsg::Shutdown) => {
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if dirty {
+                    do_sync(
+                        &mut writer,
+                        &ack_tx,
+                        &mut dead,
+                        last_written,
+                        &mut last_durable,
+                        &mut sync_deadline,
+                    );
+                }
+            }
             Ok(AppenderMsg::Sync) => {
                 if let Some(reason) = &dead {
                     let _ = ack_tx.send(JournalAck::Failed(reason.clone()));
-                } else if let Err(err) = writer.sync() {
-                    fail(&ack_tx, &mut dead, format!("journal sync failed: {err}"));
                 } else {
-                    last_durable = last_written;
-                    let _ = ack_tx.send(JournalAck::Durable(last_durable));
+                    do_sync(
+                        &mut writer,
+                        &ack_tx,
+                        &mut dead,
+                        last_written,
+                        &mut last_durable,
+                        &mut sync_deadline,
+                    );
                 }
             }
             Ok(AppenderMsg::Record(event)) => {
@@ -676,6 +741,9 @@ fn appender_loop(
                     &event.payload,
                 ) {
                     Ok(()) => {
+                        if last_written <= last_durable {
+                            sync_deadline = Some(Instant::now() + sync_interval);
+                        }
                         last_written = event.cursor.seq;
                         expected_seq += 1;
                         let _ = ack_tx.send(JournalAck::Journaled(event.cursor.seq));
@@ -686,6 +754,19 @@ fn appender_loop(
                 }
             }
         }
+    }
+
+    // Final barrier: a graceful shutdown (or the last sender going away)
+    // must not strand acknowledged-but-unsynced records (PLAN I8/I10).
+    if dead.is_none() && last_written > last_durable {
+        do_sync(
+            &mut writer,
+            &ack_tx,
+            &mut dead,
+            last_written,
+            &mut last_durable,
+            &mut sync_deadline,
+        );
     }
 }
 
@@ -801,6 +882,13 @@ impl ShadowJournal {
         payload: bytes::Bytes,
     ) -> Result<JournalCursor, JournalSubmitError> {
         self.poll_acks();
+        // Once persistence has failed, stop publishing: caching further
+        // events that can never be journaled would let a disk stall grow
+        // memory indefinitely. The degrade point is the explicit
+        // incomplete-capture boundary (I8/I10).
+        if self.core.is_degraded() {
+            return Err(JournalSubmitError::PersistenceDegraded);
+        }
         let event = self.core.publish(kind, payload);
         let cursor = event.cursor;
         if let Err(err) = self.appender.try_submit(event) {
@@ -935,7 +1023,43 @@ impl ScanOutcome {
 /// (`ScanStop::PartialTail`). Anything else is corruption, not a tear — the
 /// caller quarantines and reports it instead of silently continuing.
 pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
-    Ok(scan_impl(path, ScanMode::All)?.0)
+    // Lenient on the first sequence: this is the raw segment inspector
+    // (recovery tooling, probes, tests). Stream-level reads enforce the
+    // expected first sequence themselves via `scan_segment_stats*` and
+    // the read APIs below.
+    Ok(scan_impl(path, ScanMode::All, None)?.outcome)
+}
+
+/// Payload-free segment statistics: record count, last sequence, valid
+/// prefix length and stop reason. Recovery and cursor validation use this
+/// so their memory stays O(1) regardless of segment size.
+#[derive(Debug)]
+pub struct SegmentStats {
+    pub records: u64,
+    pub last_seq: Option<u64>,
+    pub valid_len: u64,
+    pub stop: ScanStop,
+}
+
+/// Stats scan requiring the segment to start at sequence 1 (a complete
+/// incarnation prefix).
+pub fn scan_segment_stats(path: &Path) -> io::Result<SegmentStats> {
+    scan_segment_stats_from(path, Some(1))
+}
+
+/// Stats scan with an explicit expected first sequence (`None` accepts any
+/// first record; used for continuation segments and partial inspection).
+pub fn scan_segment_stats_from(
+    path: &Path,
+    expected_first_seq: Option<u64>,
+) -> io::Result<SegmentStats> {
+    let result = scan_impl(path, ScanMode::Stats, expected_first_seq)?;
+    Ok(SegmentStats {
+        records: result.record_count,
+        last_seq: result.last_seq,
+        valid_len: result.outcome.valid_len,
+        stop: result.outcome.stop,
+    })
 }
 
 /// Result of a fixed-range read: the in-window records (contiguous, in
@@ -978,18 +1102,19 @@ pub fn read_range(
             format!("no journal segment for incarnation {incarnation}"),
         ));
     }
-    let (outcome, truncated, _) = scan_impl(
+    let result = scan_impl(
         &path,
         ScanMode::Window(CollectWindow {
             from_seq,
             to_seq,
             max_buffered_bytes: max_bytes,
         }),
+        Some(1),
     )?;
     Ok(RangeRead {
-        records: outcome.records,
-        stop: outcome.stop,
-        truncated,
+        records: result.outcome.records,
+        stop: result.outcome.stop,
+        truncated: result.truncated,
     })
 }
 
@@ -1022,11 +1147,11 @@ pub struct SegmentIndex {
 /// Scan a segment collecting only the record index (payloads are
 /// validated but not retained).
 pub fn scan_segment_index(path: &Path) -> io::Result<SegmentIndex> {
-    let (outcome, _, entries) = scan_impl(path, ScanMode::Index)?;
+    let result = scan_impl(path, ScanMode::Index, Some(1))?;
     Ok(SegmentIndex {
-        entries,
-        valid_len: outcome.valid_len,
-        stop: outcome.stop,
+        entries: result.index,
+        valid_len: result.outcome.valid_len,
+        stop: result.outcome.stop,
     })
 }
 
@@ -1236,30 +1361,53 @@ pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec
 /// What a scan collects. All modes validate the consumed prefix fully
 /// (headers, CRCs, continuity) — they differ only in what they retain.
 enum ScanMode {
-    /// Keep every record (recovery; bounded by the caller's context).
+    /// Keep every record (small segments and tests only — recovery uses
+    /// [`ScanMode::Stats`] so open-time memory does not scale with the
+    /// recording).
     All,
     /// Keep only records inside the seq window, under a byte budget.
     Window(CollectWindow),
     /// Keep only per-record index entries (bounded tail/seek support).
     Index,
+    /// Keep nothing but counters: O(1) memory regardless of segment size.
+    Stats,
+}
+
+/// Everything one pass over a segment learned. `outcome.records` is only
+/// populated in `All`/`Window` modes and `index` only in `Index` mode;
+/// `record_count`/`last_seq` are tracked in every mode.
+struct ScanResult {
+    outcome: ScanOutcome,
+    truncated: bool,
+    index: Vec<IndexEntry>,
+    record_count: u64,
+    last_seq: Option<u64>,
 }
 
 fn scan_impl(
     path: &Path,
     mode: ScanMode,
-) -> io::Result<(ScanOutcome, bool /* truncated */, Vec<IndexEntry>)> {
+    expected_first_seq: Option<u64>,
+) -> io::Result<ScanResult> {
     let mut file = fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
     let mut records = Vec::new();
     let mut index_entries = Vec::new();
     let mut buffered_bytes = 0usize;
     let mut truncated = false;
     let mut offset = 0u64;
-    let mut expected_seq: Option<u64> = None;
+    let mut expected_seq: Option<u64> = expected_first_seq;
+    let mut record_count = 0u64;
+    let mut last_seq: Option<u64> = None;
 
     macro_rules! stop {
         ($reason:expr) => {
-            return Ok((outcome(records, offset, $reason), truncated, index_entries))
+            return Ok(ScanResult {
+                outcome: outcome(records, offset, $reason),
+                truncated,
+                index: index_entries,
+                record_count,
+                last_seq,
+            })
         };
     }
 
@@ -1269,7 +1417,8 @@ fn scan_impl(
             ReadPiece::Complete => {}
             ReadPiece::Partial => stop!(ScanStop::PartialTail),
             ReadPiece::Empty => {
-                debug_assert_eq!(offset, file_len, "EOF only at the real end");
+                // On a live segment the file may have grown since the scan
+                // started; `offset` remains the end of what was validated.
                 stop!(ScanStop::CleanEof);
             }
         }
@@ -1313,11 +1462,15 @@ fn scan_impl(
         if let Some(expected) = expected_seq
             && seq != expected
         {
-            // A sequence gap means an earlier record was lost or the tail was
-            // aliased: stop here so recovery never presents a silent hole.
+            // A sequence gap (or a first record that is not the expected
+            // first sequence of this stream) means an earlier record was
+            // lost or the tail was aliased: stop here so recovery never
+            // presents a silent hole.
             stop!(ScanStop::SequenceDiscontinuity);
         }
         expected_seq = Some(seq + 1);
+        record_count += 1;
+        last_seq = Some(seq);
 
         match &mode {
             ScanMode::All => {
@@ -1352,6 +1505,7 @@ fn scan_impl(
                     record_len: HEADER_LEN as u64 + payload_len as u64,
                 });
             }
+            ScanMode::Stats => {}
         }
         offset += (HEADER_LEN + payload_len as usize) as u64;
         file.seek(SeekFrom::Start(offset))?;
@@ -2328,6 +2482,132 @@ mod tests {
         assert!(matches!(recv_ack(&acks), JournalAck::Failed(_)));
         tx.send(AppenderMsg::Shutdown).unwrap();
         worker.join().unwrap();
+    }
+
+    /// Regression for the `recv_timeout` starvation bug: with an absolute
+    /// sync deadline, a producer that never lets the queue go idle must
+    /// still see `durable_seq` advance within roughly one cadence.
+    #[test]
+    fn sync_deadline_fires_under_a_continuous_producer() {
+        let dir = test_session_dir("sync_deadline");
+        let (mut shadow, _, _) =
+            ShadowJournal::open_with_sync_interval(&dir, std::time::Duration::from_millis(50))
+                .unwrap();
+        let start = std::time::Instant::now();
+        while shadow.core.durable_seq() < 1 {
+            // Gaps between records stay far below the cadence, so a
+            // per-message timeout would keep resetting forever.
+            shadow
+                .record_output(bytes::Bytes::from_static(b"x"))
+                .unwrap();
+            shadow.poll_acks();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "durable_seq never advanced under a continuous producer"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A graceful shutdown must sync whatever it already acknowledged as
+    /// journaled — otherwise "written" records can be lost without any
+    /// failed ack (I8).
+    #[test]
+    fn shutdown_syncs_unsynced_records() {
+        let dir = test_session_dir("shutdown_sync");
+        let opened = open(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let (ack_tx, acks) = std::sync::mpsc::channel();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = std::thread::spawn(move || {
+            appender_loop(
+                opened.writer,
+                rx,
+                ack_tx,
+                queued,
+                // Long cadence: only the shutdown barrier may sync.
+                std::time::Duration::from_secs(3600),
+            )
+        });
+        tx.send(AppenderMsg::Record(Box::new(event(1, b"x"))))
+            .unwrap();
+        assert_eq!(recv_ack(&acks), JournalAck::Journaled(1));
+        tx.send(AppenderMsg::Shutdown).unwrap();
+        let ack = acks
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("shutdown must produce a final durability ack");
+        assert_eq!(ack, JournalAck::Durable(1));
+        worker.join().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stats_scan_counts_records_without_buffering() {
+        let dir = test_session_dir("stats_scan");
+        write_ten_record_segment(&dir);
+        let path = segment_path(&dir.join(JOURNAL_DIR_NAME), 1);
+        let stats = scan_segment_stats(&path).unwrap();
+        assert_eq!(stats.records, 10);
+        assert_eq!(stats.last_seq, Some(10));
+        assert_eq!(stats.valid_len, fs::metadata(&path).unwrap().len());
+        assert_eq!(stats.stop, ScanStop::CleanEof);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_rejects_a_first_sequence_other_than_one() {
+        let dir = test_session_dir("first_seq");
+        let journal_dir = dir.join(JOURNAL_DIR_NAME);
+        fs::create_dir_all(&journal_dir).unwrap();
+        let path = segment_path(&journal_dir, 1);
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer
+            .append_record(RecordKind::Output, 5, 0, b"orphan")
+            .unwrap();
+        drop(writer);
+        let stats = scan_segment_stats(&path).unwrap();
+        assert_eq!(stats.stop, ScanStop::SequenceDiscontinuity);
+        assert_eq!(stats.records, 0);
+        // ...but a continuation scan with the right expectation accepts it.
+        let stats = scan_segment_stats_from(&path, Some(5)).unwrap();
+        assert_eq!(stats.stop, ScanStop::CleanEof);
+        assert_eq!(stats.records, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The M1 exit requirement "disk stall cannot grow memory
+    /// indefinitely": once persistence degrades, further records are
+    /// refused before they are cached, and the cache size freezes.
+    #[test]
+    fn degraded_journal_stops_growing() {
+        let (_ack_tx, acks) = std::sync::mpsc::channel();
+        let mut shadow = ShadowJournal {
+            core: SequencerCore::new(1),
+            appender: undrained_appender(64, 8),
+            acks,
+        };
+        let payload = || bytes::Bytes::from_static(b"1234");
+        shadow.record_output(payload()).unwrap();
+        shadow.record_output(payload()).unwrap();
+        // Budget exhausted: this event is published, then the submit
+        // failure degrades the core.
+        assert_eq!(
+            shadow.record_output(payload()),
+            Err(JournalSubmitError::QueueBudgetExhausted)
+        );
+        assert!(shadow.core.is_degraded());
+        let cache_at_degrade = shadow.core.cache_bytes();
+        let head_at_degrade = shadow.core.head_seq();
+
+        for _ in 0..1000 {
+            assert_eq!(
+                shadow.record_output(payload()),
+                Err(JournalSubmitError::PersistenceDegraded)
+            );
+        }
+        assert_eq!(shadow.core.cache_bytes(), cache_at_degrade);
+        assert_eq!(shadow.core.head_seq(), head_at_degrade);
     }
 
     #[test]
