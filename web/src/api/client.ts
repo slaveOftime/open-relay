@@ -433,6 +433,12 @@ export function subscribeEvents(
 // ---------------------------------------------------------------------------
 
 const textDecoder = new TextDecoder()
+// Binary attach frames (M3-3): every data-carrying frame names its stream
+// cursor so the client can verify the C/C+1 boundary — contiguous,
+// gap-free application of the canonical stream (PLAN §7.2, invariant I2).
+//   INIT:   [tag=1][flags:1][endOffset:u64be][incarnation:u64be][running:u8][data]
+//   DATA:   [tag=2][offset:u64be][data]
+//   ENDED:  [tag=5][hasExitCode:u8][exitCode:i32be][finalOffset:u64be]
 const WS_FRAME_INIT = 1
 const WS_FRAME_DATA = 2
 const WS_FRAME_MODE_CHANGED = 3
@@ -442,6 +448,9 @@ const WS_FRAME_ERROR = 6
 const WS_FRAME_PONG = 7
 const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
 const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
+const WS_INIT_HEADER_LEN = 19
+const WS_DATA_HEADER_LEN = 9
+const WS_ENDED_LEN = 14
 
 export interface AttachOptions {
   /** Called with decoded terminal bytes that recreate the current visible session state. */
@@ -462,6 +471,8 @@ export interface AttachOptions {
 export class AttachSocket {
   private ws: WebSocket
   private closed = false
+  /** Next expected stream offset (from the init frame's snapshot boundary). */
+  private expectedOffset: number | null = null
 
   constructor(
     sessionId: string,
@@ -501,17 +512,33 @@ export class AttachSocket {
 
         switch (tag) {
           case WS_FRAME_INIT: {
-            const flags = bytes[1] ?? 0
+            if (bytes.length < WS_INIT_HEADER_LEN) return
+            const flags = bytes[1]
+            const endOffset = Number(view.getBigUint64(2, false))
+            this.expectedOffset = endOffset
             opts.onInit(
-              bytes.subarray(2),
+              bytes.subarray(WS_INIT_HEADER_LEN),
               (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
               (flags & WS_FLAG_BRACKETED_PASTE_MODE) !== 0
             )
             return
           }
-          case WS_FRAME_DATA:
-            opts.onData(bytes.subarray(1))
+          case WS_FRAME_DATA: {
+            if (bytes.length < WS_DATA_HEADER_LEN) return
+            const offset = Number(view.getBigUint64(1, false))
+            if (this.expectedOffset !== null && offset !== this.expectedOffset) {
+              // A gap or overlap means the rendered screen would be corrupt;
+              // abort loudly instead of applying out-of-order bytes (I2).
+              opts.onError(
+                `attach stream cursor mismatch: expected offset ${this.expectedOffset}, chunk starts at ${offset}`
+              )
+              this.ws.close()
+              return
+            }
+            this.expectedOffset = offset + (bytes.length - WS_DATA_HEADER_LEN)
+            opts.onData(bytes.subarray(WS_DATA_HEADER_LEN))
             return
+          }
           case WS_FRAME_MODE_CHANGED: {
             const flags = bytes[1] ?? 0
             opts.onModeChanged(
@@ -528,6 +555,17 @@ export class AttachSocket {
           case WS_FRAME_SESSION_ENDED: {
             const hasExitCode = bytes[1] === 1
             const exitCode = hasExitCode && bytes.length >= 6 ? view.getInt32(2, false) : null
+            const finalOffset =
+              bytes.length >= WS_ENDED_LEN ? Number(view.getBigUint64(6, false)) : 0
+            if (
+              finalOffset !== 0 &&
+              this.expectedOffset !== null &&
+              finalOffset !== this.expectedOffset
+            ) {
+              opts.onError(
+                `attach stream ended at offset ${finalOffset} but the client applied up to ${this.expectedOffset}`
+              )
+            }
             opts.onSessionEnded(exitCode)
             return
           }

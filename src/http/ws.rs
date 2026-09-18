@@ -30,16 +30,25 @@ pub struct AttachParams {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage {
-    /// Initial terminal snapshot. `data` contains filtered stream bytes.
+    /// Initial terminal snapshot. `data` contains filtered stream bytes
+    /// covering the stream up to `end_offset` in journal `incarnation`.
     Init {
         data: Vec<u8>,
+        /// Stream offset immediately after the snapshot (C in ADR-0004).
+        end_offset: u64,
+        /// Journal incarnation the snapshot/cursor belongs to (0 = legacy).
+        incarnation: u64,
+        /// Whether the session was still running at attach time.
+        running: bool,
         #[serde(rename = "appCursorKeys")]
         app_cursor_keys: bool,
         #[serde(rename = "bracketedPasteMode")]
         bracketed_paste_mode: bool,
     },
-    /// Incremental PTY output chunk.
+    /// Incremental PTY output chunk; `offset` is the stream offset of the
+    /// first byte so clients can verify contiguity (I2).
     Data {
+        offset: u64,
         data: Vec<u8>,
     },
     /// Terminal mode changed mid-stream.
@@ -54,9 +63,11 @@ enum ServerMessage {
         rows: u16,
         cols: u16,
     },
-    /// Session ended.
+    /// Session ended. `final_offset` is the end-of-stream cursor (I2
+    /// completion check); 0 when unknown (proxy errors).
     SessionEnded {
         exit_code: Option<i32>,
+        final_offset: u64,
     },
     Error {
         message: String,
@@ -150,22 +161,31 @@ fn mode_flags(app_cursor_keys: bool, bracketed_paste_mode: bool) -> u8 {
     flags
 }
 
-async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
-    let payload = match msg {
+/// Encode a server message into its binary wire frame. Pure so the layout
+/// is unit-testable against the TypeScript decoder (web/src/api/client.ts).
+fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
+    match msg {
         ServerMessage::Init {
             data,
+            end_offset,
+            incarnation,
+            running,
             app_cursor_keys,
             bracketed_paste_mode,
         } => {
-            let mut payload = Vec::with_capacity(2 + data.len());
+            let mut payload = Vec::with_capacity(19 + data.len());
             payload.push(WS_FRAME_INIT);
             payload.push(mode_flags(*app_cursor_keys, *bracketed_paste_mode));
+            payload.extend_from_slice(&end_offset.to_be_bytes());
+            payload.extend_from_slice(&incarnation.to_be_bytes());
+            payload.push(u8::from(*running));
             payload.extend_from_slice(data);
             payload
         }
-        ServerMessage::Data { data } => {
-            let mut payload = Vec::with_capacity(1 + data.len());
+        ServerMessage::Data { offset, data } => {
+            let mut payload = Vec::with_capacity(9 + data.len());
             payload.push(WS_FRAME_DATA);
+            payload.extend_from_slice(&offset.to_be_bytes());
             payload.extend_from_slice(data);
             payload
         }
@@ -183,8 +203,11 @@ async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> boo
             payload.extend_from_slice(&cols.to_be_bytes());
             payload
         }
-        ServerMessage::SessionEnded { exit_code } => {
-            let mut payload = Vec::with_capacity(6);
+        ServerMessage::SessionEnded {
+            exit_code,
+            final_offset,
+        } => {
+            let mut payload = Vec::with_capacity(14);
             payload.push(WS_FRAME_SESSION_ENDED);
             match exit_code {
                 Some(code) => {
@@ -193,6 +216,7 @@ async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> boo
                 }
                 None => payload.push(0),
             }
+            payload.extend_from_slice(&final_offset.to_be_bytes());
             payload
         }
         ServerMessage::Error { message } => {
@@ -202,8 +226,14 @@ async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> boo
             payload
         }
         ServerMessage::Pong => vec![WS_FRAME_PONG],
-    };
-    socket.send(Message::Binary(payload.into())).await.is_ok()
+    }
+}
+
+async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> bool {
+    socket
+        .send(Message::Binary(encode_server_message(msg).into()))
+        .await
+        .is_ok()
 }
 
 async fn handle_ws(
@@ -247,7 +277,7 @@ async fn handle_ws_streaming(
         }
     }
 
-    let (mut pump, init) = match AttachPump::subscribe(&state.store, &id, None).await {
+    let (mut pump, init) = match AttachPump::subscribe(&state.store, &id, None, None).await {
         Ok(pair) => pair,
         Err(err) => {
             warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
@@ -264,6 +294,9 @@ async fn handle_ws_streaming(
 
     let init_msg = ServerMessage::Init {
         data: init.data,
+        end_offset: init.end_offset,
+        incarnation: init.incarnation,
+        running: init.running,
         app_cursor_keys: init.modes.app_cursor_keys,
         bracketed_paste_mode: init.modes.bracketed_paste_mode,
     };
@@ -295,8 +328,8 @@ async fn handle_ws_streaming(
             // coalesce / lag resync / completion flush / mode tracking.
             event = pump.next() => {
                 match event {
-                    AttachEvent::Chunk { data, .. } => {
-                        if !send_server_message(&mut socket, &ServerMessage::Data { data }).await {
+                    AttachEvent::Chunk { offset, data } => {
+                        if !send_server_message(&mut socket, &ServerMessage::Data { offset, data }).await {
                             let _ = state.store.attach_detach(&id).await;
                             return;
                         }
@@ -310,14 +343,20 @@ async fn handle_ws_streaming(
                             return;
                         }
                     }
-                    AttachEvent::Done { exit_code } => {
-                        info!(session_id = %id, ?exit_code, "WS session ended");
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+                    AttachEvent::Done {
+                        exit_code,
+                        final_offset,
+                    } => {
+                        info!(session_id = %id, ?exit_code, final_offset, "WS session ended");
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code, final_offset }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
                     }
                     AttachEvent::Closed => {
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
+                            exit_code: None,
+                            final_offset: pump.current_offset(),
+                        }).await;
                         let _ = state.store.attach_detach(&id).await;
                         return;
                     }
@@ -417,6 +456,7 @@ async fn handle_ws_proxied_streaming(
     let rpc = RpcRequest::AttachSubscribe {
         id: id.to_string(),
         from_byte_offset: None,
+        incarnation: None,
         rows: initial_rows.filter(|rows| *rows > 0),
         cols: initial_cols.filter(|cols| *cols > 0),
     };
@@ -452,13 +492,19 @@ async fn handle_ws_proxied_streaming(
                         match resp {
                             RpcResponse::AttachStreamInit {
                                 data,
+                                end_offset,
+                                running,
                                 app_cursor_keys,
                                 bracketed_paste_mode,
+                                incarnation,
                                 ..
                             } => {
                                 let replay_bytes = data.len();
                                 let msg = ServerMessage::Init {
                                     data,
+                                    end_offset,
+                                    incarnation,
+                                    running,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
                                 };
@@ -475,10 +521,11 @@ async fn handle_ws_proxied_streaming(
                                 );
                                 init_sent = true;
                             }
-                            RpcResponse::AttachStreamChunk { data, .. } => {
+                            RpcResponse::AttachStreamChunk { offset, data } => {
                                 if !data.is_empty() {
                                     trace!(session_id = %id, node = %node, bytes = data.len(), "forwarding proxied PTY output");
                                     let msg = ServerMessage::Data {
+                                        offset,
                                         data,
                                     };
                                     if !send_server_message(&mut socket, &msg).await {
@@ -514,9 +561,12 @@ async fn handle_ws_proxied_streaming(
                                     cols,
                                 }).await;
                             }
-                            RpcResponse::AttachStreamDone { exit_code } => {
+                            RpcResponse::AttachStreamDone {
+                                exit_code,
+                                final_offset,
+                            } => {
                                 info!(session_id = %id, node = %node, ?exit_code, "proxied WebSocket stream ended");
-                                let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code }).await;
+                                let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code, final_offset }).await;
                                 break;
                             }
                             RpcResponse::Error { message } => {
@@ -529,12 +579,20 @@ async fn handle_ws_proxied_streaming(
                     }
                     Some(Err(err)) => {
                         warn!(session_id = %id, %err, "proxy stream error");
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
+                                    exit_code: None,
+                                    final_offset: 0,
+                                })
+                                .await;
                         break;
                     }
                     None => {
                         // Stream channel closed.
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code: None }).await;
+                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
+                                    exit_code: None,
+                                    final_offset: 0,
+                                })
+                                .await;
                         break;
                     }
                 }
@@ -623,7 +681,10 @@ fn init_msg_data_len(msg: &ServerMessage) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::panic_payload_message;
+    use super::{
+        ServerMessage, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED, encode_server_message,
+        panic_payload_message,
+    };
 
     #[test]
     fn panic_payload_message_formats_static_str_payload() {
@@ -635,6 +696,49 @@ mod tests {
     fn panic_payload_message_formats_string_payload() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("attach panic"));
         assert_eq!(panic_payload_message(payload.as_ref()), "attach panic");
+    }
+
+    /// Frame-layout golden checks: the TypeScript decoder
+    /// (web/src/api/client.ts) must read exactly these bytes.
+    #[test]
+    fn encode_init_frame_carries_cursor_and_incarnation() {
+        let payload = encode_server_message(&ServerMessage::Init {
+            data: b"hi".to_vec(),
+            end_offset: 0x0102_0304_0506_0708,
+            incarnation: 9,
+            running: true,
+            app_cursor_keys: true,
+            bracketed_paste_mode: false,
+        });
+        assert_eq!(payload[0], WS_FRAME_INIT);
+        assert_eq!(payload[1], 1); // app-cursor-keys flag only
+        assert_eq!(payload[2..10], 0x0102_0304_0506_0708_u64.to_be_bytes());
+        assert_eq!(payload[10..18], 9_u64.to_be_bytes());
+        assert_eq!(payload[18], 1); // running
+        assert_eq!(&payload[19..], b"hi");
+    }
+
+    #[test]
+    fn encode_data_frame_carries_chunk_offset() {
+        let payload = encode_server_message(&ServerMessage::Data {
+            offset: 42,
+            data: b"xy".to_vec(),
+        });
+        assert_eq!(payload[0], WS_FRAME_DATA);
+        assert_eq!(payload[1..9], 42_u64.to_be_bytes());
+        assert_eq!(&payload[9..], b"xy");
+    }
+
+    #[test]
+    fn encode_session_ended_frame_carries_final_offset() {
+        let payload = encode_server_message(&ServerMessage::SessionEnded {
+            exit_code: Some(3),
+            final_offset: 99,
+        });
+        assert_eq!(payload[0], WS_FRAME_SESSION_ENDED);
+        assert_eq!(payload[1], 1);
+        assert_eq!(payload[2..6], 3_i32.to_be_bytes());
+        assert_eq!(payload[6..14], 99_u64.to_be_bytes());
     }
 
     #[test]

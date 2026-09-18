@@ -165,6 +165,13 @@ impl SessionStore {
             .get(id)
             .map(|handle| Arc::clone(&handle.read().shared_modes))
     }
+    /// Current journal incarnation of a live session, if journaled.
+    pub fn journal_incarnation(&self, id: &str) -> Option<u64> {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .and_then(|handle| handle.read().journal_incarnation())
+    }
 
     pub async fn render_live_logs(
         &self,

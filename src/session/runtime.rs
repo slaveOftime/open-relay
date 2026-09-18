@@ -726,6 +726,13 @@ impl SessionRuntime {
         self.journal_failed
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+    /// Current journal incarnation, when the session has a live journal.
+    /// Resume cursors from any other incarnation are stale (ADR-0004).
+    pub fn journal_incarnation(&self) -> Option<u64> {
+        self.journal
+            .as_ref()
+            .map(|journal| journal.lock().core.incarnation())
+    }
 
     /// Journal one raw PTY chunk; returns its cursor when recorded.
     fn journal_output(&self, payload: Bytes) -> Option<journal::JournalCursor> {

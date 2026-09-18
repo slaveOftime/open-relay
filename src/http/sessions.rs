@@ -748,6 +748,14 @@ pub async fn set_session_notifications(
             )
                 .into_response()
         }
+        Err(err @ SessionError::StaleCursor { .. }) => {
+            warn!(session_id = %id, error = err.message(&id), "notification toggle rejected");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": err.message(&id) })),
+            )
+                .into_response()
+        }
     }
 }
 

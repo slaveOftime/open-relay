@@ -332,7 +332,10 @@ async fn relay_streaming_rpc(
                 let _ = frame_tx
                     .send((
                         rpc_id.to_string(),
-                        RpcResponse::AttachStreamDone { exit_code: None },
+                        RpcResponse::AttachStreamDone {
+                            exit_code: None,
+                            final_offset: 0,
+                        },
                         true,
                     ))
                     .await;
@@ -485,7 +488,10 @@ pub(super) async fn handle_node_proxy_streaming(
                     None => {
                         let _ = ipc::write_response_to_writer(
                             &mut writer,
-                            RpcResponse::AttachStreamDone { exit_code: None },
+                            RpcResponse::AttachStreamDone {
+                            exit_code: None,
+                            final_offset: 0,
+                        },
                         )
                         .await;
                         break;

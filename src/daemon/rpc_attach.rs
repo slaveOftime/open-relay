@@ -20,6 +20,7 @@ use super::SessionStoreHandle;
 pub(super) async fn handle_attach_subscribe(
     id: String,
     from_byte_offset: Option<u64>,
+    incarnation: Option<u64>,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
     mut reader: BufReader<tokio::io::ReadHalf<Stream>>,
@@ -49,16 +50,17 @@ pub(super) async fn handle_attach_subscribe(
         );
     }
 
-    let (mut pump, init) = match AttachPump::subscribe(session_store, &id, from_byte_offset).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            debug!(session_id = %id, error = err.message(&id), "IPC attach init failed");
-            let resp = RpcResponse::Error {
-                message: err.message(&id),
-            };
-            return ipc::write_response_to_writer(&mut writer, resp).await;
-        }
-    };
+    let (mut pump, init) =
+        match AttachPump::subscribe(session_store, &id, from_byte_offset, incarnation).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                debug!(session_id = %id, error = err.message(&id), "IPC attach init failed");
+                let resp = RpcResponse::Error {
+                    message: err.message(&id),
+                };
+                return ipc::write_response_to_writer(&mut writer, resp).await;
+            }
+        };
 
     // Seed scrollback only for fresh interactive attaches: offset-based
     // resumes already have their terminal history, and piped attaches have no
@@ -92,6 +94,7 @@ pub(super) async fn handle_attach_subscribe(
             bracketed_paste_mode: init.modes.bracketed_paste_mode,
             app_cursor_keys: init.modes.app_cursor_keys,
             scrollback,
+            incarnation: init.incarnation,
         },
     )
     .await?;
@@ -176,10 +179,16 @@ pub(super) async fn handle_attach_subscribe(
                             )
                             .await?;
                         }
-                        AttachEvent::Done { exit_code } => {
+                        AttachEvent::Done {
+                            exit_code,
+                            final_offset,
+                        } => {
                             let _ = ipc::write_response_to_writer(
                                 &mut writer,
-                                RpcResponse::AttachStreamDone { exit_code },
+                                RpcResponse::AttachStreamDone {
+                                    exit_code,
+                                    final_offset,
+                                },
                             )
                             .await;
                             break;

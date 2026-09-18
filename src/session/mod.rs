@@ -99,6 +99,12 @@ pub enum SessionError {
     NotRunning,
     Busy,
     Persistence(String),
+    /// A resume cursor named a different journal incarnation than the
+    /// session's current one; the client must resnapshot (ADR-0004).
+    StaleCursor {
+        requested: Option<u64>,
+        current: Option<u64>,
+    },
 }
 
 impl SessionError {
@@ -108,6 +114,9 @@ impl SessionError {
             Self::NotRunning => format!("session not running: {id}"),
             Self::Busy => format!("session input queue is full: {id}"),
             Self::Persistence(message) => message.clone(),
+            Self::StaleCursor { requested, current } => format!(
+                "stale resume cursor for {id}: cursor names incarnation {requested:?},                  session incarnation is {current:?}; resnapshot instead of resuming"
+            ),
         }
     }
 }

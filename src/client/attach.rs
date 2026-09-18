@@ -17,6 +17,8 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
 };
 
+use super::cursor::StreamCursor;
+
 /// Upper bound on how many bytes of already-queued server output are written
 /// to the terminal in one go. Batching turns a burst of frames into a single
 /// blocking write plus flush; the cap keeps the terminal painting
@@ -129,6 +131,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             RpcRequest::AttachSubscribe {
                 id: id_owned.clone(),
                 from_byte_offset: None,
+                incarnation: None,
                 rows: initial_size.map(|(_, rows)| rows),
                 cols: initial_size.map(|(cols, _)| cols),
             },
@@ -144,6 +147,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         mut running,
         mut child_bracketed_paste_mode,
         mut child_app_cursor_keys,
+        stream_end_offset,
     ) = match init {
         RpcResponse::AttachStreamInit {
             data,
@@ -151,6 +155,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            end_offset,
             ..
         } => (
             data,
@@ -158,9 +163,14 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            end_offset,
         ),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
+
+    // Every chunk must continue exactly at the cursor the init frame left
+    // us at; gaps/duplicates abort the attach loudly (I2, M3-3).
+    let mut stream_cursor = StreamCursor::new(stream_end_offset);
 
     // When stdio is piped, interactive terminal control fails across platforms,
     // so fall back to a plain stream replay instead of raw-mode attach.
@@ -170,9 +180,13 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
         while running {
             match ipc::read_checked_response_from_reader(&mut reader).await? {
-                RpcResponse::AttachStreamChunk { data, .. } => write_bytes_to_stdout(&data)?,
+                RpcResponse::AttachStreamChunk { offset, data } => {
+                    stream_cursor.accept(offset, data.len())?;
+                    write_bytes_to_stdout(&data)?;
+                }
                 RpcResponse::AttachModeChanged { .. } => {}
-                RpcResponse::AttachStreamDone { .. } => {
+                RpcResponse::AttachStreamDone { final_offset, .. } => {
+                    stream_cursor.finish(final_offset)?;
                     running = false;
                 }
                 _ => {}
@@ -395,7 +409,14 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                             let mut response = Some(response);
                             while let Some(current) = response.take() {
                                 match current {
-                                    RpcResponse::AttachStreamChunk { data, .. } => {
+                                    RpcResponse::AttachStreamChunk { offset, data } => {
+                                        if let Err(err) =
+                                            stream_cursor.accept(offset, data.len())
+                                        {
+                                            stream_error = Some(err);
+                                            running = false;
+                                            break;
+                                        }
                                         if batch.is_empty() {
                                             batch = data;
                                         } else {
@@ -420,7 +441,10 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                             terminal::size().unwrap_or((80, 24));
                                         last_sent_size = (actual_cols, actual_rows);
                                     }
-                                    RpcResponse::AttachStreamDone { .. } => {
+                                    RpcResponse::AttachStreamDone { final_offset, .. } => {
+                                        if let Err(err) = stream_cursor.finish(final_offset) {
+                                            stream_error = Some(err);
+                                        }
                                         running = false;
                                     }
                                     _ => {}

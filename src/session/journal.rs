@@ -564,6 +564,11 @@ impl SequencerCore {
     pub fn durable_seq(&self) -> u64 {
         self.durable_seq
     }
+    /// The incarnation this sequencer writes under. Journal cursors from
+    /// other incarnations must be rejected on resume (ADR-0004).
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
 
     /// Number of events currently retained in the recent cache.
     pub fn cached_events(&self) -> usize {

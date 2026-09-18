@@ -187,6 +187,12 @@ pub enum RpcRequest {
     AttachSubscribe {
         id: String,
         from_byte_offset: Option<u64>,
+        /// Incarnation the `from_byte_offset` cursor was issued by. Resume is
+        /// only valid within the same incarnation; a mismatch is rejected with
+        /// a precise stale-cursor error (PLAN §7.3). Required when
+        /// `from_byte_offset` is set.
+        #[serde(default)]
+        incarnation: Option<u64>,
         #[serde(default)]
         rows: Option<u16>,
         #[serde(default)]
@@ -366,6 +372,11 @@ pub enum RpcResponse {
         /// piped attaches, and older daemons.
         #[serde(default, with = "base64_bytes")]
         scrollback: Vec<u8>,
+        /// Journal incarnation the snapshot and `end_offset` cursor belong
+        /// to; 0 when the session predates journaling. A later resume must
+        /// present the same incarnation (ADR-0004).
+        #[serde(default)]
+        incarnation: u64,
     },
     /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
     AttachStreamChunk {
@@ -388,6 +399,10 @@ pub enum RpcResponse {
     /// Session ended; attach stream is done.
     AttachStreamDone {
         exit_code: Option<i32>,
+        /// Canonical filtered-stream offset of the end of the stream; the
+        /// client must have applied exactly up to here (I2 completion).
+        #[serde(default)]
+        final_offset: u64,
     },
     Stop {
         stopped: bool,

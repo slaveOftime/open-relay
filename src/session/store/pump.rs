@@ -38,8 +38,13 @@ pub enum AttachEvent {
     /// A terminal mode changed after the preceding chunk.
     Modes(ModeSnapshot),
     /// The session ended. `exit_code` is `Some` when the child exited on its
-    /// own, `None` when it was killed/stopped externally.
-    Done { exit_code: Option<i32> },
+    /// own, `None` when it was killed/stopped externally. `final_offset` is
+    /// the exact end-of-stream cursor so clients can verify they applied
+    /// every byte (I2 at the completion boundary).
+    Done {
+        exit_code: Option<i32>,
+        final_offset: u64,
+    },
     /// The pump can no longer trust its state (store status lookup failed or
     /// the broadcast channel closed without a completion record). The
     /// transport should end the stream in whatever way its protocol allows.
@@ -58,6 +63,10 @@ pub struct AttachInit {
     pub running: bool,
     /// Terminal modes at attach time.
     pub modes: ModeSnapshot,
+    /// Journal incarnation the snapshot/cursor belongs to; 0 when the
+    /// session predates journaling. A later resume must present the same
+    /// incarnation (ADR-0004).
+    pub incarnation: u64,
 }
 
 /// A live output stream for one attached client.
@@ -80,7 +89,22 @@ impl AttachPump {
         store: &Arc<SessionStore>,
         id: &str,
         from_offset: Option<u64>,
+        incarnation: Option<u64>,
     ) -> Result<(Self, AttachInit), SessionError> {
+        // Incarnation fencing (PLAN §7.3): a resume cursor is only valid for
+        // the incarnation that issued it. Anything else is rejected up front
+        // with a precise error instead of streaming from an inferred offset.
+        if from_offset.is_some() {
+            let current = store.journal_incarnation(id);
+            let matches = matches!((incarnation, current), (Some(req), Some(cur)) if req == cur);
+            if !matches {
+                return Err(SessionError::StaleCursor {
+                    requested: incarnation,
+                    current,
+                });
+            }
+        }
+        let init_incarnation = store.journal_incarnation(id).unwrap_or(0);
         let (init, broadcast_rx) = match from_offset {
             None => {
                 let (snapshot, end_offset, rx, bracketed_paste_mode, app_cursor_keys) =
@@ -94,6 +118,7 @@ impl AttachPump {
                             app_cursor_keys,
                             bracketed_paste_mode,
                         },
+                        incarnation: init_incarnation,
                     },
                     rx,
                 )
@@ -110,6 +135,7 @@ impl AttachPump {
                             app_cursor_keys,
                             bracketed_paste_mode,
                         },
+                        incarnation: init_incarnation,
                     },
                     rx,
                 )
@@ -166,17 +192,36 @@ impl AttachPump {
                             .await
                         {
                             Ok((chunks, new_end, _rx, _bpm, _ack)) => {
-                                self.current_offset = new_end;
-                                collect_chunk_bytes(&chunks)
+                                // The persisted view may lag the live
+                                // broadcast (async journal appender); the
+                                // pump cursor must never move backwards.
+                                if new_end < self.current_offset {
+                                    warn!(
+                                        session_id = %self.id,
+                                        persisted_end = new_end,
+                                        cursor = self.current_offset,
+                                        "attach pump completion flush: persisted end behind cursor"
+                                    );
+                                    Vec::new()
+                                } else {
+                                    self.current_offset = new_end;
+                                    collect_chunk_bytes(&chunks)
+                                }
                             }
                             Err(_) => Vec::new(),
                         };
                         info!(session_id = %self.id, ?exit_code,
                             final_offset = self.current_offset, "attach pump completed");
                         if data.is_empty() {
-                            return AttachEvent::Done { exit_code };
+                            return AttachEvent::Done {
+                                exit_code,
+                                final_offset: self.current_offset,
+                            };
                         }
-                        self.pending.push_back(AttachEvent::Done { exit_code });
+                        self.pending.push_back(AttachEvent::Done {
+                            exit_code,
+                            final_offset: self.current_offset,
+                        });
                         return AttachEvent::Chunk {
                             offset: self.current_offset - data.len() as u64,
                             data,
@@ -219,6 +264,18 @@ impl AttachPump {
                             {
                                 Ok((chunks, new_end, rx, _bpm, _ack)) => {
                                     self.broadcast_rx = rx;
+                                    // Never move the cursor backwards: the
+                                    // persisted view can lag the live
+                                    // broadcast we already forwarded.
+                                    if new_end < self.current_offset {
+                                        warn!(
+                                            session_id = %self.id,
+                                            persisted_end = new_end,
+                                            cursor = self.current_offset,
+                                            "attach pump resync: persisted end behind cursor"
+                                        );
+                                        continue;
+                                    }
                                     let data = collect_chunk_bytes(&chunks);
                                     debug!(
                                         session_id = %self.id,
@@ -245,12 +302,24 @@ impl AttachPump {
                         Err(RecvError::Closed) => {
                             let exit_code = self.store.get_exit_code(&self.id);
                             info!(session_id = %self.id, ?exit_code, "attach pump broadcast channel closed");
-                            return AttachEvent::Done { exit_code };
+                            // The completion flush normally reports Done before
+                            // the channel closes; if shutdown raced us, the
+                            // best-known cursor is what the client has seen.
+                            return AttachEvent::Done {
+                                exit_code,
+                                final_offset: self.current_offset,
+                            };
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The pump cursor: the stream offset the next [`AttachEvent::Chunk`]
+    /// continues from.
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset
     }
 
     /// Coalesce every chunk the reader has already produced into one frame.
@@ -322,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn pump_streams_chunks_modes_and_completion() {
         let (store, rt) = running_store("pump1", "hello\r\n").await;
-        let (mut pump, init) = AttachPump::subscribe(&store, "pump1", None)
+        let (mut pump, init) = AttachPump::subscribe(&store, "pump1", None, None)
             .await
             .expect("subscribe");
         assert!(init.running, "a running session must attach as running");
@@ -354,15 +423,60 @@ mod tests {
             rt.meta.exit_code = Some(7);
         }
         match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
-            Ok(AttachEvent::Done { exit_code }) => assert_eq!(exit_code, Some(7)),
+            Ok(AttachEvent::Done {
+                exit_code,
+                final_offset,
+            }) => {
+                assert_eq!(exit_code, Some(7));
+                // chunk-one (9) + ESC[?1h (5) streamed after the 7-byte excerpt
+                assert_eq!(final_offset, init.end_offset + 14);
+            }
             other => panic!("expected done, got {other:?}"),
         }
     }
 
     #[tokio::test]
+    async fn resume_with_stale_incarnation_is_rejected() {
+        let (store, _rt) = running_store("pump3", "x").await;
+        // The fixture runtime has no live journal, so every resume cursor is
+        // stale: both a wrong incarnation and a missing one are refused
+        // instead of streaming from an inferred offset.
+        let result = AttachPump::subscribe(&store, "pump3", Some(0), Some(1)).await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("wrong incarnation must be rejected"),
+        };
+        assert!(matches!(
+            err,
+            SessionError::StaleCursor {
+                requested: Some(1),
+                current: None
+            }
+        ));
+        let result = AttachPump::subscribe(&store, "pump3", Some(0), None).await;
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("resume without incarnation must be rejected"),
+        };
+        assert!(matches!(
+            err,
+            SessionError::StaleCursor {
+                requested: None,
+                ..
+            }
+        ));
+        // Fresh attaches carry no cursor and stay unaffected.
+        assert!(
+            AttachPump::subscribe(&store, "pump3", None, None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn pump_resyncs_from_persisted_stream_after_lag() {
         let (store, rt) = running_store("pump2", "").await;
-        let (mut pump, init) = AttachPump::subscribe(&store, "pump2", None)
+        let (mut pump, init) = AttachPump::subscribe(&store, "pump2", None, None)
             .await
             .expect("subscribe");
         assert_eq!(init.end_offset, 0);
