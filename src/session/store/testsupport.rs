@@ -183,6 +183,7 @@ pub(super) fn make_runtime_writable_with_capacity(
 
     let dir =
         std::env::temp_dir().join(format!("oly_store_writable_{id}_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create writable runtime test dir");
     let meta = SessionMeta {
         id: id.to_string(),
         title: None,

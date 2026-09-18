@@ -460,7 +460,9 @@ enum Forward {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testsupport::{make_runtime, make_test_db, store_with};
+    use super::super::testsupport::{
+        make_runtime, make_runtime_writable, make_test_db, store_with,
+    };
     use super::*;
     use crate::session::{
         SessionStatus,
@@ -682,6 +684,230 @@ mod tests {
                 assert_eq!(data, b"012345", "no bytes lost or duplicated");
             }
             other => panic!("expected resync chunk, got {other:?}"),
+        }
+    }
+
+    /// M3 exit stress (I2/I6/I7): ten mixed attachments — CLI and web,
+    /// controller and observers — streaming through output bursts, ring
+    /// overflows, resizes, a control takeover, and a detach/re-attach, then
+    /// a clean session end. Every pump must observe exactly the same
+    /// contiguous byte stream (its own suffix of the total), control
+    /// gating must hold throughout, and every completion reports the same
+    /// final cursor.
+    #[tokio::test]
+    async fn pump_stress_ten_mixed_clients_stay_consistent() {
+        use crate::session::registry::{AttachKind, AttachRole, ControlRequest};
+
+        struct Client {
+            pump: AttachPump,
+            attachment_id: u64,
+            expect: u64,
+            init_end: u64,
+            received: Vec<u8>,
+            done: bool,
+        }
+
+        async fn drain_once(client: &mut Client) {
+            let event = tokio::time::timeout(Duration::from_secs(5), client.pump.next())
+                .await
+                .expect("pump event within timeout");
+            match event {
+                AttachEvent::Chunk { offset, data } => {
+                    assert_eq!(
+                        offset, client.expect,
+                        "chunk must continue exactly at the client cursor (I2)"
+                    );
+                    client.received.extend_from_slice(&data);
+                    client.expect += data.len() as u64;
+                }
+                AttachEvent::Modes(_) => {}
+                AttachEvent::Done {
+                    exit_code,
+                    final_offset,
+                } => {
+                    assert_eq!(exit_code, Some(0));
+                    assert_eq!(
+                        final_offset, client.expect,
+                        "final cursor matches everything the client applied (I2)"
+                    );
+                    client.done = true;
+                }
+                AttachEvent::Closed => panic!("pump closed unexpectedly"),
+            }
+        }
+
+        /// Feed one chunk exactly as the reader does, and persist it so a
+        /// lagging pump can resync (the fixture uses the legacy output.log
+        /// fallback for reads).
+        fn emit_persisted(rt: &Arc<RwLock<SessionRuntime>>, bytes: &[u8]) {
+            let dir = rt.read().dir.clone();
+            append_output_raw(&dir, bytes).unwrap();
+            emit(rt, bytes);
+        }
+
+        let (rt, mut writer_rx) = make_runtime_writable("stress1", SessionStatus::Running);
+        let store = Arc::new(store_with(vec![Arc::clone(&rt)], make_test_db().await));
+
+        // Ten attachments, alternating kinds: the first takes the control
+        // lease, the rest join as observers (many observers, one
+        // controller).
+        let mut attachment_ids = Vec::new();
+        for i in 0..10u8 {
+            let reg = store
+                .attach_register(
+                    "stress1",
+                    if i % 2 == 0 {
+                        AttachKind::Cli
+                    } else {
+                        AttachKind::Web
+                    },
+                    ControlRequest::Controller,
+                    None,
+                )
+                .await
+                .expect("register attachment");
+            attachment_ids.push(reg.attachment_id);
+        }
+
+        // Ten pumps, all fresh attaches (snapshot + live from the current
+        // end). Half subscribe now, half after the first burst.
+        let mut total: Vec<u8> = Vec::new();
+        let mut clients: Vec<Client> = Vec::new();
+        for (i, &attachment_id) in attachment_ids.iter().enumerate() {
+            if i == 5 {
+                for step in 0..5u8 {
+                    let chunk = format!(
+                        "pre{step:02}
+"
+                    )
+                    .into_bytes();
+                    total.extend_from_slice(&chunk);
+                    emit_persisted(&rt, &chunk);
+                }
+            }
+            let (pump, init) = AttachPump::subscribe(&store, "stress1", None, None)
+                .await
+                .expect("subscribe");
+            clients.push(Client {
+                pump,
+                attachment_id,
+                expect: init.end_offset,
+                init_end: init.end_offset,
+                received: Vec::new(),
+                done: false,
+            });
+        }
+
+        let mut controller = attachment_ids[0];
+        for step in 0..120u32 {
+            let mut chunk = format!(
+                "line{step:03}
+"
+            )
+            .into_bytes();
+            if step == 30 {
+                chunk.extend_from_slice(b"\x1b[?25l"); // mode flip mid-stream
+            }
+            total.extend_from_slice(&chunk);
+            emit_persisted(&rt, &chunk);
+
+            // Group A (0..5) keeps up every step; group B (5..10) polls
+            // only every 7 steps so its ring overflows and it resyncs from
+            // the persisted stream in bounded windows (I7).
+            let group_b_due = step % 7 == 0;
+            for (i, client) in clients.iter_mut().enumerate() {
+                if client.done || (i >= 5 && !group_b_due) {
+                    continue;
+                }
+                drain_once(client).await;
+            }
+
+            match step {
+                // Resize driven only by the controller.
+                10 | 50 => {
+                    store
+                        .attach_resize("stress1", Some(controller), 30 + (step as u16 % 5), 100)
+                        .await
+                        .expect("controller resize");
+                }
+                // Takeover: attachment 3 seizes control mid-stream.
+                40 => {
+                    let outcome = store
+                        .attach_acquire_control("stress1", attachment_ids[3])
+                        .await
+                        .expect("takeover");
+                    assert_eq!(outcome.role, AttachRole::Controller);
+                    controller = attachment_ids[3];
+                    // The demoted controller is now gated (I6).
+                    let err = store
+                        .attach_input("stress1", Some(attachment_ids[0]), "x", false)
+                        .await
+                        .expect_err("demoted controller must be gated");
+                    assert!(matches!(err, SessionError::NotController));
+                }
+                // Controller input still lands.
+                41 => {
+                    store
+                        .attach_input("stress1", Some(controller), "k", false)
+                        .await
+                        .expect("controller input");
+                    assert_eq!(writer_rx.try_recv().ok().as_deref(), Some(b"k".as_slice()));
+                }
+                // One client detaches mid-stream and a fresh client joins.
+                60 => {
+                    let leaving = clients.remove(4);
+                    store
+                        .attach_detach("stress1", leaving.attachment_id)
+                        .await
+                        .expect("detach");
+                    drop(leaving);
+                    let reg = store
+                        .attach_register("stress1", AttachKind::Web, ControlRequest::Observer, None)
+                        .await
+                        .expect("late observer");
+                    let (pump, init) = AttachPump::subscribe(&store, "stress1", None, None)
+                        .await
+                        .expect("late subscribe");
+                    clients.push(Client {
+                        pump,
+                        attachment_id: reg.attachment_id,
+                        expect: init.end_offset,
+                        init_end: init.end_offset,
+                        received: Vec::new(),
+                        done: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Clean end: every client drains the tail and sees the same final
+        // cursor.
+        rt.write().mark_completed(SessionStatus::Stopped, Some(0));
+        for _ in 0..500 {
+            if clients.iter().all(|client| client.done) {
+                break;
+            }
+            for client in &mut clients {
+                if !client.done {
+                    drain_once(client).await;
+                }
+            }
+        }
+        assert!(
+            clients.iter().all(|client| client.done),
+            "every client reached Done"
+        );
+
+        // Every client applied exactly its own suffix of the one true
+        // stream — no gaps, no duplication, across lag/takeover/reconnect.
+        for client in &clients {
+            assert_eq!(
+                client.received,
+                total[client.init_end as usize..],
+                "client starting at {} must observe the exact suffix",
+                client.init_end
+            );
         }
     }
 }
