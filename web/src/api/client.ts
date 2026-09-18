@@ -448,7 +448,8 @@ const WS_FRAME_ERROR = 6
 const WS_FRAME_PONG = 7
 const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
 const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
-const WS_INIT_HEADER_LEN = 19
+const WS_INIT_HEADER_LEN = 28
+const WS_FRAME_CONTROL = 8
 const WS_DATA_HEADER_LEN = 9
 const WS_ENDED_LEN = 14
 
@@ -461,6 +462,8 @@ export interface AttachOptions {
   onModeChanged: (appCursorKeys: boolean, bracketedPasteMode: boolean) => void
   /** Called when the PTY was resized by another attached client. */
   onResized?: (rows: number, cols: number) => void
+  /** Called on control handoffs with this attachment's new role. */
+  onControl?: (role: 'controller' | 'observer') => void
   /** Called when the session ends. */
   onSessionEnded: (exitCode: number | null) => void
   onError: (message: string) => void
@@ -473,12 +476,15 @@ export class AttachSocket {
   private closed = false
   /** Next expected stream offset (from the init frame's snapshot boundary). */
   private expectedOffset: number | null = null
+  /** Granted control role; observers never send input or resize (I6). */
+  role: 'controller' | 'observer' = 'controller'
 
   constructor(
     sessionId: string,
     opts: AttachOptions,
     node?: string,
-    initialSize?: { rows: number; cols: number }
+    initialSize?: { rows: number; cols: number },
+    controlRole?: 'observer' | 'controller' | 'takeover'
   ) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = location.host
@@ -488,6 +494,7 @@ export class AttachSocket {
       params.set('rows', String(initialSize.rows))
       params.set('cols', String(initialSize.cols))
     }
+    if (controlRole) params.set('role', controlRole)
     const tok = getToken()
     if (tok) params.set('token', tok)
     const qs = params.toString()
@@ -516,6 +523,9 @@ export class AttachSocket {
             const flags = bytes[1]
             const endOffset = Number(view.getBigUint64(2, false))
             this.expectedOffset = endOffset
+            // [19..27] attachment id, [27] role — M3-4 control lease fields.
+            this.role = bytes[27] === 1 ? 'controller' : 'observer'
+            opts.onControl?.(this.role)
             opts.onInit(
               bytes.subarray(WS_INIT_HEADER_LEN),
               (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
@@ -572,6 +582,12 @@ export class AttachSocket {
           case WS_FRAME_ERROR:
             opts.onError(textDecoder.decode(bytes.subarray(1)))
             return
+          case WS_FRAME_CONTROL: {
+            // [8][role] — control handoff notice for this attachment.
+            this.role = bytes[1] === 1 ? 'controller' : 'observer'
+            opts.onControl?.(this.role)
+            return
+          }
           case WS_FRAME_PONG:
             return
         }
@@ -588,12 +604,18 @@ export class AttachSocket {
   }
 
   sendInput(data: string, waitForChange: boolean) {
+    if (this.role !== 'controller') return
     this.send({ type: 'input', data, waitForChange })
+  }
+  /** Request the control lease (observer → controller takeover). */
+  sendAcquireControl() {
+    this.send({ type: 'acquire_control' })
   }
   sendBusy() {
     this.send({ type: 'busy' })
   }
   sendResize(rows: number, cols: number) {
+    if (this.role !== 'controller') return
     this.send({ type: 'resize', rows, cols })
   }
 

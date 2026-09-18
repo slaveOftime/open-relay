@@ -193,6 +193,10 @@ pub enum RpcRequest {
         /// `from_byte_offset` is set.
         #[serde(default)]
         incarnation: Option<u64>,
+        /// Requested control role: "observer" | "controller" (default) |
+        /// "takeover" (PLAN §8.1). Unknown values are rejected.
+        #[serde(default)]
+        role: Option<String>,
         #[serde(default)]
         rows: Option<u16>,
         #[serde(default)]
@@ -220,6 +224,11 @@ pub enum RpcRequest {
         cols: u16,
     },
     AttachDetach {
+        id: String,
+    },
+    /// Take over the session's control lease from an attached observer
+    /// position (streaming attach connections only).
+    AttachAcquireControl {
         id: String,
     },
     Stop {
@@ -312,6 +321,7 @@ impl RpcRequest {
             RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
+            RpcRequest::AttachAcquireControl { .. } => "attach_acquire_control",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Restart { .. } => "restart",
             RpcRequest::Kill { .. } => "kill",
@@ -377,6 +387,17 @@ pub enum RpcResponse {
         /// present the same incarnation (ADR-0004).
         #[serde(default)]
         incarnation: u64,
+        /// This attachment's fencing token (M3-4).
+        #[serde(default)]
+        attachment_id: u64,
+        /// Granted control role: "controller" or "observer".
+        #[serde(default)]
+        role: String,
+    },
+    /// Control handoff notice pushed mid-stream: this attachment's role
+    /// after the change ("controller" or "observer").
+    AttachControlChanged {
+        role: String,
     },
     /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
     AttachStreamChunk {

@@ -748,7 +748,11 @@ pub async fn set_session_notifications(
             )
                 .into_response()
         }
-        Err(err @ SessionError::StaleCursor { .. }) => {
+        Err(
+            err @ (SessionError::StaleCursor { .. }
+            | SessionError::NotController
+            | SessionError::StaleAttachment),
+        ) => {
             warn!(session_id = %id, error = err.message(&id), "notification toggle rejected");
             (
                 StatusCode::CONFLICT,
@@ -959,7 +963,7 @@ pub async fn send_input(
 
     match state
         .store
-        .attach_input(&id, &body.data, body.wait_for_change)
+        .attach_input(&id, None, &body.data, body.wait_for_change)
         .await
     {
         Ok(()) => {

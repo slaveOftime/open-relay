@@ -31,11 +31,64 @@ impl SessionStore {
         Ok((!rt.is_completed(), rt.output_closed, rt.meta.exit_code))
     }
 
-    pub async fn register_attach_client(&self, id: &str) {
-        let sessions = self.sessions.load();
-        if let Some(handle) = sessions.get(id).cloned() {
-            handle.write().register_attach_client();
+    /// Register an identified attachment and grant control per the registry
+    /// policy (M3-4, PLAN §8.1). When control is granted and a viewport is
+    /// declared, the initial geometry is applied through the session
+    /// sequencer before any snapshot is taken.
+    pub async fn attach_register(
+        &self,
+        id: &str,
+        kind: crate::session::registry::AttachKind,
+        request: crate::session::registry::ControlRequest,
+        viewport: Option<(u16, u16)>,
+    ) -> std::result::Result<AttachRegistration, SessionError> {
+        let handle = self.lookup_runtime(id).await?;
+        let (attachment_id, outcome, resized) = {
+            let mut rt = handle.write();
+            rt.register_attachment(kind, request, viewport)
+        };
+        if resized {
+            let rt = handle.read();
+            let offset = rt.filtered_stream_len();
+            if let Some((rows, cols)) = viewport {
+                let _ = super::super::persist::append_resize_event(&rt.dir, offset, rows, cols);
+            }
         }
+        debug!(
+            session_id = id,
+            attachment_id,
+            role = outcome.role.as_str(),
+            "attach client registered"
+        );
+        Ok(AttachRegistration {
+            attachment_id,
+            role: outcome.role,
+        })
+    }
+
+    /// Explicit control takeover by an attached observer.
+    pub async fn attach_acquire_control(
+        &self,
+        id: &str,
+        attachment_id: u64,
+    ) -> std::result::Result<crate::session::registry::ControlOutcome, SessionError> {
+        let handle = self.lookup_runtime(id).await?;
+        handle
+            .write()
+            .acquire_control(attachment_id)
+            .ok_or(SessionError::StaleAttachment)
+    }
+
+    /// Subscribe to control handoffs for a session: every send carries the
+    /// current controller's attachment id (`None` = lease free).
+    pub fn subscribe_control(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<ControlNotice>> {
+        let sessions = self.sessions.load();
+        sessions
+            .get(id)
+            .map(|handle| handle.read().control_tx.subscribe())
     }
 
     /// Initialise a streaming subscription: return persisted canonical output
@@ -178,16 +231,21 @@ impl SessionStore {
         Some((rt.resize_tx.subscribe(), rt.pty_size))
     }
 
-    pub async fn attach_detach(&self, id: &str) -> std::result::Result<(), SessionError> {
+    pub async fn attach_detach(
+        &self,
+        id: &str,
+        attachment_id: u64,
+    ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        handle.write().detach_attach_client();
-        debug!(session_id = id, "attach detach acknowledged");
+        handle.write().unregister_attachment(attachment_id);
+        debug!(session_id = id, attachment_id, "attach detach acknowledged");
         Ok(())
     }
 
     pub async fn attach_input(
         &self,
         id: &str,
+        attachment_id: Option<u64>,
         data: &str,
         wait_for_change: bool,
     ) -> std::result::Result<(), SessionError> {
@@ -197,6 +255,14 @@ impl SessionStore {
         }
 
         let handle = self.lookup_runtime(id).await?;
+
+        // I6: attached clients drive input only while holding the control
+        // lease. `None` is the operator control plane (`oly send`, HTTP
+        // input), which is not an attachment and stays ungated.
+        if let Some(attachment_id) = attachment_id {
+            let rt = handle.read();
+            check_control(&rt, attachment_id)?;
+        }
 
         // Read lock: gather mode flags, transform input, send to PTY channel.
         // try_write_input() is a non-blocking channel send that only needs &self.
@@ -324,12 +390,19 @@ impl SessionStore {
     pub async fn attach_resize(
         &self,
         id: &str,
+        attachment_id: Option<u64>,
         rows: u16,
         cols: u16,
     ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
         let resized = {
             let mut rt = handle.write();
+            // I6: observers never resize the PTY; their declared size is a
+            // viewport, recorded for status surfaces only.
+            if let Some(attachment_id) = attachment_id {
+                check_control(&rt, attachment_id)?;
+                rt.attachments.set_viewport(attachment_id, rows, cols);
+            }
             rt.mark_attach_activity();
             rt.resize_pty(rows, cols)
         };
@@ -346,6 +419,34 @@ impl SessionStore {
         } else {
             Err(SessionError::Evicted)
         }
+    }
+}
+
+/// The result of registering an attachment (M3-4).
+#[derive(Debug, Clone, Copy)]
+pub struct AttachRegistration {
+    /// Fencing token identifying this attachment for its lifetime.
+    pub attachment_id: u64,
+    /// The role actually granted (a controller request may join as observer).
+    pub role: crate::session::registry::AttachRole,
+}
+
+/// Control-handoff notice element: the current controller's attachment id
+/// (`None` = lease free).
+pub type ControlNotice = Option<u64>;
+
+/// Geometry/input gate for attached clients: only the controller drives.
+fn check_control(
+    rt: &super::super::runtime::SessionRuntime,
+    attachment_id: u64,
+) -> std::result::Result<(), SessionError> {
+    if !rt.attachments.contains(attachment_id) {
+        return Err(SessionError::StaleAttachment);
+    }
+    if rt.attachments.is_controller(attachment_id) {
+        Ok(())
+    } else {
+        Err(SessionError::NotController)
     }
 }
 
@@ -385,7 +486,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0001", "hello\r", true)
+            .attach_input("inp0001", None, "hello\r", true)
             .await
             .expect("attach_input should succeed");
 
@@ -403,7 +504,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0002", "x", true)
+            .attach_input("inp0002", None, "x", true)
             .await
             .expect("attach_input should succeed");
 
@@ -425,7 +526,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0003", "\x1b[A", true)
+            .attach_input("inp0003", None, "\x1b[A", true)
             .await
             .expect("attach_input should succeed");
 
@@ -447,7 +548,7 @@ mod tests {
 
         // Send all four arrow sequences at once.
         store
-            .attach_input("inp0004", "\x1b[A\x1b[B\x1b[C\x1b[D", true)
+            .attach_input("inp0004", None, "\x1b[A\x1b[B\x1b[C\x1b[D", true)
             .await
             .expect("attach_input should succeed");
 
@@ -465,7 +566,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0005", "\x1b[A\x1b[B", true)
+            .attach_input("inp0005", None, "\x1b[A\x1b[B", true)
             .await
             .expect("attach_input should succeed");
 
@@ -479,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn test_attach_input_not_found_for_unknown_session() {
         let store = SessionStore::new(900, make_test_db().await);
-        let result = store.attach_input("no_such_id", "data", true).await;
+        let result = store.attach_input("no_such_id", None, "data", true).await;
         assert!(
             result.is_err(),
             "attach_input to unknown session should return an error"
@@ -499,7 +600,7 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let result = store.attach_input("inpbusy1", "second", true).await;
+        let result = store.attach_input("inpbusy1", None, "second", true).await;
         assert!(
             matches!(result, Err(SessionError::Busy)),
             "expected bounded writer queue saturation to surface SessionLookupError::Busy"
@@ -522,7 +623,7 @@ mod tests {
 
         let started = Instant::now();
         store
-            .attach_input("inpwait1", "x", true)
+            .attach_input("inpwait1", None, "x", true)
             .await
             .expect("attach_input should succeed");
         updater.await.expect("output updater should complete");
@@ -540,7 +641,7 @@ mod tests {
 
         let started = Instant::now();
         store
-            .attach_input("inpwait2", "x", true)
+            .attach_input("inpwait2", None, "x", true)
             .await
             .expect("attach_input should succeed");
 
@@ -582,14 +683,22 @@ mod tests {
         let rt_clone = rt.clone();
         let store = store_with(vec![rt], make_test_db().await);
 
-        store.register_attach_client("detach001").await;
+        let reg1 = store
+            .attach_register(
+                "detach001",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::ControlRequest::Controller,
+                None,
+            )
+            .await
+            .expect("register should succeed");
         {
             let mut locked = rt_clone.write();
             locked.mark_attach_activity();
         }
 
         store
-            .attach_detach("detach001")
+            .attach_detach("detach001", reg1.attachment_id)
             .await
             .expect("detach should succeed");
 
@@ -606,22 +715,39 @@ mod tests {
         let rt_clone = rt.clone();
         let store = store_with(vec![rt], make_test_db().await);
 
-        store.register_attach_client("detach002").await;
-        store.register_attach_client("detach002").await;
+        let reg1 = store
+            .attach_register(
+                "detach002",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::ControlRequest::Controller,
+                None,
+            )
+            .await
+            .expect("first register should succeed");
+        let reg2 = store
+            .attach_register(
+                "detach002",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::ControlRequest::Controller,
+                None,
+            )
+            .await
+            .expect("second register should succeed");
         {
             let mut locked = rt_clone.write();
             locked.mark_attach_activity();
         }
 
         store
-            .attach_detach("detach002")
+            .attach_detach("detach002", reg1.attachment_id)
             .await
             .expect("first detach should succeed");
 
         {
             let locked = rt_clone.read();
             assert_eq!(
-                locked.attach_count, 1,
+                locked.attachments.len(),
+                1,
                 "one client should still remain registered"
             );
             assert!(
@@ -631,16 +757,113 @@ mod tests {
         }
 
         store
-            .attach_detach("detach002")
+            .attach_detach("detach002", reg2.attachment_id)
             .await
             .expect("second detach should succeed");
 
         let locked = rt_clone.read();
-        assert_eq!(locked.attach_count, 0, "all clients should be disconnected");
+        assert_eq!(
+            locked.attachments.len(),
+            0,
+            "all clients should be disconnected"
+        );
         assert!(
             locked.last_attach_activity_at.is_some(),
             "final detach should still keep the last-seen activity timestamp"
         );
+    }
+
+    #[tokio::test]
+    async fn attach_control_lease_gates_input_and_resize() {
+        use crate::session::SessionError;
+        use crate::session::registry::{AttachKind, ControlRequest};
+
+        let (rt, _writer_rx) = make_runtime_writable("ctl0001", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        // First controller takes the lease.
+        let first = store
+            .attach_register("ctl0001", AttachKind::Cli, ControlRequest::Controller, None)
+            .await
+            .expect("first attach");
+        assert_eq!(first.role, crate::session::registry::AttachRole::Controller);
+
+        // A second controller request joins as observer.
+        let second = store
+            .attach_register("ctl0001", AttachKind::Web, ControlRequest::Controller, None)
+            .await
+            .expect("second attach");
+        assert_eq!(second.role, crate::session::registry::AttachRole::Observer);
+
+        // Observer input and resize are rejected with NotController.
+        let err = store
+            .attach_input("ctl0001", Some(second.attachment_id), "x", false)
+            .await
+            .expect_err("observer input must be gated");
+        assert!(matches!(err, SessionError::NotController));
+        let err = store
+            .attach_resize("ctl0001", Some(second.attachment_id), 24, 80)
+            .await
+            .expect_err("observer resize must be gated");
+        assert!(matches!(err, SessionError::NotController));
+
+        // The operator control plane (no attachment) stays ungated.
+        store
+            .attach_input("ctl0001", None, "ls", false)
+            .await
+            .expect("operator input must not be gated");
+
+        // Takeover flips the lease: second drives, first is rejected.
+        let outcome = store
+            .attach_acquire_control("ctl0001", second.attachment_id)
+            .await
+            .expect("takeover should succeed");
+        assert_eq!(
+            outcome.role,
+            crate::session::registry::AttachRole::Controller
+        );
+        assert_eq!(outcome.demoted, Some(first.attachment_id));
+        store
+            .attach_input("ctl0001", Some(second.attachment_id), "x", false)
+            .await
+            .expect("new controller input");
+        let err = store
+            .attach_input("ctl0001", Some(first.attachment_id), "x", false)
+            .await
+            .expect_err("demoted controller input must be gated");
+        assert!(matches!(err, SessionError::NotController));
+
+        // Detaching the controller frees the lease; a stale token is a
+        // no-op, and further control ops on it fail precisely.
+        store
+            .attach_detach("ctl0001", second.attachment_id)
+            .await
+            .expect("detach controller");
+        let err = store
+            .attach_input("ctl0001", Some(second.attachment_id), "x", false)
+            .await
+            .expect_err("stale attachment must fail precisely");
+        assert!(matches!(err, SessionError::StaleAttachment));
+        // The demoted first attachment stays an observer (no implicit
+        // promotion), but can take the now-free lease explicitly.
+        let err = store
+            .attach_input("ctl0001", Some(first.attachment_id), "x", false)
+            .await
+            .expect_err("demoted attachment stays observer after lease frees");
+        assert!(matches!(err, SessionError::NotController));
+        let outcome = store
+            .attach_acquire_control("ctl0001", first.attachment_id)
+            .await
+            .expect("takeover of the free lease should succeed");
+        assert_eq!(
+            outcome.role,
+            crate::session::registry::AttachRole::Controller
+        );
+        assert_eq!(outcome.demoted, None);
+        store
+            .attach_input("ctl0001", Some(first.attachment_id), "x", false)
+            .await
+            .expect("re-acquired controller input");
     }
 
     #[tokio::test]

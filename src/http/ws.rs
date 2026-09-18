@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::protocol::{RpcRequest, RpcResponse};
+use crate::session::registry::{AttachKind, ControlRequest};
 use crate::session::resize::ResizeSubscriber;
-use crate::session::{AttachEvent, AttachPump};
+use crate::session::{AttachEvent, AttachPump, SessionError};
 
 use super::AppState;
 
@@ -21,6 +22,8 @@ pub struct AttachParams {
     pub cols: Option<u16>,
     /// Initial terminal height (rows) reported by the browser xterm instance.
     pub rows: Option<u16>,
+    /// Requested control role: observer | controller (default) | takeover.
+    pub role: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,6 +47,9 @@ enum ServerMessage {
         app_cursor_keys: bool,
         #[serde(rename = "bracketedPasteMode")]
         bracketed_paste_mode: bool,
+        /// This attachment's fencing token and granted role (M3-4).
+        attachment_id: u64,
+        role: &'static str,
     },
     /// Incremental PTY output chunk; `offset` is the stream offset of the
     /// first byte so clients can verify contiguity (I2).
@@ -72,6 +78,10 @@ enum ServerMessage {
     Error {
         message: String,
     },
+    /// Control handoff notice: this attachment's role after the change.
+    Control {
+        role: &'static str,
+    },
     Pong,
 }
 
@@ -88,6 +98,8 @@ enum ClientMessage {
         rows: u16,
         cols: u16,
     },
+    /// Take over the control lease from an observer position.
+    AcquireControl,
     Detach,
     Ping,
 }
@@ -99,6 +111,7 @@ const WS_FRAME_RESIZED: u8 = 4;
 const WS_FRAME_SESSION_ENDED: u8 = 5;
 const WS_FRAME_ERROR: u8 = 6;
 const WS_FRAME_PONG: u8 = 7;
+const WS_FRAME_CONTROL: u8 = 8;
 const WS_FLAG_APP_CURSOR_KEYS: u8 = 1 << 0;
 const WS_FLAG_BRACKETED_PASTE_MODE: u8 = 1 << 1;
 
@@ -123,6 +136,7 @@ pub async fn attach_handler(
             params.node,
             params.rows,
             params.cols,
+            params.role,
         ))
         .catch_unwind()
         .await;
@@ -172,13 +186,17 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
             running,
             app_cursor_keys,
             bracketed_paste_mode,
+            attachment_id,
+            role,
         } => {
-            let mut payload = Vec::with_capacity(19 + data.len());
+            let mut payload = Vec::with_capacity(28 + data.len());
             payload.push(WS_FRAME_INIT);
             payload.push(mode_flags(*app_cursor_keys, *bracketed_paste_mode));
             payload.extend_from_slice(&end_offset.to_be_bytes());
             payload.extend_from_slice(&incarnation.to_be_bytes());
             payload.push(u8::from(*running));
+            payload.extend_from_slice(&attachment_id.to_be_bytes());
+            payload.push(u8::from(*role == "controller"));
             payload.extend_from_slice(data);
             payload
         }
@@ -225,6 +243,7 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
             payload.extend_from_slice(message.as_bytes());
             payload
         }
+        ServerMessage::Control { role } => vec![WS_FRAME_CONTROL, u8::from(*role == "controller")],
         ServerMessage::Pong => vec![WS_FRAME_PONG],
     }
 }
@@ -243,15 +262,25 @@ async fn handle_ws(
     node: Option<String>,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
+    role: Option<String>,
 ) {
     debug!(session_id = %id, node = ?node, "WebSocket connected");
 
     if let Some(node_name) = node {
-        handle_ws_proxied_streaming(socket, state, id, node_name, initial_rows, initial_cols).await;
+        handle_ws_proxied_streaming(
+            socket,
+            state,
+            id,
+            node_name,
+            initial_rows,
+            initial_cols,
+            role,
+        )
+        .await;
         return;
     }
 
-    handle_ws_streaming(socket, state, id, initial_rows, initial_cols).await;
+    handle_ws_streaming(socket, state, id, initial_rows, initial_cols, role).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -264,22 +293,45 @@ async fn handle_ws_streaming(
     id: String,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
+    role: Option<String>,
 ) {
-    if let (Some(rows), Some(cols)) = (initial_rows, initial_cols)
-        && rows > 0
-        && cols > 0
-    {
-        match state.store.attach_resize(&id, rows, cols).await {
-            Ok(()) => debug!(session_id = %id, rows, cols, "PTY pre-resized before WS init"),
-            Err(err) => {
-                warn!(session_id = %id, rows, cols, error = err.message(&id), "PTY pre-resize before WS init failed")
-            }
+    // M3-4: register the attachment (control lease + viewport) before the
+    // snapshot, so a controller's authorized initial geometry is applied
+    // through the sequencer and already reflected in the init.
+    let request = match ControlRequest::parse(role.as_deref()) {
+        Ok(request) => request,
+        Err(message) => {
+            let _ = send_server_message(&mut socket, &ServerMessage::Error { message }).await;
+            return;
         }
-    }
+    };
+    let viewport = match (initial_rows, initial_cols) {
+        (Some(rows), Some(cols)) if rows > 0 && cols > 0 => Some((rows, cols)),
+        _ => None,
+    };
+    let registration = match state
+        .store
+        .attach_register(&id, AttachKind::Web, request, viewport)
+        .await
+    {
+        Ok(registration) => registration,
+        Err(err) => {
+            let _ = send_server_message(
+                &mut socket,
+                &ServerMessage::Error {
+                    message: err.message(&id),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+    let attachment_id = registration.attachment_id;
 
     let (mut pump, init) = match AttachPump::subscribe(&state.store, &id, None, None).await {
         Ok(pair) => pair,
         Err(err) => {
+            let _ = state.store.attach_detach(&id, attachment_id).await;
             warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
             let _ = send_server_message(
                 &mut socket,
@@ -299,13 +351,16 @@ async fn handle_ws_streaming(
         running: init.running,
         app_cursor_keys: init.modes.app_cursor_keys,
         bracketed_paste_mode: init.modes.bracketed_paste_mode,
+        attachment_id,
+        role: registration.role.as_str(),
     };
     if !send_server_message(&mut socket, &init_msg).await {
         debug!(session_id = %id, "local WebSocket closed before init frame could be sent");
         return;
     }
 
-    state.store.register_attach_client(&id).await;
+    // Control-handoff notices for this session.
+    let mut control_rx = state.store.subscribe_control(&id);
 
     // Subscribe to resize broadcasts so we can notify this client when
     // another attached client changes the PTY size.
@@ -330,7 +385,7 @@ async fn handle_ws_streaming(
                 match event {
                     AttachEvent::Chunk { offset, data } => {
                         if !send_server_message(&mut socket, &ServerMessage::Data { offset, data }).await {
-                            let _ = state.store.attach_detach(&id).await;
+                            let _ = state.store.attach_detach(&id, attachment_id).await;
                             return;
                         }
                     }
@@ -339,7 +394,7 @@ async fn handle_ws_streaming(
                             app_cursor_keys: modes.app_cursor_keys,
                             bracketed_paste_mode: modes.bracketed_paste_mode,
                         }).await {
-                            let _ = state.store.attach_detach(&id).await;
+                            let _ = state.store.attach_detach(&id, attachment_id).await;
                             return;
                         }
                     }
@@ -349,7 +404,7 @@ async fn handle_ws_streaming(
                     } => {
                         info!(session_id = %id, ?exit_code, final_offset, "WS session ended");
                         let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code, final_offset }).await;
-                        let _ = state.store.attach_detach(&id).await;
+                        let _ = state.store.attach_detach(&id, attachment_id).await;
                         return;
                     }
                     AttachEvent::Closed => {
@@ -357,7 +412,7 @@ async fn handle_ws_streaming(
                             exit_code: None,
                             final_offset: pump.current_offset(),
                         }).await;
-                        let _ = state.store.attach_detach(&id).await;
+                        let _ = state.store.attach_detach(&id, attachment_id).await;
                         return;
                     }
                 }
@@ -370,12 +425,20 @@ async fn handle_ws_streaming(
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Input { data, wait_for_change }) => {
                                 debug!(session_id = %id, bytes = data.len(), "WS input received");
-                                if let Err(err) = state.store.attach_input(&id, &data, wait_for_change).await {
-                                    let _ = send_server_message(&mut socket, &ServerMessage::Error {
+                                if let Err(err) = state.store.attach_input(&id, Some(attachment_id), &data, wait_for_change).await {
+                                    // Control-gate violations are reported but
+                                    // keep the stream; transport failures end it.
+                                    let gated = matches!(err, SessionError::NotController | SessionError::StaleAttachment);
+                                    if !send_server_message(&mut socket, &ServerMessage::Error {
                                         message: err.message(&id),
-                                    }).await;
-                                    let _ = state.store.attach_detach(&id).await;
-                                    return;
+                                    }).await {
+                                        let _ = state.store.attach_detach(&id, attachment_id).await;
+                                        return;
+                                    }
+                                    if !gated {
+                                        let _ = state.store.attach_detach(&id, attachment_id).await;
+                                        return;
+                                    }
                                 }
                             }
                             Ok(ClientMessage::Busy) => {
@@ -384,24 +447,53 @@ async fn handle_ws_streaming(
                                     let _ = send_server_message(&mut socket, &ServerMessage::Error {
                                         message: err.message(&id),
                                     }).await;
-                                    let _ = state.store.attach_detach(&id).await;
+                                    let _ = state.store.attach_detach(&id, attachment_id).await;
                                     return;
                                 }
                             }
                             Ok(ClientMessage::Resize { rows, cols }) => {
                                 debug!(session_id = %id, rows, cols, "WS resize received");
                                 resize_sub.mark_sent(rows, cols);
-                                if let Err(err) = state.store.attach_resize(&id, rows, cols).await {
-                                    let _ = send_server_message(&mut socket, &ServerMessage::Error {
-                                        message: err.message(&id),
-                                    }).await;
-                                    let _ = state.store.attach_detach(&id).await;
-                                    return;
+                                match state.store.attach_resize(&id, Some(attachment_id), rows, cols).await {
+                                    Ok(()) => {}
+                                    // Observers never resize the shared PTY;
+                                    // their declared size is a viewport only.
+                                    Err(SessionError::NotController | SessionError::StaleAttachment) => {
+                                        resize_sub.mark_sent(0, 0);
+                                    }
+                                    Err(err) => {
+                                        let _ = send_server_message(&mut socket, &ServerMessage::Error {
+                                            message: err.message(&id),
+                                        }).await;
+                                        let _ = state.store.attach_detach(&id, attachment_id).await;
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(ClientMessage::AcquireControl) => {
+                                debug!(session_id = %id, attachment_id, "local WebSocket control takeover requested");
+                                match state.store.attach_acquire_control(&id, attachment_id).await {
+                                    Ok(outcome) => {
+                                        if !send_server_message(
+                                            &mut socket,
+                                            &ServerMessage::Control {
+                                                role: outcome.role.as_str(),
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            let _ = state.store.attach_detach(&id, attachment_id).await;
+                                            return;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(session_id = %id, error = err.message(&id), "control takeover failed");
+                                    }
                                 }
                             }
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, "WS client detached");
-                                let _ = state.store.attach_detach(&id).await;
+                                let _ = state.store.attach_detach(&id, attachment_id).await;
                                 return;
                             }
                             Ok(ClientMessage::Ping) => {
@@ -415,10 +507,31 @@ async fn handle_ws_streaming(
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         debug!(session_id = %id, "WS client disconnected");
-                        let _ = state.store.attach_detach(&id).await;
+                        let _ = state.store.attach_detach(&id, attachment_id).await;
                         return;
                     }
                     _ => {}
+                }
+            }
+
+            // Control handoffs: every notice carries the current controller
+            // id; derive this attachment's role from it.
+            notice = async {
+                match control_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Ok(controller) = notice {
+                    let role: &'static str = if controller == Some(attachment_id) {
+                        "controller"
+                    } else {
+                        "observer"
+                    };
+                    if !send_server_message(&mut socket, &ServerMessage::Control { role }).await {
+                        let _ = state.store.attach_detach(&id, attachment_id).await;
+                        return;
+                    }
                 }
             }
 
@@ -430,7 +543,7 @@ async fn handle_ws_streaming(
                     "forwarding resize notification to local WebSocket client"
                 );
                 if !send_server_message(&mut socket, &ServerMessage::Resized { rows, cols }).await {
-                    let _ = state.store.attach_detach(&id).await;
+                    let _ = state.store.attach_detach(&id, attachment_id).await;
                     return;
                 }
             }
@@ -449,6 +562,7 @@ async fn handle_ws_proxied_streaming(
     node: String,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
+    role: Option<String>,
 ) {
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
 
@@ -459,6 +573,7 @@ async fn handle_ws_proxied_streaming(
         incarnation: None,
         rows: initial_rows.filter(|rows| *rows > 0),
         cols: initial_cols.filter(|cols| *cols > 0),
+        role,
     };
     let (stream_rpc_id, mut stream_rx) = match state
         .node_registry
@@ -497,6 +612,8 @@ async fn handle_ws_proxied_streaming(
                                 app_cursor_keys,
                                 bracketed_paste_mode,
                                 incarnation,
+                                attachment_id,
+                                role,
                                 ..
                             } => {
                                 let replay_bytes = data.len();
@@ -507,6 +624,8 @@ async fn handle_ws_proxied_streaming(
                                     running,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
+                                    attachment_id,
+                                    role: if role == "controller" { "controller" } else { "observer" },
                                 };
                                 if !send_server_message(&mut socket, &msg).await {
                                     break;
@@ -532,6 +651,12 @@ async fn handle_ws_proxied_streaming(
                                         break;
                                     }
                                 }
+                            }
+                            RpcResponse::AttachControlChanged { role } => {
+                                debug!(session_id = %id, node = %node, %role, "proxied WebSocket control handoff");
+                                let _ = send_server_message(&mut socket, &ServerMessage::Control {
+                                    role: if role == "controller" { "controller" } else { "observer" },
+                                }).await;
                             }
                             RpcResponse::AttachModeChanged {
                                 app_cursor_keys,
@@ -632,6 +757,13 @@ async fn handle_ws_proxied_streaming(
                                     warn!(session_id = %id, node = %node, rows, cols, %err, "failed to proxy WebSocket resize");
                                 }
                             }
+                            Ok(ClientMessage::AcquireControl) => {
+                                debug!(session_id = %id, node = %node, "proxied WebSocket control takeover requested");
+                                let rpc = RpcRequest::AttachAcquireControl { id: id.to_string() };
+                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
+                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket control takeover");
+                                }
+                            }
                             Ok(ClientMessage::Detach) => {
                                 debug!(session_id = %id, node = %node, "proxied WebSocket detach requested");
                                 let rpc = RpcRequest::AttachDetach { id: id.to_string() };
@@ -682,8 +814,8 @@ fn init_msg_data_len(msg: &ServerMessage) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerMessage, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED, encode_server_message,
-        panic_payload_message,
+        ServerMessage, WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED,
+        encode_server_message, panic_payload_message,
     };
 
     #[test]
@@ -709,13 +841,29 @@ mod tests {
             running: true,
             app_cursor_keys: true,
             bracketed_paste_mode: false,
+            attachment_id: 42,
+            role: "controller",
         });
         assert_eq!(payload[0], WS_FRAME_INIT);
         assert_eq!(payload[1], 1); // app-cursor-keys flag only
         assert_eq!(payload[2..10], 0x0102_0304_0506_0708_u64.to_be_bytes());
         assert_eq!(payload[10..18], 9_u64.to_be_bytes());
         assert_eq!(payload[18], 1); // running
-        assert_eq!(&payload[19..], b"hi");
+        assert_eq!(payload[19..27], 42_u64.to_be_bytes()); // attachment id
+        assert_eq!(payload[27], 1); // role: controller
+        assert_eq!(&payload[28..], b"hi");
+    }
+
+    #[test]
+    fn encode_control_frame_layout() {
+        assert_eq!(
+            encode_server_message(&ServerMessage::Control { role: "controller" }),
+            vec![WS_FRAME_CONTROL, 1]
+        );
+        assert_eq!(
+            encode_server_message(&ServerMessage::Control { role: "observer" }),
+            vec![WS_FRAME_CONTROL, 0]
+        );
     }
 
     #[test]

@@ -55,6 +55,7 @@ pub(super) async fn handle_client(
         incarnation,
         rows,
         cols,
+        role,
     } = request
     {
         return handle_attach_subscribe(
@@ -63,6 +64,7 @@ pub(super) async fn handle_client(
             incarnation,
             rows,
             cols,
+            role,
             reader,
             write_half,
             &session_store,
@@ -178,7 +180,7 @@ async fn dispatch_request(
             )
             .await
         }
-        RpcRequest::AttachSubscribe { .. } => {
+        RpcRequest::AttachSubscribe { .. } | RpcRequest::AttachAcquireControl { .. } => {
             // Handled before dispatch in handle_client; should not reach here.
             RpcResponse::Error {
                 message: "AttachSubscribe must be handled on the streaming path".into(),

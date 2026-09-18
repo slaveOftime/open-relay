@@ -370,6 +370,25 @@ pub struct AttachArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+    /// Attach view-only: never drives input or geometry.
+    #[arg(long, conflicts_with = "takeover")]
+    pub observer: bool,
+    /// Take the control lease from the current controller (it becomes an observer).
+    #[arg(long)]
+    pub takeover: bool,
+}
+
+impl AttachArgs {
+    /// Wire role token for the attach subscription (None = controller).
+    pub fn role(&self) -> Option<&'static str> {
+        if self.observer {
+            Some("observer")
+        } else if self.takeover {
+            Some("takeover")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Args)]

@@ -101,15 +101,25 @@ fn passthrough_signals(data: &[u8]) -> Vec<u8> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_attach(config: &AppConfig, id: &str) -> Result<()> {
-    run_attach_inner(config, id, None).await
+pub async fn run_attach(config: &AppConfig, id: &str, role: Option<&str>) -> Result<()> {
+    run_attach_inner(config, id, None, role).await
 }
 
-pub async fn run_attach_node(config: &AppConfig, id: &str, node: Option<String>) -> Result<()> {
-    run_attach_inner(config, id, node.as_deref()).await
+pub async fn run_attach_node(
+    config: &AppConfig,
+    id: &str,
+    node: Option<String>,
+    role: Option<&str>,
+) -> Result<()> {
+    run_attach_inner(config, id, node.as_deref(), role).await
 }
 
-async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
+async fn run_attach_inner(
+    config: &AppConfig,
+    id: &str,
+    node: Option<&str>,
+    role: Option<&str>,
+) -> Result<()> {
     let stream = ipc::connect(config).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -134,6 +144,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                 incarnation: None,
                 rows: initial_size.map(|(_, rows)| rows),
                 cols: initial_size.map(|(cols, _)| cols),
+                role: role.map(str::to_owned),
             },
         ),
     )
@@ -148,6 +159,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         mut child_bracketed_paste_mode,
         mut child_app_cursor_keys,
         stream_end_offset,
+        granted_role,
     ) = match init {
         RpcResponse::AttachStreamInit {
             data,
@@ -156,6 +168,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             bracketed_paste_mode,
             app_cursor_keys,
             end_offset,
+            role,
             ..
         } => (
             data,
@@ -164,9 +177,18 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             bracketed_paste_mode,
             app_cursor_keys,
             end_offset,
+            role,
         ),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
+
+    // I6 (PLAN §8.1): observers never drive input or geometry. The server
+    // enforces the lease; this mirrors it client-side so an observer's
+    // keystrokes don't bounce off the gate.
+    let mut is_controller = granted_role != "observer";
+    if interactive && !is_controller {
+        eprintln!("Attached as observer (view-only). Ctrl-T takes control, Ctrl-D detaches.");
+    }
 
     // Every chunk must continue exactly at the cursor the init frame left
     // us at; gaps/duplicates abort the attach loudly (I2, M3-3).
@@ -185,6 +207,7 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                     write_bytes_to_stdout(&data)?;
                 }
                 RpcResponse::AttachModeChanged { .. } => {}
+                RpcResponse::AttachControlChanged { .. } => {}
                 RpcResponse::AttachStreamDone { final_offset, .. } => {
                     stream_cursor.finish(final_offset)?;
                     running = false;
@@ -305,7 +328,11 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 // carry stale dimensions on some platforms.
                                 let (actual_cols, actual_rows) =
                                     terminal::size().unwrap_or((cols, rows));
-                                if (actual_cols, actual_rows) != last_sent_size {
+                                if !is_controller {
+                                    // Observer: the resize is a viewport
+                                    // preference, not session geometry.
+                                    last_sent_size = (actual_cols, actual_rows);
+                                } else if (actual_cols, actual_rows) != last_sent_size {
                                     last_sent_size = (actual_cols, actual_rows);
 
                                     #[cfg(windows)]
@@ -353,6 +380,18 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 } else if is_ctrl_d(key) {
                                     detached = true;
                                     running = false;
+                                } else if !is_controller && is_ctrl_t(key) {
+                                    // Observer takeover: the server answers
+                                    // with an AttachControlChanged frame.
+                                    ipc::write_request_to_writer(
+                                        &mut write_half,
+                                        RpcRequest::AttachAcquireControl {
+                                            id: id_owned.clone(),
+                                        },
+                                    )
+                                    .await?;
+                                } else if !is_controller {
+                                    // Observer: keys do not reach the session.
                                 } else if let Some(data) = map_key_to_input(key, child_app_cursor_keys)
                                 {
                                     // Every ordinary key is sent the moment it
@@ -369,6 +408,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                 }
                             }
                             Event::Mouse(mouse) => {
+                                if !is_controller {
+                                    continue;
+                                }
                                 let data = map_mouse_to_sgr_input(mouse);
                                 ipc::write_request_to_writer(
                                     &mut write_half,
@@ -440,6 +482,9 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
                                         let (actual_cols, actual_rows) =
                                             terminal::size().unwrap_or((80, 24));
                                         last_sent_size = (actual_cols, actual_rows);
+                                    }
+                                    RpcResponse::AttachControlChanged { role } => {
+                                        is_controller = role == "controller";
                                     }
                                     RpcResponse::AttachStreamDone { final_offset, .. } => {
                                         if let Err(err) = stream_cursor.finish(final_offset) {
@@ -926,6 +971,11 @@ fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
         'M'
     };
     format!("\x1b[<{cb};{cx};{cy}{suffix}")
+}
+
+fn is_ctrl_t(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
 }
 
 fn is_ctrl_d(key: KeyEvent) -> bool {

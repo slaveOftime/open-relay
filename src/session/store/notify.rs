@@ -846,7 +846,15 @@ mod tests {
         );
         let store = store_with(vec![rt.clone()], make_test_db().await);
 
-        store.register_attach_client("abc1234").await;
+        let registration = store
+            .attach_register(
+                "abc1234",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::ControlRequest::Controller,
+                None,
+            )
+            .await
+            .expect("attach_register should succeed");
 
         assert!(
             store
@@ -871,9 +879,17 @@ mod tests {
         );
         let store = store_with(vec![rt.clone()], make_test_db().await);
 
-        store.register_attach_client("abc1234").await;
+        let registration = store
+            .attach_register(
+                "abc1234",
+                crate::session::registry::AttachKind::Cli,
+                crate::session::registry::ControlRequest::Controller,
+                None,
+            )
+            .await
+            .expect("attach_register should succeed");
         store
-            .attach_detach("abc1234")
+            .attach_detach("abc1234", registration.attachment_id)
             .await
             .expect("detach should succeed");
 

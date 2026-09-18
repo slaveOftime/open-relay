@@ -135,8 +135,12 @@ pub struct SessionRuntime {
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
-    /// Number of currently connected local clients for this session.
-    pub attach_count: usize,
+    /// Identified attachments and the control lease (M3-4); the attachment
+    /// count is `attachments.len()`.
+    pub attachments: super::registry::AttachmentRegistry,
+    /// Publishes the current controller's attachment id on every handoff
+    /// (`None` = lease free). Receivers compare with their own id.
+    pub control_tx: broadcast::Sender<Option<u64>>,
     /// Timestamp of the last *successful* notification delivery for this session.
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
@@ -307,7 +311,7 @@ impl SessionRuntime {
             last_output_epoch: self.last_output_epoch.and_then(instant_to_utc),
             rows: self.pty_size.map(|(rows, _)| rows),
             cols: self.pty_size.map(|(_, cols)| cols),
-            attach_count: self.attach_count,
+            attach_count: self.attachments.len(),
             foreground_color: self.meta.foreground_color.clone(),
             background_color: self.meta.background_color.clone(),
         }
@@ -403,42 +407,88 @@ impl SessionRuntime {
         super::logs::render_engine_screen(&self.engine, tail, keep_color, term_cols)
     }
 
-    pub fn register_attach_client(&mut self) {
-        self.attach_count = self.attach_count.saturating_add(1);
+    /// Register an identified attachment and grant control per the registry
+    /// policy (M3-4). When control is granted and the attachment declared a
+    /// viewport, the authorized initial geometry is applied here, through
+    /// the same sequencer path as any later resize (PLAN §7.2.1). Returns
+    /// the attachment id (fencing token), the granted role, and whether the
+    /// initial geometry was applied.
+    pub fn register_attachment(
+        &mut self,
+        kind: super::registry::AttachKind,
+        request: super::registry::ControlRequest,
+        viewport: Option<(u16, u16)>,
+    ) -> (u64, super::registry::ControlOutcome, bool) {
+        use super::registry::AttachRole;
         // Attaching is itself user activity: someone just opened this
         // session and saw its current state.
         self.last_attach_activity_at = Some(Instant::now());
+        let (id, outcome) = self.attachments.register(kind, request, viewport);
+        let mut resized = false;
+        if outcome.role == AttachRole::Controller
+            && let Some((rows, cols)) = viewport
+            && rows > 0
+            && cols > 0
+        {
+            resized = self.resize_pty(rows, cols);
+        }
+        if outcome.demoted.is_some() || outcome.role == AttachRole::Controller {
+            let _ = self.control_tx.send(self.attachments.controller_id());
+        }
         trace!(
             session_id = %self.meta.id,
-            attach_count = self.attach_count,
+            attachment_id = id,
+            role = outcome.role.as_str(),
+            attach_count = self.attachments.len(),
             "attach client registered"
         );
+        (id, outcome, resized)
     }
 
     pub fn mark_attach_activity(&mut self) {
         debug!(
             session_id = %self.meta.id,
-            attach_count = self.attach_count,
+            attach_count = self.attachments.len(),
             "interactive attach activity marked"
         );
         self.last_attach_activity_at = Some(Instant::now());
     }
 
-    pub fn detach_attach_client(&mut self) {
-        self.attach_count = self.attach_count.saturating_sub(1);
+    /// Remove an attachment by its fencing token; releases the control lease
+    /// if it held it. Unknown (stale) ids are a no-op.
+    pub fn unregister_attachment(&mut self, attachment_id: u64) {
+        let removed = self.attachments.unregister(attachment_id);
         debug!(
             session_id = %self.meta.id,
-            attach_count = self.attach_count,
+            attachment_id,
+            found = removed.is_some(),
+            attach_count = self.attachments.len(),
             "attach client detached"
         );
-        if self.attach_count == 0 {
+        if removed
+            .as_ref()
+            .is_some_and(|attachment| attachment.role == super::registry::AttachRole::Controller)
+        {
+            let _ = self.control_tx.send(None);
+        }
+        if self.attachments.is_empty() {
             self.clear_attach_state();
         }
     }
 
+    /// Explicit control takeover by an attached observer.
+    pub fn acquire_control(
+        &mut self,
+        attachment_id: u64,
+    ) -> Option<super::registry::ControlOutcome> {
+        let outcome = self.attachments.acquire_control(attachment_id)?;
+        self.last_attach_activity_at = Some(Instant::now());
+        let _ = self.control_tx.send(self.attachments.controller_id());
+        Some(outcome)
+    }
+
     pub fn clear_attach_state(&mut self) {
         debug!(session_id = %self.meta.id, "attach presence cleared");
-        self.attach_count = 0;
         // `last_attach_activity_at` deliberately survives detach: it records
         // when a user last *saw and touched* the session, which stays true
         // after they disconnect. Clearing it would make a just-detached
@@ -480,7 +530,7 @@ impl SessionRuntime {
     /// Returns `true` when at least one attach subscriber is currently live.
     #[allow(dead_code)]
     pub fn has_active_attach_client(&self) -> bool {
-        self.attach_count > 0
+        !self.attachments.is_empty()
     }
 
     /// Checks child exit status and updates `meta.status`. Returns `true` if completed.
@@ -1030,7 +1080,8 @@ pub fn spawn_session(
         last_output_epoch: None,
         last_input_at: None,
         last_attach_activity_at: None,
-        attach_count: 0,
+        attachments: Default::default(),
+        control_tx: broadcast::channel(8).0,
         notified_output_epoch: None,
         last_notified_at: None,
         engine: {
@@ -1515,7 +1566,8 @@ mod tests {
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
-            attach_count: 0,
+            attachments: Default::default(),
+            control_tx: broadcast::channel(8).0,
             last_notified_at: None,
             notified_output_epoch: None,
             engine: Terminal::new(24, 80, 1000),
@@ -2348,7 +2400,11 @@ mod tests {
     #[test]
     fn test_has_active_attach_client_true_with_registered_client() {
         let mut rt = new_runtime();
-        rt.register_attach_client();
+        rt.register_attachment(
+            crate::session::registry::AttachKind::Cli,
+            crate::session::registry::ControlRequest::Controller,
+            None,
+        );
         assert!(
             rt.has_active_attach_client(),
             "one registered client → should report active client"
@@ -2434,7 +2490,8 @@ mod tests {
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
-            attach_count: 0,
+            attachments: Default::default(),
+            control_tx: broadcast::channel(8).0,
             last_notified_at: None,
             notified_output_epoch: None,
             engine: Terminal::new(24, 80, 1000),

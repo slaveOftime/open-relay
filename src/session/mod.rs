@@ -16,6 +16,7 @@ pub(crate) mod persist;
 pub mod pty;
 // M3-1b: derive the canonical filtered display stream from the raw
 // journal (the read path that replaces `output.log`).
+pub mod registry;
 pub(crate) mod replay;
 pub(crate) mod resize;
 mod runtime;
@@ -105,6 +106,11 @@ pub enum SessionError {
         requested: Option<u64>,
         current: Option<u64>,
     },
+    /// An attached client tried to drive geometry/input without holding
+    /// the session's control lease (I6; PLAN §8.1).
+    NotController,
+    /// The attachment id is unknown to the session (stale fencing token).
+    StaleAttachment,
 }
 
 impl SessionError {
@@ -117,6 +123,12 @@ impl SessionError {
             Self::StaleCursor { requested, current } => format!(
                 "stale resume cursor for {id}: cursor names incarnation {requested:?},                  session incarnation is {current:?}; resnapshot instead of resuming"
             ),
+            Self::NotController => format!(
+                "not the controller of session {id}: attached as observer;                  take over control to send input or resize"
+            ),
+            Self::StaleAttachment => {
+                format!("attachment is no longer registered for session {id}; re-attach")
+            }
         }
     }
 }

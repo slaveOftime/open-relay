@@ -162,6 +162,7 @@ function SessionDetailPageContent() {
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
+  const [controlRole, setControlRole] = useState<'controller' | 'observer'>('controller')
   const wsConnectedRef = useRef(false)
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
@@ -737,6 +738,10 @@ function SessionDetailPageContent() {
           onModeChanged: () => {
             lastWsFrameAtRef.current = Date.now()
             // Mode changes are tracked server-side; client doesn't need to act.
+          },
+          onControl: (role) => {
+            lastWsFrameAtRef.current = Date.now()
+            if (isMounted.current) setControlRole(role)
           },
           onResized: (rows, cols) => {
             lastWsFrameAtRef.current = Date.now()
@@ -1323,6 +1328,12 @@ function SessionDetailPageContent() {
                 <span className="hidden sm:inline">Offline</span>
               </Badge>
             )}
+            {mode === 'attach' && controlRole === 'observer' && (
+              <Badge variant="secondary" className="inline-flex font-light">
+                <span className="hidden sm:inline">Observer (view-only)</span>
+                <span className="sm:hidden">Observer</span>
+              </Badge>
+            )}
           </div>
 
           {/* Desktop actions */}
@@ -1331,6 +1342,15 @@ function SessionDetailPageContent() {
               <ReloadIcon className="h-4 w-4" />
               Refresh
             </Button>
+            {mode === 'attach' && controlRole === 'observer' && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => socketRef.current?.sendAcquireControl()}
+              >
+                Take control
+              </Button>
+            )}
             {mode === 'attach' && (
               <Button
                 size="sm"
