@@ -1023,9 +1023,7 @@ mod tests {
             )
             .await
             .expect("first attach");
-        let initial = store
-            .subscribe_resize("ctl0002")
-            .and_then(|(_, size)| size);
+        let initial = store.subscribe_resize("ctl0002").and_then(|(_, size)| size);
         assert_eq!(initial, Some((24, 80)));
 
         // B joins as an observer (lease held) with a different viewport;
@@ -1040,9 +1038,7 @@ mod tests {
             .await
             .expect("second attach");
         assert_eq!(second.role, crate::session::registry::AttachRole::Observer);
-        let before = store
-            .subscribe_resize("ctl0002")
-            .and_then(|(_, size)| size);
+        let before = store.subscribe_resize("ctl0002").and_then(|(_, size)| size);
         assert_eq!(before, Some((24, 80)), "observer viewport must not resize");
 
         // B takes control: the session adopts B's viewport immediately,
@@ -1051,9 +1047,7 @@ mod tests {
             .attach_acquire_control("ctl0002", second.attachment_id)
             .await
             .expect("takeover should succeed");
-        let after = store
-            .subscribe_resize("ctl0002")
-            .and_then(|(_, size)| size);
+        let after = store.subscribe_resize("ctl0002").and_then(|(_, size)| size);
         assert_eq!(
             after,
             Some((40, 120)),
