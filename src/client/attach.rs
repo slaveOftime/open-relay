@@ -384,6 +384,28 @@ async fn run_attach_inner(
         // before the main event loop.
         let _ = drain_pending_terminal_events();
 
+        // A resize that landed during the handshake or replay was drained
+        // above as "stale"; reconcile against the real terminal size so a
+        // startup-race resize is not silently lost until the next one.
+        {
+            let (now_cols, now_rows) = terminal::size().unwrap_or((cols, rows));
+            if (now_cols, now_rows) != last_sent_size {
+                last_sent_size = (now_cols, now_rows);
+                #[cfg(windows)]
+                if is_controller {
+                    renderer.resize(now_rows, now_cols);
+                }
+                send_attach_resize(
+                    &mut write_half,
+                    &id_owned,
+                    now_rows,
+                    now_cols,
+                    !is_controller,
+                )
+                .await?;
+            }
+        }
+
         // Frame reads are not safe to keep cancelling with timeouts. Read
         // daemon frames in a dedicated task and receive them over a channel
         // instead. The channel is bounded (M5-1): when the render loop falls
@@ -488,23 +510,25 @@ async fn run_attach_inner(
                                 // carry stale dimensions on some platforms.
                                 let (actual_cols, actual_rows) =
                                     terminal::size().unwrap_or((cols, rows));
-                                if !is_controller {
-                                    // Observer: the resize is a viewport
-                                    // preference, not session geometry.
-                                    last_sent_size = (actual_cols, actual_rows);
-                                } else if (actual_cols, actual_rows) != last_sent_size {
+                                if (actual_cols, actual_rows) != last_sent_size {
                                     last_sent_size = (actual_cols, actual_rows);
 
                                     #[cfg(windows)]
-                                    renderer.resize(actual_rows, actual_cols);
+                                    if is_controller {
+                                        renderer.resize(actual_rows, actual_cols);
+                                    }
 
-                                    ipc::write_request_to_writer(
+                                    // Observers take control first: the
+                                    // daemon rejects observer resizes with
+                                    // NotController, so without the takeover
+                                    // an observer's window resize never
+                                    // reached the session.
+                                    send_attach_resize(
                                         &mut write_half,
-                                        RpcRequest::AttachResize {
-                                            id: id_owned.clone(),
-                                            rows: actual_rows,
-                                            cols: actual_cols,
-                                        },
+                                        &id_owned,
+                                        actual_rows,
+                                        actual_cols,
+                                        !is_controller,
                                     )
                                     .await?
                                 }
@@ -1321,6 +1345,36 @@ fn is_detach_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\u{4}'))
         || (matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
             && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
+}
+
+/// Push the client's terminal size to the daemon as session geometry.
+/// `take_control` first acquires the control lease: a native window
+/// resize signals intent to drive, and the daemon rejects observer
+/// resizes with NotController, so an observer's resize must take control
+/// (last-active-client-wins, same rule as attach) to reach the session.
+async fn send_attach_resize(
+    writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    id: &str,
+    rows: u16,
+    cols: u16,
+    take_control: bool,
+) -> Result<()> {
+    if take_control {
+        ipc::write_request_to_writer(
+            writer,
+            RpcRequest::AttachAcquireControl { id: id.to_string() },
+        )
+        .await?;
+    }
+    ipc::write_request_to_writer(
+        writer,
+        RpcRequest::AttachResize {
+            id: id.to_string(),
+            rows,
+            cols,
+        },
+    )
+    .await
 }
 
 /// Applied-cursor credit cadence (M3-5, I7): credits are backpressure

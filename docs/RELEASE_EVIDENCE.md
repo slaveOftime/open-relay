@@ -4,7 +4,7 @@ Item-by-item evidence for the PLAN §16 release checklist, for the 0.5.0
 beta line (`v0.5.x` branch; 0.3.x on `main` remains the stable default).
 Test names are exact; run any of them with
 `cargo test --locked --offline <name>`.
-Suite totals at this commit: **627 unit + 57 integration/e2e = 684 tests,
+Suite totals at this commit: **627 unit + 58 integration/e2e = 685 tests,
 0 ignored** (the M0-era ignored repro/probe tests were removed during the
 0.5.0 cleanup; their findings are recorded in the ADRs), `cargo fmt`
 clean, and **clippy is a zero-warning gate**:
@@ -91,7 +91,10 @@ checkpoint-anchored bounded replay (OJCK v2), and removal of the pre-0.5
   viewport:
   `attach_control_lease_gates_input_and_resize`,
   `attach_takeover_resizes_session_to_the_new_controllers_viewport`,
-  `attach_applied_cursor_credits_register_per_attachment`. (The separate
+  `attach_applied_cursor_credits_register_per_attachment`; native window
+  resizes propagate to the daemon (observers take control on resize) and a
+  startup-race resize is reconciled after the replay drain:
+  `e2e_attach_terminal_resize_reaches_the_daemon`. (The separate
   `oly control acquire/release` + `send --lease` parked-lease ceremony was
   removed: `oly send` is an ungated operator channel by design.)
 - [x] **Slow clients stay memory-bounded.** Enforced stream credits and

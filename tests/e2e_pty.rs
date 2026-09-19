@@ -1013,3 +1013,166 @@ fn e2e_attach_ctrl_right_bracket_then_d_detaches() {
         "attach did not report the detach.\noutput:\n{text}"
     );
 }
+
+/// Helper for attach-under-PTY tests: spawn `oly attach` (extra args
+/// allowed, e.g. `--observer`) at the given size and return the pieces a
+/// resize/detach scenario needs. Output is pumped on a thread so every
+/// wait in the caller has a real timeout.
+#[cfg(not(target_os = "windows"))]
+struct PtyAttach {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pump: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl PtyAttach {
+    fn spawn(tmp: &Path, id: &str, extra_args: &[&str], rows: u16, cols: u16) -> Self {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::io::Read;
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open pty pair");
+
+        let mut cmd = CommandBuilder::new(oly_bin());
+        cmd.arg("attach");
+        cmd.args(extra_args);
+        cmd.arg(id);
+        cmd.env("OLY_STATE_DIR", tmp.join("oly"));
+        cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(tmp));
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("spawn `oly attach` on the pty");
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+        let writer = pair.master.take_writer().expect("take pty writer");
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let pump = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if output_tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let attach = PtyAttach {
+            master: pair.master,
+            writer,
+            child,
+            output_rx,
+            pump: Some(pump),
+        };
+        attach.wait_for_output(Duration::from_secs(10));
+        attach
+    }
+
+    fn wait_for_output(&self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "`oly attach` produced no output on the pty"
+            );
+            match self.output_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(_) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        self.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize outer pty");
+    }
+
+    fn detach(mut self) {
+        use std::io::Write;
+        self.writer.write_all(b"\x1dd").ok();
+        let _ = self.child.wait();
+        while self
+            .output_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok()
+        {}
+        drop(self.writer);
+        drop(self.master);
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.join();
+        }
+    }
+}
+
+/// Ask the session itself how big it is: run `stty size` in the shell and
+/// watch the logs for the answer. This observes the real session PTY
+/// winsize end-to-end (client event -> IPC -> daemon -> TIOCSWINSZ).
+#[cfg(not(target_os = "windows"))]
+fn wait_for_session_size(tmp: &Path, id: &str, rows: u16, cols: u16, timeout: Duration) {
+    let expected = format!("{rows} {cols}");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        send_line(tmp, id, "stty size");
+        let log = fetch_logs_with_tail(tmp, id, 20);
+        if normalize_log_text(&log).contains(&expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session never reported size {expected}.\nlast logs:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Resizing the outer terminal while attached must reach the daemon and
+/// resize the session PTY (the controller has geometry authority).
+/// Regression test: a native-window resize previously went nowhere
+/// whenever the client was not the controller.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_attach_terminal_resize_reaches_the_daemon() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_attach_resize_propagates");
+    let _daemon = start_daemon(&tmp);
+    let id = start_session(&tmp, &["sh", "-i"]);
+
+    // Controller resize: 24x80 -> 40x100 propagates to the session PTY.
+    let controller = PtyAttach::spawn(&tmp, &id, &[], 24, 80);
+    controller.resize(40, 100);
+    wait_for_session_size(&tmp, &id, 40, 100, Duration::from_secs(15));
+
+    // A second, explicitly read-only attach starts as an observer.
+    let observer = PtyAttach::spawn(&tmp, &id, &["--observer"], 24, 80);
+
+    // Resizing the observer's window takes control (same last-active-wins
+    // rule as attach) and resizes the session to the observer's geometry.
+    observer.resize(50, 120);
+    wait_for_session_size(&tmp, &id, 50, 120, Duration::from_secs(15));
+
+    observer.detach();
+    controller.detach();
+}

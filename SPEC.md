@@ -173,6 +173,10 @@ The implemented top-level commands are:
   `--takeover` is accepted for compatibility and is the default behavior.
 - Browser attach behaves the same way: opening the attach view takes
   control and adopts the browser viewport.
+- Resizing an attached terminal window reports the new size to the daemon;
+  when the resizing client is an observer it first takes control (same
+  last-active-client-wins rule), so the session geometry always follows the
+  most recently resized active window.
 - The control lease is a coordination and observability mechanism (who is
   driving right now), not a security boundary: operator channels such as
   `oly send` reach the session regardless of lease ownership by design.
