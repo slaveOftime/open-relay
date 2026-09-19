@@ -47,6 +47,9 @@ honest migration instead.
 | API keys | one all-powerful daemon key | scoped keys (M5-4) | Old keys stop working; create new scoped keys with `oly api-key`. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
 | Input handling | timing heuristics for paste/keys | event-driven; paste boundaries come from bracketed-paste markers only (ADR-0003) | No action; apps that enable bracketed paste get exact paste boundaries. |
+| Attach control | first attach holds control; later attaches observe | attaching (CLI or browser) **takes control by default** and resizes the session to the new controller's viewport; the previous controller is demoted to observer | Use `oly attach --observer` for view-only attaches. Scripts that relied on attach-as-observer should add `--observer`. |
+| Detach keys | `Ctrl-]` then `d` (broken in some terminals) | `Ctrl-]` then `d` works in all supported terminals (plain `d` or Ctrl-held `d`) | No action. |
+| Daemon status | reported the client's config values | reports the running daemon's effective flags and HTTP endpoint (from the daemon's own record) | No action; `oly daemon start` against a running daemon now prints the running config and the remedy. |
 
 Everything else about the CLI is **additive**: new subcommands
 (`doctor`, `wait`, `screen`, `history`, `control`, `observe`, `notify`,

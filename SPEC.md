@@ -161,12 +161,22 @@ The implemented top-level commands are:
 - `--limit` defaults to `10`.
 - `--node` targets a connected secondary node.
 
-### `oly attach [id] [--node <name>]`
+### `oly attach [id] [--observer] [--takeover] [--node <name>]`
 
 - Attaches to a running session.
 - Replays recent buffered output first, then switches to live IO.
 - If `id` is omitted, `oly` resolves the most recently created session.
-- Detach escape is `Ctrl-]`, then `d`.
+- Interactive attach takes the control lease by default (last-active client
+  wins): the attaching client drives input and the session immediately
+  resizes to its viewport; any previous controller is demoted to observer.
+  `--observer` attaches view-only (never drives input or geometry).
+  `--takeover` is accepted for compatibility and is the default behavior.
+- Browser attach behaves the same way: opening the attach view takes
+  control and adopts the browser viewport.
+- The control lease is a coordination and observability mechanism (who is
+  driving right now), not a security boundary: operator channels such as
+  `oly send` reach the session regardless of lease ownership by design.
+- Detach escape is `Ctrl-]`, then `d` (a Ctrl-held `d` also detaches).
 
 ### `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]`
 

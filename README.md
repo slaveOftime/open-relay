@@ -108,7 +108,8 @@ Useful behavior to know:
 
 - `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
 - To detach from an attached session, press `Ctrl-]`, then `d`.
-- `oly ls --json` prints machine-readable output for scripts and agents.
+- Attaching (CLI or browser) takes control of the session by default and resizes it to the attaching client's viewport — the most recently active client always drives. Use `oly attach --observer` for a view-only attach that never drives input or geometry.
+- The control lease is coordination, not a security boundary: it records who is driving and demotes the previous controller, but operator commands like `oly send` reach the session regardless by design. Agents that want turn-taking should use `oly control acquire`/`release`; human attach needs no ceremony.
 
 ---
 
