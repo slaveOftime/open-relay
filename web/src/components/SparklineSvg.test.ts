@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { SparklineStore } from './SparklineSvg'
+import { SparklineStore } from './sparklineStore'
 
 describe('SparklineStore', () => {
   it('uses the first absolute total as a baseline only', () => {

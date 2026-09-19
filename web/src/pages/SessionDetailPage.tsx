@@ -260,6 +260,10 @@ function SessionDetailPageContent() {
     disarmAttachIdleAnimation()
   }, [disarmAttachIdleAnimation])
 
+  // Self-reference for the trailing-frame reflush below: a useCallback
+  // cannot reference itself directly, so the recursive call goes through
+  // a ref that is synced in an effect.
+  const flushTerminalOutputRef = useRef<() => void>(() => {})
   const flushTerminalOutput = useCallback(() => {
     if (outputWriteInFlightRef.current) {
       return
@@ -301,11 +305,15 @@ function SessionDetailPageContent() {
       ) {
         outputFlushRafRef.current = requestAnimationFrame(() => {
           outputFlushRafRef.current = null
-          flushTerminalOutput()
+          flushTerminalOutputRef.current()
         })
       }
     })
   }, [])
+
+  useEffect(() => {
+    flushTerminalOutputRef.current = flushTerminalOutput
+  }, [flushTerminalOutput])
 
   const enqueueTerminalOutput = useCallback(
     (chunks: Uint8Array[], opts?: { reset?: boolean }) => {
@@ -486,10 +494,19 @@ function SessionDetailPageContent() {
     }
   }, [])
 
+  // Mirror the store's live session into local state. Identity-compare
+  // render-time adjustment (React-recommended) instead of a
+  // setState-in-effect cascade.
+  const [prevLiveSession, setPrevLiveSession] = useState(liveSession)
+  if (liveSession !== prevLiveSession) {
+    setPrevLiveSession(liveSession)
+    if (liveSession) {
+      setSession((current) => (current === liveSession ? current : liveSession))
+    }
+  }
+
   useEffect(() => {
     if (!liveSession) return
-
-    setSession((current) => (current === liveSession ? current : liveSession))
 
     if (modeRef.current === 'attach') {
       const previous = previousLiveSessionRef.current
@@ -551,6 +568,15 @@ function SessionDetailPageContent() {
   useEffect(() => {
     fetchMoreLogsRef.current = fetchMoreLogs
   }, [fetchMoreLogs])
+
+  // Synced before `stepReplay` (which captures the ref) below — refs
+  // captured by hooks must not be mutated after the capture point.
+  // `handleScrub` is a hoisted function declaration, so the effect can
+  // reference it before its textual position.
+  const handleScrubRef = useRef<((val: number) => void) | null>(null)
+  useEffect(() => {
+    handleScrubRef.current = handleScrub
+  })
 
   const stepReplayRef = useRef<((delta: number) => Promise<void>) | null>(null)
   const stepReplay = useCallback(async (delta: number) => {
@@ -642,7 +668,9 @@ function SessionDetailPageContent() {
     if (mode !== 'attach' || !id || !sessionReady) return
 
     // ── WebSocket attach (local + remote node) ─────────────────────────────
-    pushConnectTrace('mode entered realtime connect view')
+    // Deferred: the trace is a state update and must not run synchronously
+    // inside the effect body.
+    queueMicrotask(() => pushConnectTrace('mode entered realtime connect view'))
     // Mark the start of this connection attempt before any async work so that
     // the visibilitychange / pageshow handlers (which fire during iOS PWA app
     // launch / page transitions) see a fresh attempt and do NOT trigger a
@@ -651,7 +679,9 @@ function SessionDetailPageContent() {
     // "don't reconnect while already connecting" guard in requestReconnect.
     connectAttemptStartedAtRef.current = Date.now()
     lastReconnectTriggerAtRef.current = Date.now()
-    setWsConnecting(true)
+    // Deferred: the connecting flag is a state update and must not run
+    // synchronously inside the effect body.
+    queueMicrotask(() => setWsConnecting(true))
 
     // ended: server sent an 'end' frame — session finished normally, no reconnect.
     // discarded: this effect run is being cleaned up — prevents stale onClose from
@@ -838,12 +868,18 @@ function SessionDetailPageContent() {
   ])
 
   useEffect(() => {
-    if (mode !== 'attach') setWsConnecting(false)
+    // Deferred: clearing the flag is a state update, not an effect-body
+    // responsibility.
+    if (mode !== 'attach') queueMicrotask(() => setWsConnecting(false))
   }, [mode])
 
   useEffect(() => {
     if (mode !== 'logs' || !isTailMode) return
-    setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
+    // Deferred: syncing the input is a state update, not an effect-body
+    // responsibility.
+    queueMicrotask(() =>
+      setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
+    )
   }, [mode, logsView, isTailMode, tailLimit])
 
   // iOS PWA: reconnect the WebSocket immediately when the app returns from
@@ -937,22 +973,26 @@ function SessionDetailPageContent() {
   useEffect(() => {
     if (mode !== 'logs' || !id) return
 
-    // Reset common state.
+    // Reset common state. Terminal/ref resets belong to the effect; the
+    // React state resets are deferred so they are not synchronous
+    // setState-in-effect cascades.
     termRef.current?.reset()
-    commitReplayIdx(0, { force: true })
+    queueMicrotask(() => {
+      commitReplayIdx(0, { force: true })
+      setIsReplaying(false)
+      setIsPaused(false)
+      setScrubberMax(0)
+      setTotalChunks(0)
+    })
     replayCommittedIdxRef.current = 0
     isReplayingRef.current = false
-    setIsReplaying(false)
-    setIsPaused(false)
     isPausedRef.current = false
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)
       replayTimerRef.current = null
     }
     getHistory()?.reset()
-    setScrubberMax(0)
     logReplayStateRef.current = initialLogReplayState()
-    setTotalChunks(0)
 
     let cancelled = false
 
@@ -1023,7 +1063,6 @@ function SessionDetailPageContent() {
   const isScrubbingRef = useRef(false)
   const wasPlayingBeforeScrubRef = useRef(false)
 
-  const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)
@@ -1047,8 +1086,6 @@ function SessionDetailPageContent() {
       )
     }
   }
-  handleScrubRef.current = handleScrub
-
   function startReplay(fromIdx = 0) {
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)

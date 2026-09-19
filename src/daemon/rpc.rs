@@ -81,11 +81,9 @@ pub(super) async fn handle_client(
         &request,
         RpcRequest::NodeProxy { inner, .. }
             if matches!(inner.as_ref(), RpcRequest::AttachSubscribe { .. })
-    ) {
-        if let RpcRequest::NodeProxy { node, inner } = request {
-            return handle_node_proxy_streaming(node, *inner, reader, write_half, &node_registry)
-                .await;
-        }
+    ) && let RpcRequest::NodeProxy { node, inner } = request
+    {
+        return handle_node_proxy_streaming(node, *inner, reader, write_half, &node_registry).await;
     }
 
     // Non-streaming path: dispatch and write single response.
@@ -645,6 +643,221 @@ async fn handle_doctor(id: Option<String>, db: &Arc<Database>) -> RpcResponse {
     RpcResponse::Doctor { results }
 }
 
+async fn handle_logs_pagination(
+    id: String,
+    offset: Option<usize>,
+    limit: usize,
+    session_store: &SessionStoreHandle,
+    db: &Arc<Database>,
+) -> RpcResponse {
+    let session_dir = match db.get_session_dir(&id).await {
+        Ok(Some(dir)) => dir,
+        Ok(None) => {
+            return RpcResponse::Error {
+                message: format!("session not found: {id}"),
+            };
+        }
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+    };
+
+    let page = match read_persisted_log_page(&session_dir, offset.unwrap_or(0), limit) {
+        // Pre-1.0 log format: explicit, actionable error (M6-2).
+        Err(message) => return RpcResponse::Error { message },
+        Ok(page) => page.map(|(lines, total)| (lines, total, offset.unwrap_or(0))),
+    };
+
+    match page {
+        Some((lines, mut total, offset)) => {
+            if let Ok(live_total) = session_store.read_live_log_chunk_count(&id).await {
+                total += live_total;
+            }
+            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
+            RpcResponse::LogsPagination {
+                offset,
+                lines,
+                total,
+                resizes,
+            }
+        }
+        None => RpcResponse::Error {
+            message: format!("session not found: {id}"),
+        },
+    }
+}
+
+async fn handle_logs_wait(
+    id: String,
+    timeout_ms: u64,
+    session_store: &SessionStoreHandle,
+    notification_tx: &NotificationTx,
+    db: &Arc<Database>,
+) -> RpcResponse {
+    if let Err(err) = db.get_session_dir(&id).await {
+        return RpcResponse::Error {
+            message: err.to_string(),
+        };
+    }
+
+    if timeout_ms == 0
+        || !session_store.is_running(&id)
+        || session_store.is_input_needed(&id)
+        || session_store.is_silent_for(&id, std::time::Duration::from_secs(10))
+    {
+        return RpcResponse::Empty;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut notify_rx = notification_tx.subscribe();
+    let mut state_poll = tokio::time::interval(std::time::Duration::from_millis(100));
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+
+    'wait: loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline_sleep => break 'wait,
+            _ = state_poll.tick() => {
+                if !session_store.is_running(&id) || session_store.is_silent_for(&id, std::time::Duration::from_secs(5)) {
+                    break 'wait;
+                }
+            }
+            notif = notify_rx.recv() => {
+                match notif {
+                    Ok(event) => {
+                        if matches!(event.kind, crate::notification::event::NotificationKind::InputNeeded)
+                            && event.session_ids.iter().any(|s| s == &id)
+                        {
+                            break 'wait;
+                        }
+                        debug!(event = ?event.kind, "other event or session received");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
+                }
+            }
+        }
+    }
+
+    RpcResponse::Empty
+}
+
+async fn handle_api_key_add(name: String, scopes: String, db: &Arc<Database>) -> RpcResponse {
+    if let Err(message) = crate::http::auth::validate_scope_list(&scopes) {
+        return RpcResponse::Error { message };
+    }
+    use rand::RngCore;
+    let mut key_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut key_bytes);
+    let plaintext: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    match auth::hash_password(&plaintext) {
+        Ok(hash) => match db.add_api_key(&name, &hash, &scopes).await {
+            Ok(()) => {
+                info!(name, "api key registered");
+                RpcResponse::ApiKeyAdd {
+                    plaintext_key: plaintext,
+                }
+            }
+            Err(e) => RpcResponse::Error {
+                message: e.to_string(),
+            },
+        },
+        Err(e) => RpcResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+async fn handle_api_key_list(db: &Arc<Database>) -> RpcResponse {
+    match db.list_api_keys().await {
+        Ok(records) => RpcResponse::ApiKeyList {
+            keys: records
+                .into_iter()
+                .map(|r| ApiKeySummary {
+                    name: r.name,
+                    created_at: r.created_at,
+                    scopes: r.scopes,
+                })
+                .collect(),
+        },
+        Err(e) => RpcResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+async fn handle_api_key_remove(name: String, db: &Arc<Database>) -> RpcResponse {
+    match db.delete_api_key(&name).await {
+        Ok(removed) => {
+            info!(name, removed, "api key removed");
+            RpcResponse::ApiKeyRemove { removed }
+        }
+        Err(e) => RpcResponse::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+async fn handle_join_start(
+    config: &Arc<AppConfig>,
+    join_handles: &JoinHandles,
+    session_event_tx: &SessionEventTx,
+    url: String,
+    name: String,
+    key: String,
+) -> Result<RpcResponse> {
+    let join = client::join::JoinConfig {
+        name: name.clone(),
+        primary_url: url,
+        api_key: key,
+    };
+    client::join::save_join_config(config, &join)?;
+    let (abort, stop_tx) =
+        spawn_join_connector(join, Arc::clone(config), session_event_tx.subscribe());
+    join_handles.lock().await.insert(name, (abort, stop_tx));
+    Ok(RpcResponse::Ack)
+}
+
+async fn handle_join_stop(
+    config: &AppConfig,
+    join_handles: &JoinHandles,
+    name: String,
+) -> RpcResponse {
+    client::join::remove_join_config(config, &name);
+    if let Some((abort, stop_tx)) = join_handles.lock().await.remove(&name) {
+        let _ = stop_tx.send(true);
+        drop(abort);
+    }
+    RpcResponse::Ack
+}
+
+async fn handle_join_list(
+    config: &AppConfig,
+    node_registry: &NodeRegistry,
+    primary: bool,
+) -> RpcResponse {
+    let joins = if primary {
+        node_registry
+            .connected_names()
+            .await
+            .iter()
+            .map(|n| JoinSummary {
+                name: n.clone(),
+                primary_url: "".into(),
+                connected: true,
+            })
+            .collect()
+    } else {
+        client::join::list_join_summaries(config)
+    };
+
+    RpcResponse::JoinList { joins }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{handle_doctor, handle_logs_tail};
@@ -1060,7 +1273,7 @@ mod tests {
                 &mut writer_a,
                 RpcRequest::AttachInput {
                     id: "ipcconf1".into(),
-                    data: "ls".into(),
+                    data: b"ls".to_vec(),
                     wait_for_change: false,
                     attachment_id: Some(attachment_id),
                 },
@@ -1080,7 +1293,7 @@ mod tests {
                 &mut writer_a,
                 RpcRequest::AttachInput {
                     id: "ipcconf1".into(),
-                    data: "x".into(),
+                    data: b"x".to_vec(),
                     wait_for_change: false,
                     attachment_id: Some(attachment_id + 1_000),
                 },
@@ -1101,7 +1314,6 @@ mod tests {
                 rt.push_output(b"\n", 1);
                 let offset = rt.filtered_stream_len() - 1;
                 let _ = rt.broadcast_tx.send(SequencedChunk {
-                    cursor: None,
                     offset,
                     bytes: Bytes::from_static(b"\n"),
                 });
@@ -1219,7 +1431,7 @@ mod tests {
                 &mut writer_d,
                 RpcRequest::AttachInput {
                     id: "ipcconf1".into(),
-                    data: "nope".into(),
+                    data: b"nope".to_vec(),
                     wait_for_change: false,
                     attachment_id: None,
                 },
@@ -1265,7 +1477,7 @@ mod tests {
                 &mut writer_d,
                 RpcRequest::AttachInput {
                     id: "ipcconf1".into(),
-                    data: "go".into(),
+                    data: b"go".to_vec(),
                     wait_for_change: false,
                     attachment_id: None,
                 },
@@ -1282,216 +1494,4 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
     }
-}
-
-async fn handle_logs_pagination(
-    id: String,
-    offset: Option<usize>,
-    limit: usize,
-    session_store: &SessionStoreHandle,
-    db: &Arc<Database>,
-) -> RpcResponse {
-    let session_dir = match db.get_session_dir(&id).await {
-        Ok(Some(dir)) => dir,
-        Ok(None) => {
-            return RpcResponse::Error {
-                message: format!("session not found: {id}"),
-            };
-        }
-        Err(err) => {
-            return RpcResponse::Error {
-                message: err.to_string(),
-            };
-        }
-    };
-
-    let page = read_persisted_log_page(&session_dir, offset.unwrap_or(0), limit)
-        .map(|(lines, total)| (lines, total, offset.unwrap_or(0)));
-
-    match page {
-        Some((lines, mut total, offset)) => {
-            if let Ok(live_total) = session_store.read_live_log_chunk_count(&id).await {
-                total += live_total;
-            }
-            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
-            RpcResponse::LogsPagination {
-                offset,
-                lines,
-                total,
-                resizes,
-            }
-        }
-        None => RpcResponse::Error {
-            message: format!("session not found: {id}"),
-        },
-    }
-}
-
-async fn handle_logs_wait(
-    id: String,
-    timeout_ms: u64,
-    session_store: &SessionStoreHandle,
-    notification_tx: &NotificationTx,
-    db: &Arc<Database>,
-) -> RpcResponse {
-    if let Err(err) = db.get_session_dir(&id).await {
-        return RpcResponse::Error {
-            message: err.to_string(),
-        };
-    }
-
-    if timeout_ms == 0
-        || !session_store.is_running(&id)
-        || session_store.is_input_needed(&id)
-        || session_store.is_silent_for(&id, std::time::Duration::from_secs(10))
-    {
-        return RpcResponse::Empty;
-    }
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let mut notify_rx = notification_tx.subscribe();
-    let mut state_poll = tokio::time::interval(std::time::Duration::from_millis(100));
-    let deadline_sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(deadline_sleep);
-
-    'wait: loop {
-        tokio::select! {
-            biased;
-            _ = &mut deadline_sleep => break 'wait,
-            _ = state_poll.tick() => {
-                if !session_store.is_running(&id) || session_store.is_silent_for(&id, std::time::Duration::from_secs(5)) {
-                    break 'wait;
-                }
-            }
-            notif = notify_rx.recv() => {
-                match notif {
-                    Ok(event) => {
-                        if matches!(event.kind, crate::notification::event::NotificationKind::InputNeeded)
-                            && event.session_ids.iter().any(|s| s == &id)
-                        {
-                            break 'wait;
-                        }
-                        debug!(event = ?event.kind, "other event or session received");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
-                }
-            }
-        }
-    }
-
-    RpcResponse::Empty
-}
-
-async fn handle_api_key_add(name: String, scopes: String, db: &Arc<Database>) -> RpcResponse {
-    if let Err(message) = crate::http::auth::validate_scope_list(&scopes) {
-        return RpcResponse::Error { message };
-    }
-    use rand::RngCore;
-    let mut key_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
-    let plaintext: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
-
-    match auth::hash_password(&plaintext) {
-        Ok(hash) => match db.add_api_key(&name, &hash, &scopes).await {
-            Ok(()) => {
-                info!(name, "api key registered");
-                RpcResponse::ApiKeyAdd {
-                    plaintext_key: plaintext,
-                }
-            }
-            Err(e) => RpcResponse::Error {
-                message: e.to_string(),
-            },
-        },
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
-async fn handle_api_key_list(db: &Arc<Database>) -> RpcResponse {
-    match db.list_api_keys().await {
-        Ok(records) => RpcResponse::ApiKeyList {
-            keys: records
-                .into_iter()
-                .map(|r| ApiKeySummary {
-                    name: r.name,
-                    created_at: r.created_at,
-                    scopes: r.scopes,
-                })
-                .collect(),
-        },
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
-async fn handle_api_key_remove(name: String, db: &Arc<Database>) -> RpcResponse {
-    match db.delete_api_key(&name).await {
-        Ok(removed) => {
-            info!(name, removed, "api key removed");
-            RpcResponse::ApiKeyRemove { removed }
-        }
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
-async fn handle_join_start(
-    config: &Arc<AppConfig>,
-    join_handles: &JoinHandles,
-    session_event_tx: &SessionEventTx,
-    url: String,
-    name: String,
-    key: String,
-) -> Result<RpcResponse> {
-    let join = client::join::JoinConfig {
-        name: name.clone(),
-        primary_url: url,
-        api_key: key,
-    };
-    client::join::save_join_config(config, &join)?;
-    let (abort, stop_tx) =
-        spawn_join_connector(join, Arc::clone(config), session_event_tx.subscribe());
-    join_handles.lock().await.insert(name, (abort, stop_tx));
-    Ok(RpcResponse::Ack)
-}
-
-async fn handle_join_stop(
-    config: &AppConfig,
-    join_handles: &JoinHandles,
-    name: String,
-) -> RpcResponse {
-    client::join::remove_join_config(config, &name);
-    if let Some((abort, stop_tx)) = join_handles.lock().await.remove(&name) {
-        let _ = stop_tx.send(true);
-        drop(abort);
-    }
-    RpcResponse::Ack
-}
-
-async fn handle_join_list(
-    config: &AppConfig,
-    node_registry: &NodeRegistry,
-    primary: bool,
-) -> RpcResponse {
-    let joins = if primary {
-        node_registry
-            .connected_names()
-            .await
-            .iter()
-            .map(|n| JoinSummary {
-                name: n.clone(),
-                primary_url: "".into(),
-                connected: true,
-            })
-            .collect()
-    } else {
-        client::join::list_join_summaries(config)
-    };
-
-    RpcResponse::JoinList { joins }
 }

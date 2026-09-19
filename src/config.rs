@@ -363,7 +363,7 @@ impl AppConfig {
 /// Encode raw bytes as base64url without padding.
 fn base64url_no_pad(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((bytes.len() * 4 + 2) / 3);
+    let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
         let b1 = chunk.get(1).copied().unwrap_or(0);
@@ -442,7 +442,7 @@ pub fn ensure_config_file(state_dir: &Path) {
     }
 }
 
-fn load_overrides(state_dir: &PathBuf) -> AppConfigOverrides {
+fn load_overrides(state_dir: &std::path::Path) -> AppConfigOverrides {
     let path = state_dir.join("config.json");
     let Ok(raw) = std::fs::read_to_string(path) else {
         return AppConfigOverrides::default();

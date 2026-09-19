@@ -232,7 +232,7 @@ async fn run() -> Result<()> {
                         return Ok(());
                     }
                     if let Err(err) = client::run_attach(&config, &session_id, None).await {
-                        eprintln!("");
+                        eprintln!();
                         eprintln!(
                             "warning: started session {session_id}, but failed to attach: {err}"
                         );
@@ -482,7 +482,7 @@ async fn run() -> Result<()> {
                         if keys.is_empty() {
                             println!("No API keys registered.");
                         } else {
-                            println!("{:<24} {:<20} {}", "NAME", "SCOPES", "CREATED");
+                            println!("{:<24} {:<20} CREATED", "NAME", "SCOPES");
                             for k in keys {
                                 let created = k
                                     .created_at
@@ -526,7 +526,7 @@ async fn run() -> Result<()> {
                         if nodes.is_empty() {
                             println!("No secondary nodes connected.");
                         } else {
-                            println!("{}", "NAME");
+                            println!("NAME");
                             for n in nodes {
                                 println!("{}", n);
                             }
@@ -561,7 +561,7 @@ async fn run() -> Result<()> {
                                 println!("{:<24}", j.name);
                             }
                         } else {
-                            println!("{:<24} {:<12} {}", "NAME", "STATUS", "PRIMARY URL");
+                            println!("{:<24} {:<12} PRIMARY URL", "NAME", "STATUS");
                             for j in joins {
                                 let status = if j.connected { "connected" } else { "saved" };
                                 println!("{:<24} {:<12} {}", j.name, status, j.primary_url);

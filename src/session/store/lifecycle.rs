@@ -458,10 +458,8 @@ impl SessionStore {
         )
         .await;
 
-        if terminated {
-            if let Some(summary) = self.get_summary(id) {
-                let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
-            }
+        if terminated && let Some(summary) = self.get_summary(id) {
+            let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
         }
 
         terminated

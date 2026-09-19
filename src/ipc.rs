@@ -513,6 +513,9 @@ mod tests {
         let control = RpcResponse::AttachModeChanged {
             app_cursor_keys: true,
             bracketed_paste_mode: false,
+            mouse_report: false,
+            sgr_mouse: false,
+            focus_events: false,
         };
 
         let (mut tx, rx) = tokio::io::duplex(64 * 1024);
@@ -559,7 +562,8 @@ mod tests {
                         *resp,
                         RpcResponse::AttachModeChanged {
                             app_cursor_keys: true,
-                            bracketed_paste_mode: false
+                            bracketed_paste_mode: false,
+                            ..
                         }
                     ));
                     seen_control = true;

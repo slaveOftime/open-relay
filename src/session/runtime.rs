@@ -40,6 +40,12 @@ use crate::terminal::{EngineEvent, Terminal};
 pub struct ModeSnapshot {
     pub app_cursor_keys: bool,
     pub bracketed_paste_mode: bool,
+    /// Child has mouse reporting enabled (any of 1000/1002/1003).
+    pub mouse_report: bool,
+    /// Child negotiated SGR (1006) mouse encoding.
+    pub sgr_mouse: bool,
+    /// Child has focus in/out reporting (1004) enabled.
+    pub focus_events: bool,
 }
 
 /// Lock-free publication of the session's input-affecting terminal modes.
@@ -55,6 +61,9 @@ pub struct SharedModes(std::sync::atomic::AtomicU8);
 
 const MODE_BIT_APP_CURSOR_KEYS: u8 = 1 << 0;
 const MODE_BIT_BRACKETED_PASTE: u8 = 1 << 1;
+const MODE_BIT_MOUSE_REPORT: u8 = 1 << 2;
+const MODE_BIT_SGR_MOUSE: u8 = 1 << 3;
+const MODE_BIT_FOCUS_EVENTS: u8 = 1 << 4;
 
 impl SharedModes {
     pub fn load(&self) -> ModeSnapshot {
@@ -62,6 +71,9 @@ impl SharedModes {
         ModeSnapshot {
             app_cursor_keys: bits & MODE_BIT_APP_CURSOR_KEYS != 0,
             bracketed_paste_mode: bits & MODE_BIT_BRACKETED_PASTE != 0,
+            mouse_report: bits & MODE_BIT_MOUSE_REPORT != 0,
+            sgr_mouse: bits & MODE_BIT_SGR_MOUSE != 0,
+            focus_events: bits & MODE_BIT_FOCUS_EVENTS != 0,
         }
     }
 
@@ -73,19 +85,24 @@ impl SharedModes {
         if modes.bracketed_paste_mode {
             bits |= MODE_BIT_BRACKETED_PASTE;
         }
+        if modes.mouse_report {
+            bits |= MODE_BIT_MOUSE_REPORT;
+        }
+        if modes.sgr_mouse {
+            bits |= MODE_BIT_SGR_MOUSE;
+        }
+        if modes.focus_events {
+            bits |= MODE_BIT_FOCUS_EVENTS;
+        }
         self.0.store(bits, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// One broadcast unit of the canonical filtered stream, tagged with the
-/// journal cursor of the raw PTY chunk it came from when the shadow
-/// journal recorded it; `None` when no journal is enabled (or it is
-/// degraded), in which case consumers fall back to offset-based replay.
-/// Sent inside the same write-lock section that sequenced the journal
-/// record, so cursor order and broadcast order agree (PLAN.md §4.1).
+/// One broadcast unit of the canonical filtered stream. Sent inside the
+/// same write-lock section that sequenced the journal record, so
+/// journal order and broadcast order agree (PLAN.md §4.1).
 #[derive(Debug, Clone)]
 pub struct SequencedChunk {
-    pub cursor: Option<journal::JournalCursor>,
     /// Filtered-stream offset of the first byte (I2): the attach pump
     /// trims overlaps and detects gaps against this instead of trusting
     /// broadcast delivery order blindly.
@@ -179,18 +196,19 @@ pub struct SessionRuntime {
     /// incarnation; `None` until the baseline revision is recorded.
     pub(crate) journaled_modes: Option<ModeSnapshot>,
     pub notifications_enabled: bool,
-    /// M1 shadow journal (dev-only `OLY_JOURNAL=1`): the per-session
-    /// sequencing point for output, resize and lifecycle facts. The mutex
-    /// only covers in-memory sequencing plus a bounded, non-blocking queue
-    /// submit — never disk I/O — so it is safe to take while the runtime
-    /// write lock is held (that lock is what orders mutation, sequencing
-    /// and publication against each other; PLAN.md §4.1 item 4).
+    /// The session's canonical journal (ADR-0002): the per-session
+    /// sequencing point for output, resize and lifecycle facts. Always on
+    /// since M6-2; `None` only for runtimes constructed without a session
+    /// directory (tests). The mutex only covers in-memory sequencing plus
+    /// a bounded, non-blocking queue submit — never disk I/O — so it is
+    /// safe to take while the runtime write lock is held (that lock is
+    /// what orders mutation, sequencing and publication against each
+    /// other; PLAN.md §4.1 item 4).
     pub journal: Option<parking_lot::Mutex<ShadowJournal>>,
-    /// Set the first time a journal record fails (M3-1, ADR-0006): the
-    /// journal is becoming canonical, so a session whose history can no
-    /// longer be recorded is stopped (marked `Failed`) instead of
-    /// continuing to run unrecorded. Atomic because `journal_event` only
-    /// holds `&self`.
+    /// Set the first time a journal record fails (ADR-0006): a session
+    /// whose history can no longer be recorded is stopped (marked
+    /// `Failed`) instead of continuing to run unrecorded. Atomic because
+    /// `journal_event` only holds `&self`.
     pub journal_failed: std::sync::atomic::AtomicBool,
 }
 
@@ -210,12 +228,17 @@ const PTY_WRITER_QUEUE_CAPACITY: usize = 4096;
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 
 impl SessionRuntime {
-    /// Current terminal mode snapshot (DECCKM, bracketed paste).
+    /// Current terminal mode snapshot (DECCKM, bracketed paste, mouse
+    /// and focus reporting) — everything an attach client needs to decide
+    /// which local terminal capabilities to enable and forward.
     pub fn mode_snapshot(&self) -> ModeSnapshot {
         let modes = self.engine.modes();
         ModeSnapshot {
             app_cursor_keys: modes.app_cursor_keys,
             bracketed_paste_mode: modes.bracketed_paste,
+            mouse_report: modes.mouse_report,
+            sgr_mouse: modes.sgr_mouse,
+            focus_events: modes.focus_events,
         }
     }
 
@@ -578,7 +601,7 @@ impl SessionRuntime {
         match self.pty.try_wait() {
             Ok(Some(code)) => {
                 debug!(session_id = %self.meta.id, exit_code = code, "child process exited");
-                let status = self.requested_final_status.unwrap_or_else(|| {
+                let status = self.requested_final_status.unwrap_or({
                     if code == 0 {
                         SessionStatus::Stopped
                     } else {
@@ -693,15 +716,18 @@ impl SessionRuntime {
     /// fails, the journal's degraded state is the explicit
     /// incomplete-capture boundary rather than a silently mis-ordered or
     /// non-durable ending.
-    pub fn close_output_stream(&mut self, detail: String) {
+    /// `scanner_idle`: whether the reader thread's scanner held no partial
+    /// escape at EOF — the final checkpoint is a replay anchor only then.
+    pub fn close_output_stream_at_boundary(&mut self, detail: String, scanner_idle: bool) {
         if self.output_closed {
             return;
         }
         self.output_closed = true;
         self.journal_lifecycle(LifecycleCode::OutputClosed, None, &detail);
         // Anchor the final state so retention and replay can start from
-        // the checkpoint instead of the raw prefix (PLAN §5.3).
-        self.journal_checkpoint();
+        // the checkpoint instead of the raw prefix (PLAN §5.3); a trailing
+        // partial escape at EOF makes this retention-only.
+        self.journal_checkpoint(scanner_idle);
         if let Some((code, exit_code, completion_detail)) = self.pending_journal_completion.take() {
             self.journal_terminal_end(code, exit_code, &completion_detail);
         }
@@ -709,8 +735,12 @@ impl SessionRuntime {
 
     /// Journal a checkpoint of the current engine state, then run
     /// checkpoint-gated retention off the write lock. No-op when the
-    /// shadow journal is disabled.
-    fn journal_checkpoint(&mut self) {
+    /// runtime has no journal (tests without a session directory).
+    /// `anchored` is true only when the reader thread's scanner is idle at
+    /// this boundary (no partial escape buffered); anchored checkpoints
+    /// carry the filtered-stream offset and double as replay anchors
+    /// (PLAN §5.3), unanchored ones still gate retention.
+    fn journal_checkpoint(&mut self, anchored: bool) {
         if self.journal.is_none() {
             return;
         }
@@ -732,6 +762,14 @@ impl SessionRuntime {
             alt_screen: modes.alt_screen,
             app_cursor_keys: modes.app_cursor_keys,
             bracketed_paste: modes.bracketed_paste,
+            // Anchor (PLAN §5.3): replay may start at this record and treat
+            // the derived filtered stream as beginning at this offset. 0 =
+            // unanchored (scanner mid-escape): retention-only.
+            filtered_offset: if anchored {
+                self.filtered_total_bytes
+            } else {
+                0
+            },
             program: Bytes::from(program),
         };
         self.journal_event(|journal| journal.record_checkpoint(&checkpoint).map(|_| ()));
@@ -752,13 +790,13 @@ impl SessionRuntime {
     /// `JOURNAL_CHECKPOINT_INTERVAL_BYTES` of filtered output (a
     /// conservative proxy for raw journaled bytes: filtered <= raw) —
     /// this bounds replay-from-checkpoint work (PLAN §5.3 cadence).
-    fn journal_checkpoint_if_due(&mut self) {
+    fn journal_checkpoint_if_due(&mut self, scanner_idle: bool) {
         if self
             .filtered_total_bytes
             .saturating_sub(self.last_journal_checkpoint_at)
             >= JOURNAL_CHECKPOINT_INTERVAL_BYTES
         {
-            self.journal_checkpoint();
+            self.journal_checkpoint(scanner_idle);
         }
     }
 
@@ -771,8 +809,8 @@ impl SessionRuntime {
 
     /// Sequence one event into the journal. Failures degrade the journal
     /// explicitly and are logged once (on the transition into the degraded
-    /// state); since M3-1 the journal is becoming canonical, so a failure
-    /// also sets the fail-loud flag that stops the session (ADR-0006).
+    /// state); the journal is canonical, so a failure also sets the
+    /// fail-loud flag that stops the session (ADR-0006).
     fn journal_event(
         &self,
         record: impl FnOnce(
@@ -811,17 +849,9 @@ impl SessionRuntime {
             .map(|journal| journal.lock().core.incarnation())
     }
 
-    /// Journal one raw PTY chunk; returns its cursor when recorded.
-    fn journal_output(&self, payload: Bytes) -> Option<journal::JournalCursor> {
-        let mut sequenced = None;
-        self.journal_event(|journal| {
-            let result = journal.record_output(payload.clone());
-            if let Ok(cursor) = &result {
-                sequenced = Some(*cursor);
-            }
-            result.map(|_| ())
-        });
-        sequenced
+    /// Journal one raw PTY chunk (ADR-0002: the raw stream is canonical).
+    fn journal_output(&self, payload: Bytes) {
+        self.journal_event(|journal| journal.record_output(payload).map(|_| ()));
     }
 
     fn journal_policy(&self, key: &str, value: &str) {
@@ -840,9 +870,12 @@ impl SessionRuntime {
             return;
         }
         let value = format!(
-            "app_cursor_keys={},bracketed_paste={}",
+            "app_cursor_keys={},bracketed_paste={},mouse_report={},sgr_mouse={},focus_events={}",
             u8::from(current.app_cursor_keys),
-            u8::from(current.bracketed_paste_mode)
+            u8::from(current.bracketed_paste_mode),
+            u8::from(current.mouse_report),
+            u8::from(current.sgr_mouse),
+            u8::from(current.focus_events),
         );
         self.journal_policy("modes", &value);
         self.journaled_modes = Some(current);
@@ -1180,13 +1213,13 @@ pub fn spawn_session(
                     // positions), advance the stream counters, and publish
                     // any changed notifications (adopting a terminal-emitted
                     // title while the session has no user-chosen one).
-                    let (query_responses, meta_update, chunk_cursor, chunk_offset, journal_stop) = {
+                    let (query_responses, meta_update, chunk_offset, journal_stop) = {
                         let mut rt = runtime_reader.write();
                         // Journal the exact bytes read from the PTY —
                         // pre-filter — so replay and post-mortems never lose
                         // data the scan pipeline dropped (PLAN.md I4). This
                         // happens even when the filtered chunk is empty.
-                        let chunk_cursor = rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
+                        rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
                         let query_responses = rt.feed_engine(&buf[..n]);
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
@@ -1198,8 +1231,9 @@ pub fn spawn_session(
                         // A mode flip lands immediately after the output
                         // that caused it, in the same order a replay sees.
                         rt.journal_modes_if_changed();
-                        // Checkpoint past the configured raw-byte interval.
-                        rt.journal_checkpoint_if_due();
+                        // Checkpoint past the configured raw-byte interval;
+                        // anchored only at an idle scanner boundary.
+                        rt.journal_checkpoint_if_due(scanner.is_idle());
                         // ADR-0006: a journal failure stops the session
                         // cleanly (Failed) instead of running unrecorded.
                         let journal_stop = rt.journal_failed().then(|| {
@@ -1210,7 +1244,6 @@ pub fn spawn_session(
                         (
                             query_responses,
                             meta_changed.then(|| rt.to_summary()),
-                            chunk_cursor,
                             chunk_offset,
                             journal_stop,
                         )
@@ -1236,7 +1269,6 @@ pub fn spawn_session(
                     // the persisted log on the next tick).
                     if !filtered.is_empty()
                         && let Ok(receiver_count) = broadcast_tx_reader.send(SequencedChunk {
-                            cursor: chunk_cursor,
                             offset: chunk_offset,
                             bytes: filtered.clone(),
                         })
@@ -1289,7 +1321,9 @@ pub fn spawn_session(
                 }
             }
         };
-        runtime_reader.write().close_output_stream(close_detail);
+        runtime_reader
+            .write()
+            .close_output_stream_at_boundary(close_detail, scanner.is_idle());
         debug!(session_id = %reader_session_id, "PTY reader thread stopped");
     });
 
@@ -1616,7 +1650,7 @@ mod tests {
 
         assert!(!rt.journal_failed());
         let huge = Bytes::from(vec![0u8; 65 * 1024 * 1024]);
-        assert!(rt.journal_output(huge).is_none());
+        rt.journal_output(huge);
         assert!(
             rt.journal_failed(),
             "a failed journal record must set the fail-loud flag"
@@ -1636,7 +1670,7 @@ mod tests {
 
         // The output stream has drained (EOF), so completion is journaled
         // immediately, after the OutputClosed fact.
-        rt.close_output_stream("pty output closed (eof)".to_string());
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
         rt.mark_completed(SessionStatus::Killed, Some(-9));
         // Idempotent completion must not duplicate the end fact.
         rt.mark_completed(SessionStatus::Killed, Some(-9));
@@ -1704,7 +1738,7 @@ mod tests {
         let expected_history_len = rt.engine.history_size();
         assert!(expected_history_len > 0, "content must have scrolled off");
 
-        rt.close_output_stream("pty output closed (eof)".to_string());
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
 
         // Drain until the checkpoint is durable.
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -1762,10 +1796,10 @@ mod tests {
 
         // Below the interval: nothing.
         rt.filtered_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES - 1;
-        rt.journal_checkpoint_if_due();
+        rt.journal_checkpoint_if_due(true);
         // Crossing the interval: a checkpoint is sequenced.
         rt.filtered_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES;
-        rt.journal_checkpoint_if_due();
+        rt.journal_checkpoint_if_due(true);
         assert_eq!(rt.last_journal_checkpoint_at, rt.filtered_total_bytes);
         {
             let journal = rt.journal.as_ref().unwrap().lock();
@@ -1773,7 +1807,7 @@ mod tests {
         }
         // And not again until another interval passes.
         rt.filtered_total_bytes += 1;
-        rt.journal_checkpoint_if_due();
+        rt.journal_checkpoint_if_due(true);
         {
             let journal = rt.journal.as_ref().unwrap().lock();
             assert_eq!(journal.core.head_seq(), Some(1));
@@ -1832,7 +1866,10 @@ mod tests {
         assert_eq!(outcome.records[1].kind, journal::RecordKind::Policy);
         assert_eq!(
             journal::parse_policy(&outcome.records[1].payload),
-            Some(("modes", "app_cursor_keys=0,bracketed_paste=1"))
+            Some((
+                "modes",
+                "app_cursor_keys=0,bracketed_paste=1,mouse_report=0,sgr_mouse=0,focus_events=0"
+            ))
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1858,9 +1895,9 @@ mod tests {
             assert_eq!(journal.core.head_seq(), Some(1));
         }
 
-        rt.close_output_stream("pty output closed (eof)".to_string());
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
         // A duplicate close must not re-record anything.
-        rt.close_output_stream("pty output closed (eof)".to_string());
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
 
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1941,6 +1978,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: false,
                 bracketed_paste_mode: true,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
@@ -1960,6 +2000,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: false,
                 bracketed_paste_mode: false,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
@@ -1978,6 +2021,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: true,
                 bracketed_paste_mode: false,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
@@ -1997,6 +2043,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: false,
                 bracketed_paste_mode: false,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(

@@ -65,11 +65,11 @@ pub fn resolve_state_dir() -> PathBuf {
             return PathBuf::from(xdg_state_home).join("oly");
         }
 
-        return dirs::home_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".local")
             .join("state")
-            .join("oly");
+            .join("oly")
     }
 
     #[cfg(target_os = "macos")]

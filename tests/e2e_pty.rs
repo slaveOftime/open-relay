@@ -1,7 +1,7 @@
 mod e2e;
 
 use e2e::*;
-use std::{fs, path::PathBuf, thread::sleep, time::Duration};
+use std::{fs, path::Path, thread::sleep, time::Duration};
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
@@ -43,7 +43,7 @@ fn bash_shell_timeout() -> Duration {
 }
 
 fn wait_for_prompted_output<I, S>(
-    tmp: &PathBuf,
+    tmp: &Path,
     id: &str,
     baseline: &str,
     prompt: &str,
@@ -90,7 +90,7 @@ where
     .map(|log| normalize_log_text(&log))
 }
 
-fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
+fn start_bash_session(tmp: &Path, test_name: &str) -> Option<String> {
     if !program_exists("bash") {
         eprintln!("SKIP {test_name}: bash not found on PATH");
         return None;

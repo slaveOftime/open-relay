@@ -21,14 +21,24 @@ export default function LoginDialog({ open, onSuccess }: LoginDialogProps) {
   const [countdown, setCountdown] = useState<string>('')
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // Focus the password field whenever the dialog opens.
-  useEffect(() => {
+  // Reset the form whenever the dialog (re)opens. Render-time adjustment
+  // on the open transition is the React-recommended alternative to a
+  // setState-in-effect cascade.
+  const [prevOpen, setPrevOpen] = useState(open)
+  if (prevOpen !== open) {
+    setPrevOpen(open)
     if (open) {
       setPassword('')
       setError(null)
       setAttemptsRemaining(null)
-      setTimeout(() => inputRef.current?.focus(), 50)
     }
+  }
+
+  // Focus the password field whenever the dialog opens.
+  useEffect(() => {
+    if (!open) return
+    const timer = setTimeout(() => inputRef.current?.focus(), 50)
+    return () => clearTimeout(timer)
   }, [open])
 
   // Live countdown when locked out.

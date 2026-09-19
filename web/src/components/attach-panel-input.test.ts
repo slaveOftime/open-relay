@@ -8,7 +8,9 @@ import {
 
 describe('attach-panel input helpers', () => {
   it('inserts uploaded paths at the current cursor position', () => {
-    expect(insertUploadedPathAtSelection('echo hello', '/tmp/paste.png', { start: 5, end: 5 })).toEqual({
+    expect(
+      insertUploadedPathAtSelection('echo hello', '/tmp/paste.png', { start: 5, end: 5 })
+    ).toEqual({
       value: 'echo /tmp/paste.pnghello',
       selection: {
         start: 19,
@@ -18,7 +20,9 @@ describe('attach-panel input helpers', () => {
   })
 
   it('replaces the current selection with the uploaded path', () => {
-    expect(insertUploadedPathAtSelection('echo hello', '/tmp/paste.png', { start: 5, end: 10 })).toEqual({
+    expect(
+      insertUploadedPathAtSelection('echo hello', '/tmp/paste.png', { start: 5, end: 10 })
+    ).toEqual({
       value: 'echo /tmp/paste.png',
       selection: {
         start: 19,
@@ -65,7 +69,9 @@ describe('attach-panel input helpers', () => {
   })
 
   it('removes every occurrence so hidden previews stay removed', () => {
-    expect(removeUploadedPathFromInput('/tmp/paste.png cat /tmp/paste.png', '/tmp/paste.png')).toEqual({
+    expect(
+      removeUploadedPathFromInput('/tmp/paste.png cat /tmp/paste.png', '/tmp/paste.png')
+    ).toEqual({
       value: 'cat',
       selection: {
         start: 3,

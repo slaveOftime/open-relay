@@ -197,7 +197,7 @@ async fn connect_and_relay(
                         };
 
                         if matches!(req, RpcRequest::AttachSubscribe { .. }) {
-                            let local_cfg = Arc::clone(&local_config);
+                            let local_cfg = Arc::clone(local_config);
                             let rpc_id = id.clone();
                             let frame_tx = stream_frame_tx.clone();
                             let (msg_tx, msg_rx) = mpsc::channel::<RpcRequest>(64);
@@ -315,7 +315,7 @@ fn decode_node_message(frame: WsMessage) -> std::io::Result<NodeWsMessage> {
 fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
     matches!(
         request,
-        RpcRequest::Health { .. }
+        RpcRequest::Health
             | RpcRequest::List { .. }
             | RpcRequest::Start { .. }
             | RpcRequest::NotifySet { .. }
@@ -451,92 +451,6 @@ async fn relay_streaming_rpc(
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{is_stream_message_relayable, is_supported_proxied_rpc};
-    use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
-
-    /// M5-2: only attach stream messages may ride the mid-stream channel
-    /// — it is not a general RPC tunnel.
-    #[test]
-    fn only_attach_messages_are_relayable_mid_stream() {
-        for req in [
-            RpcRequest::AttachInput {
-                id: "s".into(),
-                data: "x".into(),
-                wait_for_change: false,
-                attachment_id: None,
-            },
-            RpcRequest::AttachResize {
-                id: "s".into(),
-                rows: 24,
-                cols: 80,
-            },
-            RpcRequest::AttachAcquireControl { id: "s".into() },
-            RpcRequest::AttachAppliedCursor {
-                id: "s".into(),
-                cursor: 7,
-            },
-            RpcRequest::AttachDetach { id: "s".into() },
-        ] {
-            assert!(is_stream_message_relayable(&req), "{req:?} must relay");
-        }
-        let other = RpcRequest::Kill { id: "s".into() };
-        assert!(!is_stream_message_relayable(&other));
-    }
-
-    /// The serde default for `credited` is `false` (fail-open): an absent
-    /// flag must never silently enable gating.
-    #[test]
-    fn subscribe_credited_defaults_to_false() {
-        let decoded: RpcRequest =
-            serde_json::from_str(r#"{"type":"attach_subscribe","id":"s","from_byte_offset":null}"#)
-                .expect("decode without credited field");
-        let RpcRequest::AttachSubscribe { credited, .. } = decoded else {
-            panic!("wrong variant");
-        };
-        assert!(!credited, "absent credited must default to false");
-    }
-
-    #[test]
-    fn proxied_detach_cleanup_is_supported() {
-        assert!(is_supported_proxied_rpc(&RpcRequest::AttachDetach {
-            id: "session-123".to_string(),
-        }));
-    }
-
-    #[test]
-    fn proxied_notify_send_is_supported() {
-        assert!(is_supported_proxied_rpc(&RpcRequest::NotifySend {
-            source: Some("session-123".to_string()),
-            title: "Deploy ready".to_string(),
-            description: Some("Build finished".to_string()),
-            body: Some("Open the session for details.".to_string()),
-            url: None,
-        }));
-    }
-
-    #[test]
-    fn nested_node_proxy_is_rejected() {
-        assert!(!is_supported_proxied_rpc(&RpcRequest::NodeProxy {
-            node: "secondary-a".to_string(),
-            inner: Box::new(RpcRequest::List {
-                query: ListQuery {
-                    search: None,
-                    tags: Vec::new(),
-                    statuses: Vec::new(),
-                    since: None,
-                    until: None,
-                    limit: 10,
-                    offset: 0,
-                    sort: ListSortField::CreatedAt,
-                    order: SortOrder::Desc,
-                },
-            }),
-        }));
-    }
 }
 
 pub(super) async fn handle_node_proxy(
@@ -701,4 +615,90 @@ pub(super) async fn handle_node_proxy_streaming(
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_stream_message_relayable, is_supported_proxied_rpc};
+    use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
+
+    /// M5-2: only attach stream messages may ride the mid-stream channel
+    /// — it is not a general RPC tunnel.
+    #[test]
+    fn only_attach_messages_are_relayable_mid_stream() {
+        for req in [
+            RpcRequest::AttachInput {
+                id: "s".into(),
+                data: b"x".to_vec(),
+                wait_for_change: false,
+                attachment_id: None,
+            },
+            RpcRequest::AttachResize {
+                id: "s".into(),
+                rows: 24,
+                cols: 80,
+            },
+            RpcRequest::AttachAcquireControl { id: "s".into() },
+            RpcRequest::AttachAppliedCursor {
+                id: "s".into(),
+                cursor: 7,
+            },
+            RpcRequest::AttachDetach { id: "s".into() },
+        ] {
+            assert!(is_stream_message_relayable(&req), "{req:?} must relay");
+        }
+        let other = RpcRequest::Kill { id: "s".into() };
+        assert!(!is_stream_message_relayable(&other));
+    }
+
+    /// The serde default for `credited` is `false` (fail-open): an absent
+    /// flag must never silently enable gating.
+    #[test]
+    fn subscribe_credited_defaults_to_false() {
+        let decoded: RpcRequest =
+            serde_json::from_str(r#"{"type":"attach_subscribe","id":"s","from_byte_offset":null}"#)
+                .expect("decode without credited field");
+        let RpcRequest::AttachSubscribe { credited, .. } = decoded else {
+            panic!("wrong variant");
+        };
+        assert!(!credited, "absent credited must default to false");
+    }
+
+    #[test]
+    fn proxied_detach_cleanup_is_supported() {
+        assert!(is_supported_proxied_rpc(&RpcRequest::AttachDetach {
+            id: "session-123".to_string(),
+        }));
+    }
+
+    #[test]
+    fn proxied_notify_send_is_supported() {
+        assert!(is_supported_proxied_rpc(&RpcRequest::NotifySend {
+            source: Some("session-123".to_string()),
+            title: "Deploy ready".to_string(),
+            description: Some("Build finished".to_string()),
+            body: Some("Open the session for details.".to_string()),
+            url: None,
+        }));
+    }
+
+    #[test]
+    fn nested_node_proxy_is_rejected() {
+        assert!(!is_supported_proxied_rpc(&RpcRequest::NodeProxy {
+            node: "secondary-a".to_string(),
+            inner: Box::new(RpcRequest::List {
+                query: ListQuery {
+                    search: None,
+                    tags: Vec::new(),
+                    statuses: Vec::new(),
+                    since: None,
+                    until: None,
+                    limit: 10,
+                    offset: 0,
+                    sort: ListSortField::CreatedAt,
+                    order: SortOrder::Desc,
+                },
+            }),
+        }));
+    }
 }

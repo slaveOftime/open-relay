@@ -10,7 +10,11 @@ use crate::session::SessionEvent;
 // 12: attach streams carry PTY output as binary length-delimited frames
 // after the JSON init line (M6-3, ADR-0004); pre-12 peers expect base64
 // JSON chunks and are rejected.
-pub const PROTOCOL_VERSION: u16 = 12;
+// 13: `AttachInput.data` is raw bytes (base64 in JSON) instead of a JSON
+// string — PTY input is byte-exact end to end, so invalid UTF-8 (binary
+// paste, `hex:` specs, piped files) can no longer be mangled by a
+// lossy UTF-8 round-trip. Mode frames also carry mouse/focus flags.
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -135,7 +139,7 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
 fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
     match message {
         NodeWsMessage::Join { .. } => "join",
-        NodeWsMessage::Joined { .. } => "joined",
+        NodeWsMessage::Joined => "joined",
         NodeWsMessage::Error { .. } => "error",
         NodeWsMessage::Rpc { .. } => "rpc",
         NodeWsMessage::RpcResponse { .. } => "rpc_response",
@@ -220,7 +224,11 @@ pub enum RpcRequest {
     },
     AttachInput {
         id: String,
-        data: String,
+        /// Raw PTY input bytes (base64 on the JSON wire): input is
+        /// byte-exact end to end — no UTF-8 validation or lossy
+        /// conversion anywhere on the path (PLAN §5.1).
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
         wait_for_change: bool,
         /// Held control lease for agent-driven sends (`oly send --lease`);
         /// `None` is the ungated operator one-shot path.
@@ -463,6 +471,15 @@ pub enum RpcResponse {
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
+        /// Child has mouse reporting enabled (any of 1000/1002/1003).
+        #[serde(default)]
+        mouse_report: bool,
+        /// Child negotiated SGR (1006) mouse encoding.
+        #[serde(default)]
+        sgr_mouse: bool,
+        /// Child has focus in/out reporting (1004) enabled.
+        #[serde(default)]
+        focus_events: bool,
         /// Rendered scrolled-off rows (color, `\n`-terminated), at most the
         /// client's screen height, which a CLI client prints before the
         /// snapshot so the terminal scrollbar covers pre-attach history.
@@ -495,11 +512,24 @@ pub enum RpcResponse {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
-    /// Terminal mode changed (bracketed-paste / app-cursor-keys) mid-stream.
+    /// Terminal mode changed (bracketed-paste / app-cursor-keys /
+    /// mouse reporting / focus events) mid-stream.
     AttachModeChanged {
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
+        /// The child application enabled mouse reporting (any of
+        /// 1000/1002/1003). Attach clients should capture and forward
+        /// mouse events while set.
+        #[serde(default)]
+        mouse_report: bool,
+        /// The child negotiated SGR (1006) mouse encoding; otherwise
+        /// legacy X11 encoding applies.
+        #[serde(default)]
+        sgr_mouse: bool,
+        /// The child application enabled focus in/out reporting (1004).
+        #[serde(default)]
+        focus_events: bool,
     },
     /// Another attached client resized the PTY; receivers should adapt.
     AttachResized {
@@ -806,6 +836,7 @@ pub struct SessionSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ListSortField {
     Id,
     Title,
@@ -813,13 +844,8 @@ pub enum ListSortField {
     Cwd,
     Status,
     Pid,
+    #[default]
     CreatedAt,
-}
-
-impl Default for ListSortField {
-    fn default() -> Self {
-        Self::CreatedAt
-    }
 }
 
 impl ListSortField {
@@ -838,15 +864,11 @@ impl ListSortField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SortOrder {
     Asc,
+    #[default]
     Desc,
-}
-
-impl Default for SortOrder {
-    fn default() -> Self {
-        Self::Desc
-    }
 }
 
 impl SortOrder {

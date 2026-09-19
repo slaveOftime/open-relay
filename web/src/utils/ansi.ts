@@ -92,7 +92,7 @@ export function _stylesEqual(a: TextStyle, b: TextStyle): boolean {
   )
 }
 
-function applyCode(style: TextStyle, code: number, _params: number[]): TextStyle {
+function applyCode(style: TextStyle, code: number): TextStyle {
   const s = { ...style }
   switch (code) {
     case 0:
@@ -178,7 +178,7 @@ function applySgrParams(style: TextStyle, params: number[]): TextStyle {
       i += 5
       continue
     }
-    s = applyCode(s, p, params)
+    s = applyCode(s, p)
     i++
   }
   return s
@@ -189,10 +189,15 @@ function applySgrParams(style: TextStyle, params: number[]): TextStyle {
 // ---------------------------------------------------------------------------
 
 export function stripAnsi(text: string): string {
-  return text
-    .replace(/\x1b\[[0-9;]*[mGKHJABCDsuSTfhilnprqx]/g, '')
-    .replace(/\x1b[()][AB012]/g, '')
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+  return (
+    text
+      // eslint-disable-next-line no-control-regex -- ANSI CSI sequences are control characters by definition
+      .replace(/\x1b\[[0-9;]*[mGKHJABCDsuSTfhilnprqx]/g, '')
+      // eslint-disable-next-line no-control-regex -- ANSI charset selects are control characters by definition
+      .replace(/\x1b[()][AB012]/g, '')
+      // eslint-disable-next-line no-control-regex -- intentionally strips C0 control characters from display text
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+  )
 }
 
 // ---------------------------------------------------------------------------

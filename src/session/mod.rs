@@ -2,19 +2,14 @@
 //! metadata types the rest of the daemon speaks in.
 
 pub(crate) mod file;
-// M1 (PLAN.md §6.1): record format, segment writer/reader, torn-tail
-// recovery, the in-memory sequencing core, the bounded journal appender,
-// ordered resize/lifecycle records, fixed-range/tail/history reads and
-// retention. Wired in as a shadow journal behind `OLY_JOURNAL=1`
-// Always on since M3-1a; the journal becomes canonical in M3. The allow
-// covers the pieces only later-M3 consumers will use.
-#[allow(dead_code)]
+// The single canonical per-session recording (PLAN.md §6.1, ADR-0002):
+// record format, segment writer/reader, torn-tail recovery, the bounded
+// journal appender, ordered resize/lifecycle records, fixed-range/tail/
+// history reads and checkpoint-gated retention. Always on; if it fails,
+// the session fails loudly.
 pub(crate) mod journal;
 pub mod logs;
-mod m0_probes;
 pub mod pty;
-// M3-1b: derive the canonical filtered display stream from the raw
-// journal (the read path that replaces `output.log`).
 pub mod registry;
 pub(crate) mod replay;
 pub(crate) mod resize;
@@ -24,7 +19,8 @@ pub(crate) mod scan;
 mod store;
 #[cfg(test)]
 pub(crate) mod store;
-pub use runtime::SequencedChunk;
+#[cfg(test)]
+pub(crate) use runtime::SequencedChunk;
 pub use store::pump::{AttachEvent, AttachPump, PumpCredit};
 
 use chrono::{DateTime, Utc};

@@ -10,15 +10,17 @@
 //! journal already owns and is retired in M3-1c; this module is the read
 //! path that replaces it.
 //!
-//! Cost note: deriving from an arbitrary filtered offset replays the raw
-//! prefix once (bounded batches, no whole-history buffering). Attach-init
-//! calls this once per attach; live clients then follow the broadcast.
-//! Cached checkpoints make deep resumes cheap in M3's stream protocol.
+//! Cost note: replay is checkpoint-anchored (PLAN §5.3): deriving from an
+//! arbitrary filtered offset starts at the newest anchored checkpoint at
+//! or before that offset, so cost is bounded by the checkpoint cadence
+//! (~32 MiB), never by total recording size. Sessions without anchors
+//! (pre-checkpoint journals, or a scanner that was mid-escape at every
+//! cadence boundary) fall back to a full-prefix scan in bounded batches.
 
 use std::io;
 use std::path::Path;
 
-use super::journal::{self, JOURNAL_DIR_NAME, RecordKind};
+use super::journal::{self, CheckpointAnchor, JOURNAL_DIR_NAME, RecordKind, SegmentStream};
 use super::scan::{PtyScanner, ScanOut};
 use crate::protocol::LogResize;
 
@@ -26,6 +28,59 @@ use crate::protocol::LogResize;
 /// memory while replaying; the scanner's concatenation is boundary
 /// independent, so batch size never affects the derived stream.
 const REPLAY_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// How far past `from_offset` a resize-history derivation scans. Resizes
+/// further ahead cannot affect a bounded render window, so the scan stays
+/// bounded even for arbitrarily long-lived sessions (PLAN §5.3).
+const MAX_RESIZE_EVENTS_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resolve the replay anchor for a target filtered offset: the newest
+/// anchored (v2, scanner-idle) checkpoint at or before the target, or no
+/// anchor (journal start). The anchor's offset counts the filtered bytes
+/// journaled *before* its checkpoint record, so replay resumes on the
+/// next record.
+fn replay_start(
+    session_dir: &Path,
+    incarnation: u64,
+    target_offset: u64,
+) -> Option<CheckpointAnchor> {
+    journal::checkpoint_anchors(session_dir, incarnation)
+        .unwrap_or_default()
+        .into_iter()
+        .rfind(|anchor| anchor.filtered_offset > 0 && anchor.filtered_offset <= target_offset)
+}
+
+/// Open a replay stream for `incarnation`, checkpoint-anchored for
+/// `target_offset` when an anchor covers it, and return it with the
+/// filtered offset the stream starts at.
+fn replay_stream(
+    session_dir: &Path,
+    incarnation: u64,
+    target_offset: u64,
+) -> io::Result<(SegmentStream, u64)> {
+    match replay_start(session_dir, incarnation, target_offset) {
+        Some(anchor) => Ok((
+            SegmentStream::open_at(session_dir, incarnation, &anchor)?,
+            anchor.filtered_offset,
+        )),
+        None => Ok((SegmentStream::open(session_dir, incarnation)?, 0)),
+    }
+}
+
+/// Anchored checkpoint offsets of the latest incarnation, ascending.
+/// `oly logs` uses these to bound tail replays (PLAN §5.3).
+pub fn replay_anchors(session_dir: &Path) -> io::Result<Vec<u64>> {
+    let Some(incarnation) = latest_incarnation(session_dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut offsets: Vec<u64> = journal::checkpoint_anchors(session_dir, incarnation)?
+        .into_iter()
+        .filter(|anchor| anchor.filtered_offset > 0)
+        .map(|anchor| anchor.filtered_offset)
+        .collect();
+    offsets.sort_unstable();
+    Ok(offsets)
+}
 
 /// Latest journal incarnation for a session directory, if any.
 fn latest_incarnation(session_dir: &Path) -> io::Result<Option<u64>> {
@@ -42,9 +97,7 @@ fn latest_incarnation(session_dir: &Path) -> io::Result<Option<u64>> {
 /// `output.log`. Pulls bounded record batches, filters them through the
 /// scanner, and never buffers more than one batch.
 pub struct ReplayReader {
-    session_dir: std::path::PathBuf,
-    incarnation: Option<u64>,
-    next_seq: u64,
+    stream: Option<SegmentStream>,
     scanner: PtyScanner,
     pending: std::collections::VecDeque<u8>,
     done: bool,
@@ -52,10 +105,12 @@ pub struct ReplayReader {
 
 impl ReplayReader {
     pub fn new(session_dir: &Path) -> io::Result<Self> {
+        let stream = match latest_incarnation(session_dir)? {
+            Some(incarnation) => Some(SegmentStream::open(session_dir, incarnation)?),
+            None => None,
+        };
         Ok(Self {
-            session_dir: session_dir.to_path_buf(),
-            incarnation: latest_incarnation(session_dir)?,
-            next_seq: 1,
+            stream,
             scanner: PtyScanner::new(),
             pending: std::collections::VecDeque::new(),
             done: false,
@@ -66,31 +121,23 @@ impl ReplayReader {
         if self.done || !self.pending.is_empty() {
             return Ok(());
         }
-        let Some(incarnation) = self.incarnation else {
+        let Some(stream) = &mut self.stream else {
             self.done = true;
             return Ok(());
         };
-        let range = journal::read_range(
-            &self.session_dir,
-            incarnation,
-            self.next_seq,
-            u64::MAX,
-            REPLAY_BATCH_BYTES,
-        )?;
-        if range.records.is_empty() {
+        // `SegmentStream` resumes at a byte position, so successive fills
+        // never rescan a validated prefix.
+        let records = stream.next_batch(REPLAY_BATCH_BYTES)?;
+        if records.is_empty() {
             self.done = true;
             return Ok(());
         }
         let mut out = ScanOut::default();
-        for record in &range.records {
+        for record in &records {
             if record.kind == RecordKind::Output {
                 self.scanner.scan(&record.payload, &mut out);
                 self.pending.extend(out.filtered.iter().copied());
             }
-            self.next_seq = record.seq + 1;
-        }
-        if !range.truncated {
-            self.done = true;
         }
         Ok(())
     }
@@ -117,10 +164,9 @@ impl io::Read for ReplayReader {
 /// reported from `output.log`). A session directory without a journal
 /// yields an empty stream.
 ///
-/// Never returns a silent hole: `read_range` validates continuity and
-/// integrity of the whole consumed prefix and a torn tail ends the stream
-/// exactly where the validated prefix ends (`ScanStop` is exposed for
-/// diagnostics, not patched over).
+/// Never returns a silent hole: the underlying [`SegmentStream`] validates
+/// continuity and integrity from the resume position onward, and a torn
+/// tail ends the stream exactly where the validated prefix ends.
 pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<(Vec<u8>, u64)> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     let incarnations = match journal::list_incarnations(&journal_dir) {
@@ -132,24 +178,17 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
         return Ok((Vec::new(), 0));
     };
 
+    let (mut stream, mut filtered_pos) = replay_stream(session_dir, incarnation, from_offset)?;
     let mut scanner = PtyScanner::new();
     let mut out = ScanOut::default();
-    let mut filtered_pos = 0u64;
     let mut collected: Vec<u8> = Vec::new();
-    let mut next_seq = 1u64;
 
     loop {
-        let range = journal::read_range(
-            session_dir,
-            incarnation,
-            next_seq,
-            u64::MAX,
-            REPLAY_BATCH_BYTES,
-        )?;
-        if range.records.is_empty() {
+        let records = stream.next_batch(REPLAY_BATCH_BYTES)?;
+        if records.is_empty() {
             break;
         }
-        for record in &range.records {
+        for record in &records {
             if record.kind == RecordKind::Output {
                 scanner.scan(&record.payload, &mut out);
                 let batch = &out.filtered;
@@ -160,10 +199,6 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
                     collected.extend_from_slice(&batch[skip.min(batch.len())..]);
                 }
             }
-            next_seq = record.seq + 1;
-        }
-        if !range.truncated {
-            break;
         }
     }
 
@@ -177,28 +212,28 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
 /// journal is append-ordered with the output stream, so the offsets are
 /// derived, never stored, and cannot disagree with the stream.
 pub fn resize_events(session_dir: &Path) -> io::Result<Vec<LogResize>> {
+    resize_events_from(session_dir, 0)
+}
+
+/// Bounded variant of [`resize_events`]: only resizes at or after
+/// `from_offset`, anchored at a checkpoint (PLAN §5.3). Offsets in the
+/// result are absolute filtered-stream offsets.
+pub fn resize_events_from(session_dir: &Path, from_offset: u64) -> io::Result<Vec<LogResize>> {
     let Some(incarnation) = latest_incarnation(session_dir)? else {
         return Ok(Vec::new());
     };
 
+    let (mut stream, mut filtered_pos) = replay_stream(session_dir, incarnation, from_offset)?;
     let mut scanner = PtyScanner::new();
     let mut out = ScanOut::default();
-    let mut filtered_pos = 0u64;
     let mut events = Vec::new();
-    let mut next_seq = 1u64;
 
     loop {
-        let range = journal::read_range(
-            session_dir,
-            incarnation,
-            next_seq,
-            u64::MAX,
-            REPLAY_BATCH_BYTES,
-        )?;
-        if range.records.is_empty() {
+        let records = stream.next_batch(REPLAY_BATCH_BYTES)?;
+        if records.is_empty() {
             break;
         }
-        for record in &range.records {
+        for record in &records {
             match record.kind {
                 RecordKind::Output => {
                     scanner.scan(&record.payload, &mut out);
@@ -215,9 +250,9 @@ pub fn resize_events(session_dir: &Path) -> io::Result<Vec<LogResize>> {
                 }
                 _ => {}
             }
-            next_seq = record.seq + 1;
         }
-        if !range.truncated {
+        if filtered_pos > from_offset + MAX_RESIZE_EVENTS_SCAN_BYTES {
+            // No useful resize history this far ahead of the window.
             break;
         }
     }
@@ -246,24 +281,17 @@ pub fn filtered_stream_window(
         return Ok(Vec::new());
     };
 
+    let (mut stream, mut filtered_pos) = replay_stream(session_dir, incarnation, from_offset)?;
     let mut scanner = PtyScanner::new();
     let mut out = ScanOut::default();
-    let mut filtered_pos = 0u64;
     let mut collected: Vec<u8> = Vec::new();
-    let mut next_seq = 1u64;
 
     loop {
-        let range = journal::read_range(
-            session_dir,
-            incarnation,
-            next_seq,
-            u64::MAX,
-            REPLAY_BATCH_BYTES,
-        )?;
-        if range.records.is_empty() {
+        let records = stream.next_batch(REPLAY_BATCH_BYTES)?;
+        if records.is_empty() {
             break;
         }
-        for record in &range.records {
+        for record in &records {
             if record.kind == RecordKind::Output {
                 scanner.scan(&record.payload, &mut out);
                 let batch = &out.filtered;
@@ -276,9 +304,8 @@ pub fn filtered_stream_window(
                     collected.extend_from_slice(&batch[skip.min(batch.len())..][..take]);
                 }
             }
-            next_seq = record.seq + 1;
         }
-        if !range.truncated || collected.len() >= max_bytes {
+        if collected.len() >= max_bytes {
             break;
         }
     }
@@ -431,6 +458,113 @@ mod tests {
         assert_eq!(bytes, b"second-run");
         assert_eq!(end, 10);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Write `outputs`, placing an anchored checkpoint after each
+    /// `checkpoint_after` record count, then flush.
+    fn journaled_stream_with_checkpoints(
+        tag: &str,
+        outputs: &[&[u8]],
+        checkpoint_after: &[(usize, u64)],
+    ) -> std::path::PathBuf {
+        let dir = journal_dir(tag);
+        let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut checkpoints = checkpoint_after.iter().peekable();
+        for (index, chunk) in outputs.iter().enumerate() {
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(chunk))
+                .unwrap();
+            if let Some(&&(after, offset)) = checkpoints.peek()
+                && after == index + 1
+            {
+                journal
+                    .record_checkpoint(&journal::Checkpoint {
+                        rows: 24,
+                        cols: 80,
+                        cursor: (1, 1),
+                        alt_screen: false,
+                        app_cursor_keys: false,
+                        bracketed_paste: false,
+                        filtered_offset: offset,
+                        program: bytes::Bytes::from_static(b"\x1b[2Jrepaint"),
+                    })
+                    .unwrap();
+                checkpoints.next();
+            }
+        }
+        flush(
+            &mut journal,
+            outputs.len() as u64 + checkpoint_after.len() as u64,
+        );
+        dir
+    }
+
+    #[test]
+    fn anchored_replay_matches_full_replay_for_any_offset() {
+        let dir = journaled_stream_with_checkpoints(
+            "anchored",
+            &[b"aaaa", b"bbbb", b"cccc", b"dddd", b"eeee"],
+            &[(2, 8), (4, 16)],
+        );
+
+        let (full, end) = filtered_stream_from(&dir, 0).unwrap();
+        assert_eq!(end, 20);
+        for offset in [0, 1, 7, 8, 9, 15, 16, 17, 19, 20, 25] {
+            let (anchored, anchored_end) = filtered_stream_from(&dir, offset).unwrap();
+            assert_eq!(anchored_end, end, "end offset at {offset}");
+            let expected = &full[(offset.min(end)) as usize..];
+            assert_eq!(anchored, expected, "anchored replay diverges at {offset}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn anchored_windows_match_full_stream_slices() {
+        let dir = journaled_stream_with_checkpoints(
+            "anchored_window",
+            &[b"aaaa", b"bbbb", b"cccc", b"dddd", b"eeee"],
+            &[(2, 8), (4, 16)],
+        );
+
+        let (full, _) = filtered_stream_from(&dir, 0).unwrap();
+        for offset in [0u64, 8, 9, 16, 17] {
+            let window = filtered_stream_window(&dir, offset, 3).unwrap();
+            let expected = &full[offset as usize..(offset as usize + 3).min(full.len())];
+            assert_eq!(window, expected, "anchored window diverges at {offset}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn anchored_replay_skips_records_before_the_anchor() {
+        let dir = journaled_stream_with_checkpoints(
+            "anchored_skip",
+            &[b"aaaa", b"bbbb", b"cccc", b"dddd"],
+            &[(2, 8)],
+        );
+
+        // Corrupt a pre-anchor record's payload in place: anchored replay
+        // from a covered offset never reads it (PLAN §5.3 bound), while a
+        // full-prefix replay must fail integrity validation.
+        let journal_dir = dir.join(journal::JOURNAL_DIR_NAME);
+        let segment = std::fs::read_dir(&journal_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "ojrn"))
+            .expect("segment file");
+        let mut bytes = std::fs::read(&segment).unwrap();
+        // Header is 36 bytes; first payload byte sits at offset 36.
+        bytes[36] ^= 0xFF;
+        std::fs::write(&segment, bytes).unwrap();
+
+        let (tail, end) = filtered_stream_from(&dir, 12).unwrap();
+        assert_eq!(end, 16);
+        assert_eq!(tail, b"dddd");
+        assert!(
+            filtered_stream_from(&dir, 0).is_err(),
+            "a corrupted prefix must fail a full replay (I3)"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

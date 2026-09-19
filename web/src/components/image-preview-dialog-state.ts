@@ -21,12 +21,7 @@ export function getImagePreviewPanLimit(
   image: ImagePreviewDimensions,
   zoom: number
 ): ImagePreviewOffset {
-  if (
-    viewport.width <= 0 ||
-    viewport.height <= 0 ||
-    image.width <= 0 ||
-    image.height <= 0
-  ) {
+  if (viewport.width <= 0 || viewport.height <= 0 || image.width <= 0 || image.height <= 0) {
     return { x: 0, y: 0 }
   }
 

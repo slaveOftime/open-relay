@@ -73,7 +73,11 @@ function SessionMetadataDialogForm({
 
   async function handleSubmit() {
     const spec = buildSessionMetadataUpdateSpec(
-      { title: session.title, tags: session.tags, notificationsEnabled: session.notifications_enabled },
+      {
+        title: session.title,
+        tags: session.tags,
+        notificationsEnabled: session.notifications_enabled,
+      },
       { title, tags, notificationsEnabled }
     )
     if (Object.keys(spec).length === 0) {
@@ -97,60 +101,58 @@ function SessionMetadataDialogForm({
       <DialogHeader>
         <DialogTitle>Edit Session</DialogTitle>
       </DialogHeader>
-        <Form.Root
-          onSubmit={(event) => {
-            event.preventDefault()
-            void handleSubmit()
-          }}
-          className="mt-1 flex flex-col gap-4"
-        >
-          <div className="rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 px-3 py-2 flex items-center gap-2">
-            <div className="text-xs text-[hsl(var(--muted-foreground))]">Session:</div>
-            <div className="font-mono text-sm text-[hsl(var(--foreground))] break-all">{session.id}</div>
+      <Form.Root
+        onSubmit={(event) => {
+          event.preventDefault()
+          void handleSubmit()
+        }}
+        className="mt-1 flex flex-col gap-4"
+      >
+        <div className="rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 px-3 py-2 flex items-center gap-2">
+          <div className="text-xs text-[hsl(var(--muted-foreground))]">Session:</div>
+          <div className="font-mono text-sm text-[hsl(var(--foreground))] break-all">
+            {session.id}
           </div>
-          <FormField
-            name="title"
-            label="Title"
-            description="Leave blank to clear the title."
-          >
-            <Input
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              placeholder="Optional display name"
-              autoFocus
-            />
-          </FormField>
-          <FormField
-            name="tags"
-            label="Tags"
-            description="Separate tags with commas. Leave blank to clear all tags."
-          >
-            <Input
-              value={tags}
-              onChange={(event) => setTags(event.target.value)}
-              placeholder="prod, release"
-            />
-          </FormField>
-          <NotificationToggle
-            checked={notificationsEnabled}
-            disabled={!isRunning}
-            description={
-              isRunning
-                ? 'Get a push notification when the session needs attention or exits.'
-                : 'Notifications are unavailable after the session exits.'
-            }
-            onCheckedChange={setNotificationsEnabled}
+        </div>
+        <FormField name="title" label="Title" description="Leave blank to clear the title.">
+          <Input
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder="Optional display name"
+            autoFocus
           />
-          {error ? <FormError>{error}</FormError> : null}
-          <FormActions>
-            <Button type="button" variant="ghost" size="sm" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button type="submit" size="sm" disabled={loading}>
-              {loading ? 'Saving…' : 'Save'}
-            </Button>
-          </FormActions>
-        </Form.Root>
-      </DialogContent>
-    )
+        </FormField>
+        <FormField
+          name="tags"
+          label="Tags"
+          description="Separate tags with commas. Leave blank to clear all tags."
+        >
+          <Input
+            value={tags}
+            onChange={(event) => setTags(event.target.value)}
+            placeholder="prod, release"
+          />
+        </FormField>
+        <NotificationToggle
+          checked={notificationsEnabled}
+          disabled={!isRunning}
+          description={
+            isRunning
+              ? 'Get a push notification when the session needs attention or exits.'
+              : 'Notifications are unavailable after the session exits.'
+          }
+          onCheckedChange={setNotificationsEnabled}
+        />
+        {error ? <FormError>{error}</FormError> : null}
+        <FormActions>
+          <Button type="button" variant="ghost" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button type="submit" size="sm" disabled={loading}>
+            {loading ? 'Saving…' : 'Save'}
+          </Button>
+        </FormActions>
+      </Form.Root>
+    </DialogContent>
+  )
 }

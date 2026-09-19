@@ -150,7 +150,9 @@ export default function ImagePreviewDialog({
               Image preview
             </DialogTitle>
             {path && (
-              <p className="truncate text-[11px] leading-4 text-[hsl(var(--muted-foreground))]">{path}</p>
+              <p className="truncate text-[11px] leading-4 text-[hsl(var(--muted-foreground))]">
+                {path}
+              </p>
             )}
           </div>
           <div className="flex shrink-0 items-center gap-1.5">

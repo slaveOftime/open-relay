@@ -97,7 +97,7 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
         total += target_total;
     }
 
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
     sessions.truncate(limit);
     sessions.reverse();
 

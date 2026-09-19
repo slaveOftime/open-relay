@@ -99,7 +99,7 @@ fn run_logs_raw(config: &AppConfig, id: &str, node: Option<String>) -> Result<()
     let journal_dir = session_dir.join(crate::session::journal::JOURNAL_DIR_NAME);
     if !journal_dir.is_dir() {
         return Err(AppError::Protocol(format!(
-            "session {id} uses the pre-1.0 log format (output.log); export it \
+            "session {id} uses the pre-0.5 log format (output.log); export it \
              with a 0.x build first, see MIGRATION.md"
         )));
     }
@@ -161,7 +161,7 @@ async fn run_logs_local(
         .is_dir()
     {
         return Err(AppError::Protocol(format!(
-            "session {id} has no journal (pre-1.0 log format); see MIGRATION.md"
+            "session {id} has no journal (pre-0.5 log format); see MIGRATION.md"
         )));
     }
 

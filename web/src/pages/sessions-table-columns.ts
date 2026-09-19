@@ -5,7 +5,13 @@ export const SESSION_TABLE_COLUMN_STORAGE_KEY = 'open-relay.webv2.sessions.table
 export const SESSION_TABLE_COLUMNS = [
   { key: 'id', label: 'ID', sortField: SessionSortField.Id, defaultWidth: 80, minWidth: 64 },
   { key: 'output', label: 'Output', sortField: undefined, defaultWidth: 96, minWidth: 72 },
-  { key: 'title', label: 'Title', sortField: SessionSortField.Title, defaultWidth: 176, minWidth: 96 },
+  {
+    key: 'title',
+    label: 'Title',
+    sortField: SessionSortField.Title,
+    defaultWidth: 176,
+    minWidth: 96,
+  },
   { key: 'tags', label: 'Tags', sortField: undefined, defaultWidth: 152, minWidth: 96 },
   {
     key: 'command',
@@ -78,7 +84,9 @@ export function coerceSessionTableColumnSizes(raw: unknown): SessionTableColumnS
   return SESSION_TABLE_COLUMNS.reduce((sizes, column) => {
     const value = record[column.key]
     sizes[column.key] =
-      typeof value === 'number' ? clampSessionTableColumnSize(column.key, value) : defaults[column.key]
+      typeof value === 'number'
+        ? clampSessionTableColumnSize(column.key, value)
+        : defaults[column.key]
     return sizes
   }, {} as SessionTableColumnSizes)
 }
@@ -119,7 +127,9 @@ export function coerceSessionTableColumnSettings(raw: unknown): SessionTableColu
   }
 }
 
-export function getOrderedSessionTableColumns(order: SessionTableColumnOrder): SessionTableColumn[] {
+export function getOrderedSessionTableColumns(
+  order: SessionTableColumnOrder
+): SessionTableColumn[] {
   const columnsByKey = new Map(SESSION_TABLE_COLUMNS.map((column) => [column.key, column]))
   return coerceSessionTableColumnOrder(order).flatMap((key) => {
     const column = columnsByKey.get(key)

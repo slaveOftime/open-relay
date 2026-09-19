@@ -173,7 +173,7 @@ impl Database {
 
     pub fn session_output_offset(&self, id: &str) -> u64 {
         let session_dir = self.sessions_dir.join(id);
-        // M6-2: only journal-backed sessions have a stream; pre-1.0
+        // M6-2: only journal-backed sessions have a stream; pre-0.5
         // sessions report 0 (see MIGRATION.md).
         if session_dir
             .join(crate::session::journal::JOURNAL_DIR_NAME)
@@ -229,7 +229,7 @@ impl Database {
     /// List all sessions as `SessionSummary` DTOs, applying the `ListQuery` filter.
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
         let limit = query.limit.max(1) as i64;
-        let offset = query.offset.max(0) as i64;
+        let offset = query.offset as i64;
 
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \

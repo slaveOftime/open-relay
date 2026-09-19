@@ -29,18 +29,19 @@ pub async fn run_send(
 
     // Process ordered chunks left to right
     for chunk in chunks.iter() {
-        let data = resolve_chunk(config, &id, chunk, node.as_deref()).await?;
-        send_data(config, &id, data, node.as_deref(), lease).await?;
+        let data = resolve_chunk(config, id, chunk, node.as_deref()).await?;
+        send_data(config, id, data, node.as_deref(), lease).await?;
         sent_any = true;
     }
 
-    // Piped stdin (only when no explicit chunks were given)
+    // Piped stdin (only when no explicit chunks were given). Bytes are
+    // forwarded exactly as read — no UTF-8 validation or lossy
+    // conversion — so binary input survives (PLAN §5.1).
     if !has_chunks && !stdin_is_terminal {
         let mut bytes = Vec::new();
         std::io::stdin().read_to_end(&mut bytes)?;
         if !bytes.is_empty() {
-            let data = String::from_utf8_lossy(&bytes).to_string();
-            send_data(config, &id, data, node.as_deref(), lease).await?;
+            send_data(config, id, bytes, node.as_deref(), lease).await?;
             sent_any = true;
         }
     }
@@ -52,7 +53,7 @@ pub async fn run_send(
     Ok(())
 }
 
-/// Resolve a single CLI chunk into the bytes to send.
+/// Resolve a single CLI chunk into the raw bytes to send.
 /// - `key:<spec>` → special key sequence
 /// - `oly-clipboard` → clipboard text or uploaded clipboard file paths
 /// - `oly-file:<local-file-path>` → uploaded file path
@@ -62,12 +63,16 @@ async fn resolve_chunk(
     id: &str,
     chunk: &str,
     node: Option<&str>,
-) -> Result<String> {
+) -> Result<Vec<u8>> {
     match parse_chunk(chunk) {
         Chunk::Key(spec) => parse_key_spec(spec),
-        Chunk::Clipboard => resolve_clipboard_chunk(config, id, node).await,
-        Chunk::File(path) => upload_local_file(config, id, Path::new(path), node).await,
-        Chunk::Literal(text) => Ok(text.to_string()),
+        Chunk::Clipboard => resolve_clipboard_chunk(config, id, node)
+            .await
+            .map(String::into_bytes),
+        Chunk::File(path) => upload_local_file(config, id, Path::new(path), node)
+            .await
+            .map(String::into_bytes),
+        Chunk::Literal(text) => Ok(text.as_bytes().to_vec()),
     }
 }
 
@@ -205,7 +210,7 @@ async fn upload_file(
 async fn send_data(
     config: &AppConfig,
     id: &str,
-    data: String,
+    data: Vec<u8>,
     node: Option<&str>,
     lease: Option<u64>,
 ) -> Result<()> {
@@ -233,7 +238,7 @@ async fn send_data(
 // Key spec parsing
 // ---------------------------------------------------------------------------
 
-pub fn parse_key_spec(spec: &str) -> Result<String> {
+pub fn parse_key_spec(spec: &str) -> Result<Vec<u8>> {
     let trimmed = spec.trim();
     let normalized = trimmed.to_ascii_lowercase();
 
@@ -244,7 +249,7 @@ pub fn parse_key_spec(spec: &str) -> Result<String> {
     }
 
     if let Some(sequence) = named_key_sequence(&normalized) {
-        return Ok(sequence.to_string());
+        return Ok(sequence.as_bytes().to_vec());
     }
 
     if let Some(hex) = parse_hex_bytes(&normalized) {
@@ -252,15 +257,15 @@ pub fn parse_key_spec(spec: &str) -> Result<String> {
     }
 
     if let Some(control_char) = parse_ctrl_key(&normalized) {
-        return Ok(control_char.to_string());
+        return Ok(vec![control_char as u8]);
     }
 
     if let Some(alt) = parse_alt_key(&normalized) {
-        return Ok(alt);
+        return Ok(alt.into_bytes());
     }
 
     if normalized == "shift+tab" || normalized == "shift-tab" {
-        return Ok("\x1b[Z".to_string());
+        return Ok(b"\x1b[Z".to_vec());
     }
 
     if matches!(normalized.as_str(), "shift" | "alt" | "meta" | "ctrl") {
@@ -323,7 +328,9 @@ fn parse_ctrl_key(normalized: &str) -> Option<char> {
 }
 
 /// Parse `hex:<hex-bytes>` notation, e.g. `hex:1b` or `hex:1b5b41`.
-fn parse_hex_bytes(normalized: &str) -> Option<String> {
+/// Returns the exact decoded bytes — never lossy UTF-8 — so arbitrary
+/// binary input is representable (PLAN §5.1).
+fn parse_hex_bytes(normalized: &str) -> Option<Vec<u8>> {
     let payload = normalized.strip_prefix("hex:")?;
 
     if payload.is_empty() || payload.len() % 2 != 0 {
@@ -339,7 +346,7 @@ fn parse_hex_bytes(normalized: &str) -> Option<String> {
         idx += 2;
     }
 
-    Some(String::from_utf8_lossy(&bytes).to_string())
+    Some(bytes)
 }
 
 fn parse_alt_key(normalized: &str) -> Option<String> {
@@ -456,19 +463,19 @@ mod tests {
     #[test]
     fn test_ctrl_plus_c() {
         let result = parse_key_spec("ctrl+c").unwrap();
-        assert_eq!(result.as_bytes(), &[3]);
+        assert_eq!(result, vec![3]);
     }
 
     #[test]
     fn test_ctrl_dash_a() {
         let result = parse_key_spec("ctrl-a").unwrap();
-        assert_eq!(result.as_bytes(), &[1]);
+        assert_eq!(result, vec![1]);
     }
 
     #[test]
     fn test_ctrl_uppercase_treated_as_lowercase() {
         let result = parse_key_spec("CTRL+C").unwrap();
-        assert_eq!(result.as_bytes(), &[3]);
+        assert_eq!(result, vec![3]);
     }
 
     #[test]
@@ -476,11 +483,7 @@ mod tests {
         for (letter, expected_byte) in ('a'..='z').zip(1u8..=26u8) {
             let spec = format!("ctrl+{letter}");
             let result = parse_key_spec(&spec).unwrap_or_else(|e| panic!("failed for {spec}: {e}"));
-            assert_eq!(
-                result.as_bytes(),
-                &[expected_byte],
-                "failed for ctrl+{letter}"
-            );
+            assert_eq!(result, vec![expected_byte], "failed for ctrl+{letter}");
         }
     }
 
@@ -490,13 +493,13 @@ mod tests {
 
     #[test]
     fn test_hex_key_notation() {
-        assert_eq!(parse_key_spec("hex:1b").unwrap(), "\x1b");
-        assert_eq!(parse_key_spec("hex:03").unwrap(), "\x03");
+        assert_eq!(parse_key_spec("hex:1b").unwrap(), b"\x1b".to_vec());
+        assert_eq!(parse_key_spec("hex:03").unwrap(), b"\x03".to_vec());
     }
 
     #[test]
     fn test_hex_sequence_multi_byte() {
-        assert_eq!(parse_key_spec("hex:1b5b").unwrap(), "\x1b[");
+        assert_eq!(parse_key_spec("hex:1b5b").unwrap(), b"\x1b[".to_vec());
     }
 
     #[test]
@@ -510,8 +513,8 @@ mod tests {
 
     #[test]
     fn test_shift_tab_produces_backtab_sequence() {
-        assert_eq!(parse_key_spec("shift+tab").unwrap(), "\x1b[Z");
-        assert_eq!(parse_key_spec("shift-tab").unwrap(), "\x1b[Z");
+        assert_eq!(parse_key_spec("shift+tab").unwrap(), b"\x1b[Z".to_vec());
+        assert_eq!(parse_key_spec("shift-tab").unwrap(), b"\x1b[Z".to_vec());
     }
 
     // -----------------------------------------------------------------------
@@ -520,37 +523,37 @@ mod tests {
 
     #[test]
     fn test_alt_letter_prepends_escape() {
-        assert_eq!(parse_key_spec("alt+x").unwrap(), "\x1bx");
+        assert_eq!(parse_key_spec("alt+x").unwrap(), b"\x1bx".to_vec());
     }
 
     #[test]
     fn test_meta_letter_same_as_alt() {
-        assert_eq!(parse_key_spec("meta+x").unwrap(), "\x1bx");
+        assert_eq!(parse_key_spec("meta+x").unwrap(), b"\x1bx".to_vec());
     }
 
     #[test]
     fn test_alt_named_key_prepends_escape() {
-        assert_eq!(parse_key_spec("alt+up").unwrap(), "\x1b\x1b[A");
+        assert_eq!(parse_key_spec("alt+up").unwrap(), b"\x1b\x1b[A".to_vec());
     }
 
     #[test]
     fn test_alt_arrow_keys() {
-        assert_eq!(parse_key_spec("alt+up").unwrap(), "\x1b\x1b[A");
-        assert_eq!(parse_key_spec("alt+down").unwrap(), "\x1b\x1b[B");
-        assert_eq!(parse_key_spec("alt+right").unwrap(), "\x1b\x1b[C");
-        assert_eq!(parse_key_spec("alt+left").unwrap(), "\x1b\x1b[D");
+        assert_eq!(parse_key_spec("alt+up").unwrap(), b"\x1b\x1b[A".to_vec());
+        assert_eq!(parse_key_spec("alt+down").unwrap(), b"\x1b\x1b[B".to_vec());
+        assert_eq!(parse_key_spec("alt+right").unwrap(), b"\x1b\x1b[C".to_vec());
+        assert_eq!(parse_key_spec("alt+left").unwrap(), b"\x1b\x1b[D".to_vec());
     }
 
     #[test]
     fn test_alt_home_end() {
-        assert_eq!(parse_key_spec("alt+home").unwrap(), "\x1b\x1b[H");
-        assert_eq!(parse_key_spec("alt+end").unwrap(), "\x1b\x1b[F");
+        assert_eq!(parse_key_spec("alt+home").unwrap(), b"\x1b\x1b[H".to_vec());
+        assert_eq!(parse_key_spec("alt+end").unwrap(), b"\x1b\x1b[F".to_vec());
     }
 
     #[test]
     fn test_alt_ctrl_combo() {
         let result = parse_key_spec("alt+ctrl+c").unwrap();
-        assert_eq!(result.as_bytes(), &[0x1b, 0x03]);
+        assert_eq!(result, vec![0x1b, 0x03]);
     }
 
     // -----------------------------------------------------------------------
@@ -559,19 +562,19 @@ mod tests {
 
     #[test]
     fn test_named_key_via_parse_key_spec() {
-        assert_eq!(parse_key_spec("enter").unwrap(), "\r");
-        assert_eq!(parse_key_spec("ESC").unwrap(), "\x1b");
-        assert_eq!(parse_key_spec("tab").unwrap(), "\t");
+        assert_eq!(parse_key_spec("enter").unwrap(), b"\r".to_vec());
+        assert_eq!(parse_key_spec("ESC").unwrap(), b"\x1b".to_vec());
+        assert_eq!(parse_key_spec("tab").unwrap(), b"\t".to_vec());
     }
 
     #[test]
     fn test_function_keys_via_parse_key_spec() {
         // Same xterm-compatible profile as the interactive codec.
-        assert_eq!(parse_key_spec("f1").unwrap(), "\x1bOP");
-        assert_eq!(parse_key_spec("f4").unwrap(), "\x1bOS");
-        assert_eq!(parse_key_spec("f5").unwrap(), "\x1b[15~");
-        assert_eq!(parse_key_spec("F12").unwrap(), "\x1b[24~");
-        assert_eq!(parse_key_spec("alt+f5").unwrap(), "\x1b\x1b[15~");
+        assert_eq!(parse_key_spec("f1").unwrap(), b"\x1bOP".to_vec());
+        assert_eq!(parse_key_spec("f4").unwrap(), b"\x1bOS".to_vec());
+        assert_eq!(parse_key_spec("f5").unwrap(), b"\x1b[15~".to_vec());
+        assert_eq!(parse_key_spec("F12").unwrap(), b"\x1b[24~".to_vec());
+        assert_eq!(parse_key_spec("alt+f5").unwrap(), b"\x1b\x1b[15~".to_vec());
     }
 
     // -----------------------------------------------------------------------

@@ -1,11 +1,10 @@
 //! Segmented session journal: typed, checksummed records with stable
 //! sequence numbers (PLAN.md §6.1, invariants I1/I3/I8/I10).
 //!
-//! M1 wires this as a **shadow journal** (dev-gated by `OLY_JOURNAL`):
-//! every raw PTY chunk, resize, mode revision (Policy) and lifecycle fact
+//! Every raw PTY chunk, resize, mode revision (Policy) and lifecycle fact
 //! is sequenced under the session write lock and appended by a dedicated
-//! thread with a group-sync cadence. `output.log` remains the canonical
-//! store until M3.
+//! thread with a group-sync cadence. The journal is the canonical store;
+//! everything else is derived at read time (ADR-0002).
 //!
 //! One incarnation spans bounded parts (`seg-NNNNNNNN-PPPP.ojrn`) with a
 //! continuous sequence — cursors never name parts. Only the newest part
@@ -114,6 +113,7 @@ const fn crc32_table() -> [u32; 256] {
 
 static CRC32_TABLE: [u32; 256] = crc32_table();
 
+#[cfg(test)]
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in bytes {
@@ -168,12 +168,14 @@ impl SegmentWriter {
         })
     }
 
+    #[cfg(test)]
     pub fn open_append(path: &Path) -> io::Result<Self> {
         let file = fs::OpenOptions::new().append(true).open(path)?;
         let written = file.metadata()?.len();
         Ok(Self { file, written })
     }
 
+    #[cfg(test)]
     /// Append one already-sequenced record.
     pub fn append_record(
         &mut self,
@@ -215,13 +217,10 @@ impl SegmentWriter {
         self.file.sync_data()
     }
 
+    #[cfg(test)]
     /// Bytes written so far — the segment's authoritative length.
     pub fn len(&self) -> u64 {
         self.written
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.written == 0
     }
 }
 
@@ -330,9 +329,8 @@ pub struct RecoveryReport {
     pub last_seq: Option<u64>,
     /// Why the scan stopped.
     pub stop: ScanStop,
-    /// Offset of the first byte that is not a valid record.
-    pub valid_len: u64,
-    /// Whether a torn tail was rewound (file truncated to `valid_len`).
+    /// Whether a torn tail was rewound (file truncated to the valid
+    /// prefix).
     pub rewound: bool,
 }
 
@@ -429,7 +427,6 @@ pub fn open(session_dir: &Path) -> io::Result<OpenedJournal> {
             records: stats.records,
             last_seq: stats.last_seq,
             stop: stats.stop,
-            valid_len: stats.valid_len,
             rewound,
         });
     }
@@ -652,6 +649,7 @@ impl SequencerCore {
         }
     }
 
+    #[cfg(test)]
     /// The cache holds events beyond its byte budget because the journal
     /// has not caught up. Callers should backpressure ingestion.
     pub fn over_budget(&self) -> bool {
@@ -686,16 +684,19 @@ impl SequencerCore {
         self.degraded.as_deref()
     }
 
+    #[cfg(test)]
     /// Highest sequence published so far, if any.
     pub fn head_seq(&self) -> Option<u64> {
         (self.next_seq > 1).then_some(self.next_seq - 1)
     }
 
+    #[cfg(test)]
     /// Highest sequence contiguously readable from the journal.
     pub fn journal_seq(&self) -> u64 {
         self.journal_seq
     }
 
+    #[cfg(test)]
     /// Highest sequence covered by a completed sync.
     pub fn durable_seq(&self) -> u64 {
         self.durable_seq
@@ -706,11 +707,13 @@ impl SequencerCore {
         self.incarnation
     }
 
+    #[cfg(test)]
     /// Number of events currently retained in the recent cache.
     pub fn cached_events(&self) -> usize {
         self.cache.len()
     }
 
+    #[cfg(test)]
     pub fn cache_bytes(&self) -> usize {
         self.cache_bytes
     }
@@ -731,6 +734,7 @@ pub enum JournalAck {
 enum AppenderMsg {
     Record(Box<OrderedEvent>),
     Sync,
+    #[cfg(test)]
     Shutdown,
 }
 
@@ -743,12 +747,14 @@ pub struct JournalAppender {
     tx: std::sync::mpsc::SyncSender<AppenderMsg>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queue_budget_bytes: usize,
+    #[cfg(test)]
     /// Joined on [`JournalAppender::shutdown`] so a clean stop guarantees
     /// the final barrier (sync + tail-part seal) has actually run (I10).
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl JournalAppender {
+    #[cfg(test)]
     /// Open the journal under `session_dir` (recovering the previous
     /// incarnation) and spawn the appender thread for the new one.
     pub fn spawn(
@@ -762,6 +768,7 @@ impl JournalAppender {
         Self::spawn_with_sync_interval(session_dir, DEFAULT_SYNC_INTERVAL)
     }
 
+    #[cfg(test)]
     /// Like [`Self::spawn`], with an explicit group-sync cadence (tests,
     /// and the cadence probe that feeds the ADR-0002 decision).
     pub fn spawn_with_sync_interval(
@@ -802,11 +809,14 @@ impl JournalAppender {
         let worker = std::thread::Builder::new()
             .name("journal-appender".to_string())
             .spawn(move || appender_loop(writer, rx, ack_tx, worker_queued, sync_interval))?;
+        #[cfg(not(test))]
+        drop(worker); // only tests join the worker (via shutdown)
         Ok((
             Self {
                 tx,
                 queued_bytes,
                 queue_budget_bytes: DEFAULT_QUEUE_BUDGET_BYTES,
+                #[cfg(test)]
                 worker: std::sync::Mutex::new(Some(worker)),
             },
             opened.incarnation,
@@ -848,6 +858,7 @@ impl JournalAppender {
         let _ = self.tx.try_send(AppenderMsg::Sync);
     }
 
+    #[cfg(test)]
     /// Stop the appender thread after draining queued records and wait for
     /// the final barrier (last group-sync + tail-part seal) to complete.
     pub fn shutdown(&self) {
@@ -1052,7 +1063,11 @@ fn appender_loop(
             }
         };
         match msg {
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) | Ok(AppenderMsg::Shutdown) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break;
+            }
+            #[cfg(test)]
+            Ok(AppenderMsg::Shutdown) => {
                 break;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -1163,6 +1178,7 @@ pub fn policy_payload(key: &str, value: &str) -> Vec<u8> {
 }
 
 /// Inverse of [`policy_payload`]; `None` for malformed payloads.
+#[cfg(test)]
 pub fn parse_policy(payload: &[u8]) -> Option<(&str, &str)> {
     let text = std::str::from_utf8(payload).ok()?;
     let (key, value) = text.split_once('=')?;
@@ -1198,6 +1214,7 @@ pub enum LifecycleCode {
 }
 
 impl LifecycleCode {
+    #[cfg(test)]
     fn from_u8(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Started),
@@ -1225,6 +1242,7 @@ pub fn encode_lifecycle_payload(
     payload
 }
 
+#[cfg(test)]
 pub fn decode_lifecycle_payload(payload: &[u8]) -> Option<(LifecycleCode, Option<i32>, &str)> {
     if payload.len() < 5 {
         return None;
@@ -1247,6 +1265,7 @@ pub struct ShadowJournal {
 impl ShadowJournal {
     /// Drain queued records and stop the appender (sealing the tail part
     /// into the manifest, M3-6).
+    #[cfg(test)]
     pub fn shutdown(&self) {
         self.appender.shutdown();
     }
@@ -1381,14 +1400,6 @@ impl ShadowJournal {
     pub fn request_sync(&self) {
         self.appender.request_sync();
     }
-}
-
-/// M1/M2 kept the journal behind the `OLY_JOURNAL` dev switch; since
-/// M3-1 the journal is always on — it is becoming the canonical stream
-/// (ADR-0002). The switch is gone; the function remains only so call
-/// sites read intentionally.
-pub fn shadow_enabled() -> bool {
-    true
 }
 
 fn crc32_two(first: &[u8], second: &[u8]) -> u32 {
@@ -1706,6 +1717,7 @@ pub struct ScanOutcome {
 }
 
 impl ScanOutcome {
+    #[cfg(test)]
     pub fn is_clean(&self) -> bool {
         self.stop == ScanStop::CleanEof
     }
@@ -1717,6 +1729,7 @@ impl ScanOutcome {
 /// active segment; recovery rewinds to `valid_len`
 /// (`ScanStop::PartialTail`). Anything else is corruption, not a tear — the
 /// caller quarantines and reports it instead of silently continuing.
+#[cfg(test)]
 pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
     // Lenient on the first sequence: this is the raw segment inspector
     // (recovery tooling, probes, tests). Stream-level reads enforce the
@@ -1738,6 +1751,7 @@ pub struct SegmentStats {
 
 /// Stats scan requiring the segment to start at sequence 1 (a complete
 /// incarnation prefix).
+#[cfg(test)]
 pub fn scan_segment_stats(path: &Path) -> io::Result<SegmentStats> {
     scan_segment_stats_from(path, Some(1))
 }
@@ -1766,6 +1780,7 @@ pub fn scan_segment_stats_from(
 /// means "more is being appended right now", not corruption. When
 /// `truncated` is set, retry with `from_seq = last_returned_seq + 1`.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct RangeRead {
     pub records: Vec<Record>,
     pub stop: ScanStop,
@@ -1777,6 +1792,7 @@ pub struct RangeRead {
 /// first in-window record is always included, even if it alone exceeds
 /// the budget). Continuity and integrity of the whole consumed prefix are
 /// still validated — a range read never presents a silent hole (I3).
+#[cfg(test)]
 pub fn read_range(
     session_dir: &Path,
     incarnation: u64,
@@ -1871,6 +1887,114 @@ fn incarnation_parts(journal_dir: &Path, incarnation: u64) -> io::Result<Vec<(u6
     Ok(parts)
 }
 
+/// Streaming reader over one incarnation, pulling bounded batches from a
+/// resume position (PLAN §5.3 anchored replay). The resume position is
+/// either the journal start (prefix fully validated) or the record
+/// following a [`CheckpointAnchor`] — the skipped prefix is then trusted
+/// as of the anchor, the same trust model the sparse tail index uses for
+/// sealed parts. Headers, CRCs, and cross-part continuity are validated
+/// from the resume position onward; corruption from there is an error,
+/// never a silently truncated stream.
+pub struct SegmentStream {
+    parts: Vec<(u64, PathBuf)>,
+    part_index: usize,
+    byte_offset: u64,
+    next_seq: u64,
+    done: bool,
+}
+
+impl SegmentStream {
+    /// Stream from the journal start, validating the whole prefix.
+    pub fn open(session_dir: &Path, incarnation: u64) -> io::Result<Self> {
+        let parts = incarnation_parts(&session_dir.join(JOURNAL_DIR_NAME), incarnation)?;
+        Ok(Self {
+            parts,
+            part_index: 0,
+            byte_offset: 0,
+            next_seq: 1,
+            done: false,
+        })
+    }
+
+    /// Stream starting at the record following a checkpoint anchor,
+    /// skipping the anchored prefix entirely.
+    pub fn open_at(
+        session_dir: &Path,
+        incarnation: u64,
+        anchor: &CheckpointAnchor,
+    ) -> io::Result<Self> {
+        debug_assert_eq!(anchor.cursor.incarnation, incarnation);
+        let parts = incarnation_parts(&session_dir.join(JOURNAL_DIR_NAME), incarnation)?;
+        let part_index = parts
+            .iter()
+            .position(|(part, _)| *part == anchor.part)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "checkpoint anchor segment part is not retained",
+                )
+            })?;
+        Ok(Self {
+            parts,
+            part_index,
+            byte_offset: anchor.record_end_offset,
+            next_seq: anchor.cursor.seq + 1,
+            done: false,
+        })
+    }
+
+    /// Pull the next batch, buffering at most `max_bytes` of payload (the
+    /// first record of a batch is always included). An empty batch means
+    /// the validated stream end — or a torn live tail — is reached.
+    pub fn next_batch(&mut self, max_bytes: usize) -> io::Result<Vec<Record>> {
+        let mut records = Vec::new();
+        while !self.done && records.is_empty() {
+            let Some((_, path)) = self.parts.get(self.part_index) else {
+                self.done = true;
+                break;
+            };
+            let start = (self.byte_offset > 0).then_some(ScanStart {
+                offset: self.byte_offset,
+                seq: self.next_seq,
+            });
+            let result = scan_impl(
+                path,
+                ScanMode::Window(CollectWindow {
+                    from_seq: self.next_seq,
+                    to_seq: u64::MAX,
+                    max_buffered_bytes: max_bytes,
+                }),
+                (self.byte_offset == 0).then_some(self.next_seq),
+                start,
+            )?;
+            if let Some(last) = result.outcome.records.last() {
+                self.next_seq = last.seq + 1;
+            }
+            match result.outcome.stop {
+                ScanStop::CleanEof if result.truncated => {
+                    // Budget stop mid-part: resume at the validated end.
+                    self.byte_offset = result.outcome.valid_len;
+                    records = result.outcome.records;
+                }
+                ScanStop::CleanEof | ScanStop::PartialTail => {
+                    // Part exhausted (or torn live tail): advance.
+                    self.part_index += 1;
+                    self.byte_offset = 0;
+                    records = result.outcome.records;
+                }
+                stop => {
+                    self.done = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("journal segment is corrupt from the resume position: {stop:?}"),
+                    ));
+                }
+            }
+        }
+        Ok(records)
+    }
+}
+
 /// Window/budget for a range read.
 struct CollectWindow {
     from_seq: u64,
@@ -1880,6 +2004,7 @@ struct CollectWindow {
 
 /// Where one record lives inside its segment file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct IndexEntry {
     pub seq: u64,
     /// Byte offset of the record header inside the segment.
@@ -1893,17 +2018,20 @@ pub struct IndexEntry {
 /// size / stride regardless of record count. Basis for bounded tail
 /// reads (and later persisted O(1) seeks).
 #[derive(Debug)]
+#[cfg(test)]
 pub struct SegmentIndex {
     pub entries: Vec<IndexEntry>,
     pub valid_len: u64,
     pub stop: ScanStop,
 }
 
+#[cfg(test)]
 impl SegmentIndex {
     /// Where to start reading so that the scanned region covers at least
     /// the newest `max_bytes` bytes of the valid prefix. Returns
     /// `(seq, offset)`; the region length is `valid_len - offset`, at
     /// most `max_bytes + stride + one record`.
+    #[cfg(test)]
     fn tail_start(&self, max_bytes: u64) -> Option<(u64, u64)> {
         let first = self.entries.first()?;
         if self.valid_len <= max_bytes {
@@ -1922,6 +2050,7 @@ impl SegmentIndex {
 
 /// Scan a segment collecting only the sparse record index (payloads are
 /// validated but not retained).
+#[cfg(test)]
 pub fn scan_segment_index(path: &Path) -> io::Result<SegmentIndex> {
     // Lenient on the first sequence: parts after the first continue the
     // incarnation's sequence, and cross-part continuity is validated by
@@ -1936,9 +2065,9 @@ pub fn scan_segment_index(path: &Path) -> io::Result<SegmentIndex> {
 
 /// Result of a bounded tail read.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct TailRead {
     pub records: Vec<Record>,
-    pub stop: ScanStop,
 }
 
 /// Read the newest records of one incarnation whose payloads fit in
@@ -1946,6 +2075,7 @@ pub struct TailRead {
 /// stay bounded by `max_bytes + part size limit`, never by the total
 /// recording: parts are bounded, the sparse index seeks directly to the
 /// tail region, and only that region is re-validated and buffered.
+#[cfg(test)]
 pub fn read_tail(session_dir: &Path, incarnation: u64, max_bytes: usize) -> io::Result<TailRead> {
     let parts = incarnation_parts(&session_dir.join(JOURNAL_DIR_NAME), incarnation)?;
     // Select parts newest-first: whole parts while they fit the remaining
@@ -1989,11 +2119,9 @@ pub fn read_tail(session_dir: &Path, incarnation: u64, max_bytes: usize) -> io::
         .saturating_add(MAX_PAYLOAD_LEN as usize);
     let mut records: Vec<Record> = Vec::new();
     let mut buffered = 0usize;
-    let mut stop = ScanStop::CleanEof;
     let mut expected_first: Option<u64> = None;
-    let selected_len = selected.len();
     // Selected newest-first above; assemble oldest-first.
-    for (n, (path, start)) in selected.into_iter().rev().enumerate() {
+    for (path, start) in selected.into_iter().rev() {
         let result = scan_impl(
             &path,
             ScanMode::Window(CollectWindow {
@@ -2008,10 +2136,7 @@ pub fn read_tail(session_dir: &Path, incarnation: u64, max_bytes: usize) -> io::
             },
             start,
         )?;
-        let is_newest_selected = n + 1 == selected_len;
-        if is_newest_selected {
-            stop = result.outcome.stop;
-        } else if !matches!(result.outcome.stop, ScanStop::CleanEof) {
+        if !matches!(result.outcome.stop, ScanStop::CleanEof) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -2037,20 +2162,21 @@ pub fn read_tail(session_dir: &Path, incarnation: u64, max_bytes: usize) -> io::
         buffered -= records[0].payload.len();
         records.remove(0);
     }
-    Ok(TailRead { records, stop })
+    Ok(TailRead { records })
 }
 
 /// One event returned by [`read_history`], carrying its durable cursor.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct HistoryEvent {
     pub cursor: JournalCursor,
-    pub elapsed_ms: u64,
     pub kind: RecordKind,
     pub payload: Vec<u8>,
 }
 
 /// Result of a cross-incarnation history read.
 #[derive(Debug)]
+#[cfg(test)]
 pub struct HistoryRead {
     pub events: Vec<HistoryEvent>,
     /// Resume cursor (exclusive of the returned events). `None` when no
@@ -2073,6 +2199,7 @@ pub struct HistoryRead {
 ///
 /// Corruption inside any consumed incarnation is an `InvalidData` error —
 /// history reads never skip past a hole.
+#[cfg(test)]
 pub fn read_history(
     session_dir: &Path,
     from: JournalCursor,
@@ -2168,7 +2295,6 @@ pub fn read_history(
                 incarnation,
                 seq: record.seq,
             },
-            elapsed_ms: record.elapsed_ms,
             kind: record.kind,
             payload: record.payload,
         }));
@@ -2191,6 +2317,7 @@ pub fn read_history(
 /// Highest recovered valid sequence of an incarnation (0 = no records).
 /// Only the newest part can be torn by a crash, so this scans the newest
 /// non-empty part — O(part), never O(history).
+#[cfg(test)]
 fn recovered_tail(journal_dir: &Path, incarnation: u64) -> io::Result<u64> {
     let parts = incarnation_parts(journal_dir, incarnation)?;
     let last_index = parts.len() - 1;
@@ -2224,7 +2351,7 @@ fn recovered_tail(journal_dir: &Path, incarnation: u64) -> io::Result<u64> {
 // start at the checkpoint instead.
 // ---------------------------------------------------------------------------
 
-pub const CHECKPOINT_VERSION: u16 = 1;
+pub const CHECKPOINT_VERSION: u16 = 2;
 const CHECKPOINT_MAGIC: &[u8; 4] = b"OJCK";
 
 /// One checkpoint payload, decoded.
@@ -2237,12 +2364,17 @@ pub struct Checkpoint {
     pub alt_screen: bool,
     pub app_cursor_keys: bool,
     pub bracketed_paste: bool,
+    /// Filtered display-stream offset covered by this checkpoint (v2):
+    /// replay may start at the checkpoint's journal position and treat the
+    /// derived stream as beginning at this offset (PLAN §5.3). `0` means
+    /// unknown — records written by checkpoint format v1 carry no offset.
+    pub filtered_offset: u64,
     /// Side-effect-free restore program (repaint escape stream).
     pub program: bytes::Bytes,
 }
 
 pub fn encode_checkpoint(checkpoint: &Checkpoint) -> bytes::Bytes {
-    let mut out = Vec::with_capacity(19 + checkpoint.program.len());
+    let mut out = Vec::with_capacity(27 + checkpoint.program.len());
     out.extend_from_slice(CHECKPOINT_MAGIC);
     out.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
     out.extend_from_slice(&checkpoint.rows.to_le_bytes());
@@ -2253,11 +2385,13 @@ pub fn encode_checkpoint(checkpoint: &Checkpoint) -> bytes::Bytes {
         | u8::from(checkpoint.app_cursor_keys) << 1
         | u8::from(checkpoint.bracketed_paste) << 2;
     out.push(flags);
+    out.extend_from_slice(&checkpoint.filtered_offset.to_le_bytes());
     out.extend_from_slice(&(checkpoint.program.len() as u32).to_le_bytes());
     out.extend_from_slice(&checkpoint.program);
     bytes::Bytes::from(out)
 }
 
+#[cfg(test)]
 pub fn decode_checkpoint(payload: &[u8]) -> io::Result<Checkpoint> {
     fn take<'a>(payload: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
         if payload.len() < n {
@@ -2278,7 +2412,7 @@ pub fn decode_checkpoint(payload: &[u8]) -> io::Result<Checkpoint> {
         ));
     }
     let version = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
-    if version != CHECKPOINT_VERSION {
+    if !(1..=CHECKPOINT_VERSION).contains(&version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported checkpoint version {version}"),
@@ -2289,6 +2423,11 @@ pub fn decode_checkpoint(payload: &[u8]) -> io::Result<Checkpoint> {
     let cursor_row = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
     let cursor_col = u16::from_le_bytes(take(&mut rest, 2)?.try_into().unwrap());
     let flags = take(&mut rest, 1)?[0];
+    let filtered_offset = if version >= 2 {
+        u64::from_le_bytes(take(&mut rest, 8)?.try_into().unwrap())
+    } else {
+        0 // v1 records predate filtered-offset anchoring
+    };
     let program_len = u32::from_le_bytes(take(&mut rest, 4)?.try_into().unwrap()) as usize;
     let program = take(&mut rest, program_len)?;
     if !rest.is_empty() {
@@ -2304,8 +2443,97 @@ pub fn decode_checkpoint(payload: &[u8]) -> io::Result<Checkpoint> {
         alt_screen: flags & 1 != 0,
         app_cursor_keys: flags & 2 != 0,
         bracketed_paste: flags & 4 != 0,
+        filtered_offset,
         program: bytes::Bytes::copy_from_slice(program),
     })
+}
+
+/// One replay anchor: a checkpoint's filtered-stream offset and its
+/// journal position (PLAN §5.3). Sorted by filtered offset ascending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointAnchor {
+    pub filtered_offset: u64,
+    pub cursor: JournalCursor,
+    /// Segment part holding the checkpoint record.
+    pub part: u64,
+    /// Byte offset just past the checkpoint record within `part`: replay
+    /// resumes scanning here (the record itself is never replayed).
+    pub record_end_offset: u64,
+}
+
+/// Fixed header length of a v2 checkpoint payload before the restore
+/// program: magic, version, rows, cols, cursor (row, col), flags,
+/// filtered offset, program length.
+const CHECKPOINT_FIXED_HEADER_LEN: usize = 4 + 2 + 2 + 2 + 2 + 2 + 1 + 8 + 4;
+
+/// Scan one incarnation for checkpoint anchors, header-only: every record
+/// header is validated in order (continuity is part of the anchor's
+/// meaning), but payloads are skipped by seek except for the fixed
+/// checkpoint header, which carries the filtered offset.
+pub fn checkpoint_anchors(
+    session_dir: &Path,
+    incarnation: u64,
+) -> io::Result<Vec<CheckpointAnchor>> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    let parts = incarnation_parts(&journal_dir, incarnation)?;
+    let mut anchors = Vec::new();
+    let mut expected_seq = 1u64;
+    'parts: for (part, path) in &parts {
+        let mut file = fs::File::open(path)?;
+        let mut byte_pos = 0u64;
+        let mut header = [0u8; HEADER_LEN];
+        loop {
+            match file.read_exact(&mut header) {
+                Ok(()) => {}
+                // End of this part (sealed parts end cleanly; a torn tail
+                // only exists on the live last part): advance to the next
+                // part. Anchors only come from validated records.
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err),
+            }
+            if &header[0..4] != RECORD_MAGIC {
+                break 'parts;
+            }
+            let seq = u64::from_le_bytes(header[12..20].try_into().unwrap());
+            if seq != expected_seq {
+                break 'parts; // continuity hole: trust nothing further
+            }
+            let kind = u16::from_le_bytes(header[6..8].try_into().unwrap());
+            let payload_len = u32::from_le_bytes(header[28..32].try_into().unwrap()) as u64;
+            let record_end = byte_pos + HEADER_LEN as u64 + payload_len;
+            if kind == RecordKind::CheckpointRef as u16 {
+                // Only the fixed header is needed; skip the restore
+                // program (which can be MiBs) entirely.
+                if payload_len >= CHECKPOINT_FIXED_HEADER_LEN as u64 {
+                    let mut fixed = [0u8; CHECKPOINT_FIXED_HEADER_LEN];
+                    if file.read_exact(&mut fixed).is_err() {
+                        break 'parts;
+                    }
+                    let version = u16::from_le_bytes(fixed[4..6].try_into().unwrap());
+                    if version >= 2 {
+                        let filtered_offset = u64::from_le_bytes(fixed[15..23].try_into().unwrap());
+                        anchors.push(CheckpointAnchor {
+                            filtered_offset,
+                            cursor: JournalCursor { incarnation, seq },
+                            part: *part,
+                            record_end_offset: record_end,
+                        });
+                    }
+                    let skip = payload_len - CHECKPOINT_FIXED_HEADER_LEN as u64;
+                    if file.seek_relative(skip as i64).is_err() {
+                        break 'parts;
+                    }
+                } else if file.seek_relative(payload_len as i64).is_err() {
+                    break 'parts;
+                }
+            } else if file.seek_relative(payload_len as i64).is_err() {
+                break 'parts;
+            }
+            byte_pos = record_end;
+            expected_seq += 1;
+        }
+    }
+    Ok(anchors)
 }
 
 /// The incarnation holding the newest checkpoint record, if any. Scans
@@ -2413,6 +2641,7 @@ pub fn retain_before(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec
 /// [`retain_before`], which clamps the deletion horizon to the newest
 /// checkpoint (ADR-0002: a sealed incarnation is deleted only once a
 /// retained checkpoint can reconstruct the first exposed boundary).
+#[cfg(test)]
 pub fn retain_before_unchecked(session_dir: &Path, min_incarnation: u64) -> io::Result<Vec<u64>> {
     let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
     let incarnations = list_incarnations(&journal_dir)?;
@@ -2444,10 +2673,12 @@ enum ScanMode {
     /// Keep every record (small segments and tests only — recovery uses
     /// [`ScanMode::Stats`] so open-time memory does not scale with the
     /// recording).
+    #[cfg(test)]
     All,
     /// Keep only records inside the seq window, under a byte budget.
     Window(CollectWindow),
     /// Keep only per-record index entries (bounded tail/seek support).
+    #[cfg(test)]
     Index,
     /// Keep nothing but counters: O(1) memory regardless of segment size.
     Stats,
@@ -2459,6 +2690,7 @@ enum ScanMode {
 struct ScanResult {
     outcome: ScanOutcome,
     truncated: bool,
+    #[cfg(test)]
     index: Vec<IndexEntry>,
     record_count: u64,
     last_seq: Option<u64>,
@@ -2475,6 +2707,7 @@ struct ScanStart {
     seq: u64,
 }
 
+#[cfg(test)]
 /// Sparse index granularity: one entry per at most this many bytes of
 /// segment data. Keeps index memory O(part_size / stride) — 64 entries
 /// for a default 64 MiB part — while bounding a tail read's seek region
@@ -2489,6 +2722,7 @@ fn scan_impl(
 ) -> io::Result<ScanResult> {
     let mut file = fs::File::open(path)?;
     let mut records = Vec::new();
+    #[cfg(test)]
     let mut index_entries = Vec::new();
     let mut buffered_bytes = 0usize;
     let mut truncated = false;
@@ -2507,6 +2741,7 @@ fn scan_impl(
             return Ok(ScanResult {
                 outcome: outcome(records, offset, $reason),
                 truncated,
+                #[cfg(test)]
                 index: index_entries,
                 record_count,
                 last_seq,
@@ -2576,6 +2811,7 @@ fn scan_impl(
         last_seq = Some(seq);
 
         match &mode {
+            #[cfg(test)]
             ScanMode::All => {
                 records.push(Record {
                     kind,
@@ -2601,6 +2837,7 @@ fn scan_impl(
                     });
                 }
             }
+            #[cfg(test)]
             ScanMode::Index => {
                 let due = index_entries
                     .last()
@@ -3646,6 +3883,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
     fn rollover_keeps_one_sequence_across_parts() {
         let dir = test_session_dir("rollover");
         // 100-byte records, 512-byte parts -> 5 records per part.
@@ -3722,6 +3960,7 @@ mod tests {
             alt_screen: false,
             app_cursor_keys: true,
             bracketed_paste: false,
+            filtered_offset: 1234,
             program: bytes::Bytes::copy_from_slice(program),
         }
     }
@@ -3743,6 +3982,58 @@ mod tests {
         let mut bad = encoded.to_vec();
         bad.push(0);
         assert!(decode_checkpoint(&bad).is_err());
+    }
+
+    #[test]
+    fn checkpoint_v1_records_still_decode_without_a_filtered_offset() {
+        // Legacy v1 layout: no filtered-offset field (19-byte fixed part).
+        let checkpoint = test_checkpoint(b"\x1b[2Jlegacy");
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(CHECKPOINT_MAGIC);
+        v1.extend_from_slice(&1u16.to_le_bytes());
+        v1.extend_from_slice(&checkpoint.rows.to_le_bytes());
+        v1.extend_from_slice(&checkpoint.cols.to_le_bytes());
+        v1.extend_from_slice(&checkpoint.cursor.0.to_le_bytes());
+        v1.extend_from_slice(&checkpoint.cursor.1.to_le_bytes());
+        v1.push(0b110); // alt_screen=0, app_cursor_keys=1, bracketed_paste=1
+        v1.extend_from_slice(&(checkpoint.program.len() as u32).to_le_bytes());
+        v1.extend_from_slice(&checkpoint.program);
+
+        let decoded = decode_checkpoint(&v1).unwrap();
+        assert_eq!(decoded.filtered_offset, 0, "v1 carries no anchor offset");
+        assert!(decoded.app_cursor_keys);
+        assert!(decoded.bracketed_paste);
+        assert_eq!(decoded.program, checkpoint.program);
+    }
+
+    #[test]
+    fn checkpoint_anchors_scan_headers_and_track_filtered_offsets() {
+        let dir = test_session_dir("anchors");
+        let (mut shadow, incarnation, _) = ShadowJournal::open(&dir).unwrap();
+        shadow
+            .record_output(bytes::Bytes::from_static(b"aaa"))
+            .unwrap();
+        let mut checkpoint = checkpoint_payload();
+        checkpoint.filtered_offset = 3;
+        shadow.record_checkpoint(&checkpoint).unwrap();
+        shadow
+            .record_output(bytes::Bytes::from_static(b"bbb"))
+            .unwrap();
+        checkpoint.filtered_offset = 6;
+        shadow.record_checkpoint(&checkpoint).unwrap();
+        shadow.shutdown();
+
+        let anchors = checkpoint_anchors(&dir, incarnation).unwrap();
+        assert_eq!(
+            anchors
+                .iter()
+                .map(|anchor| (anchor.filtered_offset, anchor.cursor.seq))
+                .collect::<Vec<_>>(),
+            vec![(3, 2), (6, 4)],
+            "one anchor per checkpoint, in journal order"
+        );
+        assert_eq!(anchors[0].cursor.incarnation, incarnation);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4323,6 +4614,7 @@ mod tests {
             alt_screen: false,
             app_cursor_keys: false,
             bracketed_paste: false,
+            filtered_offset: 42,
             program: bytes::Bytes::from_static(b"\x1b[2Jrestored"),
         }
     }

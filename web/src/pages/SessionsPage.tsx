@@ -317,11 +317,7 @@ function SessionTagList({
   return (
     <div className={`flex min-w-0 max-w-full items-center ${className}`.trim()}>
       {normalizedTags.map((tag) => (
-        <Badge
-          key={tag}
-          variant="accent"
-          className="min-w-0 max-w-full text-[10px] font-semibold"
-        >
+        <Badge key={tag} variant="accent" className="min-w-0 max-w-full text-[10px] font-semibold">
           <span className="min-w-0 truncate">#{tag}</span>
         </Badge>
       ))}
@@ -391,7 +387,11 @@ function SessionPinButton({
           onClick={onToggle}
           className="shrink-0"
         >
-          {pinned ? <DrawingPinFilledIcon className="h-4 w-4" /> : <DrawingPinIcon className="h-4 w-4" />}
+          {pinned ? (
+            <DrawingPinFilledIcon className="h-4 w-4" />
+          ) : (
+            <DrawingPinIcon className="h-4 w-4" />
+          )}
         </Button>
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
@@ -757,7 +757,10 @@ function SessionCard({
     ? 'text-[hsl(var(--foreground))]/70'
     : 'text-[hsl(var(--foreground))]'
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
-  const opacityClass = session.status === 'stopped' || session.status === 'killed' || session.status === 'failed' ? 'opacity-60' : ''
+  const opacityClass =
+    session.status === 'stopped' || session.status === 'killed' || session.status === 'failed'
+      ? 'opacity-60'
+      : ''
 
   function openSession(mode: 'attach' | 'logs') {
     navigate(buildSessionHref(session.id, mode, node))
@@ -845,10 +848,10 @@ function SessionCard({
               className="border-[hsl(var(--primary))] text-[hsl(var(--primary))]"
               size="sm"
             >
-                <Link to={attachHref}>
+              <Link to={attachHref}>
                 <Link2Icon className="h-4 w-4" />
                 Attach
-                </Link>
+              </Link>
             </Button>
           )}
           {isRunning && (
@@ -875,10 +878,7 @@ function SessionCard({
                 pending={notificationsPending}
                 onToggle={() => onToggleNotifications(session)}
               />
-              <SessionPinButton
-                pinned={pinned ?? false}
-                onToggle={() => onTogglePin(session)}
-              />
+              <SessionPinButton pinned={pinned ?? false} onToggle={() => onTogglePin(session)} />
             </>
           )}
           <div className="flex-1"></div>
@@ -1226,13 +1226,17 @@ export default function SessionsPage() {
 
   useEffect(() => {
     if (!selectedNode) {
-      void loadLocal()
+      // Deferred to a microtask: loadLocal synchronously sets loading
+      // state, which must not run inside the effect body itself.
+      queueMicrotask(() => void loadLocal())
     }
   }, [loadLocal, selectedNode])
 
   useEffect(() => {
     if (selectedNode) {
-      void loadRemote()
+      // Deferred to a microtask: loadRemote synchronously sets loading
+      // state, which must not run inside the effect body itself.
+      queueMicrotask(() => void loadRemote())
     }
   }, [loadRemote, selectedNode])
 
@@ -1311,7 +1315,6 @@ export default function SessionsPage() {
     }
   }, [reloadSessions])
 
-
   // Display order: pinned live sessions first (most recently pinned topmost),
   // then — for the default Created At sort — active sessions before finished
   // ones (same rule as the TUI's "active first" strategy). An explicit user
@@ -1331,10 +1334,15 @@ export default function SessionsPage() {
   const pageStart = total === 0 ? 0 : page * PAGE_SIZE + 1
   const pageEnd = Math.min(page * PAGE_SIZE + pagedSessions.length, total)
 
-  useEffect(() => {
+  // Clamp the page when the filtered total shrinks (e.g. after a search).
+  // Render-time adjustment is the React-recommended alternative to a
+  // setState-in-effect cascade.
+  const [prevTotal, setPrevTotal] = useState(total)
+  if (prevTotal !== total) {
+    setPrevTotal(total)
     const lastPage = Math.max(Math.ceil(total / PAGE_SIZE) - 1, 0)
     setPage((prev) => Math.min(prev, lastPage))
-  }, [total])
+  }
 
   const grouped = useMemo<Array<{ key: string; items: SessionSummary[] }>>(() => {
     if (groupBy === 'none') return [{ key: '', items: pagedSessions }]
@@ -1442,7 +1450,7 @@ export default function SessionsPage() {
 
   function handleSort(field: SessionSortField) {
     let nextSortField = sortField
-    let nextSortOrder = sortOrder
+    let nextSortOrder: SortOrder
     if (field === sortField) {
       nextSortOrder = sortOrder === SortOrder.Asc ? SortOrder.Desc : SortOrder.Asc
       setSortOrder(nextSortOrder)
@@ -1517,7 +1525,8 @@ export default function SessionsPage() {
 
   function dropColumnBefore(columnKey: SessionTableColumnKey, event: React.DragEvent) {
     const draggedColumn =
-      tableColumnDragRef.current || (event.dataTransfer.getData('text/plain') as SessionTableColumnKey)
+      tableColumnDragRef.current ||
+      (event.dataTransfer.getData('text/plain') as SessionTableColumnKey)
     tableColumnDragRef.current = null
     if (!draggedColumn || draggedColumn === columnKey) return
     event.preventDefault()
@@ -1982,15 +1991,15 @@ export default function SessionsPage() {
                           onPointerCancel={endColumnResize}
                           onDoubleClick={(event) => {
                             event.stopPropagation()
-                          setTableColumnSettings((previous) => ({
-                            ...previous,
-                            sizes: {
-                              ...previous.sizes,
-                              [col.key]: col.defaultWidth,
-                            },
-                          }))
-                        }}
-                      />
+                            setTableColumnSettings((previous) => ({
+                              ...previous,
+                              sizes: {
+                                ...previous.sizes,
+                                [col.key]: col.defaultWidth,
+                              },
+                            }))
+                          }}
+                        />
                       </TableHead>
                     )
                   })}

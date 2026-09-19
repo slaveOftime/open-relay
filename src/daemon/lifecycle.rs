@@ -125,10 +125,10 @@ async fn acquire_daemon_start_lock(config: &AppConfig) -> Result<File> {
                     return Err(AppError::DaemonAlreadyRunning);
                 }
 
-                if let Some(pid) = storage::read_pid(&config.lock_file)? {
-                    if process_is_running(pid) {
-                        return Err(AppError::DaemonAlreadyRunning);
-                    }
+                if let Some(pid) = storage::read_pid(&config.lock_file)?
+                    && process_is_running(pid)
+                {
+                    return Err(AppError::DaemonAlreadyRunning);
                 }
 
                 if std::time::Instant::now() >= deadline {
@@ -303,13 +303,13 @@ async fn wait_for_daemon_ready(
         // For detached start, track the actual spawned child PID rather than the
         // lockfile PID, which may still contain a stale value until the new daemon
         // acquires the startup lock and writes its own PID.
-        if let Some(pid) = expected_pid {
-            if !process_is_running(pid) {
-                return Err(AppError::DaemonUnavailable(format!(
-                    "daemon process exited before becoming ready. Check logs under {}",
-                    config.state_dir.display()
-                )));
-            }
+        if let Some(pid) = expected_pid
+            && !process_is_running(pid)
+        {
+            return Err(AppError::DaemonUnavailable(format!(
+                "daemon process exited before becoming ready. Check logs under {}",
+                config.state_dir.display()
+            )));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;

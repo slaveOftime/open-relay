@@ -99,3 +99,28 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+
+# Clippy baseline (M6 review hardening): the gate is
+# `cargo clippy --locked --all-targets --all-features -- -D warnings`.
+# The allowances below are the deliberate, documented exceptions; every
+# other lint must stay clean.
+[lints.clippy]
+# The session store's `std::sync::Mutex` guards deliberately span `.await`
+# points: the store's locking discipline protects in-memory subscriber
+# registries while awaiting channel sends that can never re-enter the same
+# lock on the same task. Switching to async mutexes would widen, not
+# narrow, the hold windows.
+await_holding_lock = "allow"
+# Long-lived plumbing functions (RPC dispatch, log rendering) thread many
+# orthogonal parameters; a parameter-object refactor is not worth the
+# indirection at these two sites.
+too_many_arguments = "allow"
+# Subscriber registries store per-subscriber senders keyed by compound
+# cursors; the types are structural, not domain concepts worth naming.
+type_complexity = "allow"
+# `RpcResponse` has one large attach-snapshot variant; boxing it would add
+# an allocation to the hottest attach path for no runtime win.
+large_enum_variant = "allow"
+# Session-scoped protocol types share the `Session` prefix on purpose;
+# renaming them would diverge from the protocol documentation.
+enum_variant_names = "allow"

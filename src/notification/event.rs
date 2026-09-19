@@ -144,7 +144,7 @@ impl NotificationEvent {
         let navigation_url = url.or_else(|| {
             session_ids
                 .first()
-                .map(|session_id| format!("{}?mode=attach", session_navigation_url(&session_id)))
+                .map(|session_id| format!("{}?mode=attach", session_navigation_url(session_id)))
         });
 
         Self {

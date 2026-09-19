@@ -1,7 +1,7 @@
 import { useSyncExternalStore } from 'react'
 
 import type { SessionEvent, SessionNotificationData, SessionSummary } from '@/api/types'
-import { SparklineStore } from '@/components/SparklineSvg'
+import { SparklineStore } from '@/components/sparklineStore'
 
 const sparklineStore = new SparklineStore()
 const EMPTY_ACTIVITY_SERIES: number[] = []

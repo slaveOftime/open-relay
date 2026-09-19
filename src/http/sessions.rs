@@ -161,7 +161,7 @@ pub async fn list(
         })
         .unwrap_or_default();
 
-    let page_limit = params.limit.unwrap_or(20).max(1).min(200);
+    let page_limit = params.limit.unwrap_or(20).clamp(1, 200);
     let offset = params.offset.unwrap_or(0);
 
     let query = ListQuery {
@@ -171,7 +171,7 @@ pub async fn list(
         since: None,
         until: None,
         limit: page_limit,
-        offset: offset,
+        offset,
         sort: params.sort.unwrap_or_default(),
         order: params.order.unwrap_or_default(),
     };
@@ -410,9 +410,9 @@ pub async fn get_session(
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
             // M3-1c: journal-backed sessions report the derived filtered
-            // stream length; pre-1.0 sessions report 0 (M6-2).
+            // stream length; pre-0.5 sessions report 0 (M6-2).
             let session_dir = state.config.get().sessions_dir.join(&id);
-            // M6-2: pre-1.0 sessions (no journal) report 0.
+            // M6-2: pre-0.5 sessions (no journal) report 0.
             let total_bytes = if session_dir
                 .join(crate::session::journal::JOURNAL_DIR_NAME)
                 .is_dir()
@@ -938,7 +938,7 @@ pub async fn send_input(
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::AttachInput {
             id: id.clone(),
-            data: body.data.clone(),
+            data: body.data.clone().into_bytes(),
             wait_for_change: body.wait_for_change,
             attachment_id: None,
         };
@@ -964,7 +964,7 @@ pub async fn send_input(
 
     match state
         .store
-        .attach_input(&id, None, &body.data, body.wait_for_change)
+        .attach_input(&id, None, body.data.as_bytes(), body.wait_for_change)
         .await
     {
         Ok(()) => {
@@ -1112,7 +1112,16 @@ pub async fn get_logs(
     };
 
     match read_persisted_log_page(&session_dir, offset, limit) {
-        Some((lines, mut total)) => {
+        Err(message) => {
+            // Pre-1.0 log format: explicit, actionable error (M6-2).
+            debug!(session_id = %id, error = %message, "session log unreadable");
+            (
+                StatusCode::GONE,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+        Ok(Some((lines, mut total))) => {
             if let Ok(live_total) = state.store.read_live_log_chunk_count(&id).await {
                 total += live_total;
             }
@@ -1124,7 +1133,7 @@ pub async fn get_logs(
                 resizes,
             })
         }
-        None => {
+        Ok(None) => {
             debug!(session_id = %id, "session not found for logs (disk)");
             (
                 StatusCode::NOT_FOUND,

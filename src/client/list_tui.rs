@@ -123,8 +123,10 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
     native_crash::install();
 
     let query = super::list::build_list_query(args)?;
-    let mut app = App::default();
-    app.show_node = targets.len() > 1;
+    let mut app = App {
+        show_node: targets.len() > 1,
+        ..Default::default()
+    };
     let refresh = fetch_sessions(config, query.clone(), &targets).await?;
     app.message = refresh.warning();
     app.replace_sessions(refresh.sessions);
@@ -176,7 +178,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
                     );
                     refresh
                         .sessions
-                        .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                        .sort_by_key(|session| std::cmp::Reverse(session.created_at));
                     refresh.sessions.truncate(query.limit);
                     let warning = refresh.warning();
                     app.replace_sessions(refresh.sessions);
@@ -289,7 +291,7 @@ async fn fetch_sessions(
     if successful_targets == 0 {
         return Err(AppError::Protocol(failures.join(" · ")));
     }
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
     sessions.truncate(query.limit);
     Ok(SessionRefresh {
         sessions,
@@ -3072,7 +3074,7 @@ fn pad_truncated(value: &str, width: usize) -> String {
     format!("{value}{}", " ".repeat(padding))
 }
 
-fn status_label<'a>(status: &'a str, input_needed: bool) -> &'a str {
+fn status_label(status: &str, input_needed: bool) -> &str {
     if input_needed { "attention" } else { status }
 }
 
@@ -5264,10 +5266,12 @@ mod tests {
 
     #[test]
     fn render_tolerates_stale_visible_indices() {
-        let mut app = App::default();
-        app.sessions = vec![session("a")];
-        app.search_text = vec!["a".to_string()];
-        app.visible = vec![usize::MAX];
+        let mut app = App {
+            sessions: vec![session("a")],
+            search_text: vec!["a".to_string()],
+            visible: vec![usize::MAX],
+            ..Default::default()
+        };
         app.selected = usize::MAX;
 
         let rendered = render_app(&mut app, 120, 20);
@@ -5277,10 +5281,12 @@ mod tests {
 
     #[test]
     fn rebuild_visible_repairs_stale_search_index() {
-        let mut app = App::default();
-        app.sessions = vec![session("a")];
+        let mut app = App {
+            sessions: vec![session("a")],
+            normalized_filter: "cmd".to_string(),
+            ..Default::default()
+        };
         app.search_text.clear();
-        app.normalized_filter = "cmd".to_string();
 
         app.rebuild_visible();
 

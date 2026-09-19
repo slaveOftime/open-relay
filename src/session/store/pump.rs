@@ -198,34 +198,27 @@ impl AttachPump {
         let init_incarnation = store.journal_incarnation(id).unwrap_or(0);
         let (init, broadcast_rx) = match from_offset {
             None => {
-                let (snapshot, end_offset, rx, bracketed_paste_mode, app_cursor_keys) =
-                    store.attach_snapshot_init(id).await?;
+                let (snapshot, end_offset, rx, modes) = store.attach_snapshot_init(id).await?;
                 (
                     AttachInit {
                         data: snapshot,
                         end_offset,
                         running: store.is_running(id),
-                        modes: ModeSnapshot {
-                            app_cursor_keys,
-                            bracketed_paste_mode,
-                        },
+                        modes,
                         incarnation: init_incarnation,
                     },
                     rx,
                 )
             }
             Some(offset) => {
-                let (chunks, end, rx, bracketed_paste_mode, app_cursor_keys) =
+                let (chunks, end, rx, modes) =
                     store.attach_subscribe_init(id, Some(offset)).await?;
                 (
                     AttachInit {
                         data: collect_chunk_bytes(&chunks),
                         end_offset: end,
                         running: store.is_running(id),
-                        modes: ModeSnapshot {
-                            app_cursor_keys,
-                            bracketed_paste_mode,
-                        },
+                        modes,
                         incarnation: init_incarnation,
                     },
                     rx,
@@ -613,7 +606,6 @@ mod tests {
         rt.push_output(bytes, bytes.len());
         let offset = rt.filtered_stream_len() - bytes.len() as u64;
         let _ = rt.broadcast_tx.send(SequencedChunk {
-            cursor: None,
             offset,
             bytes: Bytes::copy_from_slice(bytes),
         });
@@ -868,13 +860,11 @@ mod tests {
         // A duplicate of already-forwarded bytes (offset fully covered by
         // the cursor) must be skipped, never double-sent (I2).
         let _ = rt.read().broadcast_tx.send(SequencedChunk {
-            cursor: None,
             offset: 0,
             bytes: Bytes::from_static(b"abc"),
         });
         // A partially covered chunk is trimmed to the uncovered suffix.
         let _ = rt.read().broadcast_tx.send(SequencedChunk {
-            cursor: None,
             offset: 2,
             bytes: Bytes::from_static(b"cXY"),
         });
@@ -903,7 +893,6 @@ mod tests {
         let dir = rt.read().dir.clone();
         super::super::testsupport::seed_journal_output(&dir, b"01234");
         let _ = rt.read().broadcast_tx.send(SequencedChunk {
-            cursor: None,
             offset: 5,
             bytes: Bytes::from_static(b"56789"),
         });
@@ -1123,7 +1112,7 @@ mod tests {
                     controller = attachment_ids[3];
                     // The demoted controller is now gated (I6).
                     let err = store
-                        .attach_input("stress1", Some(attachment_ids[0]), "x", false)
+                        .attach_input("stress1", Some(attachment_ids[0]), b"x", false)
                         .await
                         .expect_err("demoted controller must be gated");
                     assert!(matches!(err, SessionError::NotController));
@@ -1131,7 +1120,7 @@ mod tests {
                 // Controller input still lands.
                 41 => {
                     store
-                        .attach_input("stress1", Some(controller), "k", false)
+                        .attach_input("stress1", Some(controller), b"k", false)
                         .await
                         .expect("controller input");
                     assert_eq!(writer_rx.try_recv().ok().as_deref(), Some(b"k".as_slice()));

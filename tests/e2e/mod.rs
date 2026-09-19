@@ -29,18 +29,18 @@ pub fn oly_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_oly"))
 }
 
-pub fn oly_cmd(tmp_dir: &PathBuf) -> Command {
+pub fn oly_cmd(tmp_dir: &std::path::Path) -> Command {
     let mut cmd = Command::new(oly_bin());
     apply_state_env(&mut cmd, tmp_dir);
     cmd
 }
 
-fn apply_state_env(cmd: &mut Command, tmp_dir: &PathBuf) {
+fn apply_state_env(cmd: &mut Command, tmp_dir: &std::path::Path) {
     cmd.env("OLY_STATE_DIR", tmp_dir.join("oly"));
     cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(tmp_dir));
 }
 
-pub fn socket_name_for_tmp(tmp_dir: &PathBuf) -> String {
+pub fn socket_name_for_tmp(tmp_dir: &std::path::Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tmp_dir.to_string_lossy().hash(&mut hasher);
@@ -103,8 +103,8 @@ fn daemon_ready_timeout(no_http: bool) -> Duration {
 
 fn wait_for_daemon_ready(
     mut child: std::process::Child,
-    tmp: &PathBuf,
-    log_path: &PathBuf,
+    tmp: &std::path::Path,
+    log_path: &std::path::Path,
     timeout: Duration,
 ) -> DaemonGuard {
     let deadline = Instant::now() + timeout;
@@ -132,7 +132,7 @@ fn wait_for_daemon_ready(
         if probe_stderr.contains("zzz9999") {
             return DaemonGuard {
                 child,
-                tmp_dir: tmp.clone(),
+                tmp_dir: tmp.to_path_buf(),
             };
         }
 
@@ -165,7 +165,7 @@ impl Drop for DaemonGuard {
     }
 }
 
-pub fn start_daemon(tmp: &PathBuf) -> DaemonGuard {
+pub fn start_daemon(tmp: &std::path::Path) -> DaemonGuard {
     let log_path = tmp.join("daemon-stderr.log");
     let log_file = fs::File::create(&log_path).expect("create daemon log file");
 
@@ -191,11 +191,11 @@ pub fn pick_free_port() -> u16 {
     listener.local_addr().expect("read local addr").port()
 }
 
-pub fn start_daemon_http(tmp: &PathBuf, port: u16) -> DaemonGuard {
+pub fn start_daemon_http(tmp: &std::path::Path, port: u16) -> DaemonGuard {
     start_daemon_http_with_bind(tmp, "127.0.0.1", port)
 }
 
-pub fn start_daemon_http_with_bind(tmp: &PathBuf, bind: &str, port: u16) -> DaemonGuard {
+pub fn start_daemon_http_with_bind(tmp: &std::path::Path, bind: &str, port: u16) -> DaemonGuard {
     let log_path = tmp.join("daemon-stderr.log");
     let log_file = fs::File::create(&log_path).expect("create daemon log file");
 
@@ -219,7 +219,7 @@ pub fn start_daemon_http_with_bind(tmp: &PathBuf, bind: &str, port: u16) -> Daem
     wait_for_daemon_ready(child, tmp, &log_path, daemon_ready_timeout(false))
 }
 
-pub fn start_session(tmp: &PathBuf, cmd_and_args: &[&str]) -> String {
+pub fn start_session(tmp: &std::path::Path, cmd_and_args: &[&str]) -> String {
     let mut args = vec!["start", "--detach"];
     args.extend_from_slice(cmd_and_args);
     let output = oly_cmd(tmp)
@@ -236,7 +236,7 @@ pub fn start_session(tmp: &PathBuf, cmd_and_args: &[&str]) -> String {
     id
 }
 
-pub fn send_line(tmp: &PathBuf, id: &str, text: &str) {
+pub fn send_line(tmp: &std::path::Path, id: &str, text: &str) {
     let output = oly_cmd(tmp)
         .args(["send", id, text, "key:enter"])
         .output()
@@ -249,7 +249,7 @@ pub fn send_line(tmp: &PathBuf, id: &str, text: &str) {
     );
 }
 
-pub fn send_text_only(tmp: &PathBuf, id: &str, text: &str) {
+pub fn send_text_only(tmp: &std::path::Path, id: &str, text: &str) {
     let output = oly_cmd(tmp)
         .args(["send", id, text])
         .output()
@@ -261,7 +261,7 @@ pub fn send_text_only(tmp: &PathBuf, id: &str, text: &str) {
     );
 }
 
-pub fn send_key(tmp: &PathBuf, id: &str, key: &str) {
+pub fn send_key(tmp: &std::path::Path, id: &str, key: &str) {
     let key_chunk = format!("key:{key}");
     let output = oly_cmd(tmp)
         .args(["send", id, &key_chunk])
@@ -274,7 +274,7 @@ pub fn send_key(tmp: &PathBuf, id: &str, key: &str) {
     );
 }
 
-pub fn fetch_logs_with_tail(tmp: &PathBuf, id: &str, tail: usize) -> String {
+pub fn fetch_logs_with_tail(tmp: &std::path::Path, id: &str, tail: usize) -> String {
     let tail = tail.to_string();
     let output = oly_cmd(tmp)
         .args(["logs", id, "--tail", &tail, "--no-truncate"])
@@ -283,7 +283,7 @@ pub fn fetch_logs_with_tail(tmp: &PathBuf, id: &str, tail: usize) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-pub fn fetch_logs(tmp: &PathBuf, id: &str) -> String {
+pub fn fetch_logs(tmp: &std::path::Path, id: &str) -> String {
     fetch_logs_with_tail(tmp, id, 200)
 }
 
@@ -295,7 +295,7 @@ pub fn normalize_log_text(log: &str) -> String {
 }
 
 pub fn wait_for_log(
-    tmp: &PathBuf,
+    tmp: &std::path::Path,
     id: &str,
     predicate: impl Fn(&str) -> bool,
     timeout: Duration,
@@ -311,7 +311,7 @@ pub fn wait_for_log(
     None
 }
 
-pub fn wait_for_stable_log(tmp: &PathBuf, id: &str, timeout: Duration) -> Option<String> {
+pub fn wait_for_stable_log(tmp: &std::path::Path, id: &str, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     let mut previous_non_empty: Option<String> = None;
     while Instant::now() < deadline {
@@ -328,7 +328,7 @@ pub fn wait_for_stable_log(tmp: &PathBuf, id: &str, timeout: Duration) -> Option
 }
 
 pub fn wait_for_exact_log(
-    tmp: &PathBuf,
+    tmp: &std::path::Path,
     id: &str,
     expected: &str,
     timeout: Duration,
@@ -337,7 +337,7 @@ pub fn wait_for_exact_log(
 }
 
 pub fn wait_for_exact_log_with_tail(
-    tmp: &PathBuf,
+    tmp: &std::path::Path,
     id: &str,
     tail: usize,
     expected: &str,
@@ -377,7 +377,7 @@ pub fn strip_session_status_marker(log: &str, id: &str) -> String {
 /// the exact moment the daemon flips the session to `stopped` is racy, so
 /// tests that only care about transcript content must not depend on it.
 pub fn wait_for_exact_log_with_tail_ignoring_status_marker(
-    tmp: &PathBuf,
+    tmp: &std::path::Path,
     id: &str,
     tail: usize,
     expected: &str,
@@ -395,7 +395,7 @@ pub fn wait_for_exact_log_with_tail_ignoring_status_marker(
     None
 }
 
-pub fn fetch_logs_node(tmp: &PathBuf, node: &str, id: &str) -> String {
+pub fn fetch_logs_node(tmp: &std::path::Path, node: &str, id: &str) -> String {
     let output = oly_cmd(tmp)
         .args(["logs", id, "--node", node, "--tail", "200", "--no-truncate"])
         .output()
@@ -404,7 +404,7 @@ pub fn fetch_logs_node(tmp: &PathBuf, node: &str, id: &str) -> String {
 }
 
 pub fn wait_for_log_node(
-    tmp: &PathBuf,
+    tmp: &std::path::Path,
     node: &str,
     id: &str,
     predicate: impl Fn(&str) -> bool,

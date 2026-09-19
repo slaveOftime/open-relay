@@ -46,9 +46,7 @@ describe('sessionIsActive', () => {
   it('treats finished sessions as inactive unless they wait for input', () => {
     expect(sessionIsActive(session({ status: 'stopped' }))).toBe(false)
     expect(sessionIsActive(session({ status: 'failed' }))).toBe(false)
-    expect(
-      sessionIsActive(session({ status: 'stopped', input_needed: true }))
-    ).toBe(true)
+    expect(sessionIsActive(session({ status: 'stopped', input_needed: true }))).toBe(true)
   })
 })
 
@@ -197,7 +195,11 @@ describe('orderSessionPage pinning', () => {
 
   it('scopes pins to the selected node', () => {
     const remoteSession = session({ id: 'same', status: 'running' })
-    const otherRemote = session({ id: 'other', status: 'running', created_at: '2026-01-02T00:00:00Z' })
+    const otherRemote = session({
+      id: 'other',
+      status: 'running',
+      created_at: '2026-01-02T00:00:00Z',
+    })
 
     // Pinning the local list does not float the remote node's session...
     const localPinOnly = orderSessionPage([otherRemote, remoteSession], {

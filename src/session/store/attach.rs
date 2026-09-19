@@ -13,7 +13,10 @@ use bytes::Bytes;
 use tokio::sync::{broadcast, mpsc::error::TrySendError};
 use tracing::{debug, warn};
 
-use crate::session::{SessionEvent, runtime::SequencedChunk};
+use crate::session::{
+    SessionEvent,
+    runtime::{ModeSnapshot, SequencedChunk},
+};
 
 use super::super::{SessionError, journal, replay};
 use super::{
@@ -141,8 +144,7 @@ impl SessionStore {
             Vec<(u64, Bytes)>,
             u64,
             broadcast::Receiver<SequencedChunk>,
-            bool,
-            bool,
+            ModeSnapshot,
         ),
         SessionError,
     > {
@@ -157,12 +159,12 @@ impl SessionStore {
         };
         let offset = from_byte_offset.unwrap_or(0);
         // The filtered display stream is derived from the raw journal
-        // (M3-1b); sessions without a journal are pre-1.0 and unsupported
+        // (M3-1b); sessions without a journal are pre-0.5 and unsupported
         // (M6-2 removed the output.log fallback; see MIGRATION.md).
         if !dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
             warn!(
                 session_id = id,
-                "session has no journal (pre-1.0 log format)"
+                "session has no journal (pre-0.5 log format)"
             );
             return Err(SessionError::Evicted);
         }
@@ -183,13 +185,7 @@ impl SessionStore {
             app_cursor_keys = modes.app_cursor_keys,
             "attach subscribe init"
         );
-        Ok((
-            chunks,
-            end_offset,
-            rx,
-            modes.bracketed_paste_mode,
-            modes.app_cursor_keys,
-        ))
+        Ok((chunks, end_offset, rx, modes))
     }
 
     /// Initialise an attach stream from the current rendered terminal state
@@ -310,8 +306,7 @@ impl SessionStore {
             Vec<u8>,
             u64,
             broadcast::Receiver<SequencedChunk>,
-            bool,
-            bool,
+            ModeSnapshot,
         ),
         SessionError,
     > {
@@ -329,13 +324,7 @@ impl SessionStore {
             app_cursor_keys = modes.app_cursor_keys,
             "attach snapshot init"
         );
-        Ok((
-            snapshot,
-            end_offset,
-            rx,
-            modes.bracketed_paste_mode,
-            modes.app_cursor_keys,
-        ))
+        Ok((snapshot, end_offset, rx, modes))
     }
 
     /// Render the session's scrolled-off rows for the client to print before
@@ -387,18 +376,21 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Forward raw input bytes to the session PTY.
+    ///
+    /// Byte-exact (PLAN §5.1): the bytes the client sent reach the PTY
+    /// unchanged. Key-to-sequence encoding (DECCKM application cursor
+    /// keys, modifier parameters, bracketed-paste wrapping) happens at
+    /// the *client* that owns the key event; the daemon never rewrites
+    /// input, so pasted or scripted bytes containing `ESC [ A`-style
+    /// sequences are not corrupted.
     pub async fn attach_input(
         &self,
         id: &str,
         attachment_id: Option<u64>,
-        data: &str,
+        data: &[u8],
         wait_for_change: bool,
     ) -> std::result::Result<(), SessionError> {
-        // Avoid sending lose focus escape sequence which will cause other clients not able to input anything
-        if data == "\x1b[O" {
-            return Ok(());
-        }
-
         let handle = self.lookup_runtime(id).await?;
 
         // I6: attached clients drive input only while holding the control
@@ -409,37 +401,14 @@ impl SessionStore {
             check_control(&rt, attachment_id)?;
         }
 
-        // Read lock: gather mode flags, transform input, send to PTY channel.
-        // try_write_input() is a non-blocking channel send that only needs &self.
-        let (initial_total_bytes, byte_len, transformed, app_cursor_keys) = {
+        // Read lock: send to the PTY channel. try_write_input() is a
+        // non-blocking channel send that only needs &self.
+        let (initial_total_bytes, byte_len) = {
             let rt = handle.read();
             let initial_total_bytes = rt.filtered_total_bytes;
-            let modes = rt.mode_snapshot();
-            let cooked;
-            let transformed = modes.app_cursor_keys
-                && (data.contains("\x1b[A")
-                    || data.contains("\x1b[B")
-                    || data.contains("\x1b[C")
-                    || data.contains("\x1b[D"));
-            let bytes = if transformed {
-                cooked = data
-                    .replace("\x1b[A", "\x1bOA")
-                    .replace("\x1b[B", "\x1bOB")
-                    .replace("\x1b[C", "\x1bOC")
-                    .replace("\x1b[D", "\x1bOD");
-                cooked.into_bytes()
-            } else {
-                data.as_bytes().to_vec()
-            };
-
-            let byte_len = bytes.len();
-            match rt.pty.try_write_input(bytes) {
-                Ok(()) => Ok((
-                    initial_total_bytes,
-                    byte_len,
-                    transformed,
-                    modes.app_cursor_keys,
-                )),
+            let byte_len = data.len();
+            match rt.pty.try_write_input(data.to_vec()) {
+                Ok(()) => Ok((initial_total_bytes, byte_len)),
                 Err(TrySendError::Full(_)) => {
                     debug!(
                         session_id = id,
@@ -470,13 +439,7 @@ impl SessionStore {
             }
         }
 
-        debug!(
-            session_id = id,
-            bytes = byte_len,
-            transformed,
-            app_cursor_keys,
-            "attach input forwarded"
-        );
+        debug!(session_id = id, bytes = byte_len, "attach input forwarded");
 
         if wait_for_change {
             let _ = self
@@ -625,7 +588,7 @@ mod tests {
         );
         let store = store_with(vec![runtime], make_test_db().await);
 
-        let (chunks, end_offset, _rx, _bpm, _ack) = store
+        let (chunks, end_offset, _rx, _modes) = store
             .attach_subscribe_init("attach123", Some(6))
             .await
             .expect("attach subscribe init");
@@ -644,7 +607,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0001", None, "hello\r", true)
+            .attach_input("inp0001", None, b"hello\r", true)
             .await
             .expect("attach_input should succeed");
 
@@ -662,7 +625,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0002", None, "x", true)
+            .attach_input("inp0002", None, b"x", true)
             .await
             .expect("attach_input should succeed");
 
@@ -673,9 +636,12 @@ mod tests {
         );
     }
 
+    /// PLAN §5.1 byte-exactness: the daemon NEVER rewrites input, even
+    /// when the child has DECCKM application cursor keys enabled — the
+    /// key-to-sequence mapping is the sending client's job, and a pasted
+    /// or scripted stream containing `ESC [ A` must survive unchanged.
     #[tokio::test]
-    async fn test_attach_input_decckm_transforms_arrow_up() {
-        // When app_cursor_keys = true, \x1b[A → \x1bOA (DECCKM mode).
+    async fn test_attach_input_never_rewrites_arrow_bytes_under_decckm() {
         let (rt, mut writer_rx) = make_runtime_writable("inp0003", SessionStatus::Running);
         {
             let mut locked = rt.write();
@@ -684,61 +650,38 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         store
-            .attach_input("inp0003", None, "\x1b[A", true)
+            .attach_input("inp0003", None, b"\x1b[A\x1b[B\x1b[C\x1b[D", true)
             .await
             .expect("attach_input should succeed");
 
         let written = writer_rx.recv().await.expect("should receive bytes");
         assert_eq!(
-            written, b"\x1bOA",
-            "arrow up should be translated to app-cursor-key form"
+            written, b"\x1b[A\x1b[B\x1b[C\x1b[D",
+            "raw arrow sequences pass through byte-exact under DECCKM"
         );
     }
 
+    /// Byte-exactness for non-UTF-8 input (binary paste, hex: specs):
+    /// bytes that are not valid UTF-8 reach the PTY unmodified.
     #[tokio::test]
-    async fn test_attach_input_decckm_transforms_all_arrows() {
+    async fn test_attach_input_passes_non_utf8_bytes_through() {
         let (rt, mut writer_rx) = make_runtime_writable("inp0004", SessionStatus::Running);
-        {
-            let mut locked = rt.write();
-            locked.feed_engine(b"\x1b[?1h");
-        }
         let store = store_with(vec![rt], make_test_db().await);
 
-        // Send all four arrow sequences at once.
+        let raw: &[u8] = b"\x00\xff\xfe\x80abc\x1b[A";
         store
-            .attach_input("inp0004", None, "\x1b[A\x1b[B\x1b[C\x1b[D", true)
+            .attach_input("inp0004", None, raw, true)
             .await
             .expect("attach_input should succeed");
 
         let written = writer_rx.recv().await.expect("should receive bytes");
-        assert_eq!(
-            written, b"\x1bOA\x1bOB\x1bOC\x1bOD",
-            "all arrow sequences should be translated in DECCKM mode"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_attach_input_no_transform_when_decckm_off() {
-        let (rt, mut writer_rx) = make_runtime_writable("inp0005", SessionStatus::Running);
-        // app_cursor_keys is false by default.
-        let store = store_with(vec![rt], make_test_db().await);
-
-        store
-            .attach_input("inp0005", None, "\x1b[A\x1b[B", true)
-            .await
-            .expect("attach_input should succeed");
-
-        let written = writer_rx.recv().await.expect("should receive bytes");
-        assert_eq!(
-            written, b"\x1b[A\x1b[B",
-            "arrow sequences should pass through unchanged when DECCKM is off"
-        );
+        assert_eq!(written, raw, "non-UTF-8 bytes pass through byte-exact");
     }
 
     #[tokio::test]
     async fn test_attach_input_not_found_for_unknown_session() {
         let store = SessionStore::new(900, make_test_db().await);
-        let result = store.attach_input("no_such_id", None, "data", true).await;
+        let result = store.attach_input("no_such_id", None, b"data", true).await;
         assert!(
             result.is_err(),
             "attach_input to unknown session should return an error"
@@ -758,7 +701,7 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let result = store.attach_input("inpbusy1", None, "second", true).await;
+        let result = store.attach_input("inpbusy1", None, b"second", true).await;
         assert!(
             matches!(result, Err(SessionError::Busy)),
             "expected bounded writer queue saturation to surface SessionLookupError::Busy"
@@ -781,7 +724,7 @@ mod tests {
 
         let started = Instant::now();
         store
-            .attach_input("inpwait1", None, "x", true)
+            .attach_input("inpwait1", None, b"x", true)
             .await
             .expect("attach_input should succeed");
         updater.await.expect("output updater should complete");
@@ -799,7 +742,7 @@ mod tests {
 
         let started = Instant::now();
         store
-            .attach_input("inpwait2", None, "x", true)
+            .attach_input("inpwait2", None, b"x", true)
             .await
             .expect("attach_input should succeed");
 
@@ -994,7 +937,7 @@ mod tests {
 
         // Observer input and resize are rejected with NotController.
         let err = store
-            .attach_input("ctl0001", Some(second.attachment_id), "x", false)
+            .attach_input("ctl0001", Some(second.attachment_id), b"x", false)
             .await
             .expect_err("observer input must be gated");
         assert!(matches!(err, SessionError::NotController));
@@ -1006,7 +949,7 @@ mod tests {
 
         // The operator control plane (no attachment) stays ungated.
         store
-            .attach_input("ctl0001", None, "ls", false)
+            .attach_input("ctl0001", None, b"ls", false)
             .await
             .expect("operator input must not be gated");
 
@@ -1021,11 +964,11 @@ mod tests {
         );
         assert_eq!(outcome.demoted, Some(first.attachment_id));
         store
-            .attach_input("ctl0001", Some(second.attachment_id), "x", false)
+            .attach_input("ctl0001", Some(second.attachment_id), b"x", false)
             .await
             .expect("new controller input");
         let err = store
-            .attach_input("ctl0001", Some(first.attachment_id), "x", false)
+            .attach_input("ctl0001", Some(first.attachment_id), b"x", false)
             .await
             .expect_err("demoted controller input must be gated");
         assert!(matches!(err, SessionError::NotController));
@@ -1037,14 +980,14 @@ mod tests {
             .await
             .expect("detach controller");
         let err = store
-            .attach_input("ctl0001", Some(second.attachment_id), "x", false)
+            .attach_input("ctl0001", Some(second.attachment_id), b"x", false)
             .await
             .expect_err("stale attachment must fail precisely");
         assert!(matches!(err, SessionError::StaleAttachment));
         // The demoted first attachment stays an observer (no implicit
         // promotion), but can take the now-free lease explicitly.
         let err = store
-            .attach_input("ctl0001", Some(first.attachment_id), "x", false)
+            .attach_input("ctl0001", Some(first.attachment_id), b"x", false)
             .await
             .expect_err("demoted attachment stays observer after lease frees");
         assert!(matches!(err, SessionError::NotController));
@@ -1058,7 +1001,7 @@ mod tests {
         );
         assert_eq!(outcome.demoted, None);
         store
-            .attach_input("ctl0001", Some(first.attachment_id), "x", false)
+            .attach_input("ctl0001", Some(first.attachment_id), b"x", false)
             .await
             .expect("re-acquired controller input");
     }
@@ -1283,7 +1226,7 @@ mod tests {
             .expect("parked acquire")
             .attachment_id;
         store
-            .attach_input("parked01", Some(lease), "agent-bytes", false)
+            .attach_input("parked01", Some(lease), b"agent-bytes", false)
             .await
             .expect("parked controller drives input");
         assert_eq!(writer_rx.recv().await.expect("written"), b"agent-bytes");
@@ -1315,7 +1258,7 @@ mod tests {
             .await
             .expect("released slot is reusable");
         let err = store
-            .attach_input("parked01", Some(leases[0]), "x", false)
+            .attach_input("parked01", Some(leases[0]), b"x", false)
             .await
             .expect_err("released lease token is stale");
         assert!(matches!(err, SessionError::StaleAttachment));

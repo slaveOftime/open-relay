@@ -56,9 +56,12 @@ export default function SessionActionConfirmDialog({
           <AlertDialogHeader>
             <AlertDialogTitle>{copy.title}</AlertDialogTitle>
             <AlertDialogDescription>
-              Are you sure you want to <span className="font-medium text-[hsl(var(--foreground))]">{action}</span>{' '}
-              session <span className="font-mono text-[hsl(var(--foreground))]">{sessionId.slice(0, 7)}</span>?{' '}
-              {copy.description}
+              Are you sure you want to{' '}
+              <span className="font-medium text-[hsl(var(--foreground))]">{action}</span> session{' '}
+              <span className="font-mono text-[hsl(var(--foreground))]">
+                {sessionId.slice(0, 7)}
+              </span>
+              ? {copy.description}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

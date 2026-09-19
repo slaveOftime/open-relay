@@ -11,7 +11,10 @@ export type NewSessionInitialValues = {
 }
 
 export function buildNewSessionInitialValues(
-  session: Pick<SessionSummary, 'command' | 'args' | 'title' | 'tags' | 'cwd' | 'notifications_enabled'>
+  session: Pick<
+    SessionSummary,
+    'command' | 'args' | 'title' | 'tags' | 'cwd' | 'notifications_enabled'
+  >
 ): NewSessionInitialValues {
   return {
     cmd: session.command,
@@ -21,6 +24,6 @@ export function buildNewSessionInitialValues(
     title: session.title ?? '',
     tags: formatSessionTagInput(session.tags),
     cwd: session.cwd ?? '',
-    notifications_enabled: session.notifications_enabled
+    notifications_enabled: session.notifications_enabled,
   }
 }

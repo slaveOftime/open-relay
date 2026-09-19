@@ -846,7 +846,7 @@ mod tests {
         );
         let store = store_with(vec![rt.clone()], make_test_db().await);
 
-        let registration = store
+        let _registration = store
             .attach_register(
                 "abc1234",
                 crate::session::registry::AttachKind::Cli,

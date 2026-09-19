@@ -16,7 +16,9 @@ describe('sessions table columns', () => {
     const sizes = coerceSessionTableColumnSizes({ id: 120 })
 
     expect(sizes.id).toBe(120)
-    expect(sizes.title).toBe(SESSION_TABLE_COLUMNS.find((column) => column.key === 'title')?.defaultWidth)
+    expect(sizes.title).toBe(
+      SESSION_TABLE_COLUMNS.find((column) => column.key === 'title')?.defaultWidth
+    )
   })
 
   it('clamps unsafe persisted column widths', () => {

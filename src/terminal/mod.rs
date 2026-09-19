@@ -43,6 +43,13 @@ pub struct EngineModes {
     pub app_cursor_keys: bool,
     pub bracketed_paste: bool,
     pub alt_screen: bool,
+    /// Any mouse reporting mode (1000/1002/1003).
+    pub mouse_report: bool,
+    /// SGR (1006) mouse encoding negotiated; otherwise legacy X11
+    /// encoding applies.
+    pub sgr_mouse: bool,
+    /// Focus in/out reporting (1004).
+    pub focus_events: bool,
 }
 
 /// The colours the engine reports for `OSC 10 ; ?` / `OSC 11 ; ?` probes.
@@ -187,6 +194,9 @@ impl Terminal {
             app_cursor_keys: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            mouse_report: mode.intersects(TermMode::MOUSE_MODE),
+            sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
+            focus_events: mode.contains(TermMode::FOCUS_IN_OUT),
         }
     }
 
@@ -449,8 +459,8 @@ fn row_text(row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::
 mod tests {
     use super::*;
 
-    /// The M0 engine-eval corpus (tools/engine-eval), ported so the main
-    /// crate pins clean-stream agreement with the incumbent oracle.
+    /// The engine-selection corpus (ADR-0001), pinned so the main crate
+    /// keeps clean-stream agreement with the incumbent oracle.
     fn corpus() -> Vec<(&'static str, Vec<u8>)> {
         vec![
             ("plain lines", b"one\r\ntwo\r\nthree\r\n".to_vec()),
@@ -682,6 +692,15 @@ mod tests {
         term.feed(b"\x1b[?1049h");
         assert!(term.modes().alt_screen);
         term.feed(b"\x1b[?2004l\x1b[?1l\x1b[?1049l");
+        assert_eq!(term.modes(), EngineModes::default());
+
+        // Mouse and focus reporting modes are tracked for attach clients.
+        term.feed(b"\x1b[?1002h\x1b[?1006h\x1b[?1004h");
+        let modes = term.modes();
+        assert!(modes.mouse_report);
+        assert!(modes.sgr_mouse);
+        assert!(modes.focus_events);
+        term.feed(b"\x1b[?1002l\x1b[?1006l\x1b[?1004l");
         assert_eq!(term.modes(), EngineModes::default());
     }
 

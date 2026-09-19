@@ -74,8 +74,7 @@ export function orderSessionPage(
   const createdSign = sortOrder === SortOrder.Asc ? 1 : -1
 
   return [...sessions].sort((a, b) => {
-    const pinDiff =
-      pinnedRankOf(a, node, ranks) - pinnedRankOf(b, node, ranks)
+    const pinDiff = pinnedRankOf(a, node, ranks) - pinnedRankOf(b, node, ranks)
     if (pinDiff !== 0) return pinDiff
 
     if (activeFirst) {

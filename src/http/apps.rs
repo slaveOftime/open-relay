@@ -280,22 +280,22 @@ fn resolve_manifest_entry(
         return Err(invalid_data("app manifest entry cannot be empty"));
     }
 
-    if let Ok(url) = Url::parse(entry) {
-        if matches!(url.scheme(), "http" | "https") {
-            if !redirect_files.is_empty() {
-                return Err(invalid_data(
-                    "app manifest redirect files require a local entry",
-                ));
-            }
-            // Block proxying to private LAN / link-local addresses to
-            // prevent SSRF via crafted oly.app.json manifests.
-            if is_private_proxy_target(&url) {
-                return Err(invalid_data(
-                    "app manifest proxy entry must not target private or link-local addresses",
-                ));
-            }
-            return Ok(AppEntry::Proxy { entry_url: url });
+    if let Ok(url) = Url::parse(entry)
+        && matches!(url.scheme(), "http" | "https")
+    {
+        if !redirect_files.is_empty() {
+            return Err(invalid_data(
+                "app manifest redirect files require a local entry",
+            ));
         }
+        // Block proxying to private LAN / link-local addresses to
+        // prevent SSRF via crafted oly.app.json manifests.
+        if is_private_proxy_target(&url) {
+            return Err(invalid_data(
+                "app manifest proxy entry must not target private or link-local addresses",
+            ));
+        }
+        return Ok(AppEntry::Proxy { entry_url: url });
     }
 
     let entry_path = normalize_relative_asset_path(entry)
@@ -721,10 +721,9 @@ fn extract_app_description(html: &str) -> Option<String> {
 fn extract_app_kind(html: &str) -> StaticAppKind {
     if let Some(raw_kind) = extract_meta_content(html, "oly:app-type")
         .or_else(|| extract_meta_content(html, "oly:type"))
+        && let Some(app_kind) = StaticAppKind::from_meta_value(&raw_kind)
     {
-        if let Some(app_kind) = StaticAppKind::from_meta_value(&raw_kind) {
-            return app_kind;
-        }
+        return app_kind;
     }
 
     infer_app_kind(html)
@@ -744,14 +743,10 @@ fn extract_app_icon_href(html: &str, app_href: &str) -> Option<String> {
         let rel = extract_html_attribute(tag, "rel");
         let href = extract_html_attribute(tag, "href");
 
-        if rel
-            .as_deref()
-            .is_some_and(|value| link_rel_mentions_icon(value))
+        if rel.as_deref().is_some_and(link_rel_mentions_icon)
+            && let Some(icon_href) = href.and_then(|value| resolve_app_asset_href(app_href, &value))
         {
-            if let Some(icon_href) = href.and_then(|value| resolve_app_asset_href(app_href, &value))
-            {
-                return Some(icon_href);
-            }
+            return Some(icon_href);
         }
 
         offset = tag_end;

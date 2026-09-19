@@ -563,8 +563,10 @@ export class AttachSocket {
           case 'pong':
             return
         }
-      } catch {
-        /* ignore malformed frames */
+      } catch (err) {
+        // Truncated/unknown frames are corruption or a version mismatch:
+        // surface them instead of silently dropping stream bytes (I2).
+        opts.onError(`unreadable server frame: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
   }

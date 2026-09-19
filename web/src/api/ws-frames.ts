@@ -48,7 +48,13 @@ export type ServerFrame =
   | { type: 'control'; role: ControlRole }
   | { type: 'pong' }
 
-/** Decode one server frame; `null` for empty, truncated, or unknown frames. */
+/**
+ * Decode one server frame. `null` means "no frame" (empty payload) and is
+ * the only ignorable result: truncated headers and unknown tags throw,
+ * because silently dropping a frame desynchronizes the attach stream —
+ * the client must surface the corruption instead of rendering on
+ * (fail-loud, I2).
+ */
 export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
   if (bytes.length === 0) return null
   const tag = bytes[0]
@@ -56,7 +62,8 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
 
   switch (tag) {
     case WS_FRAME_INIT: {
-      if (bytes.length < WS_INIT_HEADER_LEN) return null
+      if (bytes.length < WS_INIT_HEADER_LEN)
+        throw new Error(`truncated init frame: ${bytes.length} bytes`)
       const flags = bytes[1]
       return {
         type: 'init',
@@ -71,7 +78,8 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
       }
     }
     case WS_FRAME_DATA: {
-      if (bytes.length < WS_DATA_HEADER_LEN) return null
+      if (bytes.length < WS_DATA_HEADER_LEN)
+        throw new Error(`truncated data frame: ${bytes.length} bytes`)
       return {
         type: 'data',
         offset: Number(view.getBigUint64(1, false)),
@@ -79,7 +87,8 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
       }
     }
     case WS_FRAME_MODE_CHANGED: {
-      const flags = bytes[1] ?? 0
+      if (bytes.length < 2) throw new Error('truncated mode-changed frame')
+      const flags = bytes[1]
       return {
         type: 'modeChanged',
         appCursorKeys: (flags & WS_FLAG_APP_CURSOR_KEYS) !== 0,
@@ -87,10 +96,11 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
       }
     }
     case WS_FRAME_RESIZED: {
-      if (bytes.length < 5) return null
+      if (bytes.length < 5) throw new Error(`truncated resized frame: ${bytes.length} bytes`)
       return { type: 'resized', rows: view.getUint16(1, false), cols: view.getUint16(3, false) }
     }
     case WS_FRAME_SESSION_ENDED: {
+      if (bytes.length < 2) throw new Error('truncated session-ended frame')
       const hasExitCode = bytes[1] === 1
       return {
         type: 'sessionEnded',
@@ -101,10 +111,11 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
     case WS_FRAME_ERROR:
       return { type: 'error', message: textDecoder.decode(bytes.subarray(1)) }
     case WS_FRAME_CONTROL:
+      if (bytes.length < 2) throw new Error('truncated control frame')
       return { type: 'control', role: bytes[1] === 1 ? 'controller' : 'observer' }
     case WS_FRAME_PONG:
       return { type: 'pong' }
     default:
-      return null
+      throw new Error(`unknown server frame tag ${tag}`)
   }
 }

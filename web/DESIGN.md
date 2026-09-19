@@ -17,22 +17,22 @@ Open Relay uses a compact, dark, terminal-adjacent interface. The visual system 
 
 The app uses HSL tokens in `src\index.css`.
 
-| Token | Dark value | Purpose |
-| --- | --- | --- |
-| `--background` | `220 18% 3%` | app canvas |
-| `--foreground` | `210 20% 92%` | primary text |
-| `--card` | `220 14% 6%` | cards, dialogs, menus |
-| `--popover` | `220 14% 6%` | floating surfaces |
-| `--secondary` | `220 11% 10%` | inputs, secondary buttons |
-| `--muted` | `220 11% 10%` | passive panels |
-| `--muted-foreground` | `220 8% 66%` | helper text |
-| `--accent` | `220 10% 14%` | hover/active neutral |
-| `--primary` | `160 84% 39%` | Open Relay green |
-| `--destructive` | `0 72% 48%` | destructive state |
-| `--border` | `220 9% 16%` | hairline borders |
-| `--input` | `220 9% 16%` | input borders |
-| `--ring` | `160 84% 39%` | focus rings |
-| `--radius` | `0.375rem` | default compact radius |
+| Token                | Dark value    | Purpose                   |
+| -------------------- | ------------- | ------------------------- |
+| `--background`       | `220 18% 3%`  | app canvas                |
+| `--foreground`       | `210 20% 92%` | primary text              |
+| `--card`             | `220 14% 6%`  | cards, dialogs, menus     |
+| `--popover`          | `220 14% 6%`  | floating surfaces         |
+| `--secondary`        | `220 11% 10%` | inputs, secondary buttons |
+| `--muted`            | `220 11% 10%` | passive panels            |
+| `--muted-foreground` | `220 8% 66%`  | helper text               |
+| `--accent`           | `220 10% 14%` | hover/active neutral      |
+| `--primary`          | `160 84% 39%` | Open Relay green          |
+| `--destructive`      | `0 72% 48%`   | destructive state         |
+| `--border`           | `220 9% 16%`  | hairline borders          |
+| `--input`            | `220 9% 16%`  | input borders             |
+| `--ring`             | `160 84% 39%` | focus rings               |
+| `--radius`           | `0.375rem`    | default compact radius    |
 
 Light mode exists for accessibility/system preference, but new design work should optimize the compact dark theme first and keep light values token-compatible.
 
@@ -46,14 +46,14 @@ Light mode exists for accessibility/system preference, but new design work shoul
 
 ## Shape, spacing, density
 
-| Item | Standard |
-| --- | --- |
-| Control height | 32px default, 28px small |
-| Icon button | 32px square |
-| Radius | 6px default, 8px cards/dialogs, full only for pills |
-| Panel padding | 12-16px |
-| Form field gap | 6px inside field, 12-16px between fields |
-| Table row density | prefer `py-2` to `py-3` |
+| Item              | Standard                                            |
+| ----------------- | --------------------------------------------------- |
+| Control height    | 32px default, 28px small                            |
+| Icon button       | 32px square                                         |
+| Radius            | 6px default, 8px cards/dialogs, full only for pills |
+| Panel padding     | 12-16px                                             |
+| Form field gap    | 6px inside field, 12-16px between fields            |
+| Table row density | prefer `py-2` to `py-3`                             |
 
 Avoid `rounded-xl`, large shadows, and `p-6` unless the element is intentionally spacious.
 

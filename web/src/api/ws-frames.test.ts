@@ -94,14 +94,18 @@ describe('ws frame fixture conformance', () => {
     })
   }
 
-  it('rejects truncated and unknown frames instead of misparsing them', () => {
+  it('fails loudly on truncated and unknown frames instead of misparsing them', () => {
+    // Empty payload is the only ignorable result ("no frame").
     expect(parseServerFrame(new Uint8Array(0))).toBeNull()
-    expect(parseServerFrame(new Uint8Array([255, 1, 2]))).toBeNull()
+    // Unknown tag: throwing beats silently dropping stream bytes (I2).
+    expect(() => parseServerFrame(new Uint8Array([255, 1, 2]))).toThrow(/unknown server frame tag/)
     // INIT header is 28 bytes; 27 must not decode.
-    expect(parseServerFrame(fromHex(vectors[0].hex).subarray(0, 27))).toBeNull()
+    expect(() => parseServerFrame(fromHex(vectors[0].hex).subarray(0, 27))).toThrow(
+      /truncated init frame/
+    )
     // DATA header is 9 bytes; 8 must not decode.
-    expect(
+    expect(() =>
       parseServerFrame(fromHex(vectors.find((v) => v.name === 'data')!.hex).subarray(0, 8))
-    ).toBeNull()
+    ).toThrow(/truncated data frame/)
   })
 })

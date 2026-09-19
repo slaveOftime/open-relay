@@ -489,7 +489,7 @@ async fn handle_ws_streaming(
                         match serde_json::from_str::<ClientMessage>(&text) {
                             Ok(ClientMessage::Input { data, wait_for_change }) => {
                                 debug!(session_id = %id, bytes = data.len(), "WS input received");
-                                if let Err(err) = state.store.attach_input(&id, Some(attachment_id), &data, wait_for_change).await {
+                                if let Err(err) = state.store.attach_input(&id, Some(attachment_id), data.as_bytes(), wait_for_change).await {
                                     // Control-gate violations are reported but
                                     // keep the stream; transport failures end it.
                                     let gated = matches!(err, SessionError::NotController | SessionError::StaleAttachment);
@@ -768,6 +768,7 @@ async fn handle_ws_proxied_streaming(
                             RpcResponse::AttachModeChanged {
                                 app_cursor_keys,
                                 bracketed_paste_mode,
+                                ..
                             } => {
                                 debug!(
                                     session_id = %id,
@@ -839,7 +840,7 @@ async fn handle_ws_proxied_streaming(
                                 debug!(session_id = %id, node = %node, bytes = data.len(), "proxied WebSocket input received");
                                 let rpc = RpcRequest::AttachInput {
                                     id: id.to_string(),
-                                    data,
+                                    data: data.into_bytes(),
                                     wait_for_change,
                                     attachment_id: None,
                                 };

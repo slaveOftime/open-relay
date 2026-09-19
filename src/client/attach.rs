@@ -2,10 +2,10 @@ use std::io::{IsTerminal, Write};
 
 use crossterm::{
     event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
-    terminal,
+    execute, terminal,
 };
 use tokio::{io::BufReader, sync::mpsc};
 
@@ -254,6 +254,9 @@ async fn run_attach_inner(
         mut running,
         mut child_bracketed_paste_mode,
         mut child_app_cursor_keys,
+        mut child_mouse_report,
+        mut child_sgr_mouse,
+        mut child_focus_events,
         stream_end_offset,
         granted_role,
     ) = match init {
@@ -263,6 +266,9 @@ async fn run_attach_inner(
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            mouse_report,
+            sgr_mouse,
+            focus_events,
             end_offset,
             role,
             ..
@@ -272,6 +278,9 @@ async fn run_attach_inner(
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            mouse_report,
+            sgr_mouse,
+            focus_events,
             end_offset,
             role,
         ),
@@ -283,7 +292,9 @@ async fn run_attach_inner(
     // keystrokes don't bounce off the gate.
     let mut is_controller = granted_role != "observer";
     if interactive && !is_controller {
-        eprintln!("Attached as observer (view-only). Ctrl-T takes control, Ctrl-D detaches.");
+        eprintln!(
+            "Attached as observer (view-only). Ctrl-T takes control, Ctrl-] then d detaches."
+        );
     }
 
     // Every chunk must continue exactly at the cursor the init frame left
@@ -359,6 +370,16 @@ async fn run_attach_inner(
 
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
+        // Mirror the child's negotiated input modes on the outer terminal:
+        // mouse capture and focus-event reporting (1004) are enabled only
+        // while the child wants them, so local selection and focus behave
+        // normally otherwise.
+        sync_local_terminal_modes(child_mouse_report, child_focus_events);
+
+        // Ctrl-] detach-prefix state: true after an armed Ctrl-] until the
+        // next key resolves it.
+        let mut detach_prefix_pending = false;
+
         // Drain any stale resize events queued by writing replay data
         // before the main event loop.
         let _ = drain_pending_terminal_events();
@@ -425,20 +446,42 @@ async fn run_attach_inner(
                         match ev {
                             Event::Paste(data) => {
                                 // Explicit bracketed-paste boundaries: send the
-                                // paste as one bounded transaction.
-                                ipc::write_request_to_writer(
-                                    &mut write_half,
-                                    RpcRequest::AttachInput {
-                                        id: id_owned.clone(),
-                                        data: wrap_paste_input(
-                                            normalize_paste_text(data),
-                                            child_bracketed_paste_mode,
-                                        ),
-                                        wait_for_change: false,
-                                        attachment_id: None,
-                                    },
-                                )
-                                .await?
+                                // paste as one bounded transaction, bytes
+                                // exactly as the terminal delivered them
+                                // (PLAN §5.1: no CRLF rewriting).
+                                if is_controller {
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        wrap_paste_input(data, child_bracketed_paste_mode),
+                                        false,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Event::FocusGained => {
+                                // DECSET 1004: forward focus events only when
+                                // the child asked for them.
+                                if is_controller && child_focus_events {
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        b"\x1b[I".to_vec(),
+                                        false,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Event::FocusLost => {
+                                if is_controller && child_focus_events {
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        b"\x1b[O".to_vec(),
+                                        false,
+                                    )
+                                    .await?;
+                                }
                             }
                             Event::Resize(cols, rows) => {
                                 // Re-read the actual terminal size — the event may
@@ -467,82 +510,118 @@ async fn run_attach_inner(
                                 }
                             }
                             Event::Key(key) => {
-                                if is_clipboard_paste_key(key) {
-                                    // Explicit paste shortcut: read the clipboard
-                                    // and send the paste in one bounded
-                                    // transaction. An empty or unavailable
-                                    // clipboard swallows the shortcut rather than
-                                    // leaking a stray ^V into the session.
-                                    if let Some(data) = maybe_collect_clipboard_paste(
-                                        config,
-                                        id,
-                                        node,
-                                        key,
-                                        child_bracketed_paste_mode,
-                                    )
-                                    .await?
-                                    {
-                                        ipc::write_request_to_writer(
+                                // Detach prefix (README/SPEC: `Ctrl-]` then
+                                // `d`). Arming the prefix consumes the key;
+                                // the next key decides: `d` detaches, Esc
+                                // cancels, a second `Ctrl-]` sends one
+                                // literal GS (0x1d), any other key forwards
+                                // the prefix byte and is then handled
+                                // normally. Ctrl-D/Ctrl-V keep their
+                                // application meaning (PLAN §5.1).
+                                let mut key_to_handle = Some(key);
+                                if detach_prefix_pending {
+                                    detach_prefix_pending = false;
+                                    if is_detach_key(key) {
+                                        detached = true;
+                                        running = false;
+                                        key_to_handle = None;
+                                    } else if matches!(key.code, KeyCode::Esc) {
+                                        key_to_handle = None; // prefix cancelled
+                                    } else if is_detach_prefix(key) {
+                                        send_attach_input(
                                             &mut write_half,
-                                            RpcRequest::AttachInput {
-                                                id: id_owned.clone(),
-                                                data,
-                                                wait_for_change: true,
-                                                                      attachment_id: None,
-                                            },
+                                            &id_owned,
+                                            vec![0x1d],
+                                            false,
+                                        )
+                                        .await?;
+                                        key_to_handle = None;
+                                    } else {
+                                        send_attach_input(
+                                            &mut write_half,
+                                            &id_owned,
+                                            vec![0x1d],
+                                            false,
                                         )
                                         .await?;
                                     }
-                                } else if !matches!(key.kind, KeyEventKind::Press) {
-                                    // Key release/repeat events: not sent.
-                                } else if is_ctrl_d(key) {
-                                    detached = true;
-                                    running = false;
-                                } else if !is_controller && is_ctrl_t(key) {
-                                    // Observer takeover: the server answers
-                                    // with an AttachControlChanged frame.
-                                    ipc::write_request_to_writer(
-                                        &mut write_half,
-                                        RpcRequest::AttachAcquireControl {
-                                            id: id_owned.clone(),
-                                        },
-                                    )
-                                    .await?;
-                                } else if !is_controller {
-                                    // Observer: keys do not reach the session.
-                                } else if let Some(data) = map_key_to_input(key, child_app_cursor_keys)
-                                {
-                                    // Every ordinary key is sent the moment it
-                                    // arrives — no burst buffering.
-                                    ipc::write_request_to_writer(
-                                        &mut write_half,
-                                        RpcRequest::AttachInput {
-                                            id: id_owned.clone(),
-                                            data,
-                                            wait_for_change: false,
-                                                                   attachment_id: None,
-                                        },
-                                    )
-                                    .await?;
+                                } else if is_detach_prefix(key) {
+                                    detach_prefix_pending = true;
+                                    key_to_handle = None;
+                                }
+
+                                if let Some(key) = key_to_handle {
+                                    if is_clipboard_paste_key(key) {
+                                        // Explicit paste shortcut
+                                        // (Shift+Insert): read the clipboard
+                                        // and send the paste in one bounded
+                                        // transaction. An empty or
+                                        // unavailable clipboard swallows the
+                                        // shortcut rather than leaking a
+                                        // stray keystroke into the session.
+                                        if let Some(data) = maybe_collect_clipboard_paste(
+                                            config,
+                                            id,
+                                            node,
+                                            key,
+                                            child_bracketed_paste_mode,
+                                        )
+                                        .await?
+                                        {
+                                            send_attach_input(
+                                                &mut write_half,
+                                                &id_owned,
+                                                data,
+                                                true,
+                                            )
+                                            .await?;
+                                        }
+                                    } else if matches!(key.kind, KeyEventKind::Release) {
+                                        // Key releases are never sent (only
+                                        // kitty-protocol terminals report
+                                        // them; we do not negotiate that
+                                        // with the outer terminal). Press
+                                        // and Repeat both send.
+                                    } else if !is_controller && is_ctrl_t(key) {
+                                        // Observer takeover: the server answers
+                                        // with an AttachControlChanged frame.
+                                        ipc::write_request_to_writer(
+                                            &mut write_half,
+                                            RpcRequest::AttachAcquireControl {
+                                                id: id_owned.clone(),
+                                            },
+                                        )
+                                        .await?;
+                                    } else if !is_controller {
+                                        // Observer: keys do not reach the session.
+                                    } else if let Some(data) =
+                                        map_key_to_input(key, child_app_cursor_keys)
+                                    {
+                                        // Every ordinary key is sent the moment it
+                                        // arrives — no burst buffering.
+                                        send_attach_input(
+                                            &mut write_half,
+                                            &id_owned,
+                                            data.into_bytes(),
+                                            false,
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                             Event::Mouse(mouse) => {
-                                if !is_controller {
+                                // Forward mouse input only while the child
+                                // application asked for it (any of
+                                // 1000/1002/1003); otherwise the local
+                                // terminal keeps selection semantics.
+                                if !is_controller || !child_mouse_report {
                                     continue;
                                 }
-                                let data = map_mouse_to_sgr_input(mouse);
-                                ipc::write_request_to_writer(
-                                    &mut write_half,
-                                    RpcRequest::AttachInput {
-                                        id: id_owned.clone(),
-                                        data,
-                                        wait_for_change: false,
-                                                               attachment_id: None,
-                                    },
-                                )
-                                .await?
+                                if let Some(data) = map_mouse_input(mouse, child_sgr_mouse) {
+                                    send_attach_input(&mut write_half, &id_owned, data, false)
+                                        .await?;
+                                }
                             }
-                            _ => {}
                         }
                         if !running {
                             break;
@@ -594,9 +673,23 @@ async fn run_attach_inner(
                                     RpcResponse::AttachModeChanged {
                                         app_cursor_keys,
                                         bracketed_paste_mode,
+                                        mouse_report,
+                                        sgr_mouse,
+                                        focus_events,
                                     } => {
                                         child_app_cursor_keys = app_cursor_keys;
                                         child_bracketed_paste_mode = bracketed_paste_mode;
+                                        child_sgr_mouse = sgr_mouse;
+                                        if (mouse_report, focus_events)
+                                            != (child_mouse_report, child_focus_events)
+                                        {
+                                            child_mouse_report = mouse_report;
+                                            child_focus_events = focus_events;
+                                            sync_local_terminal_modes(
+                                                child_mouse_report,
+                                                child_focus_events,
+                                            );
+                                        }
                                     }
                                     RpcResponse::AttachResized { rows: _, cols: _ } => {
                                         // Another client resized the PTY.  We cannot
@@ -823,15 +916,25 @@ fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
+/// Wrap pasted text in bracketed-paste markers when the child enabled
+/// DECSET 2004. The pasted bytes themselves are preserved exactly — no
+/// CRLF rewriting, no key substitution (PLAN §5.1).
+fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> Vec<u8> {
     if bracketed_paste_mode {
-        format!("\x1b[200~{data}\x1b[201~")
+        let mut out = b"\x1b[200~".to_vec();
+        out.extend_from_slice(data.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
     } else {
-        data
+        data.into_bytes()
     }
 }
 
-fn normalize_paste_text(data: String) -> String {
+/// The explicit clipboard-paste operation (Shift+Insert) is a *text*
+/// operation: line endings are normalized to LF, which is what shells and
+/// REPLs expect from a clipboard. Raw terminal paste events
+/// (`Event::Paste`) are NOT normalized — those bytes go through exactly.
+fn normalize_clipboard_text(data: String) -> String {
     data.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -841,7 +944,7 @@ async fn maybe_collect_clipboard_paste(
     node: Option<&str>,
     key: KeyEvent,
     bracketed_paste_mode: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<Vec<u8>>> {
     if !is_clipboard_paste_key(key) {
         return Ok(None);
     }
@@ -852,7 +955,7 @@ async fn maybe_collect_clipboard_paste(
     };
 
     Ok(data
-        .map(normalize_paste_text)
+        .map(normalize_clipboard_text)
         .map(|data| wrap_paste_input(data, bracketed_paste_mode)))
 }
 
@@ -896,11 +999,11 @@ async fn upload_remote_clipboard_file(
     }
 }
 
+/// The explicit clipboard-paste shortcut: Shift+Insert only. Ctrl-V is
+/// deliberately NOT intercepted — it is the application's literal-next
+/// (quoted-insert) key and keeps that meaning (PLAN §5.1/§5.2).
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('\u{16}'))
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
-        || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert))
+    key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert)
 }
 
 // ---------------------------------------------------------------------------
@@ -1070,7 +1173,11 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
     }
 }
 
-fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
+/// Encode a mouse event for the child in the encoding the child
+/// negotiated: SGR (DECSET 1006) when enabled, otherwise the legacy X11
+/// encoding (button press/release and scroll only — motion has no
+/// faithful legacy form and is dropped).
+fn map_mouse_input(mouse: MouseEvent, sgr: bool) -> Option<Vec<u8>> {
     let mut cb: u16 = match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => 0,
         MouseEventKind::Down(MouseButton::Middle) => 1,
@@ -1096,15 +1203,85 @@ fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
     if mouse.modifiers.contains(KeyModifiers::CONTROL) {
         cb += 16;
     }
-    // SGR uses 1-based coordinates.
-    let cx = mouse.column + 1;
-    let cy = mouse.row + 1;
-    let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
-        'm'
+    if sgr {
+        // SGR uses 1-based coordinates.
+        let cx = mouse.column + 1;
+        let cy = mouse.row + 1;
+        let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            'm'
+        } else {
+            'M'
+        };
+        Some(format!("\x1b[<{cb};{cx};{cy}{suffix}").into_bytes())
     } else {
-        'M'
-    };
-    format!("\x1b[<{cb};{cx};{cy}{suffix}")
+        // Legacy X11 encoding: `ESC [ M Cb Cx Cy`, every field a single
+        // byte biased by 32; releases report button 3; coordinates
+        // beyond 223 cannot be represented and are dropped rather than
+        // corrupted.
+        if matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved) {
+            return None;
+        }
+        let base = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            3
+        } else {
+            cb
+        };
+        let cb = u8::try_from(base).ok()?.checked_add(32)?;
+        let cx = u8::try_from(mouse.column).ok()?.checked_add(33)?;
+        let cy = u8::try_from(mouse.row).ok()?.checked_add(33)?;
+        Some(vec![0x1b, b'[', b'M', cb, cx, cy])
+    }
+}
+
+/// Mirror the child's input modes on the outer terminal: mouse capture
+/// and focus-event reporting (DECSET 1004) follow the child so local
+/// selection and focus keys behave normally whenever the child has not
+/// enabled them.
+fn sync_local_terminal_modes(mouse_report: bool, focus_events: bool) {
+    let mut stdout = std::io::stdout();
+    if mouse_report {
+        let _ = execute!(stdout, EnableMouseCapture);
+    } else {
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
+    let _ = stdout.write_all(if focus_events {
+        b"\x1b[?1004h"
+    } else {
+        b"\x1b[?1004l"
+    });
+    let _ = stdout.flush();
+}
+
+/// Write one input frame to the daemon.
+async fn send_attach_input(
+    writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    id: &str,
+    data: Vec<u8>,
+    wait_for_change: bool,
+) -> Result<()> {
+    ipc::write_request_to_writer(
+        writer,
+        RpcRequest::AttachInput {
+            id: id.to_string(),
+            data,
+            wait_for_change,
+            attachment_id: None,
+        },
+    )
+    .await
+}
+
+/// The detach prefix key: Ctrl-] (GS, 0x1d).
+fn is_detach_prefix(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('\u{1d}'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']')))
+}
+
+/// `d` after the detach prefix detaches (a literal Ctrl-D / EOT byte
+/// after the prefix also detaches, matching tmux-style muscle memory).
+fn is_detach_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('\u{4}'))
+        || (key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')))
 }
 
 /// Applied-cursor credit cadence (M3-5, I7): credits are backpressure
@@ -1136,11 +1313,6 @@ async fn maybe_send_ack(
 fn is_ctrl_t(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
-}
-
-fn is_ctrl_d(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
 }
 
 #[cfg(test)]
@@ -1376,7 +1548,7 @@ mod tests {
     fn test_wrap_paste_input_passthrough_when_bracketed_paste_is_disabled() {
         assert_eq!(
             wrap_paste_input("hello\nworld".to_string(), false),
-            "hello\nworld"
+            b"hello\nworld".to_vec()
         );
     }
 
@@ -1384,34 +1556,49 @@ mod tests {
     fn test_wrap_paste_input_wraps_when_bracketed_paste_is_enabled() {
         assert_eq!(
             wrap_paste_input("hello\nworld".to_string(), true),
-            "\x1b[200~hello\nworld\x1b[201~"
+            b"\x1b[200~hello\nworld\x1b[201~".to_vec()
         );
     }
 
     #[test]
-    fn test_normalize_paste_text_converts_crlf_to_lf() {
+    fn test_wrap_paste_input_preserves_crlf_bytes() {
+        // Terminal paste events are forwarded byte-exact (PLAN §5.1).
         assert_eq!(
-            normalize_paste_text("line1\r\nline2\r\nline3".to_string()),
+            wrap_paste_input("line1\r\nline2".to_string(), false),
+            b"line1\r\nline2".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_normalize_clipboard_text_converts_crlf_to_lf() {
+        // Only the explicit clipboard-paste operation normalizes text.
+        assert_eq!(
+            normalize_clipboard_text("line1\r\nline2\r\nline3".to_string()),
             "line1\nline2\nline3"
         );
     }
 
     #[test]
-    fn test_normalize_paste_text_converts_lone_cr_to_lf() {
+    fn test_normalize_clipboard_text_converts_lone_cr_to_lf() {
         assert_eq!(
-            normalize_paste_text("line1\rline2\rline3".to_string()),
+            normalize_clipboard_text("line1\rline2\rline3".to_string()),
             "line1\nline2\nline3"
         );
     }
 
     #[test]
-    fn test_is_clipboard_paste_key_accepts_ctrl_v_as_control_character() {
-        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('\u{16}'))));
-    }
-
-    #[test]
-    fn test_is_clipboard_paste_key_accepts_bare_control_character() {
-        assert!(is_clipboard_paste_key(press(KeyCode::Char('\u{16}'))));
+    fn test_is_clipboard_paste_key_only_shift_insert() {
+        assert!(is_clipboard_paste_key(KeyEvent::new_with_kind(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press
+        )));
+        // Ctrl-V keeps its application meaning (quoted-insert); the attach
+        // client must not intercept it (PLAN §5.1).
+        assert!(!is_clipboard_paste_key(ctrl_press(KeyCode::Char('v'))));
+        assert!(!is_clipboard_paste_key(ctrl_press(KeyCode::Char('V'))));
+        assert!(!is_clipboard_paste_key(ctrl_press(KeyCode::Char('\u{16}'))));
+        assert!(!is_clipboard_paste_key(press(KeyCode::Char('\u{16}'))));
     }
 
     // -----------------------------------------------------------------------
@@ -1565,27 +1752,52 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_ctrl_d
+    // detach prefix: Ctrl-] then d
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_ctrl_d_true() {
-        assert!(is_ctrl_d(ctrl_press(KeyCode::Char('d'))));
-        assert!(is_ctrl_d(ctrl_press(KeyCode::Char('D'))));
+    fn test_is_detach_prefix_accepts_ctrl_right_bracket_forms() {
+        assert!(is_detach_prefix(ctrl_press(KeyCode::Char(']'))));
+        assert!(is_detach_prefix(press(KeyCode::Char('\u{1d}'))));
     }
 
     #[test]
-    fn test_is_ctrl_d_false_for_plain_d() {
-        assert!(!is_ctrl_d(press(KeyCode::Char('d'))));
+    fn test_is_detach_prefix_rejects_other_keys() {
+        assert!(!is_detach_prefix(ctrl_press(KeyCode::Char('d'))));
+        assert!(!is_detach_prefix(press(KeyCode::Char(']'))));
+        assert!(!is_detach_prefix(press(KeyCode::Esc)));
     }
 
     #[test]
-    fn test_is_ctrl_d_false_for_other_ctrl() {
-        assert!(!is_ctrl_d(ctrl_press(KeyCode::Char('c'))));
+    fn test_is_detach_key_accepts_d_and_control_d() {
+        assert!(is_detach_key(press(KeyCode::Char('d'))));
+        assert!(is_detach_key(press(KeyCode::Char('D'))));
+        assert!(is_detach_key(press(KeyCode::Char('\u{4}'))));
+    }
+
+    #[test]
+    fn test_is_detach_key_rejects_other_keys() {
+        assert!(!is_detach_key(press(KeyCode::Char('x'))));
+        assert!(!is_detach_key(press(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn test_ctrl_d_maps_to_eot_byte_for_the_session() {
+        // Ctrl-D is no longer the detach key: it reaches the child as the
+        // literal EOT byte, e.g. EOF for a shell or scroll-half-page in vim.
+        let result = map_key_to_input(ctrl_press(KeyCode::Char('d')), false).unwrap();
+        assert_eq!(result.as_bytes(), &[4]);
+    }
+
+    #[test]
+    fn test_ctrl_v_maps_to_syn_byte_for_the_session() {
+        // Ctrl-V (quoted-insert) reaches the child unchanged.
+        let result = map_key_to_input(ctrl_press(KeyCode::Char('v')), false).unwrap();
+        assert_eq!(result.as_bytes(), &[22]);
     }
 
     // -----------------------------------------------------------------------
-    // map_mouse_to_sgr_input
+    // map_mouse_input (SGR encoding)
     // -----------------------------------------------------------------------
 
     fn mouse_event(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
@@ -1614,37 +1826,55 @@ mod tests {
     #[test]
     fn test_mouse_left_press() {
         let ev = mouse_event(MouseEventKind::Down(MouseButton::Left), 9, 4);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<0;10;5M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<0;10;5M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_right_release() {
         let ev = mouse_event(MouseEventKind::Up(MouseButton::Right), 0, 0);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<2;1;1m");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<2;1;1m".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_middle_drag() {
         let ev = mouse_event(MouseEventKind::Drag(MouseButton::Middle), 5, 10);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<33;6;11M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<33;6;11M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_scroll_up() {
         let ev = mouse_event(MouseEventKind::ScrollUp, 20, 15);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<64;21;16M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<64;21;16M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_scroll_down() {
         let ev = mouse_event(MouseEventKind::ScrollDown, 20, 15);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<65;21;16M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<65;21;16M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_moved() {
         let ev = mouse_event(MouseEventKind::Moved, 3, 7);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<35;4;8M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<35;4;8M".as_bytes())
+        );
     }
 
     #[test]
@@ -1655,7 +1885,10 @@ mod tests {
             0,
             KeyModifiers::SHIFT,
         );
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<4;1;1M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<4;1;1M".as_bytes())
+        );
     }
 
     #[test]
@@ -1666,7 +1899,10 @@ mod tests {
             0,
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<24;1;1M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<24;1;1M".as_bytes())
+        );
     }
 
     // -------------------------------------------------------------------

@@ -8,7 +8,10 @@ export interface TextInsertionResult {
   selection: TextSelectionRange
 }
 
-function clampSelection(value: string, selection: Partial<TextSelectionRange> = {}): TextSelectionRange {
+function clampSelection(
+  value: string,
+  selection: Partial<TextSelectionRange> = {}
+): TextSelectionRange {
   const max = value.length
   const rawStart = selection.start ?? max
   const rawEnd = selection.end ?? rawStart
@@ -85,7 +88,12 @@ export function removeUploadedPathFromInput(
     const removedLength = removeEnd - removeStart
     nextValue = `${nextValue.slice(0, removeStart)}${nextValue.slice(removeEnd)}`
     nextSelection = {
-      start: adjustSelectionAfterRemoval(nextSelection.start, removeStart, removeEnd, removedLength),
+      start: adjustSelectionAfterRemoval(
+        nextSelection.start,
+        removeStart,
+        removeEnd,
+        removedLength
+      ),
       end: adjustSelectionAfterRemoval(nextSelection.end, removeStart, removeEnd, removedLength),
     }
     matchIndex = nextValue.indexOf(uploadedPath)

@@ -71,7 +71,7 @@ fn ensure_csvlens_installed() -> PathBuf {
     binary
 }
 
-fn wait_for_session_status(tmp: &PathBuf, id: &str, expected: &str, timeout: Duration) {
+fn wait_for_session_status(tmp: &std::path::Path, id: &str, expected: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let output = oly_cmd(tmp)

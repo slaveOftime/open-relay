@@ -285,10 +285,19 @@ export default function AttachPanel({
     resizeCustomInput()
   }, [customInput])
 
-  useEffect(() => {
+  // Switching sessions reloads all per-session persisted UI state in one
+  // render-time adjustment (the React-recommended alternative to
+  // setState-in-effect cascades).
+  const [prevSessionId, setPrevSessionId] = useState(sessionId)
+  if (prevSessionId !== sessionId) {
+    setPrevSessionId(sessionId)
     shouldPersistDrawerOpenRef.current = false
+    shouldPersistDraftRef.current = false
     setDrawerOpen(loadSessionDrawerOpen(sessionId))
-  }, [sessionId])
+    updateCustomInput(loadSessionInputDraft(sessionId))
+    setImagePreviews(loadSessionImagePreviews(sessionId))
+    setPreviewPath(null)
+  }
 
   useEffect(() => {
     if (!shouldPersistDrawerOpenRef.current) {
@@ -301,16 +310,6 @@ export default function AttachPanel({
   useEffect(() => {
     onDrawerOpenChange?.(drawerOpen)
   }, [drawerOpen, onDrawerOpenChange])
-
-  useEffect(() => {
-    shouldPersistDraftRef.current = false
-    updateCustomInput(loadSessionInputDraft(sessionId))
-  }, [sessionId, updateCustomInput])
-
-  useEffect(() => {
-    setImagePreviews(loadSessionImagePreviews(sessionId))
-    setPreviewPath(null)
-  }, [sessionId])
 
   useEffect(() => {
     if (!shouldPersistDraftRef.current) {

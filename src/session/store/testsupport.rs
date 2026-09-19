@@ -93,8 +93,8 @@ pub(crate) fn make_runtime(
     Arc::new(RwLock::new(super::super::runtime::SessionRuntime {
         meta,
         dir,
-        last_total_bytes: excerpt.as_bytes().len() as u64,
-        filtered_total_bytes: excerpt.as_bytes().len() as u64,
+        last_total_bytes: excerpt.len() as u64,
+        filtered_total_bytes: excerpt.len() as u64,
         broadcast_tx,
         resize_tx,
         pty: super::super::pty::PtyHandle {

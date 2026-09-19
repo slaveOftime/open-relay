@@ -35,21 +35,19 @@ function FormField({
   )
 }
 
-function FormDescription({
-  className,
-  ...props
-}: React.HTMLAttributes<HTMLParagraphElement>) {
+function FormDescription({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
   return (
-    <p
-      className={cn('text-[11px] text-[hsl(var(--muted-foreground))]', className)}
-      {...props}
-    />
+    <p className={cn('text-[11px] text-[hsl(var(--muted-foreground))]', className)} {...props} />
   )
 }
 
 function FormError({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
   return (
-    <p className={cn('text-xs text-[hsl(var(--destructive))]', className)} role="alert" {...props} />
+    <p
+      className={cn('text-xs text-[hsl(var(--destructive))]', className)}
+      role="alert"
+      {...props}
+    />
   )
 }
 

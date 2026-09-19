@@ -40,26 +40,46 @@ pub fn render_log_session(
         .is_dir()
     {
         return Err(crate::error::AppError::Protocol(format!(
-            "session log in {} uses the pre-1.0 format (output.log) and is no \
+            "session log in {} uses the pre-0.5 format (output.log) and is no \
              longer readable; export it with a 0.x build first, see MIGRATION.md",
             session_dir.display()
         )));
     }
 
-    let (bytes, end) = crate::session::replay::filtered_stream_from(session_dir, 0)?;
-    let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
-    debug_assert_eq!(tail_bytes.end_offset, end);
+    // Checkpoint-anchored tail replay (PLAN §5.3): start at the newest
+    // anchored checkpoint and walk older anchors only until the replayed
+    // suffix covers the requested tail. Cost is bounded by the checkpoint
+    // cadence, not by total recording size.
+    let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
+    let mut starts: Vec<u64> = anchors.iter().rev().copied().collect();
+    starts.push(0);
+    let mut rendered: Option<(Vec<u8>, u64, u64)> = None;
+    for start in starts {
+        let (bytes, end) = crate::session::replay::filtered_stream_from(session_dir, start)?;
+        let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
+        debug_assert_eq!(tail_bytes.end_offset + start, end);
+        // start_offset > 0 means the window found enough lines inside the
+        // suffix; otherwise widen the replay at an older anchor.
+        if tail_bytes.start_offset > 0 || start == 0 {
+            rendered = Some((tail_bytes.bytes, start + tail_bytes.start_offset, end));
+            break;
+        }
+    }
+    let Some((bytes, start_offset, end_offset)) = rendered else {
+        return Ok(Vec::new());
+    };
     let viewport_plan = if viewport.is_some() {
         ViewportReplayPlan::default()
     } else {
         // M6-2: resize history is derived from the journal (append-ordered
-        // with output), not the retired events.log.
-        let resizes = crate::session::replay::resize_events(session_dir)?;
-        viewport_resize_plan(&resizes, tail_bytes.start_offset, tail_bytes.end_offset)
+        // with output), not the retired events.log. Anchored: only resizes
+        // inside the replayed window are derived.
+        let resizes = crate::session::replay::resize_events_from(session_dir, start_offset)?;
+        viewport_resize_plan(&resizes, start_offset, end_offset)
     };
 
     Ok(render_log_bytes(
-        &tail_bytes.bytes,
+        &bytes,
         tail,
         keep_color,
         term_cols,

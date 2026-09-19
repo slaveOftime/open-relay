@@ -131,6 +131,9 @@ pub(super) async fn handle_attach_subscribe(
             running: init.running,
             bracketed_paste_mode: init.modes.bracketed_paste_mode,
             app_cursor_keys: init.modes.app_cursor_keys,
+            mouse_report: init.modes.mouse_report,
+            sgr_mouse: init.modes.sgr_mouse,
+            focus_events: init.modes.focus_events,
             scrollback,
             incarnation: init.incarnation,
             attachment_id,
@@ -240,6 +243,9 @@ pub(super) async fn handle_attach_subscribe(
                                 &RpcResponse::AttachModeChanged {
                                     app_cursor_keys: modes.app_cursor_keys,
                                     bracketed_paste_mode: modes.bracketed_paste_mode,
+                                    mouse_report: modes.mouse_report,
+                                    sgr_mouse: modes.sgr_mouse,
+                                    focus_events: modes.focus_events,
                                 },
                             )
                             .await?;
@@ -319,7 +325,7 @@ pub(super) async fn handle_attach_subscribe(
 
 pub(super) async fn handle_attach_input(
     id: String,
-    data: String,
+    data: Vec<u8>,
     session_store: &SessionStoreHandle,
     wait_for_change: bool,
     attachment_id: Option<u64>,

@@ -106,7 +106,7 @@ fn read_clipboard_files() -> Result<Option<Vec<PathBuf>>> {
 
     match clipboard.get().file_list() {
         Ok(files) => {
-            let files: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
+            let files: Vec<PathBuf> = files.into_iter().collect();
             if files.is_empty() {
                 Ok(None)
             } else {

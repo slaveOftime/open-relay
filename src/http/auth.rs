@@ -157,7 +157,7 @@ impl AuthState {
                 let now = Instant::now();
                 let mut lockout = state.lockout.lock().await;
                 let before = lockout.len();
-                lockout.retain(|_, r| r.locked_until.map_or(true, |t| now < t));
+                lockout.retain(|_, r| r.locked_until.is_none_or(|t| now < t));
                 let removed = before - lockout.len();
                 if removed > 0 {
                     debug!(
@@ -547,9 +547,7 @@ pub(super) async fn authorize_request(
     bearer: Option<String>,
     client_ip: Option<String>,
 ) -> Option<Response> {
-    let Some(auth) = state.auth.as_ref().map(Arc::clone) else {
-        return None;
-    };
+    let auth = state.auth.as_ref().map(Arc::clone)?;
 
     if let Some(token) = token
         && auth.validate_token(&token).await

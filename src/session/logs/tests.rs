@@ -8,7 +8,7 @@
 use super::index::LOG_RECORD_FALLBACK_BYTES;
 use super::index::{
     read_persisted_log_page, split_persisted_log_records, split_rendered_log_output,
-    sync_persisted_log_index, viewport_resize_plan,
+    viewport_resize_plan,
 };
 use super::render::{
     format_history_rows, parser_cols, parser_rows, render_engine_screen, render_log_bytes,
@@ -17,7 +17,6 @@ use super::render::{
 use super::{ViewportReplayPlan, ViewportSize};
 use crate::protocol::LogResize;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -115,8 +114,9 @@ fn journal_backed_session_logs_render_and_paginate() {
     assert!(text.contains("line 39"), "{text:?}");
 
     // Pagination path (HTTP logs page endpoint).
-    let (records, total) =
-        super::index::read_persisted_log_page(&dir, 0, 5).expect("paginate journal logs");
+    let (records, total) = super::index::read_persisted_log_page(&dir, 0, 5)
+        .expect("paginate journal logs")
+        .expect("journal-backed session has a persisted log page");
     // Records split on both \r and \n (legacy rule), so each line is two.
     assert_eq!(total, 80);
     assert_eq!(records.len(), 5);
@@ -407,61 +407,19 @@ fn splits_persisted_logs_by_fallback_size_when_no_boundaries_exist() {
 }
 
 #[test]
-fn persisted_log_index_extends_across_append_boundaries() {
-    let temp_dir = temp_session_dir("oly-log-index");
+fn persisted_log_page_rejects_pre_0_5_output_log_sessions() {
+    // M6-2: sessions with only a legacy `output.log` (no journal) fail
+    // loudly instead of silently serving the retired format.
+    let temp_dir = temp_session_dir("oly-log-legacy");
     fs::create_dir_all(&temp_dir).expect("create temp dir");
+    fs::write(temp_dir.join("output.log"), b"alpha\n").expect("write output log");
 
-    let log_path = temp_dir.join("output.log");
-    fs::write(&log_path, b"alpha").expect("write initial output log");
-    sync_persisted_log_index(&log_path).expect("index initial output log");
-
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial page");
-    assert_eq!(lines, vec!["alpha".to_string()]);
-    assert_eq!(total, 1);
-
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&log_path)
-        .expect("open output log for append");
-    file.write_all(b" beta\ngamma")
-        .expect("append output log continuation");
-    file.flush().expect("flush appended output log");
-
-    sync_persisted_log_index(&log_path).expect("extend persisted log index");
-
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended page");
-    assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
-    assert_eq!(total, 2);
-
-    let (tail_lines, tail_total) =
-        read_persisted_log_page(&temp_dir, 1, 10).expect("read trailing page");
-    assert_eq!(tail_lines, vec!["gamma".to_string()]);
-    assert_eq!(tail_total, 2);
-
-    let _ = fs::remove_dir_all(&temp_dir);
-}
-
-#[test]
-fn persisted_log_page_rebuilds_index_after_append_output_raw() {
-    let temp_dir = temp_session_dir("oly-log-index-lazy");
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-    fs::write(temp_dir.join("output.log"), b"alpha").expect("write initial raw output");
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial raw page");
-    assert_eq!(lines, vec!["alpha".to_string()]);
-    assert_eq!(total, 1);
-
-    {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .append(true)
-            .open(temp_dir.join("output.log"))
-            .expect("open raw output");
-        file.write_all(b" beta\ngamma").expect("append raw output");
-    }
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended raw page");
-    assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
-    assert_eq!(total, 2);
+    let err = read_persisted_log_page(&temp_dir, 0, 10)
+        .expect_err("pre-0.5 output.log sessions are an explicit error");
+    assert!(
+        err.contains("pre-0.5"),
+        "error must name the retired format: {err}"
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -474,24 +432,6 @@ fn split_rendered_log_output_drops_final_reset_suffix() {
         split_rendered_log_output(output),
         vec!["alpha\x1b[0m\n".to_string(), "beta\x1b[0m\n".to_string()]
     );
-}
-
-#[test]
-fn read_persisted_log_total_counts_indexed_records() {
-    let temp_dir = temp_session_dir("oly-log-total");
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-    let log_path = temp_dir.join("output.log");
-    fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
-    sync_persisted_log_index(&log_path).expect("index output log");
-    assert_eq!(
-        read_persisted_log_page(&temp_dir, 0, 1)
-            .expect("read total")
-            .1,
-        4
-    );
-
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[test]

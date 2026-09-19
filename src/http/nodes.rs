@@ -48,19 +48,19 @@ pub async fn join_handler(
 ) -> Response {
     // Rate-limit join attempts per IP to prevent brute-force API key guessing.
     let client_ip = peer.ip();
-    if let Some(ref auth) = state.auth {
-        if let Some(locked_until) = auth.locked_until(client_ip).await {
-            let secs = locked_until
-                .saturating_duration_since(std::time::Instant::now())
-                .as_secs();
-            warn!(ip = %client_ip, "node join: rate limited (locked for ~{}s)", secs);
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(axum::http::header::RETRY_AFTER, secs.to_string())],
-                "too many failed attempts",
-            )
-                .into_response();
-        }
+    if let Some(ref auth) = state.auth
+        && let Some(locked_until) = auth.locked_until(client_ip).await
+    {
+        let secs = locked_until
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs();
+        warn!(ip = %client_ip, "node join: rate limited (locked for ~{}s)", secs);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, secs.to_string())],
+            "too many failed attempts",
+        )
+            .into_response();
     }
 
     ws.on_upgrade(move |socket| handle_join(socket, state, client_ip))
@@ -192,7 +192,6 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                             },
                         };
                         match message {
-                            node_message => match node_message {
                                 NodeWsMessage::RpcResponse { id, response } => {
                                     if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
                                         let sender = {
@@ -237,12 +236,11 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                                     None
                                                 }
                                             };
-                                            if let Some(tx) = tx_clone {
-                                                if tx.send(Ok(rpc_resp)).await.is_err() {
+                                            if let Some(tx) = tx_clone
+                                                && tx.send(Ok(rpc_resp)).await.is_err() {
                                                     let mut pm = pending_recv.lock().await;
                                                     pm.remove(&id);
                                                 }
-                                            }
                                         }
                                     }
                                 }
@@ -288,7 +286,6 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                         .await;
                                 }
                                 _ => {}
-                            }
                         }
                     }
                     Some(Err(err)) => break format!("node WebSocket receive error: {err}"),
@@ -309,7 +306,8 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                     let _ = tx.send(Err(err()));
                 }
                 PendingRpc::Stream(tx) => {
-                    let _ = tx.send(Err(err()));
+                    // A dropped future would silently lose the error frame.
+                    let _ = tx.send(Err(err())).await;
                 }
             }
         }

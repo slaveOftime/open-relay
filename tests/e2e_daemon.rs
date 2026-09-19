@@ -744,9 +744,9 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
         let mut reader = BufReader::new(read_half);
 
         // IPC control messages are versioned envelopes:
-        // {"version":12,"payload":{...}} (v12: attach streams carry output
+        // {"version":13,"payload":{...}} (v13: attach streams carry output
         // as binary frames after the JSON init line, M6-3).
-        let envelope = |payload: serde_json::Value| json!({"version": 12, "payload": payload});
+        let envelope = |payload: serde_json::Value| json!({"version": 13, "payload": payload});
         let subscribe = envelope(json!({
             "type": "node_proxy",
             "node": "worker1",
@@ -786,10 +786,12 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
 
         // Mid-stream input through the relay.
         const RELAY_MARKER: &str = "oly_fed_relay_echo_marker";
+        // v13: attach input data is raw bytes, base64-encoded in JSON.
         let input = envelope(json!({
             "type": "attach_input",
             "id": session_id,
-            "data": format!("echo {RELAY_MARKER}\n"),
+            // base64("echo oly_fed_relay_echo_marker\n")
+            "data": "ZWNobyBvbHlfZmVkX3JlbGF5X2VjaG9fbWFya2VyCg==",
             "wait_for_change": false
         }));
         write_half
@@ -942,6 +944,9 @@ fn e2e_session_status_transitions_in_list() {
     );
 }
 
+// The global e2e lock serializes daemon-spawning tests; holding it across
+// awaits is the point (a second daemon must not start mid-test).
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn e2e_kill_session_status_transitions_to_killed() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());

@@ -15,7 +15,7 @@ fn oly_bin() -> PathBuf {
 
 /// Build a `Command` for `oly` with a self-contained state directory so the
 /// tests never interact with a real daemon.
-fn oly_cmd(tmp_dir: &PathBuf) -> Command {
+fn oly_cmd(tmp_dir: &std::path::Path) -> Command {
     let mut cmd = Command::new(oly_bin());
 
     // OLY_STATE_DIR directly overrides resolve_state_dir() — no
