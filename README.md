@@ -13,11 +13,17 @@ https://github.com/user-attachments/assets/bd52a474-d9c4-48a7-824b-8df328a9d5a7
 
 `oly` gives long-running terminal jobs a durable home.
 
+> **Preview branch:** this branch (`v0.5.x`) carries the 0.5.x beta line —
+> a ground-up rework of storage, terminal fidelity, and streaming with
+> breaking changes. The stable release line is 0.3.x on `main`. Beta
+> artifacts ship as GitHub *prereleases* and under the npm `beta`
+> dist-tag. See [MIGRATION.md](./MIGRATION.md) before switching.
+
 Start a command once, detach, close your terminal, come back later, inspect logs, send input only when needed, or reattach and take over. It is built for AI agent workflows, interactive CLIs, and any session you do not want tied to one fragile terminal window.
 
 If `oly` saves you time, please star the repo. That helps more people discover it.
 
-Upgrading from 0.x? Read [MIGRATION.md](./MIGRATION.md) first — 1.0 is a clean break. For internals, see [ARCHITECTURE.md](./ARCHITECTURE.md) and the [ADRs](./docs/adrs/).
+Upgrading from 0.3.x? Read [MIGRATION.md](./MIGRATION.md) first — 0.5.0 is a clean break. For internals, see [ARCHITECTURE.md](./ARCHITECTURE.md) and the [ADRs](./docs/adrs/).
 
 ---
 
@@ -315,7 +321,7 @@ raw bytes with `oly logs --raw <id>`.
 
 ## Learn more
 
-- [MIGRATION.md](./MIGRATION.md) for the 0.x → 1.0 transition
+- [MIGRATION.md](./MIGRATION.md) for the 0.3.x → 0.5.0 transition
 - [SPEC.md](./SPEC.md) for the implementation-aligned product spec
 - [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview
 - [docs/adrs/](./docs/adrs/) for the architecture decision records

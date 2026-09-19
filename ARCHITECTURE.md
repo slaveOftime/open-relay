@@ -11,17 +11,22 @@ before changing anything structural.
 
 ## The three rules
 
-Everything in 1.0 follows from keeping exactly one implementation of each
+Everything in the current design follows from keeping exactly one implementation of each
 core concern:
 
 1. **One journal.** Every session persists a single ordered stream — raw PTY
    output, resizes, lifecycle transitions, checkpoints — in a per-session
-   shadow journal (`src/session/journal.rs`). Nothing else is persisted per
+   journal (`src/session/journal.rs`). Nothing else is persisted per
    session. Everything else (the filtered display stream, resize history,
    logs, attach snapshots) is *derived* from the journal at read time
    (`src/session/replay.rs`), so derived state can never silently disagree
-   with the recording. The journal is always on; if it fails, the session
+   with the recording. Replay is checkpoint-anchored: anchored v2
+   checkpoints carry their filtered-stream offset, so deriving a window
+   costs O(checkpoint cadence), never O(total recording) (PLAN §5.3).
+   The journal is always on; if it fails, the session
    fails loudly rather than recording nothing (ADR-0002, ADR-0006).
+   Sessions left over from pre-0.5 builds (only `output.log`) are rejected
+   with an explicit error (see MIGRATION.md).
 2. **One terminal engine.** All terminal-state questions — the live screen,
    `oly logs` rendering, web views, Windows repaint — are answered by one
    embedded alacritty engine (`src/terminal/`). vt100 survives only as a
@@ -61,7 +66,7 @@ test suite enforces (the full list with rationale is in `PLAN.md` §4):
 - **Bounded memory.** Slow clients backpressure via stream credits and
   bounded queues; a stuck client is resynced or dropped, never buffered
   forever.
-- **Explicit degradation.** Missing, corrupt, or pre-1.0 state produces
+- **Explicit degradation.** Missing, corrupt, or pre-0.5 state produces
   clear errors (see `MIGRATION.md`), never silently empty output.
 
 ## Reading the code
@@ -78,10 +83,10 @@ protocol conformance in `src/daemon/rpc.rs` (`ipc_conformance`) and
 ## Documents
 
 - `README.md` — what oly is and how to use it.
-- `MIGRATION.md` — 0.x → 1.0 breaking changes and upgrade steps.
+- `MIGRATION.md` — 0.3.x → 0.5.0 breaking changes and upgrade steps.
 - `SPEC.md` — the product surface (commands, behaviors) as implemented.
 - `docs/adrs/` — the seven architecture decision records (engine, journal,
   input, streaming, history UX, crash boundary, authz).
-- `PLAN.md` — the 1.0 milestone plan and per-slice status log.
-- `docs/` — evidence reports (engine evaluation, security audit, M0
-  baselines) and release evidence.
+- `PLAN.md` — the design plan behind 0.5.0: invariants, architecture rules,
+  and the release checklist the code and tests cite.
+- `docs/` — the security audit report and the 0.5.0 release evidence.

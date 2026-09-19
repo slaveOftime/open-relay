@@ -1,7 +1,7 @@
 # 🔒 Open Relay (`oly`) — 安全审计报告
 
 **项目:** [github.com/slaveOftime/open-relay](https://github.com/slaveOftime/open-relay)  
-**版本:** 0.2.3  
+**版本:** 0.2.3（原始审计）；附录覆盖至 0.5.0 beta  
 **审计日期:** 2026-04-02  
 **审计方法:** 自动化多角度源码审计（加密/认证、网络攻击面、命令注入/PTY、木马/后门扫描、Web前端安全）  
 
@@ -486,7 +486,7 @@ Unix 上 0600 权限正确，但 Windows 上未设置等效 ACL。密钥以明�
 
 ---
 
-# 📌 附录：1.0.0 M2–M5 安全面审计（2026-06）
+# 📌 附录：0.5.0 M2–M5 安全面审计（2026-06）
 
 **范围:** M2（事件日志/回放/崩溃恢复）、M3（流式协议/附着控制）、M4–M5-3（联邦中继）、M5-4（认证/授权）、M5-5（进程树终止/关停排空）、M5-6（导出/隐私）。
 
@@ -540,6 +540,37 @@ Unix 上 0600 权限正确，但 Windows 上未设置等效 ACL。密钥以明�
 3. API key 正向缓存 ≤ 60 s 的吊销滞后。
 4. 进程组信号的 PID 复用竞态（极小窗口）。
 5. 广播环按消息数（256 块）而非字节数限界（调优项，非静默数据丢失）。
+
+---
+
+## Addendum — post-release review hardening (protocol v13)
+
+Scope: six release-blocker fixes from the M6 review, assessed for security
+impact.
+
+- **Legacy `output.log` fallback removed.** The ambiguous-format read path
+  (plus its trust-on-disk sidecar index) is gone; pre-0.5 sessions now fail
+  loud with an explicit error (HTTP 410 / RPC error). This removes a
+  parser-divergence surface between "what the operator sees" and "what the
+  journal recorded."
+- **Byte-exact input (v13).** Attach input is raw bytes end to end; the
+  server no longer rewrites input sequences. This eliminates silent input
+  mutation between client and PTY (an integrity improvement; no new input
+  is journaled — input remains unrecorded by design).
+- **Fail-loud web framing.** Unknown/truncated attach frames surface as
+  errors instead of being silently dropped, closing a silent-stream-loss
+  class on the browser path.
+- **Clippy zero-warning gate.** The cleanup found one real defect (a
+  dropped `.await` on an error-frame send in the HTTP nodes drain loop —
+  the error frame would have been silently lost) and a `never_loop` logic
+  bug in the checkpoint-anchor scanner. Both fixed; the gate is now
+  enforced in CI.
+- **No new residual risks.** Mode propagation (mouse/focus/SGR) forwards
+  input only while the session's engine reports the mode enabled; CLI
+  attach restores local terminal state on every exit path. Checkpoint
+  anchoring reads the journal at trusted byte positions recorded by the
+  journal itself; a corrupted anchor fails loudly, it does not redirect
+  reads elsewhere.
 
 ---
 

@@ -12,7 +12,7 @@ races output drain — stop can lose the last diagnostics.
 
 ## Decision (draft)
 
-1. 1.0 documents the boundary honestly: sessions survive **client** loss;
+1. 0.5.0 documents the boundary honestly: sessions survive **client** loss;
    journal history survives daemon restart according to the durability
    policy (`journal_seq`/`durable_seq`); live processes do not survive
    daemon death.
@@ -25,7 +25,7 @@ races output drain — stop can lose the last diagnostics.
    deadline. Stop/kill/finalize are idempotent and platform-tested
    (Unix process groups, Windows Job Objects).
 4. A separately supervised session-host process (for daemon upgrades that
-   keep sessions alive) is deferred past 1.0 as its own ADR; the journal
+   keep sessions alive) is deferred past 0.5.0 as its own ADR; the journal
    and protocol boundaries chosen here must not preclude it.
 
 ## Rejected alternatives
@@ -33,7 +33,7 @@ races output drain — stop can lose the last diagnostics.
 - PID-based "reattachment" to a lost PTY (impossible; do not fake it).
 - Silent restart of agent commands after daemon death (side effects are
   not safely replayable).
-- Shipping session-host separation in 1.0 (doubles the lifecycle matrix).
+- Shipping session-host separation in 0.5.0 (doubles the lifecycle matrix).
 
 ## Acceptance
 

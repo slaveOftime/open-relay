@@ -1,6 +1,6 @@
 # Specification: Open Relay (`oly`)
 
-**Version:** 0.1.0  
+**Version:** 0.5.0 (beta)  
 **Language:** Rust  
 **Status:** Implementation-aligned living spec
 

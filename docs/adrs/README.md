@@ -1,6 +1,6 @@
 # Architecture decision records
 
-Decisions for the 1.0.0 redesign described in [PLAN.md](../../PLAN.md).
+Decisions for the 0.5.0 redesign described in [PLAN.md](../../PLAN.md).
 Each ADR records context, the decision, rejected alternatives, acceptance
 tests, and migration impact. Statuses:
 

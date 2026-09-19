@@ -50,7 +50,7 @@ acknowledgment.
 ## Evidence gathered in M0
 
 Incumbent `map_key_to_input` coverage gaps, pinned as repros in
-`client::attach::tests` (see [M0_EVIDENCE.md](../M0_EVIDENCE.md)):
+`client::attach::tests`:
 
 Expected sequences below are the legacy xterm-compatible profile
 (ADR-0001 stable profiles); enhanced keyboard profiles (kitty protocol)
@@ -70,15 +70,15 @@ are a separate negotiated capability.
   unshifted Tab) is buffered and each follow-up **resets** the 30 ms
   `PASTE_BURST_WAIT` deadline, so continuous typing accumulates until the
   user pauses for a full burst window — while the daemon backend
-  round-trip measures ~100 µs p50 ([M0_EVIDENCE.md](../M0_EVIDENCE.md)).
+  round-trip measures ~100 µs p50 (M0 measurement).
 - Silent loss: the 150 ms `PASTE_KEY_SUPPRESS_WINDOW` drops incoming key
   events after a clipboard paste (input-side, not output filtering) —
   legitimate fast follow-up typing after a paste is silently discarded.
-- The 1.0 codec must use explicit paste events (bracketed paste where the
+- The 0.5.0 codec must use explicit paste events (bracketed paste where the
   terminal supports it, explicit paste command otherwise) with no
   timing-based classification of ordinary typing.
 
 ## Migration
 
 CLI detach keybinding changes are breaking and documented; agent `send`
-requires explicit session IDs and leases in 1.0 machine workflows.
+requires explicit session IDs and leases in 0.5.0 machine workflows.

@@ -6,7 +6,7 @@
 ## Context
 
 The daemon owns one PTY per session and renders it with `vt100`. Known
-defects the 1.0 design must fix:
+defects the 0.5.0 design must fix:
 
 - Resize rebuilds the parser from formatted, width-trimmed rows
   (`safe_resize_parser`), permanently destroying retained history beyond the
@@ -51,7 +51,7 @@ defects the 1.0 design must fix:
 ## Evidence gathered in M0
 
 Incumbent `vt100` + `state_formatted` snapshot, restore-continuation
-oracle (see [M0_EVIDENCE.md](../M0_EVIDENCE.md)):
+oracle (M0 measurements, recorded here):
 
 - Passes: committed text/SGR/cursor; the wrap-pending flag survives too
   (a `state_formatted` replay encodes the last-column cursor position such
@@ -63,7 +63,7 @@ oracle (see [M0_EVIDENCE.md](../M0_EVIDENCE.md)):
   TUI frame instead of the preserved main screen).
 
 Conclusion so far: the incumbent screen replay is not a checkpoint; a
-1.0 checkpoint must serialize parser state (pending escape/UTF-8
+0.5.0 checkpoint must serialize parser state (pending escape/UTF-8
 fragments, active modes incl. DECSET 1049, wrap-pending) alongside the
 grid. Whether the incumbent engine can grow that checkpoint or a
 replacement core is needed is the open M2 decision.
@@ -79,11 +79,14 @@ A **time-boxed evaluation of `alacritty_terminal` (lead) and
 `wezterm-term` (comparison)** is authorized, via one online build or
 vendored exact-version sources, in an isolated prototype crate — no
 production dependency is added until the checkpoint/resize corpus passes.
-`vt100` is not selected as the 1.0 engine unless both candidates fail and
+`vt100` is not selected as the 0.5.0 engine unless both candidates fail and
 a scoped fork is demonstrably cheaper; building a screen model on `vte`
 is rejected as a de-facto from-scratch emulator.
 
-## Evaluation outcome (tools/engine-eval, [ENGINE_EVAL.md](../ENGINE_EVAL.md))
+## Evaluation outcome
+
+Measured with a throwaway evaluation crate (removed after the decision; the
+corpus now lives in `src/terminal/mod.rs` conformance tests):
 
 - Clean-stream agreement with the incumbent oracle: exact on 6/7 corpus
   streams; the 7th is an API difference (logical vs physical wrapped
@@ -101,9 +104,9 @@ is rejected as a de-facto from-scratch emulator.
   (M2 decision). `wezterm-term` is not published to crates.io and is
   deferred unless the Alacritty patch path proves prohibitive.
 
-**Direction: Alacritty's core is the selected engine candidate.** Final
-selection is ratified when the M2 checkpoint prototype re-runs experiment
-2 with 0 failures (follow-ups in ENGINE_EVAL.md).
+**Direction: Alacritty's core is the selected engine.** Ratified by the M2
+checkpoint prototype (0 failures); the corpus runs as
+`clean_stream_corpus_agrees_with_vt100_oracle` in `src/terminal/mod.rs`.
 
 ## Migration
 

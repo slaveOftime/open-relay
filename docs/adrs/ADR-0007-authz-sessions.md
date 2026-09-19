@@ -44,7 +44,7 @@ into any renderer that replays them.
 
 ## Migration
 
-1.0 upgrade requires re-login and credential reissue; insecure sessions are
+0.5.0 upgrade requires re-login and credential reissue; insecure sessions are
 not carried over for convenience.
 
 ## Addendum (M5-4): implemented authz
