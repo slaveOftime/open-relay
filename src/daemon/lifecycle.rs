@@ -154,6 +154,16 @@ pub async fn start(
     auth_hash_internal: Option<String>,
 ) -> Result<()> {
     if daemon_is_healthy(&config).await {
+        // A start request with different flags cannot be honored while
+        // another daemon owns this state directory (the common case: an
+        // auto-spawned or earlier daemon runs with HTTP enabled and the
+        // user now asks for --no-http). Say what is actually running and
+        // how to replace it instead of failing with a bare error.
+        eprintln!("a daemon is already running with this state directory:");
+        eprintln!();
+        eprint!("{}", running_daemon_summary(&config));
+        eprintln!();
+        eprintln!("stop it first (`oly daemon stop`) to start with different flags.");
         return Err(AppError::DaemonAlreadyRunning);
     }
 
@@ -221,16 +231,44 @@ pub async fn status(config: AppConfig) -> Result<()> {
 
     println!("Daemon is running...");
 
-    let (no_http, no_auth, started_at) = storage::read_daemon_info(&config.info_file)?
-        .map(|i| (i.no_http, i.no_auth, Some(i.started_at)))
+    let info = storage::read_daemon_info(&config.info_file)?;
+    let (no_http, no_auth, started_at) = info
+        .as_ref()
+        .map(|i| (i.no_http, i.no_auth, Some(i.started_at.clone())))
         .unwrap_or((false, false, None));
 
     if let Some(started_at) = started_at {
         println!("Started at:   {}", format_status_timestamp(&started_at));
     }
 
-    print_detached_start_summary(&config, no_http, no_auth);
+    let effective = effective_status_config(&config, info.as_ref());
+    print_detached_start_summary(&effective, no_http, no_auth);
     Ok(())
+}
+
+/// Resolve the config view `status`/already-running messages report from:
+/// the running daemon's own recorded flags and effective HTTP endpoint win
+/// over the client's config file (CLI `--bind`/`--port` overrides and any
+/// config drift since the daemon started would otherwise misreport).
+fn effective_status_config(config: &AppConfig, info: Option<&storage::DaemonInfo>) -> AppConfig {
+    let mut effective = config.clone();
+    if let Some(info) = info {
+        effective.http_bind = info.http_bind.clone();
+        effective.http_port = info.http_port;
+    }
+    effective
+}
+
+/// The summary of the currently running daemon for the already-running
+/// error path: same source-of-truth rules as `daemon status`.
+fn running_daemon_summary(config: &AppConfig) -> String {
+    let info = storage::read_daemon_info(&config.info_file).ok().flatten();
+    let (no_http, no_auth) = info
+        .as_ref()
+        .map(|i| (i.no_http, i.no_auth))
+        .unwrap_or((false, false));
+    let effective = effective_status_config(config, info.as_ref());
+    detached_start_summary(&effective, no_http, no_auth)
 }
 
 fn format_status_timestamp(value: &str) -> String {
@@ -480,6 +518,8 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             no_http,
             no_auth,
             started_at: chrono::Utc::now().to_rfc3339(),
+            http_bind: config.http_bind.clone(),
+            http_port: config.http_port,
         },
     )?;
 
@@ -750,8 +790,9 @@ async fn drain_sessions_for_shutdown(session_store: &SessionStoreHandle) {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{detached_start_summary, format_status_timestamp};
+    use super::{detached_start_summary, effective_status_config, format_status_timestamp};
     use crate::config::AppConfig;
+    use crate::storage;
 
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
@@ -841,6 +882,44 @@ mod tests {
 
         assert!(summary.contains("HTTP:         disabled (--no-http)"));
         assert!(!summary.contains("Auth:"));
+    }
+
+    #[test]
+    fn status_endpoint_prefers_the_running_daemons_recorded_values() {
+        // The daemon was started with `--port 9999` (a runtime override
+        // that never reaches config.json): status must report the running
+        // daemon's effective endpoint, not the client's config default.
+        let config = test_config();
+        let info = storage::DaemonInfo {
+            no_http: false,
+            no_auth: true,
+            started_at: "2026-03-27T12:34:56Z".to_string(),
+            http_bind: "0.0.0.0".to_string(),
+            http_port: 9999,
+        };
+        let effective = effective_status_config(&config, Some(&info));
+        let summary = detached_start_summary(&effective, info.no_http, info.no_auth);
+        assert!(summary.contains("HTTP:         http://0.0.0.0:9999"));
+        assert!(!summary.contains("15443"));
+    }
+
+    #[test]
+    fn status_endpoint_falls_back_to_client_config_without_info() {
+        let config = test_config();
+        let effective = effective_status_config(&config, None);
+        assert_eq!(effective.http_bind, "127.0.0.1");
+        assert_eq!(effective.http_port, 15443);
+    }
+
+    #[test]
+    fn daemon_info_without_endpoint_fields_still_parses() {
+        // Info files written before the endpoint fields existed must stay
+        // readable; the defaults mirror config.rs's built-in endpoint.
+        let legacy = r#"{"no_http":true,"no_auth":true,"started_at":"2026-03-27T12:34:56Z"}"#;
+        let info: storage::DaemonInfo = serde_json::from_str(legacy).expect("legacy info parses");
+        assert!(info.no_http);
+        assert_eq!(info.http_bind, "127.0.0.1");
+        assert_eq!(info.http_port, 15443);
     }
 
     #[test]

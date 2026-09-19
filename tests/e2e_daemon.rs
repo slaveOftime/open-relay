@@ -1326,3 +1326,114 @@ fn e2e_logs_raw_exports_unfiltered_bytes() {
         "rendered logs must not re-emit raw SGR sequences"
     );
 }
+
+#[test]
+fn e2e_daemon_status_matches_running_no_http_daemon() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_daemon_status_no_http");
+    let _daemon = start_daemon(&tmp); // --no-http --no-auth
+
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "status"])
+        .output()
+        .expect("`oly daemon status` failed to execute");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "`oly daemon status` exited non-zero.\nstdout:\n{stdout}"
+    );
+    assert!(stdout.contains("Daemon is running"), "stdout:\n{stdout}");
+    assert!(stdout.contains("Started at:"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("HTTP:         disabled (--no-http)"),
+        "no-http daemon must be reported as disabled.\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("http://"),
+        "no-http daemon must not advertise an HTTP URL.\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn e2e_daemon_status_reports_the_effective_http_endpoint_override() {
+    // The daemon is started with a `--port` runtime override that never
+    // reaches config.json: `daemon status` must report the port the daemon
+    // actually bound (from its own info record), not the client config's
+    // default — otherwise status silently desyncs from reality.
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_daemon_status_http_endpoint");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http(&tmp, port);
+
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "status"])
+        .output()
+        .expect("`oly daemon status` failed to execute");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "`oly daemon status` exited non-zero.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("HTTP:         http://127.0.0.1:{port}")),
+        "status must report the daemon's effective port.\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("15443"),
+        "status must not fall back to the config default port.\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Auth:         disabled (--no-auth)"),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn e2e_daemon_start_while_running_explains_the_running_config() {
+    // A second start (e.g. with different flags like --no-http) cannot be
+    // honored: the error must name the running daemon's actual config and
+    // the way forward, instead of a bare "already running".
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_daemon_start_conflict");
+    let _daemon = start_daemon(&tmp); // --no-http --no-auth
+
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "start", "-d", "--no-http"])
+        .output()
+        .expect("`oly daemon start` failed to execute");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "second daemon start must fail.\nstdout:\n{}\nstderr:\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("daemon is already running"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HTTP:         disabled (--no-http)"),
+        "conflict message must show the running daemon's config.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("oly daemon stop"),
+        "conflict message must point at the remedy.\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn e2e_daemon_status_reports_not_running() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_daemon_status_stopped");
+
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "status"])
+        .output()
+        .expect("`oly daemon status` failed to execute");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stderr.contains("Daemon is not running.") || stdout.contains("Daemon is not running."),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}

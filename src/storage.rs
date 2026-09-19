@@ -14,6 +14,24 @@ pub struct DaemonInfo {
     pub no_http: bool,
     pub no_auth: bool,
     pub started_at: String,
+    /// The HTTP endpoint the daemon actually bound at startup. This is a
+    /// runtime property of the running process: `--bind`/`--port` CLI
+    /// overrides never reach `config.json`, and bind/port edits require a
+    /// restart, so a client reading only its own config file can disagree
+    /// with the running daemon. `oly daemon status` must report these
+    /// effective values (defaults keep pre-field info files parseable).
+    #[serde(default = "default_daemon_http_bind")]
+    pub http_bind: String,
+    #[serde(default = "default_daemon_http_port")]
+    pub http_port: u16,
+}
+
+fn default_daemon_http_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_daemon_http_port() -> u16 {
+    15443
 }
 
 pub fn write_daemon_info(path: &PathBuf, info: &DaemonInfo) -> Result<()> {
