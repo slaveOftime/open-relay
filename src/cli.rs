@@ -382,23 +382,26 @@ pub struct AttachArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
-    /// Attach view-only: never drives input or geometry.
+    /// Attach view-only: never drives input or geometry, never takes control.
     #[arg(long, conflicts_with = "takeover")]
     pub observer: bool,
-    /// Take the control lease from the current controller (it becomes an observer).
+    /// Take the control lease from the current controller (it becomes an
+    /// observer). This is the default for interactive attach: the most
+    /// recently activated client always drives input and geometry.
     #[arg(long)]
     pub takeover: bool,
 }
 
 impl AttachArgs {
-    /// Wire role token for the attach subscription (None = controller).
-    pub fn role(&self) -> Option<&'static str> {
+    /// Wire role token for the attach subscription. Interactive attach
+    /// defaults to takeover: a client that becomes active takes the control
+    /// lease (and with it geometry authority) from whoever held it, matching
+    /// tmux-style last-attach-wins semantics. `--observer` opts out.
+    pub fn role(&self) -> &'static str {
         if self.observer {
-            Some("observer")
-        } else if self.takeover {
-            Some("takeover")
+            "observer"
         } else {
-            None
+            "takeover"
         }
     }
 }

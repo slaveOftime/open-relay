@@ -781,6 +781,13 @@ function SessionDetailPageContent() {
           onControl: (role) => {
             lastWsFrameAtRef.current = Date.now()
             if (isMounted.current) setControlRole(role)
+            // The controller owns session geometry: the moment we hold the
+            // lease, push our actual viewport so the session resizes to the
+            // active browser instead of keeping a previous controller's size.
+            if (role === 'controller') {
+              const size = termRef.current?.getSize()
+              if (size) sock.sendResize(size.rows, size.cols)
+            }
           },
           onResized: (rows, cols) => {
             lastWsFrameAtRef.current = Date.now()
@@ -828,7 +835,10 @@ function SessionDetailPageContent() {
           },
         },
         node ?? undefined,
-        initialSize ?? undefined
+        initialSize ?? undefined,
+        // Browser attach always takes control (and with it geometry
+        // authority): the active browser tab drives the session.
+        'takeover'
       )
       pushConnectTrace('websocket created')
       socketRef.current = sock

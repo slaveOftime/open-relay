@@ -902,3 +902,114 @@ fn e2e_input_to_nonexistent_session_fails_gracefully() {
         "expected clear error for non-existent session.\nstderr:\n{stderr}"
     );
 }
+
+/// `oly attach` runs under a real PTY; pressing Ctrl-] (GS, 0x1d) then `d`
+/// must detach the client (README/SPEC key contract). This exercises the
+/// full terminal input path — crossterm delivers the GS byte as
+/// `Char('5') + CONTROL` in legacy mode, which is the form this test
+/// verifies end-to-end.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_attach_ctrl_right_bracket_then_d_detaches() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::{Read, Write};
+
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_attach_detach_prefix");
+    let _daemon = start_daemon(&tmp);
+    let id = start_session(&tmp, &["sh", "-i"]);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty pair");
+
+    let mut cmd = CommandBuilder::new(oly_bin());
+    cmd.args(["attach", &id]);
+    cmd.env("OLY_STATE_DIR", tmp.join("oly"));
+    cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(&tmp));
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("spawn `oly attach` on the pty");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let mut writer = pair.master.take_writer().expect("take pty writer");
+    // PTY master reads block; pump them on a thread so every wait below
+    // has a real timeout instead of hanging the test on a stuck client.
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let pump = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut output: Vec<u8> = Vec::new();
+
+    // Wait until the attach client is fully up: it enters raw mode and
+    // replays the session; drain whatever arrives first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while output.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`oly attach` produced no output on the pty"
+        );
+        match output_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Ctrl-] then d → detach. Send the prefix first, then the detach key.
+    writer.write_all(b"\x1d").expect("write GS prefix");
+    std::thread::sleep(Duration::from_millis(100));
+    writer.write_all(b"d").expect("write detach key");
+
+    // The attach process must exit on its own and report the detach.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check attach child") {
+            break status;
+        }
+        match output_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`oly attach` did not exit after Ctrl-] d.\noutput so far:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    };
+    // Drain whatever the client printed while exiting.
+    while let Ok(chunk) = output_rx.recv_timeout(Duration::from_millis(200)) {
+        output.extend_from_slice(&chunk);
+    }
+    drop(writer);
+    let _ = pump.join();
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        status.success(),
+        "attach exited non-zero: {status:?}\n{text}"
+    );
+    assert!(
+        text.contains(&format!("Detached from session {id}")),
+        "attach did not report the detach.\noutput:\n{text}"
+    );
+}

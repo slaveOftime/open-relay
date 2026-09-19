@@ -231,7 +231,12 @@ async fn run() -> Result<()> {
                         println!("{session_id}");
                         return Ok(());
                     }
-                    if let Err(err) = client::run_attach(&config, &session_id, None).await {
+                    // Interactive attach takes control by default (see
+                    // AttachArgs::role): the just-started session is driven
+                    // by the terminal that launched it.
+                    if let Err(err) =
+                        client::run_attach(&config, &session_id, Some("takeover")).await
+                    {
                         eprintln!();
                         eprintln!(
                             "warning: started session {session_id}, but failed to attach: {err}"
@@ -373,11 +378,11 @@ async fn run() -> Result<()> {
         Commands::Attach(attach_args) => {
             let id = resolve_session_id(&config, attach_args.id.clone(), attach_args.node.as_ref())
                 .await?;
-            let role = attach_args.role();
+            let role = Some(attach_args.role());
             if attach_args.node.is_some() {
                 client::run_attach_node(&config, &id, attach_args.node, role).await
             } else {
-                client::run_attach(&config, &id, attach_args.role()).await
+                client::run_attach(&config, &id, role).await
             }
         }
 

@@ -546,6 +546,16 @@ impl SessionRuntime {
         self.purge_expired_leases_at(Instant::now());
         let outcome = self.attachments.acquire_control(attachment_id)?;
         self.last_attach_activity_at = Some(Instant::now());
+        // The controller owns session geometry: adopt the new controller's
+        // declared viewport immediately so a takeover resizes the session to
+        // the now-active client instead of leaving the previous controller's
+        // size in place until the next resize event.
+        if let Some((rows, cols)) = self.attachments.viewport(attachment_id)
+            && rows > 0
+            && cols > 0
+        {
+            self.resize_pty(rows, cols);
+        }
         let _ = self.control_tx.send(self.attachments.controller_id());
         Some(outcome)
     }

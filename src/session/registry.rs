@@ -281,6 +281,11 @@ impl AttachmentRegistry {
         }
     }
 
+    /// An attachment's last declared viewport, if any.
+    pub fn viewport(&self, id: u64) -> Option<(u16, u16)> {
+        self.attachments.get(&id).and_then(|a| a.viewport)
+    }
+
     /// Number of live attachments (replaces the anonymous attach counter).
     pub fn len(&self) -> usize {
         self.attachments.len()

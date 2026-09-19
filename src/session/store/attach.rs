@@ -1007,6 +1007,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_takeover_resizes_session_to_the_new_controllers_viewport() {
+        use crate::session::registry::{AttachKind, ControlRequest};
+
+        let (rt, _writer_rx) = make_runtime_writable("ctl0002", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        // Controller A attaches with a 24x80 viewport: geometry applies.
+        let _first = store
+            .attach_register(
+                "ctl0002",
+                AttachKind::Cli,
+                ControlRequest::Controller,
+                Some((24, 80)),
+            )
+            .await
+            .expect("first attach");
+        let initial = store
+            .subscribe_resize("ctl0002")
+            .and_then(|(_, size)| size);
+        assert_eq!(initial, Some((24, 80)));
+
+        // B joins as an observer (lease held) with a different viewport;
+        // session geometry is unchanged.
+        let second = store
+            .attach_register(
+                "ctl0002",
+                AttachKind::Web,
+                ControlRequest::Controller,
+                Some((40, 120)),
+            )
+            .await
+            .expect("second attach");
+        assert_eq!(second.role, crate::session::registry::AttachRole::Observer);
+        let before = store
+            .subscribe_resize("ctl0002")
+            .and_then(|(_, size)| size);
+        assert_eq!(before, Some((24, 80)), "observer viewport must not resize");
+
+        // B takes control: the session adopts B's viewport immediately,
+        // not on the next resize event.
+        store
+            .attach_acquire_control("ctl0002", second.attachment_id)
+            .await
+            .expect("takeover should succeed");
+        let after = store
+            .subscribe_resize("ctl0002")
+            .and_then(|(_, size)| size);
+        assert_eq!(
+            after,
+            Some((40, 120)),
+            "takeover must resize the session to the new controller's viewport"
+        );
+    }
+
+    #[tokio::test]
     async fn test_attach_stream_status_keeps_stopping_session_live() {
         let rt = make_runtime("stoplive", SessionStatus::Stopping, "", None);
         let store = store_with(vec![rt], make_test_db().await);

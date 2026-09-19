@@ -510,6 +510,17 @@ async fn run_attach_inner(
                                 }
                             }
                             Event::Key(key) => {
+                                // Key releases are never sent and must never
+                                // resolve the detach prefix (only
+                                // kitty-protocol terminals and Windows report
+                                // them; we do not negotiate that with the
+                                // outer terminal). Without this filter a
+                                // Release of Ctrl-] would consume the armed
+                                // prefix and leak a literal GS byte into the
+                                // session. Press and Repeat are handled.
+                                if matches!(key.kind, KeyEventKind::Release) {
+                                    continue;
+                                }
                                 // Detach prefix (README/SPEC: `Ctrl-]` then
                                 // `d`). Arming the prefix consumes the key;
                                 // the next key decides: `d` detaches, Esc
@@ -576,12 +587,6 @@ async fn run_attach_inner(
                                             )
                                             .await?;
                                         }
-                                    } else if matches!(key.kind, KeyEventKind::Release) {
-                                        // Key releases are never sent (only
-                                        // kitty-protocol terminals report
-                                        // them; we do not negotiate that
-                                        // with the outer terminal). Press
-                                        // and Repeat both send.
                                     } else if !is_controller && is_ctrl_t(key) {
                                         // Observer takeover: the server answers
                                         // with an AttachControlChanged frame.
@@ -704,6 +709,31 @@ async fn run_attach_inner(
                                     }
                                     RpcResponse::AttachControlChanged { role } => {
                                         is_controller = role == "controller";
+                                        if is_controller {
+                                            // The controller owns session
+                                            // geometry: push our actual
+                                            // terminal size immediately so a
+                                            // takeover (Ctrl-T, or a demoted
+                                            // client becoming active again)
+                                            // resizes the session to the now
+                                            // -active client instead of
+                                            // leaving stale geometry until
+                                            // the next window resize.
+                                            let (actual_cols, actual_rows) =
+                                                terminal::size().unwrap_or((80, 24));
+                                            last_sent_size = (actual_cols, actual_rows);
+                                            #[cfg(windows)]
+                                            renderer.resize(actual_rows, actual_cols);
+                                            ipc::write_request_to_writer(
+                                                &mut write_half,
+                                                RpcRequest::AttachResize {
+                                                    id: id_owned.clone(),
+                                                    rows: actual_rows,
+                                                    cols: actual_cols,
+                                                },
+                                            )
+                                            .await?;
+                                        }
                                     }
                                     RpcResponse::AttachStreamDone { final_offset, .. } => {
                                         if let Err(err) = stream_cursor.finish(final_offset) {
@@ -1272,16 +1302,25 @@ async fn send_attach_input(
 }
 
 /// The detach prefix key: Ctrl-] (GS, 0x1d).
+///
+/// Crossterm maps the 0x1C–0x1F control bytes to `Char('4'..='7')` +
+/// CONTROL, so in legacy terminal mode a physical Ctrl-] arrives as
+/// `Char('5')` + CONTROL (byte-identical to Ctrl-5 — they are the same
+/// wire byte and cannot be told apart; enhanced/kitty keyboards may
+/// report `Char(']')` instead). All forms are accepted.
 fn is_detach_prefix(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\u{1d}'))
-        || (key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(']')))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')))
 }
 
-/// `d` after the detach prefix detaches (a literal Ctrl-D / EOT byte
-/// after the prefix also detaches, matching tmux-style muscle memory).
+/// `d` after the detach prefix detaches. tmux-style muscle memory is
+/// honored: both a plain `d` and a Ctrl-held `d` (EOT, 0x04 — crossterm
+/// reports it as `Char('d')` + CONTROL) detach.
 fn is_detach_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\u{4}'))
-        || (key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')))
+        || (matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
 }
 
 /// Applied-cursor credit cadence (M3-5, I7): credits are backpressure
@@ -1759,6 +1798,10 @@ mod tests {
     fn test_is_detach_prefix_accepts_ctrl_right_bracket_forms() {
         assert!(is_detach_prefix(ctrl_press(KeyCode::Char(']'))));
         assert!(is_detach_prefix(press(KeyCode::Char('\u{1d}'))));
+        // Crossterm delivers the GS byte (0x1d, physical Ctrl-]) as
+        // Char('5') + CONTROL in legacy terminal mode — this is the form
+        // real terminals actually produce.
+        assert!(is_detach_prefix(ctrl_press(KeyCode::Char('5'))));
     }
 
     #[test]
@@ -1773,6 +1816,9 @@ mod tests {
         assert!(is_detach_key(press(KeyCode::Char('d'))));
         assert!(is_detach_key(press(KeyCode::Char('D'))));
         assert!(is_detach_key(press(KeyCode::Char('\u{4}'))));
+        // tmux-style Ctrl-held second key: crossterm reports EOT (0x04)
+        // as Char('d') + CONTROL, and it must still detach.
+        assert!(is_detach_key(ctrl_press(KeyCode::Char('d'))));
     }
 
     #[test]

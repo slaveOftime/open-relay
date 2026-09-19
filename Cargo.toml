@@ -90,6 +90,11 @@ tachyonfx = { version = "0.25", default-features = false, features = ["std"] }
 # tests validate against vt100; it is never compiled into the binary.
 vt100 = "0.16.2"
 
+[target.'cfg(not(windows))'.dev-dependencies]
+# PTY harness for driving `oly attach` itself in e2e tests (the main
+# dependency is reused; Windows attach rendering is a separate path).
+portable-pty = "0.9"
+
 [target.'cfg(not(windows))'.dependencies]
 mimalloc = { version = "0.1.48", features = ["v3"] }
 libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
