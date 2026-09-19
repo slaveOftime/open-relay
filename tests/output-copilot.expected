@@ -1,4 +1,4 @@
-[0;34m● [0m💡  No copilot instructions found. Run /init to generate a copilot-instructions.md file for this[0m
+[0;34m● [0m💡 No copilot instructions found. Run /init to generate a copilot-instructions.md file for this[0m
 [0;35m│  [0;36m╭─╮╭─╮[0m                                                                                          [0;35m│[0m
   project.[0m
 [0;35m│  [0;36m╰─╯╰─╯[0m
@@ -6,7 +6,7 @@
 [0;35m│  █ [0;32m▘▝ [0;35m█  [0mDescribe a task to get started.[0m
                                             [0;1mSelect Model[0m
 [0;35m│   ▔▔▔▔[0m
-[0;34m● [0m💡  No copilot instructions found. Run /init to generatChoose the AI model to use for Copilot CLI. The s[0m
+[0;34m● [0m💡 No copilot instructions found. Run /init to generatChoose the AI model to use for Copilot CLI. The s[0m
 elected model will be persisted and used for future     y specify session ID or task ID)           [0;35m│[0m
   project.                                              sessions.[0m
 [0;34m● [0mEnvironment loaded: 1 MCP server[0m

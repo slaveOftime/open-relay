@@ -422,7 +422,16 @@ impl SessionRuntime {
     /// adapter, ADR-0001 #4) plus the window/icon title and progress
     /// notifications the renderer stream does not model.
     pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
-        let mut snapshot = self.engine.snapshot_stream();
+        let mut snapshot = Vec::new();
+        if self.engine.modes().alt_screen {
+            // The app owns the alternate screen, but a freshly attached
+            // terminal is in normal mode. Without entering the alt screen
+            // first, the app's next `\x1b[?1049l` would exit an alt screen
+            // the client never entered, leaving the display a mix of stale
+            // alt-screen content and the redrawn normal screen.
+            snapshot.extend_from_slice(b"\x1b[?1049h");
+        }
+        snapshot.extend_from_slice(&self.engine.snapshot_stream());
         snapshot.extend_from_slice(&self.terminal_signals.restore_bytes());
         snapshot
     }
@@ -2398,6 +2407,44 @@ mod tests {
         push_scanned(&mut rt, b"plain output");
 
         assert_eq!(rt.attach_snapshot_bytes(), rt.engine.snapshot_stream());
+    }
+
+    #[test]
+    fn attach_snapshot_enters_alt_screen_before_repainting_it() {
+        let mut rt = new_runtime();
+        push_scanned(&mut rt, b"shell prompt$\r\n");
+        push_scanned(&mut rt, b"\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN APP");
+
+        let snapshot = rt.attach_snapshot_bytes();
+        assert!(
+            snapshot.starts_with(b"\x1b[?1049h"),
+            "alt-screen sessions must put the fresh terminal into alt screen,              snapshot: {}",
+            String::from_utf8_lossy(&snapshot)
+        );
+
+        // End-to-end: a fresh terminal fed the snapshot, then the app's
+        // alt-screen exit, must end on a coherent normal screen instead of
+        // mixing stale alt-screen rows with the redraw.
+        let mut client = vt100::Parser::new(6, 40, 0);
+        client.process(&snapshot);
+        client.process(b"\x1b[?1049l\x1b[2J\x1b[Hshell prompt$");
+        assert_eq!(
+            client
+                .screen()
+                .contents()
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end(),
+            "shell prompt$"
+        );
+    }
+
+    #[test]
+    fn attach_snapshot_skips_alt_prefix_on_the_normal_screen() {
+        let mut rt = new_runtime();
+        push_scanned(&mut rt, b"plain output");
+        assert!(!rt.attach_snapshot_bytes().starts_with(b"\x1b[?1049h"));
     }
 
     #[test]

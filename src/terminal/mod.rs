@@ -346,7 +346,7 @@ fn styled_row(row: &alacritty_terminal::grid::Row<Cell>) -> Vec<u8> {
     for cell in row.into_iter() {
         if cell
             .flags
-            .contains(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         {
             continue;
         }
@@ -443,7 +443,7 @@ fn row_text(row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::
     for cell in row.into_iter() {
         if cell
             .flags
-            .contains(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         {
             continue;
         }
@@ -729,6 +729,76 @@ mod tests {
                 EngineEvent::Title(Some("my title".to_string())),
                 EngineEvent::Bell,
             ]
+        );
+    }
+
+    #[test]
+    fn snapshot_stream_restores_cjk_wide_chars_in_a_fresh_parser() {
+        // CJK glyphs occupy two grid cells; the snapshot must reproduce them
+        // exactly (no extra/missing spacer) in a fresh client parser.
+        let mut term = Terminal::new(6, 40, 100);
+        term.feed("中文字符串测试 hello\r\n│你好│ world\r\n末尾宽字符对齐测试ABC".as_bytes());
+
+        let snapshot = term.snapshot_stream();
+        let mut client = vt100::Parser::new(6, 40, 0);
+        client.process(&snapshot);
+        let restored: Vec<String> = client
+            .screen()
+            .contents()
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        // Pin the exact text, not just self-agreement: a renderer that emits
+        // wide-char spacer cells as real spaces used to pass the
+        // self-comparison while corrupting every CJK glyph run.
+        assert_eq!(
+            trim_blank_edges(restored),
+            vec![
+                "中文字符串测试 hello".to_string(),
+                "│你好│ world".to_string(),
+                "末尾宽字符对齐测试ABC".to_string()
+            ],
+            "snapshot restores CJK text exactly; snapshot bytes: {}",
+            String::from_utf8_lossy(&snapshot)
+        );
+        assert_eq!(
+            trim_blank_edges(term.screen_lines()),
+            vec![
+                "中文字符串测试 hello".to_string(),
+                "│你好│ world".to_string(),
+                "末尾宽字符对齐测试ABC".to_string()
+            ],
+            "row text keeps CJK runs free of spacer cells"
+        );
+    }
+
+    #[test]
+    fn cup_positioned_wide_chars_render_without_spacer_gaps() {
+        // ratatui/codex-style drawing: each wide char is written at an
+        // explicit cursor position two columns apart. The grid stores a
+        // WIDE_CHAR_SPACER after every glyph; row rendering must elide those
+        // spacers (they are not spaces) or every CJK run gains phantom gaps.
+        let mut term = Terminal::new(6, 40, 100);
+        term.feed("❯ ".as_bytes());
+        for (i, ch) in "请用一句中文".chars().enumerate() {
+            let col = 3 + i * 2; // 1-based CUP column, wide-char pitch
+            term.feed(format!("\x1b[1;{col}H{ch}").as_bytes());
+        }
+        assert_eq!(term.screen_lines()[0].trim_end(), "❯ 请用一句中文");
+        let snapshot = term.snapshot_stream();
+        let mut client = vt100::Parser::new(6, 40, 0);
+        client.process(&snapshot);
+        assert_eq!(
+            client
+                .screen()
+                .contents()
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end(),
+            "❯ 请用一句中文",
+            "snapshot bytes: {}",
+            String::from_utf8_lossy(&snapshot)
         );
     }
 
