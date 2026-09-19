@@ -84,7 +84,7 @@ pub async fn run_observe(
     Ok(())
 }
 
-/// `oly history <id> --from <offset> --limit <bytes> [--json]`: one bounded
+/// `oly logs <id> --from <offset> [--limit <bytes>] [--json]`: one bounded
 /// window of the filtered output stream.
 pub async fn run_history(
     config: &AppConfig,
@@ -131,7 +131,7 @@ pub async fn run_history(
     Ok(())
 }
 
-/// `oly screen <id> [--cols N]`: the visible terminal screen (plain text).
+/// `oly logs <id> --screen [--cols N]`: the visible terminal screen (plain text).
 pub async fn run_screen(
     config: &AppConfig,
     id: &str,
@@ -179,7 +179,7 @@ pub struct WaitCondition {
     pub timeout_secs: u64,
 }
 
-/// `oly wait <id> [--after N] [--exit|--idle-ms M|--pattern RE] [--timeout S]`.
+/// `oly logs <id> --after N [--exit|--idle-ms M|--pattern RE] [--timeout D]`.
 ///
 /// Exit status: 0 when a condition matched, 2 on timeout, 1 on error.
 pub async fn run_wait(

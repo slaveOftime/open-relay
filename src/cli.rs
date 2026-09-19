@@ -71,12 +71,6 @@ pub enum Commands {
     Restart(RestartArgs),
     /// Machine-readable session cursor (liveness + canonical stream offset).
     Observe(SessionRefArgs),
-    /// Bounded window read of the session's output stream.
-    History(HistoryArgs),
-    /// Current terminal screen contents (plain text).
-    Screen(ScreenArgs),
-    /// Wait for output after a cursor, an exit, silence, or a pattern.
-    Wait(WaitArgs),
     /// Verify journal integrity (sealed-part manifests) for one or all sessions.
     Doctor(DoctorArgs),
     /// Stop a session by ID.
@@ -86,7 +80,11 @@ pub enum Commands {
     Remove(RemoveArgs),
     /// Attach to a running session.
     Attach(AttachArgs),
-    /// Show session logs. Uses live screen state when running, otherwise replays the journal; `--from-file` forces the journal replay.
+    /// Show session output: rendered log tail (default), the visible screen
+    /// (`--screen`), a raw byte window from a cursor (`--from`), or block
+    /// until a condition is met (`--after`/`--exit`/`--idle-ms`/`--pattern`).
+    /// Uses live screen state when running, otherwise replays the journal;
+    /// `--from-file` forces the journal replay.
     Logs(LogsArgs),
     /// Send text or keys to a session. Example: `oly send <id> "hello" key:enter`.
     Send(SendArgs),
@@ -435,14 +433,80 @@ pub struct LogsArgs {
     /// Block until the session needs input (or exits), then print logs.
     #[arg(long = "wait-for-prompt", short = 'w')]
     pub wait_for_prompt: bool,
-    /// Timeout for --wait-for-prompt. Accepts plain milliseconds or units like 10s, 5m, or 1h.
+    /// Timeout for --wait-for-prompt and the wait conditions below.
+    /// Accepts plain milliseconds or units like 10s, 5m, or 1h; 0 waits
+    /// forever. Defaults: 5m with --wait-for-prompt, 30s for wait mode.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
+    pub timeout: Option<u64>,
+    /// Print the visible screen as plain text instead of the log tail.
     #[arg(
         long,
-        default_value = "5m",
-        value_name = "DURATION",
-        value_parser = parse_timeout_ms
+        conflicts_with_all = [
+            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
+            "from", "limit", "after", "exit", "idle_ms", "pattern", "json"
+        ]
     )]
-    pub timeout: u64,
+    pub screen: bool,
+    /// Override the render width for --screen (defaults to the local
+    /// terminal width, fallback 80).
+    #[arg(long, requires = "screen")]
+    pub cols: Option<u32>,
+    /// Agent window read: emit raw bytes of the canonical filtered stream
+    /// starting at this offset (pair with `oly observe` for the cursor;
+    /// page with the returned `next` offset).
+    #[arg(
+        long,
+        value_name = "OFFSET",
+        conflicts_with_all = [
+            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
+            "screen", "after", "exit", "idle_ms", "pattern"
+        ]
+    )]
+    pub from: Option<u64>,
+    /// Maximum bytes for a --from window (bounded; larger spans need
+    /// multiple calls).
+    #[arg(long, requires = "from")]
+    pub limit: Option<u32>,
+    /// Wait mode: block until output appears after this filtered-stream
+    /// offset, the session exits (--exit), output goes quiet (--idle-ms),
+    /// or a regex matches new output (--pattern). Prints the result and
+    /// the new cursor; exit codes: 0 condition met, 2 timeout, 1 error.
+    #[arg(
+        long,
+        value_name = "OFFSET",
+        conflicts_with_all = [
+            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
+            "screen", "cols", "from", "limit"
+        ]
+    )]
+    pub after: Option<u64>,
+    /// Wait-mode condition: the session exited.
+    #[arg(long)]
+    pub exit: bool,
+    /// Wait-mode condition: no output for this many milliseconds
+    /// (heuristic: likely idle or waiting for input, never proof).
+    #[arg(long)]
+    pub idle_ms: Option<u64>,
+    /// Wait-mode condition: regex matches output produced after --after.
+    #[arg(long)]
+    pub pattern: Option<String>,
+    /// Emit machine-readable JSON (with --from: one JSON line with the
+    /// window base64-encoded; with wait mode: one JSON object).
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
+            "screen", "cols"
+        ]
+    )]
+    pub json: bool,
+}
+
+impl LogsArgs {
+    /// Wait mode is active when any wait condition flag is present.
+    pub fn wait_mode(&self) -> bool {
+        self.after.is_some() || self.exit || self.idle_ms.is_some() || self.pattern.is_some()
+    }
 }
 
 #[derive(Debug, Args)]
@@ -458,66 +522,6 @@ pub struct DoctorArgs {
 pub struct SessionRefArgs {
     /// Session ID. If omitted, uses the most recently created session.
     pub id: Option<String>,
-    /// Emit one JSON object instead of tab-separated text.
-    #[arg(long)]
-    pub json: bool,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct HistoryArgs {
-    /// Session ID. If omitted, uses the most recently created session.
-    pub id: Option<String>,
-    /// Filtered-stream offset to read from (0 = start; use `oly observe`
-    /// to get the current end).
-    #[arg(long, default_value_t = 0)]
-    pub from: u64,
-    /// Maximum bytes to read per window (bounded; larger spans need
-    /// multiple calls).
-    #[arg(long, default_value_t = 131072)]
-    pub limit: u32,
-    /// Emit one JSON line (agent-friendly) instead of raw bytes.
-    #[arg(long)]
-    pub json: bool,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct ScreenArgs {
-    /// Session ID. If omitted, uses the most recently created session.
-    pub id: Option<String>,
-    /// Override the render width (defaults to the session's PTY width).
-    #[arg(long)]
-    pub cols: Option<u32>,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct WaitArgs {
-    /// Session ID. If omitted, uses the most recently created session.
-    pub id: Option<String>,
-    /// Wait for output after this filtered-stream offset.
-    #[arg(long, default_value_t = 0)]
-    pub after: u64,
-    /// Wait for the session to exit.
-    #[arg(long)]
-    pub exit: bool,
-    /// Wait until no output appears for this many milliseconds
-    /// (heuristic: likely idle or waiting for input).
-    #[arg(long)]
-    pub idle_ms: Option<u64>,
-    /// Wait until a regex matches output produced after --after.
-    #[arg(long)]
-    pub pattern: Option<String>,
-    /// Overall timeout in seconds (0 = no timeout).
-    #[arg(long, default_value_t = 30)]
-    pub timeout: u64,
     /// Emit one JSON object instead of tab-separated text.
     #[arg(long)]
     pub json: bool,
@@ -714,16 +718,18 @@ mod tests {
         let Commands::Logs(args) = cli.command else {
             panic!("expected logs command");
         };
-        assert_eq!(args.timeout, 10_000);
+        assert_eq!(args.timeout, Some(10_000));
     }
 
     #[test]
-    fn logs_timeout_defaults_to_thirty_seconds() {
+    fn logs_timeout_defaults_to_none_for_mode_defaults() {
+        // No explicit --timeout: run_logs applies the per-mode defaults
+        // (5m with --wait-for-prompt, 30s in wait mode).
         let cli = Cli::try_parse_from(["oly", "logs", "session-1"]).unwrap();
         let Commands::Logs(args) = cli.command else {
             panic!("expected logs command");
         };
-        assert_eq!(args.timeout, 300_000);
+        assert_eq!(args.timeout, None);
     }
 
     #[test]

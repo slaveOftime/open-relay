@@ -390,19 +390,55 @@ async fn run() -> Result<()> {
             let id =
                 resolve_session_id(&config, logs_args.id.clone(), logs_args.node.as_ref()).await?;
             let node = logs_args.node.clone();
-            client::run_logs(
-                &config,
-                &id,
-                logs_args.tail,
-                logs_args.keep_color,
-                logs_args.from_file,
-                logs_args.no_truncate,
-                logs_args.raw,
-                node,
-                logs_args.wait_for_prompt,
-                logs_args.timeout,
-            )
-            .await
+            if logs_args.screen {
+                // `oly logs --screen`: the visible screen as plain text.
+                client::run_screen(&config, &id, logs_args.cols, node).await
+            } else if let Some(from) = logs_args.from {
+                // `oly logs --from`: raw window of the canonical filtered
+                // stream starting at a cursor (agent reads).
+                client::run_history(
+                    &config,
+                    &id,
+                    from,
+                    logs_args.limit.unwrap_or(131072),
+                    logs_args.json,
+                    node,
+                )
+                .await
+            } else if logs_args.wait_mode() {
+                // `oly logs --after/--exit/--idle-ms/--pattern`: block
+                // until the condition is met (exit 0), the timeout lapses
+                // (exit 2), or an error occurs (exit 1).
+                client::run_wait(
+                    &config,
+                    &id,
+                    client::WaitCondition {
+                        after: logs_args.after.unwrap_or(0),
+                        exit: logs_args.exit,
+                        idle_ms: logs_args.idle_ms,
+                        pattern: logs_args.pattern.clone(),
+                        // 0 = wait forever; default 30s.
+                        timeout_secs: logs_args.timeout.map(|ms| ms.div_ceil(1000)).unwrap_or(30),
+                    },
+                    node,
+                )
+                .await
+            } else {
+                client::run_logs(
+                    &config,
+                    &id,
+                    logs_args.tail,
+                    logs_args.keep_color,
+                    logs_args.from_file,
+                    logs_args.no_truncate,
+                    logs_args.raw,
+                    node,
+                    logs_args.wait_for_prompt,
+                    // --wait-for-prompt default: 5 minutes.
+                    logs_args.timeout.unwrap_or(300_000),
+                )
+                .await
+            }
         }
 
         Commands::Send(send_args) => {
@@ -414,30 +450,6 @@ async fn run() -> Result<()> {
         Commands::Observe(args) => {
             let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
             client::run_observe(&config, &id, args.node, args.json).await
-        }
-        Commands::History(args) => {
-            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
-            client::run_history(&config, &id, args.from, args.limit, args.json, args.node).await
-        }
-        Commands::Screen(args) => {
-            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
-            client::run_screen(&config, &id, args.cols, args.node).await
-        }
-        Commands::Wait(args) => {
-            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
-            client::run_wait(
-                &config,
-                &id,
-                client::WaitCondition {
-                    after: args.after,
-                    exit: args.exit,
-                    idle_ms: args.idle_ms,
-                    pattern: args.pattern,
-                    timeout_secs: args.timeout,
-                },
-                args.node,
-            )
-            .await
         }
         Commands::Doctor(args) => client::run_doctor(&config, args.id, args.node).await,
 

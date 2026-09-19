@@ -36,7 +36,7 @@ impl SessionStore {
             }
             // Persisted fallback (post-review corrective increment): a
             // session keeps an answerable stream status after eviction or
-            // daemon restart, so `oly wait`/`observe`/`history` keep
+            // daemon restart, so `logs --after`/`observe`/`logs --from` keep
             // working against the canonical store.
             Err(err) => match self.db.get_session(id).await {
                 Ok(Some(meta)) => Ok((false, true, meta.exit_code)),
@@ -245,7 +245,7 @@ impl SessionStore {
     /// legacy `output.log`) for a session with no live runtime. The scan
     /// is O(journal), so results are cached per incarnation: a completed
     /// session's stream never changes within one incarnation, and polling
-    /// callers (`oly wait`) must not re-scan the whole journal every tick.
+    /// callers (`logs --after`) must not re-scan the whole journal every tick.
     async fn persisted_filtered_len(&self, id: &str) -> Option<u64> {
         let dir = self.persisted_session_dir(id).await?;
         if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
@@ -1195,7 +1195,7 @@ mod tests {
             persisted_journal_session("persist1", &[b"hello ", b"world"], Some(7)).await;
         let store = store_with(Vec::new(), db);
 
-        // The session-cursor trio backs `oly observe`/`history`/`wait`.
+        // The session-cursor trio backs `oly observe` and `logs --from/--after`.
         assert_eq!(store.attach_filtered_len("persist1").await, Some(11));
         assert_eq!(
             store

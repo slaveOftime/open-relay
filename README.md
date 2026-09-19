@@ -185,8 +185,8 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
 | `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
-| `oly attach [id] [--node <name>]` | Reattach to a session |
-| `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching |
+| `oly attach [id] [--observer] [--node <name>]` | Reattach to a session (takes control by default) |
+| `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching (also `--screen`, `--from`, and wait modes — see below) |
 | `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
 | `oly restart <id> [--force] [--node <name>]` | Start a new session from persisted launch metadata (`--force` first kills a running source) |
@@ -194,9 +194,6 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
 | `oly doctor [id]` | Verify journal integrity (sealed-part manifests) |
-| `oly wait [id]` | Wait for output after a cursor, an exit, silence, or a pattern |
-| `oly screen [id]` | Print the session's current terminal screen (plain text) |
-| `oly history [id]` | Bounded window read of the session's output stream |
 | `oly observe [id]` | Machine-readable session cursor (liveness + canonical stream offset) |
 | `oly update <id> ...` | Override a session's title, tags, and notification setting |
 | `oly skill` | Print the bundled `oly` skill markdown |
@@ -204,6 +201,44 @@ oly logs --node worker-1 --wait-for-prompt <id>
 The interactive view can monitor several nodes at once, for example `oly ls --follow --node worker-a --node worker-b`. Add `--node-local` to include sessions from the current daemon (or the primary itself); the table shows a node column when multiple sources are selected. `Ctrl+D` opens a clone editor prefilled from the selected session, while `Ctrl+U` opens an update editor for the selected session's title, tags, and notification setting. `Tab`/`Ctrl+Tab` move between dialog fields, `Space` toggles notifications, and `Enter` submits the current dialog. Use `Ctrl+K` to stop the selected running session, `Enter` to open it inline, `Ctrl+Enter` to open it in another terminal window, and `Ctrl+C` to exit the list view.
 
 Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `key:esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, modifier forms like `key:ctrl+c`, `key:alt+x`, `key:meta+enter`, `key:shift+tab`, and raw bytes via `key:hex:...`.
+
+### Reading session output: the `oly logs` modes
+
+`oly logs` is the single read surface for session output. The default mode is
+for humans; the flag-selected modes are the stable agent API:
+
+```bash
+# Human: rendered log tail (default)
+oly logs <ID> --tail 40                 # last 40 rendered lines
+oly logs <ID> --keep-color              # preserve ANSI colors
+oly logs <ID> --raw                     # raw original byte stream (for pipes/files)
+oly logs <ID> --wait-for-prompt         # block until the session likely needs input
+
+# Machine: visible screen as plain text
+oly logs <ID> --screen [--cols 120]
+
+# Machine: cursor-based window reads (pair with `oly observe`)
+oly observe <ID> --json                 # -> {"offset": N, "status": ..., ...}
+oly logs <ID> --from <offset> --limit 65536        # raw bytes of one window
+oly logs <ID> --from <offset> --json               # same, base64 in one JSON line
+
+# Machine: block until a condition, then report the new cursor
+oly logs <ID> --after <offset>                     # any new output
+oly logs <ID> --after <offset> --idle-ms 800       # quiet for 800ms (heuristic)
+oly logs <ID> --after <offset> --pattern 'DONE|FAILED'
+oly logs <ID> --exit --timeout 30s                 # session exited
+```
+
+- The canonical agent loop is: `oly observe` (record `offset`) →
+  `oly logs --after <offset>` (block) → `oly logs --from <offset>` (read
+  exactly the new bytes) → repeat from the returned `next` offset.
+- Wait-mode exit codes: `0` condition met, `2` timeout, `1` error.
+  `--timeout` accepts plain milliseconds or `s`/`m`/`h` suffixes; `0` waits
+  forever (defaults: 30s in wait mode, 5m with `--wait-for-prompt`).
+- `--idle-ms` means "quiet", never "done" — a silent session may be thinking,
+  blocked, or crashed. Confirm with `--screen` or a pattern.
+- Window reads are bounded (`--limit`, hard-capped server-side); page with the
+  returned `next` offset instead of asking for everything.
 
 ### Federation commands
 

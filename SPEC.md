@@ -178,16 +178,33 @@ The implemented top-level commands are:
   `oly send` reach the session regardless of lease ownership by design.
 - Detach escape is `Ctrl-]`, then `d` (a Ctrl-held `d` also detaches).
 
-### `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]`
+### `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--raw] [--wait-for-prompt] [--screen [--cols <n>]] [--from <offset> [--limit <bytes>] [--json]] [--after <offset>] [--exit] [--idle-ms <ms>] [--pattern <regex>] [--timeout <duration>] [--node <name>]`
 
-- Prints recent logs without attaching.
+`oly logs` is the single read surface for session output. The default mode
+is human-oriented; the flag-selected modes are the machine (agent) API.
+The mode flags are mutually exclusive with the human rendering flags.
+
+- Default mode prints recent rendered logs without attaching.
 - If `id` is omitted, `oly` resolves the most recently created session.
 - `--tail` defaults to terminal height minus one line when available, otherwise `40`.
 - `--keep-color` preserves ANSI color codes.
 - `--no-truncate` disables column truncation when rendering.
+- `--raw` exports the journal-derived original byte stream for pipes/files.
 - `--wait-for-prompt` waits until the session likely needs input or exits, then prints logs.
-- `--timeout` accepts plain milliseconds or `ms`, `s`, `m`, `h` suffixes.
-- Default timeout is `30s`; `0` means wait forever.
+- `--screen` prints the visible screen as plain text; `--cols` overrides the
+  render width (default: local terminal width, fallback 80).
+- `--from <offset>` reads one bounded raw window of the canonical filtered
+  stream (pair with `oly observe` to get the current end offset); `--limit`
+  caps the window bytes (default 131072, hard-capped server-side); `--json`
+  emits one JSON line with the window base64-encoded and the `next` offset.
+- Wait mode (`--after`, `--exit`, `--idle-ms`, and/or `--pattern`) blocks
+  until output appears after the `--after` offset (default 0), the session
+  exits, output is quiet for `--idle-ms` milliseconds, or `--pattern` matches
+  new output; it then prints the result with the new cursor. Exit codes: `0`
+  condition met, `2` timeout, `1` error.
+- `--timeout` accepts plain milliseconds or `ms`, `s`, `m`, `h` suffixes;
+  `0` waits forever. Defaults: `30s` in wait mode, `5m` with
+  `--wait-for-prompt`.
 
 ### `oly send [id] [CHUNK]... [--node <name>]`
 

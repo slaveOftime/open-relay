@@ -25,7 +25,7 @@ caps retention and corrupts on reconnect/reseed.
    surface — never private xterm buffer surgery.
 3. Native CLI: fresh attach seeds a bounded configurable recent window once
    without clearing host scrollback; full retained history is an explicit
-   `oly history` view. Intact-renderer resume never reseeds; a restarted
+   `oly logs --from` view. Intact-renderer resume never reseeds; a restarted
    CLI takes a fresh snapshot.
 4. Historical work (tail/seek/search/replay) runs off the sequencer,
    checkpoint-bounded, and never mutates live state, geometry, notification
