@@ -186,7 +186,9 @@ The implemented top-level commands are:
 
 `oly logs` is the single read surface for session output. The default mode
 is human-oriented; the flag-selected modes are the machine (agent) API.
-The mode flags are mutually exclusive with the human rendering flags.
+The mode flags are mutually exclusive with each other and with the
+human rendering flags (except `--keep-color`, which also applies to
+`--screen`).
 
 - Default mode prints recent rendered logs without attaching.
 - If `id` is omitted, `oly` resolves the most recently created session.
@@ -195,8 +197,9 @@ The mode flags are mutually exclusive with the human rendering flags.
 - `--no-truncate` disables column truncation when rendering.
 - `--raw` exports the journal-derived original byte stream for pipes/files.
 - `--wait-for-prompt` waits until the session likely needs input or exits, then prints logs.
-- `--screen` prints the visible screen as plain text; `--cols` overrides the
-  render width (default: local terminal width, fallback 80).
+- `--screen` prints the visible screen as plain text; `--keep-color`
+  preserves ANSI colors; `--cols` overrides the render width (default:
+  local terminal width, fallback 80).
 - `--from <offset>` reads one bounded raw window of the canonical filtered
   stream (pair with `oly observe` to get the current end offset); `--limit`
   caps the window bytes (default 131072, hard-capped server-side); `--json`

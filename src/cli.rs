@@ -438,11 +438,12 @@ pub struct LogsArgs {
     /// forever. Defaults: 5m with --wait-for-prompt, 30s for wait mode.
     #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
     pub timeout: Option<u64>,
-    /// Print the visible screen as plain text instead of the log tail.
+    /// Print the visible screen as plain text instead of the log tail
+    /// (combine with --keep-color to preserve ANSI colors).
     #[arg(
         long,
         conflicts_with_all = [
-            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
+            "tail", "from_file", "no_truncate", "raw", "wait_for_prompt",
             "from", "limit", "after", "exit", "idle_ms", "pattern", "json"
         ]
     )]
@@ -719,6 +720,19 @@ mod tests {
             panic!("expected logs command");
         };
         assert_eq!(args.timeout, Some(10_000));
+    }
+
+    #[test]
+    fn logs_screen_accepts_keep_color_but_not_tail() {
+        // --screen renders through the same engine as the default mode, so
+        // --keep-color is meaningful there; --tail is not (the screen is
+        // always the whole visible viewport).
+        let cli = Cli::try_parse_from(["oly", "logs", "s1", "--screen", "--keep-color"]).unwrap();
+        let Commands::Logs(args) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert!(args.screen && args.keep_color);
+        assert!(Cli::try_parse_from(["oly", "logs", "s1", "--screen", "--tail", "5"]).is_err());
     }
 
     #[test]

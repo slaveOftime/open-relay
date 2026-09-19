@@ -215,8 +215,8 @@ oly logs <ID> --keep-color              # preserve ANSI colors
 oly logs <ID> --raw                     # raw original byte stream (for pipes/files)
 oly logs <ID> --wait-for-prompt         # block until the session likely needs input
 
-# Machine: visible screen as plain text
-oly logs <ID> --screen [--cols 120]
+# Machine: visible screen as plain text (--keep-color preserves colors)
+oly logs <ID> --screen [--cols 120] [--keep-color]
 
 # Machine: cursor-based window reads (pair with `oly observe`)
 oly observe <ID> --json                 # -> {"offset": N, "status": ..., ...}

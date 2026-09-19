@@ -392,7 +392,7 @@ async fn run() -> Result<()> {
             let node = logs_args.node.clone();
             if logs_args.screen {
                 // `oly logs --screen`: the visible screen as plain text.
-                client::run_screen(&config, &id, logs_args.cols, node).await
+                client::run_screen(&config, &id, logs_args.cols, logs_args.keep_color, node).await
             } else if let Some(from) = logs_args.from {
                 // `oly logs --from`: raw window of the canonical filtered
                 // stream starting at a cursor (agent reads).

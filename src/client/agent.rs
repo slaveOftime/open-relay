@@ -136,6 +136,7 @@ pub async fn run_screen(
     config: &AppConfig,
     id: &str,
     cols: Option<u32>,
+    keep_color: bool,
     node: Option<String>,
 ) -> Result<()> {
     // Match `oly logs`: render at the local terminal width (fallback 80);
@@ -151,7 +152,7 @@ pub async fn run_screen(
             // render_engine_screen truncates to the last `tail` rows of the
             // visible screen; a large tail = the whole screen.
             tail: usize::MAX,
-            keep_color: false,
+            keep_color,
             term_cols,
             from_file: false,
         },
