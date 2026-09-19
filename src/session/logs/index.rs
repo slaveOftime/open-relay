@@ -394,7 +394,11 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
     let ends_with_newline = last_byte[0] == b'\n';
 
     // We want at least `tail * 2` lines, but ensure a minimum of 100 lines for context.
-    let lines_needed = (tail * 2).max(100) + if ends_with_newline { 1 } else { 0 };
+    // Saturate: callers pass usize::MAX for "the whole stream/screen".
+    let lines_needed = tail
+        .saturating_mul(2)
+        .max(100)
+        .saturating_add(usize::from(ends_with_newline));
 
     let chunk_size = 64 * 1024; // 64KB chunks
     let mut position = file_size;
@@ -447,7 +451,11 @@ pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
         };
     }
     let ends_with_newline = bytes.last() == Some(&b'\n');
-    let lines_needed = (tail * 2).max(100) + usize::from(ends_with_newline);
+    // Saturate: callers pass usize::MAX for "the whole stream/screen".
+    let lines_needed = tail
+        .saturating_mul(2)
+        .max(100)
+        .saturating_add(usize::from(ends_with_newline));
 
     let mut position = bytes.len();
     let mut lines_found = 0usize;

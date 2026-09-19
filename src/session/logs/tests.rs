@@ -8,7 +8,7 @@
 use super::index::LOG_RECORD_FALLBACK_BYTES;
 use super::index::{
     read_persisted_log_page, split_persisted_log_records, split_rendered_log_output,
-    viewport_resize_plan,
+    tail_window_bytes, viewport_resize_plan,
 };
 use super::render::{
     format_history_rows, parser_cols, parser_rows, render_engine_screen, render_log_bytes,
@@ -478,4 +478,30 @@ fn screen_history_is_none_when_nothing_scrolled_off() {
     let mut engine = crate::terminal::Terminal::new(5, 80, 100);
     engine.feed(b"still visible\r\n");
     assert!(format_history_rows(engine.styled_history_rows(10)).is_none());
+}
+
+/// `usize::MAX` means "the whole stream" (e.g. `logs --screen`); the tail
+/// arithmetic must saturate instead of overflowing (daemon worker panicked
+/// with "attempt to multiply/add with overflow" on this path).
+#[test]
+fn tail_window_bytes_saturates_on_usize_max_tail() {
+    let bytes = b"one\ntwo\nthree\n";
+    let window = tail_window_bytes(bytes, usize::MAX);
+    assert_eq!(window.bytes, bytes);
+    assert_eq!(window.start_offset, 0);
+    assert_eq!(window.end_offset, bytes.len() as u64);
+    // No trailing newline hits the saturating_add arm too.
+    let window = tail_window_bytes(b"one\ntwo", usize::MAX);
+    assert_eq!(window.bytes, b"one\ntwo");
+}
+
+#[test]
+fn read_tail_bytes_saturates_on_usize_max_tail() {
+    let dir = std::env::temp_dir().join(format!("oly_tail_sat_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let log_path = dir.join("output.log");
+    std::fs::write(&log_path, b"one\ntwo\nthree\n").expect("write log");
+    let window = super::index::read_tail_bytes(&log_path, usize::MAX).expect("read tail");
+    assert_eq!(window.bytes, b"one\ntwo\nthree\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }
