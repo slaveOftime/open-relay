@@ -390,9 +390,69 @@ async fn run() -> Result<()> {
             let id =
                 resolve_session_id(&config, logs_args.id.clone(), logs_args.node.as_ref()).await?;
             let node = logs_args.node.clone();
+
+            // --json only has a defined shape for window reads and
+            // wait-only results; anywhere else it would be silently ignored.
+            if logs_args.json && logs_args.from.is_none() && !logs_args.wait_only() {
+                return Err(AppError::Protocol(
+                    "--json requires --from or a wait-only condition \
+                     (--after/--exit/--idle-ms/--pattern with nothing to read selected)"
+                        .to_string(),
+                ));
+            }
+
+            // Wait-only mode: gate conditions with no read selected — print
+            // the condition result and the new cursor (exit 0 met, 2
+            // timeout, 1 error).
+            if logs_args.wait_only() {
+                return client::run_wait(
+                    &config,
+                    &id,
+                    client::WaitCondition {
+                        after: logs_args.after.unwrap_or(0),
+                        exit: logs_args.exit,
+                        idle_ms: logs_args.idle_ms,
+                        pattern: logs_args.pattern.clone(),
+                        // 0 = wait forever; default 30s.
+                        timeout_secs: logs_args.timeout.map(|ms| ms.div_ceil(1000)).unwrap_or(30),
+                    },
+                    logs_args.json,
+                    node,
+                )
+                .await;
+            }
+
+            // Gate conditions + something to read: block first, then read
+            // (`--after N --screen`, `--exit --tail 40`, `--from N --after N`,
+            // ...). A gate timeout exits 2 without reading.
+            if logs_args.wait_mode() {
+                eprintln!("Waiting for session {id}…");
+                client::wait_for_condition(
+                    &config,
+                    &id,
+                    &client::WaitCondition {
+                        after: logs_args.after.unwrap_or(0),
+                        exit: logs_args.exit,
+                        idle_ms: logs_args.idle_ms,
+                        pattern: logs_args.pattern.clone(),
+                        timeout_secs: logs_args.timeout.map(|ms| ms.div_ceil(1000)).unwrap_or(30),
+                    },
+                    node.as_deref(),
+                )
+                .await?;
+            }
+
             if logs_args.screen {
-                // `oly logs --screen`: the visible screen as plain text.
-                client::run_screen(&config, &id, logs_args.cols, logs_args.keep_color, node).await
+                // `oly logs --screen`: the visible screen as text.
+                client::run_screen(
+                    &config,
+                    &id,
+                    logs_args.cols,
+                    logs_args.keep_color,
+                    logs_args.from_file,
+                    node,
+                )
+                .await
             } else if let Some(from) = logs_args.from {
                 // `oly logs --from`: raw window of the canonical filtered
                 // stream starting at a cursor (agent reads).
@@ -405,24 +465,6 @@ async fn run() -> Result<()> {
                     node,
                 )
                 .await
-            } else if logs_args.wait_mode() {
-                // `oly logs --after/--exit/--idle-ms/--pattern`: block
-                // until the condition is met (exit 0), the timeout lapses
-                // (exit 2), or an error occurs (exit 1).
-                client::run_wait(
-                    &config,
-                    &id,
-                    client::WaitCondition {
-                        after: logs_args.after.unwrap_or(0),
-                        exit: logs_args.exit,
-                        idle_ms: logs_args.idle_ms,
-                        pattern: logs_args.pattern.clone(),
-                        // 0 = wait forever; default 30s.
-                        timeout_secs: logs_args.timeout.map(|ms| ms.div_ceil(1000)).unwrap_or(30),
-                    },
-                    node,
-                )
-                .await
             } else {
                 client::run_logs(
                     &config,
@@ -432,6 +474,7 @@ async fn run() -> Result<()> {
                     logs_args.from_file,
                     logs_args.no_truncate,
                     logs_args.raw,
+                    logs_args.cols,
                     node,
                     logs_args.wait_for_prompt,
                     // --wait-for-prompt default: 5 minutes.

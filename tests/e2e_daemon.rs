@@ -1437,3 +1437,147 @@ fn e2e_daemon_status_reports_not_running() {
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+/// The merged `oly logs` surface: gates compose with read selectors
+/// (block, then read), wait-only mode emits real JSON with `--json`, and
+/// meaningless combinations are usage errors instead of being silently
+/// ignored.
+#[test]
+fn e2e_logs_gates_compose_with_reads_and_json_wait_results() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_logs_ergonomics");
+    let _daemon = start_daemon(&tmp);
+    let id = start_session(&tmp, &["sh", "-i"]);
+    send_line(&tmp, &id, "echo ERGO-MARKER");
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains("ERGO-MARKER"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "marker never appeared in logs"
+    );
+
+    // Gate + window read: --from/--after/--json blocks until output exists
+    // after the cursor, then emits the window (the agent loop in one call).
+    let output = oly_cmd(&tmp)
+        .args([
+            "logs",
+            &id,
+            "--from",
+            "0",
+            "--after",
+            "0",
+            "--json",
+            "--timeout",
+            "10s",
+        ])
+        .output()
+        .expect("`oly logs --from --after` failed to execute");
+    assert!(
+        output.status.success(),
+        "gated window read failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let window: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("gated window read emits one JSON line");
+    assert_eq!(window["from"], 0);
+    assert!(window["bytes"].as_u64().expect("bytes") > 0);
+
+    // Gate + screen: blocks, then prints the visible screen.
+    let output = oly_cmd(&tmp)
+        .args([
+            "logs",
+            &id,
+            "--pattern",
+            "ERGO-MARKER",
+            "--screen",
+            "--timeout",
+            "10s",
+        ])
+        .output()
+        .expect("`oly logs --pattern --screen` failed to execute");
+    assert!(
+        output.status.success(),
+        "gated screen failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ERGO-MARKER"),
+        "gated screen should show the marker"
+    );
+
+    // Wait-only + --json: a real JSON object (previously --json was
+    // silently ignored in wait mode).
+    let output = oly_cmd(&tmp)
+        .args([
+            "logs",
+            &id,
+            "--after",
+            "0",
+            "--pattern",
+            "ERGO-MARKER",
+            "--json",
+            "--timeout",
+            "10s",
+        ])
+        .output()
+        .expect("`oly logs --json` failed to execute");
+    assert!(output.status.success());
+    let result: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
+            .expect("wait-only --json emits one JSON object");
+    assert_eq!(result["condition"], "pattern");
+    assert_eq!(result["match"], "ERGO-MARKER");
+    assert!(result["offset"].as_u64().expect("offset") > 0);
+
+    // Gate + default tail read.
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--exit", "--tail", "5", "--timeout", "1s"])
+        .output()
+        .expect("`oly logs --exit --tail` failed to execute");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "gate timeout exits 2 without reading"
+    );
+
+    // Meaningless combinations are usage errors, not silent misreads.
+    for args in [
+        vec!["logs", &id, "--raw", "--exit"],
+        vec!["logs", &id, "--json"],
+        vec!["logs", &id, "--screen", "--from", "0"],
+        vec!["logs", &id, "-w", "--after", "0"],
+    ] {
+        let output = oly_cmd(&tmp).args(&args).output().expect("run oly logs");
+        assert!(
+            !output.status.success(),
+            "{args:?} should be a usage error.\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    let output = oly_cmd(&tmp)
+        .args(["stop", &id])
+        .output()
+        .expect("`oly stop` failed to execute");
+    assert!(output.status.success());
+
+    // Gate that is already satisfied (session exited) reads immediately.
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--exit", "--screen", "--timeout", "10s"])
+        .output()
+        .expect("`oly logs --exit --screen` failed to execute");
+    assert!(
+        output.status.success(),
+        "--exit --screen on a stopped session failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ERGO-MARKER"),
+        "screen after exit should render the journal"
+    );
+}

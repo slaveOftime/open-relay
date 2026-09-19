@@ -406,107 +406,113 @@ impl AttachArgs {
 pub struct LogsArgs {
     /// Session ID to show logs for. If omitted, uses the most recently created session.
     pub id: Option<String>,
-    /// Number of recent lines to display. By default it uses the current terminal height - 1, or 40 if it cannot be determined.
-    #[arg(long)]
-    pub tail: Option<usize>,
-    /// Keep ANSI color codes in output.
-    #[arg(long = "keep-color")]
-    pub keep_color: bool,
-    /// Force rendering from the persisted journal instead of live screen state.
-    #[arg(long = "from-file")]
-    pub from_file: bool,
-    /// Do not truncate columns.
-    #[arg(long = "no-truncate")]
-    pub no_truncate: bool,
-    /// Export the raw original output byte stream (journal-derived, unfiltered
+
+    // ── What to read (at most one; default: the rendered log tail) ──────
+    /// Print the visible screen instead of the log tail.
+    #[arg(long, conflicts_with_all = ["from", "raw"])]
+    pub screen: bool,
+    /// Read a raw byte window of the canonical filtered stream starting at
+    /// OFFSET (pair with `oly observe` for the cursor; page with the
+    /// returned `next` offset).
+    #[arg(long, value_name = "OFFSET", conflicts_with = "raw")]
+    pub from: Option<u64>,
+    /// Export the whole raw output byte stream (journal-derived, unfiltered
     /// by rendering). May contain terminal control sequences — meant for
     /// pipes and files; a warning is printed when stdout is a terminal.
     /// Local sessions only.
     #[arg(
         long = "raw",
-        conflicts_with_all = ["keep_color", "from_file", "no_truncate", "tail", "wait_for_prompt"]
+        conflicts_with_all = [
+            "tail", "keep_color", "from_file", "no_truncate", "cols",
+            "wait_for_prompt", "after", "exit", "idle_ms", "pattern", "json"
+        ]
     )]
     pub raw: bool,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-    /// Block until the session needs input (or exits), then print logs.
-    #[arg(long = "wait-for-prompt", short = 'w')]
+
+    // ── When to read it (optional gate; with nothing to read selected,
+    //    prints the condition result and the new cursor instead) ─────────
+    /// Block until the session needs input (or exits) before reading.
+    #[arg(
+        long = "wait-for-prompt",
+        short = 'w',
+        conflicts_with_all = ["after", "exit", "idle_ms", "pattern"]
+    )]
     pub wait_for_prompt: bool,
-    /// Timeout for --wait-for-prompt and the wait conditions below.
-    /// Accepts plain milliseconds or units like 10s, 5m, or 1h; 0 waits
-    /// forever. Defaults: 5m with --wait-for-prompt, 30s for wait mode.
+    /// Block until output appears after this filtered-stream offset (or
+    /// another gate condition below is met) before reading.
+    #[arg(long, value_name = "OFFSET")]
+    pub after: Option<u64>,
+    /// Gate condition: the session exited.
+    #[arg(long)]
+    pub exit: bool,
+    /// Gate condition: no output for this many milliseconds (heuristic:
+    /// likely idle or waiting for input, never proof).
+    #[arg(long)]
+    pub idle_ms: Option<u64>,
+    /// Gate condition: regex matches output produced after --after.
+    #[arg(long)]
+    pub pattern: Option<String>,
+    /// Timeout for --wait-for-prompt and the gate conditions. Accepts plain
+    /// milliseconds or units like 10s, 5m, or 1h; 0 waits forever.
+    /// Defaults: 5m with --wait-for-prompt, 30s for gate conditions.
     #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
     pub timeout: Option<u64>,
-    /// Print the visible screen as plain text instead of the log tail
-    /// (combine with --keep-color to preserve ANSI colors).
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "tail", "from_file", "no_truncate", "raw", "wait_for_prompt",
-            "from", "limit", "after", "exit", "idle_ms", "pattern", "json"
-        ]
-    )]
-    pub screen: bool,
-    /// Override the render width for --screen (defaults to the local
-    /// terminal width, fallback 80).
-    #[arg(long, requires = "screen")]
+
+    // ── How to format it ─────────────────────────────────────────────────
+    /// Number of recent lines to display (rendered tail). Defaults to the
+    /// terminal height - 1, or 40 if it cannot be determined.
+    #[arg(long, conflicts_with_all = ["screen", "from", "raw"])]
+    pub tail: Option<usize>,
+    /// Keep ANSI color codes (rendered modes: log tail, --screen).
+    #[arg(long = "keep-color", conflicts_with_all = ["from", "raw"])]
+    pub keep_color: bool,
+    /// Render width in columns (default: local terminal width, fallback 80).
+    #[arg(long, conflicts_with_all = ["from", "raw", "no_truncate"])]
     pub cols: Option<u32>,
-    /// Agent window read: emit raw bytes of the canonical filtered stream
-    /// starting at this offset (pair with `oly observe` for the cursor;
-    /// page with the returned `next` offset).
-    #[arg(
-        long,
-        value_name = "OFFSET",
-        conflicts_with_all = [
-            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
-            "screen", "after", "exit", "idle_ms", "pattern"
-        ]
-    )]
-    pub from: Option<u64>,
+    /// Do not truncate columns (rendered tail).
+    #[arg(long = "no-truncate", conflicts_with_all = ["screen", "from", "raw"])]
+    pub no_truncate: bool,
+    /// Force rendering from the persisted journal instead of live screen
+    /// state (rendered modes: log tail, --screen).
+    #[arg(long = "from-file", conflicts_with_all = ["from", "raw"])]
+    pub from_file: bool,
     /// Maximum bytes for a --from window (bounded; larger spans need
     /// multiple calls).
     #[arg(long, requires = "from")]
     pub limit: Option<u32>,
-    /// Wait mode: block until output appears after this filtered-stream
-    /// offset, the session exits (--exit), output goes quiet (--idle-ms),
-    /// or a regex matches new output (--pattern). Prints the result and
-    /// the new cursor; exit codes: 0 condition met, 2 timeout, 1 error.
-    #[arg(
-        long,
-        value_name = "OFFSET",
-        conflicts_with_all = [
-            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
-            "screen", "cols", "from", "limit"
-        ]
-    )]
-    pub after: Option<u64>,
-    /// Wait-mode condition: the session exited.
-    #[arg(long)]
-    pub exit: bool,
-    /// Wait-mode condition: no output for this many milliseconds
-    /// (heuristic: likely idle or waiting for input, never proof).
-    #[arg(long)]
-    pub idle_ms: Option<u64>,
-    /// Wait-mode condition: regex matches output produced after --after.
-    #[arg(long)]
-    pub pattern: Option<String>,
-    /// Emit machine-readable JSON (with --from: one JSON line with the
-    /// window base64-encoded; with wait mode: one JSON object).
+    /// Emit machine-readable JSON (with --from, or with a wait condition
+    /// and no read selected).
     #[arg(
         long,
         conflicts_with_all = [
-            "tail", "keep_color", "from_file", "no_truncate", "raw", "wait_for_prompt",
-            "screen", "cols"
+            "screen", "raw", "tail", "keep_color", "cols", "no_truncate", "from_file"
         ]
     )]
     pub json: bool,
+
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
 }
 
 impl LogsArgs {
-    /// Wait mode is active when any wait condition flag is present.
+    /// A wait gate is configured when any wait condition flag is present.
     pub fn wait_mode(&self) -> bool {
         self.after.is_some() || self.exit || self.idle_ms.is_some() || self.pattern.is_some()
+    }
+
+    /// Wait-only mode: gate flags but nothing to read selected (nor any
+    /// render modifier that would imply the default tail read). Prints the
+    /// condition result and the new cursor.
+    pub fn wait_only(&self) -> bool {
+        self.wait_mode()
+            && !self.screen
+            && self.from.is_none()
+            && self.tail.is_none()
+            && !self.keep_color
+            && !self.no_truncate
+            && !self.from_file
+            && self.cols.is_none()
     }
 }
 
@@ -733,6 +739,77 @@ mod tests {
         };
         assert!(args.screen && args.keep_color);
         assert!(Cli::try_parse_from(["oly", "logs", "s1", "--screen", "--tail", "5"]).is_err());
+    }
+
+    /// The logs surface is three orthogonal axes: what to read (default
+    /// tail / --screen / --from / --raw), an optional gate (-w or
+    /// --after/--exit/--idle-ms/--pattern), and format modifiers. Any
+    /// meaningful combination parses; meaningless ones are usage errors
+    /// instead of being silently ignored.
+    #[test]
+    fn logs_ergonomic_axis_combinations_parse() {
+        let ok: &[&[&str]] = &[
+            // Gates compose with every read selector (block, then read).
+            &["oly", "logs", "s1", "--after", "10", "--screen"],
+            &["oly", "logs", "s1", "--exit", "--tail", "40"],
+            &[
+                "oly", "logs", "s1", "--from", "10", "--after", "10", "--json",
+            ],
+            &[
+                "oly",
+                "logs",
+                "s1",
+                "--idle-ms",
+                "800",
+                "--screen",
+                "--keep-color",
+            ],
+            &["oly", "logs", "s1", "-w", "--screen"],
+            &["oly", "logs", "s1", "-w", "--from", "0", "--json"],
+            &["oly", "logs", "s1", "--pattern", "DONE", "--after", "0"],
+            // Format modifiers across the rendered modes.
+            &[
+                "oly",
+                "logs",
+                "s1",
+                "--screen",
+                "--from-file",
+                "--keep-color",
+            ],
+            &["oly", "logs", "s1", "--cols", "120"],
+            &["oly", "logs", "s1", "--cols", "120", "--screen"],
+            &["oly", "logs", "s1", "--tail", "10", "--keep-color", "-w"],
+            // Wait-only with JSON.
+            &["oly", "logs", "s1", "--after", "0", "--json"],
+        ];
+        for argv in ok {
+            assert!(Cli::try_parse_from(*argv).is_ok(), "should parse: {argv:?}");
+        }
+
+        let err: &[&[&str]] = &[
+            // Two read selectors.
+            &["oly", "logs", "s1", "--screen", "--from", "0"],
+            &["oly", "logs", "s1", "--raw", "--screen"],
+            // Two gates.
+            &["oly", "logs", "s1", "-w", "--after", "0"],
+            // Render modifiers that do not apply to the selected read.
+            &["oly", "logs", "s1", "--from", "0", "--keep-color"],
+            &["oly", "logs", "s1", "--from", "0", "--cols", "80"],
+            &["oly", "logs", "s1", "--screen", "--no-truncate"],
+            &["oly", "logs", "s1", "--cols", "80", "--no-truncate"],
+            &["oly", "logs", "s1", "--raw", "--keep-color"],
+            // Raw export and gates do not compose.
+            &["oly", "logs", "s1", "--raw", "--exit"],
+            &["oly", "logs", "s1", "--raw", "--after", "0"],
+            // JSON only shapes --from windows and wait-only results.
+            &["oly", "logs", "s1", "--screen", "--json"],
+            &["oly", "logs", "s1", "--tail", "5", "--json"],
+            // --limit / --cols need their selector.
+            &["oly", "logs", "s1", "--limit", "100"],
+        ];
+        for argv in err {
+            assert!(Cli::try_parse_from(*argv).is_err(), "should fail: {argv:?}");
+        }
     }
 
     #[test]

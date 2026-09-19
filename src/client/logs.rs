@@ -18,6 +18,7 @@ pub async fn run_logs(
     from_file: bool,
     no_truncate: bool,
     raw: bool,
+    cols: Option<u32>,
     node: Option<String>,
     wait_for_prompt: bool,
     timeout_ms: u64,
@@ -53,6 +54,9 @@ pub async fn run_logs(
 
     let term_cols = if no_truncate {
         u16::MAX
+    } else if let Some(cols) = cols {
+        // Explicit --cols render width (0 renders nothing).
+        cols.min(u32::from(u16::MAX)) as u16
     } else {
         terminal::size().map(|(w, _)| w).unwrap_or(80)
     };

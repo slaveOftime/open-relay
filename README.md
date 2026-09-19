@@ -203,43 +203,56 @@ The interactive view can monitor several nodes at once, for example `oly ls --fo
 
 Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `key:esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, modifier forms like `key:ctrl+c`, `key:alt+x`, `key:meta+enter`, `key:shift+tab`, and raw bytes via `key:hex:...`.
 
-### Reading session output: the `oly logs` modes
+### Reading session output: `oly logs`
 
-`oly logs` is the single read surface for session output. The default mode is
-for humans; the flag-selected modes are the stable agent API:
+`oly logs` is the single read surface for session output, organized as three
+independent axes that combine freely:
+
+1. **What to read** (pick at most one): the rendered log tail (default),
+   `--screen` (visible screen as text), `--from <offset>` (raw byte window of
+   the canonical stream), or `--raw` (the whole original byte stream).
+2. **When to read it** (optional gate): `-w/--wait-for-prompt`, or
+   `--after <offset>` with any of `--exit`, `--idle-ms <ms>`,
+   `--pattern <regex>`. With nothing to read selected, the gate alone prints
+   the condition result and the new cursor; combined with a read, it blocks
+   first and reads after the condition is met.
+3. **How to format it**: `--tail`, `--keep-color`, `--cols`, `--no-truncate`,
+   `--from-file` (rendered modes), `--limit` and `--json` (window reads and
+   wait-only results), `--timeout` (gates).
 
 ```bash
 # Human: rendered log tail (default)
-oly logs <ID> --tail 40                 # last 40 rendered lines
-oly logs <ID> --keep-color              # preserve ANSI colors
-oly logs <ID> --raw                     # raw original byte stream (for pipes/files)
-oly logs <ID> --wait-for-prompt         # block until the session likely needs input
+oly logs <ID> --tail 40 --keep-color
+oly logs <ID> -w                        # block until the session needs input, then print
+oly logs <ID> --raw > dump.bin          # exact child bytes (pipes/files)
 
-# Machine: visible screen as plain text (--keep-color preserves colors)
+# Screen snapshots
 oly logs <ID> --screen [--cols 120] [--keep-color]
+oly logs <ID> --pattern 'ERROR' --screen   # block until output matches, then show the screen
 
 # Machine: cursor-based window reads (pair with `oly observe`)
 oly observe <ID> --json                 # -> {"offset": N, "status": ..., ...}
-oly logs <ID> --from <offset> --limit 65536        # raw bytes of one window
-oly logs <ID> --from <offset> --json               # same, base64 in one JSON line
+oly logs <ID> --from <offset> --limit 65536 --json   # one window, base64
 
-# Machine: block until a condition, then report the new cursor
+# Machine: the cursor loop in one call — block until there is output after
+# the cursor, then read exactly that window
+oly logs <ID> --from <offset> --after <offset> --json
+
+# Machine: gates on their own report the condition and the new cursor
 oly logs <ID> --after <offset>                     # any new output
 oly logs <ID> --after <offset> --idle-ms 800       # quiet for 800ms (heuristic)
-oly logs <ID> --after <offset> --pattern 'DONE|FAILED'
 oly logs <ID> --exit --timeout 30s                 # session exited
 ```
 
-- The canonical agent loop is: `oly observe` (record `offset`) →
-  `oly logs --after <offset>` (block) → `oly logs --from <offset>` (read
-  exactly the new bytes) → repeat from the returned `next` offset.
-- Wait-mode exit codes: `0` condition met, `2` timeout, `1` error.
-  `--timeout` accepts plain milliseconds or `s`/`m`/`h` suffixes; `0` waits
-  forever (defaults: 30s in wait mode, 5m with `--wait-for-prompt`).
+- Wait exit codes: `0` condition met, `2` timeout, `1` error. `--timeout`
+  accepts plain milliseconds or `s`/`m`/`h` suffixes; `0` waits forever
+  (defaults: 30s for gates, 5m with `--wait-for-prompt`).
 - `--idle-ms` means "quiet", never "done" — a silent session may be thinking,
   blocked, or crashed. Confirm with `--screen` or a pattern.
 - Window reads are bounded (`--limit`, hard-capped server-side); page with the
   returned `next` offset instead of asking for everything.
+- Combinations that would be silently meaningless (e.g. `--screen --tail`,
+  `--raw --exit`, `--json` without `--from` or a gate) are usage errors.
 
 ### Federation commands
 

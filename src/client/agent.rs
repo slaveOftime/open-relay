@@ -137,6 +137,7 @@ pub async fn run_screen(
     id: &str,
     cols: Option<u32>,
     keep_color: bool,
+    from_file: bool,
     node: Option<String>,
 ) -> Result<()> {
     // Match `oly logs`: render at the local terminal width (fallback 80);
@@ -154,7 +155,7 @@ pub async fn run_screen(
             tail: usize::MAX,
             keep_color,
             term_cols,
-            from_file: false,
+            from_file,
         },
     )
     .await?;
@@ -180,23 +181,37 @@ pub struct WaitCondition {
     pub timeout_secs: u64,
 }
 
-/// `oly logs <id> --after N [--exit|--idle-ms M|--pattern RE] [--timeout D]`.
+/// The outcome of a satisfied [`WaitCondition`].
+#[derive(Debug)]
+pub struct WaitOutcome {
+    /// `"exit"` | `"output"` | `"idle"` | `"pattern"`.
+    pub condition: &'static str,
+    /// The new cursor (filtered-stream offset).
+    pub offset: u64,
+    pub exit_code: Option<i32>,
+    pub idle_ms: Option<u64>,
+    pub matched: Option<String>,
+}
+
+/// Block until a [`WaitCondition`] is met and report the outcome.
 ///
-/// Exit status: 0 when a condition matched, 2 on timeout, 1 on error.
-pub async fn run_wait(
+/// Used both by wait-only mode (the outcome is printed) and as a silent
+/// gate before a read (`logs --after N --screen` and friends). Exit
+/// status: 0 when a condition matched, 2 on timeout, 1 on error.
+pub async fn wait_for_condition(
     config: &AppConfig,
     id: &str,
-    condition: WaitCondition,
-    node: Option<String>,
-) -> Result<()> {
+    condition: &WaitCondition,
+    node: Option<&str>,
+) -> Result<WaitOutcome> {
     let WaitCondition {
         after,
         exit,
         idle_ms,
-        pattern,
+        ref pattern,
         timeout_secs,
-    } = condition;
-    let pattern = match &pattern {
+    } = *condition;
+    let pattern = match pattern {
         Some(p) => Some(
             regex::Regex::new(p)
                 .map_err(|err| AppError::Protocol(format!("invalid --pattern regex: {err}")))?,
@@ -213,28 +228,39 @@ pub async fn run_wait(
     let mut search_buf: Vec<u8> = Vec::new();
 
     loop {
-        let cursor = session_cursor(config, node.as_deref(), id).await?;
+        let cursor = session_cursor(config, node, id).await?;
         if cursor.offset != last_offset {
             last_change = Instant::now();
         }
         if exit && !cursor.running {
-            println!(
-                "exit\t{}\toffset={}",
-                cursor.exit_code.unwrap_or(-1),
-                cursor.offset
-            );
-            return Ok(());
+            return Ok(WaitOutcome {
+                condition: "exit",
+                offset: cursor.offset,
+                exit_code: Some(cursor.exit_code.unwrap_or(-1)),
+                idle_ms: None,
+                matched: None,
+            });
         }
         if want_output && cursor.offset > after {
-            println!("output\toffset={}", cursor.offset);
-            return Ok(());
+            return Ok(WaitOutcome {
+                condition: "output",
+                offset: cursor.offset,
+                exit_code: None,
+                idle_ms: None,
+                matched: None,
+            });
         }
         if let Some(idle) = idle_ms {
             let quiet = cursor.offset == last_offset
                 && last_change.elapsed() >= Duration::from_millis(idle);
             if quiet {
-                println!("idle\t{}ms\toffset={}", idle, cursor.offset);
-                return Ok(());
+                return Ok(WaitOutcome {
+                    condition: "idle",
+                    offset: cursor.offset,
+                    exit_code: None,
+                    idle_ms: Some(idle),
+                    matched: None,
+                });
             }
         }
         if let Some(re) = &pattern
@@ -242,7 +268,7 @@ pub async fn run_wait(
         {
             let window = rpc(
                 config,
-                node.as_deref(),
+                node,
                 RpcRequest::ObserveWindow {
                     id: id.to_string(),
                     from: search_from,
@@ -262,8 +288,13 @@ pub async fn run_wait(
                     search_buf = keep;
                 }
                 if let Some(m) = re.find(&String::from_utf8_lossy(&search_buf)) {
-                    println!("pattern\t{}\toffset={}", m.as_str(), search_from);
-                    return Ok(());
+                    return Ok(WaitOutcome {
+                        condition: "pattern",
+                        offset: search_from,
+                        exit_code: None,
+                        idle_ms: None,
+                        matched: Some(m.as_str().to_string()),
+                    });
                 }
             }
         }
@@ -276,6 +307,56 @@ pub async fn run_wait(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// `oly logs <id> --after N [--exit|--idle-ms M|--pattern RE] [--timeout D]`
+/// with no read selected: print the condition result and the new cursor.
+pub async fn run_wait(
+    config: &AppConfig,
+    id: &str,
+    condition: WaitCondition,
+    json: bool,
+    node: Option<String>,
+) -> Result<()> {
+    let outcome = wait_for_condition(config, id, &condition, node.as_deref()).await?;
+    if json {
+        let mut obj = serde_json::json!({
+            "v": 1,
+            "session": id,
+            "condition": outcome.condition,
+            "offset": outcome.offset,
+        });
+        if let Some(code) = outcome.exit_code {
+            obj["exit_code"] = code.into();
+        }
+        if let Some(ms) = outcome.idle_ms {
+            obj["idle_ms"] = ms.into();
+        }
+        if let Some(matched) = outcome.matched {
+            obj["match"] = matched.into();
+        }
+        println!("{obj}");
+        return Ok(());
+    }
+    match outcome.condition {
+        "exit" => println!(
+            "exit\t{}\toffset={}",
+            outcome.exit_code.unwrap_or(-1),
+            outcome.offset
+        ),
+        "idle" => println!(
+            "idle\t{}ms\toffset={}",
+            outcome.idle_ms.unwrap_or(0),
+            outcome.offset
+        ),
+        "pattern" => println!(
+            "pattern\t{}\toffset={}",
+            outcome.matched.unwrap_or_default(),
+            outcome.offset
+        ),
+        _ => println!("output\toffset={}", outcome.offset),
+    }
+    Ok(())
 }
 
 /// `oly doctor [id]`: verify sealed-part journal manifests. Exit 1 when any

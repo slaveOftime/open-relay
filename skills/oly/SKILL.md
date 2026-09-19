@@ -132,15 +132,18 @@ rendered log tail; the flags below select the machine surfaces):
 oly observe <ID> --json                          # {status, offset, exit_code, incarnation}
 oly logs <ID> --from <off> --limit N             # raw bytes of one bounded window
 oly logs <ID> --from <off> --json                # same, base64 in one JSON line
+oly logs <ID> --from <off> --after <off> --json  # block until new output, then read it (one call)
 oly logs <ID> --screen                           # visible screen as plain text
 oly logs <ID> --exit --timeout 30s               # exit 0 on exit, 2 on timeout
 oly logs <ID> --after <off>                      # any new output after the cursor
 oly logs <ID> --after <off> --idle-ms 800        # quiet for N ms (heuristic, not success)
 oly logs <ID> --after <off> --pattern 'DONE|FAILED'
+oly logs <ID> --pattern 'ERROR' --screen         # block on a match, then show the screen
 ```
 
 - **Poll with cursors, not guesses.** Record `offset` from `observe`, then
-  `logs --after <offset>`; read exactly the new bytes with `logs --from`.
+  `logs --from <offset> --after <offset> --json` waits for new output and
+  returns exactly the new window in one call; repeat from its `next` offset.
 - **`--idle-ms` means "quiet", never "done".** A silent session may be
   thinking, blocked, or crashed. Treat idle as a hint to look, not as success.
 - **`--pattern` searches only output produced after `--after`** and prints the
