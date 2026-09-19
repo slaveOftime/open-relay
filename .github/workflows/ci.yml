@@ -1,17 +1,66 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - main
+      # Long-lived preview/beta release line (0.5.x); main stays on 0.3.x.
+      - v0.5.x
   pull_request:
     branches:
       - main
+      - v0.5.x
     paths:
       - .github/workflows/ci.yml
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
       - src/**
+      - tests/**
+      # The web bundle is embedded into the Rust binary at build time.
+      - web/src/**
+      - web/package.json
+      - web/package-lock.json
+      - web/vite.config.*
+      - web/tsconfig*.json
+      - web/index.html
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # Zero-warning gate; the pinned allowances live in [lints.clippy] in
+      # Cargo.toml with per-lint rationale.
+      - name: clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
   build-test:
     name: build-test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -63,21 +112,26 @@ jobs:
       - name: Build web
         run: |
           cd web
-          npm install
+          npm ci
           npm run build
 
+      # Full suite: unit tests (binary target) plus every integration/e2e
+      # target. --locked proves Cargo.lock is in sync with the tree.
       - name: Test
         run: |
-          cargo test --test cli_errors
-          cargo test --test e2e_csvlens
-          cargo test --test e2e_daemon
-          # Windows PTY e2e tests require single-threaded execution due to resource contention
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test --test e2e_pty -- --test-threads=1
+            # Windows PTY e2e tests require single-threaded execution due
+            # to resource contention.
+            cargo test --locked -- --test-threads=1
           else
-            cargo test --test e2e_pty
+            cargo test --locked
           fi
         shell: bash
 
       - name: Build Release
-        run: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Audit dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

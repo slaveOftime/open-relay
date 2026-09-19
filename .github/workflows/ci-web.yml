@@ -1,11 +1,17 @@
 name: CI-WEB
 
 on:
+  push:
+    branches:
+      - main
+      # Long-lived preview/beta release line (0.5.x); main stays on 0.3.x.
+      - v0.5.x
   pull_request:
     branches:
       - main
+      - v0.5.x
     paths:
-      # - .github/workflows/**
+      - .github/workflows/ci-web.yml
       - web/**
 
 permissions:
@@ -13,22 +19,11 @@ permissions:
 
 jobs:
   build-test:
-    name: build-test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          # - macos-latest
-          # - windows-latest
-
+    name: lint / test / build
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -48,9 +43,53 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-
 
+      - name: Install
+        run: |
+          cd web
+          npm ci
+
+      - name: Lint
+        run: |
+          cd web
+          npm run lint
+
+      - name: Format check
+        run: |
+          cd web
+          npm run format:check
+
       - name: Test
         run: |
           cd web
-          npm install
           npm test
+
+      - name: Build
+        run: |
+          cd web
           npm run build
+
+  e2e:
+    name: playwright (chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          cd web
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Playwright e2e
+        run: |
+          cd web
+          npm run e2e

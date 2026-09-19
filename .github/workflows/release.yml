@@ -1,5 +1,9 @@
 name: Release
 
+# Release channels: tags on the v0.5.x branch (v0.5.*, or any tag with a
+# prerelease suffix like v0.5.0-beta.1) publish a *preview/beta* GitHub
+# release and an npm `beta` dist-tag; they do NOT touch the default-branch
+# Homebrew formula or crates.io, so main / 0.3.x stays the stable default.
 on:
   push:
     tags:
@@ -84,9 +88,9 @@ jobs:
 
           Set-Content $cargoToml $updated -NoNewline
 
-      # - name: Test
-      #   run: cargo test --target ${{ matrix.target }}
-        
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+
       - name: Build release binary
         env:
           NPM_CONFIG_INCLUDE: optional
@@ -109,12 +113,18 @@ jobs:
         with:
           files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
           generate_release_notes: false
+          # 0.5.x-line tags and explicit prerelease tags publish as
+          # preview/beta releases, never as "latest".
+          prerelease: ${{ startsWith(github.ref_name, 'v0.5.') || contains(github.ref_name, '-') }}
+          name: ${{ (startsWith(github.ref_name, 'v0.5.') || contains(github.ref_name, '-')) && format('{0} (beta)', github.ref_name) || github.ref_name }}
 
   update-homebrew-formula-and-cargo-toml:
     name: update-homebrew-formula-and-cargo-toml
     needs: build-release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    # Stable tags only: beta/preview releases must not rewrite the
+    # default-branch formula or Cargo.toml (main tracks 0.3.x).
+    if: startsWith(github.ref, 'refs/tags/') && !startsWith(github.ref_name, 'v0.5.') && !contains(github.ref_name, '-')
     steps:
       - name: Checkout default branch
         uses: actions/checkout@v4
@@ -173,7 +183,9 @@ jobs:
     name: publish-crates
     needs: build-release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    # Stable tags only: crates.io has no dist-tags, and 0.5.0 > 0.3.x would
+    # become the default `cargo install oly` otherwise.
+    if: startsWith(github.ref, 'refs/tags/') && !startsWith(github.ref_name, 'v0.5.') && !contains(github.ref_name, '-')
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -217,6 +229,15 @@ jobs:
           npm version "$VERSION" --no-git-tag-version
         working-directory: npm
 
+      - name: Resolve npm dist-tag
+        id: dist-tag
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == v0.5.* || "${GITHUB_REF_NAME}" == *-* ]]; then
+            echo "tag=beta" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -254,7 +275,7 @@ jobs:
       - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: npm publish --access public --tag ${{ steps.dist-tag.outputs.tag }}
         working-directory: npm
 
   # publish-winget:
