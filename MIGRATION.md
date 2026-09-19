@@ -52,8 +52,8 @@ honest migration instead.
 | Daemon status | reported the client's config values | reports the running daemon's effective flags and HTTP endpoint (from the daemon's own record) | No action; `oly daemon start` against a running daemon now prints the running config and the remedy. |
 
 Everything else about the CLI is **additive**: new subcommands
-(`doctor`, `wait`, `screen`, `history`, `control`, `observe`, `notify`,
-`restart`, `status`, `skill`, `update`) and new flags. All 0.x commands
+(`doctor`, `wait`, `screen`, `history`, `observe`, `notify`, `restart`,
+`status`, `skill`, `update`) and new flags. All 0.x commands
 (`start`, `stop`, `list`, `logs`, `attach`, `send`, `node`, `join`,
 `api-key`, `daemon`) still exist with the same names.
 

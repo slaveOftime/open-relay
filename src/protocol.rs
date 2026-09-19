@@ -230,8 +230,8 @@ pub enum RpcRequest {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         wait_for_change: bool,
-        /// Held control lease for agent-driven sends (`oly send --lease`);
-        /// `None` is the ungated operator one-shot path.
+        /// Fencing token of the sending attachment (streaming attach input);
+        /// `None` is the ungated operator one-shot path (`oly send`).
         #[serde(default)]
         attachment_id: Option<u64>,
     },
@@ -246,16 +246,6 @@ pub enum RpcRequest {
         id: String,
         from: u64,
         max_bytes: u32,
-    },
-    /// Acquire the control lease without a streaming attach (M4): a parked
-    /// controller attachment whose id is the lease token for gated sends.
-    ControlAcquire {
-        id: String,
-    },
-    /// Release a lease previously taken with [`RpcRequest::ControlAcquire`].
-    ControlRelease {
-        id: String,
-        lease: u64,
     },
     /// Verify sealed-part journal manifests (M4 doctor): `None` = all sessions.
     Doctor {
@@ -384,8 +374,6 @@ impl RpcRequest {
             RpcRequest::AttachInput { .. } => "attach_input",
             RpcRequest::SessionCursor { .. } => "session_cursor",
             RpcRequest::ObserveWindow { .. } => "observe_window",
-            RpcRequest::ControlAcquire { .. } => "control_acquire",
-            RpcRequest::ControlRelease { .. } => "control_release",
             RpcRequest::Doctor { .. } => "doctor",
             RpcRequest::AttachBusy { .. } => "attach_busy",
             RpcRequest::UploadFile { .. } => "upload_file",
@@ -431,11 +419,6 @@ pub enum RpcResponse {
         running: bool,
         exit_code: Option<i32>,
         incarnation: Option<u64>,
-    },
-    /// Control lease acquired without a streaming attach (M4); `lease` is
-    /// the attachment id token for gated sends.
-    ControlAcquired {
-        lease: u64,
     },
     /// Journal verification report (M4 doctor).
     Doctor {

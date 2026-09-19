@@ -22,8 +22,7 @@ use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, Session
 use super::{
     rpc_attach::{
         handle_attach_busy, handle_attach_detach, handle_attach_input, handle_attach_resize,
-        handle_attach_subscribe, handle_control_acquire, handle_control_release,
-        handle_observe_window, handle_session_cursor,
+        handle_attach_subscribe, handle_observe_window, handle_session_cursor,
     },
     rpc_nodes::{
         handle_node_list, handle_node_proxy, handle_node_proxy_streaming, spawn_join_connector,
@@ -201,10 +200,6 @@ async fn dispatch_request(
             from,
             max_bytes,
         } => handle_observe_window(id, from, max_bytes, session_store).await,
-        RpcRequest::ControlAcquire { id } => handle_control_acquire(id, session_store).await,
-        RpcRequest::ControlRelease { id, lease } => {
-            handle_control_release(id, lease, session_store).await
-        }
         RpcRequest::Doctor { id } => handle_doctor(id, db).await,
         RpcRequest::AttachBusy { id } => handle_attach_busy(id, session_store).await,
         RpcRequest::UploadFile {
@@ -1029,10 +1024,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     mod agent_surfaces {
-        use crate::daemon::rpc_attach::{
-            handle_attach_input, handle_control_acquire, handle_control_release,
-            handle_observe_window, handle_session_cursor,
-        };
+        use crate::daemon::rpc_attach::{handle_observe_window, handle_session_cursor};
         use crate::protocol::RpcResponse;
         use crate::session::SessionStatus;
         use crate::session::store::testsupport::{make_runtime_writable, make_test_db, store_with};
@@ -1096,36 +1088,6 @@ mod tests {
             };
             assert!(data.is_empty());
             assert_eq!(next_offset, 11);
-        }
-
-        #[tokio::test]
-        async fn control_lease_gates_agent_input_until_release() {
-            let (rt, mut writer_rx) = make_runtime_writable("lease01", SessionStatus::Running);
-            let store = Arc::new(store_with(vec![rt], make_test_db().await));
-
-            // Acquire: a parked controller attachment is registered.
-            let acquired = handle_control_acquire("lease01".into(), &store).await;
-            let RpcResponse::ControlAcquired { lease } = acquired else {
-                panic!("unexpected response: {acquired:?}");
-            };
-
-            // Input carrying the lease token is authorized.
-            let ok =
-                handle_attach_input("lease01".into(), "x".into(), &store, false, Some(lease)).await;
-            assert!(matches!(ok, RpcResponse::Ack));
-            assert_eq!(writer_rx.try_recv().expect("input written"), b"x");
-
-            // Input carrying a foreign token is rejected as not-controller.
-            let foreign =
-                handle_attach_input("lease01".into(), "y".into(), &store, false, Some(999)).await;
-            assert!(matches!(foreign, RpcResponse::Error { .. }));
-
-            // Release detaches the parked controller; the lease goes stale.
-            let released = handle_control_release("lease01".into(), lease, &store).await;
-            assert!(matches!(released, RpcResponse::Ack));
-            let stale =
-                handle_attach_input("lease01".into(), "z".into(), &store, false, Some(lease)).await;
-            assert!(matches!(stale, RpcResponse::Error { .. }));
         }
     }
 

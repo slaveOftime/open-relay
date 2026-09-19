@@ -13,7 +13,6 @@ pub async fn run_send(
     id: &str,
     node: Option<String>,
     chunks: Vec<String>,
-    lease: Option<u64>,
 ) -> Result<()> {
     let has_chunks = !chunks.is_empty();
     let stdin_is_terminal = std::io::stdin().is_terminal();
@@ -30,7 +29,7 @@ pub async fn run_send(
     // Process ordered chunks left to right
     for chunk in chunks.iter() {
         let data = resolve_chunk(config, id, chunk, node.as_deref()).await?;
-        send_data(config, id, data, node.as_deref(), lease).await?;
+        send_data(config, id, data, node.as_deref()).await?;
         sent_any = true;
     }
 
@@ -41,7 +40,7 @@ pub async fn run_send(
         let mut bytes = Vec::new();
         std::io::stdin().read_to_end(&mut bytes)?;
         if !bytes.is_empty() {
-            send_data(config, id, bytes, node.as_deref(), lease).await?;
+            send_data(config, id, bytes, node.as_deref()).await?;
             sent_any = true;
         }
     }
@@ -207,19 +206,15 @@ async fn upload_file(
     }
 }
 
-async fn send_data(
-    config: &AppConfig,
-    id: &str,
-    data: Vec<u8>,
-    node: Option<&str>,
-    lease: Option<u64>,
-) -> Result<()> {
+async fn send_data(config: &AppConfig, id: &str, data: Vec<u8>, node: Option<&str>) -> Result<()> {
     use crate::protocol::RpcRequest as R;
     let inner = RpcRequest::AttachInput {
         id: id.to_string(),
         data,
         wait_for_change: true,
-        attachment_id: lease,
+        // Ungated operator one-shot: no attachment token (PLAN §5.1 —
+        // `oly send` works regardless of who holds the control lease).
+        attachment_id: None,
     };
     let req = match node {
         None => inner,

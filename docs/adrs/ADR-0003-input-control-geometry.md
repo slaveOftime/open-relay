@@ -81,4 +81,11 @@ are a separate negotiated capability.
 ## Migration
 
 CLI detach keybinding changes are breaking and documented; agent `send`
-requires explicit session IDs and leases in 0.5.0 machine workflows.
+requires explicit session IDs in 0.5.0 machine workflows.
+
+> **Amendment (0.5.0 beta):** the parked agent lease (`oly control
+> acquire/release` + `oly send --lease`) was removed before release. The
+> attach-time controller lease (one controller, many observers, takeover
+> semantics, fenced handoff) remains; `oly send` is an ungated operator
+> channel by design. The lease is coordination/observability, not a
+> security boundary.

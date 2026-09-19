@@ -277,52 +277,6 @@ pub async fn run_wait(
     }
 }
 
-/// `oly control acquire <id>`: take the lease, print the token.
-pub async fn run_control_acquire(config: &AppConfig, id: &str, node: Option<String>) -> Result<()> {
-    match rpc(
-        config,
-        node.as_deref(),
-        RpcRequest::ControlAcquire { id: id.to_string() },
-    )
-    .await?
-    {
-        RpcResponse::ControlAcquired { lease } => {
-            println!("{lease}");
-            Ok(())
-        }
-        other => Err(AppError::Protocol(format!(
-            "unexpected response to control_acquire: {other:?}"
-        ))),
-    }
-}
-
-/// `oly control release <id> --lease <token>`.
-pub async fn run_control_release(
-    config: &AppConfig,
-    id: &str,
-    lease: u64,
-    node: Option<String>,
-) -> Result<()> {
-    match rpc(
-        config,
-        node.as_deref(),
-        RpcRequest::ControlRelease {
-            id: id.to_string(),
-            lease,
-        },
-    )
-    .await?
-    {
-        RpcResponse::Ack => {
-            eprintln!("released control lease {lease} on session {id}");
-            Ok(())
-        }
-        other => Err(AppError::Protocol(format!(
-            "unexpected response to control_release: {other:?}"
-        ))),
-    }
-}
-
 /// `oly doctor [id]`: verify sealed-part journal manifests. Exit 1 when any
 /// session reports an integrity issue.
 pub async fn run_doctor(

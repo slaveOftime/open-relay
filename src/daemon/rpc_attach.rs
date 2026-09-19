@@ -385,7 +385,7 @@ pub(super) async fn handle_attach_detach(
 }
 
 // ---------------------------------------------------------------------------
-// M4 agent surfaces: cursor, bounded observe windows, parked control leases
+// M4 agent surfaces: cursor, bounded observe windows
 // ---------------------------------------------------------------------------
 
 /// Machine-readable session cursor: liveness + canonical filtered offset.
@@ -445,41 +445,5 @@ pub(super) async fn handle_observe_window(
         running,
         exit_code,
         incarnation: session_store.journal_incarnation(&id),
-    }
-}
-
-/// Acquire the control lease without a streaming attach: a parked
-/// controller attachment whose id is the lease token for gated agent
-/// sends. The lease carries a TTL (post-review corrective increment): an
-/// agent that crashes without releasing stops gating the session after
-/// the TTL instead of leaking the lease forever.
-pub(super) async fn handle_control_acquire(
-    id: String,
-    session_store: &SessionStoreHandle,
-) -> RpcResponse {
-    match session_store
-        .attach_register_parked(&id, AttachKind::Cli)
-        .await
-    {
-        Ok(registration) => RpcResponse::ControlAcquired {
-            lease: registration.attachment_id,
-        },
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
-    }
-}
-
-/// Release a parked control lease.
-pub(super) async fn handle_control_release(
-    id: String,
-    lease: u64,
-    session_store: &SessionStoreHandle,
-) -> RpcResponse {
-    match session_store.attach_detach(&id, lease).await {
-        Ok(()) => RpcResponse::Ack,
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
     }
 }

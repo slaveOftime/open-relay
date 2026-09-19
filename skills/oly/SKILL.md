@@ -117,7 +117,7 @@ oly --help            # or: oly <command> --help
 oly skill             # print the bundled copy of this skill — bootstrap other agents with it
 ```
 
-## Machine surfaces (cursors, waits, control lease)
+## Machine surfaces (cursors and waits)
 
 These commands form the stable agent API. Every session output stream has a
 canonical **cursor**: a byte offset into the session's filtered output stream,
@@ -147,27 +147,17 @@ oly wait <ID> --after <off> --pattern 'DONE|FAILED'
 - `wait` exit codes: `0` condition met, `2` timeout, `1` error. `--timeout 0`
   waits forever.
 
-### Driving a session exclusively (control lease)
+### Sharing a session with a human
 
-A session has at most one **controller**. `oly send` without a lease is an
-ungated operator action and always works; when you need exclusive drive — or
-must not race a human at the keyboard — take the lease:
+A session has at most one **controller** — the most recently attached
+interactive client (CLI or browser attach takes control on arrival and
+resizes the session to its viewport). `oly send` is an ungated operator
+action and always works, regardless of who is attached.
 
-```bash
-LEASE=$(oly control acquire <ID>)          # prints a lease token
-oly send <ID> --lease "$LEASE" "make test" key:enter
-oly control release <ID> --lease "$LEASE"
-```
-
-- While you hold the lease, other attachments become observers; a human can
-  still explicitly take over (their attach wins, your lease goes stale and
-  gated sends start failing with not-controller — that is your signal to stop
-  typing, not to fight).
-- Human to agent handoff: the human detaches or you `control acquire`
-  (which demotes them to observer); agent to human: `control release`, then
-  the next attach becomes controller.
-- Always resume observation from your last cursor after any handoff; never
-  assume the screen you last saw is current.
+- Check `oly status <ID>` / the attach count before typing into a session a
+  human might be driving; prefer `oly send` over racing them.
+- After any handoff, resume observation from your last cursor (`observe` +
+  `history --from`); never assume the screen you last saw is current.
 
 ## Recipes
 

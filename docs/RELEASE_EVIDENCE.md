@@ -4,7 +4,7 @@ Item-by-item evidence for the PLAN §16 release checklist, for the 0.5.0
 beta line (`v0.5.x` branch; 0.3.x on `main` remains the stable default).
 Test names are exact; run any of them with
 `cargo test --locked --offline <name>`.
-Suite totals at this commit: **627 unit + 52 integration/e2e = 679 tests,
+Suite totals at this commit: **625 unit + 57 integration/e2e = 682 tests,
 0 ignored** (the M0-era ignored repro/probe tests were removed during the
 0.5.0 cleanup; their findings are recorded in the ADRs), `cargo fmt`
 clean, and **clippy is a zero-warning gate**:
@@ -85,11 +85,15 @@ checkpoint-anchored bounded replay (OJCK v2), and removal of the pre-0.5
 - [x] **History scroll persists; no forced follow.** Web HistoryController
   (M4-2) with scroll-theft fix; unit tests in
   `web/src/lib/history-controller.test.ts`.
-- [x] **Mixed clients: one controller, fenced handoff.** Control lease +
-  observer gating (M3-4):
+- [x] **Mixed clients: one controller, fenced handoff.** Attach-time
+  control lease + observer gating (M3-4); interactive attach takes control
+  by default and takeover resizes the session to the new controller's
+  viewport:
   `attach_control_lease_gates_input_and_resize`,
-  `parked_control_leases_drive_input_are_capped_and_releasable`,
-  `attach_applied_cursor_credits_register_per_attachment`.
+  `attach_takeover_resizes_session_to_the_new_controllers_viewport`,
+  `attach_applied_cursor_credits_register_per_attachment`. (The separate
+  `oly control acquire/release` + `send --lease` parked-lease ceremony was
+  removed: `oly send` is an ungated operator channel by design.)
 - [x] **Slow clients stay memory-bounded.** Enforced stream credits and
   bounded queues (M5-1): `credit_gate_holds_output_until_the_client_applies`,
   `credit_gate_disconnects_a_stalled_client_loudly`,

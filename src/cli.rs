@@ -77,8 +77,6 @@ pub enum Commands {
     Screen(ScreenArgs),
     /// Wait for output after a cursor, an exit, silence, or a pattern.
     Wait(WaitArgs),
-    /// Acquire or release the session's control lease (agent drives).
-    Control(ControlArgs),
     /// Verify journal integrity (sealed-part manifests) for one or all sessions.
     Doctor(DoctorArgs),
     /// Stop a session by ID.
@@ -529,42 +527,6 @@ pub struct WaitArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ControlArgs {
-    #[command(subcommand)]
-    pub command: ControlCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ControlCommand {
-    /// Take the session's control lease; prints the lease token to use
-    /// with `oly send --lease`.
-    Acquire(ControlOpArgs),
-    /// Release a previously acquired lease.
-    Release(ControlReleaseArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ControlOpArgs {
-    /// Session ID. If omitted, uses the most recently created session.
-    pub id: Option<String>,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct ControlReleaseArgs {
-    /// Session ID. If omitted, uses the most recently created session.
-    pub id: Option<String>,
-    /// Lease token from `oly control acquire`.
-    #[arg(long)]
-    pub lease: u64,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-}
-
-#[derive(Debug, Args)]
 pub struct SendArgs {
     /// Session ID to send input to. If omitted, uses the most recently created session.
     pub id: Option<String>,
@@ -583,10 +545,6 @@ pub struct SendArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
-    /// Control lease token from `oly control acquire`; required when a
-    /// session has a registered controller (agent-driven sends are gated).
-    #[arg(long)]
-    pub lease: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

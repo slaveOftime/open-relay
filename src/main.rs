@@ -408,14 +408,7 @@ async fn run() -> Result<()> {
         Commands::Send(send_args) => {
             let id =
                 resolve_session_id(&config, send_args.id.clone(), send_args.node.as_ref()).await?;
-            client::run_send(
-                &config,
-                &id,
-                send_args.node,
-                send_args.chunks,
-                send_args.lease,
-            )
-            .await
+            client::run_send(&config, &id, send_args.node, send_args.chunks).await
         }
 
         Commands::Observe(args) => {
@@ -446,17 +439,6 @@ async fn run() -> Result<()> {
             )
             .await
         }
-        Commands::Control(args) => match args.command {
-            crate::cli::ControlCommand::Acquire(op) => {
-                let id = resolve_session_id(&config, op.id.clone(), op.node.as_ref()).await?;
-                client::run_control_acquire(&config, &id, op.node).await
-            }
-            crate::cli::ControlCommand::Release(op) => {
-                let id = resolve_session_id(&config, op.id.clone(), op.node.as_ref()).await?;
-                client::run_control_release(&config, &id, op.lease, op.node).await
-            }
-        },
-
         Commands::Doctor(args) => client::run_doctor(&config, args.id, args.node).await,
 
         // ── API key management (primary side) ────────────────────────────────

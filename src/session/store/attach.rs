@@ -84,28 +84,6 @@ impl SessionStore {
         })
     }
 
-    /// Acquire the control lease without a streaming attach: a parked
-    /// agent controller whose lease expires after
-    /// [`PARKED_LEASE_TTL`](crate::session::registry::PARKED_LEASE_TTL)
-    /// without activity (post-review corrective increment — crashed agents
-    /// must not leak leases). Gated sends renew the lease. Refused with
-    /// [`SessionError::Busy`] when the parked-lease cap is genuinely
-    /// exhausted (i.e. that many agents are concurrently active).
-    pub async fn attach_register_parked(
-        &self,
-        id: &str,
-        kind: crate::session::registry::AttachKind,
-    ) -> std::result::Result<AttachRegistration, SessionError> {
-        let handle = self.lookup_runtime(id).await?;
-        let mut rt = handle.write();
-        rt.register_parked_attachment(kind, crate::session::registry::PARKED_LEASE_TTL)
-            .map(|(attachment_id, outcome)| AttachRegistration {
-                attachment_id,
-                role: outcome.role,
-            })
-            .ok_or(SessionError::Busy)
-    }
-
     /// Explicit control takeover by an attached observer.
     pub async fn attach_acquire_control(
         &self,
@@ -428,15 +406,11 @@ impl SessionStore {
             }
         }?;
 
-        // Brief write lock: touch the timestamp fields and renew a parked
-        // agent lease (a successful gated send proves the agent is alive).
+        // Brief write lock: touch the activity timestamp fields.
         {
             let mut rt = handle.write();
             rt.mark_attach_activity();
             rt.last_input_at = Some(Instant::now());
-            if let Some(attachment_id) = attachment_id {
-                rt.attachments.renew_lease(attachment_id, Instant::now());
-            }
         }
 
         debug!(session_id = id, bytes = byte_len, "attach input forwarded");
@@ -1259,58 +1233,6 @@ mod tests {
         assert_eq!(store.attach_filtered_len("nope000").await, None);
         assert!(store.attach_resync_window("nope000", 0, 64).await.is_err());
         assert_eq!(store.journal_incarnation("nope000"), None);
-    }
-
-    #[tokio::test]
-    async fn parked_control_leases_drive_input_are_capped_and_releasable() {
-        use crate::session::registry::{AttachKind, MAX_PARKED_LEASES};
-
-        let (rt, mut writer_rx) = make_runtime_writable("parked01", SessionStatus::Running);
-        let store = store_with(vec![rt], make_test_db().await);
-
-        // A parked lease is a controller: gated input flows.
-        let lease = store
-            .attach_register_parked("parked01", AttachKind::Cli)
-            .await
-            .expect("parked acquire")
-            .attachment_id;
-        store
-            .attach_input("parked01", Some(lease), b"agent-bytes", false)
-            .await
-            .expect("parked controller drives input");
-        assert_eq!(writer_rx.recv().await.expect("written"), b"agent-bytes");
-
-        // The cap refuses unbounded growth (crashed-agent protection).
-        let mut leases = vec![lease];
-        for _ in 1..MAX_PARKED_LEASES {
-            leases.push(
-                store
-                    .attach_register_parked("parked01", AttachKind::Cli)
-                    .await
-                    .expect("under the cap")
-                    .attachment_id,
-            );
-        }
-        let err = store
-            .attach_register_parked("parked01", AttachKind::Cli)
-            .await
-            .expect_err("the cap refuses further parked leases");
-        assert!(matches!(err, SessionError::Busy));
-
-        // Releasing a lease frees a slot; a stale token fails precisely.
-        store
-            .attach_detach("parked01", leases[0])
-            .await
-            .expect("release");
-        store
-            .attach_register_parked("parked01", AttachKind::Cli)
-            .await
-            .expect("released slot is reusable");
-        let err = store
-            .attach_input("parked01", Some(leases[0]), b"x", false)
-            .await
-            .expect_err("released lease token is stale");
-        assert!(matches!(err, SessionError::StaleAttachment));
     }
 
     #[tokio::test]
