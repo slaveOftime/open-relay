@@ -127,8 +127,16 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
         show_node: targets.len() > 1,
         ..Default::default()
     };
+    // When the list shows exactly one node's sessions, dialogs that start or
+    // update sessions default to that node — Ctrl+N in a `--node worker`
+    // view must create the session on `worker`, not locally (where it would
+    // never appear in the filtered list).
+    let list_node = match targets.as_slice() {
+        [target] => target.node.as_deref(),
+        _ => None,
+    };
     let refresh = fetch_sessions(config, query.clone(), &targets).await?;
-    app.message = refresh.warning();
+    app.set_refresh_message(refresh.warning());
     app.replace_sessions(refresh.sessions);
     let mut terminal = TuiTerminal::new()?;
     let mut last_refresh = Instant::now();
@@ -151,7 +159,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
 
         match read_terminal_event(INPUT_POLL_INTERVAL)? {
             Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                match route_key(&mut app, key, None) {
+                match route_key(&mut app, key, list_node) {
                     AppAction::None => {}
                     AppAction::Quit => break,
                     AppAction::OpenInline => open_selected_inline(&mut terminal, &mut app, None)?,
@@ -182,9 +190,9 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
                     refresh.sessions.truncate(query.limit);
                     let warning = refresh.warning();
                     app.replace_sessions(refresh.sessions);
-                    app.message = warning;
+                    app.set_refresh_message(warning);
                 }
-                Err(error) => app.message = Some(format!("sync lost: {error}")),
+                Err(error) => app.set_refresh_message(Some(format!("sync lost: {error}"))),
             }
             last_refresh = Instant::now();
             redraw = true;
@@ -309,7 +317,7 @@ async fn start_clone(
     match ipc::send_request_checked(config, launch.request()).await {
         Ok(RpcResponse::Start { session_id }) => {
             app.clone_dialog = None;
-            app.message = Some(format!("started new session {session_id}"));
+            app.set_action_message(Some(format!("started new session {session_id}")));
             if launch.attach_after_start {
                 open_session_inline(terminal, app, &session_id, launch.node.as_deref(), true)?;
             }
@@ -340,7 +348,7 @@ fn apply_update_response(
             summary.node = target_node.map(str::to_string);
             app.update_dialog = None;
             app.apply_updated_summary(summary);
-            app.message = Some(format!("updated session {target_id}"));
+            app.set_action_message(Some(format!("updated session {target_id}")));
         }
         Ok(_) => set_update_error(app, "unexpected response type".to_string()),
         Err(error) => set_update_error(app, format!("update failed: {error}")),
@@ -359,7 +367,7 @@ fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
     tokio::spawn(async move {
         let _ = ipc::send_request_checked(&config, request).await;
     });
-    app.message = Some(format!("stop signal sent to {}", target.id));
+    app.set_action_message(Some(format!("stop signal sent to {}", target.id)));
 }
 
 fn wrap_node(node: Option<&str>, inner: RpcRequest) -> RpcRequest {
@@ -376,7 +384,7 @@ fn set_clone_error(app: &mut App, error: String) {
     if let Some(dialog) = app.clone_dialog.as_mut() {
         dialog.error = Some(error);
     } else {
-        app.message = Some(error);
+        app.set_action_message(Some(error));
     }
 }
 
@@ -384,7 +392,7 @@ fn set_update_error(app: &mut App, error: String) {
     if let Some(dialog) = app.update_dialog.as_mut() {
         dialog.error = Some(error);
     } else {
-        app.message = Some(error);
+        app.set_action_message(Some(error));
     }
 }
 
@@ -396,6 +404,12 @@ struct App {
     opened: HashMap<String, OpenedTerminal>,
     next_slot: usize,
     message: Option<String>,
+    /// True when `message` carries user-action feedback ("started new
+    /// session …", "update failed: …") rather than refresh-cycle sync
+    /// status. The 250 ms refresh cycle must not clobber action feedback —
+    /// otherwise success/error messages vanish before the user can read
+    /// them (and a `--node`-scoped Ctrl+N looks like "nothing happened").
+    message_is_action: bool,
     filter: String,
     normalized_filter: String,
     search_text: Vec<String>,
@@ -627,7 +641,7 @@ impl CloneDialog {
         }
     }
 
-    fn blank() -> Self {
+    fn blank(list_node: Option<&str>) -> Self {
         Self {
             source_id: None,
             active: 0,
@@ -636,7 +650,9 @@ impl CloneDialog {
             cwd: EditText::new(String::new()),
             title: EditText::new(String::new()),
             tags: EditText::new(String::new()),
-            node: EditText::new(String::new()),
+            // Prefill the node the list is currently scoped to so the new
+            // session lands where the user is looking; still editable.
+            node: EditText::new(list_node.unwrap_or_default().to_string()),
             rows: EditText::new(String::new()),
             cols: EditText::new(String::new()),
             disable_notifications: false,
@@ -967,12 +983,12 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
 
     match key.code {
         _ if is_new_session_dialog_key(key) => {
-            app.clone_dialog = Some(CloneDialog::blank());
+            app.clone_dialog = Some(CloneDialog::blank(list_node));
             AppAction::None
         }
         _ if is_clone_dialog_key(key) => {
             let Some(session) = app.selected_session() else {
-                app.message = Some("no session selected to clone".to_string());
+                app.set_action_message(Some("no session selected to clone".to_string()));
                 return AppAction::None;
             };
             app.clone_dialog = Some(CloneDialog::from_session(session, list_node));
@@ -980,7 +996,7 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
         }
         _ if is_update_dialog_key(key) => {
             let Some(session) = app.selected_session() else {
-                app.message = Some("no session selected to update".to_string());
+                app.set_action_message(Some("no session selected to update".to_string()));
                 return AppAction::None;
             };
             app.update_dialog = Some(UpdateDialog::from_session(session, list_node));
@@ -988,14 +1004,14 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
         }
         KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let Some(session) = app.selected_session() else {
-                app.message = Some("no session selected to stop".to_string());
+                app.set_action_message(Some("no session selected to stop".to_string()));
                 return AppAction::None;
             };
             if !matches!(session.status.as_str(), "created" | "running") {
-                app.message = Some(format!(
+                app.set_action_message(Some(format!(
                     "{} cannot be stopped while {}",
                     session.id, session.status
-                ));
+                )));
                 return AppAction::None;
             }
             AppAction::Stop(SessionTarget {
@@ -1083,7 +1099,7 @@ fn route_clone_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> App
             "new session cancelled"
         };
         app.clone_dialog = None;
-        app.message = Some(message.to_string());
+        app.set_action_message(Some(message.to_string()));
         return AppAction::None;
     }
 
@@ -1147,7 +1163,7 @@ fn route_clone_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> App
 fn route_update_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
     if key.code == KeyCode::Esc {
         app.update_dialog = None;
-        app.message = Some("update cancelled".to_string());
+        app.set_action_message(Some("update cancelled".to_string()));
         return AppAction::None;
     }
 
@@ -1357,6 +1373,22 @@ fn session_key(session: &SessionSummary) -> String {
 }
 
 impl App {
+    /// Refresh-cycle sync status (warnings / "sync lost"): replaces the
+    /// current message only when no action feedback is showing, so a fresh
+    /// warning never silently discards feedback the user hasn't read yet.
+    fn set_refresh_message(&mut self, message: Option<String>) {
+        if !self.message_is_action {
+            self.message = message;
+        }
+    }
+
+    /// User-action feedback: always shown, and stays until the next action
+    /// or an explicit clear; the refresh cycle leaves it alone.
+    fn set_action_message(&mut self, message: Option<String>) {
+        self.message_is_action = message.is_some();
+        self.message = message;
+    }
+
     fn replace_sessions(&mut self, mut sessions: Vec<SessionSummary>) {
         sort_sessions(&mut sessions, self.sort_strategy);
         let selected_key = self.sessions.get(self.selected).map(session_key);
@@ -1519,7 +1551,7 @@ impl App {
         self.normalized_filter = self.filter.to_lowercase();
         self.rebuild_visible();
         self.first();
-        self.message = None;
+        self.set_action_message(None);
     }
 
     fn push_filter(&mut self, character: char) {
@@ -1552,10 +1584,10 @@ impl App {
             })
             .unwrap_or(0);
         self.rebuild_visible();
-        self.message = Some(format!(
+        self.set_action_message(Some(format!(
             "sorted by {} · Ctrl+O cycle",
             self.sort_strategy.label()
-        ));
+        )));
     }
 
     fn toggle_status_filter(&mut self) {
@@ -1566,10 +1598,10 @@ impl App {
         };
         self.rebuild_visible();
         self.first();
-        self.message = Some(format!(
+        self.set_action_message(Some(format!(
             "showing {} sessions · Ctrl+S toggle",
             self.status_filter.label()
-        ));
+        )));
     }
 
     fn open_selected_terminal(&mut self, node: Option<&str>) {
@@ -1582,7 +1614,7 @@ impl App {
         let key = session_key(session);
         let size = (session.cols.unwrap_or(80), session.rows.unwrap_or(24));
         if attach && self.opened.contains_key(&key) {
-            self.message = Some(format!("{id} is already jacked in"));
+            self.set_action_message(Some(format!("{id} is already jacked in")));
             return;
         }
 
@@ -1606,13 +1638,13 @@ impl App {
                     );
                 }
                 self.next_slot += 1;
-                self.message = Some(if attach {
+                self.set_action_message(Some(if attach {
                     format!("opened {id} · link established")
                 } else {
                     format!("opened {id} · log tail")
-                });
+                }));
             }
-            Err(error) => self.message = Some(format!("launch failed: {error}")),
+            Err(error) => self.set_action_message(Some(format!("launch failed: {error}"))),
         }
     }
 }
@@ -1646,11 +1678,11 @@ fn open_session_inline(
     terminal.resume()?;
     wait_result?;
 
-    app.message = Some(match result {
+    app.set_action_message(Some(match result {
         Ok(status) if status.success() => format!("returned from {id}"),
         Ok(status) => format!("session {id} exited with {status}"),
         Err(error) => format!("open failed: {error}"),
-    });
+    }));
     Ok(())
 }
 
@@ -4062,7 +4094,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_n_opens_completely_blank_new_session_dialog() {
+    fn ctrl_n_opens_blank_new_session_dialog_scoped_to_the_viewed_node() {
         let mut app = App::default();
         let mut source = session("source");
         source.title = Some("must not copy".to_string());
@@ -4080,7 +4112,10 @@ mod tests {
         assert!(dialog.cwd.value.is_empty());
         assert!(dialog.title.value.is_empty());
         assert!(dialog.tags.value.is_empty());
-        assert!(dialog.node.value.is_empty());
+        // The node field is prefilled from the node the list is scoped to —
+        // never copied from the selected session — so the new session lands
+        // where the user is looking instead of silently going local.
+        assert_eq!(dialog.node.value, "list-node");
         assert!(dialog.rows.value.is_empty());
         assert!(dialog.cols.value.is_empty());
         assert!(!dialog.disable_notifications);
@@ -4089,6 +4124,64 @@ mod tests {
         let rendered = render_app(&mut app, 120, 30);
         assert!(rendered.contains("New Session"));
         assert!(!rendered.contains("Duplicate source"));
+    }
+
+    #[test]
+    fn ctrl_n_without_node_scope_stays_completely_blank() {
+        let mut app = App::default();
+        let mut source = session("source");
+        source.node = Some("worker-a".to_string());
+        app.replace_sessions(vec![source]);
+
+        route_key(&mut app, ctrl(KeyCode::Char('n')), None);
+        let dialog = app.clone_dialog.as_ref().unwrap();
+        assert!(dialog.node.value.is_empty());
+    }
+
+    #[test]
+    fn new_session_enter_launches_on_the_viewed_node() {
+        let mut app = App::default();
+        route_key(&mut app, ctrl(KeyCode::Char('n')), Some("worker-a"));
+        for character in "bash".chars() {
+            route_key(&mut app, key(KeyCode::Char(character)), Some("worker-a"));
+        }
+        let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), Some("worker-a"))
+        else {
+            panic!("enter must launch the new session dialog");
+        };
+        assert_eq!(launch.node.as_deref(), Some("worker-a"));
+        assert_eq!(launch.command, "bash");
+        let request = launch.request();
+        let RpcRequest::NodeProxy { node, inner } = request else {
+            panic!("node-scoped launch must be wrapped in NodeProxy");
+        };
+        assert_eq!(node, "worker-a");
+        assert!(matches!(*inner, RpcRequest::Start { .. }));
+    }
+
+    #[test]
+    fn refresh_cycle_preserves_action_feedback_messages() {
+        let mut app = App::default();
+
+        // Refresh warnings show when no action feedback is pending.
+        app.set_refresh_message(Some("sync lost: worker-a".to_string()));
+        assert_eq!(app.message.as_deref(), Some("sync lost: worker-a"));
+        // A later refresh replaces (or clears) its own message.
+        app.set_refresh_message(None);
+        assert_eq!(app.message, None);
+
+        // Action feedback survives the 250 ms refresh cycle...
+        app.set_action_message(Some("started new session abc1234".to_string()));
+        app.set_refresh_message(None);
+        assert_eq!(app.message.as_deref(), Some("started new session abc1234"));
+        app.set_refresh_message(Some("sync lost: worker-a".to_string()));
+        assert_eq!(app.message.as_deref(), Some("started new session abc1234"));
+
+        // ...until the next action replaces it, after which refresh status
+        // is allowed through again.
+        app.set_action_message(None);
+        app.set_refresh_message(Some("sync lost: worker-a".to_string()));
+        assert_eq!(app.message.as_deref(), Some("sync lost: worker-a"));
     }
 
     #[test]
