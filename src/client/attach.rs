@@ -678,7 +678,17 @@ fn scrollback_seed_bytes(seed: &[u8], rows: u16) -> Vec<u8> {
         }
         out.push(byte);
     }
-    out.resize(out.len() + usize::from(rows), b'\n');
+    // The seed must end fully scrolled off: the snapshot repaints the visible
+    // screen afterwards, and rows still on screen would be duplicated by it.
+    // A seed at least one screen tall has already scrolled itself off — its
+    // last row's own line feed did the final scroll — so extra newlines would
+    // only push blank rows between the seed and the snapshot in the client's
+    // scrollback.  A shorter seed still needs a full screen of newlines to
+    // guarantee the scroll-off regardless of where the cursor started.
+    let seed_lines = seed.iter().filter(|&&byte| byte == b'\n').count();
+    if seed_lines < usize::from(rows) {
+        out.resize(out.len() + usize::from(rows), b'\n');
+    }
     out.extend_from_slice(b"\x1b[H");
     out
 }
@@ -949,6 +959,25 @@ mod tests {
         let bytes = scrollback_seed_bytes(b"only\n", 2);
         assert!(!bytes.windows(4).any(|window| window == b"\x1b[2J"));
         assert!(bytes.ends_with(b"\x1b[H"));
+    }
+
+    #[test]
+    fn scrollback_seed_taller_than_screen_needs_no_extra_newlines() {
+        // A deep seed scrolls itself off with its own line feeds; extra
+        // newlines would push blank rows between the seed and the snapshot
+        // repaint in the client's scrollback.
+        let seed = "row 0\nrow 1\nrow 2\n";
+        let bytes = scrollback_seed_bytes(seed.as_bytes(), 3);
+        assert_eq!(bytes, b"row 0\r\nrow 1\r\nrow 2\r\n\x1b[H".as_slice());
+    }
+
+    #[test]
+    fn scrollback_seed_one_line_short_of_screen_still_scrolls_off() {
+        // Short seeds keep the full screen of trailing newlines: the seed must
+        // scroll off no matter where the cursor started.
+        let seed = "row 0\nrow 1\n";
+        let bytes = scrollback_seed_bytes(seed.as_bytes(), 3);
+        assert_eq!(bytes, b"row 0\r\nrow 1\r\n\n\n\n\x1b[H".as_slice());
     }
 
     // -----------------------------------------------------------------------

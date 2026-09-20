@@ -8,6 +8,13 @@ use crate::error::Result;
 /// Default for [`AppConfig::screen_scrollback_rows`].
 pub const DEFAULT_SCREEN_SCROLLBACK_ROWS: usize = 5000;
 
+/// Minimum number of scrolled-off rows a fresh attach seeds into the client
+/// terminal's scrollback, regardless of the client's own screen height.
+/// Without this floor a reattach only restores one screenful of history,
+/// which reads as "the session's history got cut". Capped by the session's
+/// [`AppConfig::screen_scrollback_rows`] retention.
+pub const DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS: usize = 1000;
+
 /// Default prompt patterns used to detect interactive prompts in terminal output.
 /// These are intentionally broad to cover common shells, REPLs, and CLI tools.
 ///

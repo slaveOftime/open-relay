@@ -42,6 +42,13 @@ import {
   formatTimestamp,
   sessionDisplayName,
 } from '@/utils/format'
+import {
+  loadPinnedSessionKeys,
+  orderSessionPage,
+  savePinnedSessionKeys,
+  sessionIsPinnable,
+  sessionPinKey,
+} from '@/utils/sessionOrdering'
 import Logo from '@/components/Logo'
 import CommandLogo from '@/components/CommandLogo'
 import SseStatusDot from '@/components/SseStatusDot'
@@ -77,6 +84,8 @@ import {
   ChevronUpIcon,
   CopyIcon,
   Cross2Icon,
+  DrawingPinFilledIcon,
+  DrawingPinIcon,
   FileTextIcon,
   GridIcon,
   Link2Icon,
@@ -361,6 +370,35 @@ function SessionNotificationButton({
   )
 }
 
+function SessionPinButton({
+  pinned,
+  pending,
+  onToggle,
+}: {
+  pinned: boolean
+  pending?: boolean
+  onToggle: () => void
+}) {
+  const label = pinned ? 'Unpin session' : 'Pin live session to top'
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant={pinned ? 'link' : 'ghost'}
+          size="icon"
+          aria-label={label}
+          disabled={pending}
+          onClick={onToggle}
+          className="shrink-0"
+        >
+          {pinned ? <DrawingPinFilledIcon className="h-4 w-4" /> : <DrawingPinIcon className="h-4 w-4" />}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  )
+}
+
 // ── Skeleton loading ───────────────────────────────────────────────────────
 
 function SkeletonRow() {
@@ -430,9 +468,11 @@ function GroupHeaderLabel({
 function SessionRow({
   session,
   animateIn,
+  pinned,
   onStop,
   onKill,
   onToggleNotifications,
+  onTogglePin,
   onRunAgain,
   onEditSession,
   notificationsPending,
@@ -441,9 +481,11 @@ function SessionRow({
 }: {
   session: SessionSummary
   animateIn?: boolean
+  pinned?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
   onToggleNotifications: (session: SessionSummary) => void
+  onTogglePin: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
   onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
@@ -619,6 +661,10 @@ function SessionRow({
                     pending={notificationsPending}
                     onToggle={() => onToggleNotifications(session)}
                   />
+                  <SessionPinButton
+                    pinned={pinned ?? false}
+                    onToggle={() => onTogglePin(session)}
+                  />
                 </>
               )}
               <Tooltip>
@@ -678,9 +724,11 @@ function SessionRow({
 function SessionCard({
   session,
   animateIn,
+  pinned,
   onStop,
   onKill,
   onToggleNotifications,
+  onTogglePin,
   onRunAgain,
   onEditSession,
   notificationsPending,
@@ -688,9 +736,11 @@ function SessionCard({
 }: {
   session: SessionSummary
   animateIn?: boolean
+  pinned?: boolean
   onStop: (id: string) => void
   onKill: (id: string) => void
   onToggleNotifications: (session: SessionSummary) => void
+  onTogglePin: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
   onEditSession: (session: SessionSummary) => void
   notificationsPending?: boolean
@@ -825,6 +875,10 @@ function SessionCard({
                 pending={notificationsPending}
                 onToggle={() => onToggleNotifications(session)}
               />
+              <SessionPinButton
+                pinned={pinned ?? false}
+                onToggle={() => onTogglePin(session)}
+              />
             </>
           )}
           <div className="flex-1"></div>
@@ -931,6 +985,9 @@ export default function SessionsPage() {
   const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
   const [loadError, setLoadError] = useState<LoadErrorState | null>(null)
+  // Pinned live sessions (browser-local only, most recently pinned first).
+  const [pinnedKeys, setPinnedKeys] = useState<string[]>(loadPinnedSessionKeys)
+  const pinnedKeySet = useMemo(() => new Set(pinnedKeys), [pinnedKeys])
   const [tableColumnSettings, setTableColumnSettings] = useState(loadSessionTableColumnSettings)
   const tableColumnSizes = tableColumnSettings.sizes
   const tableColumnOrder = tableColumnSettings.order
@@ -1164,6 +1221,10 @@ export default function SessionsPage() {
   }, [tableColumnSettings])
 
   useEffect(() => {
+    savePinnedSessionKeys(pinnedKeys)
+  }, [pinnedKeys])
+
+  useEffect(() => {
     if (!selectedNode) {
       void loadLocal()
     }
@@ -1214,6 +1275,8 @@ export default function SessionsPage() {
       if (ev.event === 'session_deleted') {
         if (!matchesSelectedNode(selectedNode, ev.data.node)) return
         removeLoadedSession(ev.data.id)
+        const deletedPinKey = sessionPinKey(ev.data.id, normalizeStoredNode(ev.data.node))
+        setPinnedKeys((prev) => prev.filter((key) => key !== deletedPinKey))
         void reloadSessions({ background: true })
         return
       }
@@ -1249,7 +1312,20 @@ export default function SessionsPage() {
   }, [reloadSessions])
 
 
-  const pagedSessions = sessions
+  // Display order: pinned live sessions first (most recently pinned topmost),
+  // then — for the default Created At sort — active sessions before finished
+  // ones (same rule as the TUI's "active first" strategy). An explicit user
+  // sort column keeps the server order below the pinned rows.
+  const pagedSessions = useMemo(
+    () =>
+      orderSessionPage(sessions, {
+        pinnedKeys,
+        node: selectedNode,
+        sortField,
+        sortOrder,
+      }),
+    [sessions, pinnedKeys, selectedNode, sortField, sortOrder]
+  )
 
   const total = remoteTotal
   const pageStart = total === 0 ? 0 : page * PAGE_SIZE + 1
@@ -1298,6 +1374,18 @@ export default function SessionsPage() {
 
   function handleEditSession(session: SessionSummary) {
     setEditingSession(session)
+  }
+
+  function isSessionPinned(session: SessionSummary): boolean {
+    return pinnedKeySet.has(sessionPinKey(session.id, selectedNode))
+  }
+
+  function handleTogglePin(session: SessionSummary) {
+    if (!sessionIsPinnable(session)) return
+    const key = sessionPinKey(session.id, selectedNode)
+    setPinnedKeys((prev) =>
+      prev.includes(key) ? prev.filter((entry) => entry !== key) : [key, ...prev]
+    )
   }
 
   function handleNodeChange(node: string | null) {
@@ -1802,9 +1890,11 @@ export default function SessionsPage() {
                       key={s.id}
                       session={s}
                       animateIn={enteringIds.has(s.id)}
+                      pinned={isSessionPinned(s)}
                       onStop={handleStop}
                       onKill={handleKill}
                       onToggleNotifications={handleToggleNotifications}
+                      onTogglePin={handleTogglePin}
                       onRunAgain={handleRunAgain}
                       onEditSession={handleEditSession}
                       notificationsPending={notificationRequestIds.has(s.id)}
@@ -1924,9 +2014,11 @@ export default function SessionsPage() {
                         key={`${s.id}:${s.status}:${s.input_needed ? 'input' : 'normal'}`}
                         session={s}
                         animateIn={enteringIds.has(s.id)}
+                        pinned={isSessionPinned(s)}
                         onStop={handleStop}
                         onKill={handleKill}
                         onToggleNotifications={handleToggleNotifications}
+                        onTogglePin={handleTogglePin}
                         onRunAgain={handleRunAgain}
                         onEditSession={handleEditSession}
                         notificationsPending={notificationRequestIds.has(s.id)}

@@ -90,7 +90,8 @@ pub(super) async fn handle_attach_subscribe(
     // Seed scrollback only for fresh interactive attaches: offset-based
     // resumes already have their terminal history, and piped attaches have no
     // terminal at all. The client only sends dimensions when interactive; the
-    // seed depth is the client's own screen height.
+    // seed depth is a fixed floor (see `attach_scrollback_seed`), not the
+    // client's screen height, so reattach keeps a deep scrollback.
     let scrollback = match (from_byte_offset, initial_rows, initial_cols) {
         (None, Some(rows), Some(_)) if rows > 0 => session_store
             .attach_scrollback_seed(&id, rows)

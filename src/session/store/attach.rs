@@ -121,11 +121,14 @@ impl SessionStore {
         ))
     }
 
-    /// Render the session's scrolled-off rows — at most `rows`, the attaching
-    /// client's screen height — for the client to print before the screen
-    /// snapshot, so the terminal scrollbar covers pre-attach history instead
-    /// of starting empty.  The visible screen is deliberately excluded: the
-    /// snapshot already covers it, and seeding it would duplicate content.
+    /// Render the session's scrolled-off rows for the client to print before
+    /// the screen snapshot, so the terminal scrollbar covers pre-attach
+    /// history instead of starting empty.  The seed depth is a fixed floor
+    /// (see [`crate::config::DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS`]), not the
+    /// attaching client's screen height: reattaching to a session with a long
+    /// transcript must not feel like the history was cut to one screenful.
+    /// The visible screen is deliberately excluded: the snapshot already
+    /// covers it, and seeding it would duplicate content.
     ///
     /// Returns `None` when there is nothing worth seeding: the session is in
     /// the alternate screen (rows that scrolled off there are not linear
@@ -137,7 +140,12 @@ impl SessionStore {
         if screen.alternate_screen() {
             return None;
         }
-        crate::session::logs::render_screen_history(screen, usize::from(rows))
+        // At least `DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS` rows when available,
+        // never more than the session retained in the first place.
+        let depth = usize::from(rows)
+            .max(crate::config::DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS)
+            .min(rt.screen_scrollback_rows);
+        crate::session::logs::render_screen_history(screen, depth)
     }
 
     /// Subscribe to resize notifications for a session.
@@ -659,6 +667,34 @@ mod tests {
         // The visible screen is covered by the attach snapshot, not the seed.
         assert!(!text.contains("history line 08"));
         assert!(!text.contains("history line 30"));
+    }
+
+    #[tokio::test]
+    async fn attach_scrollback_seed_reaches_at_least_a_thousand_rows() {
+        // 1200 lines on a 24-row screen: the trailing line feeds scroll lines
+        // 1..=1177 off the visible screen. The seed must cover 1000 of them
+        // — far beyond the attaching terminal's own screen height — so a
+        // reattach keeps deep history instead of a single screenful.
+        let mut excerpt = String::new();
+        for i in 1..=1200 {
+            excerpt.push_str(&format!("history line {i:04}\r\n"));
+        }
+        let rt = make_runtime("seeddeep", SessionStatus::Running, &excerpt, None);
+        let store = store_with(vec![rt], make_test_db().await);
+
+        let seed = store
+            .attach_scrollback_seed("seeddeep", 24)
+            .await
+            .expect("session with deep scrollback should render a seed");
+        let text = String::from_utf8_lossy(&seed);
+        // Depth floor: rows past the newest 1000 scrollback rows are dropped,
+        // the newest 1000 are all kept (scrollback holds lines 1..=1177).
+        assert!(text.contains("history line 0178"));
+        assert!(text.contains("history line 0200"));
+        assert!(text.contains("history line 1177"));
+        assert!(!text.contains("history line 0177"));
+        // The visible screen (lines 1178..=1200) is covered by the snapshot.
+        assert!(!text.contains("history line 1178"));
     }
 
     #[tokio::test]
