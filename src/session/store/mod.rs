@@ -6,6 +6,8 @@
 
 mod attach;
 mod lifecycle;
+
+pub(crate) use attach::scrollback_seed_bytes;
 mod notify;
 pub mod pump;
 mod query;

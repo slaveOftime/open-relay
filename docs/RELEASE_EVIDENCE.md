@@ -4,7 +4,7 @@ Item-by-item evidence for the PLAN §16 release checklist, for the 0.5.0
 beta line (`v0.5.x` branch; 0.3.x on `main` remains the stable default).
 Test names are exact; run any of them with
 `cargo test --locked --offline <name>`.
-Suite totals at this commit: **634 unit + 59 integration/e2e = 693 tests,
+Suite totals at this commit: **642 unit + 59 integration/e2e = 701 tests,
 0 ignored** (the M0-era ignored repro/probe tests were removed during the
 0.5.0 cleanup; their findings are recorded in the ADRs), `cargo fmt`
 clean, and **clippy is a zero-warning gate**:

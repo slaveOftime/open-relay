@@ -22,6 +22,7 @@ pub(crate) mod store;
 #[cfg(test)]
 pub(crate) use runtime::SequencedChunk;
 pub use store::pump::{AttachEvent, AttachPump, PumpCredit};
+pub(crate) use store::scrollback_seed_bytes;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

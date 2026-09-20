@@ -375,8 +375,18 @@ async fn handle_ws_streaming(
         }
     };
 
+    // Seed scrollback exactly like the native attach client does (M6
+    // scrollback-seed): the web client replays `data` into a fresh xterm,
+    // so seed+snapshot concatenation carries the terminal scrollbar back
+    // past the attach point.
+    let seed = match viewport {
+        Some((rows, _)) => state.store.attach_scrollback_seed(&id, rows).await,
+        None => None,
+    };
+    let init_data = seed_web_init_data(seed, viewport.map(|(rows, _)| rows), init.data);
+
     let init_msg = ServerMessage::Init {
-        data: init.data,
+        data: init_data,
         end_offset: init.end_offset,
         incarnation: init.incarnation,
         running: init.running,
@@ -714,6 +724,7 @@ async fn handle_ws_proxied_streaming(
                         match resp {
                             RpcResponse::AttachStreamInit {
                                 data,
+                                scrollback,
                                 end_offset,
                                 running,
                                 app_cursor_keys,
@@ -723,6 +734,14 @@ async fn handle_ws_proxied_streaming(
                                 role,
                                 ..
                             } => {
+                                // Forward the node's scrollback seed the same
+                                // way local attaches get it (see
+                                // handle_ws_streaming).
+                                let data = seed_web_init_data(
+                                    (!scrollback.is_empty()).then_some(scrollback),
+                                    initial_rows,
+                                    data,
+                                );
                                 let replay_bytes = data.len();
                                 let msg = ServerMessage::Init {
                                     data,
@@ -947,12 +966,48 @@ fn init_msg_data_len(msg: &ServerMessage) -> usize {
     }
 }
 
+/// Merge a scrollback seed into the attach init payload the way the native
+/// client writes it: seed bytes (CRLF-normalized, guaranteed scrolled off)
+/// first, then the screen snapshot. Requires a declared viewport — without
+/// the client's row count the scroll-off padding cannot be computed, so the
+/// snapshot goes out unseeded (same rule as the native attach).
+fn seed_web_init_data(seed: Option<Vec<u8>>, rows: Option<u16>, snapshot: Vec<u8>) -> Vec<u8> {
+    match (seed, rows) {
+        (Some(seed), Some(rows)) if rows > 0 && !seed.is_empty() => {
+            let mut data = crate::session::scrollback_seed_bytes(&seed, rows);
+            data.extend_from_slice(&snapshot);
+            data
+        }
+        _ => snapshot,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ServerMessage, WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED,
-        encode_server_message, panic_payload_message,
+        encode_server_message, panic_payload_message, seed_web_init_data,
     };
+
+    #[test]
+    fn web_init_data_prepends_formatted_scrollback_seed() {
+        // Seed rows scroll into history, then the snapshot repaints the
+        // screen — the same byte stream the native attach writes.
+        let data = seed_web_init_data(Some(b"old row\n".to_vec()), Some(2), b"SNAP".to_vec());
+        assert_eq!(data, b"old row\r\n\n\n\x1b[HSNAP".as_slice());
+    }
+
+    #[test]
+    fn web_init_data_skips_seed_without_viewport_or_history() {
+        // No declared rows: scroll-off padding cannot be computed.
+        let data = seed_web_init_data(Some(b"old row\n".to_vec()), None, b"SNAP".to_vec());
+        assert_eq!(data, b"SNAP".as_slice());
+        // No scrolled-off history (e.g. alternate-screen sessions).
+        let data = seed_web_init_data(None, Some(24), b"SNAP".to_vec());
+        assert_eq!(data, b"SNAP".as_slice());
+        let data = seed_web_init_data(Some(Vec::new()), Some(24), b"SNAP".to_vec());
+        assert_eq!(data, b"SNAP".as_slice());
+    }
 
     #[test]
     fn panic_payload_message_formats_static_str_payload() {
