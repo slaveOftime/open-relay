@@ -1648,7 +1648,7 @@ export default function SessionsPage() {
                 nodes={nodes}
                 selected={selectedNode}
                 onChange={handleNodeChange}
-                className="h-7 w-auto min-w-0 max-w-[40vw] grow-0 basis-auto text-xs normal-case"
+                className="h-7 w-auto min-w-0 max-w-[40vw] grow-1 basis-auto text-xs normal-case"
               />
             )}
             <div className="flex-1 min-w-0" />
@@ -1791,12 +1791,6 @@ export default function SessionsPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <NodeSelector
-                nodes={nodes}
-                selected={selectedNode}
-                onChange={handleNodeChange}
-                className="w-full"
-              />
             </div>
           </div>
 
