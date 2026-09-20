@@ -285,40 +285,49 @@ oly join start --name myserver --key a3f4c1b2... http://192.168.1.100:15443
 
 ```bash
 # 1. Generate an Ed25519 key pair if you don't already have one
-#    (this is a standard SSH private key, works with ssh-keygen tools)
+#    (only unencrypted Ed25519 OpenSSH keys are supported)
 ssh-keygen -t ed25519 -f ~/.ssh/oly_secondary -N ""
+cat ~/.ssh/oly_secondary.pub   # copy the output
 
-# 2. On the primary, fetch and register the secondary's public key
-#    Run this on the primary machine:
-oly node accept-ssh-pubkey     --name myserver     --pub-key "ssh-ed25519 AAAA..."
+# 2. On the primary, register the secondary's public key
+oly node accept-ssh-pubkey --name myserver --pub-key "ssh-ed25519 AAAA..."
 
-#    Or, let the secondary daemon push it during join (see below).
-
-# 3. On the secondary, start the join with your SSH private key
-oly join start --name myserver --ssh-key ~/.ssh/oly_secondary http://192.168.1.100:15443
-
-# 4. First time only — TOFU host key verification:
-#    The secondary connects, fetches the primary's Ed25519 host key
-#    over HTTP, and asks you to confirm the fingerprint before proceeding.
-#    The fingerprint is printed; verify it matches the primary's known key.
+# 3. On the secondary, start the join with your SSH private key.
+#    Pass --ssh-known-hosts to pin the primary's host key on first use
+#    (TOFU) and reject any later change — strongly recommended:
+oly join start --name myserver --ssh-key ~/.ssh/oly_secondary \
+    --ssh-known-hosts ~/.ssh/oly_known_hosts http://192.168.1.100:15443
 ```
+
+`oly join start --ssh-key ...` prints the node's public key line, so you can
+copy it straight into `oly node accept-ssh-pubkey` on the primary. Real
+`ssh-keygen` public key lines (as pasted above) are accepted and normalized
+automatically; only Ed25519 keys are supported.
 
 **How SSH join works under the hood:**
 
-1. The secondary daemon fetches the primary's Ed25519 host key via `GET /api/nodes/host-key` (over HTTP, before WebSocket upgrade).
-2. On first connect, the secondary shows the host key fingerprint for TOFU verification — you confirm it matches the primary's actual key.
-3. The WebSocket handshake sends a signed challenge instead of a plaintext API key:
-   - The primary sends a random nonce over the WebSocket.
-   - The secondary signs the nonce with its Ed25519 private key.
-   - The primary verifies the signature against the registered public key.
-4. This eliminates cleartext key exposure and provides MITM protection via the verified host key.
+1. The secondary opens the WebSocket and sends `get_host_key`. The primary
+   replies with its Ed25519 host key plus a fresh random nonce *signed by
+   the host key* — the secondary refuses to send any credentials unless
+   that self-signature verifies, and (when `--ssh-known-hosts` is given)
+   the host key must match the pinned entry, or the join aborts (MITM
+   protection). Unknown hosts are pinned on first use (TOFU).
+2. The secondary then signs the challenge with its Ed25519 private key.
+   The signed payload covers a domain tag, the claimed node **name**, the
+   primary's **per-connection nonce** (so a captured handshake cannot be
+   replayed) and the signer's **public key** — no plaintext secret ever
+   crosses the wire.
+3. The primary checks that the signature covers the nonce it issued on
+   *this* connection and verifies against the registered public key.
+
+The primary's host key pair lives in its state dir (`ssh_host_key` /
+`ssh_host_key.pub`) and is also exposed at `GET /api/nodes/host-key`.
 
 **Combined steps for a typical pair:**
 
 ```bash
 # --- On the primary ---
 oly daemon start
-oly api-key add myserver
 
 # --- On the secondary ---
 ssh-keygen -t ed25519 -f ~/.ssh/oly_secondary -N ""
@@ -328,9 +337,8 @@ cat ~/.ssh/oly_secondary.pub   # copy the output
 oly node accept-ssh-pubkey --name myserver --pub-key "ssh-ed25519 AAAA..."
 
 # On the secondary:
-oly join start --name myserver --ssh-key ~/.ssh/oly_secondary http://192.168.1.100:15443
-
-# Verify the host key fingerprint shown on first connect
+oly join start --name myserver --ssh-key ~/.ssh/oly_secondary \
+    --ssh-known-hosts ~/.ssh/oly_known_hosts http://192.168.1.100:15443
 ```
 
 **Reverse direction (secondary→primary commands):**

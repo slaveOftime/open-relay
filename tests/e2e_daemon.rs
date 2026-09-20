@@ -411,6 +411,371 @@ fn e2e_daemon_supports_bind_override() {
 }
 
 #[test]
+fn e2e_federation_ssh_key_join_handshake() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ed25519_dalek::Signer as _;
+
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_fed_ssh_handshake");
+    let port = pick_free_port();
+    let _daemon = start_daemon_http(&tmp, port);
+
+    // Generate the secondary's Ed25519 SSH key and register its public key
+    // on the primary using a real OpenSSH-format key line.
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    let node_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let canonical_pub = format!("ssh-ed25519 {}", B64.encode(node_key.verifying_key().as_bytes()));
+    let keypair = ssh_key::private::Ed25519Keypair {
+        private: ssh_key::private::Ed25519PrivateKey::from_bytes(&seed),
+        public: ssh_key::public::Ed25519PublicKey(*node_key.verifying_key().as_bytes()),
+    };
+    let private =
+        ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "e2e")
+            .expect("build ssh private key");
+    let openssh_pub = private.public_key().to_openssh().expect("openssh public key line");
+
+    let accept = oly_cmd(&tmp)
+        .args(["node", "accept-ssh-pubkey", "-n", "worker1", "-k", &openssh_pub])
+        .output()
+        .expect("`oly node accept-ssh-pubkey` failed to execute");
+    assert!(
+        accept.status.success(),
+        "`oly node accept-ssh-pubkey` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    rt.block_on(async {
+        let ws_url = format!("ws://127.0.0.1:{port}/api/nodes/join");
+
+        // Helper: fetch the host-key challenge from a fresh connection.
+        async fn fetch_challenge(
+            ws_url: &str,
+        ) -> (
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            Vec<u8>,
+            String,
+            String,
+        ) {
+            let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+                .await
+                .expect("connect websocket");
+            ws.send(node_ws_json_frame(json!({"type": "get_host_key"})))
+                .await
+                .expect("send get_host_key");
+            let frame = timeout(Duration::from_secs(2), ws.next())
+                .await
+                .expect("timed out waiting for host key")
+                .expect("websocket closed")
+                .expect("websocket read failed");
+            let json = expect_node_ws_json(frame, "host key response");
+            assert_eq!(
+                json.get("type").and_then(|v| v.as_str()),
+                Some("host_key"),
+                "expected host_key, got: {json}"
+            );
+            let nonce = B64.decode(json["nonce"].as_str().expect("nonce")).expect("nonce base64");
+            (
+                ws,
+                nonce,
+                json["public_key"].as_str().expect("public_key").to_string(),
+                json["host_signature"].as_str().expect("host_signature").to_string(),
+            )
+        }
+
+        // Helper: sign the join payload for `name` over the given nonce.
+        fn join_signature(node_key: &ed25519_dalek::SigningKey, name: &str, nonce: &[u8], pubkey: &str) -> String {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(b"oly-node-join-v1");
+            payload.extend_from_slice(name.as_bytes());
+            payload.extend_from_slice(nonce);
+            payload.extend_from_slice(pubkey.as_bytes());
+            B64.encode(node_key.sign(&payload).to_bytes())
+        }
+
+        // The primary's host key response must appear at GET /api/nodes/host-key too.
+        let hk = reqwest::get(format!("http://127.0.0.1:{port}/api/nodes/host-key"))
+            .await
+            .expect("GET /api/nodes/host-key")
+            .text()
+            .await
+            .expect("read host key body");
+
+        // ── Happy path: challenge → verified join ─────────────────────────
+        let (mut ws, nonce, host_public_key, host_signature) = fetch_challenge(&ws_url).await;
+        assert!(hk.contains(&host_public_key), "host-key endpoint disagrees with WS challenge: {hk} vs {host_public_key}");
+
+        // Verify the primary's self-signature over the challenge nonce.
+        let host_pub_raw = B64.decode(
+            host_public_key
+                .strip_prefix("ssh-ed25519 ")
+                .expect("canonical host key"),
+        )
+        .expect("host key base64");
+        let host_pub_bytes = <[u8; 32]>::try_from(host_pub_raw.as_slice()).expect("host key length");
+        let host_verifying = ed25519_dalek::VerifyingKey::from_bytes(&host_pub_bytes)
+            .expect("host verifying key");
+        let mut challenge_payload = Vec::new();
+        challenge_payload.extend_from_slice(b"oly-host-challenge-v1");
+        challenge_payload.extend_from_slice(&nonce);
+        host_verifying
+            .verify_strict(
+                &challenge_payload,
+                &ed25519_dalek::Signature::from_slice(&B64.decode(&host_signature).expect("sig b64"))
+                    .expect("sig length"),
+            )
+            .expect("host key self-signature must verify");
+
+        // Join using a signature over the fresh challenge.
+        let signature = join_signature(&node_key, "worker1", &nonce, &canonical_pub);
+        ws.send(node_ws_json_frame(json!({
+            "type": "join",
+            "name": "worker1",
+            "auth": {"method": "ssh_key", "signature": signature, "public_key": openssh_pub},
+        })))
+        .await
+        .expect("send ssh join");
+        let frame = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out waiting for join response")
+            .expect("websocket closed")
+            .expect("websocket read failed");
+        let json = expect_node_ws_json(frame, "ssh join response");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("joined"),
+            "expected joined for ssh-key worker1, got: {json}"
+        );
+        drop(ws);
+
+        // ── Replay 1: Join with a valid signature but no challenge issued ─
+        let (mut ws_replay, _, _, _) = fetch_challenge(&ws_url).await;
+        // Use the ORIGINAL (stale) nonce's signature on a connection whose
+        // challenge we ignore — the primary must reject it.
+        ws_replay
+            .send(node_ws_json_frame(json!({
+                "type": "join",
+                "name": "worker1",
+                "auth": {"method": "ssh_key", "signature": join_signature(&node_key, "worker1", &nonce, &canonical_pub), "public_key": openssh_pub},
+            })))
+            .await
+            .expect("send replayed join");
+        // The connection that was pending a Join answer replies to the Join
+        // (the earlier get_host_key was already answered) — expect rejection.
+        let frame = timeout(Duration::from_secs(2), ws_replay.next())
+            .await
+            .expect("timed out waiting for replay response")
+            .expect("websocket closed")
+            .expect("websocket read failed");
+        let json = expect_node_ws_json(frame, "replayed join response");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("error"),
+            "replay with stale nonce must be rejected, got: {json}"
+        );
+        drop(ws_replay);
+
+        // ── Replay 2: Join without any challenge at all ───────────────────
+        let (mut ws_direct, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .expect("connect websocket");
+        ws_direct
+            .send(node_ws_json_frame(json!({
+                "type": "join",
+                "name": "worker1",
+                "auth": {"method": "ssh_key", "signature": join_signature(&node_key, "worker1", &nonce, &canonical_pub), "public_key": openssh_pub},
+            })))
+            .await
+            .expect("send unchallenged join");
+        let frame = timeout(Duration::from_secs(2), ws_direct.next())
+            .await
+            .expect("timed out waiting for unchallenged join response")
+            .expect("websocket closed")
+            .expect("websocket read failed");
+        let json = expect_node_ws_json(frame, "unchallenged join response");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("error"),
+            "join without challenge must be rejected, got: {json}"
+        );
+        drop(ws_direct);
+
+        // ── Name substitution: signature bound to "worker1" used for "victim" ──
+        let (mut ws_sub, nonce2, _, _) = fetch_challenge(&ws_url).await;
+        ws_sub
+            .send(node_ws_json_frame(json!({
+                "type": "join",
+                "name": "victim",
+                "auth": {"method": "ssh_key", "signature": join_signature(&node_key, "worker1", &nonce2, &canonical_pub), "public_key": openssh_pub},
+            })))
+            .await
+            .expect("send name-substituted join");
+        let frame = timeout(Duration::from_secs(2), ws_sub.next())
+            .await
+            .expect("timed out waiting for substituted join response")
+            .expect("websocket closed")
+            .expect("websocket read failed");
+        let json = expect_node_ws_json(frame, "name-substituted join response");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("error"),
+            "signature bound to another name must be rejected, got: {json}"
+        );
+        drop(ws_sub);
+
+        // ── Unregistered key: valid signature, key not in registry ────────
+        let mut other_seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut other_seed);
+        let other_key = ed25519_dalek::SigningKey::from_bytes(&other_seed);
+        let other_pub = format!("ssh-ed25519 {}", B64.encode(other_key.verifying_key().as_bytes()));
+        let (mut ws_unreg, nonce3, _, _) = fetch_challenge(&ws_url).await;
+        ws_unreg
+            .send(node_ws_json_frame(json!({
+                "type": "join",
+                "name": "worker9",
+                "auth": {"method": "ssh_key", "signature": join_signature(&other_key, "worker9", &nonce3, &other_pub), "public_key": other_pub},
+            })))
+            .await
+            .expect("send unregistered-key join");
+        let frame = timeout(Duration::from_secs(2), ws_unreg.next())
+            .await
+            .expect("timed out waiting for unregistered join response")
+            .expect("websocket closed")
+            .expect("websocket read failed");
+        let json = expect_node_ws_json(frame, "unregistered join response");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("error"),
+            "unregistered ssh key must be rejected, got: {json}"
+        );
+        drop(ws_unreg);
+    });
+}
+
+#[test]
+fn e2e_federation_ssh_key_join_lifecycle() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let primary_tmp = make_tmp_dir("e2e_fed_ssh_lifecycle_primary");
+    let secondary_tmp = make_tmp_dir("e2e_fed_ssh_lifecycle_secondary");
+    let port = pick_free_port();
+
+    let _primary = start_daemon_http(&primary_tmp, port);
+    let secondary = start_daemon(&secondary_tmp);
+
+    // Generate the secondary's SSH key and write an OpenSSH private key file.
+    let mut seed = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    let node_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let keypair = ssh_key::private::Ed25519Keypair {
+        private: ssh_key::private::Ed25519PrivateKey::from_bytes(&seed),
+        public: ssh_key::public::Ed25519PublicKey(*node_key.verifying_key().as_bytes()),
+    };
+    let private =
+        ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "e2e")
+            .expect("build ssh private key");
+    let key_path = secondary_tmp.join("node_ed25519");
+    std::fs::write(&key_path, private.to_openssh(ssh_key::LineEnding::LF).expect("to_openssh").as_bytes())
+        .expect("write node key file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Register the public key on the primary.
+    let accept = oly_cmd(&primary_tmp)
+        .args([
+            "node",
+            "accept-ssh-pubkey",
+            "-n",
+            "worker1",
+            "-k",
+            &private.public_key().to_openssh().expect("openssh pub"),
+        ])
+        .output()
+        .expect("`oly node accept-ssh-pubkey` failed to execute");
+    assert!(
+        accept.status.success(),
+        "`oly node accept-ssh-pubkey` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+
+    // Join with SSH key auth and a known_hosts file for TOFU pinning.
+    let known_hosts = secondary_tmp.join("known_hosts");
+    let join = oly_cmd(&secondary_tmp)
+        .args([
+            "join",
+            "start",
+            "--name",
+            "worker1",
+            "--ssh-key",
+            &key_path.to_string_lossy(),
+            "--ssh-known-hosts",
+            &known_hosts.to_string_lossy(),
+            &format!("http://127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("`oly join start` failed to execute");
+    assert!(
+        join.status.success(),
+        "`oly join start` exited non-zero.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&join.stdout),
+        String::from_utf8_lossy(&join.stderr)
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let connected = rt.block_on(wait_for_node_connected(port, "worker1", 10));
+    assert!(
+        connected,
+        "worker1 did not appear in /api/nodes after ssh-key join start"
+    );
+
+    // The primary host key must have been pinned on first use.
+    let pinned = std::fs::read_to_string(&known_hosts).expect("read pinned known_hosts");
+    assert!(
+        pinned.starts_with("127.0.0.1 ssh-ed25519 "),
+        "expected pinned host key entry, got: {pinned}"
+    );
+
+    // A second join attempt with a mismatched known_hosts pin must fail:
+    // overwrite the pin with garbage and verify the node cannot rejoin.
+    std::fs::write(&known_hosts, "127.0.0.1 ssh-ed25519 AAAABADKEY\n").expect("poison known_hosts");
+    let stop = oly_cmd(&secondary_tmp)
+        .args(["join", "stop", "--name", "worker1"])
+        .output()
+        .expect("`oly join stop` failed to execute");
+    assert!(stop.status.success(), "`oly join stop` failed");
+    let disconnected = rt.block_on(wait_for_no_nodes(port, 10));
+    assert!(disconnected, "worker1 did not disconnect after join stop");
+
+    let rejoin = oly_cmd(&secondary_tmp)
+        .args([
+            "join",
+            "start",
+            "--name",
+            "worker1",
+            "--ssh-key",
+            &key_path.to_string_lossy(),
+            "--ssh-known-hosts",
+            &known_hosts.to_string_lossy(),
+            &format!("http://127.0.0.1:{port}"),
+        ])
+        .output()
+        .expect("`oly join start` (rejoin) failed to execute");
+    assert!(rejoin.status.success(), "rejoin command accepted (connector fails async; check below)");
+
+    let rejoined = rt.block_on(wait_for_node_connected(port, "worker1", 3));
+    assert!(
+        !rejoined,
+        "worker1 re-joined despite mismatched known_hosts pin (MITM protection broken)"
+    );
+
+    drop(secondary);
+}
+
+#[test]
 fn e2e_federation_primary_secondary_full_lifecycle() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 

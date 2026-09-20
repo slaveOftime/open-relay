@@ -727,14 +727,7 @@ async fn handle_join_start(
     ssh_key_path: Option<String>,
     ssh_known_hosts: Option<String>,
 ) -> Result<RpcResponse> {
-    let join = client::join::JoinConfig {
-        name: name.clone(),
-        primary_url: url,
-        api_key: key,
-        ssh_key_path,
-        ssh_public_key: None,
-        ssh_known_hosts,
-    };
+    let join = client::join::build_join_config(url, name.clone(), key, ssh_key_path, ssh_known_hosts)?;
     client::join::save_join_config(config, &join)?;
     let (abort, stop_tx) =
         spawn_join_connector(join, Arc::clone(config), session_event_tx.subscribe());

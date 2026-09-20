@@ -162,12 +162,14 @@ pub enum NodeJoinAuth {
     ApiKey {
         key: String,
     },
-    /// Authenticate with an SSH key signature.
-    /// The `nonce` is a random value sent by the primary,
-    /// and `signature` is the SSH-format signature of the nonce.
+    /// Authenticate with an Ed25519 SSH key signature over the challenge
+    /// nonce issued by the primary on this connection (see `sshauth`):
+    /// `sign("oly-node-join-v1" || name || nonce || public_key)`.
+    /// A `get_host_key` exchange must precede this message.
     SshKey {
-        nonce: String,
+        /// Base64 raw 64-byte Ed25519 signature.
         signature: String,
+        /// The signer's public key (canonical or OpenSSH format).
         public_key: String,
     },
 }
@@ -641,9 +643,16 @@ pub enum NodeWsMessage {
         auth: NodeJoinAuth,
     },
 
-    /// Primary → Secondary: provides its SSH host key for verification.
+    /// Primary → Secondary: host-key proof and join challenge. The primary
+    /// signs `"oly-host-challenge-v1" || nonce` with its Ed25519 host key,
+    /// proving ownership on this very connection and issuing a fresh nonce
+    /// that the secondary must sign to complete SSH-key authentication.
     HostKey {
         public_key: String,
+        /// Base64 random challenge nonce (32 bytes).
+        nonce: String,
+        /// Base64 raw 64-byte Ed25519 signature over the challenge payload.
+        host_signature: String,
     },
 
     /// Secondary → Primary: request the primary's SSH host key (before handshake).
@@ -778,6 +787,48 @@ mod tests {
                     NodeJoinAuth::ApiKey { key } => assert_eq!(key, "secret"),
                     other => panic!("unexpected auth: {other:?}"),
                 }
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_ws_host_key_and_ssh_auth_round_trip() {
+        let host_key = NodeWsMessage::HostKey {
+            public_key: "ssh-ed25519 AAAA".into(),
+            nonce: "AAEC".into(),
+            host_signature: "xyz".into(),
+        };
+        let payload = encode_node_ws_payload(&host_key).expect("encode payload");
+        match decode_node_ws_payload(&payload).expect("decode payload") {
+            NodeWsMessage::HostKey {
+                public_key,
+                nonce,
+                host_signature,
+            } => {
+                assert_eq!(public_key, "ssh-ed25519 AAAA");
+                assert_eq!(nonce, "AAEC");
+                assert_eq!(host_signature, "xyz");
+            }
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+
+        let join = NodeWsMessage::Join {
+            name: "worker-b".into(),
+            auth: NodeJoinAuth::SshKey {
+                signature: "sig".into(),
+                public_key: "ssh-ed25519 AAAA".into(),
+            },
+        };
+        let payload = encode_node_ws_payload(&join).expect("encode payload");
+        match decode_node_ws_payload(&payload).expect("decode payload") {
+            NodeWsMessage::Join {
+                name,
+                auth: NodeJoinAuth::SshKey { signature, public_key },
+            } => {
+                assert_eq!(name, "worker-b");
+                assert_eq!(signature, "sig");
+                assert_eq!(public_key, "ssh-ed25519 AAAA");
             }
             other => panic!("unexpected decoded message: {other:?}"),
         }

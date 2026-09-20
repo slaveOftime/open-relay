@@ -291,11 +291,11 @@ Supported key forms include:
 - Requests the local daemon to connect to the primary using API key authentication.
 - If the daemon is not running, the saved join config remains and will be used on the next daemon start.
 
-### `oly join start --name <name> --ssh-key <key-path> <url>`
+### `oly join start --name <name> --ssh-key <key-path> [--ssh-known-hosts <path>] <url>`
 
-- Connects using SSH key authentication instead of a plaintext API key.
-- The primary's host key is fetched over HTTP and verified on first connect (TOFU).
-- The private key signs a nonce during the WebSocket handshake for MITM protection.
+- Connects using SSH key authentication instead of a plaintext API key (only unencrypted Ed25519 OpenSSH keys are supported).
+- The primary issues a fresh challenge nonce over the WebSocket, signed by its own Ed25519 host key; the secondary aborts unless that signature verifies, and the host key must match the `--ssh-known-hosts` pin when given (unknown hosts are pinned on first use, TOFU).
+- The node's private key signs a payload covering the node name, the challenge nonce and its public key, so credentials are never sent in cleartext and captured handshakes cannot be replayed.
 
 ### `oly join stop --name <name>`
 
@@ -312,6 +312,10 @@ Supported key forms include:
 ### `oly node ls`
 
 - Lists currently connected secondary nodes on the primary daemon.
+
+### `oly node accept-ssh-pubkey --name <name> --pub-key <KEY>`
+
+- Registers an Ed25519 SSH public key (an `ssh-keygen`-style OpenSSH line or the canonical `ssh-ed25519 <base64>` form) as allowed to join as the named secondary node.
 
 ---
 

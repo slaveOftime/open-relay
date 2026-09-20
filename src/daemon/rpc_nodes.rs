@@ -95,62 +95,103 @@ async fn connect_and_relay(
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-    // ── Step 1: fetch and verify host key for SSH auth ──
+    // ── Step 1: SSH-key authentication — fetch host key, receive the
+    // primary's signed challenge, verify the host, then sign the join.
     let host = join.primary_url
         .strip_prefix("http://")
         .or_else(|| join.primary_url.strip_prefix("https://"))
-        .and_then(|u| u.split(':').next())
+        .and_then(|u| u.split('/').next())
+        .map(|authority| {
+            let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            // Strip a trailing :port unless that would break an IPv6 literal.
+            match authority.rsplit_once(':') {
+                Some((h, port)) if !h.is_empty() && port.parse::<u16>().is_ok() => h,
+                _ => authority,
+            }
+        })
         .unwrap_or("localhost");
 
     let auth = if let Some(ssh_key_path) = &join.ssh_key_path {
-        // SSH key authentication with MITM protection
-        let ssh_public_key = join.ssh_public_key
-            .clone()
-            .unwrap_or_else(|| "".to_string());
+        let signing_key = crate::sshauth::load_signing_key(std::path::Path::new(ssh_key_path))
+            .map_err(|e| crate::error::AppError::Protocol(format!("ssh key auth: {e}")))?;
+        let public_key = crate::sshauth::public_key_line(&signing_key);
 
-        // Fetch the primary's host key
-        let fetched_host_key = crate::client::join::fetch_host_key(&join.primary_url).await
-            .map_err(|e| crate::error::AppError::Protocol(format!("host key fetch failed: {e}")))?;
+        // Request the host-key challenge from the primary.
+        let challenge_req = NodeWsMessage::GetHostKey;
+        ws_tx
+            .send(WsMessage::Binary(encode_node_ws_payload(&challenge_req)?.into()))
+            .await
+            .map_err(|e| crate::error::AppError::Protocol(format!("host key request failed: {e}")))?;
 
-        // Verify host key against known_hosts (TOFU if not configured)
-        if !crate::client::join::check_host_key(
-            join.ssh_known_hosts.as_deref(),
-            host,
-            &fetched_host_key,
+        let (host_public_key, nonce, host_signature) = match ws_rx.next().await {
+            Some(Ok(frame)) => match decode_node_message(frame) {
+                Ok(NodeWsMessage::HostKey { public_key, nonce, host_signature }) => {
+                    (public_key, nonce, host_signature)
+                }
+                Ok(NodeWsMessage::Error { message }) => {
+                    return Err(crate::error::AppError::Protocol(format!(
+                        "host key challenge rejected: {message}"
+                    )));
+                }
+                Ok(_) => {
+                    return Err(crate::error::AppError::Protocol(
+                        "unexpected response to get_host_key".into(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(crate::error::AppError::Protocol(format!(
+                        "invalid host key challenge: {e}"
+                    )));
+                }
+            },
+            _ => {
+                return Err(crate::error::AppError::Protocol(
+                    "no response to get_host_key".into(),
+                ));
+            }
+        };
+
+        let nonce_bytes = crate::sshauth::b64_decode(&nonce)
+            .map_err(|e| crate::error::AppError::Protocol(format!("invalid challenge nonce: {e}")))?;
+        let nonce: [u8; crate::sshauth::NONCE_LEN] = nonce_bytes.try_into().map_err(|_| {
+            crate::error::AppError::Protocol("challenge nonce has unexpected length".into())
+        })?;
+
+        // The primary must prove ownership of its host key *on this
+        // connection*. Abort before sending any credentials if not.
+        if !crate::sshauth::verify_signature(
+            &host_public_key,
+            &host_signature,
+            &crate::sshauth::host_challenge_payload(&nonce),
         ) {
-            return Err(crate::error::AppError::Protocol(
-                format!("host key verification failed for {host}; known_hosts mismatch or key not accepted"),
-            ));
+            return Err(crate::error::AppError::Protocol(format!(
+                "host key self-signature for {host} is invalid; aborting before credentials are sent"
+            )));
         }
 
-        // Generate a random nonce for challenge-response
-        let nonce: [u8; 32] = rand::random();
-        let nonce_hex = base64::encode(&nonce);
-
-        // Sign: nonce + public_key to bind the signature to this specific join attempt
-        let mut signed_data = Vec::with_capacity(32 + ssh_public_key.len());
-        signed_data.extend_from_slice(&nonce);
-        signed_data.extend_from_slice(ssh_public_key.as_bytes());
-
-        let signature = crate::client::join::sign_ssh_data(
-            std::path::Path::new(ssh_key_path),
-            &signed_data,
-        ).map_err(|e| crate::error::AppError::Protocol(format!("ssh signing failed: {e}")))?;
-
-        // Optionally append the host key to known_hosts
+        // Pin/verify the host key against known_hosts (TOFU on first use).
         if let Some(kh_path) = &join.ssh_known_hosts {
-            let _ = crate::client::join::append_known_hosts(
-                std::path::Path::new(kh_path),
-                host,
-                &fetched_host_key,
-            );
+            let kh = std::path::Path::new(kh_path);
+            match crate::sshauth::lookup_known_hosts(kh, host, &host_public_key) {
+                crate::sshauth::HostKeyStatus::Match => {}
+                crate::sshauth::HostKeyStatus::Unknown => {
+                    info!(node = %join.name, %host, "trust-on-first-use: pinning primary host key");
+                    let _ = crate::sshauth::append_known_hosts(kh, host, &host_public_key);
+                }
+                crate::sshauth::HostKeyStatus::Mismatch => {
+                    return Err(crate::error::AppError::Protocol(format!(
+                        "host key verification failed for {host}: key mismatch in {kh_path} (possible MITM)"
+                    )));
+                }
+            }
         }
 
-        NodeJoinAuth::SshKey {
-            nonce: nonce_hex,
-            signature,
-            public_key: ssh_public_key,
-        }
+        // Sign the challenge: binds protocol, node name, the primary's
+        // fresh per-connection nonce, and our key.
+        let payload = crate::sshauth::node_join_payload(&join.name, &nonce, &public_key);
+        let signature = crate::sshauth::sign_b64(&signing_key, &payload);
+
+        NodeJoinAuth::SshKey { signature, public_key }
     } else {
         // API key authentication
         NodeJoinAuth::ApiKey {
@@ -540,7 +581,13 @@ pub(super) async fn handle_node_accept_ssh_pubkey(
     public_key: String,
     db: &Arc<Database>,
 ) -> RpcResponse {
-    if let Err(e) = db.insert_ssh_key_entry(&name, &public_key).await {
+    // Validate and normalize the key so lookups at join time (which use the
+    // canonical form) always match, regardless of how the key was pasted in.
+    let canonical = match crate::sshauth::normalize_public_key(&public_key) {
+        Ok(key) => key,
+        Err(e) => return RpcResponse::Error { message: e.to_string() },
+    };
+    if let Err(e) = db.insert_ssh_key_entry(&name, &canonical).await {
         return RpcResponse::Error {
             message: format!("failed to register SSH key: {e}"),
         };

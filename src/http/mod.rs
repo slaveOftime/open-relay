@@ -53,63 +53,78 @@ pub struct AppState {
     pub ssh_host_key: SshHostKey,
 }
 
-/// SSH host key pair: the primary presents its public key to secondaries
-/// so they can verify its identity and prevent MITM attacks.
+/// SSH host key pair: the primary proves ownership of this Ed25519 key on
+/// every node-join handshake (host-key challenge), so secondaries can
+/// authenticate the primary and pin its key via known_hosts.
 #[derive(Clone)]
 pub struct SshHostKey {
-    pub public_key: String,  // e.g. "ssh-ed25519 AAAA..."
-    pub private_key_path: std::path::PathBuf,
-
-    pub private_key: Vec<u8>,
+    /// Canonical public key line: "ssh-ed25519 <base64(raw32)>".
+    public_key: String,
+    /// 32-byte Ed25519 private key seed (empty when disabled).
+    seed: Vec<u8>,
 }
 
 impl SshHostKey {
-    /// Generate a new Ed25519 SSH host key or load an existing one.
-    /// Keys are stored as `ssh_host_key` (private, 0600) and `ssh_host_key.pub` (public).
+    /// A host key that cannot sign anything — used when HTTP is disabled or
+    /// key generation failed; SSH-key joins are then rejected.
+    pub fn disabled() -> Self {
+        SshHostKey {
+            public_key: String::new(),
+            seed: Vec::new(),
+        }
+    }
+
+    pub fn public_key(&self) -> &str {
+        &self.public_key
+    }
+
+    /// The host signing key, if this host key is usable.
+    pub fn signing_key(&self) -> Option<ed25519_dalek::SigningKey> {
+        let seed = <[u8; 32]>::try_from(self.seed.as_slice()).ok()?;
+        Some(ed25519_dalek::SigningKey::from_bytes(&seed))
+    }
+
+    /// Generate a new Ed25519 host key or load an existing one.
+    /// The seed is stored as `ssh_host_key` (0600) and the canonical public
+    /// key line as `ssh_host_key.pub`.
     pub async fn create_or_load(state_dir: &std::path::Path) -> std::io::Result<Self> {
         let key_path = state_dir.join("ssh_host_key");
         let pub_path = state_dir.join("ssh_host_key.pub");
 
-        // Try loading existing key
-        if key_path.exists() {
-            let private_key = tokio::fs::read(&key_path).await?;
-            let public_key = tokio::fs::read_to_string(&pub_path).await?;
-            return Ok(SshHostKey {
-                public_key: public_key.trim().to_string(),
-                private_key_path: key_path,
-                private_key,
-            });
-        }
+        let seed = if key_path.exists() {
+            let seed = tokio::fs::read(&key_path).await?;
+            if seed.len() != 32 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("host key {} has unexpected length {}", key_path.display(), seed.len()),
+                ));
+            }
+            seed
+        } else {
+            // Generate new Ed25519 key pair (raw 32-byte seed).
+            let mut csprng = rand::rngs::OsRng;
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+            let seed = signing_key.to_bytes().to_vec();
 
-        // Generate new Ed25519 key pair
-        let mut csprng = rand::rngs::OsRng;
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
-        let verifying_key = signing_key.verifying_key();
+            // Write private seed (user-only) and public key line.
+            tokio::fs::write(&key_path, &seed).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            }
+            seed
+        };
 
-        // Serialize private key to bytes (32-byte seed)
-        let private_bytes = signing_key.to_bytes().to_vec();
+        // Always derive the public key from the seed so the in-memory value
+        // and the .pub file stay consistent with the private key.
+        let arr = <[u8; 32]>::try_from(seed.as_slice())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad seed"))?;
+        let public_key =
+            crate::sshauth::public_key_line(&ed25519_dalek::SigningKey::from_bytes(&arr));
+        tokio::fs::write(&pub_path, format!("{public_key}\n")).await?;
 
-        // Format public key in OpenSSH format: "ssh-ed25519 <base64>"
-        let public_bytes = verifying_key.as_bytes();
-        let public_key_str = format!("ssh-ed25519 {}", base64::encode(public_bytes));
-
-        // Write private key (user-only)
-        tokio::fs::write(&key_path, &private_bytes).await?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(&key_path, perms);
-        }
-
-        // Write public key
-        tokio::fs::write(&pub_path, &public_key_str).await?;
-
-        Ok(SshHostKey {
-            public_key: public_key_str,
-            private_key_path: key_path,
-            private_key: private_bytes,
-        })
+        Ok(SshHostKey { public_key, seed })
     }
 }
 

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use std::{fmt::Write as _, fs::File, path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use interprocess::local_socket::traits::tokio::Listener as _;
@@ -619,22 +617,12 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let auth_state = auth_hash.map(AuthState::new);
     let ssh_host_key = if no_http {
         // HTTP disabled — no host key needed, use placeholder.
-        http::SshHostKey {
-            public_key: "".to_string(),
-            private_key_path: PathBuf::new(),
-            private_key: vec![],
-        }
+        http::SshHostKey::disabled()
     } else {
         http::SshHostKey::create_or_load(&config.state_dir)
             .await
-            .unwrap_or_else(|e| {
-                warn!(%e, "failed to create SSH host key, node joins will be rejected");
-                http::SshHostKey {
-                    public_key: "".to_string(),
-                    private_key_path: PathBuf::new(),
-                    private_key: vec![],
-                }
-            })
+            .inspect_err(|e| warn!(%e, "failed to create SSH host key, SSH-key node joins will be rejected"))
+            .unwrap_or_else(|_| http::SshHostKey::disabled())
     };
     if !no_http {
         let http_state = http::AppState {

@@ -11,6 +11,7 @@ mod node;
 mod notification;
 mod protocol;
 mod session;
+mod sshauth;
 mod storage;
 mod terminal;
 mod terminal_guards;
