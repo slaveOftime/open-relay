@@ -142,8 +142,62 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
     let mut last_refresh = Instant::now();
     let mut last_draw = Instant::now();
     let mut redraw = true;
+    // Refreshes run on a spawned task so a slow daemon/node response never
+    // stalls input handling; results come back through this channel.
+    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Result<SessionRefresh>>(1);
+    let mut refresh_in_flight = false;
 
-    loop {
+    'input: loop {
+        // Wait briefly for the next event, then drain everything already
+        // queued before drawing: a fast typing burst (or paste) is applied
+        // as one batch and rendered with a single frame instead of one
+        // frame per keystroke.
+        let mut events = Vec::new();
+        if let Some(event) = read_terminal_event(INPUT_POLL_INTERVAL)? {
+            events.push(event);
+            drain_pending_events(&mut events)?;
+        }
+        for event in events {
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    match route_key(&mut app, key, list_node) {
+                        AppAction::None => {}
+                        AppAction::Quit => break 'input,
+                        AppAction::OpenInline => {
+                            open_selected_inline(&mut terminal, &mut app, None)?
+                        }
+                        AppAction::Start(launch) => {
+                            start_clone(config, &mut terminal, &mut app, launch).await?
+                        }
+                        AppAction::Update(update) => update_session(config, &mut app, update).await,
+                        AppAction::Stop(target) => stop_session(config, &mut app, target),
+                    }
+                    redraw = true;
+                }
+                Event::Resize(_, _) => redraw = true,
+                _ => {}
+            }
+        }
+
+        if last_refresh.elapsed() >= REFRESH_INTERVAL && !refresh_in_flight {
+            refresh_in_flight = true;
+            last_refresh = Instant::now();
+            let tx = refresh_tx.clone();
+            let config = config.clone();
+            let query = query.clone();
+            let targets = targets.clone();
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(fetch_sessions(&config, query, &targets).await)
+                    .await;
+            });
+        }
+        while let Ok(result) = refresh_rx.try_recv() {
+            refresh_in_flight = false;
+            apply_refresh(&mut app, &query, result);
+            redraw = true;
+        }
+
         // Effects (attention pulse, fade-ins) need a faster frame cadence;
         // the idle list ticks over at the slower refresh rate.
         let redraw_interval = if app.effects.is_running() {
@@ -156,51 +210,38 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
             last_draw = Instant::now();
             redraw = false;
         }
-
-        match read_terminal_event(INPUT_POLL_INTERVAL)? {
-            Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
-                match route_key(&mut app, key, list_node) {
-                    AppAction::None => {}
-                    AppAction::Quit => break,
-                    AppAction::OpenInline => open_selected_inline(&mut terminal, &mut app, None)?,
-                    AppAction::Start(launch) => {
-                        start_clone(config, &mut terminal, &mut app, launch).await?
-                    }
-                    AppAction::Update(update) => update_session(config, &mut app, update).await,
-                    AppAction::Stop(target) => stop_session(config, &mut app, target),
-                }
-                redraw = true;
-            }
-            Some(Event::Resize(_, _)) => redraw = true,
-            _ => {}
-        }
-
-        if last_refresh.elapsed() >= REFRESH_INTERVAL {
-            match fetch_sessions(config, query.clone(), &targets).await {
-                Ok(mut refresh) => {
-                    refresh.sessions.extend(
-                        app.sessions
-                            .iter()
-                            .filter(|session| refresh.failed_nodes.contains(&session.node))
-                            .cloned(),
-                    );
-                    refresh
-                        .sessions
-                        .sort_by_key(|session| std::cmp::Reverse(session.created_at));
-                    refresh.sessions.truncate(query.limit);
-                    let warning = refresh.warning();
-                    app.replace_sessions(refresh.sessions);
-                    app.set_refresh_message(warning);
-                }
-                Err(error) => app.set_refresh_message(Some(format!("sync lost: {error}"))),
-            }
-            last_refresh = Instant::now();
-            redraw = true;
-        }
     }
 
     terminal.teardown()?;
     Ok(())
+}
+
+/// Apply one refresh cycle's outcome: keep the last-known sessions of
+/// unreachable nodes visible, then update the list and the (non-action)
+/// status message.
+fn apply_refresh(
+    app: &mut App,
+    query: &crate::protocol::ListQuery,
+    result: Result<SessionRefresh>,
+) {
+    match result {
+        Ok(mut refresh) => {
+            refresh.sessions.extend(
+                app.sessions
+                    .iter()
+                    .filter(|session| refresh.failed_nodes.contains(&session.node))
+                    .cloned(),
+            );
+            refresh
+                .sessions
+                .sort_by_key(|session| std::cmp::Reverse(session.created_at));
+            refresh.sessions.truncate(query.limit);
+            let warning = refresh.warning();
+            app.replace_sessions(refresh.sessions);
+            app.set_refresh_message(warning);
+        }
+        Err(error) => app.set_refresh_message(Some(format!("sync lost: {error}"))),
+    }
 }
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -215,6 +256,28 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
 
 fn read_terminal_event(timeout: Duration) -> io::Result<Option<Event>> {
     read_terminal_event_with(timeout, event::poll, event::read)
+}
+
+/// Drain input events that are already queued, without waiting. Typing or
+/// pasting produces bursts; handling the whole burst before the next draw
+/// renders it as a single frame instead of one frame per keystroke.
+fn drain_pending_events(events: &mut Vec<Event>) -> io::Result<()> {
+    drain_pending_events_with(events, event::poll, event::read)
+}
+
+fn drain_pending_events_with<P, R>(
+    events: &mut Vec<Event>,
+    mut poll: P,
+    mut read: R,
+) -> io::Result<()>
+where
+    P: FnMut(Duration) -> io::Result<bool>,
+    R: FnMut() -> io::Result<Event>,
+{
+    while let Some(event) = read_terminal_event_with(Duration::ZERO, &mut poll, &mut read)? {
+        events.push(event);
+    }
+    Ok(())
 }
 
 fn read_terminal_event_with(
@@ -3533,9 +3596,9 @@ fn shell_quote(value: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AppAction, CloneField, CloneLaunch, LIST_WINDOW_TITLE, TITLE_RESTORE_BYTES,
-        TITLE_SAVE_BYTES, TUI_RESTORE_BYTES, WindowRect, arrange_window, enter_list_title,
-        panic_payload_message, restore_tui_state, route_key,
+        App, AppAction, CloneField, CloneLaunch, LIST_WINDOW_TITLE, SessionRefresh,
+        TITLE_RESTORE_BYTES, TITLE_SAVE_BYTES, TUI_RESTORE_BYTES, WindowRect, apply_refresh,
+        arrange_window, enter_list_title, panic_payload_message, restore_tui_state, route_key,
     };
     use crate::{
         error::AppError,
@@ -3544,6 +3607,7 @@ mod tests {
     use chrono::{Local, TimeZone, Utc};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{Terminal, backend::TestBackend, layout::Alignment};
+    use std::collections::HashSet;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -4935,6 +4999,98 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(fatal.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn drain_collects_all_queued_events_before_the_next_draw() {
+        let queued = [
+            crossterm::event::Event::Key(key(KeyCode::Char('a'))),
+            crossterm::event::Event::Key(key(KeyCode::Char('b'))),
+            crossterm::event::Event::Key(key(KeyCode::Char('c'))),
+        ];
+        let position = std::cell::Cell::new(0usize);
+        let mut events = vec![crossterm::event::Event::Key(key(KeyCode::Char('0')))];
+        super::drain_pending_events_with(
+            &mut events,
+            |_| Ok(true),
+            || {
+                let index = position.get();
+                position.set(index + 1);
+                queued
+                    .get(index)
+                    .cloned()
+                    .ok_or(std::io::ErrorKind::WouldBlock.into())
+            },
+        )
+        .unwrap();
+        // The burst is handled as one batch: the initial event plus every
+        // queued event, in order, with no draw in between.
+        assert_eq!(events.len(), 4);
+        assert!(
+            matches!(events[1], crossterm::event::Event::Key(k) if k.code == KeyCode::Char('a'))
+        );
+        assert!(
+            matches!(events[3], crossterm::event::Event::Key(k) if k.code == KeyCode::Char('c'))
+        );
+    }
+
+    fn list_query(limit: usize) -> crate::protocol::ListQuery {
+        crate::protocol::ListQuery {
+            search: None,
+            tags: Vec::new(),
+            statuses: Vec::new(),
+            since: None,
+            until: None,
+            limit,
+            offset: 0,
+            sort: crate::protocol::ListSortField::CreatedAt,
+            order: crate::protocol::SortOrder::Desc,
+        }
+    }
+
+    #[test]
+    fn apply_refresh_keeps_sessions_of_failed_nodes_and_warns() {
+        let mut app = App::default();
+        let mut remote = session("remote");
+        remote.node = Some("worker-a".to_string());
+        app.replace_sessions(vec![remote]);
+
+        let refresh = SessionRefresh {
+            sessions: Vec::new(),
+            failed_nodes: HashSet::from([Some("worker-a".to_string())]),
+            failures: vec!["worker-a: connection refused".to_string()],
+        };
+        apply_refresh(&mut app, &list_query(100), Ok(refresh));
+
+        // The unreachable node's last-known sessions stay visible...
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, "remote");
+        // ...and the warning is shown.
+        assert_eq!(
+            app.message.as_deref(),
+            Some("sync lost: worker-a: connection refused")
+        );
+    }
+
+    #[test]
+    fn apply_refresh_never_clobbers_action_feedback() {
+        let mut app = App::default();
+        app.set_action_message(Some("started new session abc1234".to_string()));
+
+        let refresh = SessionRefresh {
+            sessions: vec![session("a")],
+            failed_nodes: HashSet::new(),
+            failures: Vec::new(),
+        };
+        apply_refresh(&mut app, &list_query(100), Ok(refresh));
+        assert_eq!(app.message.as_deref(), Some("started new session abc1234"));
+
+        apply_refresh(
+            &mut app,
+            &list_query(100),
+            Err(crate::error::AppError::Protocol("boom".to_string())),
+        );
+        assert_eq!(app.message.as_deref(), Some("started new session abc1234"));
     }
 
     #[test]
