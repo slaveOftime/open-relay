@@ -430,6 +430,18 @@ fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
     tokio::spawn(async move {
         let _ = ipc::send_request_checked(&config, request).await;
     });
+
+    // Optimistically update the row so the user sees immediate feedback;
+    // the daemon will confirm on the next refresh cycle.
+    if let Some(session) = app
+        .sessions
+        .iter_mut()
+        .find(|s| s.id == target.id && s.node == target.node)
+    {
+        session.status = "stopped".to_string();
+        session.ended_at = Some(Utc::now());
+    }
+
     app.set_action_message(Some(format!("stop signal sent to {}", target.id)));
 }
 
