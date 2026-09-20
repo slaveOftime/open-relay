@@ -1891,7 +1891,7 @@ export default function SessionsPage() {
               {grouped.map(({ key, items }) => (
                 <div key={key || '__flat__'}>
                   {groupBy !== 'none' && key && (
-                    <div className="flex flex-nowrap gap-1 items-center px-4 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10 border-b border-t border-[hsl(var(--border))]">
+                    <div className="flex flex-nowrap gap-1 items-center px-4 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
                       <CaretDownIcon className='h-4 w-4' /> 
                       <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                     </div>
@@ -2014,7 +2014,7 @@ export default function SessionsPage() {
                       <TableRow>
                         <TableCell
                           colSpan={orderedTableColumns.length}
-                          className="px-3 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10 border-b border-[hsl(var(--border))]"
+                          className="px-3 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10"
                         >
                           <div className='flex items-center gap-1'>
                             <CaretDownIcon className='h-4 w-4' /> 
