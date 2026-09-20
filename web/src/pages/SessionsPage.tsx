@@ -77,6 +77,7 @@ import {
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   BellIcon,
+  CaretDownIcon,
   CaretSortIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
@@ -518,7 +519,7 @@ function SessionRow({
         return (
           <TableCell
             key={columnKey}
-            className={`px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
+            className={`px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
             onClick={(e) => {
               e.stopPropagation()
               onEditSession(session)
@@ -536,7 +537,7 @@ function SessionRow({
         )
       case 'output':
         return (
-          <TableCell key={columnKey} className="px-3 py-2.5 truncate max-w-0">
+          <TableCell key={columnKey} className="px-3 py-1 truncate max-w-0">
             <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
               {formatByteSize(session.last_total_bytes)}
             </span>
@@ -544,7 +545,7 @@ function SessionRow({
         )
       case 'title':
         return (
-          <TableCell key={columnKey} className="px-3 py-2.5 truncate max-w-0">
+          <TableCell key={columnKey} className="px-3 py-1 truncate max-w-0">
             <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
               {session.title?.trim() || '—'}
             </span>
@@ -558,7 +559,7 @@ function SessionRow({
         )
       case 'command':
         return (
-          <TableCell key={columnKey} className="px-3 py-2.5 truncate max-w-0">
+          <TableCell key={columnKey} className="px-3 py-1 truncate max-w-0">
             <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
               <CommandLogo command={session.command} size={24} />
               <span className="truncate">{sessionDisplayName(session)}</span>
@@ -569,7 +570,7 @@ function SessionRow({
         return (
           <TableCell
             key={columnKey}
-            className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0"
+            className="px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0"
           >
             {session.cwd ? (
               <Tooltip>
@@ -583,7 +584,7 @@ function SessionRow({
         )
       case 'status':
         return (
-          <TableCell key={columnKey} className="px-3 py-2.5 whitespace-nowrap">
+          <TableCell key={columnKey} className="px-3 py-1 whitespace-nowrap">
             <StatusBadge status={session.status} inputNeeded={session.input_needed} />
           </TableCell>
         )
@@ -591,14 +592,14 @@ function SessionRow({
         return (
           <TableCell
             key={columnKey}
-            className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs whitespace-nowrap"
+            className="px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs whitespace-nowrap"
           >
             {formatTimestamp(session.created_at)}
           </TableCell>
         )
       case 'activity':
         return (
-          <TableCell key={columnKey} className="px-3 py-2.5">
+          <TableCell key={columnKey} className="px-3 py-1">
             <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} fullWidth />
           </TableCell>
         )
@@ -606,14 +607,14 @@ function SessionRow({
         return (
           <TableCell
             key={columnKey}
-            className="px-3 py-2.5 text-[hsl(var(--muted-foreground))] text-xs font-mono"
+            className="px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs font-mono"
           >
             {session.pid != null && session.pid}
           </TableCell>
         )
       case 'actions':
         return (
-          <TableCell key={columnKey} className="px-3 py-2.5" onClick={(e) => e.stopPropagation()}>
+          <TableCell key={columnKey} className="px-3 py-1" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-1">
               {isRunning && (
                 <Tooltip>
@@ -771,7 +772,7 @@ function SessionCard({
       <Card
         className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass} ${opacityClass}`}
       >
-        <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1">
+        <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1 relative">
           {/* Row 1: id, status, pid, created at */}
           <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap">
             <button
@@ -819,16 +820,16 @@ function SessionCard({
               </div>
             )}
           </div>
-
+          
           {/* Row 4: activity sparkline */}
           {session.status === 'running' && (
-            <div className="pt-1 w-full opacity-90">
+            <div className="pt-1 w-full opacity-20 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
               <SessionActivitySparkline
                 sessionId={session.id}
                 isRunning={isRunning}
                 fullWidth
-                height={16}
-                className="w-full opacity-70"
+                height={60}
+                className="w-full"
               />
             </div>
           )}
@@ -1890,7 +1891,8 @@ export default function SessionsPage() {
               {grouped.map(({ key, items }) => (
                 <div key={key || '__flat__'}>
                   {groupBy !== 'none' && key && (
-                    <div className="px-4 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-t border-[hsl(var(--border))]">
+                    <div className="flex flex-nowrap gap-1 items-center px-4 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10 border-b border-t border-[hsl(var(--border))]">
+                      <CaretDownIcon className='h-4 w-4' /> 
                       <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                     </div>
                   )}
@@ -1949,7 +1951,7 @@ export default function SessionsPage() {
                         key={col.key}
                         onDragOver={(event) => moveColumnBefore(col.key, event)}
                         onDrop={(event) => dropColumnBefore(col.key, event)}
-                        className={`relative px-3 py-2.5 text-left text-xs font-medium tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
+                        className={`relative px-3 py-1 text-left text-xs font-medium tracking-wide border-b border-[hsl(var(--border))] bg-[hsl(var(--background))] sticky z-20 select-none whitespace-nowrap ${
                           sortableField
                             ? 'cursor-pointer hover:text-[hsl(var(--foreground))] transition-colors'
                             : 'text-[hsl(var(--muted-foreground))]'
@@ -2012,9 +2014,12 @@ export default function SessionsPage() {
                       <TableRow>
                         <TableCell
                           colSpan={orderedTableColumns.length}
-                          className="px-3 py-1.5 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--card))]/40 border-b border-[hsl(var(--border))]"
+                          className="px-3 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10 border-b border-[hsl(var(--border))]"
                         >
-                          <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
+                          <div className='flex items-center gap-1'>
+                            <CaretDownIcon className='h-4 w-4' /> 
+                            <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
+                          </div>
                         </TableCell>
                       </TableRow>
                     )}

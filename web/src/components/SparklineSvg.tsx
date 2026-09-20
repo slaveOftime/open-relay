@@ -33,10 +33,10 @@ const RUNNING_PALETTE: SparklinePalette = {
   stroke: '#34C85B',
   strokeHighlight: '#8EF5AB',
   glow: '#2BC851A6',
-  fillTop: '#2EEA6B30',
-  fillBottom: '#0A130B00',
-  dot: '#B5F8C8',
-  baseline: '#23442A',
+  fillTop: '#34C85B',
+  fillBottom: '#34c85b86',
+  dot: '#34C85B',
+  baseline: '#34c85b86',
 }
 
 const IDLE_PALETTE: SparklinePalette = {
