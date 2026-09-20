@@ -1641,8 +1641,16 @@ export default function SessionsPage() {
               onClick={() => void reloadSessions({ background: false })}
             >
               <Logo />
-              <span className="truncate">{pageTitle}</span>
+              {nodes.length === 0 && <span className="truncate">{pageTitle}</span>}
             </div>
+            {nodes.length > 0 && (
+              <NodeSelector
+                nodes={nodes}
+                selected={selectedNode}
+                onChange={handleNodeChange}
+                className="h-7 w-auto min-w-0 max-w-[40vw] grow-0 basis-auto text-xs normal-case"
+              />
+            )}
             <div className="flex-1 min-w-0" />
             <Button
               variant="ghost"
