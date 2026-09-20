@@ -180,7 +180,7 @@ The implemented top-level commands are:
 - The control lease is a coordination and observability mechanism (who is
   driving right now), not a security boundary: operator channels such as
   `oly send` reach the session regardless of lease ownership by design.
-- Detach escape is `Ctrl-]`, then `d` (a Ctrl-held `d` also detaches).
+- Detach escape is `Ctrl-D` (EOT).
 
 ### `oly logs [id] [<read>] [<gate>] [<format>] [--timeout <duration>] [--node <name>]`
 

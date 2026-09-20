@@ -903,19 +903,17 @@ fn e2e_input_to_nonexistent_session_fails_gracefully() {
     );
 }
 
-/// `oly attach` runs under a real PTY; pressing Ctrl-] (GS, 0x1d) then `d`
+/// `oly attach` runs under a real PTY; pressing Ctrl-D (EOT, 0x04)
 /// must detach the client (README/SPEC key contract). This exercises the
-/// full terminal input path — crossterm delivers the GS byte as
-/// `Char('5') + CONTROL` in legacy mode, which is the form this test
-/// verifies end-to-end.
+/// full terminal input path end-to-end.
 #[cfg(not(target_os = "windows"))]
 #[test]
-fn e2e_attach_ctrl_right_bracket_then_d_detaches() {
+fn e2e_attach_ctrl_d_detaches() {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read, Write};
 
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let tmp = make_tmp_dir("e2e_attach_detach_prefix");
+    let tmp = make_tmp_dir("e2e_attach_ctrl_d_detach");
     let _daemon = start_daemon(&tmp);
     let id = start_session(&tmp, &["sh", "-i"]);
 
@@ -975,10 +973,8 @@ fn e2e_attach_ctrl_right_bracket_then_d_detaches() {
         }
     }
 
-    // Ctrl-] then d → detach. Send the prefix first, then the detach key.
-    writer.write_all(b"\x1d").expect("write GS prefix");
-    std::thread::sleep(Duration::from_millis(100));
-    writer.write_all(b"d").expect("write detach key");
+    // Ctrl-D → detach. Send the EOT byte (0x04).
+    writer.write_all(b"\x04").expect("write Ctrl-D / EOT");
 
     // The attach process must exit on its own and report the detach.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -993,7 +989,7 @@ fn e2e_attach_ctrl_right_bracket_then_d_detaches() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "`oly attach` did not exit after Ctrl-] d.\noutput so far:\n{}",
+            "`oly attach` did not exit after Ctrl-D.\noutput so far:\n{}",
             String::from_utf8_lossy(&output)
         );
     };
@@ -1112,7 +1108,7 @@ impl PtyAttach {
 
     fn detach(mut self) {
         use std::io::Write;
-        self.writer.write_all(b"\x1dd").ok();
+        self.writer.write_all(b"\x04").ok();
         let _ = self.child.wait();
         while self
             .output_rx

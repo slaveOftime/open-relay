@@ -360,7 +360,7 @@ Distinct wire forms:
 
 Prefer raw native input when outer terminal/profile produces compatible bytes. Use a backend adapter when Windows events or negotiated keyboard differences require it. Test modifiers, function keys, keypad, Alt/Meta, Ctrl combinations, Kitty/CSI-u negotiation, repeat/release, IME, and mouse modes. Avoid independent incomplete key tables in three languages.
 
-Replace Ctrl-D detach with a documented prefix such as `Ctrl-]` then `d`, with literal-prefix escape and a disable option. Prefix recognition is a small state machine; ordinary keys are immediate. Ctrl-D/Ctrl-C/Ctrl-Z/Ctrl-V/Escape retain application meaning. Clipboard/file transfer is explicit, not interception of an application's literal-next shortcut.
+Detach is `Ctrl-D` (EOT), matching the historic key contract. Ctrl-C/Ctrl-Z/Escape retain application meaning; Ctrl-V and Shift+Insert are intercepted as clipboard paste operations. Clipboard/file transfer reads files, images, and text from the clipboard.
 
 Paste boundaries are explicit, not guessed from typing speed. Remove 30/150 ms heuristics after platform tests pass. Serialize paste relative to user transactions; impose quotas/cancellation; never silently normalize/retry. Stage/chunk large paste without session locks. Define cancellation of an open bracketed paste and reserved query/control capacity so neither is starved. PTY writes are not atomic application transactions and cannot be rolled back.
 
@@ -528,7 +528,7 @@ Extend existing `tests/e2e_pty.rs`, `tests/e2e_csvlens.rs`, Copilot/OpenCode rec
 - Main/alternate transitions, attach on alternate, inactive main history, saved cursor/margins/tabs/wrap-pending, synchronized output.
 - Truecolor/256-color, hyperlinks/default colors/cursor/title/progress/integration.
 - Wide/combining/emoji/ZWJ/box drawing, invalid UTF-8/NUL, unbroken lines, oversized/unfinished controls.
-- Supported modifiers/function keys/keypad, literal prefix, Ctrl-D EOF/Ctrl-V/Escape, paste/CRLF/binary, mouse/focus/IME.
+- Supported modifiers/function keys/keypad, literal prefix, Ctrl-V paste/Shift+Insert paste/Ctrl-D detach/Escape, paste/CRLF/binary, mouse/focus/IME.
 - Multiple queries per record, queries between cursor moves, detached queries, full input queue, exactly one response with 10 observers.
 - Shrink/grow/drag, alternate-buffer resize, reconnect/continuation at every relevant state boundary.
 
@@ -590,7 +590,7 @@ Develop vertical slices behind development-only switches, then delete replaced c
 
 **Exit:** declared core direct-run corpus passes, including query positions, raw bytes, alternate return, narrow/wide history. No artificial ordinary-key timer. Unsupported extensions negotiated/documented.
 
-**Status (complete).** One embedded alacritty engine answers every terminal query in stream order; versioned anchored checkpoints (OJCK v2) gate retention; attach input is event-driven and byte-exact (protocol v13); `map_key_to_input` implements the xterm-compatible profile; detach is the Ctrl-] prefix; mouse/focus/SGR modes propagate to attach clients.
+**Status (complete).** One embedded alacritty engine answers every terminal query in stream order; versioned anchored checkpoints (OJCK v2) gate retention; attach input is event-driven and byte-exact (protocol v13); `map_key_to_input` implements the xterm-compatible profile; detach is Ctrl-D; Ctrl-V and Shift+Insert are clipboard paste shortcuts; mouse/focus/SGR modes propagate to attach clients.
 
 
 ### M3 — Unified attach/resume/control (P0; after M1/M2)

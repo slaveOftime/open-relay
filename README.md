@@ -107,7 +107,7 @@ oly stop <id>
 Useful behavior to know:
 
 - `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
-- To detach from an attached session, press `Ctrl-]`, then `d`.
+- To detach from an attached session, press `Ctrl-D`.
 - Attaching (CLI or browser) takes control of the session by default and resizes it to the attaching client's viewport — the most recently active client always drives. Use `oly attach --observer` for a view-only attach that never drives input or geometry.
 - Resizing an attached terminal window reports the new size to the daemon and resizes the session; if that client was an observer, the resize takes control first (same last-active-wins rule), so the session always follows the window you are actively shaping.
 - The control lease is coordination, not a security boundary: it records who is driving and demotes the previous controller, but operator commands like `oly send` reach the session regardless by design — no lease ceremony is needed (or available) for scripted input.

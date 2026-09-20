@@ -293,7 +293,7 @@ async fn run_attach_inner(
     let mut is_controller = granted_role != "observer";
     if interactive && !is_controller {
         eprintln!(
-            "Attached as observer (view-only). Ctrl-T takes control, Ctrl-] then d detaches."
+            "Attached as observer (view-only). Ctrl-T takes control, Ctrl-D detaches."
         );
     }
 
@@ -378,10 +378,6 @@ async fn run_attach_inner(
         // while the child wants them, so local selection and focus behave
         // normally otherwise.
         sync_local_terminal_modes(child_mouse_report, child_focus_events);
-
-        // Ctrl-] detach-prefix state: true after an armed Ctrl-] until the
-        // next key resolves it.
-        let mut detach_prefix_pending = false;
 
         // Drain any stale resize events queued by writing replay data
         // before the main event loop.
@@ -537,108 +533,58 @@ async fn run_attach_inner(
                                 }
                             }
                             Event::Key(key) => {
-                                // Key releases are never sent and must never
-                                // resolve the detach prefix (only
-                                // kitty-protocol terminals and Windows report
-                                // them; we do not negotiate that with the
-                                // outer terminal). Without this filter a
-                                // Release of Ctrl-] would consume the armed
-                                // prefix and leak a literal GS byte into the
-                                // session. Press and Repeat are handled.
-                                if matches!(key.kind, KeyEventKind::Release) {
-                                    continue;
-                                }
-                                // Detach prefix (README/SPEC: `Ctrl-]` then
-                                // `d`). Arming the prefix consumes the key;
-                                // the next key decides: `d` detaches, Esc
-                                // cancels, a second `Ctrl-]` sends one
-                                // literal GS (0x1d), any other key forwards
-                                // the prefix byte and is then handled
-                                // normally. Ctrl-D/Ctrl-V keep their
-                                // application meaning (PLAN §5.1).
-                                let mut key_to_handle = Some(key);
-                                if detach_prefix_pending {
-                                    detach_prefix_pending = false;
-                                    if is_detach_key(key) {
-                                        detached = true;
-                                        running = false;
-                                        key_to_handle = None;
-                                    } else if matches!(key.code, KeyCode::Esc) {
-                                        key_to_handle = None; // prefix cancelled
-                                    } else if is_detach_prefix(key) {
-                                        send_attach_input(
-                                            &mut write_half,
-                                            &id_owned,
-                                            vec![0x1d],
-                                            false,
-                                        )
-                                        .await?;
-                                        key_to_handle = None;
-                                    } else {
-                                        send_attach_input(
-                                            &mut write_half,
-                                            &id_owned,
-                                            vec![0x1d],
-                                            false,
-                                        )
-                                        .await?;
-                                    }
-                                } else if is_detach_prefix(key) {
-                                    detach_prefix_pending = true;
-                                    key_to_handle = None;
-                                }
-
-                                if let Some(key) = key_to_handle {
-                                    if is_clipboard_paste_key(key) {
-                                        // Explicit paste shortcut
-                                        // (Shift+Insert): read the clipboard
-                                        // and send the paste in one bounded
-                                        // transaction. An empty or
-                                        // unavailable clipboard swallows the
-                                        // shortcut rather than leaking a
-                                        // stray keystroke into the session.
-                                        if let Some(data) = maybe_collect_clipboard_paste(
-                                            config,
-                                            id,
-                                            node,
-                                            key,
-                                            child_bracketed_paste_mode,
-                                        )
-                                        .await?
-                                        {
-                                            send_attach_input(
-                                                &mut write_half,
-                                                &id_owned,
-                                                data,
-                                                true,
-                                            )
-                                            .await?;
-                                        }
-                                    } else if !is_controller && is_ctrl_t(key) {
-                                        // Observer takeover: the server answers
-                                        // with an AttachControlChanged frame.
-                                        ipc::write_request_to_writer(
-                                            &mut write_half,
-                                            RpcRequest::AttachAcquireControl {
-                                                id: id_owned.clone(),
-                                            },
-                                        )
-                                        .await?;
-                                    } else if !is_controller {
-                                        // Observer: keys do not reach the session.
-                                    } else if let Some(data) =
-                                        map_key_to_input(key, child_app_cursor_keys)
+                                if is_clipboard_paste_key(key) {
+                                    // Explicit paste shortcut: read the clipboard
+                                    // and send the paste in one bounded
+                                    // transaction. An empty or unavailable
+                                    // clipboard swallows the shortcut rather than
+                                    // leaking a stray ^V into the session.
+                                    if let Some(data) = maybe_collect_clipboard_paste(
+                                        config,
+                                        id,
+                                        node,
+                                        key,
+                                        child_bracketed_paste_mode,
+                                    )
+                                    .await?
                                     {
-                                        // Every ordinary key is sent the moment it
-                                        // arrives — no burst buffering.
                                         send_attach_input(
                                             &mut write_half,
                                             &id_owned,
-                                            data.into_bytes(),
-                                            false,
+                                            data,
+                                            true,
                                         )
                                         .await?;
                                     }
+                                } else if !matches!(key.kind, KeyEventKind::Press) {
+                                    // Key release/repeat events: not sent.
+                                } else if is_ctrl_d(key) {
+                                    detached = true;
+                                    running = false;
+                                } else if !is_controller && is_ctrl_t(key) {
+                                    // Observer takeover: the server answers
+                                    // with an AttachControlChanged frame.
+                                    ipc::write_request_to_writer(
+                                        &mut write_half,
+                                        RpcRequest::AttachAcquireControl {
+                                            id: id_owned.clone(),
+                                        },
+                                    )
+                                    .await?;
+                                } else if !is_controller {
+                                    // Observer: keys do not reach the session.
+                                } else if let Some(data) =
+                                    map_key_to_input(key, child_app_cursor_keys)
+                                {
+                                    // Every ordinary key is sent the moment it
+                                    // arrives — no burst buffering.
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        data.into_bytes(),
+                                        false,
+                                    )
+                                    .await?;
                                 }
                             }
                             Event::Mouse(mouse) => {
@@ -1024,13 +970,17 @@ async fn upload_remote_clipboard_file(
     }
 }
 
-/// The explicit clipboard-paste shortcut: Shift+Insert only. Ctrl-V is
-/// deliberately NOT intercepted — it is the application's literal-next
-/// (quoted-insert) key and keeps that meaning (PLAN §5.1/§5.2).
+/// The explicit clipboard-paste shortcut: Ctrl-V and Shift+Insert.
+/// Ctrl-V is read as the clipboard operation: files are copied into the
+/// session file area, images are saved as PNGs, and text is normalized.
+/// Shift+Insert is the classic terminal paste shortcut. Both send the
+/// clipboard contents as one bounded paste transaction.
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert)
+    matches!(key.code, KeyCode::Char('\u{16}'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+        || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert))
 }
-
 // ---------------------------------------------------------------------------
 // Key input mapping
 // ---------------------------------------------------------------------------
@@ -1296,26 +1246,12 @@ async fn send_attach_input(
     .await
 }
 
-/// The detach prefix key: Ctrl-] (GS, 0x1d).
-///
-/// Crossterm maps the 0x1C–0x1F control bytes to `Char('4'..='7')` +
-/// CONTROL, so in legacy terminal mode a physical Ctrl-] arrives as
-/// `Char('5')` + CONTROL (byte-identical to Ctrl-5 — they are the same
-/// wire byte and cannot be told apart; enhanced/kitty keyboards may
-/// report `Char(']')` instead). All forms are accepted.
-fn is_detach_prefix(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('\u{1d}'))
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('5')))
-}
-
-/// `d` after the detach prefix detaches. tmux-style muscle memory is
-/// honored: both a plain `d` and a Ctrl-held `d` (EOT, 0x04 — crossterm
-/// reports it as `Char('d')` + CONTROL) detach.
-fn is_detach_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('\u{4}'))
-        || (matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
-            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::CONTROL))
+/// Ctrl-D is the detach key (EOT, 0x04). In the raw wire it maps to
+/// the EOT byte, but here it is intercepted as the detach signal,
+/// matching the historic key contract.
+fn is_ctrl_d(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
 }
 
 /// Push the client's terminal size to the daemon as session geometry.
@@ -1616,18 +1552,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_clipboard_paste_key_only_shift_insert() {
+    fn test_is_clipboard_paste_key_accepts_ctrl_v_and_shift_insert() {
+        // Ctrl-V and Shift+Insert both trigger the clipboard paste.
+        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('v'))));
+        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('V'))));
         assert!(is_clipboard_paste_key(KeyEvent::new_with_kind(
             KeyCode::Insert,
             KeyModifiers::SHIFT,
             KeyEventKind::Press
         )));
-        // Ctrl-V keeps its application meaning (quoted-insert); the attach
-        // client must not intercept it (PLAN §5.1).
-        assert!(!is_clipboard_paste_key(ctrl_press(KeyCode::Char('v'))));
-        assert!(!is_clipboard_paste_key(ctrl_press(KeyCode::Char('V'))));
-        assert!(!is_clipboard_paste_key(ctrl_press(KeyCode::Char('\u{16}'))));
-        assert!(!is_clipboard_paste_key(press(KeyCode::Char('\u{16}'))));
+        assert!(is_clipboard_paste_key(KeyEvent::new_with_kind(
+            KeyCode::Char('\u{16}'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press
+        )));
+        // Plain keys without the right modifier do not trigger it.
+        assert!(!is_clipboard_paste_key(press(KeyCode::Char('v'))));
+        assert!(!is_clipboard_paste_key(press(KeyCode::Insert)));
     }
 
     // -----------------------------------------------------------------------
@@ -1781,53 +1722,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // detach prefix: Ctrl-] then d
+    // is_ctrl_d: Ctrl-D detaches
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_is_detach_prefix_accepts_ctrl_right_bracket_forms() {
-        assert!(is_detach_prefix(ctrl_press(KeyCode::Char(']'))));
-        assert!(is_detach_prefix(press(KeyCode::Char('\u{1d}'))));
-        // Crossterm delivers the GS byte (0x1d, physical Ctrl-]) as
-        // Char('5') + CONTROL in legacy terminal mode — this is the form
-        // real terminals actually produce.
-        assert!(is_detach_prefix(ctrl_press(KeyCode::Char('5'))));
+    fn test_is_ctrl_d_true() {
+        assert!(is_ctrl_d(ctrl_press(KeyCode::Char('d'))));
+        assert!(is_ctrl_d(ctrl_press(KeyCode::Char('D'))));
     }
 
     #[test]
-    fn test_is_detach_prefix_rejects_other_keys() {
-        assert!(!is_detach_prefix(ctrl_press(KeyCode::Char('d'))));
-        assert!(!is_detach_prefix(press(KeyCode::Char(']'))));
-        assert!(!is_detach_prefix(press(KeyCode::Esc)));
+    fn test_is_ctrl_d_false_for_plain_d() {
+        assert!(!is_ctrl_d(press(KeyCode::Char('d'))));
+        assert!(!is_ctrl_d(press(KeyCode::Char('D'))));
     }
 
     #[test]
-    fn test_is_detach_key_accepts_d_and_control_d() {
-        assert!(is_detach_key(press(KeyCode::Char('d'))));
-        assert!(is_detach_key(press(KeyCode::Char('D'))));
-        assert!(is_detach_key(press(KeyCode::Char('\u{4}'))));
-        // tmux-style Ctrl-held second key: crossterm reports EOT (0x04)
-        // as Char('d') + CONTROL, and it must still detach.
-        assert!(is_detach_key(ctrl_press(KeyCode::Char('d'))));
-    }
-
-    #[test]
-    fn test_is_detach_key_rejects_other_keys() {
-        assert!(!is_detach_key(press(KeyCode::Char('x'))));
-        assert!(!is_detach_key(press(KeyCode::Esc)));
+    fn test_is_ctrl_d_false_for_other_ctrl() {
+        assert!(!is_ctrl_d(ctrl_press(KeyCode::Char('c'))));
+        assert!(!is_ctrl_d(ctrl_press(KeyCode::Char('v'))));
     }
 
     #[test]
     fn test_ctrl_d_maps_to_eot_byte_for_the_session() {
-        // Ctrl-D is no longer the detach key: it reaches the child as the
-        // literal EOT byte, e.g. EOF for a shell or scroll-half-page in vim.
+        // In the raw wire Ctrl-D maps to EOT (0x04); the attach client
+        // intercepts it as the detach signal before it reaches map_key_to_input.
         let result = map_key_to_input(ctrl_press(KeyCode::Char('d')), false).unwrap();
         assert_eq!(result.as_bytes(), &[4]);
     }
 
     #[test]
     fn test_ctrl_v_maps_to_syn_byte_for_the_session() {
-        // Ctrl-V (quoted-insert) reaches the child unchanged.
+        // In the raw wire Ctrl-V maps to SYN (0x16); the attach client
+        // intercepts it as the clipboard paste signal before it reaches
+        // map_key_to_input.
         let result = map_key_to_input(ctrl_press(KeyCode::Char('v')), false).unwrap();
         assert_eq!(result.as_bytes(), &[22]);
     }
