@@ -643,8 +643,16 @@ pub(super) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
 
 /// WebSocket Origin validation (ADR-0007): a browser cross-site WebSocket
 /// must not ride the ambient auth cookie. Non-browser clients (no Origin
-/// header) are unaffected; an Origin whose host[:port] does not match the
-/// Host header is rejected.
+/// header) are unaffected; an Origin whose host[:port] matches neither the
+/// Host header nor a gateway-provided `X-Forwarded-Host` is rejected.
+///
+/// `X-Forwarded-Host` is trusted as a match candidate because this check
+/// only defends against browsers, and the browser WebSocket API cannot set
+/// arbitrary handshake headers — a non-browser client capable of spoofing
+/// `X-Forwarded-Host` could bypass the check trivially by omitting `Origin`.
+/// Without it, any reverse proxy/gateway that rewrites the `Host` header
+/// (nginx's default behaviour without `proxy_set_header Host $host`) would
+/// make every browser attach fail with 403.
 pub fn ws_origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
         return true;
@@ -652,22 +660,39 @@ pub fn ws_origin_allowed(headers: &HeaderMap) -> bool {
     let Ok(origin) = origin.to_str() else {
         return false;
     };
-    let authority = origin
-        .split("://")
-        .nth(1)
-        .unwrap_or(origin)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let host = headers
+    let (scheme, rest) = origin.split_once("://").unwrap_or(("", origin));
+    let authority = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
+    if authority.is_empty() {
+        return false;
+    }
+    // Origin always carries an explicit port only when non-default, but be
+    // lenient: treat the scheme's default port as equivalent to no port.
+    let default_port = match scheme {
+        "https" | "wss" => ":443",
+        _ => ":80",
+    };
+    let authority_no_default_port = authority.strip_suffix(default_port);
+    let mut candidates = Vec::new();
+    if let Some(host) = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase);
-    match host {
-        Some(host) => !authority.is_empty() && authority == host,
-        None => false,
+    {
+        candidates.push(host);
     }
+    let forwarded_host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok());
+    let matches = |candidate: &str| {
+        let candidate = candidate.trim().to_ascii_lowercase();
+        !candidate.is_empty()
+            && (candidate == authority || authority_no_default_port.is_some_and(|a| candidate == a))
+    };
+    let mut matched = candidates.iter().any(|c| matches(c));
+    if !matched && let Some(xfh) = forwarded_host {
+        // Multi-hop proxies append; the first entry is the original Host.
+        matched = xfh.split(',').any(matches);
+    }
+    matched
 }
 
 fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
@@ -852,6 +877,47 @@ mod tests {
         let mut no_host = HeaderMap::new();
         no_host.insert(header::ORIGIN, "http://localhost:7700".parse().unwrap());
         assert!(!ws_origin_allowed(&no_host));
+    }
+
+    #[test]
+    fn websocket_origin_accepts_gateway_forwarded_host() {
+        // Gateway terminates TLS and rewrites Host to the upstream address
+        // (nginx default without `proxy_set_header Host $host`): the browser
+        // Origin no longer matches Host, but the gateway records the original
+        // host in X-Forwarded-Host.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:7700".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://oly.public.example.com".parse().unwrap(),
+        );
+        assert!(!ws_origin_allowed(&headers));
+
+        headers.insert(
+            "x-forwarded-host",
+            "oly.public.example.com".parse().unwrap(),
+        );
+        assert!(ws_origin_allowed(&headers));
+
+        // A forwarded host that does not match the Origin still rejects.
+        headers.insert("x-forwarded-host", "other.example.com".parse().unwrap());
+        assert!(!ws_origin_allowed(&headers));
+
+        // Multi-hop X-Forwarded-Host list: the first (original) entry counts.
+        headers.insert(
+            "x-forwarded-host",
+            "oly.public.example.com, internal-gw".parse().unwrap(),
+        );
+        assert!(ws_origin_allowed(&headers));
+
+        // Explicit default port in Origin equals no port.
+        let mut default_port = HeaderMap::new();
+        default_port.insert(header::HOST, "oly.example.com".parse().unwrap());
+        default_port.insert(
+            header::ORIGIN,
+            "https://oly.example.com:443".parse().unwrap(),
+        );
+        assert!(ws_origin_allowed(&default_port));
     }
 
     #[test]

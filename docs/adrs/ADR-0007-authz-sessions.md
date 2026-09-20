@@ -69,8 +69,14 @@ not carried over for convenience.
    verification off the hot path. Query-string and cookie credentials are
    never treated as API keys.
 3. **Origin/CSRF posture**: WebSocket attach upgrades reject an `Origin`
-   whose host does not match the `Host` header (non-browser clients without
-   `Origin` are unaffected). The session cookie is `HttpOnly; SameSite=Lax`
+   whose host does not match the `Host` header or a gateway-provided
+   `X-Forwarded-Host` (non-browser clients without `Origin` are unaffected).
+   `X-Forwarded-Host` is safe to trust here because the check only defends
+   against browsers, and the browser WebSocket API cannot set arbitrary
+   handshake headers — a non-browser client able to spoof it could simply
+   omit `Origin`. This keeps attach working behind HTTPS gateways that
+   rewrite `Host` to the upstream address (nginx's default without
+   `proxy_set_header Host $host`). The session cookie is `HttpOnly; SameSite=Lax`
    (`Secure` when TLS is detected), so cross-site POSTs cannot ride it.
    Query-string tokens remain accepted only on the WS/SSE upgrade paths where
    browsers cannot set headers; with random, expiring, revocable tokens the
