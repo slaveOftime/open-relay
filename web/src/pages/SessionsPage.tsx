@@ -774,7 +774,7 @@ function SessionCard({
       >
         <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1 relative">
           {/* Row 1: id, status, pid, created at */}
-          <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap">
+          <div className="z-10 flex items-center gap-2 overflow-x-auto whitespace-nowrap">
             <button
               className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold hover:text-[hsl(var(--primary))] transition-colors"
               onClick={() => onEditSession(session)}
@@ -792,7 +792,7 @@ function SessionCard({
           </div>
 
           {/* Row 2: command + title */}
-          <div onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
+          <div className="z-10" onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
             <div className={`flex min-w-0 items-center gap-2 ${titleTone}`}>
               <div className="shrink-0 pt-0.5">
                 <CommandLogo command={session.command} size={36} />
@@ -808,12 +808,12 @@ function SessionCard({
 
           {/* Row 3: cwd */}
           {session.cwd && (
-            <div className="text-sm leading-snug text-[hsl(var(--muted-foreground))] font-mono break-all">
+            <div className="z-10 text-sm leading-snug text-[hsl(var(--muted-foreground))] font-mono break-all">
               {session.cwd}
             </div>
           )}
 
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="z-10 flex flex-wrap items-center gap-2">
             {session.tags.length > 0 && (
               <div className="min-w-0 flex-1">
                 <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
