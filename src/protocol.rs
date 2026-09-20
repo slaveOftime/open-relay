@@ -247,10 +247,6 @@ pub enum RpcRequest {
         from: u64,
         max_bytes: u32,
     },
-    /// Verify sealed-part journal manifests (M4 doctor): `None` = all sessions.
-    Doctor {
-        id: Option<String>,
-    },
     AttachBusy {
         id: String,
     },
@@ -374,7 +370,6 @@ impl RpcRequest {
             RpcRequest::AttachInput { .. } => "attach_input",
             RpcRequest::SessionCursor { .. } => "session_cursor",
             RpcRequest::ObserveWindow { .. } => "observe_window",
-            RpcRequest::Doctor { .. } => "doctor",
             RpcRequest::AttachBusy { .. } => "attach_busy",
             RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
@@ -419,10 +414,6 @@ pub enum RpcResponse {
         running: bool,
         exit_code: Option<i32>,
         incarnation: Option<u64>,
-    },
-    /// Journal verification report (M4 doctor).
-    Doctor {
-        results: Vec<DoctorReport>,
     },
     Empty,
     Health {
@@ -874,16 +865,6 @@ pub struct ListQuery {
     pub offset: usize,
     pub sort: ListSortField,
     pub order: SortOrder,
-}
-
-/// Per-session journal verification result (M4 doctor).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorReport {
-    pub id: String,
-    /// Number of sealed parts covered by the manifest.
-    pub sealed_parts: usize,
-    /// Integrity issues found (empty = clean).
-    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -413,7 +413,7 @@ pub(super) async fn handle_session_cursor(
     }
 }
 
-/// One bounded filtered-stream window (agent `observe`/`history`).
+/// One bounded filtered-stream window (agent `history`).
 pub(super) async fn handle_observe_window(
     id: String,
     from: u64,

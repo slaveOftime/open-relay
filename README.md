@@ -23,7 +23,7 @@ Start a command once, detach, close your terminal, come back later, inspect logs
 
 If `oly` saves you time, please star the repo. That helps more people discover it.
 
-Upgrading from 0.3.x? Read [MIGRATION.md](./MIGRATION.md) first — 0.5.0 is a clean break. For internals, see [ARCHITECTURE.md](./ARCHITECTURE.md) and the [ADRs](./docs/adrs/).
+Upgrading from 0.3.x? Read [MIGRATION.md](./MIGRATION.md) first — 0.5.0 is a clean break. For internals, see [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ---
 
@@ -194,10 +194,9 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
-| `oly doctor [id]` | Verify journal integrity (sealed-part manifests) |
-| `oly observe [id]` | Machine-readable session cursor (liveness + canonical stream offset) |
 | `oly update <id> ...` | Override a session's title, tags, and notification setting |
 | `oly skill` | Print the bundled `oly` skill markdown |
+| `oly daemon status` | Show the running daemon's effective flags and HTTP endpoint |
 
 The interactive view can monitor several nodes at once, for example `oly ls --follow --node worker-a --node worker-b`. Add `--node-local` to include sessions from the current daemon (or the primary itself); the table shows a node column when multiple sources are selected. `Ctrl+D` opens a clone editor prefilled from the selected session, while `Ctrl+U` opens an update editor for the selected session's title, tags, and notification setting. `Tab`/`Ctrl+Tab` move between dialog fields, `Space` toggles notifications, and `Enter` submits the current dialog. Use `Ctrl+K` to stop the selected running session, `Enter` to open it inline, `Ctrl+Enter` to open it in another terminal window, and `Ctrl+C` to exit the list view.
 
@@ -230,8 +229,7 @@ oly logs <ID> --raw > dump.bin          # exact child bytes (pipes/files)
 oly logs <ID> --screen [--cols 120] [--keep-color]
 oly logs <ID> --pattern 'ERROR' --screen   # block until output matches, then show the screen
 
-# Machine: cursor-based window reads (pair with `oly observe`)
-oly observe <ID> --json                 # -> {"offset": N, "status": ..., ...}
+# Machine: cursor-based window reads
 oly logs <ID> --from <offset> --limit 65536 --json   # one window, base64
 
 # Machine: the cursor loop in one call — block until there is output after
@@ -353,7 +351,7 @@ These keys can be set in `config.json` (runtime overrides win over the file). Se
 
 Session recordings live in a per-session journal (raw bytes, resizes,
 lifecycle, checkpoints); there is no size cap key — retention is
-checkpoint-gated. Inspect a session's journal with `oly doctor <id>`; export
+checkpoint-gated. Inspect a session's journal; export
 raw bytes with `oly logs --raw <id>`.
 
 ---
@@ -373,6 +371,6 @@ raw bytes with `oly logs --raw <id>`.
 - [MIGRATION.md](./MIGRATION.md) for the 0.3.x → 0.5.0 transition
 - [SPEC.md](./SPEC.md) for the implementation-aligned product spec
 - [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview
-- [docs/adrs/](./docs/adrs/) for the architecture decision records
+- [ARCHITECTURE.md](./ARCHITECTURE.md) for the architecture decision records
 
 If you are building agent workflows and want durable, inspectable terminal sessions, `oly` is for you.

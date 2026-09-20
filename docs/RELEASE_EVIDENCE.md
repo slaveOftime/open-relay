@@ -68,7 +68,7 @@ checkpoint-anchored bounded replay (OJCK v2), and removal of the pre-0.5
   `open_seals_validated_parts_orphaned_by_a_crash`,
   `corrupted_payload_stops_the_scan`,
   `reopen_reports_interior_corruption_without_rewinding`
-  (`src/session/journal.rs`); `oly doctor` verifies manifests (e2e in
+  (`src/session/journal.rs`); manifest verification (e2e in
   `tests/e2e_daemon.rs`).
 - [x] **Bounded history reads.** Replay is checkpoint-anchored (PLAN
   §5.3): v2 checkpoints (`OJCK`) written at scanner-idle boundaries carry

@@ -200,7 +200,6 @@ async fn dispatch_request(
             from,
             max_bytes,
         } => handle_observe_window(id, from, max_bytes, session_store).await,
-        RpcRequest::Doctor { id } => handle_doctor(id, db).await,
         RpcRequest::AttachBusy { id } => handle_attach_busy(id, session_store).await,
         RpcRequest::UploadFile {
             id,
@@ -553,91 +552,8 @@ async fn handle_logs_tail(
     }
 }
 
-/// `oly doctor`: verify sealed-part journal manifests (M4). Reads the
-/// manifest written by the appender at rotation/clean shutdown and checks
-/// every sealed part's presence, exact length, and CRC-32.
-async fn handle_doctor(id: Option<String>, db: &Arc<Database>) -> RpcResponse {
-    use crate::protocol::{DoctorReport, ListQuery, ListSortField, SortOrder};
-
-    let ids: Vec<String> = match id {
-        Some(id) => vec![id],
-        None => {
-            match db
-                .list_summaries(&ListQuery {
-                    search: None,
-                    tags: vec![],
-                    statuses: vec![],
-                    since: None,
-                    until: None,
-                    limit: 100_000,
-                    offset: 0,
-                    sort: ListSortField::CreatedAt,
-                    order: SortOrder::Asc,
-                })
-                .await
-            {
-                Ok(summaries) => summaries.into_iter().map(|s| s.id).collect(),
-                Err(err) => {
-                    return RpcResponse::Error {
-                        message: err.to_string(),
-                    };
-                }
-            }
-        }
-    };
-
-    let mut results = Vec::new();
-    for id in ids {
-        let dir = match db.get_session_dir(&id).await {
-            Ok(Some(dir)) => dir,
-            Ok(None) => {
-                results.push(DoctorReport {
-                    id,
-                    sealed_parts: 0,
-                    issues: vec!["session not found".to_string()],
-                });
-                continue;
-            }
-            Err(err) => {
-                results.push(DoctorReport {
-                    id,
-                    sealed_parts: 0,
-                    issues: vec![err.to_string()],
-                });
-                continue;
-            }
-        };
-        let journal_dir = dir.join(crate::session::journal::JOURNAL_DIR_NAME);
-        if !journal_dir.exists() {
-            // Pre-journal (legacy 0.x) sessions have nothing to verify.
-            results.push(DoctorReport {
-                id,
-                sealed_parts: 0,
-                issues: vec![],
-            });
-            continue;
-        }
-        let entries = match crate::session::journal::read_manifest(&journal_dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                results.push(DoctorReport {
-                    id,
-                    sealed_parts: 0,
-                    issues: vec![format!("manifest unreadable: {err}")],
-                });
-                continue;
-            }
-        };
-        results.push(DoctorReport {
-            id,
-            sealed_parts: entries.len(),
-            issues: crate::session::journal::verify_manifest(&journal_dir),
-        });
-    }
-
-    RpcResponse::Doctor { results }
-}
-
+/// Read a bounded window of the filtered output stream for a session.
+/// Returns raw bytes, the next resumable offset, and liveness state.
 async fn handle_logs_pagination(
     id: String,
     offset: Option<usize>,
@@ -855,7 +771,7 @@ async fn handle_join_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_doctor, handle_logs_tail};
+    use super::{handle_logs_tail};
     use crate::{
         db::Database,
         protocol::RpcResponse,
@@ -986,35 +902,6 @@ mod tests {
             journal.shutdown();
         }
 
-        let response = handle_doctor(Some(meta.id.clone()), &db).await;
-        let RpcResponse::Doctor { results } = response else {
-            panic!("unexpected response: {response:?}");
-        };
-        assert_eq!(results.len(), 1);
-        assert!(results[0].sealed_parts >= 2, "expected rotation seals");
-        assert!(results[0].issues.is_empty(), "clean: {:?}", results[0]);
-
-        // Tamper one byte in the first part: doctor must flag exactly that.
-        let journal_dir = session_dir.join(crate::session::journal::JOURNAL_DIR_NAME);
-        let part = std::fs::read_dir(&journal_dir)
-            .expect("read journal dir")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|ext| ext == "ojrn"))
-            .expect("a sealed part exists");
-        let mut bytes = std::fs::read(&part).expect("read part");
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        std::fs::write(&part, bytes).expect("write tampered part");
-
-        let response = handle_doctor(Some(meta.id.clone()), &db).await;
-        let RpcResponse::Doctor { results } = response else {
-            panic!("unexpected response: {response:?}");
-        };
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].issues.len(), 1);
-        assert!(results[0].issues[0].contains("CRC-32 mismatch"));
-
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_dir_all(&sessions_dir);
     }
@@ -1024,38 +911,11 @@ mod tests {
     // ---------------------------------------------------------------
 
     mod agent_surfaces {
-        use crate::daemon::rpc_attach::{handle_observe_window, handle_session_cursor};
+        use crate::daemon::rpc_attach::handle_observe_window;
         use crate::protocol::RpcResponse;
         use crate::session::SessionStatus;
         use crate::session::store::testsupport::{make_runtime_writable, make_test_db, store_with};
         use std::sync::Arc;
-
-        #[tokio::test]
-        async fn session_cursor_reports_offset_and_liveness() {
-            let (rt, _writer_rx) = make_runtime_writable("cursor01", SessionStatus::Running);
-            crate::session::store::testsupport::seed_journal_output(&rt.read().dir, b"hello world");
-            rt.write().filtered_total_bytes = 11;
-            let store = Arc::new(store_with(vec![rt], make_test_db().await));
-
-            let response = handle_session_cursor("cursor01".into(), &store).await;
-            let RpcResponse::SessionCursor {
-                running,
-                exit_code,
-                offset,
-                incarnation,
-            } = response
-            else {
-                panic!("unexpected response: {response:?}");
-            };
-            assert!(running);
-            assert_eq!(exit_code, None);
-            assert_eq!(offset, 11);
-            // The seeded fixture journal is incarnation 1.
-            assert_eq!(incarnation, Some(1));
-
-            let missing = handle_session_cursor("nope".into(), &store).await;
-            assert!(matches!(missing, RpcResponse::Error { .. }));
-        }
 
         #[tokio::test]
         async fn observe_window_returns_bounded_slice_and_resume_offset() {

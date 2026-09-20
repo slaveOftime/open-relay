@@ -18,7 +18,7 @@ output streams (`output.log` + `events.log` vs. the journal), two terminal
 parsers (vt100 vs. the alacritty engine), and two attach wire formats (base64
 JSON vs. binary frames). Each duplicate was a place where behavior could
 silently disagree — and did. 0.5.0 keeps exactly one implementation of each
-concern, chosen by the ADRs in `docs/adrs/`:
+concern, chosen by the architecture decision records:
 
 - **Storage:** the per-session journal is the only persisted stream
   (ADR-0002, ADR-0006). It records raw output, resizes, lifecycle, and
@@ -52,7 +52,7 @@ honest migration instead.
 | Daemon status | reported the client's config values | reports the running daemon's effective flags and HTTP endpoint (from the daemon's own record) | No action; `oly daemon start` against a running daemon now prints the running config and the remedy. |
 
 Everything else about the CLI is **additive**: new subcommands
-(`doctor`, `observe`, `notify`, `restart`, `status`, `skill`, `update`;
+(`notify`, `restart`, `status`, `skill`, `update`;
 the `history`/`screen`/`wait` read surfaces are modes of `oly logs` —
 `--from`, `--screen`, and `--after`/`--exit`/`--idle-ms`/`--pattern`
 respectively) and new flags. All 0.x commands
@@ -112,7 +112,7 @@ oly list                    # 0.3.x sessions appear; logs/attach report the
                             # pre-0.5 format explicitly, never garbage
 oly start -- echo hello     # create a fresh 0.5.0 session
 oly logs <id>               # renders from the new journal
-oly doctor <id>             # journal health check
+# (journal verification is now via the underlying journal; no separate command)
 ```
 
 ## Preserving old recordings

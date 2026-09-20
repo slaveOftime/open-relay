@@ -414,7 +414,6 @@ Specify machine workflows before adding aliases. These are 0.5.0 surfaces, not e
 
 ```text
 oly start --json --size 120x40 -- <program> <args...>
-oly observe <id> --json --since <cursor>
 oly screen <id> --json
 oly history <id> --before <cursor> --limit N --json
 oly wait <id> --after <cursor> --until <condition> --timeout 30s --json
@@ -515,7 +514,7 @@ Test 0/20/100 ms RTT, jitter/loss, slow disk, blocked PTY input, CPU contention,
 
 Expose roles/controller generation, geometry version, head/journal/durable/earliest cursors, retained/queue bytes, lag, resync count, parser faults, input rejection/partial writes, persistence health.
 
-Low-overhead counters/histograms and sampled tracing; no per-byte debug logs or secrets. `oly doctor`/diagnostic export includes protocol/profile/config/build and redacted health. Traces must distinguish scheduling, parsing, journaling, network, and rendering time.
+Low-overhead counters/histograms and sampled tracing; no per-byte debug logs or secrets. diagnostic export includes protocol/profile/config/build and redacted health. Traces must distinguish scheduling, parsing, journaling, network, and rendering time.
 
 ## 12. Test and verification plan
 
@@ -599,7 +598,7 @@ Develop vertical slices behind development-only switches, then delete replaced c
 
 **Exit:** I2/I4/I5/I6/I7 hold under adversarial scheduling; 10 mixed clients stay consistent through resize/takeover/lag/reconnect. No input guessing/retry or inferred log offsets.
 
-**Status (complete).** One `AttachPump` state machine serves every attach behind thin IPC/WS adapters; cursor-checked streaming with incarnation fencing and sealed-part manifests; control lease with observer gating and fenced takeover; enforced credits with loud stall disconnects; `oly doctor` verifies manifests.
+**Status (complete).** One `AttachPump` state machine serves every attach behind thin IPC/WS adapters; cursor-checked streaming with incarnation fencing and sealed-part manifests; control lease with observer gating and fenced takeover; enforced credits with loud stall disconnects; manifests are verifiable.
 
 
 ### M4 — History UX and agent workflows (P0; after M3)
@@ -608,7 +607,7 @@ Develop vertical slices behind development-only switches, then delete replaced c
 
 **Exit:** scroll-up is not stolen, attach does not duplicate/truncate retained history, input remains responsive during history load, agents observe/handoff/resume without stealing control or equating idle with success.
 
-**Status (complete).** Agent surfaces (`observe`/`history`/`screen`/`wait`/`control`, lease-gated `send`) over cursor-checked RPCs; browser `HistoryController` with loud anchor errors; scroll-theft fix; `oly doctor` integrity surface.
+**Status (complete).** Agent surfaces (`history`/`screen`/`wait`/`control`, lease-gated `send`) over cursor-checked RPCs; browser `HistoryController` with loud anchor errors; scroll-theft fix.
 
 
 **Status amendment (complete).** The post-M4 audit corrective increment landed: journal coherence (manifest tombstones, sealing on open), persisted agent surfaces across restarts, control-lease TTL/caps, and the shared WS-frame fixture pinning the protocol from both sides.

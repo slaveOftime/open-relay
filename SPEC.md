@@ -193,7 +193,7 @@ meaningless are usage errors (clap conflicts).
 - Default mode prints recent rendered logs without attaching.
 - `--screen` prints the visible screen as plain text.
 - `--from <offset>` reads one bounded raw window of the canonical filtered
-  stream (pair with `oly observe` for the current end offset).
+  stream.
 - `--raw` exports the journal-derived original byte stream for pipes/files.
   Local sessions only.
 
@@ -464,4 +464,4 @@ Current non-goals or intentionally externalized concerns:
 - [`src/main.rs`](./src/main.rs)
 - [`src/config.rs`](./src/config.rs)
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md)
-- [`docs/adrs/`](./docs/adrs/) — architecture decision records
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — architecture decision records

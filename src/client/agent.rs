@@ -55,35 +55,6 @@ async fn session_cursor(config: &AppConfig, node: Option<&str>, id: &str) -> Res
     }
 }
 
-/// `oly observe <id> [--json]`: the session's canonical stream cursor.
-pub async fn run_observe(
-    config: &AppConfig,
-    id: &str,
-    node: Option<String>,
-    json: bool,
-) -> Result<()> {
-    let cursor = session_cursor(config, node.as_deref(), id).await?;
-    let status = if cursor.running { "running" } else { "exited" };
-    if json {
-        println!(
-            "{{\"v\":1,\"session\":\"{id}\",\"status\":\"{status}\",\"offset\":{},\"exit_code\":{},\"incarnation\":{}}}",
-            cursor.offset,
-            json_opt_i32(cursor.exit_code),
-            json_opt_u64(cursor.incarnation),
-        );
-    } else {
-        println!(
-            "{id}\t{status}\toffset={}\tincarnation={}",
-            cursor.offset,
-            cursor
-                .incarnation
-                .map(|inc| inc.to_string())
-                .unwrap_or_else(|| "none".into()),
-        );
-    }
-    Ok(())
-}
-
 /// `oly logs <id> --from <offset> [--limit <bytes>] [--json]`: one bounded
 /// window of the filtered output stream.
 pub async fn run_history(
@@ -355,38 +326,6 @@ pub async fn run_wait(
             outcome.offset
         ),
         _ => println!("output\toffset={}", outcome.offset),
-    }
-    Ok(())
-}
-
-/// `oly doctor [id]`: verify sealed-part journal manifests. Exit 1 when any
-/// session reports an integrity issue.
-pub async fn run_doctor(
-    config: &AppConfig,
-    id: Option<String>,
-    node: Option<String>,
-) -> Result<()> {
-    let response = rpc(config, node.as_deref(), RpcRequest::Doctor { id }).await?;
-    let RpcResponse::Doctor { results } = response else {
-        return Err(AppError::Protocol(format!(
-            "unexpected response to doctor: {response:?}"
-        )));
-    };
-    let mut problems = 0usize;
-    for report in &results {
-        if report.issues.is_empty() {
-            println!("{}	ok	{} sealed part(s)", report.id, report.sealed_parts);
-        } else {
-            problems += report.issues.len();
-            for issue in &report.issues {
-                println!("{}	ISSUE	{issue}", report.id);
-            }
-        }
-    }
-    if problems > 0 {
-        return Err(AppError::Protocol(format!(
-            "journal verification found {problems} issue(s)"
-        )));
     }
     Ok(())
 }

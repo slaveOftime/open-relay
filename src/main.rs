@@ -490,12 +490,6 @@ async fn run() -> Result<()> {
             client::run_send(&config, &id, send_args.node, send_args.chunks).await
         }
 
-        Commands::Observe(args) => {
-            let id = resolve_session_id(&config, args.id.clone(), args.node.as_ref()).await?;
-            client::run_observe(&config, &id, args.node, args.json).await
-        }
-        Commands::Doctor(args) => client::run_doctor(&config, args.id, args.node).await,
-
         // ── API key management (primary side) ────────────────────────────────
         Commands::ApiKey(api_key_args) => match api_key_args.command {
             ApiKeyCommand::Add(args) => {

@@ -69,10 +69,6 @@ pub enum Commands {
     List(ListArgs),
     /// Start a new session from an existing session's persisted launch metadata.
     Restart(RestartArgs),
-    /// Machine-readable session cursor (liveness + canonical stream offset).
-    Observe(SessionRefArgs),
-    /// Verify journal integrity (sealed-part manifests) for one or all sessions.
-    Doctor(DoctorArgs),
     /// Stop a session by ID.
     Stop(StopArgs),
     /// Delete a session and its files. Stopped sessions are removed directly; use --force to also remove a running one.
@@ -412,7 +408,7 @@ pub struct LogsArgs {
     #[arg(long, conflicts_with_all = ["from", "raw"])]
     pub screen: bool,
     /// Read a raw byte window of the canonical filtered stream starting at
-    /// OFFSET (pair with `oly observe` for the cursor; page with the
+    /// OFFSET (pair with `logs --from` for the cursor; page with the
     /// returned `next` offset).
     #[arg(long, value_name = "OFFSET", conflicts_with = "raw")]
     pub from: Option<u64>,
@@ -514,27 +510,6 @@ impl LogsArgs {
             && !self.from_file
             && self.cols.is_none()
     }
-}
-
-#[derive(Debug, Args)]
-pub struct DoctorArgs {
-    /// Session ID to verify. If omitted, verifies all sessions.
-    pub id: Option<String>,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
-}
-
-#[derive(Debug, Args)]
-pub struct SessionRefArgs {
-    /// Session ID. If omitted, uses the most recently created session.
-    pub id: Option<String>,
-    /// Emit one JSON object instead of tab-separated text.
-    #[arg(long)]
-    pub json: bool,
-    /// Target a secondary node by name.
-    #[arg(long, short = 'n')]
-    pub node: Option<String>,
 }
 
 #[derive(Debug, Args)]

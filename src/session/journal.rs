@@ -4638,7 +4638,7 @@ mod tests {
 
     /// The cross-feature lifecycle (mandatory corrective-increment gate):
     /// write → checkpoint → seal → retain → reopen → replay/resume →
-    /// verify (the `oly doctor` core). Intentional retention must be
+    /// verify (the journal integrity core). Intentional retention must be
     /// distinguishable from corruption end to end.
     #[test]
     fn retention_checkpoint_manifest_and_verification_stay_coherent() {

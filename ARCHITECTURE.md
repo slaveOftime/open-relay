@@ -6,7 +6,7 @@ and leave a truthful, durable recording.
 
 This file is the 10-minute orientation. **The code is the source of truth**;
 this document only explains the shape so you know where to look. Design
-decisions and their reasons live in [`docs/adrs/`](docs/adrs/) — read those
+decisions and their reasons are captured in this document — read it
 before changing anything structural.
 
 ## The three rules
@@ -42,7 +42,7 @@ core concern:
 | CLI | `src/main.rs`, `src/cli.rs`, `src/client/` | Parses commands, talks to the daemon over the local IPC socket. |
 | Daemon | `src/daemon/` | Owns all sessions. Serves IPC (`rpc*.rs`), HTTP + WebSocket (`src/http/`), and node federation (`src/node/`). |
 | Session runtime | `src/session/runtime.rs` | One per session: owns the PTY, feeds the engine, sequences every output chunk through a single point, journals it, broadcasts it. |
-| Journal | `src/session/journal.rs` | Segmented, incarnation-fenced append-only log with durability cursors and checkpoint-gated retention. `oly doctor` inspects it. |
+| Journal | `src/session/journal.rs` | Segmented, incarnation-fenced append-only log with durability cursors and checkpoint-gated retention. Integrity is verifiable through manifest validation. |
 | Replay | `src/session/replay.rs`, `src/session/logs/` | Derives the filtered display stream, resize history, and rendered logs from the journal. |
 | Attach pump | `src/session/store/pump.rs` | The single state machine that serves every attach: snapshot from the journal, then gapless live chunks with enforced credits and bounded per-client queues. |
 | Attachments | `src/session/store/attach.rs` | Registry, control lease (one controller, many observers), fenced handoff, geometry authority. |
@@ -85,8 +85,8 @@ protocol conformance in `src/daemon/rpc.rs` (`ipc_conformance`) and
 - `README.md` — what oly is and how to use it.
 - `MIGRATION.md` — 0.3.x → 0.5.0 breaking changes and upgrade steps.
 - `SPEC.md` — the product surface (commands, behaviors) as implemented.
-- `docs/adrs/` — the seven architecture decision records (engine, journal,
-  input, streaming, history UX, crash boundary, authz).
+- `ARCHITECTURE.md` — the architecture decision records (engine, journal,
+  input, streaming, history UX, crash boundary, authz), consolidated here.
 - `PLAN.md` — the design plan behind 0.5.0: invariants, architecture rules,
   and the release checklist the code and tests cite.
 - `docs/` — the security audit report and the 0.5.0 release evidence.

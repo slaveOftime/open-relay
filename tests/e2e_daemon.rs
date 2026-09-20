@@ -865,17 +865,6 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
 
         assert!(echoed, "relayed attach never echoed the input marker");
     });
-
-    // The owning node's journal stays clean after the relayed attach.
-    let doctor = oly_cmd(&secondary_tmp)
-        .args(["doctor", &session_id])
-        .output()
-        .expect("`oly doctor` failed to execute");
-    assert!(
-        doctor.status.success(),
-        "`oly doctor` failed after relayed attach.\nstderr: {}",
-        String::from_utf8_lossy(&doctor.stderr)
-    );
 }
 
 #[test]
@@ -1141,18 +1130,6 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
             .await
             .expect("send detach");
     });
-
-    // The whole exchange ran against the canonical journal: doctor is clean.
-    let doctor = oly_cmd(&tmp)
-        .args(["doctor", &id])
-        .output()
-        .expect("run doctor");
-    assert!(
-        doctor.status.success(),
-        "doctor must stay clean after the WS attach.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&doctor.stdout),
-        String::from_utf8_lossy(&doctor.stderr)
-    );
 }
 
 /// Minimal std-only HTTP POST returning the status code — keeps this test

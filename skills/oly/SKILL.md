@@ -129,7 +129,6 @@ silently misapplied.
 rendered log tail; the flags below select the machine surfaces):
 
 ```bash
-oly observe <ID> --json                          # {status, offset, exit_code, incarnation}
 oly logs <ID> --from <off> --limit N             # raw bytes of one bounded window
 oly logs <ID> --from <off> --json                # same, base64 in one JSON line
 oly logs <ID> --from <off> --after <off> --json  # block until new output, then read it (one call)

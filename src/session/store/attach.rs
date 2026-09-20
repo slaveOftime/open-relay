@@ -36,7 +36,7 @@ impl SessionStore {
             }
             // Persisted fallback (post-review corrective increment): a
             // session keeps an answerable stream status after eviction or
-            // daemon restart, so `logs --after`/`observe`/`logs --from` keep
+            // daemon restart, so `logs --after`/`logs --from` keep
             // working against the canonical store.
             Err(err) => match self.db.get_session(id).await {
                 Ok(Some(meta)) => Ok((false, true, meta.exit_code)),
@@ -1263,7 +1263,7 @@ mod tests {
             persisted_journal_session("persist1", &[b"hello ", b"world"], Some(7)).await;
         let store = store_with(Vec::new(), db);
 
-        // The session-cursor trio backs `oly observe` and `logs --from/--after`.
+        // The session-cursor trio backs `logs --from/--after`.
         assert_eq!(store.attach_filtered_len("persist1").await, Some(11));
         assert_eq!(
             store
