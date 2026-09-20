@@ -83,8 +83,9 @@ Open Relay（`oly`）是一个 Rust 编写的终端会话管理器/复用器，�
 |------|-----|
 | **文件** | `src/http/mod.rs:116`, `src/http/nodes.rs:43–84` |
 | **类别** | 认证绕过 / DoS |
+| **状态** | 已修复（M5-4 + SSH 密钥认证） |
 
-**描述：** `/api/nodes/join` 路由被放置在 `protected_router` **之外**，绕过 `require_auth` 中间件。任何能访问 HTTP 端口的人都可以发起 WebSocket 连接。API 密钥验证在 WS 升级**之后**才在处理器内部进行（line 81），但此时已消耗服务器资源。
+**描述：** `/api/nodes/join` 路由被放置在 `protected_router` **之外**，绕过 `require_auth` 中间件。任何能访问 HTTP 端口的人都可以发起 WebSocket 连接。API 密钥验证在 WS 升级**之后**才在处理器内部进行，但此时已消耗服务器资源。
 
 此外，联邦加入端点**没有速率限制**（登录端点有3次锁定，但加入端点没有）。每次尝试都触发昂贵的 Argon2 验证，且该验证**同步运行在 async 运行时线程上**（未使用 `spawn_blocking`），可导致运行时饥饿。
 
@@ -97,6 +98,8 @@ Open Relay（`oly`）是一个 Rust 编写的终端会话管理器/复用器，�
 1. 在 WS 升级前通过 HTTP 头部验证 API 密钥
 2. 添加速率限制，复用登录端点的 `AuthState` 锁定机制
 3. 将 Argon2 验证包装在 `tokio::task::spawn_blocking` 中
+
+**补充：** M5-4 已实现 SSH 密钥认证作为替代方案。SSH 密钥认证通过挑战-响应握手工作：主节点在 WebSocket 升级后发送一次性 nonce，从节点用 SSH 私钥签名 nonce，主节点使用存储的 SSH 公钥验证签名。这消除了在明文中传输 API 密钥的风险，并通过主节点托管的 Ed25519 主机密钥提供 MITM 防护。
 
 ---
 

@@ -572,12 +572,38 @@ async fn run() -> Result<()> {
                     _ => Err(AppError::Protocol("unexpected response".into())),
                 }
             }
+            NodeCommand::AcceptSshPubKey(args) => {
+                let name = args.name.clone();
+                match ipc::send_request_checked(
+                    &config,
+                    RpcRequest::NodeAcceptSshPubKey {
+                        name: args.name,
+                        public_key: args.pub_key,
+                    },
+                )
+                .await?
+                {
+                    RpcResponse::Empty => {
+                        println!("SSH public key registered for node '{}'.", name);
+                        Ok(())
+                    }
+                    _ => Err(AppError::Protocol("unexpected response".into())),
+                }
+            }
         },
 
         // ── Join management (secondary side) ─────────────────────────────────
         Commands::Join(join_args) => match join_args.command {
             JoinCommand::Start(args) => {
-                client::run_join(&config, args.url, args.name, args.key).await
+                client::run_join(
+                    &config,
+                    args.url,
+                    args.name,
+                    args.key,
+                    args.ssh_key,
+                    args.ssh_known_hosts,
+                )
+                .await
             }
             JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
             JoinCommand::List(args) => {

@@ -16,7 +16,8 @@ use crate::{
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
     protocol::{
-        NodeSummary, NodeWsMessage, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+        NodeJoinAuth, NodeSummary, NodeWsMessage, RpcResponse, decode_node_ws_payload,
+        encode_node_ws_payload,
     },
     session::SessionEvent,
 };
@@ -24,6 +25,12 @@ use crate::{
 // ---------------------------------------------------------------------------
 // GET /api/nodes
 // ---------------------------------------------------------------------------
+
+pub async fn get_host_key(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "public_key": state.ssh_host_key.public_key,
+    }))
+}
 
 pub async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeSummary>> {
     let names = state.node_registry.connected_names().await;
@@ -83,36 +90,55 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
         }
     };
 
-    let (name, key) = match handshake {
-        NodeWsMessage::Join { name, key } => (name, key),
+    let (name, auth) = match handshake {
+        NodeWsMessage::Join { name, auth } => (name, auth),
         _ => {
             send_error(&mut ws_tx, "expected join message").await;
             return;
         }
     };
 
-    // ── Step 2: validate API key against any registered key ──────────────
-    let entries = match state.db.list_api_key_entries().await {
-        Ok(e) => e,
-        Err(_) => {
-            send_error(&mut ws_tx, "internal error").await;
-            return;
+    // ── Step 2: validate authentication ─────────────────────────────────
+    let verified = match auth {
+        NodeJoinAuth::ApiKey { key } => {
+            let entries = match state.db.list_api_key_entries().await {
+                Ok(e) => e,
+                Err(_) => {
+                    send_error(&mut ws_tx, "internal error").await;
+                    return;
+                }
+            };
+
+            let key_clone = key.clone();
+            tokio::task::spawn_blocking(move || {
+                !entries.is_empty()
+                    && entries.iter().any(|(hash, scopes)| {
+                        crate::http::auth::scopes_allow(scopes, crate::http::auth::SCOPE_NODE)
+                            && crate::http::auth::verify_api_key_hash(&key_clone, hash)
+                    })
+            })
+            .await
+            .unwrap_or(false)
+        }
+        NodeJoinAuth::SshKey { nonce, signature, public_key } => {
+            'verify: {
+                let Ok(Some(stored_key)) = state.db.get_ssh_key_entry(&public_key).await else {
+                    send_error(&mut ws_tx, "unauthorized").await;
+                    break 'verify false;
+                };
+                let Ok(sig_bytes) = base64::decode(&signature) else {
+                    send_error(&mut ws_tx, "invalid signature").await;
+                    break 'verify false;
+                };
+                let nonce_clone = nonce.clone();
+                tokio::task::spawn_blocking(move || {
+                    verify_ssh_signature(&stored_key, &sig_bytes, nonce_clone.as_bytes())
+                })
+                .await
+                .unwrap_or(false)
+            }
         }
     };
-
-    // Run Argon2 verification on a blocking thread to avoid starving the
-    // async runtime with CPU-intensive work. Node join requires the `node`
-    // scope (ADR-0007, M5-4).
-    let key_clone = key.clone();
-    let verified = tokio::task::spawn_blocking(move || {
-        !entries.is_empty()
-            && entries.iter().any(|(hash, scopes)| {
-                crate::http::auth::scopes_allow(scopes, crate::http::auth::SCOPE_NODE)
-                    && crate::http::auth::verify_api_key_hash(&key_clone, hash)
-            })
-    })
-    .await
-    .unwrap_or(false);
 
     if !verified {
         if let Some(ref auth) = state.auth {
@@ -318,7 +344,80 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     warn!(node = %name, reason = %disconnect_reason, drained_waiters, "secondary node disconnected");
 }
 
-async fn handle_forwarded_session_event(state: &AppState, node_name: &str, payload: SessionEvent) {
+/// Verify an SSH signature using the stored public key.
+///
+/// The signature is in SSH wire format (as produced by `ssh-keygen -Y sign`
+/// or the ssh2 crate's `Key::sign_verify`). The public key is stored in
+/// OpenSSH format (e.g. "ssh-ed25519 AAAA...").
+fn verify_ssh_signature(stored_key: &(String, String), sig_bytes: &[u8], signed_data: &[u8]) -> bool {
+    // stored_key.1 is the public key data in OpenSSH format (e.g. "ssh-ed25519 AAAA...").
+    let (_name, key_data) = stored_key;
+    let key_str = key_data.trim();
+
+    // Parse: "ssh-ed25519 <base64>"
+    let parts: Vec<&str> = key_str.splitn(2, ' ').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let algorithm = parts[0];
+    let base64_key = parts[1];
+
+    // Only support Ed25519 for now.
+    if algorithm != "ssh-ed25519" {
+        return false;
+    }
+
+    // Decode the public key (should be 32 bytes for Ed25519).
+    let Ok(public_bytes) = base64::decode(base64_key) else {
+        return false;
+    };
+    if public_bytes.len() != 32 {
+        return false;
+    }
+
+    // Build the Ed25519 verifying key.
+    let Ok(arr) = <[u8; 32]>::try_from(public_bytes.as_slice()) else {
+        return false;
+    };
+    let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(&arr) else {
+        return false;
+    };
+
+    // SSH wire format for verification: algorithm name (length-prefixed) + signed data
+    // The signature in SSH format includes the algorithm name as a prefix.
+    // sig_bytes may be in SSH wire format or raw 64-byte format.
+    let sig = if sig_bytes.len() >= 4 {
+        // Try SSH wire format: 4-byte length + signature bytes
+        let sig_len = u32::from_be_bytes(sig_bytes[..4].try_into().unwrap_or([0;4])) as usize;
+        if sig_bytes.len() >= 4 + sig_len {
+            &sig_bytes[4..4+sig_len]
+        } else {
+            sig_bytes
+        }
+    } else {
+        sig_bytes
+    };
+
+    // Verify the signature (64 bytes for Ed25519).
+    if sig.len() != 64 {
+        return false;
+    }
+
+    let sig_array: [u8; 64] = match sig.try_into() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+
+    // Construct the SSH-format signed data: algorithm name + raw signed data
+    let algo_bytes = algorithm.as_bytes();
+    let mut full_data = Vec::with_capacity(4 + algo_bytes.len() + signed_data.len());
+    full_data.extend_from_slice(&(algo_bytes.len() as u32).to_be_bytes());
+    full_data.extend_from_slice(algo_bytes);
+    full_data.extend_from_slice(signed_data);
+
+    // Verify using ed25519-dalek
+    verifying_key.verify_strict(&full_data, &ed25519_dalek::Signature::from_bytes(&sig_array)).is_ok()
+}async fn handle_forwarded_session_event(state: &AppState, node_name: &str, payload: SessionEvent) {
     let delivered = payload.for_delivery(Some(node_name));
 
     if let SessionEvent::SessionNotification {

@@ -255,7 +255,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .await
             .expect("connect worker1 websocket");
         ws1.send(node_ws_json_frame(
-            json!({"type": "join", "name": "worker1", "key": key}),
+            json!({"type": "join", "name": "worker1", "auth": {"method": "api_key", "key": key}}),
         ))
         .await
         .expect("send worker1 join message");
@@ -297,7 +297,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .expect("connect duplicate websocket");
         ws_dup
             .send(node_ws_json_frame(
-                json!({"type": "join", "name": "worker1", "key": key}),
+                json!({"type": "join", "name": "worker1", "auth": {"method": "api_key", "key": key}}),
             ))
             .await
             .expect("send duplicate join message");
@@ -325,7 +325,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .await
             .expect("connect worker2 websocket");
         ws2.send(node_ws_json_frame(
-            json!({"type": "join", "name": "worker2", "key": key}),
+            json!({"type": "join", "name": "worker2", "auth": {"method": "api_key", "key": key}}),
         ))
         .await
         .expect("send worker2 join message");
@@ -361,7 +361,7 @@ fn e2e_federation_api_keys_and_join_handshake() {
             .await
             .expect("connect worker3 websocket");
         ws3.send(node_ws_json_frame(
-            json!({"type": "join", "name": "worker3", "key": key}),
+            json!({"type": "join", "name": "worker3", "auth": {"method": "api_key", "key": key}}),
         ))
         .await
         .expect("send worker3 join message");

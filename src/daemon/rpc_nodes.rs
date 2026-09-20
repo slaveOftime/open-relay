@@ -12,11 +12,13 @@ use tracing::{debug, info, warn};
 use crate::{
     client::join::JoinConfig,
     config::AppConfig,
+    db::Database,
     error::Result,
     ipc,
     node::NodeRegistry,
     protocol::{
-        NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+        NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload,
+        encode_node_ws_payload,
     },
     session::SessionEvent,
 };
@@ -93,9 +95,71 @@ async fn connect_and_relay(
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
+    // ── Step 1: fetch and verify host key for SSH auth ──
+    let host = join.primary_url
+        .strip_prefix("http://")
+        .or_else(|| join.primary_url.strip_prefix("https://"))
+        .and_then(|u| u.split(':').next())
+        .unwrap_or("localhost");
+
+    let auth = if let Some(ssh_key_path) = &join.ssh_key_path {
+        // SSH key authentication with MITM protection
+        let ssh_public_key = join.ssh_public_key
+            .clone()
+            .unwrap_or_else(|| "".to_string());
+
+        // Fetch the primary's host key
+        let fetched_host_key = crate::client::join::fetch_host_key(&join.primary_url).await
+            .map_err(|e| crate::error::AppError::Protocol(format!("host key fetch failed: {e}")))?;
+
+        // Verify host key against known_hosts (TOFU if not configured)
+        if !crate::client::join::check_host_key(
+            join.ssh_known_hosts.as_deref(),
+            host,
+            &fetched_host_key,
+        ) {
+            return Err(crate::error::AppError::Protocol(
+                format!("host key verification failed for {host}; known_hosts mismatch or key not accepted"),
+            ));
+        }
+
+        // Generate a random nonce for challenge-response
+        let nonce: [u8; 32] = rand::random();
+        let nonce_hex = base64::encode(&nonce);
+
+        // Sign: nonce + public_key to bind the signature to this specific join attempt
+        let mut signed_data = Vec::with_capacity(32 + ssh_public_key.len());
+        signed_data.extend_from_slice(&nonce);
+        signed_data.extend_from_slice(ssh_public_key.as_bytes());
+
+        let signature = crate::client::join::sign_ssh_data(
+            std::path::Path::new(ssh_key_path),
+            &signed_data,
+        ).map_err(|e| crate::error::AppError::Protocol(format!("ssh signing failed: {e}")))?;
+
+        // Optionally append the host key to known_hosts
+        if let Some(kh_path) = &join.ssh_known_hosts {
+            let _ = crate::client::join::append_known_hosts(
+                std::path::Path::new(kh_path),
+                host,
+                &fetched_host_key,
+            );
+        }
+
+        NodeJoinAuth::SshKey {
+            nonce: nonce_hex,
+            signature,
+            public_key: ssh_public_key,
+        }
+    } else {
+        // API key authentication
+        NodeJoinAuth::ApiKey {
+            key: join.api_key.clone().unwrap_or_default(),
+        }
+    };
     let handshake = NodeWsMessage::Join {
         name: join.name.clone(),
-        key: join.api_key.clone(),
+        auth,
     };
     let handshake_payload = encode_node_ws_payload(&handshake)?;
     ws_tx
@@ -469,6 +533,20 @@ pub(super) async fn handle_node_proxy(
 pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcResponse {
     let nodes = node_registry.connected_names().await;
     RpcResponse::NodeList { nodes }
+}
+
+pub(super) async fn handle_node_accept_ssh_pubkey(
+    name: String,
+    public_key: String,
+    db: &Arc<Database>,
+) -> RpcResponse {
+    if let Err(e) = db.insert_ssh_key_entry(&name, &public_key).await {
+        return RpcResponse::Error {
+            message: format!("failed to register SSH key: {e}"),
+        };
+    }
+    info!(node = %name, "registered SSH public key");
+    RpcResponse::Empty
 }
 
 /// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the

@@ -25,7 +25,8 @@ use super::{
         handle_attach_subscribe, handle_observe_window, handle_session_cursor,
     },
     rpc_nodes::{
-        handle_node_list, handle_node_proxy, handle_node_proxy_streaming, spawn_join_connector,
+        handle_node_accept_ssh_pubkey, handle_node_list, handle_node_proxy, handle_node_proxy_streaming,
+        spawn_join_connector,
     },
 };
 
@@ -249,12 +250,15 @@ async fn dispatch_request(
         RpcRequest::ApiKeyAdd { name, scopes } => handle_api_key_add(name, scopes, db).await,
         RpcRequest::ApiKeyList => handle_api_key_list(db).await,
         RpcRequest::ApiKeyRemove { name } => handle_api_key_remove(name, db).await,
-        RpcRequest::JoinStart { url, name, key } => {
-            handle_join_start(config, join_handles, session_event_tx, url, name, key).await?
+        RpcRequest::JoinStart { url, name, key, ssh_key_path, ssh_known_hosts } => {
+            handle_join_start(config, join_handles, session_event_tx, url, name, key, ssh_key_path, ssh_known_hosts).await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
         RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
         RpcRequest::NodeList => handle_node_list(node_registry).await,
+        RpcRequest::NodeAcceptSshPubKey { name, public_key } => {
+            handle_node_accept_ssh_pubkey(name, public_key, db).await
+        }
     };
 
     Ok(response)
@@ -719,12 +723,17 @@ async fn handle_join_start(
     session_event_tx: &SessionEventTx,
     url: String,
     name: String,
-    key: String,
+    key: Option<String>,
+    ssh_key_path: Option<String>,
+    ssh_known_hosts: Option<String>,
 ) -> Result<RpcResponse> {
     let join = client::join::JoinConfig {
         name: name.clone(),
         primary_url: url,
         api_key: key,
+        ssh_key_path,
+        ssh_public_key: None,
+        ssh_known_hosts,
     };
     client::join::save_join_config(config, &join)?;
     let (abort, stop_tx) =

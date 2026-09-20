@@ -48,6 +48,69 @@ pub struct AppState {
     pub auth: Option<Arc<AuthState>>,
     /// Registry of connected secondary nodes (only populated on a primary daemon).
     pub node_registry: Arc<NodeRegistry>,
+    /// SSH host key pair for node join authentication (primary side).
+    /// The public key is served at GET /api/nodes/host-key.
+    pub ssh_host_key: SshHostKey,
+}
+
+/// SSH host key pair: the primary presents its public key to secondaries
+/// so they can verify its identity and prevent MITM attacks.
+#[derive(Clone)]
+pub struct SshHostKey {
+    pub public_key: String,  // e.g. "ssh-ed25519 AAAA..."
+    pub private_key_path: std::path::PathBuf,
+
+    pub private_key: Vec<u8>,
+}
+
+impl SshHostKey {
+    /// Generate a new Ed25519 SSH host key or load an existing one.
+    /// Keys are stored as `ssh_host_key` (private, 0600) and `ssh_host_key.pub` (public).
+    pub async fn create_or_load(state_dir: &std::path::Path) -> std::io::Result<Self> {
+        let key_path = state_dir.join("ssh_host_key");
+        let pub_path = state_dir.join("ssh_host_key.pub");
+
+        // Try loading existing key
+        if key_path.exists() {
+            let private_key = tokio::fs::read(&key_path).await?;
+            let public_key = tokio::fs::read_to_string(&pub_path).await?;
+            return Ok(SshHostKey {
+                public_key: public_key.trim().to_string(),
+                private_key_path: key_path,
+                private_key,
+            });
+        }
+
+        // Generate new Ed25519 key pair
+        let mut csprng = rand::rngs::OsRng;
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let verifying_key = signing_key.verifying_key();
+
+        // Serialize private key to bytes (32-byte seed)
+        let private_bytes = signing_key.to_bytes().to_vec();
+
+        // Format public key in OpenSSH format: "ssh-ed25519 <base64>"
+        let public_bytes = verifying_key.as_bytes();
+        let public_key_str = format!("ssh-ed25519 {}", base64::encode(public_bytes));
+
+        // Write private key (user-only)
+        tokio::fs::write(&key_path, &private_bytes).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&key_path, perms);
+        }
+
+        // Write public key
+        tokio::fs::write(&pub_path, &public_key_str).await?;
+
+        Ok(SshHostKey {
+            public_key: public_key_str,
+            private_key_path: key_path,
+            private_key: private_bytes,
+        })
+    }
 }
 
 // ── Release-only: embed the contents of web/dist into the binary ─────────────
@@ -123,6 +186,7 @@ pub async fn serve(state: AppState) {
         .route("/api/sessions/{id}/logs/tail", get(sessions::get_logs_tail))
         .route("/api/sessions/{id}/attach", get(ws::attach_handler))
         .route("/api/nodes", get(nodes::list_nodes))
+        .route("/api/nodes/host-key", get(nodes::get_host_key))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,

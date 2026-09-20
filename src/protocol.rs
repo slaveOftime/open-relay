@@ -140,6 +140,8 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
     match message {
         NodeWsMessage::Join { .. } => "join",
         NodeWsMessage::Joined => "joined",
+        NodeWsMessage::HostKey { .. } => "host_key",
+        NodeWsMessage::GetHostKey => "get_host_key",
         NodeWsMessage::Error { .. } => "error",
         NodeWsMessage::Rpc { .. } => "rpc",
         NodeWsMessage::RpcResponse { .. } => "rpc_response",
@@ -150,6 +152,24 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
         NodeWsMessage::Ping => "ping",
         NodeWsMessage::Pong => "pong",
     }
+}
+
+/// Authentication method for a secondary node joining a primary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum NodeJoinAuth {
+    /// Authenticate with a plaintext API key.
+    ApiKey {
+        key: String,
+    },
+    /// Authenticate with an SSH key signature.
+    /// The `nonce` is a random value sent by the primary,
+    /// and `signature` is the SSH-format signature of the nonce.
+    SshKey {
+        nonce: String,
+        signature: String,
+        public_key: String,
+    },
 }
 
 fn default_api_key_scopes() -> String {
@@ -342,7 +362,9 @@ pub enum RpcRequest {
     JoinStart {
         url: String,
         name: String,
-        key: String,
+        key: Option<String>,
+        ssh_key_path: Option<String>,
+        ssh_known_hosts: Option<String>,
     },
     /// Signal the daemon to stop and remove an outbound join connector.
     JoinStop {
@@ -354,6 +376,11 @@ pub enum RpcRequest {
     },
     /// List all secondary nodes currently connected to this (primary) daemon.
     NodeList,
+    /// Register an SSH public key for a named secondary node on the primary.
+    NodeAcceptSshPubKey {
+        name: String,
+        public_key: String,
+    },
 }
 
 impl RpcRequest {
@@ -391,6 +418,7 @@ impl RpcRequest {
             RpcRequest::JoinStop { .. } => "join_stop",
             RpcRequest::JoinList { .. } => "join_list",
             RpcRequest::NodeList => "node_list",
+            RpcRequest::NodeAcceptSshPubKey { .. } => "node_accept_ssh_pubkey",
         }
     }
 }
@@ -607,10 +635,19 @@ pub struct JoinSummary {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeWsMessage {
     /// Secondary → Primary: authentication handshake.
+    /// Authentication can be via API key or SSH key signature.
     Join {
         name: String,
-        key: String,
+        auth: NodeJoinAuth,
     },
+
+    /// Primary → Secondary: provides its SSH host key for verification.
+    HostKey {
+        public_key: String,
+    },
+
+    /// Secondary → Primary: request the primary's SSH host key (before handshake).
+    GetHostKey,
     /// Primary → Secondary: handshake accepted.
     Joined,
     /// Primary → Secondary: handshake rejected or fatal error.
@@ -671,7 +708,8 @@ pub enum NodeWsMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+        NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload,
+        encode_node_ws_payload,
     };
 
     #[test]
@@ -727,16 +765,19 @@ mod tests {
     fn node_ws_payload_round_trips_uncompressed_binary_json() {
         let message = NodeWsMessage::Join {
             name: "worker-a".into(),
-            key: "secret".into(),
+            auth: NodeJoinAuth::ApiKey { key: "secret".into() },
         };
 
         let payload = encode_node_ws_payload(&message).expect("encode payload");
         let decoded = decode_node_ws_payload(&payload).expect("decode payload");
 
         match decoded {
-            NodeWsMessage::Join { name, key } => {
+            NodeWsMessage::Join { name, auth } => {
                 assert_eq!(name, "worker-a");
-                assert_eq!(key, "secret");
+                match auth {
+                    NodeJoinAuth::ApiKey { key } => assert_eq!(key, "secret"),
+                    other => panic!("unexpected auth: {other:?}"),
+                }
             }
             other => panic!("unexpected decoded message: {other:?}"),
         }

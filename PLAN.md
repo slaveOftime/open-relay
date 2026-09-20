@@ -617,7 +617,7 @@ Develop vertical slices behind development-only switches, then delete replaced c
 
 **Deliver** direct remote stream adapters/credits/fairness/deadlines/cancel/connection fencing; revocable auth/scopes/origin/proxy isolation; process-tree/drain/shutdown/reconciliation; safe export/upload/privacy; current security audit.
 
-**Status (complete).** Byte-bounded queues with enforced credits; direct remote attachment streams with fencing, deadlines, and keepalives; principal-bound authz with scoped API keys, Origin checks, and proxy credential isolation; process-tree kill with staged escalation and signal-driven drain; privacy-by-construction log/export defaults (security audit addendum in docs/SECURITY_AUDIT_REPORT.md).
+**Status (complete).** Byte-bounded queues with enforced credits; direct remote attachment streams with fencing, deadlines, and keepalives; principal-bound authz with scoped API keys and optional SSH key authentication, Origin checks, and proxy credential isolation; process-tree kill with staged escalation and signal-driven drain; privacy-by-construction log/export defaults (security audit addendum in docs/SECURITY_AUDIT_REPORT.md).
 
 
 **Exit:** local/remote share conformance suite; stalled history does not stall control; revoked controllers cannot write; supported cleanup leaves no leaked managed processes/resources.

@@ -43,6 +43,7 @@ honest migration instead.
 | CLI ↔ daemon protocol | IPC protocol v4 | IPC protocol **v13** | CLI and daemon must both be 0.5.0. A mismatch exits with a precise version error — no silent misbehavior. |
 | Attach stream framing | base64 chunks inside JSON lines | binary frames after the JSON init line | Only relevant to tooling that spoke IPC directly; update it or pipe through the 0.5.0 CLI. |
 | Federation | 0.3.x node handshake | fenced, deadline/keepalive-driven node links (M5-2…M5-4) | All nodes must run 0.5.0; re-`join` secondaries after upgrading. No rolling mixed-version federation. |
+| SSH auth | — | optional SSH key authentication with MITM protection (M5-4) | New `--ssh-key` flag on `oly join start`; primary serves host key via `GET /api/nodes/host-key`; no action for existing joins. |
 | Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed | Delete them from `config.json`. Unknown keys are **silently ignored** (the config parser is permissive by design), so a stale key will not error — it just does nothing. |
 | API keys | one all-powerful daemon key | scoped keys (M5-4) | Old keys stop working; create new scoped keys with `oly api-key`. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |

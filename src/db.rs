@@ -525,6 +525,26 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Look up an SSH public key entry by its OpenSSH-format key data.
+    /// Returns the key record if found, None otherwise.
+    pub async fn get_ssh_key_entry(&self, key_data: &str) -> Result<Option<(String, String)>> {
+        let rows = sqlx::query("SELECT name, key_data FROM ssh_keys WHERE key_data = ?1")
+            .bind(key_data)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
+    }
+
+    /// Register an SSH public key for a named secondary node.
+    pub async fn insert_ssh_key_entry(&self, name: &str, key_data: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO ssh_keys (name, key_data) VALUES (?1, ?2)")
+            .bind(name)
+            .bind(key_data)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// List all registered API keys (names + creation timestamps + scopes).
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
         let rows =

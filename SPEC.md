@@ -288,8 +288,14 @@ Supported key forms include:
 ### `oly join start --name <name> --key <key> <url>`
 
 - Saves an outbound join configuration on the secondary.
-- Requests the local daemon to connect to the primary.
+- Requests the local daemon to connect to the primary using API key authentication.
 - If the daemon is not running, the saved join config remains and will be used on the next daemon start.
+
+### `oly join start --name <name> --ssh-key <key-path> <url>`
+
+- Connects using SSH key authentication instead of a plaintext API key.
+- The primary's host key is fetched over HTTP and verified on first connect (TOFU).
+- The private key signs a nonce during the WebSocket handshake for MITM protection.
 
 ### `oly join stop --name <name>`
 
@@ -438,8 +444,8 @@ One daemon can act as the **primary** and accept outbound secondary connections.
 
 The current model is:
 
-1. Generate a key on the primary with `oly api-key add`.
-2. Start a join from the secondary with `oly join start --name <name> --key <key> <url>`.
+1. Generate an API key on the primary with `oly api-key add`.
+2. Start a join from the secondary with `oly join start --name <name> --key <key> <url>` (API key) or `oly join start --name <name> --ssh-key <key-path> <url>` (SSH key).
 3. The secondary daemon maintains a connection to the primary.
 4. Session-oriented commands can target the secondary with `--node <name>`.
 

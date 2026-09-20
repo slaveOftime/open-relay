@@ -606,6 +606,19 @@ pub enum NodeCommand {
     /// List all secondary nodes currently connected to this (primary) daemon.
     #[command(name = "ls")]
     List,
+    /// Register an SSH public key for a named secondary node.
+    #[command(name = "accept-ssh-pubkey")]
+    AcceptSshPubKey(AcceptSshPubKeyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AcceptSshPubKeyArgs {
+    /// Name of the secondary node to register the SSH key for.
+    #[arg(long, short = 'n')]
+    pub name: String,
+    /// SSH public key in OpenSSH format (e.g. "ssh-ed25519 AAAA...").
+    #[arg(long, short = 'k', value_name = "KEY")]
+    pub pub_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -615,7 +628,13 @@ pub struct JoinStartArgs {
     pub name: String,
     /// API key printed by `oly api-key add` on the primary.
     #[arg(long, short = 'k')]
-    pub key: String,
+    pub key: Option<String>,
+    /// Path to SSH private key for authentication (conflicts with --key).
+    #[arg(long, conflicts_with = "key", value_name = "PATH")]
+    pub ssh_key: Option<String>,
+    /// Path to known_hosts file for host key verification.
+    #[arg(long, value_name = "PATH")]
+    pub ssh_known_hosts: Option<String>,
     #[arg(help = "HTTP base URL of the primary daemon, e.g. http://primary-host:15443")]
     pub url: String,
 }

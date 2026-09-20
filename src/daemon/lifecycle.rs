@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use std::{fmt::Write as _, fs::File, path::Path, process::Stdio, sync::Arc, time::Duration};
 
 use interprocess::local_socket::traits::tokio::Listener as _;
@@ -615,6 +617,25 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let live_config = LiveConfig::from_arc(Arc::clone(&config));
 
     let auth_state = auth_hash.map(AuthState::new);
+    let ssh_host_key = if no_http {
+        // HTTP disabled — no host key needed, use placeholder.
+        http::SshHostKey {
+            public_key: "".to_string(),
+            private_key_path: PathBuf::new(),
+            private_key: vec![],
+        }
+    } else {
+        http::SshHostKey::create_or_load(&config.state_dir)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(%e, "failed to create SSH host key, node joins will be rejected");
+                http::SshHostKey {
+                    public_key: "".to_string(),
+                    private_key_path: PathBuf::new(),
+                    private_key: vec![],
+                }
+            })
+    };
     if !no_http {
         let http_state = http::AppState {
             store: session_store.clone(),
@@ -624,6 +645,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             event_tx: event_tx.clone(),
             auth: auth_state,
             node_registry: node_registry.clone(),
+            ssh_host_key,
         };
         tokio::spawn(http::serve(http_state));
         info!("http server task spawned");

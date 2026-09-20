@@ -259,11 +259,91 @@ oly logs <ID> --exit --timeout 30s                 # session exited
 | `oly api-key add <name>` | Create an API key on the primary and print it once |
 | `oly api-key ls` | List API key labels on the primary |
 | `oly api-key remove <name>` | Revoke an API key on the primary |
-| `oly join start --name <name> --key <key> <url>` | Connect this daemon to a primary |
+| `oly join start --name <name> --key <key> <url>` | Connect this daemon to a primary (API key auth) |
+| `oly join start --name <name> --ssh-key <key-path> <url>` | Connect this daemon to a primary (SSH key auth) |
 | `oly join stop --name <name>` | Disconnect and remove a saved join config |
 | `oly join ls` | List saved outbound join configs on this daemon |
 | `oly join ls --primary` | Ask the daemon for currently active primary-side joins |
 | `oly node ls` | List secondary nodes currently connected to the primary |
+
+---
+
+### Federation joining — two auth methods
+
+**Method 1 — API key (shared secret):**
+
+```bash
+# On the primary, generate a scoped API key
+oly api-key add myserver
+# prints: a3f4c1b2... (copy this once)
+
+# On the secondary, join with the key
+oly join start --name myserver --key a3f4c1b2... http://192.168.1.100:15443
+```
+
+**Method 2 — SSH key (challenge-response, MITM protected):**
+
+```bash
+# 1. Generate an Ed25519 key pair if you don't already have one
+#    (this is a standard SSH private key, works with ssh-keygen tools)
+ssh-keygen -t ed25519 -f ~/.ssh/oly_secondary -N ""
+
+# 2. On the primary, fetch and register the secondary's public key
+#    Run this on the primary machine:
+oly node accept-ssh-pubkey     --name myserver     --pub-key "ssh-ed25519 AAAA..."
+
+#    Or, let the secondary daemon push it during join (see below).
+
+# 3. On the secondary, start the join with your SSH private key
+oly join start --name myserver --ssh-key ~/.ssh/oly_secondary http://192.168.1.100:15443
+
+# 4. First time only — TOFU host key verification:
+#    The secondary connects, fetches the primary's Ed25519 host key
+#    over HTTP, and asks you to confirm the fingerprint before proceeding.
+#    The fingerprint is printed; verify it matches the primary's known key.
+```
+
+**How SSH join works under the hood:**
+
+1. The secondary daemon fetches the primary's Ed25519 host key via `GET /api/nodes/host-key` (over HTTP, before WebSocket upgrade).
+2. On first connect, the secondary shows the host key fingerprint for TOFU verification — you confirm it matches the primary's actual key.
+3. The WebSocket handshake sends a signed challenge instead of a plaintext API key:
+   - The primary sends a random nonce over the WebSocket.
+   - The secondary signs the nonce with its Ed25519 private key.
+   - The primary verifies the signature against the registered public key.
+4. This eliminates cleartext key exposure and provides MITM protection via the verified host key.
+
+**Combined steps for a typical pair:**
+
+```bash
+# --- On the primary ---
+oly daemon start
+oly api-key add myserver
+
+# --- On the secondary ---
+ssh-keygen -t ed25519 -f ~/.ssh/oly_secondary -N ""
+cat ~/.ssh/oly_secondary.pub   # copy the output
+
+# On the primary (paste the copied public key):
+oly node accept-ssh-pubkey --name myserver --pub-key "ssh-ed25519 AAAA..."
+
+# On the secondary:
+oly join start --name myserver --ssh-key ~/.ssh/oly_secondary http://192.168.1.100:15443
+
+# Verify the host key fingerprint shown on first connect
+```
+
+**Reverse direction (secondary→primary commands):**
+
+After joining, run commands targeting the secondary from the primary's CLI:
+
+```bash
+oly node ls           # see connected secondaries
+oly send --node myserver --screen --tail 20
+oly attach --node myserver <session-id>
+oly logs --node myserver <session-id>
+oly stop --node myserver <session-id>
+```
 
 ---
 
