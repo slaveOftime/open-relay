@@ -97,7 +97,8 @@ async fn connect_and_relay(
 
     // ── Step 1: SSH-key authentication — fetch host key, receive the
     // primary's signed challenge, verify the host, then sign the join.
-    let host = join.primary_url
+    let host = join
+        .primary_url
         .strip_prefix("http://")
         .or_else(|| join.primary_url.strip_prefix("https://"))
         .and_then(|u| u.split('/').next())
@@ -119,15 +120,21 @@ async fn connect_and_relay(
         // Request the host-key challenge from the primary.
         let challenge_req = NodeWsMessage::GetHostKey;
         ws_tx
-            .send(WsMessage::Binary(encode_node_ws_payload(&challenge_req)?.into()))
+            .send(WsMessage::Binary(
+                encode_node_ws_payload(&challenge_req)?.into(),
+            ))
             .await
-            .map_err(|e| crate::error::AppError::Protocol(format!("host key request failed: {e}")))?;
+            .map_err(|e| {
+                crate::error::AppError::Protocol(format!("host key request failed: {e}"))
+            })?;
 
         let (host_public_key, nonce, host_signature) = match ws_rx.next().await {
             Some(Ok(frame)) => match decode_node_message(frame) {
-                Ok(NodeWsMessage::HostKey { public_key, nonce, host_signature }) => {
-                    (public_key, nonce, host_signature)
-                }
+                Ok(NodeWsMessage::HostKey {
+                    public_key,
+                    nonce,
+                    host_signature,
+                }) => (public_key, nonce, host_signature),
                 Ok(NodeWsMessage::Error { message }) => {
                     return Err(crate::error::AppError::Protocol(format!(
                         "host key challenge rejected: {message}"
@@ -151,8 +158,9 @@ async fn connect_and_relay(
             }
         };
 
-        let nonce_bytes = crate::sshauth::b64_decode(&nonce)
-            .map_err(|e| crate::error::AppError::Protocol(format!("invalid challenge nonce: {e}")))?;
+        let nonce_bytes = crate::sshauth::b64_decode(&nonce).map_err(|e| {
+            crate::error::AppError::Protocol(format!("invalid challenge nonce: {e}"))
+        })?;
         let nonce: [u8; crate::sshauth::NONCE_LEN] = nonce_bytes.try_into().map_err(|_| {
             crate::error::AppError::Protocol("challenge nonce has unexpected length".into())
         })?;
@@ -191,7 +199,10 @@ async fn connect_and_relay(
         let payload = crate::sshauth::node_join_payload(&join.name, &nonce, &public_key);
         let signature = crate::sshauth::sign_b64(&signing_key, &payload);
 
-        NodeJoinAuth::SshKey { signature, public_key }
+        NodeJoinAuth::SshKey {
+            signature,
+            public_key,
+        }
     } else {
         // API key authentication
         NodeJoinAuth::ApiKey {
@@ -585,7 +596,11 @@ pub(super) async fn handle_node_accept_ssh_pubkey(
     // canonical form) always match, regardless of how the key was pasted in.
     let canonical = match crate::sshauth::normalize_public_key(&public_key) {
         Ok(key) => key,
-        Err(e) => return RpcResponse::Error { message: e.to_string() },
+        Err(e) => {
+            return RpcResponse::Error {
+                message: e.to_string(),
+            };
+        }
     };
     if let Err(e) = db.insert_ssh_key_entry(&name, &canonical).await {
         return RpcResponse::Error {

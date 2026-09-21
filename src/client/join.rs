@@ -123,7 +123,13 @@ pub async fn run_join(
     ssh_key_path: Option<String>,
     ssh_known_hosts: Option<String>,
 ) -> Result<()> {
-    let join = build_join_config(url.clone(), name.clone(), key.clone(), ssh_key_path.clone(), ssh_known_hosts.clone())?;
+    let join = build_join_config(
+        url.clone(),
+        name.clone(),
+        key.clone(),
+        ssh_key_path.clone(),
+        ssh_known_hosts.clone(),
+    )?;
     if let Some(public_key) = &join.ssh_public_key {
         println!(
             "Node SSH public key\n(register it on the primary with `oly node accept-ssh-pubkey -n {name} -k \"<KEY>\"`):\n{public_key}"

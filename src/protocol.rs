@@ -159,9 +159,7 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum NodeJoinAuth {
     /// Authenticate with a plaintext API key.
-    ApiKey {
-        key: String,
-    },
+    ApiKey { key: String },
     /// Authenticate with an Ed25519 SSH key signature over the challenge
     /// nonce issued by the primary on this connection (see `sshauth`):
     /// `sign("oly-node-join-v1" || name || nonce || public_key)`.
@@ -774,7 +772,9 @@ mod tests {
     fn node_ws_payload_round_trips_uncompressed_binary_json() {
         let message = NodeWsMessage::Join {
             name: "worker-a".into(),
-            auth: NodeJoinAuth::ApiKey { key: "secret".into() },
+            auth: NodeJoinAuth::ApiKey {
+                key: "secret".into(),
+            },
         };
 
         let payload = encode_node_ws_payload(&message).expect("encode payload");
@@ -824,7 +824,11 @@ mod tests {
         match decode_node_ws_payload(&payload).expect("decode payload") {
             NodeWsMessage::Join {
                 name,
-                auth: NodeJoinAuth::SshKey { signature, public_key },
+                auth:
+                    NodeJoinAuth::SshKey {
+                        signature,
+                        public_key,
+                    },
             } => {
                 assert_eq!(name, "worker-b");
                 assert_eq!(signature, "sig");

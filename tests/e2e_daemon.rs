@@ -412,7 +412,7 @@ fn e2e_daemon_supports_bind_override() {
 
 #[test]
 fn e2e_federation_ssh_key_join_handshake() {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use ed25519_dalek::Signer as _;
 
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -425,18 +425,30 @@ fn e2e_federation_ssh_key_join_handshake() {
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let node_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let canonical_pub = format!("ssh-ed25519 {}", B64.encode(node_key.verifying_key().as_bytes()));
+    let canonical_pub = format!(
+        "ssh-ed25519 {}",
+        B64.encode(node_key.verifying_key().as_bytes())
+    );
     let keypair = ssh_key::private::Ed25519Keypair {
         private: ssh_key::private::Ed25519PrivateKey::from_bytes(&seed),
         public: ssh_key::public::Ed25519PublicKey(*node_key.verifying_key().as_bytes()),
     };
-    let private =
-        ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "e2e")
-            .expect("build ssh private key");
-    let openssh_pub = private.public_key().to_openssh().expect("openssh public key line");
+    let private = ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "e2e")
+        .expect("build ssh private key");
+    let openssh_pub = private
+        .public_key()
+        .to_openssh()
+        .expect("openssh public key line");
 
     let accept = oly_cmd(&tmp)
-        .args(["node", "accept-ssh-pubkey", "-n", "worker1", "-k", &openssh_pub])
+        .args([
+            "node",
+            "accept-ssh-pubkey",
+            "-n",
+            "worker1",
+            "-k",
+            &openssh_pub,
+        ])
         .output()
         .expect("`oly node accept-ssh-pubkey` failed to execute");
     assert!(
@@ -672,12 +684,17 @@ fn e2e_federation_ssh_key_join_lifecycle() {
         private: ssh_key::private::Ed25519PrivateKey::from_bytes(&seed),
         public: ssh_key::public::Ed25519PublicKey(*node_key.verifying_key().as_bytes()),
     };
-    let private =
-        ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "e2e")
-            .expect("build ssh private key");
+    let private = ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "e2e")
+        .expect("build ssh private key");
     let key_path = secondary_tmp.join("node_ed25519");
-    std::fs::write(&key_path, private.to_openssh(ssh_key::LineEnding::LF).expect("to_openssh").as_bytes())
-        .expect("write node key file");
+    std::fs::write(
+        &key_path,
+        private
+            .to_openssh(ssh_key::LineEnding::LF)
+            .expect("to_openssh")
+            .as_bytes(),
+    )
+    .expect("write node key file");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -764,7 +781,10 @@ fn e2e_federation_ssh_key_join_lifecycle() {
         ])
         .output()
         .expect("`oly join start` (rejoin) failed to execute");
-    assert!(rejoin.status.success(), "rejoin command accepted (connector fails async; check below)");
+    assert!(
+        rejoin.status.success(),
+        "rejoin command accepted (connector fails async; check below)"
+    );
 
     let rejoined = rt.block_on(wait_for_node_connected(port, "worker1", 3));
     assert!(

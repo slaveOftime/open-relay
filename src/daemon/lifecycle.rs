@@ -621,7 +621,9 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     } else {
         http::SshHostKey::create_or_load(&config.state_dir)
             .await
-            .inspect_err(|e| warn!(%e, "failed to create SSH host key, SSH-key node joins will be rejected"))
+            .inspect_err(
+                |e| warn!(%e, "failed to create SSH host key, SSH-key node joins will be rejected"),
+            )
             .unwrap_or_else(|_| http::SshHostKey::disabled())
     };
     if !no_http {

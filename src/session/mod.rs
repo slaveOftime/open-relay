@@ -19,10 +19,10 @@ pub(crate) mod scan;
 mod store;
 #[cfg(test)]
 pub(crate) mod store;
+pub use runtime::ModeSnapshot;
 #[cfg(test)]
 pub(crate) use runtime::SequencedChunk;
 pub use store::pump::{AttachEvent, AttachPump, PumpCredit};
-pub use runtime::ModeSnapshot;
 pub(crate) use store::scrollback_seed_bytes;
 
 use chrono::{DateTime, Utc};

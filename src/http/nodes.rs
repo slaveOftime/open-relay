@@ -147,12 +147,18 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             .await
             .unwrap_or(false)
         }
-        NodeJoinAuth::SshKey { signature, public_key } => {
+        NodeJoinAuth::SshKey {
+            signature,
+            public_key,
+        } => {
             // SSH-key auth is only valid against a challenge issued on this
             // connection; never accept an out-of-band signature.
             let Some(nonce) = issued_nonce else {
-                send_error(&mut ws_tx, "ssh key auth requires a get_host_key challenge first")
-                    .await;
+                send_error(
+                    &mut ws_tx,
+                    "ssh key auth requires a get_host_key challenge first",
+                )
+                .await;
                 return;
             };
             let canonical = match sshauth::normalize_public_key(&public_key) {

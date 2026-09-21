@@ -59,9 +59,9 @@ pub fn load_signing_key(path: &std::path::Path) -> Result<ed25519_dalek::Signing
         ))
     })?;
     match private.key_data() {
-        ssh_key::private::KeypairData::Ed25519(kp) => {
-            Ok(ed25519_dalek::SigningKey::from_bytes(&kp.private.to_bytes()))
-        }
+        ssh_key::private::KeypairData::Ed25519(kp) => Ok(ed25519_dalek::SigningKey::from_bytes(
+            &kp.private.to_bytes(),
+        )),
         _ => Err(AppError::Protocol(format!(
             "SSH key {}: only Ed25519 keys are supported",
             path.display()
@@ -99,8 +99,7 @@ pub fn normalize_public_key(input: &str) -> Result<String> {
 
     // Canonical internal form produced by this tool.
     let mut parts = trimmed.split_whitespace();
-    if let (Some("ssh-ed25519"), Some(encoded), None) =
-        (parts.next(), parts.next(), parts.next())
+    if let (Some("ssh-ed25519"), Some(encoded), None) = (parts.next(), parts.next(), parts.next())
         && let Ok(bytes) = b64_decode(encoded)
         && let Ok(raw) = <[u8; 32]>::try_from(bytes.as_slice())
     {
@@ -144,7 +143,11 @@ pub fn sign_b64(signing_key: &ed25519_dalek::SigningKey, data: &[u8]) -> String 
 /// Verify a base64 raw Ed25519 signature against a canonical or OpenSSH
 /// public key line. Fails closed on any parse or verification error.
 pub fn verify_signature(public_key: &str, signature_b64: &str, data: &[u8]) -> bool {
-    verify_signature_deoded(public_key, &b64_decode(signature_b64).unwrap_or_default(), data)
+    verify_signature_deoded(
+        public_key,
+        &b64_decode(signature_b64).unwrap_or_default(),
+        data,
+    )
 }
 
 fn verify_signature_deoded(public_key: &str, signature: &[u8], data: &[u8]) -> bool {
@@ -204,7 +207,10 @@ pub fn lookup_known_hosts(path: &std::path::Path, host: &str, key_line: &str) ->
             // Key-type marker lines are not supported.
             continue;
         }
-        if !hosts.split(',').any(|entry| host_entry_matches(entry, host)) {
+        if !hosts
+            .split(',')
+            .any(|entry| host_entry_matches(entry, host))
+        {
             continue;
         }
         host_present = true;
@@ -267,9 +273,13 @@ mod tests {
             private: ssh_key::private::Ed25519PrivateKey::from_bytes(&sk.to_bytes()),
             public: ssh_key::public::Ed25519PublicKey(*sk.verifying_key().as_bytes()),
         };
-        let private = ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "test")
-            .expect("build private key");
-        (*private.to_openssh(ssh_key::LineEnding::LF).expect("to_openssh")).clone()
+        let private =
+            ssh_key::PrivateKey::new(ssh_key::private::KeypairData::Ed25519(keypair), "test")
+                .expect("build private key");
+        (*private
+            .to_openssh(ssh_key::LineEnding::LF)
+            .expect("to_openssh"))
+        .clone()
     }
 
     fn write_temp(file: &std::path::Path, content: &str) {
@@ -435,7 +445,11 @@ mod tests {
 
         let host_payload = host_challenge_payload(&nonce);
         let host_sig = sign_b64(&host_sk, &host_payload);
-        assert!(verify_signature(&public_key_line(&host_sk), &host_sig, &host_payload));
+        assert!(verify_signature(
+            &public_key_line(&host_sk),
+            &host_sig,
+            &host_payload
+        ));
 
         let canonical = public_key_line(&node_sk);
         let join_payload = node_join_payload("worker-a", &nonce, &canonical);
@@ -444,7 +458,11 @@ mod tests {
 
         // The host challenge signature must not be accepted as a join
         // signature and vice versa (domain separation via context prefix).
-        assert!(!verify_signature(&public_key_line(&host_sk), &host_sig, &join_payload));
+        assert!(!verify_signature(
+            &public_key_line(&host_sk),
+            &host_sig,
+            &join_payload
+        ));
         assert!(!verify_signature(&canonical, &join_sig, &host_payload));
     }
 }
