@@ -423,7 +423,7 @@ fn e2e_federation_ssh_key_join_handshake() {
     // Generate the secondary's Ed25519 SSH key and register its public key
     // on the primary using a real OpenSSH-format key line.
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
     let node_key = ed25519_dalek::SigningKey::from_bytes(&seed);
     let canonical_pub = format!(
         "ssh-ed25519 {}",
@@ -638,7 +638,7 @@ fn e2e_federation_ssh_key_join_handshake() {
 
         // ── Unregistered key: valid signature, key not in registry ────────
         let mut other_seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut other_seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut other_seed);
         let other_key = ed25519_dalek::SigningKey::from_bytes(&other_seed);
         let other_pub = format!("ssh-ed25519 {}", B64.encode(other_key.verifying_key().as_bytes()));
         let (mut ws_unreg, nonce3, _, _) = fetch_challenge(&ws_url).await;
@@ -678,7 +678,7 @@ fn e2e_federation_ssh_key_join_lifecycle() {
 
     // Generate the secondary's SSH key and write an OpenSSH private key file.
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
     let node_key = ed25519_dalek::SigningKey::from_bytes(&seed);
     let keypair = ssh_key::private::Ed25519Keypair {
         private: ssh_key::private::Ed25519PrivateKey::from_bytes(&seed),

@@ -384,20 +384,20 @@ fn base64url_no_pad(bytes: &[u8]) -> String {
 /// Generate a random VAPID (P-256) key pair.
 /// Returns `(private_key_base64url, public_key_base64url)`.
 fn generate_vapid_keypair() -> (String, String) {
-    use p256::elliptic_curve::sec1::ToEncodedPoint as _;
-    use rand::RngCore as _;
+    use p256::elliptic_curve::sec1::ToSec1Point as _;
+    use rand::Rng as _;
 
     // Retry until we land on a valid scalar (astronomically unlikely to loop more than once).
     let secret = loop {
         let mut key_bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key_bytes);
+        rand::rng().fill_bytes(&mut key_bytes);
         let fb = p256::elliptic_curve::FieldBytes::<p256::NistP256>::from(key_bytes);
         if let Ok(sk) = p256::SecretKey::from_bytes(&fb) {
             break sk;
         }
     };
     let private_b64 = base64url_no_pad(secret.to_bytes().as_ref());
-    let public_b64 = base64url_no_pad(secret.public_key().to_encoded_point(false).as_bytes());
+    let public_b64 = base64url_no_pad(secret.public_key().to_sec1_point(false).as_bytes());
     (private_b64, public_b64)
 }
 

@@ -182,9 +182,9 @@ impl AuthState {
 
     /// Issue a new random, expiring session token (ADR-0007).
     pub async fn issue_session(&self) -> String {
-        use rand::RngCore;
+        use rand::Rng as _;
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         self.sessions
             .lock()
@@ -292,12 +292,10 @@ impl AuthState {
 
 /// Hash a plaintext password with Argon2id. Returns a PHC-format string.
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    let salt = SaltString::generate(&mut rand::thread_rng());
+    use argon2::{Argon2, PasswordHasher};
+    // argon2 0.6 generates the salt internally (getrandom feature).
     let argon2 = Argon2::default();
-    Ok(argon2
-        .hash_password(password.as_bytes(), &salt)?
-        .to_string())
+    Ok(argon2.hash_password(password.as_bytes())?.to_string())
 }
 
 /// Verify a plaintext API key against a stored Argon2id hash.

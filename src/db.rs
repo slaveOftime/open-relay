@@ -20,7 +20,7 @@ pub struct Database {
 }
 
 impl Database {
-    fn push_list_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, query: &ListQuery) {
+    fn push_list_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, query: &ListQuery) {
         for tag in &query.tags {
             qb.push(" AND EXISTS (SELECT 1 FROM json_each(tags) WHERE LOWER(value) = ");
             qb.push_bind(tag.to_ascii_lowercase());

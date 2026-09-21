@@ -106,8 +106,9 @@ impl SshHostKey {
             seed
         } else {
             // Generate new Ed25519 key pair (raw 32-byte seed).
-            let mut csprng = rand::rngs::OsRng;
-            let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+            let mut seed_bytes = [0u8; 32];
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut seed_bytes);
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
             let seed = signing_key.to_bytes().to_vec();
 
             // Write private seed (user-only) and public key line.

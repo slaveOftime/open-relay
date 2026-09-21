@@ -104,7 +104,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                     return;
                 };
                 let mut nonce = [0u8; sshauth::NONCE_LEN];
-                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+                rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
                 let host_signature =
                     sshauth::sign_b64(&host_signing_key, &sshauth::host_challenge_payload(&nonce));
                 issued_nonce = Some(nonce);

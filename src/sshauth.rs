@@ -256,11 +256,11 @@ pub fn append_known_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore as _;
+    use rand::Rng as _;
 
     fn test_signing_key(seed: u8) -> ed25519_dalek::SigningKey {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         bytes[0] = seed; // deterministic-ish but distinct per seed
         ed25519_dalek::SigningKey::from_bytes(&bytes)
     }

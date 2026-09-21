@@ -32,8 +32,8 @@ strip = true
 opt-level = "z"
 
 [dependencies]
-clap = { version = "4.6", features = ["derive"] }
-tokio = { version = "1.15.1", features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "net", "sync", "fs"] }
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "time", "io-util", "net", "sync", "fs"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 async-trait = "0.1"
@@ -41,11 +41,11 @@ interprocess = { version = "2.4", features = ["tokio"] }
 portable-pty = "0.9"
 regex = "1"
 memchr = "2"
-notify-rust = "4.14.0"
+notify-rust = "4.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2"
-uuid = { version = "1.23.0", features = ["v4", "serde"] }
+uuid = { version = "1.26", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dirs = "6.0"
 thiserror = "2.0"
@@ -56,29 +56,29 @@ unicode-width = "0.2"
 # query-position events, serializable grids for checkpoints. M6-1 retired
 # the second parser: vt100 is a dev-only differential oracle now.
 alacritty_terminal = { version = "0.26.0", features = ["serde"] }
-which = "8.0.2"
+which = "8.0.6"
 axum = { version = "0.8", features = ["ws", "macros", "multipart"] }
-tower-http = { version = "0.6", features = ["cors", "compression-br", "compression-gzip"] }
+tower-http = { version = "0.7", features = ["cors", "compression-br", "compression-gzip"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "socks"] }
 rust-embed = "8"
 mime_guess = "2"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
-p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
-ed25519-dalek = { version = "2.1", features = ["batch"] }
-rand = "0.8"
-aes-gcm = "0.10"
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
+p256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
+ed25519-dalek = { version = "3", features = ["batch"] }
+rand = "0.10"
+aes-gcm = "0.11"
 hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.11"
-base64 = "0.22"
-argon2 = "0.5"
-rpassword = "7"
-tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
+base64 = "0.23"
+argon2 = "0.6"
+rpassword = "7.5"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 ssh-key = "0.7.0-rc.11"
 bytes = "1"
-arc-swap = "1.9.1"
+arc-swap = "1.9.2"
 parking_lot = "0.12"
 arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -98,8 +98,8 @@ vt100 = "0.16.2"
 portable-pty = "0.9"
 
 [target.'cfg(not(windows))'.dependencies]
-mimalloc = { version = "0.1.48", features = ["v3"] }
-libmimalloc-sys = { version = "0.1.44", features = ["v3", "extended"] }
+mimalloc = { version = "0.1.52" }
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Environment", "Win32_System_Kernel", "Win32_System_Threading", "Win32_Storage_FileSystem"] }

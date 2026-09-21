@@ -686,9 +686,9 @@ async fn handle_api_key_add(name: String, scopes: String, db: &Arc<Database>) ->
     if let Err(message) = crate::http::auth::validate_scope_list(&scopes) {
         return RpcResponse::Error { message };
     }
-    use rand::RngCore;
+    use rand::Rng;
     let mut key_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
+    rand::rng().fill_bytes(&mut key_bytes);
     let plaintext: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     match auth::hash_password(&plaintext) {
