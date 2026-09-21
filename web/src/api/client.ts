@@ -15,7 +15,7 @@ import type {
   UpdateSessionMetadataSpec,
 } from './types.ts'
 import { AuthRequiredError, TooManyAttemptsError } from './types.ts'
-import { parseServerFrame } from './ws-frames.ts'
+import { parseServerFrame, type WsModes } from './ws-frames.ts'
 
 const BASE = '/api'
 
@@ -444,12 +444,12 @@ export function subscribeEvents(
 const WS_ACK_STRIDE_BYTES = 1024 * 1024
 
 export interface AttachOptions {
-  /** Called with decoded terminal bytes that recreate the current visible session state. */
-  onInit: (data: Uint8Array, appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called with decoded terminal bytes that recreate the current visible session state, plus the authoritative input modes. */
+  onInit: (data: Uint8Array, modes: WsModes) => void
   /** Called with decoded raw PTY bytes for each incremental output chunk. */
   onData: (data: Uint8Array) => void
-  /** Called when terminal modes change (DECCKM, bracketed paste). */
-  onModeChanged: (appCursorKeys: boolean, bracketedPasteMode: boolean) => void
+  /** Called when terminal modes change (DECCKM, bracketed paste, mouse, focus). */
+  onModeChanged: (modes: WsModes) => void
   /** Called when the PTY was resized by another attached client. */
   onResized?: (rows: number, cols: number) => void
   /** Called on control handoffs with this attachment's new role. */
@@ -510,7 +510,13 @@ export class AttachSocket {
             this.expectedOffset = frame.endOffset
             this.role = frame.role
             opts.onControl?.(this.role)
-            opts.onInit(frame.data, frame.appCursorKeys, frame.bracketedPasteMode)
+            opts.onInit(frame.data, {
+              appCursorKeys: frame.appCursorKeys,
+              bracketedPasteMode: frame.bracketedPasteMode,
+              mouseReport: frame.mouseReport,
+              sgrMouse: frame.sgrMouse,
+              focusEvents: frame.focusEvents,
+            })
             return
           }
           case 'data': {
@@ -534,7 +540,13 @@ export class AttachSocket {
             return
           }
           case 'modeChanged':
-            opts.onModeChanged(frame.appCursorKeys, frame.bracketedPasteMode)
+            opts.onModeChanged({
+              appCursorKeys: frame.appCursorKeys,
+              bracketedPasteMode: frame.bracketedPasteMode,
+              mouseReport: frame.mouseReport,
+              sgrMouse: frame.sgrMouse,
+              focusEvents: frame.focusEvents,
+            })
             return
           case 'resized':
             opts.onResized?.(frame.rows, frame.cols)

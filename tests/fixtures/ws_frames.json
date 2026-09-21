@@ -9,6 +9,9 @@
         "type": "init",
         "app_cursor_keys": true,
         "bracketed_paste_mode": true,
+        "mouse_report": false,
+        "sgr_mouse": false,
+        "focus_events": false,
         "end_offset": 4096,
         "incarnation": 9,
         "running": true,
@@ -24,9 +27,30 @@
         "type": "init",
         "app_cursor_keys": false,
         "bracketed_paste_mode": false,
+        "mouse_report": false,
+        "sgr_mouse": false,
+        "focus_events": false,
         "end_offset": 0,
         "incarnation": 1,
         "running": false,
+        "attachment_id": 7,
+        "role": "observer",
+        "data_hex": ""
+      }
+    },
+    {
+      "name": "init_mouse_sgr_focus",
+      "hex": "011c0000000000000000000000000000000101000000000000000700",
+      "expect": {
+        "type": "init",
+        "app_cursor_keys": false,
+        "bracketed_paste_mode": false,
+        "mouse_report": true,
+        "sgr_mouse": true,
+        "focus_events": true,
+        "end_offset": 0,
+        "incarnation": 1,
+        "running": true,
         "attachment_id": 7,
         "role": "observer",
         "data_hex": ""
@@ -43,7 +67,22 @@
       "expect": {
         "type": "mode_changed",
         "app_cursor_keys": false,
-        "bracketed_paste_mode": true
+        "bracketed_paste_mode": true,
+        "mouse_report": false,
+        "sgr_mouse": false,
+        "focus_events": false
+      }
+    },
+    {
+      "name": "mode_changed_mouse_sgr_focus",
+      "hex": "031c",
+      "expect": {
+        "type": "mode_changed",
+        "app_cursor_keys": false,
+        "bracketed_paste_mode": false,
+        "mouse_report": true,
+        "sgr_mouse": true,
+        "focus_events": true
       }
     },
     {

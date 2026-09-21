@@ -6,7 +6,12 @@
 // client and the daemon can never drift apart without a test failing.
 import { describe, expect, it } from 'vitest'
 import fixture from '../../../tests/fixtures/ws_frames.json'
-import { parseServerFrame, type ServerFrame } from './ws-frames.ts'
+import {
+  parseServerFrame,
+  terminalModeSequences,
+  type ServerFrame,
+  type WsModes,
+} from './ws-frames.ts'
 
 interface FrameVector {
   name: string
@@ -38,6 +43,9 @@ function describeFrame(frame: ServerFrame): Record<string, unknown> {
         type: 'init',
         app_cursor_keys: frame.appCursorKeys,
         bracketed_paste_mode: frame.bracketedPasteMode,
+        mouse_report: frame.mouseReport,
+        sgr_mouse: frame.sgrMouse,
+        focus_events: frame.focusEvents,
         end_offset: frame.endOffset,
         incarnation: frame.incarnation,
         running: frame.running,
@@ -52,6 +60,9 @@ function describeFrame(frame: ServerFrame): Record<string, unknown> {
         type: 'mode_changed',
         app_cursor_keys: frame.appCursorKeys,
         bracketed_paste_mode: frame.bracketedPasteMode,
+        mouse_report: frame.mouseReport,
+        sgr_mouse: frame.sgrMouse,
+        focus_events: frame.focusEvents,
       }
     case 'resized':
       return { type: 'resized', rows: frame.rows, cols: frame.cols }
@@ -93,6 +104,27 @@ describe('ws frame fixture conformance', () => {
       expect(describeFrame(frame!)).toEqual(vector.expect)
     })
   }
+
+  it('mirrors the negotiated modes as an authoritative DECSET stream', () => {
+    const modes: WsModes = {
+      appCursorKeys: false,
+      bracketedPasteMode: true,
+      mouseReport: true,
+      sgrMouse: true,
+      focusEvents: false,
+    }
+    const seq = terminalModeSequences(modes)
+    // Set-or-clear for every mode: stale replay bytes can never leave a
+    // wrong capture state behind.
+    expect(seq).toBe(
+      '\x1b[?1l\x1b[?2004h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1000h\x1b[?1006h\x1b[?1004l'
+    )
+    expect(seq).toContain('\x1b[?1000h')
+    expect(seq).toContain('\x1b[?1006h')
+    expect(terminalModeSequences({ ...modes, mouseReport: false, sgrMouse: false })).not.toContain(
+      '\x1b[?1000h'
+    )
+  })
 
   it('fails loudly on truncated and unknown frames instead of misparsing them', () => {
     // Empty payload is the only ignorable result ("no frame").

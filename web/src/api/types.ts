@@ -170,10 +170,13 @@ export type SessionNotificationData = {
 // WebSocket protocol
 // ---------------------------------------------------------------------------
 
+// Legacy JSON attach protocol types (pre-M3-3 wire format, kept for docs).
+// The live binary protocol lives in ./ws-frames.ts; input-affecting modes
+// (DECCKM, bracketed paste, mouse report/SGR, focus) ride the frame flags.
 export type WsServerMessage =
-  | { type: 'init'; data: string; appCursorKeys: boolean; bracketedPasteMode: boolean }
+  | { type: 'init'; data: string; appCursorKeys: boolean; bracketedPasteMode: boolean; mouseReport: boolean; sgrMouse: boolean; focusEvents: boolean }
   | { type: 'data'; data: string }
-  | { type: 'mode_changed'; appCursorKeys: boolean; bracketedPasteMode: boolean }
+  | { type: 'mode_changed'; appCursorKeys: boolean; bracketedPasteMode: boolean; mouseReport: boolean; sgrMouse: boolean; focusEvents: boolean }
   | { type: 'resized'; rows: number; cols: number }
   | { type: 'session_ended'; exit_code: number | null }
   | { type: 'error'; message: string }

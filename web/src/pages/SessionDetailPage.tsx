@@ -10,6 +10,7 @@ import {
   uploadSessionFile,
   AttachSocket,
 } from '@/api/client'
+import { terminalModeSequences } from '@/api/ws-frames'
 import { formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
 import { HistoryAnchorError, HistoryController } from '@/lib/history-controller'
 import {
@@ -113,6 +114,10 @@ function didSessionVisibleOutputAdvance(
 
 const DEFAULT_LOG_TAIL = 200
 const ATTACH_IDLE_BORDER_DELAY_MS = 10_000
+
+/** Encodes the authoritative DECSET mode sequences into the terminal's
+ * byte output queue (see onInit/onModeChanged). */
+const modesEncoder = new TextEncoder()
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function SessionDetailPage() {
@@ -762,21 +767,32 @@ function SessionDetailPageContent() {
             if (isMounted.current) setWsConnected(true)
             disarmAttachIdleAnimation()
           },
-          onInit: (data) => {
+          onInit: (data, modes) => {
             if (!gotSnapshot) {
               pushConnectTrace(`init received (${data.length} bytes)`)
               gotSnapshot = true
             }
             lastWsFrameAtRef.current = Date.now()
             enqueueTerminalOutput([data], { reset: true })
+            // Mirror the child's input modes right after the snapshot — the
+            // web equivalent of the native client's
+            // sync_local_terminal_modes(). The snapshot stream never
+            // replays DECSET mode sequences (and the scrollback seed can
+            // carry stale ones), so without this xterm.js would never
+            // capture mouse clicks/wheel for a program that had them
+            // enabled before the page loaded.
+            enqueueTerminalOutput([modesEncoder.encode(terminalModeSequences(modes))])
           },
           onData: (data) => {
             lastWsFrameAtRef.current = Date.now()
             enqueueTerminalOutput([data])
           },
-          onModeChanged: () => {
+          onModeChanged: (modes) => {
             lastWsFrameAtRef.current = Date.now()
-            // Mode changes are tracked server-side; client doesn't need to act.
+            // Modes are authoritative server-side; re-mirror them so the
+            // terminal's capture state always matches the child's request
+            // even after a reconnect or stale replay bytes.
+            enqueueTerminalOutput([modesEncoder.encode(terminalModeSequences(modes))])
           },
           onControl: (role) => {
             lastWsFrameAtRef.current = Date.now()

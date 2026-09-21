@@ -11,7 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::protocol::{RpcRequest, RpcResponse};
 use crate::session::registry::{AttachKind, ControlRequest};
 use crate::session::resize::ResizeSubscriber;
-use crate::session::{AttachEvent, AttachPump, SessionError};
+use crate::session::{AttachEvent, AttachPump, ModeSnapshot, SessionError};
 
 use super::AppState;
 
@@ -43,10 +43,13 @@ enum ServerMessage {
         incarnation: u64,
         /// Whether the session was still running at attach time.
         running: bool,
-        #[serde(rename = "appCursorKeys")]
-        app_cursor_keys: bool,
-        #[serde(rename = "bracketedPasteMode")]
-        bracketed_paste_mode: bool,
+        /// Authoritative child input modes at attach time. The browser
+        /// terminal mirrors them with DECSET (the web equivalent of the
+        /// native client's `sync_local_terminal_modes`), because the
+        /// snapshot stream deliberately omits mode sequences — without
+        /// this, a fresh page load into an already-mouse-enabled program
+        /// (vim, htop, …) leaves xterm.js capturing nothing.
+        modes: WsModes,
         /// This attachment's fencing token and granted role (M3-4).
         attachment_id: u64,
         role: &'static str,
@@ -57,12 +60,9 @@ enum ServerMessage {
         offset: u64,
         data: Vec<u8>,
     },
-    /// Terminal mode changed mid-stream.
+    /// Terminal mode changed mid-stream (all input-affecting modes).
     ModeChanged {
-        #[serde(rename = "appCursorKeys")]
-        app_cursor_keys: bool,
-        #[serde(rename = "bracketedPasteMode")]
-        bracketed_paste_mode: bool,
+        modes: WsModes,
     },
     /// Another attached client resized the PTY.
     Resized {
@@ -119,6 +119,42 @@ const WS_FRAME_PONG: u8 = 7;
 const WS_FRAME_CONTROL: u8 = 8;
 const WS_FLAG_APP_CURSOR_KEYS: u8 = 1 << 0;
 const WS_FLAG_BRACKETED_PASTE_MODE: u8 = 1 << 1;
+const WS_FLAG_MOUSE_REPORT: u8 = 1 << 2;
+const WS_FLAG_SGR_MOUSE: u8 = 1 << 3;
+const WS_FLAG_FOCUS_EVENTS: u8 = 1 << 4;
+
+/// Input-affecting terminal modes carried by the Init and ModeChanged
+/// frames. The daemon tracks them in the engine (`ModeSnapshot`); the
+/// browser needs all of them because xterm.js only captures mouse/focus
+/// events while its own parsed mode state says so.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+struct WsModes {
+    #[serde(rename = "appCursorKeys")]
+    app_cursor_keys: bool,
+    #[serde(rename = "bracketedPasteMode")]
+    bracketed_paste_mode: bool,
+    /// Child has mouse reporting enabled (any of 1000/1002/1003).
+    #[serde(rename = "mouseReport")]
+    mouse_report: bool,
+    /// Child negotiated SGR (1006) mouse encoding.
+    #[serde(rename = "sgrMouse")]
+    sgr_mouse: bool,
+    /// Child has focus in/out reporting (1004) enabled.
+    #[serde(rename = "focusEvents")]
+    focus_events: bool,
+}
+
+impl From<ModeSnapshot> for WsModes {
+    fn from(modes: ModeSnapshot) -> Self {
+        WsModes {
+            app_cursor_keys: modes.app_cursor_keys,
+            bracketed_paste_mode: modes.bracketed_paste_mode,
+            mouse_report: modes.mouse_report,
+            sgr_mouse: modes.sgr_mouse,
+            focus_events: modes.focus_events,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -183,13 +219,22 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
     "non-string panic payload"
 }
 
-fn mode_flags(app_cursor_keys: bool, bracketed_paste_mode: bool) -> u8 {
+fn mode_flags(modes: &WsModes) -> u8 {
     let mut flags = 0;
-    if app_cursor_keys {
+    if modes.app_cursor_keys {
         flags |= WS_FLAG_APP_CURSOR_KEYS;
     }
-    if bracketed_paste_mode {
+    if modes.bracketed_paste_mode {
         flags |= WS_FLAG_BRACKETED_PASTE_MODE;
+    }
+    if modes.mouse_report {
+        flags |= WS_FLAG_MOUSE_REPORT;
+    }
+    if modes.sgr_mouse {
+        flags |= WS_FLAG_SGR_MOUSE;
+    }
+    if modes.focus_events {
+        flags |= WS_FLAG_FOCUS_EVENTS;
     }
     flags
 }
@@ -203,14 +248,13 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
             end_offset,
             incarnation,
             running,
-            app_cursor_keys,
-            bracketed_paste_mode,
+            modes,
             attachment_id,
             role,
         } => {
             let mut payload = Vec::with_capacity(28 + data.len());
             payload.push(WS_FRAME_INIT);
-            payload.push(mode_flags(*app_cursor_keys, *bracketed_paste_mode));
+            payload.push(mode_flags(modes));
             payload.extend_from_slice(&end_offset.to_be_bytes());
             payload.extend_from_slice(&incarnation.to_be_bytes());
             payload.push(u8::from(*running));
@@ -226,13 +270,9 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
             payload.extend_from_slice(data);
             payload
         }
-        ServerMessage::ModeChanged {
-            app_cursor_keys,
-            bracketed_paste_mode,
-        } => vec![
-            WS_FRAME_MODE_CHANGED,
-            mode_flags(*app_cursor_keys, *bracketed_paste_mode),
-        ],
+        ServerMessage::ModeChanged { modes } => {
+            vec![WS_FRAME_MODE_CHANGED, mode_flags(modes)]
+        }
         ServerMessage::Resized { rows, cols } => {
             let mut payload = Vec::with_capacity(5);
             payload.push(WS_FRAME_RESIZED);
@@ -390,8 +430,7 @@ async fn handle_ws_streaming(
         end_offset: init.end_offset,
         incarnation: init.incarnation,
         running: init.running,
-        app_cursor_keys: init.modes.app_cursor_keys,
-        bracketed_paste_mode: init.modes.bracketed_paste_mode,
+        modes: WsModes::from(init.modes),
         attachment_id,
         role: registration.role.as_str(),
     };
@@ -419,6 +458,9 @@ async fn handle_ws_streaming(
         end_offset = init.end_offset,
         app_cursor_keys = init.modes.app_cursor_keys,
         bracketed_paste_mode = init.modes.bracketed_paste_mode,
+        mouse_report = init.modes.mouse_report,
+        sgr_mouse = init.modes.sgr_mouse,
+        focus_events = init.modes.focus_events,
         "local WebSocket stream initialized"
     );
 
@@ -465,8 +507,7 @@ async fn handle_ws_streaming(
                     }
                     AttachEvent::Modes(modes) => {
                         if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
-                            app_cursor_keys: modes.app_cursor_keys,
-                            bracketed_paste_mode: modes.bracketed_paste_mode,
+                            modes: WsModes::from(modes),
                         }).await {
                             let _ = state.store.attach_detach(&id, attachment_id).await;
                             return;
@@ -729,6 +770,9 @@ async fn handle_ws_proxied_streaming(
                                 running,
                                 app_cursor_keys,
                                 bracketed_paste_mode,
+                                mouse_report,
+                                sgr_mouse,
+                                focus_events,
                                 incarnation,
                                 attachment_id,
                                 role,
@@ -748,8 +792,13 @@ async fn handle_ws_proxied_streaming(
                                     end_offset,
                                     incarnation,
                                     running,
-                                    app_cursor_keys,
-                                    bracketed_paste_mode,
+                                    modes: WsModes {
+                                        app_cursor_keys,
+                                        bracketed_paste_mode,
+                                        mouse_report,
+                                        sgr_mouse,
+                                        focus_events,
+                                    },
                                     attachment_id,
                                     role: if role == "controller" { "controller" } else { "observer" },
                                 };
@@ -787,18 +836,28 @@ async fn handle_ws_proxied_streaming(
                             RpcResponse::AttachModeChanged {
                                 app_cursor_keys,
                                 bracketed_paste_mode,
-                                ..
+                                mouse_report,
+                                sgr_mouse,
+                                focus_events,
                             } => {
                                 debug!(
                                     session_id = %id,
                                     node = %node,
                                     app_cursor_keys,
                                     bracketed_paste_mode,
+                                    mouse_report,
+                                    sgr_mouse,
+                                    focus_events,
                                     "proxied WebSocket terminal mode changed"
                                 );
                                 let _ = send_server_message(&mut socket, &ServerMessage::ModeChanged {
-                                    app_cursor_keys,
-                                    bracketed_paste_mode,
+                                    modes: WsModes {
+                                        app_cursor_keys,
+                                        bracketed_paste_mode,
+                                        mouse_report,
+                                        sgr_mouse,
+                                        focus_events,
+                                    },
                                 }).await;
                             }
                             RpcResponse::AttachResized { rows, cols } => {
@@ -985,7 +1044,8 @@ fn seed_web_init_data(seed: Option<Vec<u8>>, rows: Option<u16>, snapshot: Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerMessage, WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED,
+        ServerMessage, WsModes, WS_FLAG_FOCUS_EVENTS, WS_FLAG_MOUSE_REPORT, WS_FLAG_SGR_MOUSE,
+        WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED,
         encode_server_message, panic_payload_message, seed_web_init_data,
     };
 
@@ -1061,8 +1121,15 @@ mod tests {
                     end_offset: expect["end_offset"].as_u64().expect("end_offset"),
                     incarnation: expect["incarnation"].as_u64().expect("incarnation"),
                     running: expect["running"].as_bool().expect("running"),
-                    app_cursor_keys: expect["app_cursor_keys"].as_bool().expect("ack"),
-                    bracketed_paste_mode: expect["bracketed_paste_mode"].as_bool().expect("bpm"),
+                    modes: WsModes {
+                        app_cursor_keys: expect["app_cursor_keys"].as_bool().expect("ack"),
+                        bracketed_paste_mode: expect["bracketed_paste_mode"]
+                            .as_bool()
+                            .expect("bpm"),
+                        mouse_report: expect["mouse_report"].as_bool().expect("mouse_report"),
+                        sgr_mouse: expect["sgr_mouse"].as_bool().expect("sgr_mouse"),
+                        focus_events: expect["focus_events"].as_bool().expect("focus_events"),
+                    },
                     attachment_id: expect["attachment_id"].as_u64().expect("attachment_id"),
                     role,
                 },
@@ -1071,8 +1138,15 @@ mod tests {
                     data: decode_hex(expect["data_hex"].as_str().unwrap_or("")),
                 },
                 "mode_changed" => ServerMessage::ModeChanged {
-                    app_cursor_keys: expect["app_cursor_keys"].as_bool().expect("ack"),
-                    bracketed_paste_mode: expect["bracketed_paste_mode"].as_bool().expect("bpm"),
+                    modes: WsModes {
+                        app_cursor_keys: expect["app_cursor_keys"].as_bool().expect("ack"),
+                        bracketed_paste_mode: expect["bracketed_paste_mode"]
+                            .as_bool()
+                            .expect("bpm"),
+                        mouse_report: expect["mouse_report"].as_bool().expect("mouse_report"),
+                        sgr_mouse: expect["sgr_mouse"].as_bool().expect("sgr_mouse"),
+                        focus_events: expect["focus_events"].as_bool().expect("focus_events"),
+                    },
                 },
                 "resized" => ServerMessage::Resized {
                     rows: expect["rows"].as_u64().expect("rows") as u16,
@@ -1103,8 +1177,10 @@ mod tests {
             end_offset: 0x0102_0304_0506_0708,
             incarnation: 9,
             running: true,
-            app_cursor_keys: true,
-            bracketed_paste_mode: false,
+            modes: WsModes {
+                app_cursor_keys: true,
+                ..WsModes::default()
+            },
             attachment_id: 42,
             role: "controller",
         });
@@ -1116,6 +1192,34 @@ mod tests {
         assert_eq!(payload[19..27], 42_u64.to_be_bytes()); // attachment id
         assert_eq!(payload[27], 1); // role: controller
         assert_eq!(&payload[28..], b"hi");
+    }
+
+    /// Mouse/focus mode bits must reach the browser: xterm.js only
+    /// captures mouse and focus events while the client mirrors them,
+    /// so the flags ride the INIT and MODE_CHANGED flag byte.
+    #[test]
+    fn encode_mode_frames_carries_mouse_and_focus_flags() {
+        let modes = WsModes {
+            app_cursor_keys: false,
+            bracketed_paste_mode: false,
+            mouse_report: true,
+            sgr_mouse: true,
+            focus_events: true,
+        };
+        assert_eq!(
+            encode_server_message(&ServerMessage::ModeChanged { modes })[1],
+            WS_FLAG_MOUSE_REPORT | WS_FLAG_SGR_MOUSE | WS_FLAG_FOCUS_EVENTS
+        );
+        let payload = encode_server_message(&ServerMessage::Init {
+            data: Vec::new(),
+            end_offset: 0,
+            incarnation: 0,
+            running: false,
+            modes,
+            attachment_id: 0,
+            role: "observer",
+        });
+        assert_eq!(payload[1], WS_FLAG_MOUSE_REPORT | WS_FLAG_SGR_MOUSE | WS_FLAG_FOCUS_EVENTS);
     }
 
     #[test]
