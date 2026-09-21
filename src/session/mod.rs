@@ -13,15 +13,17 @@ pub mod pty;
 pub mod registry;
 pub(crate) mod replay;
 pub(crate) mod resize;
-mod runtime;
+// `pub(crate)` (PLAN2 S1.4) so test code outside this submodule tree can
+// reach types such as `runtime::SequencedChunk` directly, without a
+// `#[cfg(test)]` re-export flip mirroring the production module graph.
+pub(crate) mod runtime;
 pub(crate) mod scan;
-#[cfg(not(test))]
-mod store;
-#[cfg(test)]
+// `pub(crate)` (not `mod`) is required unconditionally so test code outside
+// this submodule tree can reach `crate::session::store::testsupport`
+// without a `#[cfg(test)]` visibility flip. PLAN2 S1.4 removes cfg-dependent
+// module visibility from the shipping module graph.
 pub(crate) mod store;
 pub use runtime::ModeSnapshot;
-#[cfg(test)]
-pub(crate) use runtime::SequencedChunk;
 pub use store::pump::{AttachEvent, AttachPump, PumpCredit};
 pub(crate) use store::scrollback_seed_bytes;
 

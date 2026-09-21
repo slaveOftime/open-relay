@@ -63,7 +63,10 @@ const COMPACT_SPARKLINE_WIDTH: usize = 3;
 const SPARKLINE_WIDTH: usize = 5;
 const STOP_GRACE_SECONDS: u64 = 15;
 const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-const TUI_RESTORE_BYTES: &[u8] = b"\x1b[?1049l\x1b[?2026l\x1b[0m\x1b[?25h\x1b[0 q\
+// `pub(crate)` so the Windows crash handler in `crate::client::crash` can
+// restore the terminal on unhandled exceptions. Visibility is the minimum
+// needed by the cross-module references introduced in PLAN2 S1.3.
+pub(crate) const TUI_RESTORE_BYTES: &[u8] = b"\x1b[?1049l\x1b[?2026l\x1b[0m\x1b[?25h\x1b[0 q\
     \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
 /// Window title shown while the interactive session list owns the terminal.
 const LIST_WINDOW_TITLE: &str = "oly sessions";
@@ -72,7 +75,10 @@ const LIST_WINDOW_TITLE: &str = "oly sessions";
 /// whatever the surrounding shell had set.
 const TITLE_SAVE_BYTES: &[u8] = b"\x1b[22;0t";
 /// XTWINOPS 23;0 pops the title saved by `TITLE_SAVE_BYTES`.
-const TITLE_RESTORE_BYTES: &[u8] = b"\x1b[23;0t";
+// `pub(crate)` so the Windows crash handler in `crate::client::crash` can
+// restore the terminal on unhandled exceptions. Visibility is the minimum
+// needed by the cross-module references introduced in PLAN2 S1.3.
+pub(crate) const TITLE_RESTORE_BYTES: &[u8] = b"\x1b[23;0t";
 const CLONE_DIALOG_HELP: &str =
     " Quotes group words · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
 const UPDATE_DIALOG_HELP: &str =
@@ -120,7 +126,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
         ));
     }
     #[cfg(windows)]
-    native_crash::install();
+    crate::client::crash::install();
 
     let query = super::list::build_list_query(args)?;
     let mut app = App {
@@ -1798,7 +1804,7 @@ impl TuiTerminal {
             let _ = disable_raw_mode();
             let _ = restore_tui_state(&mut stdout);
             #[cfg(windows)]
-            native_crash::set_tui_active(false);
+            crate::client::crash::set_tui_active(false);
             return Err(error.into());
         }
         // Claim the window title: push the current one onto the terminal's
@@ -1807,7 +1813,7 @@ impl TuiTerminal {
         // is a matching entry to restore.
         let title_saved = enter_list_title(&mut stdout).is_ok();
         #[cfg(windows)]
-        native_crash::set_tui_active(true);
+        crate::client::crash::set_tui_active(true);
         match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => Ok(Self {
                 terminal,
@@ -1822,7 +1828,7 @@ impl TuiTerminal {
                 }
                 let _ = restore_tui_state(&mut stdout);
                 #[cfg(windows)]
-                native_crash::set_tui_active(false);
+                crate::client::crash::set_tui_active(false);
                 Err(error.into())
             }
         }
@@ -1879,7 +1885,7 @@ impl TuiTerminal {
             first_error = Some(error);
         }
         #[cfg(windows)]
-        native_crash::set_tui_active(false);
+        crate::client::crash::set_tui_active(false);
         self.cleaned_up = true;
 
         if let Some(error) = first_error {
@@ -1916,97 +1922,6 @@ fn write_list_title(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(b"\x1b]0;")?;
     writer.write_all(LIST_WINDOW_TITLE.as_bytes())?;
     writer.write_all(b"\x07")
-}
-
-#[cfg(windows)]
-mod native_crash {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use windows_sys::Win32::{
-        Storage::FileSystem::WriteFile,
-        System::{
-            Console::{GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_OUTPUT_HANDLE},
-            Diagnostics::Debug::{
-                EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS, SetUnhandledExceptionFilter,
-            },
-        },
-    };
-
-    use super::{TITLE_RESTORE_BYTES, TUI_RESTORE_BYTES};
-
-    static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static CRASH_REPORTED: AtomicBool = AtomicBool::new(false);
-
-    /// Restore the terminal just before the process dies from a fatal exception.
-    ///
-    /// Only the top-level unhandled-exception filter is used: unlike a vectored
-    /// handler it runs solely for genuinely unhandled exceptions, so handled
-    /// first-chance exceptions raised by normal Windows code cannot tear down
-    /// the live TUI by mistake.
-    pub(super) fn install() {
-        unsafe {
-            SetUnhandledExceptionFilter(Some(handle_unhandled_exception));
-        }
-    }
-
-    pub(super) fn set_tui_active(active: bool) {
-        if active {
-            CRASH_REPORTED.store(false, Ordering::SeqCst);
-        }
-        TUI_ACTIVE.store(active, Ordering::SeqCst);
-    }
-
-    unsafe extern "system" fn handle_unhandled_exception(info: *const EXCEPTION_POINTERS) -> i32 {
-        unsafe { report_crash(info) };
-        EXCEPTION_CONTINUE_SEARCH
-    }
-
-    unsafe fn report_crash(info: *const EXCEPTION_POINTERS) {
-        if TUI_ACTIVE.load(Ordering::SeqCst) && !CRASH_REPORTED.swap(true, Ordering::SeqCst) {
-            unsafe {
-                // `set_tui_active(true)` is only reached after the window
-                // title was pushed onto the title stack, so the crash path can
-                // safely pop it back.
-                write_handle(STD_OUTPUT_HANDLE, TUI_RESTORE_BYTES);
-                write_handle(STD_OUTPUT_HANDLE, TITLE_RESTORE_BYTES);
-                write_handle(STD_ERROR_HANDLE, native_crash_message(info));
-            }
-        }
-    }
-
-    unsafe fn native_crash_message(info: *const EXCEPTION_POINTERS) -> &'static [u8] {
-        let code = unsafe {
-            if info.is_null() || (*info).ExceptionRecord.is_null() {
-                0
-            } else {
-                (*(*info).ExceptionRecord).ExceptionCode as u32
-            }
-        };
-        match code {
-            0xC0000005 => {
-                b"\r\nerror: interactive session list crashed: STATUS_ACCESS_VIOLATION\r\n"
-            }
-            0xC00000FD => b"\r\nerror: interactive session list crashed: STATUS_STACK_OVERFLOW\r\n",
-            0xC0000374 => {
-                b"\r\nerror: interactive session list crashed: STATUS_HEAP_CORRUPTION\r\n"
-            }
-            _ => b"\r\nerror: interactive session list crashed: native exception\r\n",
-        }
-    }
-
-    unsafe fn write_handle(handle_kind: STD_HANDLE, bytes: &[u8]) {
-        let handle = unsafe { GetStdHandle(handle_kind) };
-        let mut written = 0;
-        let _ = unsafe {
-            WriteFile(
-                handle,
-                bytes.as_ptr(),
-                bytes.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        };
-    }
 }
 
 #[derive(Clone, Copy)]

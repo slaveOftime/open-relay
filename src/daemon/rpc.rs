@@ -993,8 +993,9 @@ mod tests {
             notification::dispatcher::Notifier,
             protocol::{RpcRequest, RpcResponse},
             session::{
-                SequencedChunk, SessionStatus,
+                SessionStatus,
                 journal::ShadowJournal,
+                runtime::SequencedChunk,
                 store::testsupport::{
                     make_runtime_writable, make_test_config, make_test_db, store_with,
                 },

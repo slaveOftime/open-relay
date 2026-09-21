@@ -542,6 +542,10 @@ impl SessionStore {
                 && Instant::now() >= at
             {
                 group_sigterm_at = None;
+                // Bound only under cfg(unix): on non-unix platforms
+                // `signal_process_group`/`SIGTERM` are not defined, so the
+                // binding would otherwise be unused and trip a warning.
+                #[cfg(unix)]
                 let pid = handle.read().pty.process_id();
                 #[cfg(unix)]
                 if let Some(pid) = pid {

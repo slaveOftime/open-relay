@@ -1,3 +1,5 @@
+//! App discovery, manifest parsing, and request resolution for the
+//! `/apps/<slug>/*` HTTP surface. PLAN2 S1.2 split.
 use axum::{
     Json,
     extract::State,
@@ -5,10 +7,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use reqwest::Url;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::{
     io,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 use tracing::{error, info};
 
@@ -16,14 +18,53 @@ use crate::config::AppConfig;
 
 use super::AppState;
 
-const DEFAULT_WWWROOT_INDEX: &str = include_str!("apps-index.html");
-const APP_MANIFEST_FILE: &str = "oly.app.json";
+mod html;
+mod manifest;
+mod proxy_targets;
+mod resolve;
+
+// Production code uses unqualified call-sites because the moves from
+// `apps.rs` were carried out verbatim (PLAN2 S1.2). Items tests need by
+// short name are re-exported below under `#[cfg(test)]`.
+#[cfg(test)]
+use html::extract_meta_content;
+#[cfg(test)]
+pub(super) use html::resolve_app_asset_href;
+use html::{
+    detect_app_icon_href, extract_app_description, extract_app_icon_href, extract_app_kind,
+    extract_title,
+};
+#[cfg(test)]
+use manifest::APP_MANIFEST_FILE;
+use manifest::{build_manifest_app_definition, load_app_manifest};
+use proxy_targets::build_proxy_target_urls;
+use resolve::{
+    app_local_request_candidates, find_existing_app_local_asset, find_existing_redirect_asset,
+    local_asset_exists, split_app_request_path,
+};
+
+// `include_str!` paths resolve relative to this file, not the source-root,
+// so the embedded asset is referenced as `../apps-index.html` — the same
+// blob as before the S1.2 split, just with a deeper file location.
+const DEFAULT_WWWROOT_INDEX: &str = include_str!("../apps-index.html");
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum StaticAppKind {
     SingleHtml,
     Spa,
+}
+
+impl StaticAppKind {
+    pub(super) fn from_meta_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "spa" => Some(Self::Spa),
+            "single_html" | "single-html" | "html" | "singlefile" | "single-file" => {
+                Some(Self::SingleHtml)
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
@@ -37,7 +78,7 @@ pub(super) struct StaticApp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum AppEntry {
+pub(super) enum AppEntry {
     Local {
         entry_path: String,
         entry_source_path: PathBuf,
@@ -49,9 +90,9 @@ enum AppEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct AppDefinition {
-    static_app: StaticApp,
-    entry: AppEntry,
+pub(super) struct AppDefinition {
+    pub(super) static_app: StaticApp,
+    pub(super) entry: AppEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,33 +101,16 @@ pub(super) enum AppRequestTarget {
     Proxy(Vec<Url>),
 }
 
-#[derive(Debug, Deserialize)]
-struct AppManifest {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    icon_href: Option<String>,
-    #[serde(default)]
-    app_type: Option<String>,
-    #[serde(default)]
-    redirect_files: Vec<String>,
-    entry: String,
-}
-
 pub(super) fn ensure_wwwroot(config: &AppConfig) -> io::Result<PathBuf> {
     let wwwroot_dir = config.wwwroot_dir();
     let apps_dir = wwwroot_dir.join("apps");
     std::fs::create_dir_all(&wwwroot_dir)?;
     std::fs::create_dir_all(&apps_dir)?;
-
     let index_path = apps_dir.join("index.html");
     if !index_path.exists() {
         std::fs::write(&index_path, DEFAULT_WWWROOT_INDEX)?;
         info!(path = %index_path.display(), "created default wwwroot index.html");
     }
-
     Ok(wwwroot_dir)
 }
 
@@ -158,6 +182,7 @@ fn discover_static_apps(wwwroot: &Path) -> io::Result<Vec<StaticApp>> {
     }
 
     let mut apps = Vec::new();
+
     for entry in std::fs::read_dir(&apps_dir)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -199,215 +224,6 @@ fn load_app_definition(app_dir: &Path, slug: &str) -> io::Result<Option<AppDefin
     }))
 }
 
-fn build_manifest_app_definition(
-    app_dir: &Path,
-    app_href: &str,
-    fallback_title: &str,
-    manifest: AppManifest,
-) -> io::Result<AppDefinition> {
-    let entry = resolve_manifest_entry(app_dir, &manifest.entry, &manifest.redirect_files)?;
-    let entry_html = match &entry {
-        AppEntry::Local {
-            entry_source_path, ..
-        } => maybe_read_entry_html(entry_source_path)?,
-        AppEntry::Proxy { .. } => None,
-    };
-    let entry_source_dir = match &entry {
-        AppEntry::Local {
-            entry_source_path, ..
-        } => entry_source_path.parent(),
-        AppEntry::Proxy { .. } => None,
-    };
-
-    let title = cleaned_field(manifest.title)
-        .or_else(|| entry_html.as_deref().and_then(extract_title))
-        .unwrap_or_else(|| fallback_title.to_string());
-    let description = cleaned_field(manifest.description)
-        .or_else(|| entry_html.as_deref().and_then(extract_app_description));
-    let icon_href = cleaned_field(manifest.icon_href)
-        .and_then(|value| resolve_manifest_asset_href(app_href, &value))
-        .or_else(|| {
-            entry_html
-                .as_deref()
-                .and_then(|html| extract_app_icon_href(html, app_href))
-        })
-        .or_else(|| detect_app_icon_href(entry_source_dir, app_href))
-        .or_else(|| detect_app_icon_href(Some(app_dir), app_href));
-    let app_type = cleaned_field(manifest.app_type)
-        .as_deref()
-        .and_then(StaticAppKind::from_meta_value)
-        .or_else(|| entry_html.as_deref().map(extract_app_kind))
-        .unwrap_or(StaticAppKind::SingleHtml);
-
-    Ok(AppDefinition {
-        static_app: StaticApp {
-            href: app_href.to_string(),
-            title,
-            description,
-            icon_href,
-            app_type,
-        },
-        entry,
-    })
-}
-
-fn load_app_manifest(app_dir: &Path) -> io::Result<Option<AppManifest>> {
-    let manifest_path = app_dir.join(APP_MANIFEST_FILE);
-    if manifest_path.is_file() {
-        return Ok(Some(read_manifest_file(&manifest_path)?));
-    }
-
-    Ok(None)
-}
-
-fn read_manifest_file(path: &Path) -> io::Result<AppManifest> {
-    let raw = std::fs::read_to_string(path)?;
-    parse_manifest(&raw, path)
-}
-
-fn parse_manifest(raw: &str, source_path: &Path) -> io::Result<AppManifest> {
-    serde_json::from_str(raw)
-        .map_err(|err| invalid_data(format!("failed to parse {}: {err}", source_path.display())))
-}
-
-fn resolve_manifest_entry(
-    app_dir: &Path,
-    entry: &str,
-    redirect_files: &[String],
-) -> io::Result<AppEntry> {
-    let entry = entry.trim();
-    if entry.is_empty() {
-        return Err(invalid_data("app manifest entry cannot be empty"));
-    }
-
-    if let Ok(url) = Url::parse(entry)
-        && matches!(url.scheme(), "http" | "https")
-    {
-        if !redirect_files.is_empty() {
-            return Err(invalid_data(
-                "app manifest redirect files require a local entry",
-            ));
-        }
-        // Block proxying to private LAN / link-local addresses to
-        // prevent SSRF via crafted oly.app.json manifests.
-        if is_private_proxy_target(&url) {
-            return Err(invalid_data(
-                "app manifest proxy entry must not target private or link-local addresses",
-            ));
-        }
-        return Ok(AppEntry::Proxy { entry_url: url });
-    }
-
-    let entry_path = normalize_relative_asset_path(entry)
-        .ok_or_else(|| invalid_data("app manifest entry must stay inside the app directory"))?;
-    let redirect_files = resolve_manifest_redirect_files(app_dir, redirect_files)?;
-    let Some(entry_source_path) =
-        resolve_manifest_entry_source(app_dir, &entry_path, &redirect_files)?
-    else {
-        return Err(invalid_data(format!(
-            "app manifest entry {} does not exist in the app directory or redirect files",
-            app_dir
-                .join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR))
-                .display()
-        )));
-    };
-
-    Ok(AppEntry::Local {
-        entry_path,
-        entry_source_path,
-        redirect_files,
-    })
-}
-
-fn maybe_read_entry_html(entry_source_path: &Path) -> io::Result<Option<String>> {
-    let extension = entry_source_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-    if !matches!(extension.as_deref(), Some("html" | "htm")) {
-        return Ok(None);
-    }
-
-    Ok(Some(std::fs::read_to_string(entry_source_path)?))
-}
-
-fn resolve_manifest_entry_source(
-    app_dir: &Path,
-    entry_path: &str,
-    redirect_files: &[PathBuf],
-) -> io::Result<Option<PathBuf>> {
-    let local_path = app_dir.join(entry_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    if file_exists(&local_path)? {
-        return Ok(Some(local_path));
-    }
-
-    let candidates = [entry_path.to_string()];
-    for redirect_path in redirect_files {
-        if let Some(path) = find_existing_redirect_asset(redirect_path, &candidates)? {
-            return Ok(Some(path));
-        }
-    }
-
-    Ok(None)
-}
-
-fn resolve_manifest_redirect_files(
-    app_dir: &Path,
-    redirect_files: &[String],
-) -> io::Result<Vec<PathBuf>> {
-    let mut resolved = Vec::new();
-    for redirect_file in redirect_files {
-        let redirect_file = redirect_file.trim();
-        if redirect_file.is_empty() {
-            continue;
-        }
-
-        let resolved_path = canonicalize_redirect_path(app_dir, redirect_file)?;
-        let metadata = std::fs::metadata(&resolved_path)?;
-        if !metadata.is_file() && !metadata.is_dir() {
-            return Err(invalid_data(format!(
-                "app manifest redirect path {} must be a file or directory",
-                resolved_path.display()
-            )));
-        }
-        if !resolved.contains(&resolved_path) {
-            resolved.push(resolved_path);
-        }
-    }
-
-    Ok(resolved)
-}
-
-fn canonicalize_redirect_path(app_dir: &Path, redirect_file: &str) -> io::Result<PathBuf> {
-    let candidate = Path::new(redirect_file);
-    let resolved_path = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        app_dir.join(candidate)
-    };
-    std::fs::canonicalize(&resolved_path).map_err(|err| {
-        if err.kind() == io::ErrorKind::NotFound {
-            invalid_data(format!(
-                "app manifest redirect path {} does not exist",
-                resolved_path.display()
-            ))
-        } else {
-            err
-        }
-    })
-}
-
-fn cleaned_field(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    })
-}
-
 fn build_static_app(index_path: &Path, href: &str, fallback_title: &str) -> io::Result<StaticApp> {
     let html = std::fs::read_to_string(index_path)?;
     let description = extract_app_description(&html);
@@ -422,547 +238,6 @@ fn build_static_app(index_path: &Path, href: &str, fallback_title: &str) -> io::
         icon_href,
         app_type,
     })
-}
-
-fn split_app_request_path(path: &str) -> Option<(String, String, bool)> {
-    let remainder = path.strip_prefix("/apps/")?;
-    if remainder.is_empty() {
-        return None;
-    }
-
-    let trailing_slash = path.ends_with('/');
-    let normalized = normalize_relative_asset_path(remainder)?;
-    let (slug, tail) = normalized
-        .split_once('/')
-        .map_or((normalized.as_str(), ""), |(slug, tail)| (slug, tail));
-
-    if slug.is_empty() {
-        None
-    } else {
-        Some((slug.to_string(), tail.to_string(), trailing_slash))
-    }
-}
-
-fn app_local_request_candidates(
-    entry_path: &str,
-    request_tail: &str,
-    trailing_slash: bool,
-) -> Vec<String> {
-    if request_tail.is_empty() {
-        return vec![entry_path.to_string()];
-    }
-
-    let mut candidates = local_request_candidates(request_tail, trailing_slash);
-    if let Some(entry_dir) = entry_parent_dir(entry_path) {
-        append_local_request_candidates_with_prefix(
-            &mut candidates,
-            &entry_dir,
-            request_tail,
-            trailing_slash,
-        );
-    }
-
-    candidates
-}
-
-fn append_local_request_candidates_with_prefix(
-    candidates: &mut Vec<String>,
-    prefix: &str,
-    request_tail: &str,
-    trailing_slash: bool,
-) {
-    for candidate in local_request_candidates(request_tail, trailing_slash) {
-        let prefixed = format!("{prefix}/{candidate}");
-        if !candidates.contains(&prefixed) {
-            candidates.push(prefixed);
-        }
-    }
-}
-
-fn find_existing_app_local_asset(
-    app_dir: &Path,
-    candidates: &[String],
-) -> io::Result<Option<PathBuf>> {
-    for candidate in candidates {
-        let full_path = app_dir.join(candidate.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if file_exists(&full_path)? {
-            return Ok(Some(full_path));
-        }
-    }
-    Ok(None)
-}
-
-fn find_existing_redirect_asset(
-    redirect_path: &Path,
-    candidates: &[String],
-) -> io::Result<Option<PathBuf>> {
-    if file_exists(redirect_path)? {
-        return Ok(Some(redirect_path.to_path_buf()));
-    }
-    if !directory_exists(redirect_path)? {
-        return Ok(None);
-    }
-
-    for candidate in candidates {
-        let full_path = redirect_path.join(candidate.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if file_exists(&full_path)? {
-            return Ok(Some(full_path));
-        }
-    }
-
-    Ok(None)
-}
-
-fn local_request_candidates(path: &str, trailing_slash: bool) -> Vec<String> {
-    let mut candidates = Vec::with_capacity(3);
-    if trailing_slash {
-        candidates.push(format!("{path}/index.html"));
-        return candidates;
-    }
-
-    candidates.push(path.to_string());
-    if Path::new(path).extension().is_none() {
-        candidates.push(format!("{path}.html"));
-    }
-    candidates.push(format!("{path}/index.html"));
-    candidates.dedup();
-    candidates
-}
-
-fn entry_parent_dir(entry_path: &str) -> Option<String> {
-    normalize_relative_asset_path(
-        Path::new(entry_path)
-            .parent()
-            .and_then(|parent| parent.to_str())
-            .unwrap_or_default(),
-    )
-}
-
-fn normalize_relative_asset_path(path: &str) -> Option<String> {
-    let mut parts = Vec::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("/"))
-    }
-}
-
-fn local_asset_exists(wwwroot: &Path, relative_path: &str) -> io::Result<bool> {
-    let full_path = wwwroot.join(relative_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    file_exists(&full_path)
-}
-
-fn file_exists(path: &Path) -> io::Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-fn directory_exists(path: &Path) -> io::Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_dir()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
-}
-
-fn build_proxy_target_urls(
-    entry_url: &Url,
-    request_tail: &str,
-    query: Option<&str>,
-) -> io::Result<Vec<Url>> {
-    let mut targets = Vec::new();
-    if request_tail.is_empty() {
-        targets.push(with_proxy_query(entry_url.clone(), query));
-    } else {
-        let entry_relative = entry_url.join(request_tail).map_err(|err| {
-            invalid_data(format!(
-                "failed to join proxied app URL {entry_url} with {request_tail}: {err}"
-            ))
-        })?;
-        targets.push(with_proxy_query(entry_relative, query));
-
-        let root_relative = origin_root_url(entry_url)
-            .join(request_tail)
-            .map_err(|err| {
-                invalid_data(format!(
-                    "failed to build root-relative proxied app URL {entry_url} with {request_tail}: {err}"
-                ))
-            })?;
-        let root_relative = with_proxy_query(root_relative, query);
-        if !targets.iter().any(|existing| existing == &root_relative) {
-            targets.push(root_relative);
-        }
-
-        let public_path_relative = origin_root_url(entry_url)
-            .join(request_tail.trim_start_matches('/'))
-            .map_err(|err| {
-                invalid_data(format!(
-                    "failed to build public-path proxied app URL {entry_url} with {request_tail}: {err}"
-                ))
-            })?;
-        let public_path_relative = with_proxy_query(public_path_relative, query);
-        if !targets
-            .iter()
-            .any(|existing| existing == &public_path_relative)
-        {
-            targets.push(public_path_relative);
-        }
-    }
-
-    Ok(targets)
-}
-
-fn with_proxy_query(mut target: Url, query: Option<&str>) -> Url {
-    if let Some(filtered_query) = filtered_proxy_query(query) {
-        let merged_query = match target.query() {
-            Some(existing) if !existing.is_empty() => format!("{existing}&{filtered_query}"),
-            _ => filtered_query,
-        };
-        target.set_query(Some(&merged_query));
-    }
-
-    target
-}
-
-fn origin_root_url(entry_url: &Url) -> Url {
-    let mut root = entry_url.clone();
-    root.set_path("/");
-    root.set_query(None);
-    root.set_fragment(None);
-    root
-}
-
-fn filtered_proxy_query(query: Option<&str>) -> Option<String> {
-    let query = query?;
-    let filtered = query
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter(|pair| *pair != "token" && !pair.starts_with("token="))
-        .collect::<Vec<_>>();
-    if filtered.is_empty() {
-        None
-    } else {
-        Some(filtered.join("&"))
-    }
-}
-
-fn invalid_data(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-/// Returns `true` if the proxy target URL resolves to a private LAN,
-/// link-local, or unspecified address.  Loopback (127.0.0.0/8, ::1) is
-/// intentionally allowed because the primary use-case for proxy entries is
-/// forwarding to local dev servers (e.g. Vite on 127.0.0.1:5173).
-fn is_private_proxy_target(url: &Url) -> bool {
-    use std::net::IpAddr;
-
-    let host = match url.host_str() {
-        Some(h) => h,
-        None => return true, // No host → reject
-    };
-
-    // Try to parse as IP directly first.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_ssrf_dangerous_ip(&ip);
-    }
-
-    false
-}
-
-/// Returns `true` for IPs that are SSRF-dangerous: private LAN ranges,
-/// link-local (cloud metadata), and unspecified.  Loopback is allowed.
-fn is_ssrf_dangerous_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                || v4.is_link_local()  // 169.254.0.0/16 (cloud metadata)
-                || v4.is_unspecified() // 0.0.0.0
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_unspecified() // ::
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_private() || v4.is_link_local()
-                })
-        }
-    }
-}
-
-fn extract_title(html: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let title_start = lower.find("<title")?;
-    let content_start = lower[title_start..].find('>')? + title_start + 1;
-    let content_end = lower[content_start..].find("</title>")? + content_start;
-    let title = html[content_start..content_end].trim();
-    if title.is_empty() {
-        None
-    } else {
-        Some(title.to_string())
-    }
-}
-
-fn extract_app_description(html: &str) -> Option<String> {
-    extract_meta_content(html, "oly:description")
-        .or_else(|| extract_meta_content(html, "description"))
-        .or_else(|| extract_meta_content(html, "og:description"))
-}
-
-fn extract_app_kind(html: &str) -> StaticAppKind {
-    if let Some(raw_kind) = extract_meta_content(html, "oly:app-type")
-        .or_else(|| extract_meta_content(html, "oly:type"))
-        && let Some(app_kind) = StaticAppKind::from_meta_value(&raw_kind)
-    {
-        return app_kind;
-    }
-
-    infer_app_kind(html)
-}
-
-fn extract_app_icon_href(html: &str, app_href: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut offset = 0;
-
-    while let Some(relative_start) = lower[offset..].find("<link") {
-        let tag_start = offset + relative_start;
-        let tag_end = match lower[tag_start..].find('>') {
-            Some(relative_end) => tag_start + relative_end + 1,
-            None => break,
-        };
-        let tag = &html[tag_start..tag_end];
-        let rel = extract_html_attribute(tag, "rel");
-        let href = extract_html_attribute(tag, "href");
-
-        if rel.as_deref().is_some_and(link_rel_mentions_icon)
-            && let Some(icon_href) = href.and_then(|value| resolve_app_asset_href(app_href, &value))
-        {
-            return Some(icon_href);
-        }
-
-        offset = tag_end;
-    }
-
-    None
-}
-
-fn detect_app_icon_href(app_dir: Option<&Path>, app_href: &str) -> Option<String> {
-    let app_dir = app_dir?;
-    for candidate in [
-        "favicon.svg",
-        "favicon.ico",
-        "favicon.png",
-        "apple-touch-icon.png",
-    ] {
-        if app_dir.join(candidate).is_file() {
-            return resolve_app_asset_href(app_href, candidate);
-        }
-    }
-
-    None
-}
-
-fn link_rel_mentions_icon(rel: &str) -> bool {
-    rel.split_ascii_whitespace().any(|part| {
-        part.eq_ignore_ascii_case("icon")
-            || part.eq_ignore_ascii_case("shortcut")
-            || part.eq_ignore_ascii_case("apple-touch-icon")
-    })
-}
-
-fn resolve_app_asset_href(app_href: &str, asset_href: &str) -> Option<String> {
-    let asset_href = asset_href.trim();
-    if asset_href.is_empty()
-        || asset_href.starts_with("http://")
-        || asset_href.starts_with("https://")
-        || asset_href.starts_with("//")
-        || asset_href.starts_with("data:")
-        || asset_href.starts_with('#')
-    {
-        return None;
-    }
-
-    if asset_href.starts_with('/') {
-        return Some(asset_href.to_string());
-    }
-
-    let mut base = app_href.trim_end_matches('/').to_string();
-    if !base.ends_with('/') {
-        base.push('/');
-    }
-
-    let normalized = asset_href
-        .strip_prefix("./")
-        .unwrap_or(asset_href)
-        .trim_start_matches('/');
-    if normalized.contains("../") {
-        return None;
-    }
-
-    Some(format!("{base}{normalized}"))
-}
-
-fn resolve_manifest_asset_href(app_href: &str, asset_href: &str) -> Option<String> {
-    let asset_href = asset_href.trim();
-    if asset_href.is_empty() {
-        return None;
-    }
-
-    if asset_href.starts_with("http://")
-        || asset_href.starts_with("https://")
-        || asset_href.starts_with("//")
-        || asset_href.starts_with("data:")
-    {
-        return Some(asset_href.to_string());
-    }
-
-    resolve_app_asset_href(app_href, asset_href)
-}
-
-fn extract_meta_content(html: &str, attribute_value: &str) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let mut offset = 0;
-
-    while let Some(relative_start) = lower[offset..].find("<meta") {
-        let tag_start = offset + relative_start;
-        let tag_end = match lower[tag_start..].find('>') {
-            Some(relative_end) => tag_start + relative_end + 1,
-            None => break,
-        };
-        let tag = &html[tag_start..tag_end];
-        let name =
-            extract_html_attribute(tag, "name").or_else(|| extract_html_attribute(tag, "property"));
-
-        if name
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case(attribute_value))
-        {
-            return extract_html_attribute(tag, "content").filter(|value| !value.is_empty());
-        }
-
-        offset = tag_end;
-    }
-
-    None
-}
-
-fn extract_html_attribute(tag: &str, attribute_name: &str) -> Option<String> {
-    let bytes = tag.as_bytes();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-
-        if index >= bytes.len() || matches!(bytes[index], b'<' | b'>' | b'/') {
-            index += 1;
-            continue;
-        }
-
-        let name_start = index;
-        while index < bytes.len()
-            && !bytes[index].is_ascii_whitespace()
-            && bytes[index] != b'='
-            && bytes[index] != b'>'
-        {
-            index += 1;
-        }
-
-        if name_start == index {
-            index += 1;
-            continue;
-        }
-
-        let candidate_name = &tag[name_start..index];
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-
-        let mut value = String::new();
-        if index < bytes.len() && bytes[index] == b'=' {
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                index += 1;
-            }
-
-            if index < bytes.len() && matches!(bytes[index], b'"' | b'\'') {
-                let quote = bytes[index];
-                index += 1;
-                let value_start = index;
-                while index < bytes.len() && bytes[index] != quote {
-                    index += 1;
-                }
-                value = tag[value_start..index].trim().to_string();
-                if index < bytes.len() {
-                    index += 1;
-                }
-            } else {
-                let value_start = index;
-                while index < bytes.len()
-                    && !bytes[index].is_ascii_whitespace()
-                    && bytes[index] != b'>'
-                {
-                    index += 1;
-                }
-                value = tag[value_start..index].trim().to_string();
-            }
-        }
-
-        if candidate_name.eq_ignore_ascii_case(attribute_name) {
-            return Some(value);
-        }
-    }
-
-    None
-}
-
-fn infer_app_kind(html: &str) -> StaticAppKind {
-    let lower = html.to_ascii_lowercase();
-    let has_module_script = lower.contains("type=\"module\"") || lower.contains("type='module'");
-    let has_mount_root = lower.contains("id=\"root\"")
-        || lower.contains("id='root'")
-        || lower.contains("id=\"app\"")
-        || lower.contains("id='app'");
-    let has_asset_pipeline = lower.contains("src=\"./assets/")
-        || lower.contains("src=\"assets/")
-        || lower.contains("src=\"/assets/")
-        || lower.contains("href=\"./assets/")
-        || lower.contains("href=\"assets/")
-        || lower.contains("href=\"/assets/")
-        || lower.contains("src='./assets/")
-        || lower.contains("src='assets/")
-        || lower.contains("src='/assets/")
-        || lower.contains("href='./assets/")
-        || lower.contains("href='assets/")
-        || lower.contains("href='/assets/");
-
-    if has_module_script || has_mount_root || has_asset_pipeline {
-        StaticAppKind::Spa
-    } else {
-        StaticAppKind::SingleHtml
-    }
-}
-
-impl StaticAppKind {
-    fn from_meta_value(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "spa" => Some(Self::Spa),
-            "single_html" | "single-html" | "html" | "singlefile" | "single-file" => {
-                Some(Self::SingleHtml)
-            }
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]

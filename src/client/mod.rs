@@ -1,5 +1,7 @@
 mod agent;
 mod attach;
+#[cfg(windows)]
+mod crash;
 mod cursor;
 pub mod join;
 mod list;
