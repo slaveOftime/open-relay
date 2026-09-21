@@ -159,6 +159,9 @@ pub struct WaitOutcome {
     pub condition: &'static str,
     /// The new cursor (filtered-stream offset).
     pub offset: u64,
+    /// Journal incarnation backing `offset`; agents chaining `--after`
+    /// waits must restart their offsets when this changes (session restart).
+    pub incarnation: Option<u64>,
     pub exit_code: Option<i32>,
     pub idle_ms: Option<u64>,
     pub matched: Option<String>,
@@ -207,6 +210,7 @@ pub async fn wait_for_condition(
             return Ok(WaitOutcome {
                 condition: "exit",
                 offset: cursor.offset,
+                incarnation: cursor.incarnation,
                 exit_code: Some(cursor.exit_code.unwrap_or(-1)),
                 idle_ms: None,
                 matched: None,
@@ -216,6 +220,7 @@ pub async fn wait_for_condition(
             return Ok(WaitOutcome {
                 condition: "output",
                 offset: cursor.offset,
+                incarnation: cursor.incarnation,
                 exit_code: None,
                 idle_ms: None,
                 matched: None,
@@ -228,6 +233,7 @@ pub async fn wait_for_condition(
                 return Ok(WaitOutcome {
                     condition: "idle",
                     offset: cursor.offset,
+                    incarnation: cursor.incarnation,
                     exit_code: None,
                     idle_ms: Some(idle),
                     matched: None,
@@ -262,6 +268,7 @@ pub async fn wait_for_condition(
                     return Ok(WaitOutcome {
                         condition: "pattern",
                         offset: search_from,
+                        incarnation: cursor.incarnation,
                         exit_code: None,
                         idle_ms: None,
                         matched: Some(m.as_str().to_string()),
@@ -302,6 +309,9 @@ pub async fn run_wait(
         }
         if let Some(ms) = outcome.idle_ms {
             obj["idle_ms"] = ms.into();
+        }
+        if let Some(incarnation) = outcome.incarnation {
+            obj["incarnation"] = incarnation.into();
         }
         if let Some(matched) = outcome.matched {
             obj["match"] = matched.into();

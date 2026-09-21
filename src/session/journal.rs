@@ -1587,6 +1587,7 @@ fn retired_incarnations(journal_dir: &Path) -> io::Result<std::collections::Hash
 ///
 /// This reads every sealed part in full — call it from integrity
 /// tooling/compaction, never from the daemon hot path.
+#[allow(dead_code)] // Reserved for offline integrity tooling; exercised by journal tests.
 pub fn verify_manifest(journal_dir: &Path) -> Vec<String> {
     let mut issues = Vec::new();
     let lines = match read_manifest_lines(journal_dir) {
