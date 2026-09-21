@@ -140,6 +140,9 @@ pub struct AttachPump {
     /// Replaying persisted windows to close a gap (broadcast ring overflow
     /// or a held chunk that starts past the cursor).
     resync: bool,
+    /// True while a resync episode (one lag/gap event, possibly several
+    /// replay windows) is open; metrics count episodes, not windows.
+    resync_episode_open: bool,
     /// A broadcast chunk that starts past the cursor; held while resync
     /// windows fill the gap, then forwarded (trimmed if partially covered).
     held: Option<SequencedChunk>,
@@ -163,6 +166,10 @@ impl AttachPump {
         incarnation: Option<u64>,
         credit: PumpCredit,
     ) -> Result<(Self, AttachInit), SessionError> {
+        // Init build cost shared by every transport (journal snapshot +
+        // engine state + scrollback seed). Dominates time-to-first-byte
+        // on a fresh attach — tracked in PERFORMANCE.md.
+        let _timing = crate::metrics::Timer::start("attach_snapshot", None);
         Self::subscribe_with_policy(
             store,
             id,
@@ -262,6 +269,7 @@ impl AttachPump {
                 completion,
                 pending: VecDeque::new(),
                 resync: false,
+                resync_episode_open: false,
                 held: None,
                 completing: None,
                 flush_retries: 0,
@@ -290,6 +298,7 @@ impl AttachPump {
                 return None;
             }
             if tokio::time::Instant::now() >= deadline {
+                crate::metrics::count("attach_credit_closes", None);
                 warn!(
                     session_id = %self.id,
                     cursor = self.current_offset,
@@ -376,7 +385,7 @@ impl AttachPump {
                                 from_offset = self.current_offset,
                                 "attach pump lagged behind broadcast output; resyncing from persisted stream"
                             );
-                            self.resync = true;
+                            self.begin_resync();
                         }
                         Err(RecvError::Closed) => {
                             let exit_code = self.store.get_exit_code(&self.id);
@@ -406,6 +415,16 @@ impl AttachPump {
     /// the completion drain catches up to the in-memory stream length, and
     /// `Closed` — loudly, never skipping bytes — when a gap stays
     /// unpersisted past the retry budget.
+    /// Enter (or stay in) resync mode. One lag/gap detection opens one
+    /// episode; the metrics counter counts episodes, not replay windows.
+    fn begin_resync(&mut self) {
+        if !self.resync_episode_open {
+            self.resync_episode_open = true;
+            crate::metrics::count("attach_resyncs", None);
+        }
+        self.resync = true;
+    }
+
     async fn resync_step(&mut self) -> Option<AttachEvent> {
         let from = self.current_offset;
         let data = match self
@@ -431,9 +450,13 @@ impl AttachPump {
             );
             self.current_offset = window_end;
             self.flush_retries = 0;
+            crate::metrics::add("attach_resync_bytes", None, data.len() as u64);
             // A full window means more persisted data may follow; a short
             // window means the persisted stream is exhausted for now.
             self.resync = data.len() == RESYNC_WINDOW_BYTES;
+            if !self.resync {
+                self.resync_episode_open = false;
+            }
             self.observe_modes();
             return Some(AttachEvent::Chunk { offset: from, data });
         }
@@ -467,6 +490,7 @@ impl AttachPump {
         self.flush_retries = 0;
         if let Some(exit_code) = self.completing.take() {
             self.resync = false;
+            self.resync_episode_open = false;
             info!(session_id = %self.id, ?exit_code,
                 final_offset = self.current_offset, "attach pump completed");
             return Some(AttachEvent::Done {
@@ -475,6 +499,7 @@ impl AttachPump {
             });
         }
         self.resync = false;
+        self.resync_episode_open = false;
         None
     }
 
@@ -505,7 +530,7 @@ impl AttachPump {
                 "attach pump detected a broadcast gap; resyncing from persisted stream"
             );
             self.held = Some(chunk);
-            self.resync = true;
+            self.begin_resync();
             return Forward::Skip;
         }
         // Aligned at the cursor: coalesce contiguous buffered chunks.
@@ -517,7 +542,7 @@ impl AttachPump {
                     let expected = self.current_offset + data.len() as u64;
                     if next.offset > expected {
                         self.held = Some(next);
-                        self.resync = true;
+                        self.begin_resync();
                         break;
                     }
                     let skip = (expected - next.offset) as usize;
@@ -532,7 +557,7 @@ impl AttachPump {
                         cursor = self.current_offset,
                         "attach pump lagged while coalescing; resyncing from persisted stream"
                     );
-                    self.resync = true;
+                    self.begin_resync();
                     break;
                 }
                 Err(_) => break,

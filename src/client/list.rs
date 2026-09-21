@@ -100,6 +100,7 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
     sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
     sessions.truncate(limit);
     sessions.reverse();
+    crate::metrics::mark("list: data ready");
 
     if list_args.json {
         let items = sessions

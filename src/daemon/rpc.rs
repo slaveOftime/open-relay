@@ -25,8 +25,8 @@ use super::{
         handle_attach_subscribe, handle_observe_window, handle_session_cursor,
     },
     rpc_nodes::{
-        handle_node_accept_ssh_pubkey, handle_node_list, handle_node_proxy, handle_node_proxy_streaming,
-        spawn_join_connector,
+        handle_node_accept_ssh_pubkey, handle_node_list, handle_node_proxy,
+        handle_node_proxy_streaming, spawn_join_connector,
     },
 };
 
@@ -87,6 +87,12 @@ pub(super) async fn handle_client(
     }
 
     // Non-streaming path: dispatch and write single response.
+    // Daemon-side handling time per RPC method (`oly ls` et al. wait on
+    // exactly this). Streaming paths are excluded above: their
+    // handle_client lifetime is the whole stream, not the request cost —
+    // the attach path is measured separately at init
+    // (`attach_init_seconds`).
+    let _timing = crate::metrics::Timer::start("ipc_request", Some(request.name()));
     let response = dispatch_request(
         request,
         &config,
@@ -250,8 +256,24 @@ async fn dispatch_request(
         RpcRequest::ApiKeyAdd { name, scopes } => handle_api_key_add(name, scopes, db).await,
         RpcRequest::ApiKeyList => handle_api_key_list(db).await,
         RpcRequest::ApiKeyRemove { name } => handle_api_key_remove(name, db).await,
-        RpcRequest::JoinStart { url, name, key, ssh_key_path, ssh_known_hosts } => {
-            handle_join_start(config, join_handles, session_event_tx, url, name, key, ssh_key_path, ssh_known_hosts).await?
+        RpcRequest::JoinStart {
+            url,
+            name,
+            key,
+            ssh_key_path,
+            ssh_known_hosts,
+        } => {
+            handle_join_start(
+                config,
+                join_handles,
+                session_event_tx,
+                url,
+                name,
+                key,
+                ssh_key_path,
+                ssh_known_hosts,
+            )
+            .await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
         RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
@@ -727,7 +749,8 @@ async fn handle_join_start(
     ssh_key_path: Option<String>,
     ssh_known_hosts: Option<String>,
 ) -> Result<RpcResponse> {
-    let join = client::join::build_join_config(url, name.clone(), key, ssh_key_path, ssh_known_hosts)?;
+    let join =
+        client::join::build_join_config(url, name.clone(), key, ssh_key_path, ssh_known_hosts)?;
     client::join::save_join_config(config, &join)?;
     let (abort, stop_tx) =
         spawn_join_connector(join, Arc::clone(config), session_event_tx.subscribe());
@@ -773,7 +796,7 @@ async fn handle_join_list(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_logs_tail};
+    use super::handle_logs_tail;
     use crate::{
         db::Database,
         protocol::RpcResponse,

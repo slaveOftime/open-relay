@@ -96,7 +96,11 @@ impl SshHostKey {
             if seed.len() != 32 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("host key {} has unexpected length {}", key_path.display(), seed.len()),
+                    format!(
+                        "host key {} has unexpected length {}",
+                        key_path.display(),
+                        seed.len()
+                    ),
                 ));
             }
             seed
@@ -202,10 +206,14 @@ pub async fn serve(state: AppState) {
         .route("/api/sessions/{id}/attach", get(ws::attach_handler))
         .route("/api/nodes", get(nodes::list_nodes))
         .route("/api/nodes/host-key", get(nodes::get_host_key))
+        .route("/api/metrics", get(metrics_endpoint))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
-        ));
+        ))
+        // Outermost layer on the API: measures full handled time including
+        // auth, per matched route (PERFORMANCE.md data source).
+        .layer(axum::middleware::from_fn(metrics_middleware));
 
     let cors = CorsLayer::new()
         .allow_origin([
@@ -432,6 +440,77 @@ fn build_bytes_response(path: impl AsRef<Path>, bytes: Vec<u8>) -> axum::respons
         bytes,
     )
         .into_response()
+}
+
+/// `GET /api/metrics` — Prometheus text exposition of the always-on
+/// in-daemon metrics registry (see `src/metrics.rs` and PERFORMANCE.md).
+/// Sits behind the normal auth layer on purpose: timings and volumes are
+/// low-risk but not something to leak to unauthenticated visitors.
+async fn metrics_endpoint() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::render_prometheus(),
+    )
+        .into_response()
+}
+
+/// The closed set of route templates we label with; anything else lands
+/// in `"other"` so a stray wildcard or unmatched path cannot blow up
+/// label cardinality.
+const METRIC_ROUTES: &[&str] = &[
+    "/api/health",
+    "/api/metrics",
+    "/api/auth/status",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/push/public-key",
+    "/api/push/subscribe",
+    "/api/sessions",
+    "/api/sessions/{id}",
+    "/api/sessions/{id}/metadata",
+    "/api/sessions/{id}/notifications",
+    "/api/sessions/{id}/stop",
+    "/api/sessions/{id}/kill",
+    "/api/sessions/{id}/input",
+    "/api/sessions/{id}/upload",
+    "/api/sessions/{id}/logs",
+    "/api/sessions/{id}/logs/tail",
+    "/api/sessions/{id}/attach",
+    "/api/nodes",
+    "/api/nodes/host-key",
+    "/api/static/apps",
+];
+
+/// Per-route request duration histogram. Long-lived responses (SSE) are
+/// skipped: their lifetime is a connection duration, not handled work,
+/// and mixing them into latency histograms destroys the signal.
+async fn metrics_middleware(request: Request, next: axum::middleware::Next) -> Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .and_then(|matched| {
+            METRIC_ROUTES
+                .iter()
+                .find(|r| **r == matched.as_str())
+                .copied()
+        })
+        .unwrap_or("other");
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    let is_stream = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.starts_with("text/event-stream") || v.starts_with("application/x-ndjson")
+        });
+    if !is_stream {
+        crate::metrics::observe("http_request", Some(route), start.elapsed());
+    }
+    response
 }
 
 /// Middleware that injects standard security response headers on every reply.

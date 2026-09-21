@@ -1033,13 +1033,20 @@ fn appender_loop(
                    last_written: u64,
                    last_durable: &mut u64,
                    sync_deadline: &mut Option<Instant>| {
+        // fsync latency is the prime suspect when *everything* gets slow
+        // at once (a stalling disk shows up here before anywhere else);
+        // see PERFORMANCE.md.
+        let sync_start = Instant::now();
         match writer.sync() {
             Ok(()) => {
+                crate::metrics::observe("journal_sync", None, sync_start.elapsed());
                 *last_durable = last_written;
                 *sync_deadline = None;
                 let _ = ack_tx.send(JournalAck::Durable(last_written));
             }
             Err(err) => {
+                crate::metrics::count("journal_failures", Some("sync"));
+                crate::metrics::observe("journal_sync", None, sync_start.elapsed());
                 fail(ack_tx, dead, format!("journal sync failed: {err}"));
             }
         }
@@ -1113,13 +1120,17 @@ fn appender_loop(
                     );
                     continue;
                 }
-                match writer.append_record(
+                let append_start = Instant::now();
+                let append = writer.append_record(
                     event.kind,
                     event.cursor.seq,
                     event.elapsed_ms,
                     &event.payload,
-                ) {
+                );
+                crate::metrics::observe("journal_append", None, append_start.elapsed());
+                match append {
                     Ok(()) => {
+                        crate::metrics::add("journal_bytes", None, event.payload.len() as u64);
                         if last_written <= last_durable {
                             sync_deadline = Some(Instant::now() + sync_interval);
                         }
@@ -1128,6 +1139,7 @@ fn appender_loop(
                         let _ = ack_tx.send(JournalAck::Journaled(event.cursor.seq));
                     }
                     Err(err) => {
+                        crate::metrics::count("journal_failures", Some("append"));
                         fail(&ack_tx, &mut dead, format!("journal append failed: {err}"));
                     }
                 }

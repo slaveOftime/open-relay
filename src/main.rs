@@ -7,6 +7,7 @@ mod db;
 mod error;
 mod http;
 mod ipc;
+mod metrics;
 mod node;
 mod notification;
 mod protocol;
@@ -39,6 +40,8 @@ const OLY_APPS_SKILL_MARKDOWN: &str = include_str!("../skills/oly-apps/SKILL.md"
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    // Anchors OLY_TIMING marks at process start (before any work).
+    crate::metrics::mark("startup");
     configure_mimalloc_defaults();
 
     let code = match run().await {

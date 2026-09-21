@@ -136,9 +136,11 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
         _ => None,
     };
     let refresh = fetch_sessions(config, query.clone(), &targets).await?;
+    crate::metrics::mark("tui: sessions fetched");
     app.set_refresh_message(refresh.warning());
     app.replace_sessions(refresh.sessions);
     let mut terminal = TuiTerminal::new()?;
+    crate::metrics::mark("tui: terminal ready");
     let mut last_refresh = Instant::now();
     let mut last_draw = Instant::now();
     let mut redraw = true;

@@ -114,8 +114,16 @@ pub fn bind(config: &AppConfig) -> io::Result<Listener> {
 }
 
 pub async fn send_request(config: &AppConfig, request: RpcRequest) -> Result<RpcResponse> {
+    // Client-side wall-clock marks (OLY_TIMING=1): the gap between
+    // process start and "connected" is CLI startup + socket connect, the
+    // gap to "response" is daemon handling. See PERFORMANCE.md.
+    let method = request.name();
+    crate::metrics::FIRST_MARK.mark_first("ipc: connecting");
     let stream = connect(config).await?;
-    send_request_on_stream(stream, request).await
+    crate::metrics::mark(&format!("ipc: connected ({method})"));
+    let response = send_request_on_stream(stream, request).await?;
+    crate::metrics::mark(&format!("ipc: response ({method})"));
+    Ok(response)
 }
 
 pub async fn send_request_checked(config: &AppConfig, request: RpcRequest) -> Result<RpcResponse> {

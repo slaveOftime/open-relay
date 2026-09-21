@@ -356,6 +356,9 @@ async fn handle_ws_streaming(
         role,
         headers,
     } = params;
+    // Time to first byte as the browser experiences it: lease + snapshot
+    // + scrollback seed + init frame on the wire (PERFORMANCE.md).
+    let init_start = std::time::Instant::now();
     // M3-4: register the attachment (control lease + viewport) before the
     // snapshot, so a controller's authorized initial geometry is applied
     // through the sequencer and already reflected in the init.
@@ -438,6 +441,8 @@ async fn handle_ws_streaming(
         debug!(session_id = %id, "local WebSocket closed before init frame could be sent");
         return;
     }
+    crate::metrics::observe("attach_init", Some("local"), init_start.elapsed());
+    crate::metrics::count("attach_clients", Some("local"));
 
     // Control-handoff notices for this session.
     let mut control_rx = state.store.subscribe_control(&id);
@@ -690,6 +695,10 @@ async fn handle_ws_proxied_streaming(
         headers,
     } = params;
     info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
+    // Same time-to-first-byte as the local path, but including the relay
+    // round trip — the split between attach_init{proxied} and
+    // attach_snapshot (measured on the owning node) is pure relay cost.
+    let init_start = std::time::Instant::now();
 
     // Open streaming subscription via node proxy. Proxied streams are
     // credited (M5-2): mid-stream messages — including applied-cursor
@@ -814,6 +823,12 @@ async fn handle_ws_proxied_streaming(
                                     "proxied WebSocket init frame received"
                                 );
                                 init_sent = true;
+                                crate::metrics::observe(
+                                    "attach_init",
+                                    Some("proxied"),
+                                    init_start.elapsed(),
+                                );
+                                crate::metrics::count("attach_clients", Some("proxied"));
                             }
                             RpcResponse::AttachStreamChunk { offset, data } => {
                                 if !data.is_empty() {
@@ -1044,8 +1059,8 @@ fn seed_web_init_data(seed: Option<Vec<u8>>, rows: Option<u16>, snapshot: Vec<u8
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerMessage, WsModes, WS_FLAG_FOCUS_EVENTS, WS_FLAG_MOUSE_REPORT, WS_FLAG_SGR_MOUSE,
-        WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED,
+        ServerMessage, WS_FLAG_FOCUS_EVENTS, WS_FLAG_MOUSE_REPORT, WS_FLAG_SGR_MOUSE,
+        WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED, WsModes,
         encode_server_message, panic_payload_message, seed_web_init_data,
     };
 
@@ -1219,7 +1234,10 @@ mod tests {
             attachment_id: 0,
             role: "observer",
         });
-        assert_eq!(payload[1], WS_FLAG_MOUSE_REPORT | WS_FLAG_SGR_MOUSE | WS_FLAG_FOCUS_EVENTS);
+        assert_eq!(
+            payload[1],
+            WS_FLAG_MOUSE_REPORT | WS_FLAG_SGR_MOUSE | WS_FLAG_FOCUS_EVENTS
+        );
     }
 
     #[test]

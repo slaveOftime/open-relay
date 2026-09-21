@@ -214,6 +214,7 @@ async fn run_attach_inner(
     role: Option<&str>,
 ) -> Result<()> {
     let stream = ipc::connect(config).await?;
+    crate::metrics::mark("attach: ipc connected");
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let interactive = can_use_interactive_terminal();
@@ -248,6 +249,7 @@ async fn run_attach_inner(
 
     // Receive the init frame.
     let init = ipc::read_checked_response_from_reader(&mut reader).await?;
+    crate::metrics::mark("attach: init frame received");
     let (
         initial_data,
         scrollback_seed,
@@ -292,9 +294,7 @@ async fn run_attach_inner(
     // keystrokes don't bounce off the gate.
     let mut is_controller = granted_role != "observer";
     if interactive && !is_controller {
-        eprintln!(
-            "Attached as observer (view-only). Ctrl-T takes control, Ctrl-D detaches."
-        );
+        eprintln!("Attached as observer (view-only). Ctrl-T takes control, Ctrl-D detaches.");
     }
 
     // Every chunk must continue exactly at the cursor the init frame left
