@@ -312,7 +312,12 @@ export function deletePushSubscription(
 // ---------------------------------------------------------------------------
 
 type EventCallback = (ev: SessionEvent) => void
-export type SseConnectionState = 'live' | 'reconnecting' | 'offline'
+/**
+ * `connecting` — first attempt only, nothing has gone wrong yet.
+ * `reconnecting` — the stream opened before and dropped; retries are backing off.
+ * `offline` — the browser reports no network connection.
+ */
+export type SseConnectionState = 'connecting' | 'live' | 'reconnecting' | 'offline'
 
 export function subscribeEvents(
   cb: EventCallback,
@@ -322,9 +327,21 @@ export function subscribeEvents(
   let retryDelay = 1000
   let stopped = false
   let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let everOpened = false
+  let attempts = 0
 
   const setState = (state: SseConnectionState) => {
     onStateChange?.(state)
+  }
+
+  /**
+   * Network is up: a single, first handshake is benign (`connecting`); once the
+   * stream has been open before, or the first handshake needed a retry, the
+   * pill may honestly report a degraded state (`reconnecting`).
+   */
+  const setStateForAttempt = () => {
+    attempts += 1
+    setState(everOpened || attempts > 1 ? 'reconnecting' : 'connecting')
   }
 
   const scheduleReconnect = () => {
@@ -343,7 +360,7 @@ export function subscribeEvents(
       return
     }
 
-    setState('reconnecting')
+    setStateForAttempt()
     es?.close()
     es = null
     const tok = getToken()
@@ -392,13 +409,20 @@ export function subscribeEvents(
       es?.close()
       es = null
       if (!stopped) {
-        setState(typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting')
+        setState(
+          typeof navigator !== 'undefined' && !navigator.onLine
+            ? 'offline'
+            : everOpened || attempts > 1
+              ? 'reconnecting'
+              : 'connecting'
+        )
         scheduleReconnect()
         retryDelay = Math.min(retryDelay * 2, 30_000)
       }
     }
 
     es.onopen = () => {
+      everOpened = true
       setState('live')
       retryDelay = 1000
     }
@@ -406,7 +430,7 @@ export function subscribeEvents(
 
   const handleOnline = () => {
     if (stopped) return
-    setState('reconnecting')
+    // connect() reports the new attempt state synchronously.
     es?.close()
     connect()
   }

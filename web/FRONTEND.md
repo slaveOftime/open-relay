@@ -72,6 +72,13 @@ Follow the compact dark system in `web\DESIGN.md`: 32px default controls, 6-8px 
 - `src\components\ui\textarea.tsx`: shared multiline input matching `Input`.
 - `src\components\ui\form-field.tsx`: shared dialog-form field structure.
 - `src\components\SessionActionConfirmDialog.tsx`: app-level wrapper for repeated stop/kill confirmation UI.
+- `src\components\sse-status-tone.ts`: pure state-to-tone table for `SseStatusDot`, so "not connected yet" (`connecting`) stays quiet and only degraded streams (`reconnecting`, `offline`) turn red/amber and pulse.
+- `src\pages\sessions-table-columns.ts` and `src\pages\sessions-page-events.ts`: page-local pure logic next to a `.test.ts` file. Keep branch-heavy page logic (column layout, live-event routing) in such modules so it is unit-testable without React.
+
+## Live events
+
+- One `subscribeSessionEvents` subscription per page mount. Read current filters from memoized context/handlers handed to the subscription through a ref, instead of resubscribing on every filter, search, or page change; resubscribing churns the shared event store's retain count and cancels pending background reloads.
+- The store keeps a connection state for `SseStatusDot`: `connecting` (first handshake, benign), `live`, `reconnecting` (a stream that opened before has dropped and retries are backing off), `offline`.
 
 ## Avoid
 

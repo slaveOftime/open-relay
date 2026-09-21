@@ -47,8 +47,12 @@ class SessionEventsStore {
   private readonly eventListeners = new Set<EventListener>()
   private readonly sessions = new Map<string, SessionSummary>()
 
-  private connectionState: SseConnectionState =
-    typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting'
+  /** State to show while no stream is retained: never-connected reads as `connecting`. */
+  private static idleState(): SseConnectionState {
+    return typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'connecting'
+  }
+
+  private connectionState: SseConnectionState = SessionEventsStore.idleState()
   private cleanup: (() => void) | null = null
   private startRaf: number | null = null
   private retainCount = 0
@@ -79,9 +83,7 @@ class SessionEventsStore {
       this.cleanup()
       this.cleanup = null
     }
-    this.setConnectionState(
-      typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'reconnecting'
-    )
+    this.setConnectionState(SessionEventsStore.idleState())
   }
 
   subscribeStore(listener: StoreListener): () => void {
@@ -212,7 +214,7 @@ export function useSseConnectionState(): SseConnectionState {
   return useSyncExternalStore(
     (listener) => sessionEventsStore.subscribeStore(listener),
     () => sessionEventsStore.getConnectionState(),
-    () => 'reconnecting'
+    () => 'connecting'
   )
 }
 

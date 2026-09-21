@@ -34,6 +34,13 @@ import {
   type SessionTableColumnOrder,
   type SessionTableColumnSizes,
 } from './sessions-table-columns'
+import {
+  handleSessionPageEvent,
+  matchesStatusFilter,
+  normalizeStoredNode,
+  type SessionPageEventContext,
+  type SessionPageEventHandlers,
+} from './sessions-page-events'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -133,13 +140,6 @@ function normalizeStatusFilter(value: unknown): SessionStatusFilter {
   return isSessionStatusFilter(value) ? value : 'all'
 }
 
-function matchesStatusFilter(
-  statusFilter: SessionStatusFilter,
-  status: SessionSummary['status']
-): boolean {
-  return statusFilter === 'all' || status === statusFilter
-}
-
 function filterSessionsByStatus(
   items: SessionSummary[],
   statusFilter: SessionStatusFilter
@@ -227,19 +227,6 @@ function saveSessionTableColumnSettings(settings: {
   } catch {
     /* ignore */
   }
-}
-
-function normalizeStoredNode(value: unknown): string | null {
-  if (typeof value !== 'string') return null
-  const trimmed = value.trim()
-  return trimmed === '' ? null : trimmed
-}
-
-function matchesSelectedNode(
-  selectedNode: string | null,
-  eventNode: string | null | undefined
-): boolean {
-  return (selectedNode ?? null) === normalizeStoredNode(eventNode)
 }
 
 function sessionPageTitle(selectedNode: string | null): string {
@@ -1007,18 +994,11 @@ export default function SessionsPage() {
   const tableColumnDragRef = useRef<SessionTableColumnKey | null>(null)
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
-  const loadedSessionIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
-  const pushStateRef = useRef<PushSetupState>('idle')
   const sseStatus = useSseConnectionState()
 
-  useEffect(() => {
-    pushStateRef.current = pushState
-  }, [pushState])
-
-  useEffect(() => {
-    loadedSessionIdsRef.current = new Set(sessions.map((session) => session.id))
-  }, [sessions])
+  // Ids currently rendered on the page (the SSE handler must not invent rows).
+  const loadedSessionIds = useMemo(() => new Set(sessions.map((session) => session.id)), [sessions])
 
   const applySessionItems = useCallback((items: SessionSummary[]) => {
     ingestSessionSummaries(items)
@@ -1251,60 +1231,59 @@ export default function SessionsPage() {
       })
   }, [])
 
+  // ── Live events ───────────────────────────────────────────────────────────
+  // One subscription for the whole mount. Context and handlers are rebuilt with
+  // their inputs and handed to that single subscription through a ref, so a
+  // search keystroke, page flip or sort change no longer tears the subscription
+  // down — that churned the shared event store's retain count and cancelled
+  // in-flight delayed reloads.
+  const sseContext = useMemo<SessionPageEventContext>(
+    () => ({
+      selectedNode,
+      statusFilter,
+      loadedSessionIds,
+      pushSubscribed: pushState === 'subscribed',
+    }),
+    [loadedSessionIds, pushState, selectedNode, statusFilter]
+  )
+
+  const sseHandlers = useMemo<SessionPageEventHandlers>(
+    () => ({
+      applySnapshot: applyLoadedSessionSnapshot,
+      replaceLoadedSession,
+      removeLoadedSession,
+      removePinnedKey: (pinKey) => setPinnedKeys((prev) => prev.filter((key) => key !== pinKey)),
+      reloadSessions: (opts) => void reloadSessions(opts),
+      scheduleDelayedReload,
+      showNotification: (data) => void showSessionNotification(data),
+    }),
+    [
+      applyLoadedSessionSnapshot,
+      removeLoadedSession,
+      replaceLoadedSession,
+      reloadSessions,
+      scheduleDelayedReload,
+    ]
+  )
+
+  // Synced by an effect declared before the subscription effect, so the first
+  // event of a mount already sees the committed values.
+  const sseRoutingRef = useRef({ context: sseContext, handlers: sseHandlers })
+
+  useEffect(() => {
+    sseRoutingRef.current = { context: sseContext, handlers: sseHandlers }
+  }, [sseContext, sseHandlers])
+
   useEffect(() => {
     const cleanup = subscribeSessionEvents((ev) => {
-      if (ev.event === 'snapshot') {
-        if (selectedNode) return
-        applyLoadedSessionSnapshot(ev.data)
-        return
-      }
-      if (ev.event === 'session_created') {
-        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
-        void reloadSessions({ background: true })
-        return
-      }
-      if (ev.event === 'session_updated') {
-        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
-        if (!matchesStatusFilter(statusFilter, ev.data.status)) {
-          removeLoadedSession(ev.data.id)
-          void reloadSessions({ background: true })
-          return
-        }
-        if (!loadedSessionIdsRef.current.has(ev.data.id)) {
-          scheduleDelayedReload()
-          return
-        }
-        replaceLoadedSession(ev.data)
-        return
-      }
-      if (ev.event === 'session_deleted') {
-        if (!matchesSelectedNode(selectedNode, ev.data.node)) return
-        removeLoadedSession(ev.data.id)
-        const deletedPinKey = sessionPinKey(ev.data.id, normalizeStoredNode(ev.data.node))
-        setPinnedKeys((prev) => prev.filter((key) => key !== deletedPinKey))
-        void reloadSessions({ background: true })
-        return
-      }
-      if (ev.event === 'session_notification') {
-        if (pushStateRef.current === 'subscribed') return
-        void showSessionNotification(ev.data)
-        return
-      }
+      handleSessionPageEvent(ev, sseRoutingRef.current.context, sseRoutingRef.current.handlers)
     })
     return () => {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
       if (delayedReloadTimerRef.current) clearTimeout(delayedReloadTimerRef.current)
     }
-  }, [
-    applyLoadedSessionSnapshot,
-    removeLoadedSession,
-    replaceLoadedSession,
-    reloadSessions,
-    scheduleDelayedReload,
-    selectedNode,
-    statusFilter,
-  ])
+  }, [])
 
   useEffect(() => {
     const interval = setInterval(() => {
