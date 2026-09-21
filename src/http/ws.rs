@@ -6,14 +6,21 @@ use axum::{
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 
+use std::sync::Arc;
+use std::time::Instant;
+
 use tracing::{debug, error, info, trace, warn};
 
-use crate::protocol::{RpcRequest, RpcResponse};
-use crate::session::registry::{AttachKind, ControlRequest};
-use crate::session::resize::ResizeSubscriber;
-use crate::session::{AttachEvent, AttachPump, ModeSnapshot, SessionError};
+use crate::protocol::RpcRequest;
+use crate::session::registry::ControlRequest;
+
+use crate::session::{ModeSnapshot, SessionError};
 
 use super::AppState;
+use super::attach_source::{
+    AttachSource, AttachStreamEvent, InitFrame, LocalSource, LocalSourceOutput, RelayedSource,
+    RelayedSourceOutput,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct AttachParams {
@@ -32,7 +39,7 @@ pub struct AttachParams {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage {
+pub(crate) enum ServerMessage {
     /// Initial terminal snapshot. `data` contains filtered stream bytes
     /// covering the stream up to `end_offset` in journal `incarnation`.
     Init {
@@ -87,7 +94,7 @@ enum ServerMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ClientMessage {
+pub(crate) enum ClientMessage {
     Input {
         data: String,
         #[serde(rename = "waitForChange")]
@@ -128,20 +135,20 @@ const WS_FLAG_FOCUS_EVENTS: u8 = 1 << 4;
 /// browser needs all of them because xterm.js only captures mouse/focus
 /// events while its own parsed mode state says so.
 #[derive(Debug, Clone, Copy, Serialize, Default)]
-struct WsModes {
+pub(crate) struct WsModes {
     #[serde(rename = "appCursorKeys")]
-    app_cursor_keys: bool,
+    pub(crate) app_cursor_keys: bool,
     #[serde(rename = "bracketedPasteMode")]
-    bracketed_paste_mode: bool,
+    pub(crate) bracketed_paste_mode: bool,
     /// Child has mouse reporting enabled (any of 1000/1002/1003).
     #[serde(rename = "mouseReport")]
-    mouse_report: bool,
+    pub(crate) mouse_report: bool,
     /// Child negotiated SGR (1006) mouse encoding.
     #[serde(rename = "sgrMouse")]
-    sgr_mouse: bool,
+    pub(crate) sgr_mouse: bool,
     /// Child has focus in/out reporting (1004) enabled.
     #[serde(rename = "focusEvents")]
-    focus_events: bool,
+    pub(crate) focus_events: bool,
 }
 
 impl From<ModeSnapshot> for WsModes {
@@ -320,11 +327,15 @@ struct AttachConnectionParams {
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
     role: Option<String>,
+    /// Upgrade-time headers retained so a future revision can incorporate
+    /// per-connection surfaces (CSRF cookies, Auth-Bearer tokens,
+    /// per-message auth evidence) without changing the upgrade plumbing.
+    #[allow(dead_code)]
     headers: axum::http::HeaderMap,
 }
 
 async fn handle_ws(
-    socket: WebSocket,
+    mut socket: WebSocket,
     state: AppState,
     id: String,
     node: Option<String>,
@@ -332,163 +343,156 @@ async fn handle_ws(
 ) {
     debug!(session_id = %id, node = ?node, "WebSocket connected");
 
-    if let Some(node_name) = node {
-        handle_ws_proxied_streaming(socket, state, id, node_name, params).await;
-        return;
-    }
-
-    handle_ws_streaming(socket, state, id, params).await;
-}
-
-// ---------------------------------------------------------------------------
-// Streaming attach (local sessions) — unified with IPC protocol
-// ---------------------------------------------------------------------------
-
-async fn handle_ws_streaming(
-    mut socket: WebSocket,
-    state: AppState,
-    id: String,
-    params: AttachConnectionParams,
-) {
-    let AttachConnectionParams {
-        initial_rows,
-        initial_cols,
-        role,
-        headers,
-    } = params;
-    // Time to first byte as the browser experiences it: lease + snapshot
-    // + scrollback seed + init frame on the wire (PERFORMANCE.md).
-    let init_start = std::time::Instant::now();
-    // M3-4: register the attachment (control lease + viewport) before the
-    // snapshot, so a controller's authorized initial geometry is applied
-    // through the sequencer and already reflected in the init.
-    let request = match ControlRequest::parse(role.as_deref()) {
+    // Parse the role before opening either source so the dispatch error
+    // path can wrap a clean ServerMessage::Error without side effects.
+    let request = match ControlRequest::parse(params.role.as_deref()) {
         Ok(request) => request,
         Err(message) => {
             let _ = send_server_message(&mut socket, &ServerMessage::Error { message }).await;
             return;
         }
     };
-    let viewport = match (initial_rows, initial_cols) {
-        (Some(rows), Some(cols)) if rows > 0 && cols > 0 => Some((rows, cols)),
-        _ => None,
-    };
-    let registration = match state
-        .store
-        .attach_register(&id, AttachKind::Web, request, viewport)
-        .await
-    {
-        Ok(registration) => registration,
-        Err(err) => {
-            let _ = send_server_message(
-                &mut socket,
-                &ServerMessage::Error {
-                    message: err.message(&id),
-                },
-            )
-            .await;
-            return;
-        }
-    };
-    let attachment_id = registration.attachment_id;
-
-    // M5-1: local WebSocket clients ack applied cursors every 1 MiB, so
-    // their stream is credit-gated.
-    let (mut pump, init) = match AttachPump::subscribe(
-        &state.store,
-        &id,
-        None,
-        None,
-        crate::session::PumpCredit::Credited { attachment_id },
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(err) => {
-            let _ = state.store.attach_detach(&id, attachment_id).await;
-            warn!(session_id = %id, error = err.message(&id), "local WebSocket stream init failed");
-            let _ = send_server_message(
-                &mut socket,
-                &ServerMessage::Error {
-                    message: err.message(&id),
-                },
-            )
-            .await;
-            return;
-        }
-    };
-
-    // Seed scrollback exactly like the native attach client does (M6
-    // scrollback-seed): the web client replays `data` into a fresh xterm,
-    // so seed+snapshot concatenation carries the terminal scrollbar back
-    // past the attach point.
-    let seed = match viewport {
-        Some((rows, _)) => state.store.attach_scrollback_seed(&id, rows).await,
-        None => None,
-    };
-    let init_data = seed_web_init_data(seed, viewport.map(|(rows, _)| rows), init.data);
-
-    let init_msg = ServerMessage::Init {
-        data: init_data,
-        end_offset: init.end_offset,
-        incarnation: init.incarnation,
-        running: init.running,
-        modes: WsModes::from(init.modes),
-        attachment_id,
-        role: registration.role.as_str(),
-    };
-    if !send_server_message(&mut socket, &init_msg).await {
-        debug!(session_id = %id, "local WebSocket closed before init frame could be sent");
-        return;
-    }
-    crate::metrics::observe("attach_init", Some("local"), init_start.elapsed());
-    crate::metrics::count("attach_clients", Some("local"));
-
-    // Control-handoff notices for this session.
-    let mut control_rx = state.store.subscribe_control(&id);
 
     // ADR-0007 (M5-4): logout/revocation closes live control streams not
     // just future requests — watch the revocation epoch and re-validate the
-    // connection's token.
-    let revoke_token = crate::http::auth::extract_request_token_parts(&headers, None);
-    let mut revocation_rx = state.auth.as_ref().map(|auth| auth.revocation_watch());
+    // connection's token before tearing the stream down.
+    let reconnect_token =
+        crate::http::auth::extract_request_token_parts(&params.headers, None)
+            .unwrap_or_default();
 
-    // Subscribe to resize broadcasts so we can notify this client when
-    // another attached client changes the PTY size.
-    let mut resize_sub = ResizeSubscriber::new(state.store.subscribe_resize(&id), id.clone());
+    if let Some(node_name) = node.clone() {
+        match AttachSource::relayed(
+            state.node_registry.clone(),
+            id.clone(),
+            node_name.clone(),
+            params.initial_rows,
+            params.initial_cols,
+            params.role.clone(),
+        )
+        .await
+        {
+            Ok(RelayedSourceOutput {
+                source,
+                init_frame,
+                tti_start,
+            }) => {
+                if !send_init_frame(&mut socket, init_frame, tti_start, &id, "proxied").await {
+                    return;
+                }
+                let auth = state.auth.clone();
+                let revocation_rx = auth.as_ref().map(|a| a.revocation_watch());
+                serve_attach(
+                    socket,
+                    state,
+                    id,
+                    Some(node_name),
+                    "proxied",
+                    revocation_rx,
+                    auth,
+                    reconnect_token,
+                    AttachSource::Relayed(source),
+                )
+                .await;
+            }
+            Err(err) => {
+                let _ = send_server_message(&mut socket, &err.into_message()).await;
+            }
+        }
+        return;
+    }
 
+    match AttachSource::local(
+        state.store.clone(),
+        id.clone(),
+        params.initial_rows,
+        params.initial_cols,
+        request,
+    )
+    .await
+    {
+        Ok(LocalSourceOutput {
+            source,
+            init_frame,
+            tti_start,
+        }) => {
+            if !send_init_frame(&mut socket, init_frame, tti_start, &id, "local").await {
+                return;
+            }
+            let auth = state.auth.clone();
+            let revocation_rx = auth.as_ref().map(|a| a.revocation_watch());
+            serve_attach(
+                socket,
+                state,
+                id,
+                None,
+                "local",
+                revocation_rx,
+                auth,
+                String::new(),
+                AttachSource::Local(source),
+            )
+            .await;
+        }
+        Err(err) => {
+            let _ = send_server_message(&mut socket, &err.into_message()).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared serve loop — local + relayed attach via `AttachSource` (PLAN2 S2)
+// ---------------------------------------------------------------------------
+
+/// Single canonical WebSocket attach loop for both arms. The init frame
+/// has already been written to `socket` by the caller's preamble (either
+/// the local constructor or the relayed constructor), and a metrics label
+/// has been observed; this function waits for chunks/modes/resizes/etc.
+/// and dispatches client messages back into the source.
+///
+/// The `init_metrics_label` must be exactly one of `"local"` or
+/// `"proxied"` -- the same labels pre-S2 observers expect.
+async fn serve_attach(
+    mut socket: WebSocket,
+    state: AppState,
+    id: String,
+    node: Option<String>,
+    init_metrics_label: &'static str,
+    mut revocation_rx: Option<tokio::sync::watch::Receiver<u64>>,
+    auth: Option<Arc<crate::http::auth::AuthState>>,
+    reconnect_token: String,
+    mut source: AttachSource,
+) {
     debug!(
         session_id = %id,
-        snapshot_bytes = init_msg_data_len(&init_msg),
-        end_offset = init.end_offset,
-        app_cursor_keys = init.modes.app_cursor_keys,
-        bracketed_paste_mode = init.modes.bracketed_paste_mode,
-        mouse_report = init.modes.mouse_report,
-        sgr_mouse = init.modes.sgr_mouse,
-        focus_events = init.modes.focus_events,
-        "local WebSocket stream initialized"
+        attach_path = init_metrics_label,
+        "WebSocket attach entered shared serve loop"
     );
-
     loop {
-        // Session revocation check armed only while auth is enabled and the
+        // Revocation check armed only while auth is enabled and the
         // connection carried a token.
         let revoked = async {
-            match (&mut revocation_rx, &revoke_token) {
-                (Some(rx), Some(_)) => {
+            match (revocation_rx.as_mut(), reconnect_token.is_empty()) {
+                (Some(rx), false) => {
                     let _ = rx.changed().await;
                 }
                 _ => std::future::pending::<()>().await,
             }
         };
         tokio::pin!(revoked);
+
         tokio::select! {
             biased;
 
             _ = &mut revoked => {
-                if let (Some(auth), Some(token)) = (&state.auth, &revoke_token)
-                    && !auth.validate_token(token).await
+                if let Some(ref auth_state) = auth
+                    && !reconnect_token.is_empty()
+                    && !auth_state.validate_token(&reconnect_token).await
                 {
-                    info!(session_id = %id, "WebSocket closed — session token revoked");
+                    info!(
+                        session_id = %id,
+                        attach_path = init_metrics_label,
+                        "WebSocket closed -- session token revoked"
+                    );
                     let _ = send_server_message(
                         &mut socket,
                         &ServerMessage::Error {
@@ -496,43 +500,57 @@ async fn handle_ws_streaming(
                         },
                     )
                     .await;
+                    cleanup_source(&state, &id, &node, &source).await;
                     return;
                 }
             }
 
-            // Session output: the shared attach pump (M3-2) owns follow /
-            // coalesce / lag resync / completion flush / mode tracking.
-            event = pump.next() => {
+            // Stream events from the source.
+            event = source_source(&mut source) => {
                 match event {
-                    AttachEvent::Chunk { offset, data } => {
+                    Some(AttachStreamEvent::Chunk { offset, data }) => {
                         if !send_server_message(&mut socket, &ServerMessage::Data { offset, data }).await {
-                            let _ = state.store.attach_detach(&id, attachment_id).await;
+                            cleanup_source(&state, &id, &node, &source).await;
                             return;
                         }
                     }
-                    AttachEvent::Modes(modes) => {
-                        if !send_server_message(&mut socket, &ServerMessage::ModeChanged {
-                            modes: WsModes::from(modes),
-                        }).await {
-                            let _ = state.store.attach_detach(&id, attachment_id).await;
+                    Some(AttachStreamEvent::Modes(modes)) => {
+                        if !send_server_message(&mut socket, &ServerMessage::ModeChanged { modes }).await {
+                            cleanup_source(&state, &id, &node, &source).await;
                             return;
                         }
                     }
-                    AttachEvent::Done {
-                        exit_code,
-                        final_offset,
-                    } => {
-                        info!(session_id = %id, ?exit_code, final_offset, "WS session ended");
+                    Some(AttachStreamEvent::Resized { rows, cols }) => {
+                        if !send_server_message(&mut socket, &ServerMessage::Resized { rows, cols }).await {
+                            cleanup_source(&state, &id, &node, &source).await;
+                            return;
+                        }
+                    }
+                    Some(AttachStreamEvent::Control { role }) => {
+                        if !send_server_message(&mut socket, &ServerMessage::Control { role }).await {
+                            cleanup_source(&state, &id, &node, &source).await;
+                            return;
+                        }
+                    }
+                    Some(AttachStreamEvent::Done { exit_code, final_offset }) => {
+                        info!(
+                            session_id = %id,
+                            attach_path = init_metrics_label,
+                            ?exit_code,
+                            final_offset,
+                            "WebSocket session ended"
+                        );
                         let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code, final_offset }).await;
-                        let _ = state.store.attach_detach(&id, attachment_id).await;
+                        cleanup_source(&state, &id, &node, &source).await;
                         return;
                     }
-                    AttachEvent::Closed => {
+                    Some(AttachStreamEvent::Closed) | None => {
+                        let final_offset = pump_current_offset(&source);
                         let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
                             exit_code: None,
-                            final_offset: pump.current_offset(),
+                            final_offset,
                         }).await;
-                        let _ = state.store.attach_detach(&id, attachment_id).await;
+                        cleanup_source(&state, &id, &node, &source).await;
                         return;
                     }
                 }
@@ -540,136 +558,18 @@ async fn handle_ws_streaming(
 
             // Client messages.
             msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Input { data, wait_for_change }) => {
-                                debug!(session_id = %id, bytes = data.len(), "WS input received");
-                                if let Err(err) = state.store.attach_input(&id, Some(attachment_id), data.as_bytes(), wait_for_change).await {
-                                    // Control-gate violations are reported but
-                                    // keep the stream; transport failures end it.
-                                    let gated = matches!(err, SessionError::NotController | SessionError::StaleAttachment);
-                                    if !send_server_message(&mut socket, &ServerMessage::Error {
-                                        message: err.message(&id),
-                                    }).await {
-                                        let _ = state.store.attach_detach(&id, attachment_id).await;
-                                        return;
-                                    }
-                                    if !gated {
-                                        let _ = state.store.attach_detach(&id, attachment_id).await;
-                                        return;
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::Busy) => {
-                                trace!(session_id = %id, "WS attach busy received");
-                                if let Err(err) = state.store.attach_busy(&id).await {
-                                    let _ = send_server_message(&mut socket, &ServerMessage::Error {
-                                        message: err.message(&id),
-                                    }).await;
-                                    let _ = state.store.attach_detach(&id, attachment_id).await;
-                                    return;
-                                }
-                            }
-                            Ok(ClientMessage::Resize { rows, cols }) => {
-                                debug!(session_id = %id, rows, cols, "WS resize received");
-                                resize_sub.mark_sent(rows, cols);
-                                match state.store.attach_resize(&id, Some(attachment_id), rows, cols).await {
-                                    Ok(()) => {}
-                                    // Observers never resize the shared PTY;
-                                    // their declared size is a viewport only.
-                                    Err(SessionError::NotController | SessionError::StaleAttachment) => {
-                                        resize_sub.mark_sent(0, 0);
-                                    }
-                                    Err(err) => {
-                                        let _ = send_server_message(&mut socket, &ServerMessage::Error {
-                                            message: err.message(&id),
-                                        }).await;
-                                        let _ = state.store.attach_detach(&id, attachment_id).await;
-                                        return;
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::AcquireControl) => {
-                                debug!(session_id = %id, attachment_id, "local WebSocket control takeover requested");
-                                match state.store.attach_acquire_control(&id, attachment_id).await {
-                                    Ok(outcome) => {
-                                        if !send_server_message(
-                                            &mut socket,
-                                            &ServerMessage::Control {
-                                                role: outcome.role.as_str(),
-                                            },
-                                        )
-                                        .await
-                                        {
-                                            let _ = state.store.attach_detach(&id, attachment_id).await;
-                                            return;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        warn!(session_id = %id, error = err.message(&id), "control takeover failed");
-                                    }
-                                }
-                            }
-                            Ok(ClientMessage::Ack { offset }) => {
-                                state
-                                    .store
-                                    .attach_report_applied(&id, attachment_id, offset)
-                                    .await;
-                            }
-                            Ok(ClientMessage::Detach) => {
-                                debug!(session_id = %id, "WS client detached");
-                                let _ = state.store.attach_detach(&id, attachment_id).await;
-                                return;
-                            }
-                            Ok(ClientMessage::Ping) => {
-                                trace!(session_id = %id, "local WebSocket ping received");
-                                let _ = send_server_message(&mut socket, &ServerMessage::Pong).await;
-                            }
-                            Err(err) => {
-                                warn!(session_id = %id, %err, "failed to parse local WebSocket client message");
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!(session_id = %id, "WS client disconnected");
-                        let _ = state.store.attach_detach(&id, attachment_id).await;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Control handoffs: every notice carries the current controller
-            // id; derive this attachment's role from it.
-            notice = async {
-                match control_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Ok(controller) = notice {
-                    let role: &'static str = if controller == Some(attachment_id) {
-                        "controller"
-                    } else {
-                        "observer"
-                    };
-                    if !send_server_message(&mut socket, &ServerMessage::Control { role }).await {
-                        let _ = state.store.attach_detach(&id, attachment_id).await;
-                        return;
-                    }
-                }
-            }
-
-            // Resize notifications from other attached clients.
-            Some((rows, cols)) = resize_sub.recv_foreign() => {
-                debug!(
-                    session_id = %id,
-                    rows, cols,
-                    "forwarding resize notification to local WebSocket client"
-                );
-                if !send_server_message(&mut socket, &ServerMessage::Resized { rows, cols }).await {
-                    let _ = state.store.attach_detach(&id, attachment_id).await;
+                let keep = handle_client_message(
+                    msg,
+                    &state,
+                    &id,
+                    &node,
+                    &mut source,
+                    &mut socket,
+                    init_metrics_label,
+                )
+                .await;
+                if !keep {
+                    cleanup_source(&state, &id, &node, &source).await;
                     return;
                 }
             }
@@ -677,367 +577,499 @@ async fn handle_ws_streaming(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Streaming attach (node-proxied sessions) — uses proxy_rpc_stream()
-// ---------------------------------------------------------------------------
+/// Drain the source's next event: `AttachPump::next` for local, the
+/// relayed mpsc for proxied. Returns `None` if the relevant primitive has
+/// been dropped (transport-level closure).
+async fn source_source(source: &mut AttachSource) -> Option<AttachStreamEvent> {
+    match source {
+        AttachSource::Local(local) => local.next_event().await,
+        AttachSource::Relayed(relayed) => relayed.next_event().await,
+    }
+}
 
-async fn handle_ws_proxied_streaming(
-    mut socket: WebSocket,
-    state: AppState,
-    id: String,
-    node: String,
-    params: AttachConnectionParams,
-) {
-    let AttachConnectionParams {
-        initial_rows,
-        initial_cols,
-        role,
-        headers,
-    } = params;
-    info!(session_id = %id, node = %node, "starting proxied WebSocket stream");
-    // Same time-to-first-byte as the local path, but including the relay
-    // round trip — the split between attach_init{proxied} and
-    // attach_snapshot (measured on the owning node) is pure relay cost.
-    let init_start = std::time::Instant::now();
+/// Resolves the pump's `current_offset` for the local arm; the relayed arm
+/// has no concept of a live offset, so this returns `0` for it.
+fn pump_current_offset(source: &AttachSource) -> u64 {
+    match source {
+        AttachSource::Local(local) => local.pump.current_offset(),
+        AttachSource::Relayed(_) => 0,
+    }
+}
 
-    // Open streaming subscription via node proxy. Proxied streams are
-    // credited (M5-2): mid-stream messages — including applied-cursor
-    // acks — travel the relay as stream messages, so the owning node's
-    // credit gate applies to remote clients exactly as to local ones.
-    let rpc = RpcRequest::AttachSubscribe {
-        id: id.to_string(),
-        from_byte_offset: None,
-        incarnation: None,
-        rows: initial_rows.filter(|rows| *rows > 0),
-        cols: initial_cols.filter(|cols| *cols > 0),
-        role,
-        credited: true,
-    };
-    let (stream_rpc_id, mut stream_rx) = match state
-        .node_registry
-        .proxy_rpc_stream(&node, &rpc)
-        .await
-    {
-        Ok(pair) => pair,
-        Err(err) => {
-            warn!(session_id = %id, node = %node, %err, "failed to open proxied WebSocket stream");
-            let _ = send_server_message(
-                &mut socket,
-                &ServerMessage::Error {
-                    message: format!("failed to open proxy stream: {err}"),
-                },
-            )
-            .await;
-            return;
+/// Source-side cleanup on every drop path: detach local, remove_pending
+/// relay stream entry. Idempotent.
+async fn cleanup_source(state: &AppState, id: &str, node: &Option<String>, source: &AttachSource) {
+    match source {
+        AttachSource::Local(local) => {
+            let _ = state.store.attach_detach(id, local.attachment_id).await;
+            debug!(
+                session_id = %id,
+                attachment_id = local.attachment_id,
+                "local attach detached at serve-loop exit"
+            );
+        }
+        AttachSource::Relayed(relayed) => {
+            let node_name = node.as_deref().unwrap_or(&relayed.node);
+            state
+                .node_registry
+                .remove_pending(node_name, &relayed.stream_rpc_id)
+                .await;
+            debug!(
+                session_id = %id,
+                node = %node_name,
+                "relayed attach pending entry removed at serve-loop exit"
+            );
+        }
+    }
+}
+
+/// Handle one inbound WS message. Returns `false` if the loop should exit.
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_message(
+    msg: Option<std::result::Result<Message, axum::Error>>,
+    state: &AppState,
+    id: &str,
+    node: &Option<String>,
+    source: &mut AttachSource,
+    socket: &mut WebSocket,
+    init_metrics_label: &'static str,
+) -> bool {
+    let message = match msg {
+        Some(Ok(message)) => message,
+        Some(Err(err)) => {
+            warn!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                %err,
+                "WebSocket receive error"
+            );
+            return false;
+        }
+        None => {
+            debug!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                "WebSocket client disconnected"
+            );
+            return false;
         }
     };
 
-    let mut init_sent = false;
+    let text = match message {
+        Message::Text(text) => text,
+        Message::Close(_) => {
+            debug!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                "WebSocket Close frame received"
+            );
+            return false;
+        }
+        Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => return true,
+    };
 
-    // ADR-0007 (M5-4): revocation closes live proxied streams too.
-    let revoke_token = crate::http::auth::extract_request_token_parts(&headers, None);
-    let mut revocation_rx = state.auth.as_ref().map(|auth| auth.revocation_watch());
+    let client_message: ClientMessage = match serde_json::from_str(&text) {
+        Ok(message) => message,
+        Err(err) => {
+            warn!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                %err,
+                "failed to parse WebSocket client message"
+            );
+            return true;
+        }
+    };
 
-    loop {
-        let revoked = async {
-            match (&mut revocation_rx, &revoke_token) {
-                (Some(rx), Some(_)) => {
-                    let _ = rx.changed().await;
+    apply_client_message(
+        client_message,
+        state,
+        id,
+        node,
+        source,
+        socket,
+        init_metrics_label,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_client_message(
+    msg: ClientMessage,
+    state: &AppState,
+    id: &str,
+    node: &Option<String>,
+    source: &mut AttachSource,
+    socket: &mut WebSocket,
+    init_metrics_label: &'static str,
+) -> bool {
+    match source {
+        AttachSource::Local(local) => {
+            apply_client_message_local(msg, state, id, local, socket, init_metrics_label).await
+        }
+        AttachSource::Relayed(_) => {
+            let (relayed, node_name) = match source {
+                AttachSource::Relayed(relayed) => {
+                    let node_name = match node.as_deref() {
+                        Some(name) => name.to_string(),
+                        None => relayed.node.clone(),
+                    };
+                    (relayed, node_name)
                 }
-                _ => std::future::pending::<()>().await,
-            }
-        };
-        tokio::pin!(revoked);
-        tokio::select! {
-            biased;
+                AttachSource::Local(_) => unreachable!(),
+            };
+            apply_client_message_relayed(
+                msg,
+                state,
+                id,
+                &node_name,
+                relayed,
+                socket,
+                init_metrics_label,
+            )
+            .await
+        }
+    }
+}
 
-            _ = &mut revoked => {
-                if let (Some(auth), Some(token)) = (&state.auth, &revoke_token)
-                    && !auth.validate_token(token).await
+#[allow(clippy::too_many_arguments)]
+async fn apply_client_message_local(
+    msg: ClientMessage,
+    state: &AppState,
+    id: &str,
+    source: &mut LocalSource,
+    socket: &mut WebSocket,
+    init_metrics_label: &'static str,
+) -> bool {
+    match msg {
+        ClientMessage::Input {
+            data,
+            wait_for_change,
+        } => {
+            debug!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                bytes = data.len(),
+                "WS input received"
+            );
+            let outcome = state
+                .store
+                .attach_input(
+                    id,
+                    Some(source.attachment_id),
+                    data.as_bytes(),
+                    wait_for_change,
+                )
+                .await;
+            if let Err(err) = outcome {
+                let gated = matches!(
+                    err,
+                    SessionError::NotController | SessionError::StaleAttachment
+                );
+                if !send_server_message(
+                    socket,
+                    &ServerMessage::Error {
+                        message: err.message(id),
+                    },
+                )
+                .await
                 {
-                    info!(session_id = %id, node = %node, "proxied WebSocket closed — session token revoked");
+                    return false;
+                }
+                if !gated {
+                    return false;
+                }
+            }
+            true
+        }
+        ClientMessage::Busy => {
+            trace!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                "WS busy received"
+            );
+            if let Err(err) = state.store.attach_busy(id).await
+                && !send_server_message(
+                    socket,
+                    &ServerMessage::Error {
+                        message: err.message(id),
+                    },
+                )
+                .await
+            {
+                return false;
+            }
+            true
+        }
+        ClientMessage::Resize { rows, cols } => {
+            debug!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                rows,
+                cols,
+                "WS resize received"
+            );
+            source.resize_sub.mark_sent(rows, cols);
+            match state
+                .store
+                .attach_resize(id, Some(source.attachment_id), rows, cols)
+                .await
+            {
+                Ok(()) => true,
+                Err(SessionError::NotController | SessionError::StaleAttachment) => {
+                    source.resize_sub.mark_sent(0, 0);
+                    true
+                }
+                Err(err) => {
                     let _ = send_server_message(
-                        &mut socket,
+                        socket,
                         &ServerMessage::Error {
-                            message: "session revoked (logout)".to_string(),
+                            message: err.message(id),
                         },
                     )
                     .await;
-                    return;
-                }
-            }
-
-            // Streaming frames from the node proxy.
-            frame = stream_rx.recv() => {
-                match frame {
-                    Some(Ok(resp)) => {
-                        match resp {
-                            RpcResponse::AttachStreamInit {
-                                data,
-                                scrollback,
-                                end_offset,
-                                running,
-                                app_cursor_keys,
-                                bracketed_paste_mode,
-                                mouse_report,
-                                sgr_mouse,
-                                focus_events,
-                                incarnation,
-                                attachment_id,
-                                role,
-                                ..
-                            } => {
-                                // Forward the node's scrollback seed the same
-                                // way local attaches get it (see
-                                // handle_ws_streaming).
-                                let data = seed_web_init_data(
-                                    (!scrollback.is_empty()).then_some(scrollback),
-                                    initial_rows,
-                                    data,
-                                );
-                                let replay_bytes = data.len();
-                                let msg = ServerMessage::Init {
-                                    data,
-                                    end_offset,
-                                    incarnation,
-                                    running,
-                                    modes: WsModes {
-                                        app_cursor_keys,
-                                        bracketed_paste_mode,
-                                        mouse_report,
-                                        sgr_mouse,
-                                        focus_events,
-                                    },
-                                    attachment_id,
-                                    role: if role == "controller" { "controller" } else { "observer" },
-                                };
-                                if !send_server_message(&mut socket, &msg).await {
-                                    break;
-                                }
-                                debug!(
-                                    session_id = %id,
-                                    node = %node,
-                                    snapshot_bytes = replay_bytes,
-                                    app_cursor_keys,
-                                    bracketed_paste_mode,
-                                    "proxied WebSocket init frame received"
-                                );
-                                init_sent = true;
-                                crate::metrics::observe(
-                                    "attach_init",
-                                    Some("proxied"),
-                                    init_start.elapsed(),
-                                );
-                                crate::metrics::count("attach_clients", Some("proxied"));
-                            }
-                            RpcResponse::AttachStreamChunk { offset, data } => {
-                                if !data.is_empty() {
-                                    trace!(session_id = %id, node = %node, bytes = data.len(), "forwarding proxied PTY output");
-                                    let msg = ServerMessage::Data {
-                                        offset,
-                                        data,
-                                    };
-                                    if !send_server_message(&mut socket, &msg).await {
-                                        break;
-                                    }
-                                }
-                            }
-                            RpcResponse::AttachControlChanged { role } => {
-                                debug!(session_id = %id, node = %node, %role, "proxied WebSocket control handoff");
-                                let _ = send_server_message(&mut socket, &ServerMessage::Control {
-                                    role: if role == "controller" { "controller" } else { "observer" },
-                                }).await;
-                            }
-                            RpcResponse::AttachModeChanged {
-                                app_cursor_keys,
-                                bracketed_paste_mode,
-                                mouse_report,
-                                sgr_mouse,
-                                focus_events,
-                            } => {
-                                debug!(
-                                    session_id = %id,
-                                    node = %node,
-                                    app_cursor_keys,
-                                    bracketed_paste_mode,
-                                    mouse_report,
-                                    sgr_mouse,
-                                    focus_events,
-                                    "proxied WebSocket terminal mode changed"
-                                );
-                                let _ = send_server_message(&mut socket, &ServerMessage::ModeChanged {
-                                    modes: WsModes {
-                                        app_cursor_keys,
-                                        bracketed_paste_mode,
-                                        mouse_report,
-                                        sgr_mouse,
-                                        focus_events,
-                                    },
-                                }).await;
-                            }
-                            RpcResponse::AttachResized { rows, cols } => {
-                                debug!(
-                                    session_id = %id,
-                                    node = %node,
-                                    rows, cols,
-                                    "proxied WebSocket resize notification received"
-                                );
-                                let _ = send_server_message(&mut socket, &ServerMessage::Resized {
-                                    rows,
-                                    cols,
-                                }).await;
-                            }
-                            RpcResponse::AttachStreamDone {
-                                exit_code,
-                                final_offset,
-                            } => {
-                                info!(session_id = %id, node = %node, ?exit_code, "proxied WebSocket stream ended");
-                                let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded { exit_code, final_offset }).await;
-                                break;
-                            }
-                            RpcResponse::Error { message } => {
-                                warn!(session_id = %id, node = %node, %message, "proxied WebSocket stream returned an error");
-                                let _ = send_server_message(&mut socket, &ServerMessage::Error { message }).await;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(Err(err)) => {
-                        warn!(session_id = %id, %err, "proxy stream error");
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
-                                    exit_code: None,
-                                    final_offset: 0,
-                                })
-                                .await;
-                        break;
-                    }
-                    None => {
-                        // Stream channel closed.
-                        let _ = send_server_message(&mut socket, &ServerMessage::SessionEnded {
-                                    exit_code: None,
-                                    final_offset: 0,
-                                })
-                                .await;
-                        break;
-                    }
-                }
-            }
-
-            // Client messages (input, resize, detach).
-            msg = socket.recv(), if init_sent => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Input { data, wait_for_change }) => {
-                                debug!(session_id = %id, node = %node, bytes = data.len(), "proxied WebSocket input received");
-                                let rpc = RpcRequest::AttachInput {
-                                    id: id.to_string(),
-                                    data: data.into_bytes(),
-                                    wait_for_change,
-                                    attachment_id: None,
-                                };
-                                if let Err(err) = state.node_registry
-                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
-                                    .await
-                                {
-                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket input");
-                                }
-                            }
-                            Ok(ClientMessage::Busy) => {
-                                trace!(session_id = %id, node = %node, "proxied WebSocket attach busy received");
-                                let rpc = RpcRequest::AttachBusy { id: id.to_string() };
-                                if let Err(err) = state.node_registry.proxy_rpc(&node, &rpc).await {
-                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket attach busy");
-                                }
-                            }
-                            Ok(ClientMessage::Resize { rows, cols }) => {
-                                debug!(session_id = %id, node = %node, rows, cols, "proxied WebSocket resize received");
-                                let rpc = RpcRequest::AttachResize {
-                                    id: id.to_string(),
-                                    rows,
-                                    cols,
-                                };
-                                if let Err(err) = state.node_registry
-                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
-                                    .await
-                                {
-                                    warn!(session_id = %id, node = %node, rows, cols, %err, "failed to proxy WebSocket resize");
-                                }
-                            }
-                            Ok(ClientMessage::AcquireControl) => {
-                                debug!(session_id = %id, node = %node, "proxied WebSocket control takeover requested");
-                                let rpc = RpcRequest::AttachAcquireControl { id: id.to_string() };
-                                if let Err(err) = state.node_registry
-                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
-                                    .await
-                                {
-                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket control takeover");
-                                }
-                            }
-                            Ok(ClientMessage::Ack { offset }) => {
-                                let rpc = RpcRequest::AttachAppliedCursor {
-                                    id: id.to_string(),
-                                    cursor: offset,
-                                };
-                                if let Err(err) = state.node_registry
-                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
-                                    .await
-                                {
-                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket applied-cursor credit");
-                                }
-                            }
-                            Ok(ClientMessage::Detach) => {
-                                debug!(session_id = %id, node = %node, "proxied WebSocket detach requested");
-                                let rpc = RpcRequest::AttachDetach { id: id.to_string() };
-                                if let Err(err) = state.node_registry
-                                    .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
-                                    .await
-                                {
-                                    warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket detach");
-                                }
-                                break;
-                            }
-                            Ok(ClientMessage::Ping) => {
-                                trace!(session_id = %id, node = %node, "proxied WebSocket ping received");
-                                let _ = send_server_message(&mut socket, &ServerMessage::Pong).await;
-                            }
-                            Err(err) => {
-                                warn!(session_id = %id, node = %node, %err, "failed to parse proxied WebSocket client message");
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => {
-                        debug!(session_id = %id, node = %node, "proxied WebSocket client disconnected");
-                        let rpc = RpcRequest::AttachDetach { id: id.to_string() };
-                        if let Err(err) = state.node_registry
-                            .proxy_rpc_stream_message(&node, &stream_rpc_id, &rpc)
-                            .await
-                        {
-                            warn!(session_id = %id, node = %node, %err, "failed to proxy WebSocket disconnect cleanup");
-                        }
-                        break;
-                    }
-                    _ => {}
+                    false
                 }
             }
         }
+        ClientMessage::AcquireControl => {
+            debug!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                attachment_id = source.attachment_id,
+                "WS control takeover requested"
+            );
+            if let Err(err) = state
+                .store
+                .attach_acquire_control(id, source.attachment_id)
+                .await
+            {
+                warn!(
+                    session_id = %id,
+                    attach_path = init_metrics_label,
+                    error = err.message(id),
+                    "control takeover failed"
+                );
+            }
+            true
+        }
+        ClientMessage::Ack { offset } => {
+            state
+                .store
+                .attach_report_applied(id, source.attachment_id, offset)
+                .await;
+            true
+        }
+        ClientMessage::Detach => {
+            debug!(
+                session_id = %id,
+                attach_path = init_metrics_label,
+                "WS client detached"
+            );
+            let _ = state.store.attach_detach(id, source.attachment_id).await;
+            false
+        }
+        ClientMessage::Ping => {
+            let _ = send_server_message(socket, &ServerMessage::Pong).await;
+            true
+        }
     }
-
-    // Clean up the pending entry so it doesn't linger if the secondary
-    // hasn't sent a done frame yet.
-    state
-        .node_registry
-        .remove_pending(&node, &stream_rpc_id)
-        .await;
-    debug!(session_id = %id, node = %node, "proxied WebSocket stream cleanup complete");
 }
 
-fn init_msg_data_len(msg: &ServerMessage) -> usize {
+#[allow(clippy::too_many_arguments)]
+async fn apply_client_message_relayed(
+    msg: ClientMessage,
+    state: &AppState,
+    id: &str,
+    node: &str,
+    source: &mut RelayedSource,
+    socket: &mut WebSocket,
+    init_metrics_label: &'static str,
+) -> bool {
     match msg {
-        ServerMessage::Init { data, .. } => data.len(),
-        _ => 0,
+        ClientMessage::Input {
+            data,
+            wait_for_change,
+        } => {
+            debug!(
+                session_id = %id,
+                node = %node,
+                attach_path = init_metrics_label,
+                bytes = data.len(),
+                "relayed WS input received"
+            );
+            let rpc = RpcRequest::AttachInput {
+                id: id.to_string(),
+                data: data.into_bytes(),
+                wait_for_change,
+                attachment_id: None,
+            };
+            if let Err(err) = state
+                .node_registry
+                .proxy_rpc_stream_message(node, &source.stream_rpc_id, &rpc)
+                .await
+            {
+                warn!(
+                    session_id = %id,
+                    node = %node,
+                    attach_path = init_metrics_label,
+                    %err,
+                    "failed to proxy WebSocket input"
+                );
+            }
+            true
+        }
+        ClientMessage::Busy => {
+            trace!(
+                session_id = %id,
+                node = %node,
+                attach_path = init_metrics_label,
+                "relayed WS busy received"
+            );
+            let rpc = RpcRequest::AttachBusy { id: id.to_string() };
+            if let Err(err) = state.node_registry.proxy_rpc(node, &rpc).await {
+                warn!(
+                    session_id = %id,
+                    node = %node,
+                    attach_path = init_metrics_label,
+                    %err,
+                    "failed to proxy WebSocket busy"
+                );
+            }
+            true
+        }
+        ClientMessage::Resize { rows, cols } => {
+            debug!(
+                session_id = %id,
+                node = %node,
+                attach_path = init_metrics_label,
+                rows,
+                cols,
+                "relayed WS resize received"
+            );
+            let rpc = RpcRequest::AttachResize {
+                id: id.to_string(),
+                rows,
+                cols,
+            };
+            if let Err(err) = state
+                .node_registry
+                .proxy_rpc_stream_message(node, &source.stream_rpc_id, &rpc)
+                .await
+            {
+                warn!(
+                    session_id = %id,
+                    node = %node,
+                    attach_path = init_metrics_label,
+                    %err,
+                    rows,
+                    cols,
+                    "failed to proxy WebSocket resize"
+                );
+            }
+            true
+        }
+        ClientMessage::AcquireControl => {
+            debug!(
+                session_id = %id,
+                node = %node,
+                attach_path = init_metrics_label,
+                "relayed WS control takeover requested"
+            );
+            let rpc = RpcRequest::AttachAcquireControl { id: id.to_string() };
+            if let Err(err) = state
+                .node_registry
+                .proxy_rpc_stream_message(node, &source.stream_rpc_id, &rpc)
+                .await
+            {
+                warn!(
+                    session_id = %id,
+                    node = %node,
+                    attach_path = init_metrics_label,
+                    %err,
+                    "failed to proxy WebSocket control takeover"
+                );
+            }
+            true
+        }
+        ClientMessage::Ack { offset } => {
+            let rpc = RpcRequest::AttachAppliedCursor {
+                id: id.to_string(),
+                cursor: offset,
+            };
+            if let Err(err) = state
+                .node_registry
+                .proxy_rpc_stream_message(node, &source.stream_rpc_id, &rpc)
+                .await
+            {
+                warn!(
+                    session_id = %id,
+                    node = %node,
+                    attach_path = init_metrics_label,
+                    %err,
+                    "failed to proxy WebSocket applied-cursor credit"
+                );
+            }
+            true
+        }
+        ClientMessage::Detach => {
+            debug!(
+                session_id = %id,
+                node = %node,
+                attach_path = init_metrics_label,
+                "relayed WS detach requested"
+            );
+            let rpc = RpcRequest::AttachDetach { id: id.to_string() };
+            if let Err(err) = state
+                .node_registry
+                .proxy_rpc_stream_message(node, &source.stream_rpc_id, &rpc)
+                .await
+            {
+                warn!(
+                    session_id = %id,
+                    node = %node,
+                    attach_path = init_metrics_label,
+                    %err,
+                    "failed to proxy WebSocket detach"
+                );
+            }
+            false
+        }
+        ClientMessage::Ping => {
+            let _ = send_server_message(socket, &ServerMessage::Pong).await;
+            true
+        }
     }
+}
+
+/// Bridge: the caller's preamble has already produced an `InitFrame` and
+/// sent it on the wire. This wrapper hides that detail so the dispatch in
+/// `handle_ws` reads naturally.
+async fn send_init_frame(
+    socket: &mut WebSocket,
+    init_frame: InitFrame,
+    tti_start: Instant,
+    id: &str,
+    init_metrics_label: &'static str,
+) -> bool {
+    let data_len = init_frame.data.len();
+    let init_msg = init_frame.into_message();
+    if !send_server_message(socket, &init_msg).await {
+        debug!(
+            session_id = %id,
+            attach_path = init_metrics_label,
+            "WebSocket closed before init frame could be sent"
+        );
+        return false;
+    }
+    crate::metrics::observe("attach_init", Some(init_metrics_label), tti_start.elapsed());
+    debug!(
+        session_id = %id,
+        attach_path = init_metrics_label,
+        snapshot_bytes = data_len,
+        "WebSocket stream initialized"
+    );
+    true
 }
 
 /// Merge a scrollback seed into the attach init payload the way the native
@@ -1045,7 +1077,11 @@ fn init_msg_data_len(msg: &ServerMessage) -> usize {
 /// first, then the screen snapshot. Requires a declared viewport — without
 /// the client's row count the scroll-off padding cannot be computed, so the
 /// snapshot goes out unseeded (same rule as the native attach).
-fn seed_web_init_data(seed: Option<Vec<u8>>, rows: Option<u16>, snapshot: Vec<u8>) -> Vec<u8> {
+pub(crate) fn seed_web_init_data(
+    seed: Option<Vec<u8>>,
+    rows: Option<u16>,
+    snapshot: Vec<u8>,
+) -> Vec<u8> {
     match (seed, rows) {
         (Some(seed), Some(rows)) if rows > 0 && !seed.is_empty() => {
             let mut data = crate::session::scrollback_seed_bytes(&seed, rows);

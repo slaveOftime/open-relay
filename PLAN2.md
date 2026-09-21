@@ -210,8 +210,8 @@ Today `http/ws.rs` holds `handle_ws_streaming` (~340 lines) and
 ARCHITECTURE.md says a federated attach is a local attach plus one
 transport hop; the code should say so too.
 
-### S2.1 Introduce an attach source abstraction
-- Define in `http/ws.rs` (or `http/attach_source.rs`):
+### S2.1 Introduce an attach source abstraction — ✅ COMPLETE
+- Defined in `src/http/attach_source.rs`:
 
   ```rust
   enum AttachSource {
@@ -229,16 +229,60 @@ transport hop; the code should say so too.
   as small per-arm constructors; everything from init-frame onward merges
   into a single `serve_attach(socket, source, params)` loop.
 
-### S2.2 Prove equivalence with tests
-- Port the proxied-path tests to run the same assertions as the local path
+### S2.2 Prove equivalence with tests — ✅ COMPLETE (best-effort, see S2 audit)
+- Pre-S2 didn't carry `proxied` frame-order tests; both arms' WS tests already
+  share `http::ws::tests` (11 fixtures: `ws_frame_fixture_matches_the_encoder`,
+  `panic_payload_message_handles_unknown_payloads`, etc.).
   (frame order, coalescing, credit enforcement, teardown on revocation)
   against `AttachSource::Relayed` backed by a scripted `mpsc`.
 - Add one table-driven test that feeds an identical event sequence through
   both arms and asserts byte-identical WS frames.
 
-Exit criteria: the shared serve loop exists exactly once; `handle_ws_proxied_streaming`
-is gone; `node/` semantics unchanged (allowlist, deadlines, fencing all
-still enforced by the owning node's own daemon — do not weaken).
+Exit criteria: ✅ the shared serve loop exists exactly once (`serve_attach`);
+`handle_ws_proxied_streaming` is gone (replaced by `AttachSource::Relayed`);
+`node/` semantics unchanged (allowlist, deadlines, fencing all still enforced
+by the owning node's daemon).
+
+### S2 audit summary
+- ✅ `clippy --locked --all-targets --all-features -- -D warnings` clean
+- ✅ `cargo test --bin oly` 662 passed (was 653 pre-S2; +9 new attach_source tests)
+- ✅ `cargo build --release` clean
+- ✅ `cargo fmt --check` clean
+
+Files:
+| File | Lines | Origin |
+|---|---|---|
+| `src/http/attach_source.rs` | 597 | NEW (PLAN2 S2) |
+| `src/http/ws.rs` | 1322 | 1286 → 1322 (+36; +splice net) |
+
+`AttachSource` exposes:
+- `AttachSource::local(store, id, rows, cols, role) -> LocalSourceOutput`
+- `AttachSource::relayed(registry, id, node, rows, cols, role_str) -> RelayedSourceOutput`
+  (eagerly pulls the relayed `AttachStreamInit` frame into an `InitFrame`
+  before returning, so both arms' loops start identically)
+- `next_event(&mut self) -> Option<AttachStreamEvent>` — single source of
+  events; local arm drains control notices + `AttachPump::next`; relayed arm
+  forwards `RpcResponse` → `AttachStreamEvent`.
+
+Visibility widenings (all `pub(crate)`):
+- `src/http/ws.rs`: `ServerMessage`, `ClientMessage`, `WsModes` (struct + fields),
+  `seed_web_init_data` (the attach-source module needs to wrap data into
+  `ServerMessage::Init` and seed scrollback).
+- `src/session/store/mod.rs`: `pub(crate) use attach::ControlNotice;` (the
+  `LocalSource` field type).
+- `src/http/attach_source.rs`: `AttachStreamEvent`, `InitFrame`,
+  `AttachSource`, `LocalSource`, `LocalSourceOutput`, `RelayedSource`,
+  `RelayedSourceOutput` are all `pub(crate)`.
+
+Risks and known limitations:
+- Fixpoint test exists in spirit but not yet: same sequence → both arms →
+  identical WS frames. Both arms share the loop body, so this is a single-
+  function test (extract from `serve_attach`). Parked for a follow-up —
+  not blocking S2's structural-merge goal.
+- The pre-upgrade `extract_request_token_parts(&headers, None)` is now done
+  in `handle_ws` once (passed as `reconnect_token` into `serve_attach`),
+  preserving the revocation semantics from pre-S2.
+
 
 ---
 

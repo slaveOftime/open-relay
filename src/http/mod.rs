@@ -1,4 +1,5 @@
 mod apps;
+mod attach_source;
 pub mod auth;
 pub mod nodes;
 mod reverse_proxy;

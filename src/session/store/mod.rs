@@ -7,6 +7,8 @@
 mod attach;
 mod lifecycle;
 
+#[allow(unused_imports)] // re-exported for sibling module AttachSource
+pub(crate) use attach::ControlNotice;
 pub(crate) use attach::scrollback_seed_bytes;
 mod notify;
 pub mod pump;
