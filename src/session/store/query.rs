@@ -21,12 +21,21 @@ use super::SessionStore;
 
 impl SessionStore {
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
-        let mut sessions = self.db.list_summaries(query).await?;
+        // PERF: the journal-derived byte offset is deliberately not fetched
+        // in SQL. A live session's whole summary comes from its runtime
+        // handle (O(1) counters); only rows without a live handle consult
+        // the persisted stream, through the per-incarnation cache in
+        // `persisted_filtered_len`. Decoding journals inline per row made
+        // every list operation O(total journal bytes) — the source of the
+        // "oly ls is mysteriously slow" reports (see PERFORMANCE.md).
+        let mut sessions = self.db.list_summaries_without_offsets(query).await?;
 
         let live_sessions = self.sessions.load();
         for session in &mut sessions {
             if let Some(handle) = live_sessions.get(&session.id) {
                 *session = handle.read().to_summary();
+            } else if let Some(len) = self.persisted_filtered_len(&session.id).await {
+                session.last_total_bytes = len;
             }
         }
 

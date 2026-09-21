@@ -228,6 +228,25 @@ impl Database {
 
     /// List all sessions as `SessionSummary` DTOs, applying the `ListQuery` filter.
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
+        self.list_summaries_inner(query, true).await
+    }
+
+    /// [`list_summaries`](Self::list_summaries) without the journal-derived
+    /// `total_bytes` (left at 0). Computing it decodes the session's whole
+    /// journal, so [`SessionStore::list_summaries`] fills it only for rows
+    /// that no live handle covers — never inline for every row.
+    pub async fn list_summaries_without_offsets(
+        &self,
+        query: &ListQuery,
+    ) -> Result<Vec<SessionSummary>> {
+        self.list_summaries_inner(query, false).await
+    }
+
+    async fn list_summaries_inner(
+        &self,
+        query: &ListQuery,
+        with_offsets: bool,
+    ) -> Result<Vec<SessionSummary>> {
         let limit = query.limit.max(1) as i64;
         let offset = query.offset as i64;
 
@@ -260,7 +279,11 @@ impl Database {
             .iter()
             .map(|r| {
                 let row = row_to_meta(r);
-                let total_bytes = self.session_output_offset(&row.id);
+                let total_bytes = if with_offsets {
+                    self.session_output_offset(&row.id)
+                } else {
+                    0
+                };
                 meta_to_summary(&row, false, total_bytes)
             })
             .collect();

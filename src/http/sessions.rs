@@ -410,17 +410,11 @@ pub async fn get_session(
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
             // M3-1c: journal-backed sessions report the derived filtered
-            // stream length; pre-0.5 sessions report 0 (M6-2).
-            let session_dir = state.config.get().sessions_dir.join(&id);
-            // M6-2: pre-0.5 sessions (no journal) report 0.
-            let total_bytes = if session_dir
-                .join(crate::session::journal::JOURNAL_DIR_NAME)
-                .is_dir()
-            {
-                crate::session::replay::filtered_stream_len(&session_dir).unwrap_or(0)
-            } else {
-                0
-            };
+            // stream length; pre-0.5 sessions report 0 (M6-2). The store
+            // answers live sessions from O(1) runtime counters and caches
+            // the per-incarnation journal decode for persisted ones, so
+            // this stays off the O(journal) path.
+            let total_bytes = state.store.attach_filtered_len(&id).await.unwrap_or(0);
             Json(meta_to_summary(&meta, false, total_bytes)).into_response()
         }
         Ok(None) => {

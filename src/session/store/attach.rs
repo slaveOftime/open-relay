@@ -246,7 +246,7 @@ impl SessionStore {
     /// is O(journal), so results are cached per incarnation: a completed
     /// session's stream never changes within one incarnation, and polling
     /// callers (`logs --after`) must not re-scan the whole journal every tick.
-    async fn persisted_filtered_len(&self, id: &str) -> Option<u64> {
+    pub(super) async fn persisted_filtered_len(&self, id: &str) -> Option<u64> {
         let dir = self.persisted_session_dir(id).await?;
         if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
             let incarnation = journal::list_incarnations(&dir.join(journal::JOURNAL_DIR_NAME))
