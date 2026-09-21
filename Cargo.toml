@@ -47,7 +47,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2"
 uuid = { version = "1.26", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde", "clock"] }
-dirs = "6.0"
+dirs = "7.0"
 thiserror = "2.0"
 crossterm = "0.29"
 ratatui = "0.30"
@@ -76,7 +76,7 @@ base64 = "0.23"
 argon2 = "0.6"
 rpassword = "7.5"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
-ssh-key = "0.7.0-rc.11"
+ssh-key = "0.6"
 bytes = "1"
 arc-swap = "1.9.2"
 parking_lot = "0.12"
