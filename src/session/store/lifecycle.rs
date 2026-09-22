@@ -102,6 +102,7 @@ impl SessionStore {
         // we unwrap the mutex once the join completes.
         let screen_scrollback_rows = config.limits.screen_scrollback_rows;
         let meta = Arc::new(parking_lot::Mutex::new(meta));
+        let journal_byte_cap = store_handle.journal_byte_cap();
         let runtime = match tokio::task::spawn_blocking({
             let meta = Arc::clone(&meta);
             let event_tx = store_handle.event_tx.clone();
@@ -114,6 +115,7 @@ impl SessionStore {
                     cols,
                     notifications_enabled,
                     screen_scrollback_rows,
+                    journal_byte_cap,
                     event_tx,
                 )
             }
@@ -763,7 +765,7 @@ mod tests {
         }
 
         let db = make_test_db().await;
-        let store = SessionStore::new(1, db);
+        let store = SessionStore::with_journal_byte_cap(1, 0, db);
         let handle = Arc::new(SessionHandle::new(rt));
         store.sessions.rcu(|current| {
             let mut next = (**current).clone();
@@ -901,7 +903,11 @@ mod tests {
 
     #[tokio::test]
     async fn restart_rejects_missing_source() {
-        let store = Arc::new(SessionStore::new(900, make_test_db().await));
+        let store = Arc::new(SessionStore::with_journal_byte_cap(
+            900,
+            0,
+            make_test_db().await,
+        ));
         let err = SessionStore::restart_session_via_handle(
             &store,
             &make_test_config(2),
@@ -917,7 +923,7 @@ mod tests {
     async fn test_prepare_start_session_reserves_capacity_until_abort() {
         let config = make_test_config(1);
         let db = make_test_db().await;
-        let store = SessionStore::new(900, db.clone());
+        let store = SessionStore::with_journal_byte_cap(900, 0, db.clone());
         let spec = StartSpec {
             title: None,
             tags: vec![],

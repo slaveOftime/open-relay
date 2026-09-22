@@ -725,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_input_not_found_for_unknown_session() {
-        let store = SessionStore::new(900, make_test_db().await);
+        let store = SessionStore::with_journal_byte_cap(900, 0, make_test_db().await);
         let result = store.attach_input("no_such_id", None, b"data", true).await;
         assert!(
             result.is_err(),
@@ -1296,7 +1296,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_fallback_preserves_unknown_session_errors() {
-        let store = SessionStore::new(900, make_test_db().await);
+        let store = SessionStore::with_journal_byte_cap(900, 0, make_test_db().await);
         assert!(matches!(
             store.attach_stream_status("nope000").await,
             Err(SessionError::NotRunning)

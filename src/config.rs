@@ -123,6 +123,23 @@ pub struct LimitsConfig {
     pub screen_scrollback_rows: usize,
     pub silence_seconds: u64,
     pub stop_grace_seconds: u64,
+    /// PLAN2 §P2.5: byte-budget cap on a session's persisted journal.
+    /// 0 means unlimited (the historical behaviour). When non-zero, the
+    /// daemon's checkpoint-gated retention will delete the oldest sealed
+    /// journal incarnations so the surviving bytes never exceed this cap;
+    /// the live incarnation and the latest checkpoint-bearing incarnation
+    /// are never touched, so live cursors stay valid and the next
+    /// reattach can still replay from the latest checkpoint.
+    pub max_journal_bytes_per_session: u64,
+    /// PLAN2 §P2.6: wall-clock retention for **stopped** sessions, in
+    /// days. The daemon's periodic sweeper deletes the journal directory
+    /// **and** the database row for any session whose `ended_at` is
+    /// older than this cap and whose status is no longer running.
+    /// 0 means disabled (the historical behaviour: stopped-session
+    /// metadata lives forever; the operator decides what to keep).
+    /// Running sessions are NEVER auto-deleted by this knob — wall-clock
+    /// termination of running work is orthogonal and a separate setting.
+    pub journal_retention_days: u32,
 }
 
 /// VAPID keys + optional proxy for browser push subscriptions. Hot-reloadable
@@ -156,6 +173,8 @@ impl_config_diff!(LimitsConfig {
     screen_scrollback_rows,
     silence_seconds,
     stop_grace_seconds,
+    max_journal_bytes_per_session,
+    journal_retention_days,
 });
 impl_config_diff!(WebPushConfig {
     subject,
@@ -274,6 +293,21 @@ struct LimitsOverrides {
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
     screen_scrollback_rows: Option<usize>,
+    /// PLAN2 §P2.5: defaults to 0 (unlimited) to preserve the
+    /// pre-P2.5 behaviour exactly. `max_journal_bytes_per_session` is
+    /// the canonical key; the legacy `max_output_log_bytes` (0.3.x) is
+    /// re-mapped to it for migration ergonomics — see MIGRATION.md.
+    max_journal_bytes_per_session: Option<u64>,
+    /// Legacy alias for [`LimitsOverrides::max_journal_bytes_per_session`]:
+    /// the 0.3.x cap on `output.log` size. The 0.x sweep that truncated
+    /// `output.log` mid-stream was retired (M3-1c2 / PLAN I3), but the
+    /// number is morally the same one, so we accept it and apply it as
+    /// the new journal cap. Same semantics: 0 = unlimited.
+    #[serde(default, alias = "max_output_log_bytes")]
+    max_journal_bytes_per_session_legacy: Option<u64>,
+    /// PLAN2 §P2.6: wall-clock retention for stopped sessions. 0 =
+    /// disabled (keep everything, pre-P2.6 behaviour).
+    journal_retention_days: Option<u32>,
 }
 
 impl AppConfig {
@@ -336,6 +370,12 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_SCREEN_SCROLLBACK_ROWS),
             silence_seconds: overrides.limits.silence_seconds.unwrap_or(10).max(1),
             stop_grace_seconds: overrides.limits.stop_grace_seconds.unwrap_or(5).max(1),
+            max_journal_bytes_per_session: overrides
+                .limits
+                .max_journal_bytes_per_session
+                .or(overrides.limits.max_journal_bytes_per_session_legacy)
+                .unwrap_or(0),
+            journal_retention_days: overrides.limits.journal_retention_days.unwrap_or(0),
         };
         let web_push = WebPushConfig {
             subject: overrides
@@ -614,6 +654,8 @@ mod tests {
                 screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
+                max_journal_bytes_per_session: 0,
+                journal_retention_days: 0,
             },
             web_push: super::WebPushConfig {
                 subject: None,

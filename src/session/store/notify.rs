@@ -733,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_notified_on_unknown_id_is_noop() {
-        let store = SessionStore::new(900, make_test_db().await);
+        let store = SessionStore::with_journal_byte_cap(900, 0, make_test_db().await);
         // Should not panic.
         let now = Instant::now();
         store.mark_notified("does_not_exist", now, now);
@@ -777,7 +777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_notifications_enabled_unknown_id_returns_error() {
-        let store = SessionStore::new(900, make_test_db().await);
+        let store = SessionStore::with_journal_byte_cap(900, 0, make_test_db().await);
         let result = store.set_notifications_enabled("missing", false).await;
         assert!(matches!(result, Err(SessionError::NotRunning)));
     }

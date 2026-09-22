@@ -497,6 +497,10 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         attach_count: 0,
         foreground_color: meta.foreground_color.clone(),
         background_color: meta.background_color.clone(),
+        journal_bytes_retained: None,
+        journal_retention_sweeps: None,
+        journal_incarnations_dropped: None,
+        journal_byte_cap: None,
     }
 }
 

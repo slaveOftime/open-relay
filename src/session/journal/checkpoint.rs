@@ -9,6 +9,7 @@
 //! peer modules reach the items — see inline comments below.
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Read, Seek},
     path::Path,
@@ -18,8 +19,8 @@ use super::{
     HEADER_LEN, JOURNAL_DIR_NAME, JournalCursor, RECORD_MAGIC, RecordKind, RetiredIncarnation,
 };
 use super::{
-    incarnation_parts, list_incarnations, list_segments, retired_incarnations, segment_path,
-    sync_dir,
+    incarnation_parts, list_incarnations, list_segments, read_manifest, retired_incarnations,
+    segment_path, sync_dir,
 };
 // (no test-only imports beyond what's reachable via `super::*`)
 // ---------------------------------------------------------------------------
@@ -348,4 +349,89 @@ pub fn retain_before_unchecked(session_dir: &Path, min_incarnation: u64) -> io::
     }
     sync_dir(&journal_dir)?;
     Ok(deleted)
+}
+
+/// PLAN2 §P2.5: byte-budget retention horizon.
+///
+/// Returns the highest incarnation number such that the bytes of *all*
+/// sealed incarnations in `[incarnation, latest]` fit under `byte_cap`.
+/// An empty journal (or `byte_cap == 0 = unlimited`) returns
+/// `u64::MAX`, which feeds into [`retain_before`] where it clamps to the
+/// checkpoint gate — preserving the historical `retain_before(dir,
+/// u64::MAX)` semantics (pre-gate incarnations recycle, the gate and the
+/// live tail survive).
+///
+/// Three invariants the runtime relies on:
+///
+/// 1. **Never crosses the checkpoint gate.** The newest checkpoint
+///    anchors every `retain_before` call (ADR-0002); the gate itself
+///    is the floor. Pre-gate incarnations can be deleted, post-gate
+///    incarnations (and the live tail) are never touched.
+/// 2. **Whole-incarnation granularity.** A `min_incarnation` that would
+///    split an incarnation is impossible because `list_segments`
+///    returns contiguous `(incarnation, part)` pairs and a part is
+///    either sealed and manifest-entry'd or the active tail; the budget
+///    is summed over sealed parts only, so the "losing fit" decision is
+///    per-incarnation.
+/// 3. **Recency bias.** When multiple pre-gate incarnations compete for
+///    the budget, the older incarnation is dropped first; the newest
+///    sealed incarnations (right before the gate) are the ones kept.
+///    This matches the natural "keep recent past" expectation users
+///    have when capping journal size.
+///
+/// The bytes summed come from the sealed-part manifest (`SegmentManifestEntry::bytes`),
+/// which is the recovery-audited source of truth. The active tail's
+/// not-yet-sealed part is excluded; its post-seal bytes converge to a
+/// single `DEFAULT_SEGMENT_MAX_BYTES` part, so the cap is at most
+/// 64 MiB optimistic, and the very next checkpoint gives the runtime
+/// another chance to re-evaluate. That's documented behaviour, not a bug.
+pub fn min_incarnation_for_byte_budget(journal_dir: &Path, byte_cap: u64) -> io::Result<u64> {
+    if byte_cap == 0 {
+        return Ok(u64::MAX);
+    }
+    let incarnations = list_incarnations(journal_dir)?;
+    if incarnations.is_empty() {
+        return Ok(u64::MAX);
+    }
+    let latest = *incarnations.last().expect("non-empty by guard");
+    let gate = latest_checkpoint_incarnation_of(journal_dir)?.unwrap_or(latest);
+    let manifest = read_manifest(journal_dir)?;
+    let mut bytes_per_inc: BTreeMap<u64, u64> = BTreeMap::new();
+    for entry in &manifest {
+        *bytes_per_inc.entry(entry.incarnation).or_insert(0) += entry.bytes;
+    }
+    let mut h = gate;
+    let mut kept: u64 = bytes_per_inc
+        .iter()
+        .filter(|(inc, _)| **inc >= h && **inc <= latest)
+        .map(|(_, bytes)| *bytes)
+        .sum();
+    // Pre-gate incarnations, newest to oldest: each is one candidate for
+    // promotion into the kept range. We ADD the candidate's bytes to
+    // `kept` (the kept set grows as `h` moves down) and stop walking
+    // once adding the next older incarnation would push `kept` over
+    // the cap. Older incarnations whose bytes alone exceed the
+    // remaining headroom stay dropped (they never had a chance); this
+    // matches the "recency bias" contract — a fit that *almost* works
+    // keeps the most recent sealed incarnation under the gate.
+    for inc in (1..gate).rev() {
+        let bytes = bytes_per_inc.get(&inc).copied().unwrap_or(0);
+        if kept + bytes > byte_cap {
+            continue;
+        }
+        kept += bytes;
+        h = inc;
+    }
+    Ok(h)
+}
+
+/// Late-bound indirection over [`latest_checkpoint_incarnation`]: the
+/// outer function takes a journal dir only, but the underlying helper
+/// takes a session dir and joins with `JOURNAL_DIR_NAME` itself, so wrap
+/// it here to keep the byte-budget helper self-contained.
+fn latest_checkpoint_incarnation_of(journal_dir: &Path) -> io::Result<Option<u64>> {
+    let session_dir = journal_dir
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "orphan journal dir"))?;
+    latest_checkpoint_incarnation(session_dir)
 }

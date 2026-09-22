@@ -127,6 +127,8 @@ pub(crate) fn make_runtime(
         journal: None,
         journal_failed: std::sync::atomic::AtomicBool::new(false),
         notifications_enabled: true,
+        journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        retention: super::super::runtime::RetentionHandle::new(),
     }))
 }
 
@@ -173,7 +175,7 @@ pub(crate) fn store_with(
     runtimes: Vec<Arc<RwLock<super::super::runtime::SessionRuntime>>>,
     db: Arc<Database>,
 ) -> SessionStore {
-    let store = SessionStore::new(900, db);
+    let store = SessionStore::with_journal_byte_cap(900, 0, db);
     for rt in runtimes {
         let id = rt.read().meta.id.clone();
         let handle = Arc::new(SessionHandle::new(rt));
@@ -275,6 +277,8 @@ pub(crate) fn make_runtime_writable_with_capacity(
         journal: None,
         journal_failed: std::sync::atomic::AtomicBool::new(false),
         notifications_enabled: true,
+        journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        retention: super::super::runtime::RetentionHandle::new(),
     }));
     (rt, writer_rx)
 }
@@ -305,6 +309,8 @@ pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             silence_seconds: 10,
             stop_grace_seconds: 5,
+            max_journal_bytes_per_session: 0,
+            journal_retention_days: 0,
         },
         web_push: crate::config::WebPushConfig {
             subject: None,

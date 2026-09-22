@@ -91,7 +91,8 @@ pub(crate) use stream::{read_history, read_range, read_tail};
 // Checkpoints (RecordKind::CheckpointRef) + retention (PLAN2 S1.6 step 2).
 pub(crate) mod checkpoint;
 pub(crate) use checkpoint::{
-    Checkpoint, CheckpointAnchor, checkpoint_anchors, encode_checkpoint, retain_before,
+    Checkpoint, CheckpointAnchor, checkpoint_anchors, encode_checkpoint,
+    min_incarnation_for_byte_budget, retain_before,
 };
 // `CHECKPOINT_MAGIC` is reached via `use super::*` inside `mod tests` only — gate the re-export.
 #[allow(unused_imports)]
@@ -1376,6 +1377,191 @@ mod tests {
         assert_eq!(
             list_incarnations(&dir.join(JOURNAL_DIR_NAME)).unwrap(),
             vec![1, 2]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN2 §P2.5: byte-budget retention computes the highest
+    /// `min_incarnation` such that the surviving sealed bytes fit under
+    /// the cap. It honours three invariants:
+    ///
+    /// - never crosses the checkpoint gate (live + checkpoint-bearing
+    ///   incarnations stay),
+    /// - whole-incarnation granularity (either keep or drop such that
+    ///   total ≤ cap),
+    /// - recency bias (older incarnations are the ones dropped first).
+    #[test]
+    fn min_incarnation_for_byte_budget_never_falls_below_the_gate_and_drops_oldest_first() {
+        let dir = test_session_dir("retention_byte_budget");
+        let journal_dir = dir.join(JOURNAL_DIR_NAME);
+
+        // Three incarnations, each with exactly one sealed part of
+        // 1000 bytes — distinguishable incs let us assert ordered
+        // deletion. Each incarnation is sealed by closing the runtime
+        // and reopening; the second opens with a checkpoint so the gate
+        // advances to incarnation 2.
+        let (mut producer, _, _) = ShadowJournal::open(&dir).unwrap();
+        producer
+            .record_output(bytes::Bytes::from(vec![b'a'; 1000]))
+            .unwrap();
+        producer.shutdown();
+
+        let (mut inc2, _, _) = ShadowJournal::open(&dir).unwrap();
+        inc2.record_checkpoint(&test_checkpoint(b"first")).unwrap();
+        inc2.record_output(bytes::Bytes::from(vec![b'b'; 1000]))
+            .unwrap();
+        // Drain the checkpoint payload before shutdown so it's part of
+        // the sealed manifest, not just the in-memory queue.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            inc2.request_sync();
+            inc2.poll_acks();
+            if inc2.core.durable_seq() >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        inc2.shutdown();
+
+        let (mut inc3, _, _) = ShadowJournal::open(&dir).unwrap();
+        inc3.record_checkpoint(&test_checkpoint(b"second")).unwrap();
+        inc3.record_output(bytes::Bytes::from(vec![b'c'; 1000]))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            inc3.request_sync();
+            inc3.poll_acks();
+            if inc3.core.durable_seq() >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        inc3.shutdown();
+
+        // Sanity-check the manifest shape we just built. Total bytes
+        // per incarnation exceed the raw payload because each journal
+        // record carries a header (magic, kind, incarnation, seq,
+        // elapsed_ms, payload_len) + a CRC-32 trailer — read the actual
+        // values out of the manifest and use them in the cap arithmetic
+        // below, so the test does not depend on the codec's exact
+        // overhead.
+        let bytes_per_inc: std::collections::HashMap<u64, u64> = {
+            let mut map = std::collections::HashMap::new();
+            for entry in read_manifest(&journal_dir).unwrap() {
+                *map.entry(entry.incarnation).or_insert(0u64) += entry.bytes;
+            }
+            map
+        };
+        let b1 = *bytes_per_inc.get(&1).expect("inc 1 sealed");
+        let b2 = *bytes_per_inc.get(&2).expect("inc 2 sealed");
+        let b3 = *bytes_per_inc.get(&3).expect("inc 3 sealed");
+        assert!(
+            b1 > 1000 && b2 > 1000 && b3 > 1000,
+            "all three incs carry > 1000 bytes (header + payload): {b1}/{b2}/{b3}"
+        );
+
+        // Cap = 0 means disabled: horizon is u64::MAX (delete nothing).
+        assert_eq!(
+            min_incarnation_for_byte_budget(&journal_dir, 0).unwrap(),
+            u64::MAX
+        );
+
+        // Cap ≥ total bytes: keep everything, horizon lands at 1.
+        // (Once b1 + b2 + b3 fits, every iteration step adds the next
+        // pre-gate incarnation to the kept set.)
+        let gate = latest_checkpoint_incarnation(&dir).unwrap().unwrap();
+        assert_eq!(gate, 3, "checkpoint-bearing incarnation");
+        let total = b1 + b2 + b3;
+        assert_eq!(
+            min_incarnation_for_byte_budget(&journal_dir, total).unwrap(),
+            1,
+            "with enough budget, every incarnation is kept"
+        );
+        assert_eq!(
+            min_incarnation_for_byte_budget(&journal_dir, total + 1).unwrap(),
+            1,
+            "extra headroom must not push the horizon past 1"
+        );
+
+        // Drop one incarnation: pick a cap between (b3) and (b2 + b3).
+        // That keeps [inc 2, inc 3] = b2 + b3 bytes ≤ cap, but adding
+        // inc 1 would push us over.
+        assert!(
+            b3 < b2 + b3,
+            "inc 2 must contribute bytes (different payload from gate)"
+        );
+        assert_eq!(
+            min_incarnation_for_byte_budget(&journal_dir, b2 + b3).unwrap(),
+            2,
+            "drop only inc 1; keep [inc 2, inc 3] at exactly the cap"
+        );
+
+        // Drop two incarnations: pick a cap that fits inc 3 alone but
+        // not inc 3 plus inc 2. With inc 2 = b2 and the gate at inc 3,
+        // cap = b3 → kept + b2 > cap so inc 2 stays dropped, and
+        // adding any older inc only grows the rejected set.
+        assert!(
+            b2 > 0 && b3 > 0,
+            "helper needs positive sealed bytes to arithmetic against"
+        );
+        assert_eq!(
+            min_incarnation_for_byte_budget(&journal_dir, b3).unwrap(),
+            3,
+            "drop inc 1 + inc 2; keep [inc 3] only"
+        );
+
+        // Cap = 1: nothing fits; horizon lands at the gate (3) because
+        // the gate invariant always wins. This is what users see when
+        // they pick an absurdly small cap by mistake.
+        assert_eq!(min_incarnation_for_byte_budget(&journal_dir, 1).unwrap(), 3);
+
+        // End-to-end smoke: drive the helper into the retention call
+        // and verify the surviving incarnations.
+        let horizon = min_incarnation_for_byte_budget(&journal_dir, b3).unwrap();
+        let deleted = retain_before(&dir, horizon).unwrap();
+        assert_eq!(deleted, vec![1, 2], "inc 1 and inc 2 must be deleted");
+        let mut survivors = list_incarnations(&journal_dir).unwrap();
+        survivors.sort();
+        assert_eq!(survivors, vec![3]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PLAN2 §P2.5: when no checkpoint has ever been emitted
+    /// (`latest_checkpoint_incarnation == None`), the byte-budget
+    /// horizon must default to the latest incarnation, matching the
+    /// gate semantics used by [`retain_before`].
+    #[test]
+    fn min_incarnation_for_byte_budget_without_a_checkpoint_uses_latest_as_gate() {
+        let dir = test_session_dir("retention_byte_budget_no_gate");
+        let journal_dir = dir.join(JOURNAL_DIR_NAME);
+
+        // Two incarnations, no checkpoints anywhere — like a session
+        // whose first checkpoint cycle has not fired yet.
+        let (mut producer, _, _) = ShadowJournal::open(&dir).unwrap();
+        producer
+            .record_output(bytes::Bytes::from(vec![b'x'; 500]))
+            .unwrap();
+        producer.shutdown();
+
+        let (mut inc2, _, _) = ShadowJournal::open(&dir).unwrap();
+        inc2.record_output(bytes::Bytes::from(vec![b'y'; 500]))
+            .unwrap();
+        inc2.shutdown();
+
+        assert!(
+            latest_checkpoint_incarnation(&dir).unwrap().is_none(),
+            "this fixture deliberately has no checkpoint"
+        );
+
+        // With the gate defaulting to the latest incarnation (2), no
+        // pre-gate incarnation exists, so the horizon is 2 (the gate).
+        assert_eq!(
+            min_incarnation_for_byte_budget(&journal_dir, 100).unwrap(),
+            2
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -916,6 +916,32 @@ pub struct SessionSummary {
     /// spec).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_color: Option<String>,
+    /// PLAN2 §P2.5: bytes currently retained on disk for this session's
+    /// journal (sealed parts only). `None` for runtimes that never went
+    /// through a checkpointed retention sweep yet (sessions in their
+    /// pre-P2.5 lifetime). Lets the UI distinguish "cap is happily off"
+    /// from "cap is firing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_bytes_retained: Option<u64>,
+    /// PLAN2 §P2.5: cumulative count of journal retention sweeps run for
+    /// this session. Increments on every checkpoint (≈ 32 MiB of
+    /// filtered output). 0 means the session is pre-P2.5 / no sweeps
+    /// have occurred yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_retention_sweeps: Option<u64>,
+    /// PLAN2 §P2.5: cumulative count of sealed incarnations dropped from
+    /// this session's journal across all retention sweeps. Sums over
+    /// retention cycles; does not need to be ≤ `journal_retention_sweeps`
+    /// because pre-checkpoint-bound bursts may drop several at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_incarnations_dropped: Option<u64>,
+    /// PLAN2 §P2.5: snapshot of the cap currently in effect (0 = unlimited).
+    /// Mirrors `LimitsConfig::max_journal_bytes_per_session`, atomic-loaded
+    /// from the shared `Arc<AtomicU64>` inside the runtime; useful so the
+    /// UI can show "capped at X MiB" without reaching back to the config
+    /// (and crucially without holding a read lock on the whole runtime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_byte_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

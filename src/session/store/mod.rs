@@ -95,6 +95,11 @@ pub struct SessionStore {
     /// TTL for evicting completed sessions, in seconds. Atomic so the
     /// daemon's config hot-reload can adjust it without a restart.
     pub(super) eviction_ttl_secs: std::sync::atomic::AtomicU64,
+    /// PLAN2 §P2.5: byte-budget cap on a session's persisted journal,
+    /// shared with `SessionRuntime` so every retention sweep across the
+    /// process sees the same value (0 = unlimited). Updated on the
+    /// daemon's config hot-reload pass.
+    pub(super) journal_byte_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(super) db: Arc<Database>,
     pub(super) event_tx: SessionEventTx,
 }
@@ -121,7 +126,11 @@ pub(super) struct PreparedStart {
 }
 
 impl SessionStore {
-    pub fn new(eviction_seconds: u64, db: Arc<Database>) -> Self {
+    pub fn with_journal_byte_cap(
+        eviction_seconds: u64,
+        journal_byte_cap: u64,
+        db: Arc<Database>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(100);
         Self {
             sessions: ArcSwap::from_pointee(HashMap::new()),
@@ -131,6 +140,9 @@ impl SessionStore {
                 persisted_stream_len_cache: HashMap::new(),
             }),
             eviction_ttl_secs: std::sync::atomic::AtomicU64::new(eviction_seconds.max(1)),
+            journal_byte_cap: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                journal_byte_cap,
+            )),
             db,
             event_tx,
         }
@@ -148,6 +160,23 @@ impl SessionStore {
     pub fn set_eviction_seconds(&self, seconds: u64) {
         self.eviction_ttl_secs
             .store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// PLAN2 §P2.5: handle to the shared journal byte cap so a retention
+    /// sweep scheduled by one session can read it through the runtime's
+    /// `Arc` clone. The handle stays valid for the daemon's lifetime
+    /// (the `SessionStore` itself is `Arc`-shared, so this is just a
+    /// borrow-of-`Arc` from `Arc::clone`).
+    pub(super) fn journal_byte_cap(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.journal_byte_cap)
+    }
+
+    /// Hot-update the journal byte cap after a config reload. The new
+    /// value takes effect on the next retention sweep (every checkpoint,
+    /// ~32 MiB of filtered output) for every live session simultaneously.
+    pub fn set_journal_byte_cap(&self, bytes: u64) {
+        self.journal_byte_cap
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn event_tx(&self) -> SessionEventTx {

@@ -6,8 +6,8 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    io::{ErrorKind, Read, Write},
-    path::PathBuf,
+    io::{self, ErrorKind, Read, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -115,6 +115,63 @@ pub struct SequencedChunk {
 /// so a checkpoint is taken roughly every other journal part.
 pub(crate) const JOURNAL_CHECKPOINT_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
+/// PLAN2 §P2.5: the runtime's lock-free publication of the last
+/// retention sweep's outcome. The retention thread runs after every
+/// journal checkpoint; the runtime summary mirrors the bytes it kept and
+/// the sealing-pass count so users can see whether the cap is actually
+/// firing. The values are atomic-monotonic except `bytes_retained`,
+/// which an external observer can read at use time to draw the live
+/// picture on the session list.
+#[derive(Debug)]
+struct RetentionStats {
+    bytes_retained: std::sync::atomic::AtomicU64,
+    sweep_count: std::sync::atomic::AtomicU64,
+    deleted_incarnations_total: std::sync::atomic::AtomicU64,
+}
+
+impl Default for RetentionStats {
+    fn default() -> Self {
+        Self {
+            bytes_retained: std::sync::atomic::AtomicU64::new(0),
+            sweep_count: std::sync::atomic::AtomicU64::new(0),
+            deleted_incarnations_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// PLAN2 §P2.5: holder type for the retention stats + the shared byte
+/// cap. Both ends of the runtime's lifetime share these atomics (the
+/// `Arc` clone into the retention thread lets the daemon hot-reload the
+/// cap without touching every session in place).
+#[derive(Debug, Default, Clone)]
+pub struct RetentionHandle {
+    stats: Arc<RetentionStats>,
+}
+
+impl RetentionHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bytes_retained(&self) -> u64 {
+        self.stats
+            .bytes_retained
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn sweep_count(&self) -> u64 {
+        self.stats
+            .sweep_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn deleted_incarnations_total(&self) -> u64 {
+        self.stats
+            .deleted_incarnations_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 pub struct SessionRuntime {
     pub meta: SessionMeta,
     /// Absolute path to the session's working directory (`sessions/<id>/`).
@@ -210,6 +267,17 @@ pub struct SessionRuntime {
     /// `Failed`) instead of continuing to run unrecorded. Atomic because
     /// `journal_event` only holds `&self`.
     pub journal_failed: std::sync::atomic::AtomicBool,
+    /// PLAN2 §P2.5: pointer into the daemon's shared journal byte cap.
+    /// The retention thread re-loads it on every sweep, so a daemon hot
+    /// reload (`store.set_journal_byte_cap`) is visible to every live
+    /// session without a restart. 0 = unlimited (the historical,
+    /// pre-P2.5 behaviour).
+    pub journal_byte_cap: Arc<std::sync::atomic::AtomicU64>,
+    /// PLAN2 §P2.5: handle to the journal byte cap + lock-free
+    /// retention stats. Populated by `spawn_session` and shared (via the
+    /// inner `Arc`) with the retention thread so a hot-reloaded cap is
+    /// visible without re-spawning the runtime.
+    pub retention: RetentionHandle,
 }
 
 /// Capacity of the queue between attach input and the PTY writer thread.
@@ -226,6 +294,73 @@ const PTY_WRITER_QUEUE_CAPACITY: usize = 4096;
 /// buffer is sized to swallow a burst of child output in as few reads — and
 /// therefore as few downstream chunks, broadcasts and IPC frames — as possible.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
+
+/// PLAN2 §P2.5: run one byte-budgeted journal retention sweep.
+///
+/// Convenience wrapper around `journal::min_incarnation_for_byte_budget` +
+/// `journal::retain_before`. The function never panics on journal I/O:
+/// errors propagate so the runtime can log and retry on the next
+/// checkpoint. The function updates the [`RetentionHandle`] stats after
+/// every successful call so `to_summary()` can publish them later.
+fn run_retention_sweep(
+    session_dir: &Path,
+    byte_cap: &Arc<std::sync::atomic::AtomicU64>,
+    retention: &RetentionHandle,
+) -> io::Result<()> {
+    let journal_dir = session_dir.join(journal::JOURNAL_DIR_NAME);
+    let cap = byte_cap.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_horizon = if cap == 0 {
+        // Unlimited cap: nothing is deleted — `retain_before` clamps any
+        // horizon to the checkpoint gate, preserving pre-P2.5 behaviour
+        // exactly. Horizon 1 keeps ALL manifest entries for the
+        // `bytes_retained` stat (retain_before(dir, 1) clamps to the
+        // gate and deletes nothing).
+        1
+    } else {
+        match journal::min_incarnation_for_byte_budget(&journal_dir, cap) {
+            Ok(effective_horizon) => effective_horizon,
+            Err(err) => {
+                // Misformed/missing manifest: warn and fall through as
+                // if the cap were disabled. Without this, every
+                // post-checkpoint sweep would log the same recovery
+                // failure and the user could never tell what was going
+                // on without reading the journal dir.
+                warn!(
+                    error = %err,
+                    "could not compute journal byte-budget horizon; skipping sweep"
+                );
+                1
+            }
+        }
+    };
+    let deleted = journal::retain_before(session_dir, effective_horizon)?;
+    retention
+        .stats
+        .deleted_incarnations_total
+        .fetch_add(deleted.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    retention
+        .stats
+        .sweep_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(manifest) = journal::read_manifest(&journal_dir) {
+        let latest_incarnation = journal::list_incarnations(&journal_dir)
+            .ok()
+            .and_then(|list| list.last().copied());
+        let retained: u64 = manifest
+            .iter()
+            .filter(|entry| {
+                entry.incarnation >= effective_horizon
+                    || Some(&entry.incarnation) == latest_incarnation.as_ref()
+            })
+            .map(|entry| entry.bytes)
+            .sum();
+        retention
+            .stats
+            .bytes_retained
+            .store(retained, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
 
 impl SessionRuntime {
     /// Current terminal mode snapshot (DECCKM, bracketed paste, mouse
@@ -316,6 +451,7 @@ impl SessionRuntime {
 
     /// Build a `SessionSummary` snapshot from the current runtime state.
     pub fn to_summary(&self) -> SessionSummary {
+        let sweep_count = self.retention.sweep_count();
         SessionSummary {
             id: self.meta.id.clone(),
             title: self.meta.title.clone(),
@@ -338,6 +474,15 @@ impl SessionRuntime {
             attach_count: self.attachments.len(),
             foreground_color: self.meta.foreground_color.clone(),
             background_color: self.meta.background_color.clone(),
+            journal_bytes_retained: sweep_count.gt(&0).then(|| self.retention.bytes_retained()),
+            journal_retention_sweeps: sweep_count.gt(&0).then_some(sweep_count),
+            journal_incarnations_dropped: sweep_count
+                .gt(&0)
+                .then(|| self.retention.deleted_incarnations_total()),
+            journal_byte_cap: Some(
+                self.journal_byte_cap
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
         }
     }
 
@@ -763,14 +908,17 @@ impl SessionRuntime {
         self.last_journal_checkpoint_at = self.filtered_total_bytes;
         // Retention never runs under the write lock (disk I/O).
         let dir = self.dir.clone();
-        std::thread::spawn(move || {
-            if let Err(err) = journal::retain_before(&dir, u64::MAX) {
-                warn!(
+        let byte_cap = self.journal_byte_cap.clone();
+        let retention = self.retention.clone();
+        std::thread::spawn(
+            move || match run_retention_sweep(&dir, &byte_cap, &retention) {
+                Ok(()) => {}
+                Err(err) => warn!(
                     error = %err,
                     "checkpoint-gated journal retention failed; retrying at the next checkpoint"
-                );
-            }
-        });
+                ),
+            },
+        );
     }
 
     /// Emit a checkpoint once the session has produced another
@@ -946,6 +1094,7 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 /// `meta` is mutated to record the assigned `pid` once the PTY child
 /// is live; wrap the caller's `SessionMeta` in a `Mutex` and unwrap
 /// the clone after the blocking task joins.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_session(
     meta: &mut SessionMeta,
     session_dir: PathBuf,
@@ -953,6 +1102,7 @@ pub fn spawn_session(
     cols: u16,
     notifications_enabled: bool,
     screen_scrollback_rows: usize,
+    journal_byte_cap: Arc<std::sync::atomic::AtomicU64>,
     event_tx: SessionEventTx,
 ) -> Result<Arc<RwLock<SessionRuntime>>> {
     meta.notifications_enabled = notifications_enabled;
@@ -1168,6 +1318,8 @@ pub fn spawn_session(
         notifications_enabled,
         journal: shadow_journal,
         journal_failed: std::sync::atomic::AtomicBool::new(false),
+        journal_byte_cap,
+        retention: RetentionHandle::new(),
     }));
 
     // PTY reader thread: reads raw bytes, derives one canonical filtered stream,
@@ -1627,6 +1779,8 @@ mod tests {
             notifications_enabled: true,
             journal: None,
             journal_failed: std::sync::atomic::AtomicBool::new(false),
+            journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            retention: RetentionHandle::new(),
         }
     }
 
@@ -2604,6 +2758,8 @@ mod tests {
             notifications_enabled: true,
             journal: None,
             journal_failed: std::sync::atomic::AtomicBool::new(false),
+            journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            retention: RetentionHandle::new(),
         };
 
         assert!(rt.pty.try_write_input(b"before".to_vec()).is_ok());

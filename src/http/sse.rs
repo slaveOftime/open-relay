@@ -262,6 +262,10 @@ mod tests {
             attach_count: 0,
             foreground_color: None,
             background_color: None,
+            journal_bytes_retained: None,
+            journal_retention_sweeps: None,
+            journal_incarnations_dropped: None,
+            journal_byte_cap: None,
         }
     }
 
