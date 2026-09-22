@@ -1943,3 +1943,89 @@ fn e2e_logs_gates_compose_with_reads_and_json_wait_results() {
         "screen after exit should render the journal"
     );
 }
+
+// Regression guard: a single secondary daemon registering *two* persisted
+// joins against the same primary, using the *same* API key but different
+// name, must surface both nodes on the primary. In 0.3.x this worked; if
+// it ever regresses again we want a CI failure that names the symptom.
+#[test]
+#[allow(non_snake_case)]
+fn e2e_federation_cli_two_joins_same_key_different_names() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let primary_tmp = make_tmp_dir("e2e_fed_twojoins_primary");
+    let secondary_tmp = make_tmp_dir("e2e_fed_twojoins_secondary");
+    let port = pick_free_port();
+    let _primary = start_daemon_http(&primary_tmp, port);
+    let secondary = start_daemon(&secondary_tmp);
+
+    let add = oly_cmd(&primary_tmp)
+        .args(["api-key", "add", "sharedkey"])
+        .output()
+        .expect("`oly api-key add` failed to execute");
+    assert!(
+        add.status.success(),
+        "`oly api-key add` exited non-zero.\nstderr: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let key = String::from_utf8_lossy(&add.stdout)
+        .lines()
+        .last()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(key.len(), 64, "expected 64-char key, got: {key}");
+
+    let url = format!("http://127.0.0.1:{port}");
+
+    // Two sibling join attempts in the same secondary state dir, just like
+    // a user wiring multiple physical machines behind one primary URL.
+    for name in ["workerA", "workerB"] {
+        let join = oly_cmd(&secondary_tmp)
+            .args(["join", "start", "--name", name, "--key", &key, &url])
+            .output()
+            .expect("`oly join start` failed to execute");
+        assert!(
+            join.status.success(),
+            "`oly join start -n {name}` exited non-zero.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&join.stdout),
+            String::from_utf8_lossy(&join.stderr)
+        );
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let worker_a_connected = rt.block_on(wait_for_node_connected(port, "workerA", 10));
+    assert!(worker_a_connected, "workerA did not appear in /api/nodes");
+    let worker_b_connected = rt.block_on(wait_for_node_connected(port, "workerB", 10));
+    assert!(
+        worker_b_connected,
+        "workerB did not appear in /api/nodes after joining with the same key as workerA"
+    );
+
+    let nodes_json = rt.block_on(async {
+        let resp = reqwest::get(format!("http://127.0.0.1:{port}/api/nodes"))
+            .await
+            .expect("GET /api/nodes");
+        let body = resp.text().await.expect("read /api/nodes body");
+        serde_json::from_str::<serde_json::Value>(&body).expect("parse /api/nodes")
+    });
+    let names: Vec<&str> = nodes_json
+        .as_array()
+        .unwrap_or_else(|| panic!("nodes response not an array: {nodes_json}"))
+        .iter()
+        .filter_map(|n| n.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"workerA") && names.contains(&"workerB"),
+        "expected both workerA and workerB on primary, got {names:?}"
+    );
+
+    // Cleanup so other tests aren't impacted by stray connectors.
+    for name in ["workerA", "workerB"] {
+        let _ = oly_cmd(&secondary_tmp)
+            .args(["join", "stop", "--name", name])
+            .output();
+    }
+    drop(secondary);
+    drop(_primary);
+}
