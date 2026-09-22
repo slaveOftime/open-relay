@@ -108,7 +108,7 @@ fn journal_backed_session_logs_render_and_paginate() {
     assert!(!dir.join("output.log").exists());
 
     // Render path (oly logs / RPC GetLogs / HTTP tail).
-    let output =
+    let (output, _resizes) =
         super::render::render_log_session(&dir, 10, false, 80, None).expect("render journal logs");
     let text = String::from_utf8_lossy(&output);
     assert!(text.contains("line 39"), "{text:?}");
@@ -131,7 +131,7 @@ fn renders_copilot_transcript_exactly() {
         .join("tests")
         .join("output-copilot.log");
 
-    let output = render_log_file(
+    let (output, _resizes) = render_log_file(
         &log_path,
         40,
         true,
@@ -152,7 +152,7 @@ fn renders_opencode_transcript_exactly() {
         .join("tests")
         .join("output-opencode.log");
 
-    let output = render_log_file(
+    let (output, _resizes) = render_log_file(
         &log_path,
         40,
         true,

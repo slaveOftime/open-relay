@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::error::Result;
+use crate::protocol::LogResize;
 use crate::terminal::Terminal;
 
 #[cfg(test)]
@@ -34,7 +35,7 @@ pub fn render_log_session(
     keep_color: bool,
     term_cols: u16,
     viewport: Option<ViewportSize>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<LogResize>)> {
     if !session_dir
         .join(crate::session::journal::JOURNAL_DIR_NAME)
         .is_dir()
@@ -53,7 +54,7 @@ pub fn render_log_session(
     let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
     let mut starts: Vec<u64> = anchors.iter().rev().copied().collect();
     starts.push(0);
-    let mut rendered: Option<(Vec<u8>, u64, u64)> = None;
+    let mut rendered: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
     for start in starts {
         let (bytes, end) = crate::session::replay::filtered_stream_from(session_dir, start)?;
         let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
@@ -61,30 +62,36 @@ pub fn render_log_session(
         // start_offset > 0 means the window found enough lines inside the
         // suffix; otherwise widen the replay at an older anchor.
         if tail_bytes.start_offset > 0 || start == 0 {
-            rendered = Some((tail_bytes.bytes, start + tail_bytes.start_offset, end));
+            let start_offset = start + tail_bytes.start_offset;
+            // M6-2: resize history is derived from the journal
+            // (append-ordered with output), not the retired events.log.
+            // Anchored: only resizes inside the replayed window are derived
+            // — a bounded replay that breaks once we're 64 MiB past the
+            // window, never a full re-scan of the recording.
+            let resizes = crate::session::replay::resize_events_from(session_dir, start_offset)?;
+            rendered = Some((tail_bytes.bytes, start_offset, end, resizes));
             break;
         }
     }
-    let Some((bytes, start_offset, end_offset)) = rendered else {
-        return Ok(Vec::new());
+    let Some((bytes, start_offset, end_offset, resizes)) = rendered else {
+        return Ok((Vec::new(), Vec::new()));
     };
     let viewport_plan = if viewport.is_some() {
         ViewportReplayPlan::default()
     } else {
-        // M6-2: resize history is derived from the journal (append-ordered
-        // with output), not the retired events.log. Anchored: only resizes
-        // inside the replayed window are derived.
-        let resizes = crate::session::replay::resize_events_from(session_dir, start_offset)?;
         viewport_resize_plan(&resizes, start_offset, end_offset)
     };
 
-    Ok(render_log_bytes(
-        &bytes,
-        tail,
-        keep_color,
-        term_cols,
-        viewport,
-        &viewport_plan,
+    Ok((
+        render_log_bytes(
+            &bytes,
+            tail,
+            keep_color,
+            term_cols,
+            viewport,
+            &viewport_plan,
+        ),
+        resizes,
     ))
 }
 
@@ -97,7 +104,7 @@ pub fn render_log_file(
     keep_color: bool,
     term_cols: u16,
     viewport: Option<ViewportSize>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<LogResize>)> {
     // Step 1: seek to a position that gives `tail * 2` lines worth of bytes,
     // providing enough context for the replay engine even with heavy escape usage.
     let tail_bytes = read_tail_bytes(log_path, tail)?;
@@ -105,13 +112,16 @@ pub fn render_log_file(
     let viewport_plan = ViewportReplayPlan::default();
     let _ = viewport.is_some();
 
-    Ok(render_log_bytes(
-        &tail_bytes.bytes,
-        tail,
-        keep_color,
-        term_cols,
-        viewport,
-        &viewport_plan,
+    Ok((
+        render_log_bytes(
+            &tail_bytes.bytes,
+            tail,
+            keep_color,
+            term_cols,
+            viewport,
+            &viewport_plan,
+        ),
+        Vec::new(),
     ))
 }
 

@@ -29,6 +29,7 @@ Phase summaries:
 | S4 | Authorization architecture | medium | S1 |
 | P1 | Off the async workers | low | S1 |
 | P2 | Hot-path costs | low | — |
+| P2.4 | **Bounded resize-history in `render_log_session`** — **DONE** | low | — |
 | P3 | Caching & polling elimination | low | — |
 | X1 | Security quick wins | low | — (S4 helps X1.4) |
 | X2 | Credential verification hardening | medium | — |
@@ -398,6 +399,35 @@ worker (and in P1.2 a session lock) on syscall/CPU-bound work.
 - `runtime.rs` `to_summary()` clones ~15 strings per call and is called
   per-broadcast/per-list; acceptable at `max_running_sessions = 50` — note
   it, revisit if list fan-out shows up in `/api/metrics`.
+
+### P2.4 Eliminate unbounded `resize_events` scan in the log-tail path — ✅ COMPLETE
+
+**Root cause.** `render_log_session` (`src/session/logs/render.rs`) already
+derives resize history from the bounded `resize_events_from` (breaks at
+`start_offset + 64 MiB`). But the callers — daemon `handle_logs_tail` and
+HTTP `get_logs_tail` — then made a **separate, unbounded**
+`resize_events(&session_dir)` call that replays the **entire** filtered
+stream from byte 0. For a large session (many MiB of journal data), this
+is O(size) and dominates tail latency.
+
+**Fix.** `render_log_session` now returns `(Vec<u8>, Vec<LogResize>)` —
+the second element is the resize history it already computed inside the
+bounded `resize_events_from` call. The three tail-path callers
+(`daemon/rpc.rs::handle_logs_tail`, `http/sessions.rs::get_logs_tail`,
+`client/logs.rs::run_logs_local`) destructure the tuple and reuse the
+resizes; the unbounded `resize_events` call is removed from all three.
+
+The pagination paths (`handle_logs_pagination`, `get_logs_page`) are
+unchanged — they inherently need the full resize history and continue to
+call `resize_events` directly.
+
+**Files changed:** `src/session/logs/render.rs` (return type + destructuring),
+`src/daemon/rpc.rs`, `src/http/sessions.rs`, `src/client/logs.rs`,
+`src/session/logs/tests.rs` (test destructuring).
+
+**Acceptance:** all 662 unit tests + 21 e2e tests pass;
+`cargo clippy --locked --all-targets --all-features -- -D warnings` green;
+`cargo fmt --check` clean; `cargo build --release` green.
 
 ---
 

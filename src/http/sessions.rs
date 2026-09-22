@@ -1219,10 +1219,7 @@ pub async fn get_logs_tail(
 
     // Fall back to the persisted stream (journal-derived since M3-1c).
     match render_log_session(&session_dir, tail, true, term_cols, None) {
-        Ok(output) => {
-            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
-            logs_tail_binary_response(output, &resizes)
-        }
+        Ok((output, resizes)) => logs_tail_binary_response(output, &resizes),
         Err(err) => {
             debug!(session_id = %id, %err, "failed to render log file for tail");
             (

@@ -546,17 +546,9 @@ async fn handle_logs_tail(
         }
     };
 
-    let lines = match render_log_session(&session_dir, tail, keep_color, term_cols, None) {
-        Ok(output) => output,
-        Err(err) => {
-            return RpcResponse::Error {
-                message: err.to_string(),
-            };
-        }
-    };
-
-    let resizes = match crate::session::replay::resize_events(&session_dir) {
-        Ok(resizes) => resizes,
+    let (lines, resizes) = match render_log_session(&session_dir, tail, keep_color, term_cols, None)
+    {
+        Ok((output, resizes)) => (output, resizes),
         Err(err) => {
             return RpcResponse::Error {
                 message: err.to_string(),

@@ -169,7 +169,7 @@ async fn run_logs_local(
         )));
     }
 
-    let output = render_log_session(&session_dir, tail, keep_color, term_cols, None)?;
+    let (output, _resizes) = render_log_session(&session_dir, tail, keep_color, term_cols, None)?;
 
     print_log_output(output, keep_color, id, Some(session.status.as_str()))
 }
