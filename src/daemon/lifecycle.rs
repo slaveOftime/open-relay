@@ -689,6 +689,21 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         info!("config hot-reload task spawned");
     }
 
+    {
+        let retention_config = live_config.clone();
+        let retention_db = db.clone();
+        let retention_root = config.paths.sessions_dir.clone();
+        tokio::spawn(async move {
+            super::journal_retention::run_journal_retention_sweeper(
+                retention_config,
+                retention_db,
+                retention_root,
+            )
+            .await;
+        });
+        info!("journal retention sweeper task spawned");
+    }
+
     if !startup_failed_sessions.is_empty() {
         let notifier = notifier.clone();
         let event = NotificationEvent::startup_recovery(&startup_failed_sessions);
@@ -844,6 +859,8 @@ mod tests {
                 screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
+                max_journal_bytes_per_session: 0,
+                journal_retention_days: 0,
             },
             web_push: crate::config::WebPushConfig {
                 subject: None,

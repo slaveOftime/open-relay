@@ -328,6 +328,52 @@ impl Database {
             .collect())
     }
 
+    /// PLAN2 §P2.6: list stopped sessions whose `ended_at` is strictly
+    /// older than `cutoff`. Used by the daemon's periodic sweeper to
+    /// decide which rows to delete alongside their journal directories.
+    ///
+    /// Live sessions (`status IN ('created', 'running', 'stopping')`)
+    /// are filtered out by SQL: the sweeper must never see them. That
+    /// invariant is preserved even if `cutoff` is in the past (e.g.
+    /// someone just changed the cap to a tiny value).
+    pub async fn list_stopped_sessions_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<(String, SessionMeta)>> {
+        let rows = sqlx::query(
+            "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
+                    created_at, started_at, ended_at, notifications_enabled, \
+                    foreground_color, background_color \
+             FROM sessions
+             WHERE ended_at IS NOT NULL \
+               AND ended_at < ?1 \
+               AND status IN ('stopped', 'killed', 'failed')",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let meta = row_to_meta(r);
+                (meta.id.clone(), meta)
+            })
+            .collect())
+    }
+
+    /// PLAN2 §P2.6: delete a single session row by id. Returns the
+    /// number of rows removed (0 means the row was already gone — the
+    /// sweeper treats this as success because it implies a concurrent
+    /// removal has already cleaned up).
+    pub async fn delete_session_by_id(&self, id: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM sessions WHERE id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     #[allow(dead_code)]
     pub async fn list_push_subscriptions(&self) -> Result<Vec<PushSubscriptionRecord>> {
         let rows = sqlx::query(
@@ -586,5 +632,145 @@ impl Database {
                 scopes: r.get::<String, _>(2),
             })
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}.{suffix}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
+    }
+
+    async fn open_test_db() -> Arc<Database> {
+        let db_path = temp_path("oly-p26-test", "db");
+        let sessions_dir = temp_path("oly-p26-test-sessions", "dir");
+        let db = Database::open(&db_path, sessions_dir)
+            .await
+            .expect("open test db");
+        Arc::new(db)
+    }
+
+    fn meta(id: &str, status: SessionStatus, ended: Option<DateTime<Utc>>) -> SessionMeta {
+        let now = Utc::now();
+        SessionMeta {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "bash".to_string(),
+            args: vec![],
+            cwd: None,
+            status,
+            pid: None,
+            exit_code: None,
+            created_at: now,
+            started_at: Some(now),
+            ended_at: ended,
+            notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_stopped_sessions_older_than_returns_only_aged_out_stopped_ones() {
+        let db = open_test_db().await;
+        let cutoff = Utc::now();
+
+        // 10 days ago: stopped → candidate.
+        let aged_stopped = meta(
+            "aged-stopped",
+            SessionStatus::Stopped,
+            Some(cutoff - chrono::Duration::days(10)),
+        );
+        // 1 hour in the **future**: clearly not aged out, even though the
+        // status is `stopped`. (A sweep with `retention_days = 0` should
+        // still find nothing here; this exercises the `ended_at >= cutoff`
+        // branch.)
+        let fresh_stopped = meta(
+            "fresh-stopped",
+            SessionStatus::Stopped,
+            Some(cutoff + chrono::Duration::hours(1)),
+        );
+        // 30 days ago: failed → candidate.
+        let aged_failed = meta(
+            "aged-failed",
+            SessionStatus::Failed,
+            Some(cutoff - chrono::Duration::days(30)),
+        );
+        // 10 days ago: running → never swept (live work).
+        let aged_running = meta(
+            "aged-running",
+            SessionStatus::Running,
+            Some(cutoff - chrono::Duration::days(10)),
+        );
+        // 10 days ago: stopping → never swept.
+        let aged_stopping = meta(
+            "aged-stopping",
+            SessionStatus::Stopping,
+            Some(cutoff - chrono::Duration::days(10)),
+        );
+        // `ended_at == cutoff`: strict `<`, so NOT a candidate. Verifies
+        // the boundary just barely.
+        let exactly_cutoff = meta("exactly-cutoff", SessionStatus::Stopped, Some(cutoff));
+
+        for m in [
+            &aged_stopped,
+            &fresh_stopped,
+            &aged_failed,
+            &aged_running,
+            &aged_stopping,
+            &exactly_cutoff,
+        ] {
+            db.insert_session(m).await.expect("insert");
+        }
+
+        let mut ids: Vec<String> = db
+            .list_stopped_sessions_older_than(cutoff)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+
+        assert_eq!(
+            ids,
+            vec!["aged-failed".to_string(), "aged-stopped".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_by_id_removes_row_and_reports_zero_on_missing() {
+        let db = open_test_db().await;
+        let m = meta("d1", SessionStatus::Stopped, Some(Utc::now()));
+        db.insert_session(&m).await.expect("insert");
+        assert!(db.session_exists("d1").await);
+
+        let removed = db.delete_session_by_id("d1").await.expect("delete");
+        assert_eq!(removed, 1);
+        assert!(!db.session_exists("d1").await);
+
+        // Second call returns 0; the sweeper treats this as success-on-row
+        // (concurrent manual `oly rm` already cleaned it up).
+        let removed_again = db
+            .delete_session_by_id("d1")
+            .await
+            .expect("delete idempotent");
+        assert_eq!(removed_again, 0);
     }
 }

@@ -81,6 +81,7 @@ pub(super) async fn run_config_reloader(
         let reload_log_filter = old.log_level != new.log_level;
 
         store.set_eviction_seconds(new.limits.session_eviction_seconds);
+        store.set_journal_byte_cap(new.limits.max_journal_bytes_per_session);
         live.replace(new.clone());
 
         if rebuild_notifier {

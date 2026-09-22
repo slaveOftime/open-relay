@@ -869,7 +869,7 @@ mod tests {
                 .await
                 .expect("open test db"),
         );
-        let store = Arc::new(SessionStore::new(60, db.clone()));
+        let store = Arc::new(SessionStore::with_journal_byte_cap(60, 0, db.clone()));
 
         let meta = SessionMeta {
             id: "stopped123".to_string(),

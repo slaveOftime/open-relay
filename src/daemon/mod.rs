@@ -1,5 +1,6 @@
 mod auth;
 mod crash;
+mod journal_retention;
 mod lifecycle;
 mod reload;
 mod rpc;
