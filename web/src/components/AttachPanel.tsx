@@ -212,8 +212,18 @@ export default function AttachPanel({
   uploadFile,
   onDrawerOpenChange,
 }: AttachPanelProps) {
+  // Per-session persisted UI state is split between two sync sites:
+  //   1. The lazy initializer below populates state on initial mount (covers
+  //      deep links, route-level remounts, and strict-mode dual mounts).
+  //   2. The render-time adjustment below reloads state when sessionId
+  //      changes within an already-mounted instance.
+  // Both sites load from the same per-session localStorage / sessionStorage
+  // keys via `loadSessionInputDraft` / `loadSessionImagePreviews` /
+  // `loadSessionDrawerOpen`. Skipping either one leaves the textarea empty
+  // until the user re-focuses the page and types again — see the regression
+  // introduced when the previous useEffect-cascade load was collapsed.
   const [drawerOpen, setDrawerOpen] = useState(() => loadSessionDrawerOpen(sessionId))
-  const [customInput, setCustomInput] = useState('')
+  const [customInput, setCustomInput] = useState(() => loadSessionInputDraft(sessionId))
   const [customKeys, setCustomKeys] = useState('')
   const [imagePreviews, setImagePreviews] = useState<SessionImagePreviews>(() =>
     loadSessionImagePreviews(sessionId)
@@ -285,9 +295,13 @@ export default function AttachPanel({
     resizeCustomInput()
   }, [customInput])
 
-  // Switching sessions reloads all per-session persisted UI state in one
-  // render-time adjustment (the React-recommended alternative to
-  // setState-in-effect cascades).
+  // Switching sessions within an existing instance reloads all per-session
+  // persisted UI state in one render-time adjustment (the React-recommended
+  // alternative to setState-in-effect cascades). Deep links and parent-level
+  // remounts (e.g., SessionDetailPage's `key={reloadKey}` flipping on the
+  // mode / node / search-param bucket) are handled by the lazy initializers
+  // above so the draft is restored on first render instead of being wiped to
+  // an empty string.
   const [prevSessionId, setPrevSessionId] = useState(sessionId)
   if (prevSessionId !== sessionId) {
     setPrevSessionId(sessionId)
