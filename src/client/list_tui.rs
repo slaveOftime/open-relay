@@ -1210,23 +1210,31 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             AppAction::None
         }
         KeyCode::Up => {
-            app.navigate_tree(-1);
-            app.previous();
+            match app.view_mode {
+                ViewMode::Tree => app.navigate_tree(-1),
+                ViewMode::List => app.previous(),
+            }
             AppAction::None
         }
         KeyCode::Down => {
-            app.navigate_tree(1);
-            app.next();
+            match app.view_mode {
+                ViewMode::Tree => app.navigate_tree(1),
+                ViewMode::List => app.next(),
+            }
             AppAction::None
         }
         KeyCode::Home => {
-            app.tree_home();
-            app.first();
+            match app.view_mode {
+                ViewMode::Tree => app.tree_home(),
+                ViewMode::List => app.first(),
+            }
             AppAction::None
         }
         KeyCode::End => {
-            app.tree_last();
-            app.last();
+            match app.view_mode {
+                ViewMode::Tree => app.tree_last(),
+                ViewMode::List => app.last(),
+            }
             AppAction::None
         }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2029,20 +2037,23 @@ impl App {
         }));
     }
 
-    /// Move the tree cursor by `offset`, clamped to the visible row range.
+    /// Move the tree cursor by `offset`. The cursor wraps around the visible
+    /// row range (vim-style) so repeated Up/Down in tree mode feels
+    /// continuous and matches what the flat-list cursor does in list mode.
     /// No-op in list mode so a stray call from `route_key` (which also drives
     /// the flat-list cursor) is harmless.
     fn navigate_tree(&mut self, offset: isize) {
         if self.view_mode != ViewMode::Tree {
             return;
         }
-        if self.tree.visible.is_empty() {
+        let visible = self.tree.visible.len();
+        if visible == 0 {
             self.tree.cursor = 0;
             return;
         }
         let position = self.tree.cursor as isize;
-        let max = self.tree.visible.len() as isize;
-        let next = (position + offset).clamp(0, max - 1) as usize;
+        let len = visible as isize;
+        let next = (position + offset).rem_euclid(len) as usize;
         self.tree.cursor = next;
     }
 
@@ -4750,6 +4761,63 @@ mod tests {
     }
 
     #[test]
+    fn tree_arrow_keys_move_tree_cursor_only() {
+        let mut app = App::default();
+        app.replace_sessions(vec![
+            session_at("alpha", Some("/work/a")),
+            session_at("bravo", Some("/work/b")),
+            session_at("charlie", Some("/home/c")),
+        ]);
+        app.toggle_view_mode();
+        let previous_selected = app.selected;
+        let total = app.tree.visible.len();
+        assert!(total > 1, "tree needs at least two rows for this test");
+
+        // Place the cursor on the last row, then press Down. The cursor must
+        // wrap around to the top, and the flat-list `selected` field must
+        // stay untouched while we're in tree mode.
+        app.tree.cursor = total - 1;
+        route_key(&mut app, key(KeyCode::Down), None);
+        assert_eq!(
+            app.tree.cursor, 0,
+            "Down from last row wraps to top, got {}",
+            app.tree.cursor
+        );
+        assert_eq!(
+            app.selected, previous_selected,
+            "list-mode cursor must not move while in tree mode"
+        );
+
+        // Now from the top, Up must wrap to the bottom.
+        app.tree.cursor = 0;
+        route_key(&mut app, key(KeyCode::Up), None);
+        assert_eq!(
+            app.tree.cursor,
+            total - 1,
+            "Up from row 0 wraps to last"
+        );
+        assert_eq!(app.selected, previous_selected);
+
+        // Round-trip: a normal Down in the middle of the list moves one
+        // step without touching `selected`.
+        app.tree.cursor = 1;
+        route_key(&mut app, key(KeyCode::Down), None);
+        assert_eq!(app.tree.cursor, 2);
+        assert_eq!(app.selected, previous_selected);
+
+        // Switching back to list mode reverts Up/Down to the flat-list
+        // cursor; the tree cursor stays put.
+        app.toggle_view_mode();
+        let tree_cursor = app.tree.cursor;
+        route_key(&mut app, key(KeyCode::Down), None);
+        assert_eq!(app.tree.cursor, tree_cursor);
+        assert_ne!(
+            app.selected, previous_selected,
+            "list-mode Down must move the flat-list selected cursor"
+        );
+    }
+
+    #[test]
     fn tree_walks_through_empty_middleman_folders() {
         let mut app = App::default();
         // `/a/b/c/something` has three empty middleman folders. With the
@@ -4836,7 +4904,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_navigation_stays_within_visible_rows() {
+    fn tree_navigation_wraps_around_visible_rows() {
         let mut app = App::default();
         let mut sessions: Vec<SessionSummary> = (0..6)
             .map(|i| session_at(&format!("s{i}"), Some("/x")))
@@ -4849,17 +4917,24 @@ mod tests {
         app.replace_sessions(sessions);
         app.toggle_view_mode();
         let total = app.tree.visible.len();
+        assert!(total > 1, "test needs at least two visible rows");
         app.tree.cursor = 0;
-        // Move down past the end — cursor must clamp.
+        // Move down past the end — cursor must wrap around to ~start.
         for _ in 0..total + 5 {
             app.navigate_tree(1);
         }
-        assert_eq!(app.tree.cursor, total.saturating_sub(1));
-        // Move up past the start — cursor must clamp to 0.
-        for _ in 0..total + 5 {
+        // After `total` steps we'd land back at cursor 0 with the offset
+        // applied five times more. Wraps via rem_euclid so the cursor is
+        // deterministic regardless of how many extra presses we pretend.
+        assert_eq!(app.tree.cursor, 5usize.rem_euclid(total));
+        // Pressing Up wraps the same way.
+        for _ in 0..total + 7 {
             app.navigate_tree(-1);
         }
-        assert_eq!(app.tree.cursor, 0);
+        assert_eq!(
+            app.tree.cursor,
+            ((5isize) - 7).rem_euclid(total as isize) as usize
+        );
     }
 
     #[test]
