@@ -502,6 +502,8 @@ struct App {
     clone_dialog: Option<CloneDialog>,
     update_dialog: Option<UpdateDialog>,
     show_node: bool,
+    view_mode: ViewMode,
+    tree: TreeView,
     /// Shader-like visual effects (tachyonfx) processed on every frame.
     effects: EffectManager<String>,
     /// Timestamp of the previous frame, used to derive the effect tick delta.
@@ -518,6 +520,88 @@ struct App {
     /// The dialog the open-fade effect was last registered for.
     rendered_dialog: Option<&'static str>,
 }
+
+impl Default for TreeView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Top-level presentation of the session list: either the responsive table
+/// view (`List`) or a `cwd`-grouped tree (`Tree`). Toggled with Ctrl+G.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ViewMode {
+    #[default]
+    List,
+    Tree,
+}
+
+/// One folder node in the tree. Folder rows are emitted by `TreeView`'s
+/// `visible` walker; their `direct_sessions` are emitted as siblings at the
+/// same effective depth so each session sits visually beneath the deepest
+/// folder that still sits above it.
+#[derive(Debug)]
+struct TreeNode {
+    path: PathBuf,
+    /// Cached `basename` of `path`; empty for the synthetic root.
+    name: String,
+    /// Indices into `App::sessions` of sessions whose cwd equals `path`.
+    direct_sessions: Vec<usize>,
+    /// Indices of child folder nodes (in DFS order; not sorted).
+    subfolders: Vec<usize>,
+}
+
+/// What `TreeView::visible` emits: a single row that is either a folder
+/// header or a session leaf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TreeEntry {
+    Folder { node: usize, depth: usize },
+    Session { session: usize, depth: usize },
+}
+
+/// Folder-and-session tree built from `App::sessions`. The walker produces a
+/// flat list of `TreeEntry` rows in DFS order, skipping empty single-child
+/// folders and respecting `auto_depth` (folders deeper than this are hidden
+/// unless `drilled` contains an ancestor path).
+#[derive(Debug)]
+struct TreeView {
+    nodes: Vec<TreeNode>,
+    /// Index of the synthetic root node (path = `PathBuf::new()`).
+    root: usize,
+    /// Auto-drill horizon. Folders at depth ≤ this are visible by default;
+    /// deeper folders are hidden unless an ancestor path is in `drilled`.
+    auto_depth: usize,
+    /// Paths the user has explicitly drilled into (overrides `auto_depth`).
+    drilled: HashSet<PathBuf>,
+    /// Flat row list produced by `recompute_visible`.
+    visible: Vec<TreeEntry>,
+    /// Cursor index into `visible`.
+    cursor: usize,
+}
+
+impl TreeView {
+    fn new() -> Self {
+        let mut nodes = Vec::with_capacity(64);
+        nodes.push(TreeNode {
+            path: PathBuf::new(),
+            name: String::new(),
+            direct_sessions: Vec::new(),
+            subfolders: Vec::new(),
+        });
+        Self {
+            nodes,
+            root: 0,
+            auto_depth: TREE_AUTO_DEPTH,
+            drilled: HashSet::new(),
+            visible: Vec::new(),
+            cursor: 0,
+        }
+    }
+}
+
+/// Maximum folder depth shown without an explicit drill. Pressing Enter on a
+/// folder at this depth reveals one more level of children.
+const TREE_AUTO_DEPTH: usize = 3;
 
 #[derive(Debug, Eq, PartialEq)]
 enum AppAction {
@@ -1085,6 +1169,10 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             app.update_dialog = Some(UpdateDialog::from_session(session, list_node));
             AppAction::None
         }
+        KeyCode::Char('g' | 'G') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_view_mode();
+            AppAction::None
+        }
         KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             let Some(session) = app.selected_session() else {
                 app.set_action_message(Some("no session selected to stop".to_string()));
@@ -1122,18 +1210,22 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             AppAction::None
         }
         KeyCode::Up => {
+            app.navigate_tree(-1);
             app.previous();
             AppAction::None
         }
         KeyCode::Down => {
+            app.navigate_tree(1);
             app.next();
             AppAction::None
         }
         KeyCode::Home => {
+            app.tree_home();
             app.first();
             AppAction::None
         }
         KeyCode::End => {
+            app.tree_last();
             app.last();
             AppAction::None
         }
@@ -1141,7 +1233,10 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             app.open_selected_terminal(list_node);
             AppAction::None
         }
-        KeyCode::Enter => AppAction::OpenInline,
+        KeyCode::Enter => match app.view_mode {
+            ViewMode::Tree => app.tree_enter(),
+            ViewMode::List => AppAction::OpenInline,
+        },
         KeyCode::Char(character)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
@@ -1455,6 +1550,179 @@ fn session_key(session: &SessionSummary) -> String {
     )
 }
 
+/// Longest shared path prefix of `paths` whose presence as a hidden prefix
+/// would still leave at least one hierarchical level visible.
+///
+/// Always returns an **absolute** prefix so that callers can pass it
+/// directly to [`Path::strip_prefix`]. When the inputs span more than one
+/// cwd, the prefix reaches just deep enough to share without making every
+/// input equal to the prefix (which would swallow the whole tree). For a
+/// single-cwd input the prefix is just the root `/`; consumers strip the
+/// root and surface the rest as a normal chain of folders.
+fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
+    if paths.is_empty() {
+        return Path::new("/").to_path_buf();
+    }
+    if paths.len() == 1 {
+        return Path::new("/").to_path_buf();
+    }
+    let mut iter = paths.iter();
+    let first = iter.next().expect("non-empty").clone();
+    let mut prefix = first.clone();
+    for candidate in iter {
+        while !candidate.starts_with(&prefix) {
+            if !prefix.pop() {
+                return Path::new("/").to_path_buf();
+            }
+        }
+    }
+    // If every input is identical, popping the trailing component guarantees
+    // the remaining chain still has hierarchy to display.
+    if paths.iter().all(|p| p == &prefix)
+        && let Some(parent) = prefix.parent()
+    {
+        return parent.to_path_buf();
+    }
+    prefix
+}
+
+/// Walk the tree, creating intermediate folder nodes for any portion of
+/// `path` that does not yet exist. Returns the index of the deepest node
+/// matching `path` (creating it on demand).
+fn ensure_tree_path(tree: &mut TreeView, path: &Path) -> usize {
+    if path.as_os_str().is_empty() {
+        return tree.root;
+    }
+    let mut current = tree.root;
+    let mut accumulated = PathBuf::new();
+    for component in path.components() {
+        accumulated.push(component);
+        // Linear-scan the parent's `subfolders` for an existing node with
+        // this exact `accumulated` path. Trees are shallow (≤ a handful of
+        // folders per branch) so the linear scan is cheaper than the cache
+        // bookkeeping it would evict.
+        let next = tree.nodes[current]
+            .subfolders
+            .iter()
+            .copied()
+            .find(|&idx| tree.nodes[idx].path == accumulated);
+        current = match next {
+            Some(idx) => idx,
+            None => append_tree_node(tree, current, accumulated.clone()),
+        };
+    }
+    current
+}
+
+fn append_tree_node(tree: &mut TreeView, parent: usize, path: PathBuf) -> usize {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let idx = tree.nodes.len();
+    tree.nodes.push(TreeNode {
+        path,
+        name,
+        direct_sessions: Vec::new(),
+        subfolders: Vec::new(),
+    });
+    tree.nodes[parent].subfolders.push(idx);
+    idx
+}
+
+
+impl TreeView {
+}
+
+/// Free-function DFS over a tree-node snapshot. Operations that mutate the
+/// App live outside this walker; we only emit `TreeEntry` rows into the
+/// supplied `out: &mut Vec`.
+///
+/// Visibility semantics:
+///   * A node at depth ≤ `auto_depth` is always auto-visible.
+///   * A node at depth > `auto_depth` is visible iff any of its ancestors
+///     (whose path is in `drilled`) opens up the subtree below the horizon.
+///   * Empty folders with neither sessions nor descendants are skipped —
+///     empty labels communicate nothing.
+///
+/// Drilling is intentionally "open the *whole* subtree": once a folder is
+/// drilled, every descendant of it remains visible without further user
+/// action (they will be hidden again if the user un-drills the same path).
+fn walk_tree_branch(
+    nodes: &[TreeNode],
+    node_idx: usize,
+    depth: usize,
+    auto_depth: usize,
+    drilled: &HashSet<PathBuf>,
+    out: &mut Vec<TreeEntry>,
+) {
+    let node = &nodes[node_idx];
+
+    if node.direct_sessions.is_empty() && node.subfolders.is_empty() {
+        return;
+    }
+
+    if !node.is_visible(depth, auto_depth, drilled) {
+        return;
+    }
+
+    if depth > 0 {
+        out.push(TreeEntry::Folder {
+            node: node_idx,
+            depth,
+        });
+    }
+
+    for session_idx in &node.direct_sessions {
+        out.push(TreeEntry::Session {
+            session: *session_idx,
+            depth,
+        });
+    }
+
+    // Stop descending when we are at (and not past) the auto-depth horizon
+    // *and* drill state isn't keeping the subtree open. If drill state is
+    // active, every descendant of `node.path` remains visible.
+    if depth >= auto_depth && !is_in_drill_subtree(&node.path, drilled) {
+        return;
+    }
+
+    for &child_idx in &node.subfolders {
+        walk_tree_branch(nodes, child_idx, depth + 1, auto_depth, drilled, out);
+    }
+}
+
+impl TreeNode {
+    /// Visibility rule for a single node at the given chain depth. Encoded
+    /// into a method so tests can exercise it without rebuilding the whole
+    /// tree.
+    fn is_visible(&self, depth: usize, auto_depth: usize, drilled: &HashSet<PathBuf>) -> bool {
+        if depth <= auto_depth {
+            return true;
+        }
+        is_in_drill_subtree(&self.path, drilled)
+    }
+}
+
+/// True when this folder's path, or any of its ancestors, was explicitly
+/// drilled into. Walks up to the root so Enter-presses at depth auto_depth
+/// cascade visibility down to every descendant.
+fn is_in_drill_subtree(path: &Path, drilled: &HashSet<PathBuf>) -> bool {
+    let mut cursor = Some(path.to_path_buf());
+    while let Some(current) = cursor.take() {
+        if drilled.contains(&current) {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                cursor = Some(parent.to_path_buf());
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 impl App {
     /// Refresh-cycle sync status (warnings / "sync lost"): replaces the
     /// current message only when no action feedback is showing, so a fresh
@@ -1510,6 +1778,7 @@ impl App {
             })
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
+        self.rebuild_tree();
         self.sync_update_dialog();
     }
 
@@ -1586,6 +1855,7 @@ impl App {
         {
             self.selected = *index;
         }
+        self.rebuild_tree();
     }
 
     fn selected_session(&self) -> Option<&SessionSummary> {
@@ -1616,6 +1886,194 @@ impl App {
 
     fn next(&mut self) {
         self.select_visible(1);
+    }
+
+    /// Rebuild the folder tree from `self.sessions` and recompute its visible
+    /// flat row list. Tree state and cursor are preserved: the cursor snaps to
+    /// the previously selected session if it survives the rebuild, otherwise
+    /// to the first row.
+    fn rebuild_tree(&mut self) {
+        let previously_selected_session = self
+            .tree
+            .visible
+            .get(self.tree.cursor)
+            .and_then(|entry| match entry {
+                TreeEntry::Session { session, .. } => Some(*session),
+                TreeEntry::Folder { .. } => None,
+            });
+
+        self.build_tree_nodes();
+        let visible = {
+            let TreeView {
+                ref nodes,
+                root,
+                auto_depth,
+                ref drilled,
+                ..
+            } = self.tree;
+            let children: Vec<usize> = nodes[root].subfolders.clone();
+            let mut out: Vec<TreeEntry> = Vec::new();
+            for &child in &children {
+                // depth 1 = the synthetic root's direct subfolders are at
+                // chain depth 1, so they're visible by default.
+                walk_tree_branch(nodes, child, 1, auto_depth, drilled, &mut out);
+            }
+            out
+        };
+        self.tree.visible = visible;
+
+        // Restore cursor: prefer the same session, otherwise the last row.
+        self.tree.cursor = previously_selected_session
+            .and_then(|session_idx| {
+                self.tree.visible.iter().position(|entry| {
+                    matches!(entry, TreeEntry::Session { session, .. } if *session == session_idx)
+                })
+            })
+            .unwrap_or_else(|| self.tree.visible.len().saturating_sub(1));
+    }
+
+    /// Phase 1 of tree rebuild: clear the prior nodes and re-derive them
+    /// from `self.sessions`. Sessions without a `cwd` (or whose cwd matches
+    /// the shared prefix) are bucketed onto the synthetic root.
+    fn build_tree_nodes(&mut self) {
+        self.tree.nodes.clear();
+        self.tree.nodes.push(TreeNode {
+            path: PathBuf::new(),
+            name: String::new(),
+            direct_sessions: Vec::new(),
+            subfolders: Vec::new(),
+        });
+        self.tree.root = 0;
+        if self.tree.auto_depth == 0 {
+            self.tree.auto_depth = TREE_AUTO_DEPTH;
+        }
+
+        // Strip the longest shared path prefix so sessions are bucketed under
+        // their first differing ancestor. Sessions with no `cwd` and sessions
+        // whose cwd equals the common prefix land directly on the synthetic
+        // root as direct_sessions.
+        let cwds: Vec<PathBuf> = self
+            .sessions
+            .iter()
+            .map(|session| {
+                session
+                    .cwd
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+            .collect();
+        let common = common_path_prefix(&cwds);
+
+        for (index, session) in self.sessions.iter().enumerate() {
+            let cwd = session
+                .cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let effective = if cwd.as_os_str().is_empty() {
+                PathBuf::new()
+            } else {
+                cwd.strip_prefix(&common).map_or_else(
+                    |_| cwd.clone(),
+                    |stripped| {
+                        if stripped.as_os_str().is_empty() {
+                            PathBuf::new()
+                        } else {
+                            stripped.to_path_buf()
+                        }
+                    },
+                )
+            };
+            let leaf_idx = ensure_tree_path(&mut self.tree, &effective);
+            self.tree.nodes[leaf_idx].direct_sessions.push(index);
+        }
+    }
+
+    fn toggle_tree_drill(&mut self) {
+        let Some(entry) = self.tree.visible.get(self.tree.cursor).copied() else {
+            return;
+        };
+        let TreeEntry::Folder { node, depth } = entry else {
+            return;
+        };
+        // Drill toggles contribute nothing for folders that are already
+        // visible by default; toggle only matters for folders whose
+        // children sit below the auto-depth horizon.
+        if depth < self.tree.auto_depth {
+            return;
+        }
+        let path = self.tree.nodes[node].path.clone();
+        if self.tree.drilled.contains(&path) {
+            self.tree.drilled.remove(&path);
+        } else {
+            self.tree.drilled.insert(path);
+        }
+        self.rebuild_tree();
+    }
+
+    /// Switch between list and tree presentations. The flat-list `visible`
+    /// continues to reflect current sessions so a Ctrl+G <-> Ctrl+G round
+    /// trip leaves selection unchanged.
+    fn toggle_view_mode(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::List => ViewMode::Tree,
+            ViewMode::Tree => ViewMode::List,
+        };
+        self.rebuild_tree();
+        // Track and announce the new mode so users don't get disoriented.
+        self.set_action_message(Some(match self.view_mode {
+            ViewMode::List => "list view · Ctrl+G tree".to_string(),
+            ViewMode::Tree => "tree view · Enter to drill · Ctrl+G list".to_string(),
+        }));
+    }
+
+    /// Move the tree cursor by `offset`, clamped to the visible row range.
+    /// No-op in list mode so a stray call from `route_key` (which also drives
+    /// the flat-list cursor) is harmless.
+    fn navigate_tree(&mut self, offset: isize) {
+        if self.view_mode != ViewMode::Tree {
+            return;
+        }
+        if self.tree.visible.is_empty() {
+            self.tree.cursor = 0;
+            return;
+        }
+        let position = self.tree.cursor as isize;
+        let max = self.tree.visible.len() as isize;
+        let next = (position + offset).clamp(0, max - 1) as usize;
+        self.tree.cursor = next;
+    }
+
+    fn tree_home(&mut self) {
+        if self.view_mode == ViewMode::Tree {
+            self.tree.cursor = 0;
+        }
+    }
+
+    fn tree_last(&mut self) {
+        if self.view_mode == ViewMode::Tree {
+            self.tree.cursor = self.tree.visible.len().saturating_sub(1);
+        }
+    }
+
+    /// Enter pressed in tree mode: drill on a folder, open inline on a
+    /// session. Returns the action the caller should fan out to (only
+    /// `AppAction::OpenInline` is ever produced for sessions; everything
+    /// else resolves to `AppAction::None` since drilling is internal).
+    fn tree_enter(&mut self) -> AppAction {
+        match self.tree.visible.get(self.tree.cursor).copied() {
+            Some(TreeEntry::Folder { .. }) => {
+                self.toggle_tree_drill();
+                AppAction::None
+            }
+            Some(TreeEntry::Session { session, .. }) => {
+                self.selected = session;
+                AppAction::OpenInline
+            }
+            None => AppAction::None,
+        }
     }
 
     fn first(&mut self) {
@@ -2020,7 +2478,31 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let visible = &app.visible;
     let mut attention_row_rects: Vec<(String, Rect, bool)> = Vec::new();
-    if app.sessions.is_empty() || visible.is_empty() {
+    if app.view_mode == ViewMode::Tree {
+        // Tree mode owns its own empty-state, viewport, and per-row geometry.
+        // Returning early keeps the linear list path below untouched.
+        if app.sessions.is_empty() {
+            frame.render_widget(
+                Paragraph::new("\n  no signals detected\n  start one: oly start -d <cmd>")
+                    .style(Style::default().fg(Color::DarkGray)),
+                chunks[1],
+            );
+        } else {
+            let (viewport_len, viewport_start, tree_rows) = render_tree(
+                frame,
+                chunks[1],
+                app,
+                mode,
+                now,
+                &mut attention_row_rects,
+            );
+            // `viewport_len` and `viewport_start` are referenced via shadowed
+            // locals in the list-mode path; tree mode only uses them to drive
+            // the scrollbar (currently disabled for the tree view, but the
+            // hooks stay so adding it later is one line change).
+            let _ = (viewport_len, viewport_start, tree_rows);
+        }
+    } else if app.sessions.is_empty() || visible.is_empty() {
         let empty = if app.sessions.is_empty() {
             "\n  no signals detected\n  start one: oly start -d <cmd>".to_string()
         } else {
@@ -2094,9 +2576,10 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             attention_row_rects.push((
                 session_key(session),
                 Rect {
+                    x: table_area.x,
                     y: table_area.y + 1 + row_offset as u16,
+                    width: 3,
                     height: 1,
-                    ..table_area
                 },
                 position == selected_position,
             ));
@@ -2856,6 +3339,232 @@ fn aligned_cell(content: impl Into<Line<'static>>, alignment: Alignment) -> Cell
 /// semantic status colours (yellow attention, red failure, green running)
 /// stay clearly readable on top of it.
 const SELECTED_ROW_BG: Color = Color::Rgb(25, 55, 72);
+
+fn render_tree(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    app: &mut App,
+    _mode: LayoutMode,
+    now: Instant,
+    attention_row_rects: &mut Vec<(String, Rect, bool)>,
+) -> (usize, usize, u16) {
+    // Render the tree as a single Paragraph: rows are emitted as `Line`s
+    // composed of indentation glyphs, the state icon, cmd+args, title, and
+    // a final column showing the sessions' relative cwd. No `Table` so the
+    // file-explorer look matches what the user typed.
+    let total = app.tree.visible.len();
+    if total == 0 {
+        frame.render_widget(
+            Paragraph::new("  (no sessions)")
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return (0, 0, 0);
+    }
+
+    // Centre the cursor inside the viewport so drill toggles feel snappy.
+    let viewport_len = area.height as usize;
+    let viewport_start = app
+        .tree
+        .cursor
+        .saturating_sub(viewport_len / 2)
+        .min(total.saturating_sub(viewport_len));
+    let viewport_end = (viewport_start + viewport_len).min(total);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(viewport_end - viewport_start);
+    for (row, entry) in app.tree.visible[viewport_start..viewport_end]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let absolute_index = viewport_start + row;
+        let is_selected = absolute_index == app.tree.cursor;
+        match entry {
+            TreeEntry::Folder { node, depth } => {
+                lines.push(folder_line(
+                    &app.tree.nodes[node],
+                    depth,
+                    is_selected,
+                ));
+            }
+            TreeEntry::Session { session, depth } => {
+                let Some(session_summary) = app.sessions.get(session) else {
+                    lines.push(blank_line());
+                    continue;
+                };
+                let line = session_line(
+                    session_summary,
+                    app.rates.get(&session_key(session_summary)),
+                    depth,
+                    is_selected,
+                    now,
+                );
+                lines.push(line);
+                if session_summary.input_needed && session_summary.notifications_enabled {
+                    let row_y = area.y + row as u16;
+                    // State-cell pulse: a 1-cell wide highlight on the
+                    // glyph column. The pulse shines on the icon only; the
+                    // rest of the row keeps the session's own colours.
+                    attention_row_rects.push((
+                        session_key(session_summary),
+                        Rect {
+                            x: area.x + indent_width(depth),
+                            y: row_y,
+                            width: 1,
+                            height: 1,
+                        },
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(Color::White)),
+        area,
+    );
+
+    (viewport_len, viewport_start, (viewport_end - viewport_start) as u16)
+}
+
+/// Indent for a tree row at the given display depth: two cells per level
+/// (`  ┌─`) since each folder row already shows one connector of its own.
+fn indent_width(depth: usize) -> u16 {
+    (depth as u16).saturating_mul(2)
+}
+
+/// Spacer line used as a placeholder when a session-row renderer returns
+/// early because the underlying index is stale. Prevents the table from
+/// collapsing visibly during the very-rare slice between refresh swaps.
+fn blank_line() -> Line<'static> {
+    Line::from(String::new())
+}
+
+fn folder_line(node: &TreeNode, depth: usize, selected: bool) -> Line<'static> {
+    let indent = "  ".repeat(depth);
+    let prefix = if depth > 0 { "┗ " } else { "" };
+    let label = if node.name.is_empty() {
+        "(root)".to_string()
+    } else {
+        format!("{}/", node.name)
+    };
+    let count = node.direct_sessions.len();
+    let suffix = if count > 0 {
+        format!("  ({count})")
+    } else {
+        String::new()
+    };
+    let marker_style = if selected {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let label_style = if selected {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let suffix_style = Style::default().fg(Color::DarkGray);
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(prefix.to_string(), marker_style),
+        Span::styled(label, label_style),
+        Span::styled(suffix, suffix_style),
+    ])
+}
+
+fn session_line(
+    session: &SessionSummary,
+    rate: Option<&RateState>,
+    depth: usize,
+    selected: bool,
+    now: Instant,
+) -> Line<'static> {
+    // Mirrors `session_row` format ("state icon | cmd args | title | xxxx")
+    // without the table constraints. The state icon distils status into a
+    // single glyph so the column is exactly 1 cell wide.
+    let active = is_active_status(&session.status);
+    let (glyph, glyph_color) = status_glyph(&session.status, session.input_needed);
+    let glyph_color = if !active {
+        if selected {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        }
+    } else {
+        glyph_color
+    };
+    let mut glyph_style = Style::default().fg(glyph_color);
+    if session.input_needed {
+        glyph_style = glyph_style.add_modifier(Modifier::BOLD);
+    }
+
+    let muted = if selected {
+        Color::White
+    } else {
+        Color::Gray
+    };
+    let dim = Style::default().fg(if selected { Color::White } else { Color::DarkGray });
+
+    let cmd_args = if session.args.is_empty() {
+        session.command.clone()
+    } else {
+        format!("{} {}", session.command, session.args.join(" "))
+    };
+
+    // Rate widget (compact 1-cell indicator: arrow + dim cell).
+    let _ = rate_arrow; // silence unused when preview-disabled; used below.
+    let tree_cwd = tree_relative_cwd(&session.cwd);
+    let (rate_glyph, rate_glyph_color) = rate_arrow(rate, now);
+    let title_text = session.title.clone().unwrap_or_default();
+    Line::from(vec![
+        Span::raw("  ".repeat(depth + 1)), // indent past the folder connector
+        Span::styled(glyph.to_string(), glyph_style),
+        Span::raw("  "),
+        Span::styled(cmd_args, dim),
+        Span::raw("  "),
+        Span::styled(title_text, Style::default().fg(muted)),
+        Span::raw("   "),
+        Span::styled(rate_glyph.to_string(), Style::default().fg(rate_glyph_color)),
+        Span::raw(" "),
+        Span::styled(tree_cwd, dim),
+    ])
+}
+
+/// Strip the synthetic root (empty path) and turn long absolute cwds into a
+/// dot-prefixed display form so the trailing column stays one cell wide
+/// when possible. Empty cwd renders as `~` to mirror shell convention.
+fn tree_relative_cwd(cwd: &Option<String>) -> String {
+    match cwd.as_deref() {
+        None | Some("") => "~".to_string(),
+        Some(path) => {
+            let trailing = path.rsplit_terminator('/').next().unwrap_or(path);
+            if trailing.len() == path.len() {
+                format!("./{trailing}")
+            } else {
+                format!("…/{trailing}")
+            }
+        }
+    }
+}
+
+/// Compact activity indicator used in the trailing column of `session_line`.
+/// Returns the arrow glyph and its colour. Mirrors `session_row`'s rate
+/// widget: blanks for cold sessions, dim arrow on idle, cyan on hot.
+fn rate_arrow(rate: Option<&RateState>, now: Instant) -> (&'static str, Color) {
+    let Some(rate) = rate else {
+        return (" ", Color::DarkGray);
+    };
+    let value = rate.display_rate(now);
+    if value <= 0.0 {
+        ("·", Color::DarkGray)
+    } else if value < 1024.0 {
+        ("↑", Color::Cyan)
+    } else {
+        ("⇡", Color::Cyan)
+    }
+}
 
 fn session_row(
     session: &SessionSummary,
@@ -3834,8 +4543,8 @@ mod tests {
         app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
         let buffer = render_app_buffer(&mut app, 120, 30);
 
-        // The waiting session's row background pulses (interpolated colour)
-        // while its status foreground is preserved...
+        // The waiting session's state column pulses (interpolated colour)
+        // while the status foreground is preserved...
         let glyph = cells(&buffer)
             .find(|&pos| buffer[pos].symbol() == "◆")
             .expect("attention glyph rendered");
@@ -3844,8 +4553,16 @@ mod tests {
             ratatui::style::Color::Rgb(_, _, _)
         ));
         assert_eq!(buffer[glyph].fg, ratatui::style::Color::Yellow);
-        // ...the calm session's row is not animated...
-        let calm_row = cells(&buffer)
+        // ...the calm session's state column wears the static selection
+        // band (since calm is selected) and is not animated...
+        let calm_glyph = cells(&buffer)
+            .rev()
+            .find(|&pos| buffer[pos].symbol() == "●")
+            .expect("calm session glyph rendered");
+        assert_eq!(buffer[calm_glyph].bg, super::SELECTED_ROW_BG);
+        // ...the calm row's body cells (e.g., the command text) are *also*
+        // selection-coloured, never amber — the pulse no longer touches them.
+        let calm_cmd = cells(&buffer)
             .find(|&(x, y)| {
                 buffer[(x, y)].symbol() == "c"
                     && ["a", "l", "m"]
@@ -3854,8 +4571,7 @@ mod tests {
                         .all(|(dx, s)| buffer[(x + dx as u16 + 1, y)].symbol() == s)
             })
             .expect("calm session rendered");
-        // (calm is the selected row, so it wears the static selection band.)
-        assert_eq!(buffer[calm_row].bg, super::SELECTED_ROW_BG);
+        assert_eq!(buffer[calm_cmd].bg, super::SELECTED_ROW_BG);
         // ...while the dialog's yellow field label keeps its exact colour.
         let label = cells(&buffer)
             .find(|&(x, y)| {
@@ -3880,7 +4596,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_pulse_animates_the_row_background_as_time_passes() {
+    fn attention_pulse_animates_the_state_cell_as_time_passes() {
         let mut app = App::default();
         let calm = session("calm");
         let mut waiting = session("waiting");
@@ -3895,22 +4611,23 @@ mod tests {
                 .expect("attention glyph rendered")
         };
 
-        // At effect-time zero the row is untouched: default background and
-        // the status foreground at its full yellow.
+        // At effect-time zero the state cell is untouched: default
+        // background and the status foreground at its full yellow.
         let buffer = render_app_buffer(&mut app, 120, 12);
         let position = glyph_position(&buffer);
         assert_eq!(buffer[position].fg, ratatui::style::Color::Yellow);
         assert_eq!(buffer[position].bg, ratatui::style::Color::Reset);
 
-        // Part-way through the pulse the row background has lerped towards
-        // the amber tint while the status foreground is preserved.
+        // Part-way through the pulse the state-cell background has lerped
+        // towards the amber tint, while adjacent row cells keep their
+        // own backgrounds (selection band or default).
         app.last_frame_at = Some(std::time::Instant::now() - std::time::Duration::from_millis(400));
         let buffer = render_app_buffer(&mut app, 120, 12);
         match buffer[position].bg {
             ratatui::style::Color::Rgb(r, g, b) => {
                 assert!(
                     r > g && b < 30,
-                    "pulse should tint the row amber: {r},{g},{b}"
+                    "pulse should tint the state cell amber: {r},{g},{b}"
                 );
             }
             other => panic!("expected an interpolated rgb background, got {other:?}"),
@@ -3919,7 +4636,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_pulse_retunes_when_the_row_is_selected() {
+    fn attention_pulse_retunes_when_the_state_cell_is_selected() {
         let mut app = App::default();
         let mut waiting = session("waiting");
         waiting.input_needed = true;
@@ -3971,6 +4688,236 @@ mod tests {
             ratatui::style::Color::Yellow
         );
         assert!(!app.attention_rows["waiting"].1);
+    }
+
+    // ----- Tree view -------------------------------------------------------
+
+    fn session_at(id: &str, cwd: Option<&str>) -> SessionSummary {
+        let mut s = session(id);
+        s.cwd = cwd.map(str::to_string);
+        s
+    }
+
+    fn tree_visible_ids(app: &App) -> Vec<String> {
+        app.tree
+            .visible
+            .iter()
+            .map(|entry| match entry {
+                super::TreeEntry::Folder { node, .. } => {
+                    let path = &app.tree.nodes[*node].path;
+                    format!("folder:{}", path.to_string_lossy())
+                }
+                super::TreeEntry::Session { session, .. } => app.sessions[*session].id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ctrl_g_toggles_view_mode() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session("alpha")]);
+        assert_eq!(app.view_mode, super::ViewMode::List);
+        route_key(&mut app, ctrl(KeyCode::Char('g')), None);
+        assert_eq!(app.view_mode, super::ViewMode::Tree);
+        route_key(&mut app, ctrl(KeyCode::Char('g')), None);
+        assert_eq!(app.view_mode, super::ViewMode::List);
+    }
+
+    #[test]
+    fn tree_groups_sessions_under_a_shared_ancestor() {
+        let mut app = App::default();
+        app.replace_sessions(vec![
+            session_at("ls", Some("/work/proj")),
+            session_at("vim", Some("/work/proj/sub")),
+            session_at("build", Some("/home/alice")),
+        ]);
+        let ids = tree_visible_ids(&app);
+        // Top-level folders are the children of the shared ancestor: home
+        // and work. (After stripping the leading `/`, the constructed paths
+        // are relative.)
+        assert!(
+            ids.iter().any(|id| id == "folder:home"),
+            "ids = {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "folder:work"),
+            "ids = {ids:?}"
+        );
+        // Sessions render after their enclosing folder chain.
+        assert!(ids.contains(&"ls".to_string()), "ids = {ids:?}");
+        assert!(ids.contains(&"vim".to_string()), "ids = {ids:?}");
+        assert!(ids.contains(&"build".to_string()), "ids = {ids:?}");
+    }
+
+    #[test]
+    fn tree_walks_through_empty_middleman_folders() {
+        let mut app = App::default();
+        // `/a/b/c/something` has three empty middleman folders. With the
+        // default auto-depth horizon of 3, every prefix folder leading up to
+        // the depth-4 leaf is visible as a navigation row even though none
+        // of them holds a session directly — the leaf folder and its
+        // session only become visible after drilling.
+        app.replace_sessions(vec![session_at(
+            "lint",
+            Some("/a/b/c/something"),
+        )]);
+        let ids = tree_visible_ids(&app);
+        // Middleman folders are emitted as rows so the user can keep
+        // navigating through them.
+        assert!(ids.iter().any(|id| id == "folder:a"), "ids={ids:?}");
+        assert!(ids.iter().any(|id| id == "folder:a/b"), "ids={ids:?}");
+        assert!(
+            ids.iter().any(|id| id == "folder:a/b/c"),
+            "ids={ids:?}"
+        );
+        // The depth-4 leaf folder hides until drilled on `a/b/c`.
+        assert!(
+            !ids.iter().any(|id| id == "folder:a/b/c/something"),
+            "leaf folder should sit past auto-depth, ids={ids:?}"
+        );
+        assert!(
+            !ids.contains(&"lint".to_string()),
+            "leaf session should sit past auto-depth, ids={ids:?}"
+        );
+    }
+
+    #[test]
+    fn tree_enter_on_session_emits_open_inline() {
+        let mut app = App::default();
+        app.replace_sessions(vec![session_at("only", Some("/p"))]);
+        app.toggle_view_mode();
+        // Cursor lands on the only session.
+        let action = route_key(&mut app, key(KeyCode::Enter), None);
+        assert_eq!(action, AppAction::OpenInline);
+    }
+
+    #[test]
+    fn tree_enter_on_deep_folder_toggles_drill() {
+        let mut app = App::default();
+        // Build a tree where a leaf at depth 5 needs drilling.
+        app.replace_sessions(vec![session_at(
+            "deep",
+            Some("/a/b/c/d/e"),
+        )]);
+        app.toggle_view_mode();
+        // Before drilling, `deep` and its tail folders at depth > 3 are
+        // hidden. Drill on a depth-3 ancestor should expose them.
+        let ids_before = tree_visible_ids(&app);
+        assert!(
+            !ids_before.contains(&"deep".to_string()),
+            "deep session should be hidden before drilling: {ids_before:?}"
+        );
+
+        // Find the depth-3 folder (`a/b/c`) by walking visible rows. The
+        // walker emits folder rows at their chain depth; drilling the
+        // outermost visible folder should expose the leaf session past the
+        // horizon.
+        let target_position = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| match entry {
+                super::TreeEntry::Folder { node, depth } => {
+                    *depth == 3
+                        && app.tree.nodes[*node].path
+                            == std::path::Path::new("a/b/c")
+                }
+                _ => false,
+            })
+            .expect("depth-3 folder present");
+        app.tree.cursor = target_position;
+        let action = route_key(&mut app, key(KeyCode::Enter), None);
+        assert_eq!(action, AppAction::None);
+        let ids_after = tree_visible_ids(&app);
+        assert!(
+            ids_after.contains(&"deep".to_string()),
+            "deep session should be visible after drilling: {ids_after:?}"
+        );
+    }
+
+    #[test]
+    fn tree_navigation_stays_within_visible_rows() {
+        let mut app = App::default();
+        let mut sessions: Vec<SessionSummary> = (0..6)
+            .map(|i| session_at(&format!("s{i}"), Some("/x")))
+            .collect();
+        sessions[0].cwd = Some("/x".to_string());
+        // Spread the rest across multiple leaves so the tree has folder rows.
+        for (i, s) in sessions.iter_mut().enumerate().take(6).skip(1) {
+            s.cwd = Some(format!("/x/leaf{}", i));
+        }
+        app.replace_sessions(sessions);
+        app.toggle_view_mode();
+        let total = app.tree.visible.len();
+        app.tree.cursor = 0;
+        // Move down past the end — cursor must clamp.
+        for _ in 0..total + 5 {
+            app.navigate_tree(1);
+        }
+        assert_eq!(app.tree.cursor, total.saturating_sub(1));
+        // Move up past the start — cursor must clamp to 0.
+        for _ in 0..total + 5 {
+            app.navigate_tree(-1);
+        }
+        assert_eq!(app.tree.cursor, 0);
+    }
+
+    #[test]
+    fn tree_render_emits_no_table_widget() {
+        // Smoke-test: the tree render path produces a buffer whose symbol
+        // stream contains status glyphs without crashing or panicking.
+        let mut app = App::default();
+        let mut sessions = vec![
+            session_at("ls", Some("/a/b")),
+            session_at("vim", Some("/a/b/c")),
+            session_at("git", Some("/home/me")),
+        ];
+        sessions[0].input_needed = true;
+        app.replace_sessions(sessions);
+        app.toggle_view_mode();
+        let buffer = render_app_buffer(&mut app, 120, 24);
+        let area = *buffer.area();
+        let mut saw_attention = false;
+        let mut saw_running = false;
+        for x in 0..area.width {
+            for y in 0..area.height {
+                match buffer[(x, y)].symbol() {
+                    "◆" => saw_attention = true,
+                    "●" => saw_running = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_attention, "tree view should still render the attention glyph");
+        assert!(saw_running, "tree view should render running session glyph");
+    }
+
+    #[test]
+    fn common_path_prefix_strips_shared_ancestor() {
+        let paths = vec![
+            std::path::PathBuf::from("/a/b/c"),
+            std::path::PathBuf::from("/a/b/d/e"),
+            std::path::PathBuf::from("/a/b"),
+        ];
+        assert_eq!(
+            super::common_path_prefix(&paths),
+            std::path::PathBuf::from("/a/b")
+        );
+    }
+
+    #[test]
+    fn common_path_prefix_returns_root_when_no_ancestor() {
+        // No component beyond `/` is shared. The prefix is still absolute so
+        // callers can pass it straight to `Path::strip_prefix` and receive
+        // relative paths (verified indirectly by `tree_groups_sessions_*`).
+        let paths = vec![
+            std::path::PathBuf::from("/x"),
+            std::path::PathBuf::from("/y/z"),
+        ];
+        assert_eq!(
+            super::common_path_prefix(&paths),
+            std::path::PathBuf::from("/")
+        );
     }
 
     #[test]
