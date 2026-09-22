@@ -80,6 +80,10 @@ pub(crate) enum AttachStreamEvent {
 // Attach source: local-vs-relayed transport unification.
 // ---------------------------------------------------------------------------
 
+// Variants carry buffer state for hot attach paths; boxing would add an
+// allocation to every subscribe and is not worth the memory savings at
+// this call site.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum AttachSource {
     Local(LocalSource),
     Relayed(RelayedSource),

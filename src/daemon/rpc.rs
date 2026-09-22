@@ -463,6 +463,10 @@ async fn handle_session_metadata_set(
     }
 }
 
+/// The nine parameters are exactly the IPC fields of `RpcRequest::NotifySend`
+/// plus the dispatch context; merging into a struct would add boilerplate
+/// without changing what is dispatched.
+#[allow(clippy::too_many_arguments)]
 async fn handle_notify_send(
     source: Option<String>,
     title: String,
@@ -731,6 +735,10 @@ async fn handle_api_key_remove(name: String, db: &Arc<Database>) -> RpcResponse 
     }
 }
 
+/// Mirrors `RpcRequest::JoinStart`'s IPC fields plus the dispatch context;
+/// a parameter-object refactor would obscure that this handler is the
+/// 1:1 IPC shim for that request.
+#[allow(clippy::too_many_arguments)]
 async fn handle_join_start(
     config: &Arc<AppConfig>,
     join_handles: &JoinHandles,

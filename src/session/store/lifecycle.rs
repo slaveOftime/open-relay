@@ -708,6 +708,11 @@ impl SessionStore {
 }
 
 #[cfg(test)]
+// Tests hold an in-memory store's `lock.read()` across short `.await`s
+// (DB insert, store method). Production store code stays under this
+// lint; add a per-fn remove-with-rationale here only if the offending
+// test grows complex enough to need factoring.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::super::testsupport::*;
     use super::*;

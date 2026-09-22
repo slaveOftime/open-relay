@@ -285,6 +285,10 @@ fn disk_incarnation(session_dir: &std::path::Path) -> Option<u64> {
 }
 
 #[cfg(test)]
+// Mirror of the lifecycle/notify convention: tests hold `state.read()`
+// across `.await`s so they can assert on a consistent snapshot.
+// Production store code in this file stays linted.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::super::testsupport::*;
     use super::*;

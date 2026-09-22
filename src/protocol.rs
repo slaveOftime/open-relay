@@ -424,6 +424,10 @@ impl RpcRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+// `Attach` carries a full session snapshot for streaming tail-renders;
+// boxing it would move a hot-path buffer behind an extra pointer per RPC
+// response for no runtime win at this enum size.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
     /// Machine-readable session cursor answer (M4).

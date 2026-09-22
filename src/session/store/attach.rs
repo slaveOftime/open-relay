@@ -333,6 +333,9 @@ impl SessionStore {
 
     /// Subscribe to resize notifications for a session.
     /// Returns a broadcast receiver for (rows, cols) events and the current PTY size.
+    /// Param shape mirrors `ResizeCoordinator::new`; the type alias is internal so
+    /// the complexity lives there, not at this subscriber's call sites.
+    #[allow(clippy::type_complexity)]
     pub fn subscribe_resize(
         &self,
         id: &str,

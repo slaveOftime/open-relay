@@ -450,6 +450,12 @@ async fn handle_ws(
 ///
 /// The `init_metrics_label` must be exactly one of `"local"` or
 /// `"proxied"` -- the same labels pre-S2 observers expect.
+///
+/// S2 unifies the local and relayed paths, so this handler deliberately
+/// threads both shapes' bags of context (`AttachSource`, sender pair,
+/// metrics tag, etc.) instead of inventing yet another intermediate
+/// wrapper struct.
+#[allow(clippy::too_many_arguments)]
 async fn serve_attach(
     mut socket: WebSocket,
     state: AppState,

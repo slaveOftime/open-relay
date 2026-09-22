@@ -144,6 +144,10 @@ impl SessionStore {
 }
 
 #[cfg(test)]
+// Mirror of the lifecycle/store convention: tests hold `state.read()`
+// across short `.await`s so they can assert on a consistent snapshot.
+// Production store code in this file stays linted.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::super::testsupport::*;
     use super::*;

@@ -10,6 +10,10 @@ use crate::{
     session::logs::render_log_session,
 };
 
+/// Long-lived plumbing function: the CLI surface (`LogsArgs`) maps 1:1
+/// to these orthogonal parameters; a parameter-object refactor would add
+/// indirection at the only call site for no win.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_logs(
     config: &AppConfig,
     id: &str,
