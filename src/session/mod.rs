@@ -142,9 +142,6 @@ pub struct SessionLiveSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
-// S3.1/S3.2: relay-only variants; per-variant `// relay-only` doc would be
-// a follow-up so each subscriber can be enumerated.
-#[allow(dead_code)]
 #[allow(clippy::enum_variant_names)] // Session-prefix is the protocol contract; renaming diverges from wire docs.
 pub enum SessionEvent {
     SessionCreated(SessionSummary),

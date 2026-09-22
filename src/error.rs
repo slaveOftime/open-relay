@@ -18,10 +18,6 @@ pub enum AppError {
     DaemonUnavailable(String),
     #[error("{0}")]
     RequestFailed(String),
-    /// Reserved for future milestone feature gates.
-    #[allow(dead_code)]
-    #[error("unsupported command in this milestone: {0}")]
-    Unimplemented(&'static str),
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("node not connected: {0}")]

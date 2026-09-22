@@ -172,41 +172,6 @@ pub fn ensure_success_response(response: RpcResponse) -> Result<RpcResponse> {
     }
 }
 
-#[allow(dead_code)]
-pub async fn read_request(stream: &mut Stream) -> Result<RpcRequest> {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    let read = read_line_bounded(&mut reader, &mut line).await?;
-    if read == 0 {
-        return Err(AppError::Protocol(
-            "client disconnected before request".to_string(),
-        ));
-    }
-
-    let envelope: RpcEnvelope<RpcRequest> = serde_json::from_str(line.trim_end())?;
-    if envelope.version != PROTOCOL_VERSION {
-        return Err(AppError::Protocol(format!(
-            "protocol version {} is not supported",
-            envelope.version
-        )));
-    }
-
-    Ok(envelope.payload)
-}
-
-#[allow(dead_code)]
-pub async fn write_response(stream: &mut Stream, payload: RpcResponse) -> Result<()> {
-    let envelope = RpcEnvelope {
-        version: PROTOCOL_VERSION,
-        payload,
-    };
-    let message = serde_json::to_string(&envelope)?;
-    stream.write_all(message.as_bytes()).await?;
-    stream.write_all(b"\n").await?;
-    stream.flush().await?;
-    Ok(())
-}
-
 // ── Streaming-attach split-half helpers ────────────────────────────────────
 
 /// Read a single `RpcRequest` from the read-half of a split stream.

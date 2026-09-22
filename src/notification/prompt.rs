@@ -19,12 +19,6 @@ pub fn compile_prompt_patterns(patterns: &[String]) -> Vec<regex::Regex> {
 }
 
 /// Returns `true` if any line of `raw_excerpt` matches any compiled pattern.
-/// Convenience wrapper around [`find_prompt_match`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn matches_prompt(raw_excerpt: &str, patterns: &[regex::Regex]) -> bool {
-    find_prompt_match(raw_excerpt, patterns).is_some()
-}
-
 /// Returns the source string of the first pattern that matches any line of
 /// `raw_excerpt` (after ANSI stripping), or `None` if nothing matched.
 /// Used by the daemon to include the matched rule in log output.
@@ -283,6 +277,11 @@ mod tests {
     }
 
     // ── compile / find_prompt_match infrastructure ───────────────────────
+    /// Test-only shorthand: the production API is `find_prompt_match(...).is_some()`.
+    /// The boolean form makes the default-patterns assertions below readable.
+    fn matches_prompt(raw: &str, patterns: &[regex::Regex]) -> bool {
+        find_prompt_match(raw, patterns).is_some()
+    }
 
     #[test]
     fn test_compile_valid_patterns() {
