@@ -1154,16 +1154,16 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             AppAction::None
         }
         _ if is_clone_dialog_key(key) => {
-            let Some(session) = app.selected_session() else {
-                app.set_action_message(Some("no session selected to clone".to_string()));
+            let Some(session) = app.focused_session() else {
+                app.set_action_message(Some("no session in focus to clone".to_string()));
                 return AppAction::None;
             };
             app.clone_dialog = Some(CloneDialog::from_session(session, list_node));
             AppAction::None
         }
         _ if is_update_dialog_key(key) => {
-            let Some(session) = app.selected_session() else {
-                app.set_action_message(Some("no session selected to update".to_string()));
+            let Some(session) = app.focused_session() else {
+                app.set_action_message(Some("no session in focus to update".to_string()));
                 return AppAction::None;
             };
             app.update_dialog = Some(UpdateDialog::from_session(session, list_node));
@@ -1174,8 +1174,8 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
             AppAction::None
         }
         KeyCode::Char('k' | 'K') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let Some(session) = app.selected_session() else {
-                app.set_action_message(Some("no session selected to stop".to_string()));
+            let Some(session) = app.focused_session() else {
+                app.set_action_message(Some("no session in focus to stop".to_string()));
                 return AppAction::None;
             };
             if !matches!(session.status.as_str(), "created" | "running") {
@@ -1894,6 +1894,32 @@ impl App {
             .flatten()
     }
 
+    /// Return the session the user is currently focused on regardless of
+    /// view mode. In list mode, that's `self.selected` (sanity-checked
+    /// against `self.visible`). In tree mode, the user's arrow nav
+    /// drives `tree.cursor`, so the focused session is the one sitting
+    /// under that cursor — *without* any visibility pre-check, because
+    /// `visible` is the filtered list and the tree view deliberately
+    /// ignores filters (see P3.2 TODO).
+    ///
+    /// Keeping this in one helper means every dial action (Enter,
+    /// Ctrl+D duplicate, Ctrl+U update, inline open) reads the same
+    /// "what is the user pointing at" answer, no matter which view is
+    /// showing.
+    fn focused_session(&self) -> Option<&SessionSummary> {
+        match self.view_mode {
+            ViewMode::List => self.selected_session(),
+            ViewMode::Tree => self
+                .tree
+                .visible
+                .get(self.tree.cursor)
+                .and_then(|entry| match entry {
+                    TreeEntry::Session { session, .. } => self.sessions.get(*session),
+                    TreeEntry::Folder { .. } => None,
+                }),
+        }
+    }
+
     fn select_visible(&mut self, offset: isize) {
         if self.visible.is_empty() {
             return;
@@ -2007,10 +2033,39 @@ impl App {
         // their first differing ancestor. Sessions with no `cwd` and sessions
         // whose cwd equals the common prefix land directly on the synthetic
         // root as direct_sessions.
-        let cwds: Vec<PathBuf> = self
+        //
+        // The tree honours both the active search filter and the status
+        // filter so users can scope the tree the same way they scope the
+        // flat list. Sessions that don't match are simply not bucketed,
+        // and folders that end up empty after filtering collapse
+        // gracefully (the walker skips empty leaves).
+        let matches_filter = |index: usize, session: &SessionSummary| {
+            let active = is_active_status(&session.status);
+            let status_ok = match self.status_filter {
+                StatusFilter::All => true,
+                StatusFilter::Active => active,
+                StatusFilter::Inactive => !active,
+            };
+            if !status_ok {
+                return false;
+            }
+            if self.normalized_filter.is_empty() {
+                return true;
+            }
+            self.search_text
+                .get(index)
+                .is_some_and(|text| text.contains(&self.normalized_filter))
+        };
+        let filtered_sessions: Vec<(usize, &SessionSummary)> = self
             .sessions
             .iter()
-            .map(|session| {
+            .enumerate()
+            .filter(|(index, session)| matches_filter(*index, session))
+            .collect();
+
+        let cwds: Vec<PathBuf> = filtered_sessions
+            .iter()
+            .map(|(_, session)| {
                 session
                     .cwd
                     .as_deref()
@@ -2021,7 +2076,7 @@ impl App {
             .collect();
         let common = common_path_prefix(&cwds);
 
-        for (index, session) in self.sessions.iter().enumerate() {
+        for (index, session) in filtered_sessions {
             let cwd = session
                 .cwd
                 .as_deref()
@@ -2051,6 +2106,64 @@ impl App {
         // case-insensitively because human-friendly ordering should not
         // depend on whether the cwd had capitals.
         self.sort_tree_nodes();
+
+        // Prune folders that ended up empty after filtering. Without
+        // this, a search filter that hides every session under `proj/`
+        // would still leave `proj/` (and any empty ancestors above it)
+        // visible as zero-content rows. Folders that survive are the
+        // ones hosting at least one (possibly indirect) matching
+        // session.
+        self.prune_empty_tree_nodes();
+    }
+
+    /// Drop every folder whose `subfolders` post-prune is empty *and*
+    /// whose `direct_sessions` is empty. Repeatedly shrinking the
+    /// list-of-children keeps parent folders in line: a folder is only
+    /// considered empty once all of its descendants have been
+    /// eliminated. The synthetic root (`index 0`) is preserved even if
+    /// it ends up empty — the empty-state message still wants to be
+    /// anchored somewhere.
+    fn prune_empty_tree_nodes(&mut self) {
+        // Iterate until a pass removes nothing. Removing a child from a
+        // parent can empty the parent itself, which the next pass
+        // catches, and so on up the chain.
+        loop {
+            let mut empty_indices: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for (idx, node) in self.tree.nodes.iter().enumerate() {
+                if idx == self.tree.root {
+                    continue;
+                }
+                if node.subfolders.is_empty() && node.direct_sessions.is_empty() {
+                    empty_indices.insert(idx);
+                }
+            }
+            if empty_indices.is_empty() {
+                break;
+            }
+            let removed = empty_indices.len();
+            for parent in &mut self.tree.nodes {
+                parent
+                    .subfolders
+                    .retain(|child| !empty_indices.contains(child));
+            }
+            // Invalidate the survivor set every pass so a chain like
+            // `root → proj` collapses once `proj` becomes empty.
+            let mut still_empty: std::collections::HashSet<usize> =
+                std::collections::HashSet::new();
+            for (idx, node) in self.tree.nodes.iter().enumerate() {
+                if idx == self.tree.root {
+                    continue;
+                }
+                if node.subfolders.is_empty() && node.direct_sessions.is_empty() {
+                    still_empty.insert(idx);
+                }
+            }
+            let _ = removed;
+            if still_empty == empty_indices {
+                break;
+            }
+        }
     }
 
     /// Sort every node's `subfolders` (by `name`) and `direct_sessions`
@@ -2104,6 +2217,13 @@ impl App {
     /// continues to reflect current sessions so a Ctrl+G <-> Ctrl+G round
     /// trip leaves selection unchanged.
     fn toggle_view_mode(&mut self) {
+        // Each mode owns its cursor independently:
+        //   * tree mode uses `tree.cursor` and `tree.visible`;
+        //   * list mode uses `self.selected` and `self.visible`.
+        // We intentionally do **not** splice one cursor into the other
+        // here, so a Ctrl+G round-trip leaves the user exactly where
+        // they were in each mode last time. `focused_session` knows
+        // which cursor to read for the active view.
         self.view_mode = match self.view_mode {
             ViewMode::List => ViewMode::Tree,
             ViewMode::Tree => ViewMode::List,
@@ -2148,17 +2268,36 @@ impl App {
         }
     }
 
-    /// Enter pressed in tree mode: drill on a folder, open inline on a
-    /// session. Returns the action the caller should fan out to (only
-    /// `AppAction::OpenInline` is ever produced for sessions; everything
-    /// else resolves to `AppAction::None` since drilling is internal).
+    /// Enter pressed in tree mode: drill on a folder at depth
+    /// `>= auto_depth`, descend into a folder whose children are already
+    /// auto-visible, or open a session inline. Returns the action the
+    /// caller should fan out to (only `AppAction::OpenInline` is ever
+    /// produced; drilling and descending are internal cursor moves).
     fn tree_enter(&mut self) -> AppAction {
         match self.tree.visible.get(self.tree.cursor).copied() {
-            Some(TreeEntry::Folder { .. }) => {
-                self.toggle_tree_drill();
+            Some(TreeEntry::Folder { depth, .. }) => {
+                if depth >= self.tree.auto_depth {
+                    // Past the auto-depth horizon the children are
+                    // hidden; pressing Enter is the only way to expose
+                    // them, so drilling is the right action.
+                    self.toggle_tree_drill();
+                } else {
+                    // The folder's children are already on screen. Treat
+                    // Enter as "descend into this folder": move the
+                    // cursor one row down so the user lands on the
+                    // first item inside. Without this, Enter on a
+                    // shallow folder felt like a dead key.
+                    let next = (self.tree.cursor + 1)
+                        .min(self.tree.visible.len().saturating_sub(1));
+                    self.tree.cursor = next;
+                }
                 AppAction::None
             }
             Some(TreeEntry::Session { session, .. }) => {
+                // Mirror the focused session into `self.selected` so any
+                // follow-on helper that still reads `self.selected`
+                // (e.g. terminal open) lands on the right row when the
+                // action handler runs.
                 self.selected = session;
                 AppAction::OpenInline
             }
@@ -2181,7 +2320,15 @@ impl App {
     fn update_text_filter(&mut self) {
         self.normalized_filter = self.filter.to_lowercase();
         self.rebuild_visible();
-        self.first();
+        // Reset the cursor that matches the active view: `self.selected`
+        // for list mode (via `first()`), `tree.cursor` for tree mode so
+        // breadcrumbs don't drag the user off-screen after a filter
+        // change drops rows out from under them.
+        if self.view_mode == ViewMode::Tree {
+            self.tree.cursor = 0;
+        } else {
+            self.first();
+        }
         self.set_action_message(None);
     }
 
@@ -2228,7 +2375,13 @@ impl App {
             StatusFilter::Inactive => StatusFilter::All,
         };
         self.rebuild_visible();
-        self.first();
+        if self.view_mode == ViewMode::Tree {
+            // `first()` only drives the flat-list cursor, so reset the
+            // tree cursor ourselves when the active view is the tree.
+            self.tree.cursor = 0;
+        } else {
+            self.first();
+        }
         self.set_action_message(Some(format!(
             "showing {} sessions · Ctrl+S toggle",
             self.status_filter.label()
@@ -2236,7 +2389,7 @@ impl App {
     }
 
     fn open_selected_terminal(&mut self, node: Option<&str>) {
-        let Some(session) = self.selected_session() else {
+        let Some(session) = self.focused_session() else {
             return;
         };
         let attach = is_active_status(&session.status);
@@ -2285,7 +2438,7 @@ fn open_selected_inline(
     app: &mut App,
     node: Option<&str>,
 ) -> Result<()> {
-    let Some(session) = app.selected_session() else {
+    let Some(session) = app.focused_session() else {
         return Ok(());
     };
     let id = session.id.clone();
@@ -3571,24 +3724,30 @@ fn session_line(
     selected: bool,
     now: Instant,
 ) -> Line<'static> {
-    // Mirrors `session_row` format ("state icon | cmd args | title | xxxx")
-    // without the table constraints. The state icon distils status into a
-    // single glyph so the column is exactly 1 cell wide.
+    // Mirrors `session_row` format ("state icon | status text | cmd args
+    // | title | rate | cwd") without the table constraints. The state
+    // icon distils status into a single glyph so the column is exactly 1
+    // cell wide; the status word ("running" / "completed" / "attention"
+    // / "failed" ...) sits in its own span **sharing the same colour **
+    // as the glyph, so users never see the colour say one thing and the
+    // label say another.
     let active = is_active_status(&session.status);
     let (glyph, glyph_color) = status_glyph(&session.status, session.input_needed);
-    let glyph_color = if !active {
-        if selected {
-            Color::Gray
-        } else {
-            Color::DarkGray
-        }
+    let status_word = status_label(&session.status, session.input_needed);
+    // Pick the right status-cell colour: the inactive-session dimmer
+    // mirrors the glyph dim so they stay in lock-step.
+    let (glyph_color_resolved, status_color_resolved) = if !active {
+        let dim = if selected { Color::Gray } else { Color::DarkGray };
+        (dim, dim)
     } else {
-        glyph_color
+        (glyph_color, glyph_color)
     };
-    let mut glyph_style = Style::default().fg(glyph_color);
+    let mut status_style = Style::default().fg(status_color_resolved);
     if session.input_needed {
-        glyph_style = glyph_style.add_modifier(Modifier::BOLD);
+        status_style = status_style.add_modifier(Modifier::BOLD);
     }
+    let status_text_style = status_style;
+    let glyph_style = status_style.fg(glyph_color_resolved);
 
     let muted = if selected {
         Color::White
@@ -3604,13 +3763,14 @@ fn session_line(
     };
 
     // Rate widget (compact 1-cell indicator: arrow + dim cell).
-    let _ = rate_arrow; // silence unused when preview-disabled; used below.
     let tree_cwd = tree_relative_cwd(&session.cwd);
     let (rate_glyph, rate_glyph_color) = rate_arrow(rate, now);
     let title_text = session.title.clone().unwrap_or_default();
     Line::from(vec![
         Span::raw("  ".repeat(depth + 1)), // indent past the folder connector
         Span::styled(glyph.to_string(), glyph_style),
+        Span::raw("  "),
+        Span::styled(status_word.to_string(), status_text_style),
         Span::raw("  "),
         Span::styled(cmd_args, dim),
         Span::raw("  "),
@@ -4685,6 +4845,23 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// Drain a ratatui `Buffer` into one `String` per visual row. Useful
+    /// for assertions that need to match display substrings without
+    /// caring about the column the substring lives in.
+    fn buffer_symbols(buffer: &ratatui::buffer::Buffer, height: u16) -> Vec<String> {
+        (0..height)
+            .map(|y| {
+                let mut line = String::new();
+                for x in 0..buffer.area.width {
+                    if let Some(cell) = buffer.cell((x, y)) {
+                        line.push_str(cell.symbol());
+                    }
+                }
+                line
+            })
+            .collect()
+    }
+
     #[test]
     fn attention_pulse_animates_the_state_cell_as_time_passes() {
         let mut app = App::default();
@@ -5076,6 +5253,196 @@ mod tests {
         assert_eq!(
             app.tree.cursor,
             ((5isize) - 7).rem_euclid(total as isize) as usize
+        );
+    }
+
+    #[test]
+    fn tree_enter_on_session_uses_cursor_not_stale_selected() {
+        // Regression: `route_key(Enter)` in tree mode used to delegate to
+        // `app.selected_session()`, which checks `self.visible.contains
+        // (&self.selected)`. In tree mode navigation only updates
+        // `tree.cursor`, so a tree-only session (one the user navigated
+        // to in tree mode before ever stepping on it in list mode)
+        // silently failed to open because `self.selected` stayed
+        // pointed at an unrelated session. The fix is `focused_session`,
+        // which reads `tree.cursor` in tree mode.
+        let mut app = App::default();
+        let mut alpha = session_at("alpha", Some("/work/a"));
+        alpha.command = "ls".into();
+        let mut bravo = session_at("bravo", Some("/work/b"));
+        bravo.command = "vim".into();
+        app.replace_sessions(vec![alpha, bravo]);
+
+        // Stay in tree mode for the whole test.
+        app.toggle_view_mode();
+        // The tree view shows both sessions grouped under `work/`.
+        assert!(!app.tree.visible.is_empty());
+
+        // Place the cursor on the `vim` session, *without* ever syncing
+        // `self.selected` to that row first.
+        let target = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry, super::TreeEntry::Session { session, .. }
+                    if app.sessions[*session].command == "vim")
+            })
+            .expect("vim should appear in tree");
+        app.tree.cursor = target;
+        // Make `self.selected` stale on purpose to prove Enter reads the
+        // tree cursor, not `self.selected`.
+        app.selected = 0;
+        let action = route_key(&mut app, key(KeyCode::Enter), None);
+        assert_eq!(
+            action,
+            AppAction::OpenInline,
+            "Enter must open the tree-cursor session even when `self.selected` is stale"
+        );
+        assert_eq!(app.sessions[app.selected].command, "vim");
+    }
+
+    #[test]
+    fn ctrl_d_in_tree_mode_uses_tree_cursor_session() {
+        // Regression: Ctrl+D used to call `app.selected_session()`, which
+        // reads `self.selected`. In tree mode, navigation only writes to
+        // `tree.cursor`, so without `focused_session()` the dialog opened
+        // pre-filled with whatever session was last visited in list mode
+        // — typically an entirely different row than the one the user is
+        // staring at.
+        let mut app = App::default();
+        let mut ls = session_at("ls", Some("/work/a"));
+        ls.command = "bash".into();
+        let mut vim = session_at("vim", Some("/work/b"));
+        vim.command = "vim".into();
+        app.replace_sessions(vec![ls, vim]);
+        app.toggle_view_mode();
+        // Put the cursor on the second session row.
+        let vim_row = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry, super::TreeEntry::Session { session, .. }
+                    if app.sessions[*session].command == "vim")
+            })
+            .expect("vim should appear in tree");
+        app.tree.cursor = vim_row;
+
+        route_key(&mut app, ctrl(KeyCode::Char('d')), None);
+        let dialog = app
+            .clone_dialog
+            .as_ref()
+            .expect("Ctrl+D should open the clone dialog");
+        assert_eq!(dialog.command.value.as_str(), "vim");
+        assert_eq!(dialog.source_id.as_deref(), Some("vim"));
+    }
+
+    #[test]
+    fn tree_filter_sessions_by_search_text() {
+        // The tree honors the search filter: a non-matching filter
+        // should collapse every folder that has no surviving session in
+        // its subtree, while a partially-matching filter keeps the
+        // path to the surviving session.
+        let mut app = App::default();
+        let mut lint = session_at("s1", Some("/proj/lint-target"));
+        lint.command = "lint".into();
+        let mut build = session_at("s2", Some("/proj/build-target"));
+        build.command = "build".into();
+        app.replace_sessions(vec![lint, build]);
+        app.toggle_view_mode();
+        let pre_filter_session_count = app
+            .tree
+            .visible
+            .iter()
+            .filter(|e| matches!(e, super::TreeEntry::Session { .. }))
+            .count();
+        assert_eq!(pre_filter_session_count, 2);
+
+        // Apply a filter that matches nothing.
+        app.normalized_filter = "no-such-thing".into();
+        app.rebuild_visible();
+        let post_filter_session_count = app
+            .tree
+            .visible
+            .iter()
+            .filter(|e| matches!(e, super::TreeEntry::Session { .. }))
+            .count();
+        assert_eq!(post_filter_session_count, 0);
+        assert_eq!(
+            app.tree.visible.iter().filter(|e| matches!(
+                e,
+                super::TreeEntry::Folder { .. }
+            ))
+            .count(),
+            0,
+            "no folders should be visible when filter hides every host session"
+        );
+
+        // Apply a filter that matches exactly one session — the path to
+        // that session must remain visible.
+        app.normalized_filter = "build".into();
+        app.rebuild_visible();
+        let partial_session_count = app
+            .tree
+            .visible
+            .iter()
+            .filter(|e| matches!(e, super::TreeEntry::Session { .. }))
+            .count();
+        assert_eq!(partial_session_count, 1);
+        let partial_folder_count = app
+            .tree
+            .visible
+            .iter()
+            .filter(|e| matches!(e, super::TreeEntry::Folder { .. }))
+            .count();
+        assert!(
+            partial_folder_count >= 2,
+            "matching path's folder chain (proj/, proj/build-target) should be visible"
+        );
+    }
+
+    #[test]
+    fn tree_render_shows_status_word_with_matching_color() {
+        // Regression: the tree view used to skip the status text entirely,
+        // so users could only guess at session state from the icon. Worse,
+        // when the status text DID appear, it picked an independent colour
+        // from the icon, so the colour and the label could disagree.
+        let mut app = App::default();
+        let mut s = session_at("only", Some("/a"));
+        s.command = "test".into();
+        s.status = "running".into();
+        app.replace_sessions(vec![s]);
+        app.toggle_view_mode();
+        let buffer = render_app_buffer(&mut app, 120, 6);
+        let symbols = buffer_symbols(&buffer, 4);
+        // The status label "running" must appear on the same line as the
+        // session command.
+        let row_hit = symbols.iter().any(|line| line.contains("running") && line.contains("test"));
+        assert!(
+            row_hit,
+            "tree row must contain both the status label and the command. Got: {symbols:?}"
+        );
+        // Status colour and label must come from the same display cell:
+        // glyph at the icon column and the word "running" must share the
+        // same foreground colour when the session is active.
+        let cell_at = |row: u16, col: u16| -> ratatui::style::Color {
+            buffer.cell((col, row)).map(|c| c.fg).unwrap_or_default()
+        };
+        // Find the row containing the session and the icon column (the
+        // first non-space glyph). Use a rough heuristic: the first row
+        // containing "test" is our session row.
+        let (session_row, _) = symbols
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("test"))
+            .expect("session row present");
+        // The icon is at indent_width(depth=2) = 4 cells in.
+        let icon_color = cell_at(session_row as u16, 4);
+        let word_color = cell_at(session_row as u16, 13); // "  " + icon(1) + " " (1) + word start
+        assert_eq!(
+            icon_color, word_color,
+            "icon and status word must share foreground color"
         );
     }
 
@@ -5670,7 +6037,7 @@ mod tests {
         );
         assert_eq!(
             app.message.as_deref(),
-            Some("no session selected to update")
+            Some("no session in focus to update")
         );
 
         app.replace_sessions(vec![session("source")]);
@@ -6102,7 +6469,7 @@ mod tests {
             route_key(&mut app, ctrl(KeyCode::Char('k')), None),
             AppAction::None
         );
-        assert_eq!(app.message.as_deref(), Some("no session selected to stop"));
+        assert_eq!(app.message.as_deref(), Some("no session in focus to stop"));
 
         let mut active = session("active");
         active.node = Some("worker-a".to_string());
