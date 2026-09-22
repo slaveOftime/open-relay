@@ -66,7 +66,7 @@ pub async fn health() -> impl IntoResponse {
 
 pub async fn push_public_key(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "public_key": state.config.get().web_push_vapid_public_key.clone()
+        "public_key": state.config.get().web_push.vapid_public_key.clone()
     }))
 }
 
@@ -565,7 +565,7 @@ pub async fn stop_session(
 ) -> impl IntoResponse {
     let grace = body
         .and_then(|b| b.grace_seconds)
-        .unwrap_or(state.config.get().stop_grace_seconds);
+        .unwrap_or(state.config.get().limits.stop_grace_seconds);
 
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::Stop {

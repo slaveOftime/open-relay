@@ -35,12 +35,12 @@ pub(super) async fn run_notification_monitor(
 
     // Prompt patterns are cached compiled and rebuilt whenever a config hot
     // reload swaps in a different source list.
-    let mut cached_pattern_sources = config.get().prompt_patterns.clone();
+    let mut cached_pattern_sources = config.get().notify.prompt_patterns.clone();
     let mut patterns = compile_prompt_patterns(&cached_pattern_sources);
 
     info!(
-        silence_seconds = config.get().silence_seconds,
-        min_notification_interval_seconds = config.get().notification_min_interval_seconds,
+        silence_seconds = config.get().limits.silence_seconds,
+        min_notification_interval_seconds = config.get().notify.min_interval_seconds,
         prompt_patterns = patterns.len(),
         "notification monitor started"
     );
@@ -51,11 +51,11 @@ pub(super) async fn run_notification_monitor(
         // Read the live config each tick so hot-reloaded values (silence
         // window, prompt patterns) apply without a daemon restart.
         let current_config = config.get();
-        let silence = std::time::Duration::from_secs(current_config.silence_seconds);
+        let silence = std::time::Duration::from_secs(current_config.limits.silence_seconds);
         let min_notification_interval =
-            std::time::Duration::from_secs(current_config.notification_min_interval_seconds);
-        if current_config.prompt_patterns != cached_pattern_sources {
-            cached_pattern_sources = current_config.prompt_patterns.clone();
+            std::time::Duration::from_secs(current_config.notify.min_interval_seconds);
+        if current_config.notify.prompt_patterns != cached_pattern_sources {
+            cached_pattern_sources = current_config.notify.prompt_patterns.clone();
             patterns = compile_prompt_patterns(&cached_pattern_sources);
             info!(
                 prompt_patterns = patterns.len(),
@@ -178,19 +178,19 @@ fn sanitize_notification_excerpt(input: &str) -> String {
 pub(super) fn build_notifier(db: Arc<Database>, config: &AppConfig) -> Notifier {
     let mut channels: Vec<Box<dyn NotificationChannel + Send + Sync>> =
         vec![Box::new(LocalOsNotificationChannel {
-            hook: config.notification_hook.clone(),
+            hook: config.notify.hook.clone(),
         })];
 
     if let (Some(vapid_public_key), Some(vapid_private_key), Some(vapid_subject)) = (
-        config.web_push_vapid_public_key.clone(),
-        config.web_push_vapid_private_key.clone(),
-        config.web_push_subject.clone(),
+        config.web_push.vapid_public_key.clone(),
+        config.web_push.vapid_private_key.clone(),
+        config.web_push.subject.clone(),
     ) {
         match WebPushChannel::new(
             &vapid_private_key,
             &vapid_public_key,
             &vapid_subject,
-            config.web_push_proxy.as_deref(),
+            config.web_push.proxy.as_deref(),
             db,
         ) {
             Ok(channel) => {

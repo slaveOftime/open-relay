@@ -38,9 +38,9 @@ pub struct DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = storage::remove_file_if_exists(&self.config.lock_file);
-        let _ = storage::remove_file_if_exists(&self.config.info_file);
-        let _ = storage::remove_file_if_exists(&self.config.socket_file);
+        let _ = storage::remove_file_if_exists(&self.config.paths.lock_file);
+        let _ = storage::remove_file_if_exists(&self.config.paths.info_file);
+        let _ = storage::remove_file_if_exists(&self.config.paths.socket_file);
     }
 }
 
@@ -118,23 +118,23 @@ async fn acquire_daemon_start_lock(config: &AppConfig) -> Result<File> {
     let deadline = std::time::Instant::now() + LOCK_STARTUP_GRACE;
 
     loop {
-        match storage::try_acquire_daemon_lock(&config.lock_file) {
+        match storage::try_acquire_daemon_lock(&config.paths.lock_file) {
             Ok(file) => return Ok(file),
             Err(AppError::DaemonAlreadyRunning) => {
                 if daemon_is_healthy(config).await {
                     return Err(AppError::DaemonAlreadyRunning);
                 }
 
-                if let Some(pid) = storage::read_pid(&config.lock_file)?
+                if let Some(pid) = storage::read_pid(&config.paths.lock_file)?
                     && process_is_running(pid)
                 {
                     return Err(AppError::DaemonAlreadyRunning);
                 }
 
                 if std::time::Instant::now() >= deadline {
-                    storage::remove_file_if_exists(&config.lock_file)?;
-                    storage::remove_file_if_exists(&config.socket_file)?;
-                    return storage::try_acquire_daemon_lock(&config.lock_file);
+                    storage::remove_file_if_exists(&config.paths.lock_file)?;
+                    storage::remove_file_if_exists(&config.paths.socket_file)?;
+                    return storage::try_acquire_daemon_lock(&config.paths.lock_file);
                 }
 
                 tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
@@ -211,7 +211,7 @@ pub async fn start(
             overrides.http_port,
             overrides.notification_hook.as_deref(),
             overrides.web_push_proxy.as_deref(),
-            &config.state_dir,
+            &config.paths.state_dir,
         )?;
         wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
 
@@ -231,7 +231,7 @@ pub async fn status(config: AppConfig) -> Result<()> {
 
     println!("Daemon is running...");
 
-    let info = storage::read_daemon_info(&config.info_file)?;
+    let info = storage::read_daemon_info(&config.paths.info_file)?;
     let (no_http, no_auth, started_at) = info
         .as_ref()
         .map(|i| (i.no_http, i.no_auth, Some(i.started_at.clone())))
@@ -253,8 +253,8 @@ pub async fn status(config: AppConfig) -> Result<()> {
 fn effective_status_config(config: &AppConfig, info: Option<&storage::DaemonInfo>) -> AppConfig {
     let mut effective = config.clone();
     if let Some(info) = info {
-        effective.http_bind = info.http_bind.clone();
-        effective.http_port = info.http_port;
+        effective.http.bind = info.http_bind.clone();
+        effective.http.port = info.http_port;
     }
     effective
 }
@@ -262,7 +262,9 @@ fn effective_status_config(config: &AppConfig, info: Option<&storage::DaemonInfo
 /// The summary of the currently running daemon for the already-running
 /// error path: same source-of-truth rules as `daemon status`.
 fn running_daemon_summary(config: &AppConfig) -> String {
-    let info = storage::read_daemon_info(&config.info_file).ok().flatten();
+    let info = storage::read_daemon_info(&config.paths.info_file)
+        .ok()
+        .flatten();
     let (no_http, no_auth) = info
         .as_ref()
         .map(|i| (i.no_http, i.no_auth))
@@ -290,7 +292,7 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
         let _ = writeln!(
             out,
             "HTTP:         {}",
-            format_http_url(&config.http_bind, config.http_port)
+            format_http_url(&config.http.bind, config.http.port)
         );
         let _ = writeln!(
             out,
@@ -303,13 +305,13 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
         );
     }
 
-    let _ = writeln!(out, "ROOT:         {}", config.state_dir.display());
+    let _ = writeln!(out, "ROOT:         {}", config.paths.state_dir.display());
     let _ = writeln!(
         out,
         "LOGS:         {}",
-        config.state_dir.join("logs").display()
+        config.paths.state_dir.join("logs").display()
     );
-    let _ = writeln!(out, "SESSIONS:     {}", config.sessions_dir.display());
+    let _ = writeln!(out, "SESSIONS:     {}", config.paths.sessions_dir.display());
     out
 }
 
@@ -346,7 +348,7 @@ async fn wait_for_daemon_ready(
         {
             return Err(AppError::DaemonUnavailable(format!(
                 "daemon process exited before becoming ready. Check logs under {}",
-                config.state_dir.display()
+                config.paths.state_dir.display()
             )));
         }
 
@@ -500,26 +502,26 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     info!(
         no_http,
         auth_enabled = auth_hash.is_some(),
-        state_dir = ?config.state_dir,
-        sessions_dir = ?config.sessions_dir,
+        state_dir = ?config.paths.state_dir,
+        sessions_dir = ?config.paths.sessions_dir,
         "daemon foreground initialization"
     );
 
-    storage::ensure_state_dirs(&config.state_dir, &config.sessions_dir)?;
+    storage::ensure_state_dirs(&config.paths.state_dir, &config.paths.sessions_dir)?;
 
     let lock = acquire_daemon_start_lock(&config).await?;
 
-    storage::write_pid(&config.lock_file, std::process::id())?;
+    storage::write_pid(&config.paths.lock_file, std::process::id())?;
 
     let no_auth = auth_hash.is_none();
     storage::write_daemon_info(
-        &config.info_file,
+        &config.paths.info_file,
         &storage::DaemonInfo {
             no_http,
             no_auth,
             started_at: chrono::Utc::now().to_rfc3339(),
-            http_bind: config.http_bind.clone(),
-            http_port: config.http_port,
+            http_bind: config.http.bind.clone(),
+            http_port: config.http.port,
         },
     )?;
 
@@ -529,7 +531,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     };
 
     let file_appender =
-        tracing_appender::rolling::daily(config.state_dir.join("logs"), "daemon.log");
+        tracing_appender::rolling::daily(config.paths.state_dir.join("logs"), "daemon.log");
     let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = tracing_subscriber::fmt::layer()
@@ -558,14 +560,15 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // wrong silently. See daemon::crash for why this is needed: the process
     // normally runs fully detached with stdout/stderr discarded, so panics
     // and native crashes previously left no trace at all.
-    crash::install_panic_hook(config.state_dir.clone());
-    crash::install_native_crash_handler(config.state_dir.clone());
+    crash::install_panic_hook(config.paths.state_dir.clone());
+    crash::install_native_crash_handler(config.paths.state_dir.clone());
 
     let pid = std::process::id();
     info!(pid, log_level = %config.log_level, "daemon started");
 
-    let db = Arc::new(Database::open(&config.db_file, config.sessions_dir.clone()).await?);
-    info!(db_file = ?config.db_file, "database opened");
+    let db =
+        Arc::new(Database::open(&config.paths.db_file, config.paths.sessions_dir.clone()).await?);
+    info!(db_file = ?config.paths.db_file, "database opened");
 
     let node_registry = Arc::new(NodeRegistry::new());
     let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
@@ -578,12 +581,12 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // existing socket file fails with EADDRINUSE, which silently prevents the
     // daemon from starting and makes the parent `wait_for_daemon_ready` loop
     // appear to hang.
-    storage::remove_file_if_exists(&config.socket_file)?;
+    storage::remove_file_if_exists(&config.paths.socket_file)?;
 
     let listener = ipc::bind(&config)?;
-    info!(socket_file = ?config.socket_file, "ipc listener bound");
+    info!(socket_file = ?config.paths.socket_file, "ipc listener bound");
     let (store, startup_failed_sessions) = {
-        let store = SessionStore::new(config.session_eviction_seconds, db.clone());
+        let store = SessionStore::new(config.limits.session_eviction_seconds, db.clone());
         let startup_failed_sessions = store.load_running_stopping_sessions().await;
         (store, startup_failed_sessions)
     };
@@ -623,7 +626,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         // HTTP disabled — no host key needed, use placeholder.
         http::SshHostKey::disabled()
     } else {
-        http::SshHostKey::create_or_load(&config.state_dir)
+        http::SshHostKey::create_or_load(&config.paths.state_dir)
             .await
             .inspect_err(
                 |e| warn!(%e, "failed to create SSH host key, SSH-key node joins will be rejected"),
@@ -813,28 +816,38 @@ mod tests {
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
         AppConfig {
-            http_bind: "127.0.0.1".to_string(),
-            http_port: 15443,
+            paths: crate::config::PathsConfig {
+                state_dir: state_dir.clone(),
+                sessions_dir: state_dir.join("sessions"),
+                db_file: state_dir.join("oly.db"),
+                socket_name: "test.sock".to_string(),
+                socket_file: state_dir.join("daemon.sock"),
+                info_file: state_dir.join("daemon.info"),
+                lock_file: state_dir.join("daemon.lock"),
+            },
+            http: crate::config::HttpConfig {
+                bind: "127.0.0.1".to_string(),
+                port: 15443,
+            },
+            notify: crate::config::NotifyConfig {
+                min_interval_seconds: 10,
+                prompt_patterns: Vec::new(),
+                hook: None,
+            },
+            limits: crate::config::LimitsConfig {
+                max_running_sessions: 50,
+                session_eviction_seconds: 15,
+                screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
+                silence_seconds: 10,
+                stop_grace_seconds: 5,
+            },
+            web_push: crate::config::WebPushConfig {
+                subject: None,
+                vapid_public_key: None,
+                vapid_private_key: None,
+                proxy: None,
+            },
             log_level: "info".to_string(),
-            stop_grace_seconds: 5,
-            prompt_patterns: Vec::new(),
-            web_push_subject: None,
-            web_push_vapid_public_key: None,
-            web_push_vapid_private_key: None,
-            state_dir: state_dir.clone(),
-            sessions_dir: state_dir.join("sessions"),
-            db_file: state_dir.join("oly.db"),
-            lock_file: state_dir.join("daemon.lock"),
-            info_file: state_dir.join("daemon.info"),
-            socket_name: "test.sock".to_string(),
-            socket_file: state_dir.join("daemon.sock"),
-            silence_seconds: 10,
-            notification_min_interval_seconds: 10,
-            session_eviction_seconds: 15,
-            max_running_sessions: 50,
-            screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
-            notification_hook: None,
-            web_push_proxy: None,
             runtime_overrides: Default::default(),
         }
     }
@@ -883,12 +896,18 @@ mod tests {
 
         assert!(summary.contains("HTTP:         http://127.0.0.1:15443"));
         assert!(summary.contains("Auth:         disabled (--no-auth)"));
-        assert!(summary.contains(&format!("ROOT:         {}", config.state_dir.display())));
+        assert!(summary.contains(&format!(
+            "ROOT:         {}",
+            config.paths.state_dir.display()
+        )));
         assert!(summary.contains(&format!(
             "LOGS:         {}",
-            config.state_dir.join("logs").display()
+            config.paths.state_dir.join("logs").display()
         )));
-        assert!(summary.contains(&format!("SESSIONS:     {}", config.sessions_dir.display())));
+        assert!(summary.contains(&format!(
+            "SESSIONS:     {}",
+            config.paths.sessions_dir.display()
+        )));
     }
 
     #[test]
@@ -923,8 +942,8 @@ mod tests {
     fn status_endpoint_falls_back_to_client_config_without_info() {
         let config = test_config();
         let effective = effective_status_config(&config, None);
-        assert_eq!(effective.http_bind, "127.0.0.1");
-        assert_eq!(effective.http_port, 15443);
+        assert_eq!(effective.http.bind, "127.0.0.1");
+        assert_eq!(effective.http.port, 15443);
     }
 
     #[test]

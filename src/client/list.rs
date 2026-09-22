@@ -81,7 +81,8 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
                 if target.node.is_none() && !multiple_targets =>
             {
                 used_db_fallback = true;
-                let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
+                let db = Database::open(&config.paths.db_file, config.paths.sessions_dir.clone())
+                    .await?;
                 let total = db.count_summaries(&query).await?;
                 let sessions = db.list_summaries(&query).await?;
                 (sessions, total)

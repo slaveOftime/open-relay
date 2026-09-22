@@ -103,7 +103,7 @@ fn run_logs_raw(config: &AppConfig, id: &str, node: Option<String>) -> Result<()
         ));
     }
 
-    let session_dir = config.sessions_dir.join(id);
+    let session_dir = config.paths.sessions_dir.join(id);
     let journal_dir = session_dir.join(crate::session::journal::JOURNAL_DIR_NAME);
     if !journal_dir.is_dir() {
         return Err(AppError::Protocol(format!(
@@ -157,12 +157,12 @@ async fn run_logs_local(
         }
     }
 
-    let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
+    let db = Database::open(&config.paths.db_file, config.paths.sessions_dir.clone()).await?;
     let session = match db.get_session(id).await? {
         Some(session) => session,
         None => return Err(AppError::Protocol(format!("session not found: {id}"))),
     };
-    let session_dir = config.sessions_dir.join(id);
+    let session_dir = config.paths.sessions_dir.join(id);
 
     if !session_dir
         .join(crate::session::journal::JOURNAL_DIR_NAME)

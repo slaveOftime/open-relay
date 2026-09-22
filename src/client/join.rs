@@ -24,7 +24,7 @@ pub struct JoinConfig {
 }
 
 fn joins_path(config: &AppConfig) -> std::path::PathBuf {
-    config.state_dir.join("joins.json")
+    config.paths.state_dir.join("joins.json")
 }
 
 pub fn load_join_configs(config: &AppConfig) -> Vec<JoinConfig> {

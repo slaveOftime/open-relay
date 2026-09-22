@@ -67,13 +67,14 @@ async fn read_line_bounded<R: tokio::io::AsyncBufRead + Unpin>(
 pub async fn connect(config: &AppConfig) -> Result<Stream> {
     let stream = if GenericNamespaced::is_supported() {
         let name = config
+            .paths
             .socket_name
             .as_str()
             .to_ns_name::<GenericNamespaced>()
             .map_err(AppError::Io)?;
         Stream::connect(name).await
     } else {
-        let socket_file = config.socket_file.to_string_lossy().to_string();
+        let socket_file = config.paths.socket_file.to_string_lossy().to_string();
         let name = socket_file
             .as_str()
             .to_fs_name::<GenericFilePath>()
@@ -87,12 +88,13 @@ pub async fn connect(config: &AppConfig) -> Result<Stream> {
 pub fn bind(config: &AppConfig) -> io::Result<Listener> {
     if GenericNamespaced::is_supported() {
         let name = config
+            .paths
             .socket_name
             .as_str()
             .to_ns_name::<GenericNamespaced>()?;
         ListenerOptions::new().name(name).create_tokio()
     } else {
-        let socket_file = config.socket_file.to_string_lossy().to_string();
+        let socket_file = config.paths.socket_file.to_string_lossy().to_string();
         let name = socket_file.as_str().to_fs_name::<GenericFilePath>()?;
         let listener = ListenerOptions::new()
             .name(name)

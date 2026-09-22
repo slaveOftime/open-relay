@@ -54,17 +54,40 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
     r"(?i)press (?:enter|return|any key)",
 ];
 
-#[derive(Clone, Debug)]
-pub struct AppConfig {
-    pub http_bind: String,
-    pub http_port: u16,
-    pub log_level: String,
-    pub stop_grace_seconds: u64,
-    pub prompt_patterns: Vec<String>,
-    pub web_push_subject: Option<String>,
-    pub web_push_vapid_public_key: Option<String>,
-    pub web_push_vapid_private_key: Option<String>,
-    pub web_push_proxy: Option<String>,
+// ── Hot-reload diff helper (S3.4) ──────────────────────────────────────────
+//
+// `AppConfig::hot_reload_changes` and `restart_required_changes` used to be
+// two open-coded `if x != y { push("x") }` loops that grew with every new
+// setting — easy to add a field and forget to teach one of the lists, which
+// meant a config change could silently stop being applied.
+//
+// The sub-structs below each `impl ConfigDiff`, so the top-level diff
+// becomes a composition: add a field to a sub-struct, get its diff arm
+// populated by the macro. The two lists still need to make a deliberate
+// choice about which sub-struct's diff belongs where, but no per-field
+// hand-maintained bookkeeping survives.
+trait ConfigDiff {
+    fn diff(&self, other: &Self) -> Vec<&'static str>;
+}
+
+macro_rules! impl_config_diff {
+    ($T:ty { $($field:ident),+ $(,)? }) => {
+        impl ConfigDiff for $T {
+            fn diff(&self, other: &Self) -> Vec<&'static str> {
+                let mut out = Vec::new();
+                $(if self.$field != other.$field { out.push(stringify!($field)); })+
+                out
+            }
+        }
+    };
+}
+
+// ── Sub-structs ─────────────────────────────────────────────────────────────
+
+/// On-disk paths the daemon binds to once at startup.
+/// Changing any of these requires a restart (see `restart_required_changes`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathsConfig {
     pub state_dir: PathBuf,
     pub sessions_dir: PathBuf,
     pub db_file: PathBuf,
@@ -72,34 +95,101 @@ pub struct AppConfig {
     pub info_file: PathBuf,
     pub socket_name: String,
     pub socket_file: PathBuf,
-    pub silence_seconds: u64,
-    /// Minimum seconds between repeat `input_needed` notifications for the same
-    /// session. Throttles prompt-detection spam against chatty TUIs.
-    pub notification_min_interval_seconds: u64,
-    pub session_eviction_seconds: u64,
-    pub max_running_sessions: usize,
-    /// Retired (M3-1c2): the 0.x `output.log` size-cap truncation destroyed
-    /// Rows of scrolled-off output each session's live engine retains in
-    /// memory, rendered as scrollback history for freshly attaching
-    /// clients. The engine keeps scrollback only for the main screen, so
-    /// alternate-screen TUIs are unaffected.
-    pub screen_scrollback_rows: usize,
-    /// Optional path to an executable invoked on every local OS notification.
-    /// If this is provided, the default local notification mechanism is disabled and this hook is used instead.
-    pub notification_hook: Option<String>,
-    /// CLI/runtime flag overrides, recorded so hot reloads can re-apply them:
-    /// a value passed on the command line keeps winning over `config.json`
-    /// even after the file is edited.
-    pub runtime_overrides: RuntimeOverrides,
 }
 
+/// HTTP listener bind/port. Hot-reloadable on bind/port by `HttpConfig`'s
+/// placement in either diff list; see `restart_required_changes` for which
+/// changes need the daemon to actually rebind the listener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpConfig {
+    pub bind: String,
+    pub port: u16,
+}
+
+/// Notification dispatch tuning (prompt detection cadence, hook, OS hooks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotifyConfig {
+    pub min_interval_seconds: u64,
+    pub prompt_patterns: Vec<String>,
+    pub hook: Option<String>,
+}
+
+/// Resource quotas / runtime tuning knobs (TUI scrollback retention, eviction
+/// grace periods, etc.). All reload-safe because they're sampled at use time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LimitsConfig {
+    pub max_running_sessions: usize,
+    pub session_eviction_seconds: u64,
+    pub screen_scrollback_rows: usize,
+    pub silence_seconds: u64,
+    pub stop_grace_seconds: u64,
+}
+
+/// VAPID keys + optional proxy for browser push subscriptions. Hot-reloadable
+/// because the daemon reads them at every push send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebPushConfig {
+    pub subject: Option<String>,
+    pub vapid_public_key: Option<String>,
+    pub vapid_private_key: Option<String>,
+    pub proxy: Option<String>,
+}
+
+impl_config_diff!(PathsConfig {
+    state_dir,
+    sessions_dir,
+    db_file,
+    lock_file,
+    info_file,
+    socket_name,
+    socket_file,
+});
+impl_config_diff!(HttpConfig { bind, port });
+impl_config_diff!(NotifyConfig {
+    min_interval_seconds,
+    prompt_patterns,
+    hook
+});
+impl_config_diff!(LimitsConfig {
+    max_running_sessions,
+    session_eviction_seconds,
+    screen_scrollback_rows,
+    silence_seconds,
+    stop_grace_seconds,
+});
+impl_config_diff!(WebPushConfig {
+    subject,
+    vapid_public_key,
+    vapid_private_key,
+    proxy,
+});
+
 /// CLI/runtime flag overrides that take precedence over `config.json`.
+///
+/// Kept flat on purpose: the four overrides each belong to a different
+/// sub-struct (http vs notify vs web_push), and at runtime they're
+/// applied individually. Wrapping them in their own sub-struct hierarchy
+/// would be churn without benefit at this size.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeOverrides {
     pub http_bind: Option<String>,
     pub http_port: Option<u16>,
     pub notification_hook: Option<String>,
     pub web_push_proxy: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub paths: PathsConfig,
+    pub http: HttpConfig,
+    pub notify: NotifyConfig,
+    pub limits: LimitsConfig,
+    pub web_push: WebPushConfig,
+    pub log_level: String,
+    /// CLI/runtime flag overrides, recorded so hot reloads can re-apply them:
+    /// a value passed on the command line keeps winning over `config.json`
+    /// even after the file is edited.
+    pub runtime_overrides: RuntimeOverrides,
 }
 
 /// Shared, hot-reloadable view of the daemon's configuration.
@@ -133,23 +223,57 @@ impl LiveConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct AppConfigOverrides {
-    bind: Option<String>,
-    http_port: Option<u16>,
+    /// On-disk JSON shape stays flat and backward-compatible: each
+    /// sub-struct is `#[serde(flatten)]`-ed so the wire format ("bind",
+    /// "http_port", "web_push_*", …) is byte-identical to the pre-S3.4
+    /// layout. New config files land in a sub-struct automatically.
+    #[serde(flatten)]
+    http: HttpOverrides,
+    #[serde(flatten)]
+    notify: NotifyOverrides,
+    #[serde(flatten)]
+    web_push: WebPushOverrides,
+    #[serde(flatten)]
+    limits: LimitsOverrides,
     log_level: Option<String>,
-    silence_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct HttpOverrides {
+    /// Listener bind address. S3.4: canonical key is `http_bind` (matching
+    /// `http_port`); the pre-S3.4 single-word `bind` is still accepted as
+    /// an alias for backward compat with existing `config.json` files.
+    #[serde(alias = "bind")]
+    http_bind: Option<String>,
+    http_port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NotifyOverrides {
     notification_min_interval_seconds: Option<u64>,
-    stop_grace_seconds: Option<u64>,
+    notification_hook: Option<String>,
     prompt_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct WebPushOverrides {
     web_push_subject: Option<String>,
     web_push_vapid_public_key: Option<String>,
     web_push_vapid_private_key: Option<String>,
     web_push_proxy: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct LimitsOverrides {
+    silence_seconds: Option<u64>,
+    stop_grace_seconds: Option<u64>,
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
     screen_scrollback_rows: Option<usize>,
-    /// Path to an executable invoked on every local OS notification.
-    /// Event data is provided via environment variables (OLY_EVENT_*).
-    notification_hook: Option<String>,
 }
 
 impl AppConfig {
@@ -162,79 +286,88 @@ impl AppConfig {
 
     /// Build a fully-resolved config from parsed `config.json` overrides.
     fn resolve(state_dir: PathBuf, overrides: AppConfigOverrides) -> Self {
-        let sessions_dir = state_dir.join("sessions");
-        let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
-        let silence_seconds = overrides.silence_seconds.unwrap_or(10).max(1);
-        let notification_min_interval_seconds = overrides
-            .notification_min_interval_seconds
-            .unwrap_or(10)
-            .max(1);
-        let stop_grace_seconds = overrides.stop_grace_seconds.unwrap_or(5).max(1);
-        let http_bind = overrides
-            .bind
-            .and_then(normalize_optional_string)
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let http_port = overrides.http_port.unwrap_or(15443);
+        let paths = PathsConfig {
+            state_dir: state_dir.clone(),
+            sessions_dir: state_dir.join("sessions"),
+            db_file: state_dir.join("oly.db"),
+            lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
+            socket_name: std::env::var("OLY_SOCKET_NAME")
+                .ok()
+                .and_then(normalize_optional_string)
+                .unwrap_or_else(|| "open-relay.oly.sock".to_string()),
+            socket_file: state_dir.join("daemon.sock"),
+        };
+        let http = HttpConfig {
+            bind: overrides
+                .http
+                .http_bind
+                .and_then(normalize_optional_string)
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            port: overrides.http.http_port.unwrap_or(15443),
+        };
+        let notify = NotifyConfig {
+            min_interval_seconds: overrides
+                .notify
+                .notification_min_interval_seconds
+                .unwrap_or(10)
+                .max(1),
+            prompt_patterns: overrides.notify.prompt_patterns.unwrap_or_else(|| {
+                DEFAULT_PROMPT_PATTERNS
+                    .iter()
+                    .map(|p| (*p).to_string())
+                    .collect()
+            }),
+            hook: overrides
+                .notify
+                .notification_hook
+                .and_then(normalize_optional_string),
+        };
+        let limits = LimitsConfig {
+            max_running_sessions: overrides.limits.max_running_sessions.unwrap_or(50),
+            session_eviction_seconds: overrides
+                .limits
+                .session_eviction_seconds
+                .unwrap_or(15)
+                .max(1),
+            screen_scrollback_rows: overrides
+                .limits
+                .screen_scrollback_rows
+                .unwrap_or(DEFAULT_SCREEN_SCROLLBACK_ROWS),
+            silence_seconds: overrides.limits.silence_seconds.unwrap_or(10).max(1),
+            stop_grace_seconds: overrides.limits.stop_grace_seconds.unwrap_or(5).max(1),
+        };
+        let web_push = WebPushConfig {
+            subject: overrides
+                .web_push
+                .web_push_subject
+                .and_then(normalize_optional_string),
+            vapid_public_key: overrides
+                .web_push
+                .web_push_vapid_public_key
+                .and_then(normalize_optional_string),
+            vapid_private_key: overrides
+                .web_push
+                .web_push_vapid_private_key
+                .and_then(normalize_optional_string),
+            proxy: resolve_optional_string_setting(
+                None,
+                std::env::var("OLY_WEB_PUSH_PROXY").ok(),
+                overrides.web_push.web_push_proxy,
+            ),
+        };
         let log_level = overrides
             .log_level
             .and_then(normalize_optional_string)
             .unwrap_or_else(|| "info".to_string());
-        let prompt_patterns = overrides.prompt_patterns.unwrap_or_else(|| {
-            DEFAULT_PROMPT_PATTERNS
-                .iter()
-                .map(|pattern| (*pattern).to_string())
-                .collect()
-        });
-        let web_push_vapid_public_key = overrides
-            .web_push_vapid_public_key
-            .and_then(normalize_optional_string);
-        let web_push_vapid_private_key = overrides
-            .web_push_vapid_private_key
-            .and_then(normalize_optional_string);
-        let web_push_subject = overrides
-            .web_push_subject
-            .and_then(normalize_optional_string);
-        let web_push_proxy = resolve_optional_string_setting(
-            None,
-            std::env::var("OLY_WEB_PUSH_PROXY").ok(),
-            overrides.web_push_proxy,
-        );
-        let socket_name = std::env::var("OLY_SOCKET_NAME")
-            .ok()
-            .and_then(normalize_optional_string)
-            .unwrap_or_else(|| "open-relay.oly.sock".to_string());
-
-        let max_running_sessions = overrides.max_running_sessions.unwrap_or(50);
-        let screen_scrollback_rows = overrides
-            .screen_scrollback_rows
-            .unwrap_or(DEFAULT_SCREEN_SCROLLBACK_ROWS);
-        let notification_hook = overrides
-            .notification_hook
-            .and_then(normalize_optional_string);
 
         Self {
+            paths,
+            http,
+            notify,
+            limits,
+            web_push,
             log_level,
-            silence_seconds,
-            notification_min_interval_seconds,
-            stop_grace_seconds,
-            session_eviction_seconds,
-            http_bind,
-            http_port,
-            prompt_patterns,
-            web_push_vapid_public_key,
-            web_push_vapid_private_key,
-            web_push_subject,
-            web_push_proxy,
-            socket_name,
-            socket_file: state_dir.join("daemon.sock"),
-            lock_file: state_dir.join("daemon.lock"),
-            info_file: state_dir.join("daemon.info"),
-            db_file: state_dir.join("oly.db"),
-            state_dir,
-            sessions_dir,
-            max_running_sessions,
-            screen_scrollback_rows,
-            notification_hook,
             runtime_overrides: RuntimeOverrides::default(),
         }
     }
@@ -246,8 +379,8 @@ impl AppConfig {
     /// daemon's hot-reload loop keeps running on the last good configuration
     /// instead of silently falling back to defaults.
     pub fn try_reload(&self) -> std::result::Result<Self, String> {
-        let overrides = try_load_overrides(&self.state_dir)?;
-        let mut next = Self::resolve(self.state_dir.clone(), overrides);
+        let overrides = try_load_overrides(&self.paths.state_dir)?;
+        let mut next = Self::resolve(self.paths.state_dir.clone(), overrides);
         next.runtime_overrides = self.runtime_overrides.clone();
         next.apply_runtime_overrides();
         Ok(next)
@@ -258,61 +391,27 @@ impl AppConfig {
     /// Everything listed here is picked up by the running daemon without a
     /// restart; keep this in sync with the reload task in
     /// `daemon::reload` and the live readers (notification monitor, session
-    /// start paths, HTTP handlers).
+    /// start paths, HTTP handlers). S3.4 makes this a fixed composition of
+    /// per-sub-struct diffs: any future field added to the relevant
+    /// sub-structs gets its diff arm automatically.
     pub fn hot_reload_changes(&self, other: &Self) -> Vec<&'static str> {
         let mut changed = Vec::new();
+        changed.extend(self.notify.diff(&other.notify));
+        changed.extend(self.limits.diff(&other.limits));
+        changed.extend(self.web_push.diff(&other.web_push));
         if self.log_level != other.log_level {
             changed.push("log_level");
-        }
-        if self.silence_seconds != other.silence_seconds {
-            changed.push("silence_seconds");
-        }
-        if self.notification_min_interval_seconds != other.notification_min_interval_seconds {
-            changed.push("notification_min_interval_seconds");
-        }
-        if self.stop_grace_seconds != other.stop_grace_seconds {
-            changed.push("stop_grace_seconds");
-        }
-        if self.prompt_patterns != other.prompt_patterns {
-            changed.push("prompt_patterns");
-        }
-        if self.notification_hook != other.notification_hook {
-            changed.push("notification_hook");
-        }
-        if self.web_push_subject != other.web_push_subject {
-            changed.push("web_push_subject");
-        }
-        if self.web_push_vapid_public_key != other.web_push_vapid_public_key {
-            changed.push("web_push_vapid_public_key");
-        }
-        if self.web_push_vapid_private_key != other.web_push_vapid_private_key {
-            changed.push("web_push_vapid_private_key");
-        }
-        if self.web_push_proxy != other.web_push_proxy {
-            changed.push("web_push_proxy");
-        }
-        if self.max_running_sessions != other.max_running_sessions {
-            changed.push("max_running_sessions");
-        }
-        if self.session_eviction_seconds != other.session_eviction_seconds {
-            changed.push("session_eviction_seconds");
-        }
-        if self.screen_scrollback_rows != other.screen_scrollback_rows {
-            changed.push("screen_scrollback_rows");
         }
         changed
     }
 
     /// Names of fields that differ but only take effect after a daemon
-    /// restart (bind address, HTTP port, socket and state paths).
+    /// restart (bind address, HTTP port). Paths and socket name silently
+    /// stay fixed at the start-up value: the daemon doesn't rebind its
+    /// database connection or unix socket mid-flight.
     pub fn restart_required_changes(&self, other: &Self) -> Vec<&'static str> {
         let mut changed = Vec::new();
-        if self.http_bind != other.http_bind {
-            changed.push("bind");
-        }
-        if self.http_port != other.http_port {
-            changed.push("http_port");
-        }
+        changed.extend(self.http.diff(&other.http));
         changed
     }
 
@@ -338,21 +437,21 @@ impl AppConfig {
     /// a hot reload.
     fn apply_runtime_overrides(&mut self) {
         if let Some(http_bind) = &self.runtime_overrides.http_bind {
-            self.http_bind = http_bind.clone();
+            self.http.bind = http_bind.clone();
         }
         if let Some(http_port) = self.runtime_overrides.http_port {
-            self.http_port = http_port;
+            self.http.port = http_port;
         }
         if let Some(notification_hook) = &self.runtime_overrides.notification_hook {
-            self.notification_hook = Some(notification_hook.clone());
+            self.notify.hook = Some(notification_hook.clone());
         }
         if let Some(web_push_proxy) = &self.runtime_overrides.web_push_proxy {
-            self.web_push_proxy = Some(web_push_proxy.clone());
+            self.web_push.proxy = Some(web_push_proxy.clone());
         }
     }
 
     pub fn wwwroot_dir(&self) -> PathBuf {
-        self.state_dir.join("wwwroot")
+        self.paths.state_dir.join("wwwroot")
     }
 }
 
@@ -491,28 +590,38 @@ mod tests {
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
         AppConfig {
-            http_bind: "127.0.0.1".to_string(),
-            http_port: 15443,
+            paths: super::PathsConfig {
+                state_dir: state_dir.clone(),
+                sessions_dir: state_dir.join("sessions"),
+                db_file: state_dir.join("oly.db"),
+                lock_file: state_dir.join("daemon.lock"),
+                info_file: state_dir.join("daemon.info"),
+                socket_name: "test.sock".to_string(),
+                socket_file: state_dir.join("daemon.sock"),
+            },
+            http: super::HttpConfig {
+                bind: "127.0.0.1".to_string(),
+                port: 15443,
+            },
+            notify: super::NotifyConfig {
+                min_interval_seconds: 10,
+                prompt_patterns: Vec::new(),
+                hook: Some("config-hook".to_string()),
+            },
+            limits: super::LimitsConfig {
+                max_running_sessions: 50,
+                session_eviction_seconds: 15,
+                screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
+                silence_seconds: 10,
+                stop_grace_seconds: 5,
+            },
+            web_push: super::WebPushConfig {
+                subject: None,
+                vapid_public_key: None,
+                vapid_private_key: None,
+                proxy: Some("http://config-proxy:8080".to_string()),
+            },
             log_level: "info".to_string(),
-            stop_grace_seconds: 5,
-            prompt_patterns: Vec::new(),
-            web_push_subject: None,
-            web_push_vapid_public_key: None,
-            web_push_vapid_private_key: None,
-            web_push_proxy: Some("http://config-proxy:8080".to_string()),
-            state_dir: state_dir.clone(),
-            sessions_dir: state_dir.join("sessions"),
-            db_file: state_dir.join("oly.db"),
-            lock_file: state_dir.join("daemon.lock"),
-            info_file: state_dir.join("daemon.info"),
-            socket_name: "test.sock".to_string(),
-            socket_file: state_dir.join("daemon.sock"),
-            silence_seconds: 10,
-            notification_min_interval_seconds: 10,
-            session_eviction_seconds: 15,
-            max_running_sessions: 50,
-            screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
-            notification_hook: Some("config-hook".to_string()),
             runtime_overrides: Default::default(),
         }
     }
@@ -526,14 +635,11 @@ mod tests {
             Some("  socks5://127.0.0.1:1080  ".to_string()),
         );
 
-        assert_eq!(config.http_bind, "0.0.0.0");
-        assert_eq!(config.http_port, 17000);
+        assert_eq!(config.http.bind, "0.0.0.0");
+        assert_eq!(config.http.port, 17000);
+        assert_eq!(config.notify.hook.as_deref(), Some("C:/tools/notify.exe"));
         assert_eq!(
-            config.notification_hook.as_deref(),
-            Some("C:/tools/notify.exe")
-        );
-        assert_eq!(
-            config.web_push_proxy.as_deref(),
+            config.web_push.proxy.as_deref(),
             Some("socks5://127.0.0.1:1080")
         );
     }
@@ -542,11 +648,11 @@ mod tests {
     fn runtime_overrides_leave_config_values_when_not_provided() {
         let config = test_config().with_runtime_overrides(None, None, None, None);
 
-        assert_eq!(config.http_bind, "127.0.0.1");
-        assert_eq!(config.http_port, 15443);
-        assert_eq!(config.notification_hook.as_deref(), Some("config-hook"));
+        assert_eq!(config.http.bind, "127.0.0.1");
+        assert_eq!(config.http.port, 15443);
+        assert_eq!(config.notify.hook.as_deref(), Some("config-hook"));
         assert_eq!(
-            config.web_push_proxy.as_deref(),
+            config.web_push.proxy.as_deref(),
             Some("http://config-proxy:8080")
         );
     }
@@ -575,12 +681,29 @@ mod tests {
 
     #[test]
     fn screen_scrollback_rows_override_deserializes() {
+        // Sanity: S3.4 wraps the per-axis fields in sub-structs; the JSON
+        // shape is preserved via `#[serde(flatten)]`, so the wire-level
+        // override name is unchanged.
         let overrides: super::AppConfigOverrides =
             serde_json::from_str(r#"{"screen_scrollback_rows": 250}"#).expect("parse override");
-        assert_eq!(overrides.screen_scrollback_rows, Some(250));
+        assert_eq!(overrides.limits.screen_scrollback_rows, Some(250));
 
         let empty: super::AppConfigOverrides = serde_json::from_str("{}").expect("parse empty");
-        assert_eq!(empty.screen_scrollback_rows, None);
+        assert_eq!(empty.limits.screen_scrollback_rows, None);
+    }
+
+    /// S3.4 follow-up: legacy single-word `bind` JSON key must keep
+    /// loading alongside the canonical `http_bind`. Errors with
+    /// `unknown field` otherwise on every pre-S3.4 config.json.
+    #[test]
+    fn http_bind_alias_accepts_legacy_bind_key() {
+        let overrides: super::AppConfigOverrides =
+            serde_json::from_str(r#"{"bind": "10.0.0.1"}"#).expect("parse legacy key");
+        assert_eq!(overrides.http.http_bind.as_deref(), Some("10.0.0.1"));
+
+        let canonical: super::AppConfigOverrides =
+            serde_json::from_str(r#"{"http_bind": "10.0.0.2"}"#).expect("parse canonical key");
+        assert_eq!(canonical.http.http_bind.as_deref(), Some("10.0.0.2"));
     }
 
     #[test]
@@ -595,14 +718,14 @@ mod tests {
         .expect("write config.json");
 
         let mut config = test_config();
-        config.state_dir = state_dir.clone();
+        config.paths.state_dir = state_dir.clone();
 
         let reloaded = config.try_reload().expect("reload should succeed");
-        assert_eq!(reloaded.notification_hook.as_deref(), Some("old-hook"));
-        assert_eq!(reloaded.silence_seconds, 42);
+        assert_eq!(reloaded.notify.hook.as_deref(), Some("old-hook"));
+        assert_eq!(reloaded.limits.silence_seconds, 42);
         // Fields absent from the file fall back to defaults, not to the
         // previous in-memory values.
-        assert_eq!(reloaded.max_running_sessions, 50);
+        assert_eq!(reloaded.limits.max_running_sessions, 50);
 
         std::fs::write(
             state_dir.join("config.json"),
@@ -611,9 +734,9 @@ mod tests {
         .expect("rewrite config.json");
 
         let reloaded = config.try_reload().expect("second reload should succeed");
-        assert_eq!(reloaded.notification_hook.as_deref(), Some("new-hook"));
-        assert_eq!(reloaded.max_running_sessions, 7);
-        assert_eq!(reloaded.silence_seconds, 10);
+        assert_eq!(reloaded.notify.hook.as_deref(), Some("new-hook"));
+        assert_eq!(reloaded.limits.max_running_sessions, 7);
+        assert_eq!(reloaded.limits.silence_seconds, 10);
 
         let _ = std::fs::remove_dir_all(&state_dir);
     }
@@ -621,12 +744,12 @@ mod tests {
     #[test]
     fn notification_min_interval_is_configurable_and_hot_reloadable() {
         let mut base = test_config();
-        base.notification_min_interval_seconds = 10;
+        base.notify.min_interval_seconds = 10;
         let mut changed = base.clone();
-        changed.notification_min_interval_seconds = 30;
+        changed.notify.min_interval_seconds = 30;
         assert!(
             base.hot_reload_changes(&changed)
-                .contains(&"notification_min_interval_seconds"),
+                .contains(&"min_interval_seconds"),
             "changing the notify cooldown should be reported as a hot-reloadable change"
         );
 
@@ -641,14 +764,14 @@ mod tests {
         )
         .expect("write config.json");
         let mut config = test_config();
-        config.state_dir = state_dir.clone();
+        config.paths.state_dir = state_dir.clone();
         let reloaded = config.try_reload().expect("reload should succeed");
-        assert_eq!(reloaded.notification_min_interval_seconds, 45);
+        assert_eq!(reloaded.notify.min_interval_seconds, 45);
 
         // Absent from the file → falls back to the default, not the old value.
         std::fs::write(state_dir.join("config.json"), r#"{}"#).expect("rewrite config.json");
         let reloaded = config.try_reload().expect("second reload should succeed");
-        assert_eq!(reloaded.notification_min_interval_seconds, 10);
+        assert_eq!(reloaded.notify.min_interval_seconds, 10);
 
         let _ = std::fs::remove_dir_all(&state_dir);
     }
@@ -661,7 +784,7 @@ mod tests {
         std::fs::write(state_dir.join("config.json"), "{ not json").expect("write config.json");
 
         let mut config = test_config();
-        config.state_dir = state_dir.clone();
+        config.paths.state_dir = state_dir.clone();
 
         assert!(
             config.try_reload().is_err(),
@@ -683,17 +806,17 @@ mod tests {
         .expect("write config.json");
 
         let mut config = test_config();
-        config.state_dir = state_dir.clone();
+        config.paths.state_dir = state_dir.clone();
         let config =
             config.with_runtime_overrides(None, Some(17000), Some("cli-hook".to_string()), None);
 
         let reloaded = config.try_reload().expect("reload should succeed");
         assert_eq!(
-            reloaded.notification_hook.as_deref(),
+            reloaded.notify.hook.as_deref(),
             Some("cli-hook"),
             "CLI flag must keep winning over the edited config file"
         );
-        assert_eq!(reloaded.http_port, 17000);
+        assert_eq!(reloaded.http.port, 17000);
 
         let _ = std::fs::remove_dir_all(&state_dir);
     }
@@ -702,10 +825,14 @@ mod tests {
     fn hot_reload_changes_lists_only_hot_fields() {
         let base = test_config();
         let mut changed = base.clone();
-        changed.notification_hook = Some("other-hook".to_string());
-        changed.http_port = 1;
+        changed.notify.hook = Some("other-hook".to_string());
+        changed.http.port = 1;
 
-        assert_eq!(base.hot_reload_changes(&changed), vec!["notification_hook"]);
-        assert_eq!(base.restart_required_changes(&changed), vec!["http_port"]);
+        // `notify.hook` is hot-reloadable (rebuilds the notification
+        // pipeline immediately); `http.port` is restart-only (the bound
+        // socket can't move under load).  The diff names are the flat
+        // rust field names of the resolved sub-structs.
+        assert_eq!(base.hot_reload_changes(&changed), vec!["hook"]);
+        assert_eq!(base.restart_required_changes(&changed), vec!["port"]);
     }
 }

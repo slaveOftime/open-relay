@@ -230,7 +230,7 @@ mod tests {
 
     fn default_patterns() -> Vec<regex::Regex> {
         let cfg = crate::config::AppConfig::load().expect("default config");
-        compile_prompt_patterns(&cfg.prompt_patterns)
+        compile_prompt_patterns(&cfg.notify.prompt_patterns)
     }
 
     fn sample_summary() -> SessionSummary {

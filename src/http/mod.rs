@@ -142,8 +142,8 @@ impl SshHostKey {
 struct WebAssets;
 
 pub async fn serve(state: AppState) {
-    let bind = state.config.get().http_bind.clone();
-    let port = state.config.get().http_port;
+    let bind = state.config.get().http.bind.clone();
+    let port = state.config.get().http.port;
     let ip = match bind.parse::<std::net::IpAddr>() {
         Ok(ip) => ip,
         Err(err) => {

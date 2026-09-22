@@ -36,7 +36,7 @@ pub(super) async fn run_config_reloader(
     db: Arc<Database>,
     log_filter: LogFilterHandle,
 ) {
-    let path = live.get().state_dir.join("config.json");
+    let path = live.get().paths.state_dir.join("config.json");
     let mut last_seen = file_modified_at(&path);
 
     loop {
@@ -73,14 +73,14 @@ pub(super) async fn run_config_reloader(
             );
         }
 
-        let rebuild_notifier = old.notification_hook != new.notification_hook
-            || old.web_push_subject != new.web_push_subject
-            || old.web_push_vapid_public_key != new.web_push_vapid_public_key
-            || old.web_push_vapid_private_key != new.web_push_vapid_private_key
-            || old.web_push_proxy != new.web_push_proxy;
+        let rebuild_notifier = old.notify.hook != new.notify.hook
+            || old.web_push.subject != new.web_push.subject
+            || old.web_push.vapid_public_key != new.web_push.vapid_public_key
+            || old.web_push.vapid_private_key != new.web_push.vapid_private_key
+            || old.web_push.proxy != new.web_push.proxy;
         let reload_log_filter = old.log_level != new.log_level;
 
-        store.set_eviction_seconds(new.session_eviction_seconds);
+        store.set_eviction_seconds(new.limits.session_eviction_seconds);
         live.replace(new.clone());
 
         if rebuild_notifier {

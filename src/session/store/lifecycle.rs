@@ -99,7 +99,7 @@ impl SessionStore {
             rows,
             cols,
             notifications_enabled,
-            config.screen_scrollback_rows,
+            config.limits.screen_scrollback_rows,
             store_handle.event_tx.clone(),
         ) {
             Ok(runtime) => runtime,
@@ -250,8 +250,10 @@ impl SessionStore {
             .count();
 
         let mut state = self.mutable.lock().await;
-        if running_count + state.starting_sessions.len() >= config.max_running_sessions {
-            return Err(AppError::MaxSessionsReached(config.max_running_sessions));
+        if running_count + state.starting_sessions.len() >= config.limits.max_running_sessions {
+            return Err(AppError::MaxSessionsReached(
+                config.limits.max_running_sessions,
+            ));
         }
 
         let id = generate_session_id(|candidate| {
@@ -291,7 +293,7 @@ impl SessionStore {
 
         Ok(PreparedStart {
             meta,
-            session_dir: config.sessions_dir.join(&id),
+            session_dir: config.paths.sessions_dir.join(&id),
             rows,
             cols,
             notifications_enabled: spec.notifications_enabled,

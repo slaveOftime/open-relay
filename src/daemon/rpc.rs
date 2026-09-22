@@ -1070,7 +1070,7 @@ mod tests {
             // Production socket: bind once, accept loop runs the real
             // per-connection dispatcher for every test connection.
             let mut config = make_test_config(4);
-            config.socket_name = format!("oly-ipcconf-{}.sock", uuid::Uuid::new_v4());
+            config.paths.socket_name = format!("oly-ipcconf-{}.sock", uuid::Uuid::new_v4());
             let config = Arc::new(config);
             let listener = ipc::bind(&config).expect("bind test socket");
             let server = {
