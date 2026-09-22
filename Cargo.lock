@@ -5162,6 +5162,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32fast",
  "crossterm",
  "dirs 7.0.0",
  "ed25519-dalek",

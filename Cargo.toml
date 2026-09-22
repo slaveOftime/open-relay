@@ -86,6 +86,11 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 gpui = { version = "0.2.2", optional = true }
 gpui-terminal = { version = "0.1.0", optional = true }
 tachyonfx = { version = "0.25", default-features = false, features = ["std"] }
+# Journal record CRC-32 (PLAN2 P2.1): SIMD-accelerated IEEE 802.3 reflected.
+# Same polynomial as the previous hand-rolled table-based implementation, so
+# byte-identical output & on-disk format; no version bump. The legacy table
+# impl lives behind `#[cfg(test)]` as a cross-check oracle.
+crc32fast = "1.5"
 
 [dev-dependencies]
 # Test-only differential oracle (M6-1): engine conformance and renderer
