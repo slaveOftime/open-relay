@@ -1,4 +1,4 @@
-use std::{fs, io, io::IsTerminal, io::Read, path::Path};
+use std::{io, io::IsTerminal, io::Read, path::Path};
 
 use crate::{
     clipboard,
@@ -150,7 +150,8 @@ async fn upload_local_file(
         )));
     }
 
-    if !path.is_file() {
+    let file_type = tokio::fs::metadata(path).await?;
+    if !file_type.is_file() {
         return Err(AppError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -171,7 +172,7 @@ async fn upload_local_file(
         config,
         id,
         file_name.to_string_lossy().to_string(),
-        fs::read(path)?,
+        tokio::fs::read(path).await?,
         node,
     )
     .await

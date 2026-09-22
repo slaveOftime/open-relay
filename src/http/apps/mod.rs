@@ -115,7 +115,8 @@ pub(super) fn ensure_wwwroot(config: &AppConfig) -> io::Result<PathBuf> {
 }
 
 pub(super) async fn list_static_apps(State(state): State<AppState>) -> Response {
-    match discover_static_apps(&state.config.get().wwwroot_dir()) {
+    let wwwroot = state.config.get().wwwroot_dir();
+    match discover_static_apps_async(wwwroot).await {
         Ok(apps) => Json(apps).into_response(),
         Err(err) => {
             error!(%err, "failed to enumerate apps in {}", state.config.get().wwwroot_dir().display());
@@ -124,10 +125,24 @@ pub(super) async fn list_static_apps(State(state): State<AppState>) -> Response 
     }
 }
 
-pub(super) fn resolve_app_request(
-    wwwroot: &Path,
-    uri: &Uri,
+/// Async wrapper: resolves an `/apps/<slug>/*` request off the tokio
+/// worker pool. The expanded pipeline does ~3–4 `std::fs::metadata`
+/// syscalls plus the manifest/index.html reads in
+/// `load_app_definition`; all are sync. Routing the hot /app-static
+/// path through `spawn_blocking` keeps the 4-worker runtime free
+/// to drive the WS attach pumps while a slow disk is being pawed at.
+pub(super) async fn resolve_app_request(
+    wwwroot: PathBuf,
+    uri: Uri,
 ) -> io::Result<Option<AppRequestTarget>> {
+    tokio::task::spawn_blocking(move || resolve_app_request_blocking(&wwwroot, &uri))
+        .await
+        .map_err(|join_err| {
+            io::Error::other(format!("apps resolution worker join failed: {join_err}"))
+        })?
+}
+
+fn resolve_app_request_blocking(wwwroot: &Path, uri: &Uri) -> io::Result<Option<AppRequestTarget>> {
     let Some((slug, request_tail, trailing_slash)) = split_app_request_path(uri.path()) else {
         return Ok(None);
     };
@@ -163,7 +178,24 @@ pub(super) fn resolve_app_request(
     }
 }
 
-pub(super) fn find_existing_local_asset(
+/// Async wrapper: looks up an existing static asset under
+/// `wwwroot` on the blocking pool. The sync body makes up to three
+/// `std::fs::metadata` calls per candidate via `local_asset_exists`,
+/// which is a relevant cost on cold caches.
+pub(super) async fn find_existing_local_asset(
+    wwwroot: PathBuf,
+    candidates: Vec<String>,
+) -> io::Result<Option<String>> {
+    tokio::task::spawn_blocking(move || find_existing_local_asset_blocking(&wwwroot, &candidates))
+        .await
+        .map_err(|join_err| {
+            io::Error::other(format!(
+                "static asset lookup worker join failed: {join_err}"
+            ))
+        })?
+}
+
+fn find_existing_local_asset_blocking(
     wwwroot: &Path,
     candidates: &[String],
 ) -> io::Result<Option<String>> {
@@ -173,6 +205,23 @@ pub(super) fn find_existing_local_asset(
         }
     }
     Ok(None)
+}
+
+/// Async wrapper: discovers apps under `wwwroot` on the blocking pool.
+///
+/// `discover_static_apps` calls `load_app_definition` per entry, which
+/// touches `index.html` and `oly.app.json` synchronously. With seven
+/// shipped apps the directory walk + manifest reads are ~50–100µs on a
+/// warm disk; on NFS or under pointer-chasing contention that can
+/// bump the live attach keystroke→screen latency enough to be visible.
+/// Centralising the off-thread hop here keeps callers from each
+/// spawning their own `spawn_blocking` closure.
+async fn discover_static_apps_async(wwwroot: PathBuf) -> io::Result<Vec<StaticApp>> {
+    tokio::task::spawn_blocking(move || discover_static_apps(&wwwroot))
+        .await
+        .map_err(|join_err| {
+            io::Error::other(format!("apps discovery worker join failed: {join_err}"))
+        })?
 }
 
 fn discover_static_apps(wwwroot: &Path) -> io::Result<Vec<StaticApp>> {
@@ -248,6 +297,19 @@ mod tests {
         extract_app_description, extract_app_icon_href, extract_app_kind, extract_meta_content,
         extract_title, resolve_app_asset_href, resolve_app_request,
     };
+
+    /// Test helper: drives the sync `discover_static_apps` through a
+    /// blocking-pool worker so the unit tests exercise the same path
+    /// the production handler does (PLAN2 §P1.3).
+    async fn discover_static_apps_async_for_tests(
+        wwwroot: PathBuf,
+    ) -> std::io::Result<Vec<StaticApp>> {
+        tokio::task::spawn_blocking(move || discover_static_apps(&wwwroot))
+            .await
+            .map_err(|join_err| {
+                std::io::Error::other(format!("apps discovery worker join failed: {join_err}"))
+            })?
+    }
     use crate::config::AppConfig;
     use axum::http::Uri;
     use reqwest::Url;
@@ -333,8 +395,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn discover_static_apps_reads_root_and_folder_apps() {
+    #[tokio::test]
+    async fn discover_static_apps_reads_root_and_folder_apps() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let apps = wwwroot.join("apps");
@@ -366,7 +428,9 @@ mod tests {
         )
         .expect("spa asset should be written");
 
-        let apps = discover_static_apps(&wwwroot).expect("apps should be discovered");
+        let apps = discover_static_apps_async_for_tests(wwwroot.clone())
+            .await
+            .expect("apps should be discovered");
 
         assert_eq!(
             apps,
@@ -391,8 +455,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn discover_static_apps_prefers_manifest_over_index_html() {
+    #[tokio::test]
+    async fn discover_static_apps_prefers_manifest_over_index_html() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("reporting");
@@ -420,7 +484,9 @@ mod tests {
         )
         .expect("manifest should be written");
 
-        let apps = discover_static_apps(&wwwroot).expect("apps should be discovered");
+        let apps = discover_static_apps_async_for_tests(wwwroot.clone())
+            .await
+            .expect("apps should be discovered");
 
         assert_eq!(
             apps,
@@ -436,8 +502,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn resolve_app_request_uses_manifest_entry_and_nested_assets() {
+    #[tokio::test]
+    async fn resolve_app_request_uses_manifest_entry_and_nested_assets() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("nested");
@@ -467,8 +533,12 @@ mod tests {
             .parse()
             .expect("URI should parse");
 
-        let root = resolve_app_request(&wwwroot, &root_uri).expect("request should resolve");
-        let asset = resolve_app_request(&wwwroot, &asset_uri).expect("request should resolve");
+        let root = resolve_app_request(wwwroot.clone(), root_uri.clone())
+            .await
+            .expect("request should resolve");
+        let asset = resolve_app_request(wwwroot.clone(), asset_uri.clone())
+            .await
+            .expect("request should resolve");
 
         assert_eq!(
             root,
@@ -486,8 +556,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn resolve_app_request_uses_redirect_file_and_folder_after_local_candidates() {
+    #[tokio::test]
+    async fn resolve_app_request_uses_redirect_file_and_folder_after_local_candidates() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("fallback");
@@ -527,9 +597,12 @@ mod tests {
             .parse()
             .expect("URI should parse");
 
-        let asset = resolve_app_request(&wwwroot, &asset_uri).expect("request should resolve");
-        let unmatched =
-            resolve_app_request(&wwwroot, &unmatched_uri).expect("request should resolve");
+        let asset = resolve_app_request(wwwroot.clone(), asset_uri.clone())
+            .await
+            .expect("request should resolve");
+        let unmatched = resolve_app_request(wwwroot.clone(), unmatched_uri.clone())
+            .await
+            .expect("request should resolve");
         let expected_shared_asset = fs::canonicalize(shared_dir.join("assets").join("main.js"))
             .expect("shared asset path should canonicalize");
         let expected_fallback_file =
@@ -547,8 +620,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn resolve_app_request_builds_proxy_url_from_manifest_entry() {
+    #[tokio::test]
+    async fn resolve_app_request_builds_proxy_url_from_manifest_entry() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("remote");
@@ -566,7 +639,9 @@ mod tests {
             .parse()
             .expect("URI should parse");
 
-        let resolved = resolve_app_request(&wwwroot, &uri).expect("request should resolve");
+        let resolved = resolve_app_request(wwwroot.clone(), uri.clone())
+            .await
+            .expect("request should resolve");
 
         assert_eq!(
             resolved,
@@ -581,8 +656,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn resolve_app_request_adds_root_fallback_for_vite_client() {
+    #[tokio::test]
+    async fn resolve_app_request_adds_root_fallback_for_vite_client() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("demo2");
@@ -600,7 +675,9 @@ mod tests {
             .parse()
             .expect("URI should parse");
 
-        let resolved = resolve_app_request(&wwwroot, &uri).expect("request should resolve");
+        let resolved = resolve_app_request(wwwroot.clone(), uri.clone())
+            .await
+            .expect("request should resolve");
 
         assert_eq!(
             resolved,
@@ -628,8 +705,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_app_request_rejects_missing_redirect_files() {
+    #[tokio::test]
+    async fn resolve_app_request_rejects_missing_redirect_files() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("invalid");
@@ -650,7 +727,9 @@ mod tests {
         .expect("entry should be written");
 
         let root_uri: Uri = "/apps/invalid/".parse().expect("URI should parse");
-        let err = resolve_app_request(&wwwroot, &root_uri).expect_err("request should fail");
+        let err = resolve_app_request(wwwroot.clone(), root_uri.clone())
+            .await
+            .expect_err("request should fail");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("redirect path"));
@@ -659,8 +738,8 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
-    #[test]
-    fn discover_static_apps_allows_entry_from_redirect_dir_with_manifest_fields() {
+    #[tokio::test]
+    async fn discover_static_apps_allows_entry_from_redirect_dir_with_manifest_fields() {
         let state_dir = temp_state_dir();
         let wwwroot = state_dir.join("wwwroot");
         let app_dir = wwwroot.join("apps").join("interview-markdown-viewer");
@@ -685,11 +764,15 @@ mod tests {
         )
         .expect("manifest should be written");
 
-        let apps = discover_static_apps(&wwwroot).expect("apps should be discovered");
+        let apps = discover_static_apps_async_for_tests(wwwroot.clone())
+            .await
+            .expect("apps should be discovered");
         let root_uri: Uri = "/apps/interview-markdown-viewer/"
             .parse()
             .expect("URI should parse");
-        let resolved = resolve_app_request(&wwwroot, &root_uri).expect("request should resolve");
+        let resolved = resolve_app_request(wwwroot.clone(), root_uri.clone())
+            .await
+            .expect("request should resolve");
 
         assert_eq!(
             apps,

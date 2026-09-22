@@ -285,7 +285,7 @@ async fn serve_static_or_proxy(
     let bearer = auth::extract_bearer_token(&headers);
     let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
 
-    match apps::resolve_app_request(&wwwroot_dir, &uri) {
+    match apps::resolve_app_request(wwwroot_dir.clone(), uri.clone()).await {
         Ok(Some(apps::AppRequestTarget::LocalFile(candidate))) => {
             if let Some(response) = auth::authorize_request(
                 &state,
@@ -340,13 +340,14 @@ async fn serve_static_or_proxy(
         Err(status) => return status.into_response(),
     };
 
-    let local_candidate = match apps::find_existing_local_asset(&wwwroot_dir, &candidates) {
-        Ok(candidate) => candidate,
-        Err(err) => {
-            error!(%err, path = %uri.path(), "failed to inspect static file in wwwroot");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let local_candidate =
+        match apps::find_existing_local_asset(wwwroot_dir.clone(), candidates.clone()).await {
+            Ok(candidate) => candidate,
+            Err(err) => {
+                error!(%err, path = %uri.path(), "failed to inspect static file in wwwroot");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
     if let Some(candidate) = local_candidate {
         if let Some(response) =
             auth::authorize_request(&state, &method, uri.path(), auth_token, bearer, client_ip)
