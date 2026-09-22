@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::super::SessionError;
-use super::super::logs::split_rendered_log_output;
+use super::super::logs::{finish_render, split_rendered_log_output};
 use super::SessionStore;
 
 impl SessionStore {
@@ -194,6 +194,12 @@ impl SessionStore {
         disk_incarnation(&self.db.session_dir_by_id(id))
     }
 
+    /// Live-tail render of the engine screen, off the runtime read
+    /// lock. Snapshots the engine's content rows under the guard,
+    /// drops it, then runs the CPU-only `finish_render` on
+    /// `spawn_blocking`.  Holding the runtime read lock across a
+    /// full tabular render was starving the PTY reader's write lock
+    /// when the visible region grew (PLAN2 §P1.2).
     pub async fn render_live_logs(
         &self,
         id: &str,
@@ -202,16 +208,28 @@ impl SessionStore {
         term_cols: u16,
     ) -> std::result::Result<(Vec<u8>, Vec<crate::protocol::LogResize>), SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        let rt = handle.read();
-        if rt.is_completed() || rt.output_closed {
-            return Err(SessionError::NotRunning);
-        }
-        Ok((
-            rt.render_logs(tail, keep_color, term_cols),
-            rt.resize_history.clone(),
-        ))
+        let (rows, resize_history) = {
+            let rt = handle.read();
+            if rt.is_completed() || rt.output_closed {
+                return Err(SessionError::NotRunning);
+            }
+            (
+                rt.snapshot_engine_rows(keep_color, term_cols),
+                rt.resize_history.clone(),
+            )
+        };
+
+        let rendered = tokio::task::spawn_blocking(move || finish_render(rows, tail, keep_color))
+            .await
+            .map_err(|join_err| {
+                SessionError::Internal(format!("log render worker join failed: {join_err}"))
+            })?;
+
+        Ok((rendered, resize_history))
     }
 
+    /// Same off-lock pattern as [`Self::render_live_logs`], but
+    /// returns the typed chunks used by the HTTP live-tail endpoint.
     pub async fn read_live_log_tail_page(
         &self,
         id: &str,
@@ -221,21 +239,32 @@ impl SessionStore {
         SessionError,
     > {
         let handle = self.lookup_runtime(id).await?;
-        let rt = handle.read();
-        if rt.is_completed() || rt.output_closed {
-            return Err(SessionError::NotRunning);
-        }
+        let (rows, resize_history) = {
+            let rt = handle.read();
+            if rt.is_completed() || rt.output_closed {
+                return Err(SessionError::NotRunning);
+            }
+            let term_cols = rt
+                .pty_size
+                .map(|(_, cols)| cols)
+                .or_else(|| rt.resize_history.last().map(|resize| resize.cols))
+                .filter(|cols| *cols > 0)
+                .unwrap_or(80);
+            (
+                rt.snapshot_engine_rows(true, term_cols),
+                rt.resize_history.clone(),
+            )
+        };
 
-        let term_cols = rt
-            .pty_size
-            .map(|(_, cols)| cols)
-            .or_else(|| rt.resize_history.last().map(|resize| resize.cols))
-            .filter(|cols| *cols > 0)
-            .unwrap_or(80);
-        let chunks = split_rendered_log_output(&rt.render_logs(tail, true, term_cols));
+        let rendered = tokio::task::spawn_blocking(move || finish_render(rows, tail, true))
+            .await
+            .map_err(|join_err| {
+                SessionError::Internal(format!("log render worker join failed: {join_err}"))
+            })?;
+
+        let chunks = split_rendered_log_output(&rendered);
         let total = chunks.len();
-
-        Ok((chunks, total, 0, rt.resize_history.clone()))
+        Ok((chunks, total, 0, resize_history))
     }
 
     pub async fn read_live_log_chunk_count(

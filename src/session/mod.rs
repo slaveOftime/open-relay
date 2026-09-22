@@ -113,6 +113,10 @@ pub enum SessionError {
     NotController,
     /// The attachment id is unknown to the session (stale fencing token).
     StaleAttachment,
+    /// A background worker join/sync failed. Surfaces only when a
+    /// `spawn_blocking` task panics or is cancelled mid-flight; it
+    /// indicates an internal invariant was violated (PLAN2 §P1.2).
+    Internal(String),
 }
 
 impl SessionError {
@@ -132,6 +136,9 @@ impl SessionError {
             ),
             Self::StaleAttachment => {
                 format!("attachment is no longer registered for session {id}; re-attach")
+            }
+            Self::Internal(message) => {
+                format!("session {id} internal error: {message}")
             }
         }
     }

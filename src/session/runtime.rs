@@ -436,8 +436,15 @@ impl SessionRuntime {
         snapshot
     }
 
-    pub fn render_logs(&self, tail: usize, keep_color: bool, term_cols: u16) -> Vec<u8> {
-        super::logs::render_engine_screen(&self.engine, tail, keep_color, term_cols)
+    /// Borrow the engine just long enough to copy its visible rows.
+    /// Lets async callers snapshot the rows under the read lock, drop
+    /// the guard, and finish the render on
+    /// `tokio::task::spawn_blocking` so the PTY reader's write lock is
+    /// never starved by a long render (PLAN2 §P1.2). Pairs with
+    /// [`super::logs::finish_render`] which performs the
+    /// CPU-bound tail/skip pass off the lock.
+    pub fn snapshot_engine_rows(&self, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
+        super::logs::engine_content_rows(&self.engine, keep_color, term_cols)
     }
 
     /// Register an identified attachment and grant control per the registry

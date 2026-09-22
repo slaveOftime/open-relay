@@ -9,113 +9,168 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
 use crate::session::SessionEvent;
+use crate::session::logs::finish_render;
 
 use super::{SessionStore, SilentCandidate, USER_ACTIVITY_WINDOW};
 
+/// Per-session data needed to evaluate silence/notification state, captured
+/// under the runtime's read lock with no rendering performed. Render → excerpt
+/// is CPU-only and runs on `spawn_blocking` (PLAN2 §P1.2).
+struct CandidateSnapshot {
+    session_id: String,
+    session_title: Option<String>,
+    rows: Vec<Vec<u8>>,
+    output_epoch: Instant,
+    silence_epoch: Instant,
+    should_notify: bool,
+    enabled_for_channels: bool,
+    last_total_bytes: u64,
+}
+
 impl SessionStore {
     /// Returns silent candidates with their output and latest activity epochs.
-    pub fn silent_candidates(
+    pub async fn silent_candidates(
         &self,
         attach_suppression_window: Duration,
         min_notification_interval: Duration,
     ) -> Vec<SilentCandidate> {
-        let now = Instant::now();
-        let sessions = self.sessions.load();
-        sessions
-            .values()
-            .filter_map(|handle| {
-                let rt = handle.read();
-                if rt.is_completed() {
-                    return None;
-                }
+        // Phase 1: walk every live session once, snapshot the
+        // silence-detection metadata and a flat byte payload of the
+        // engine rows we want to render. The read lock is held only
+        // long enough to copy plain data — no CPU-bound format pass
+        // runs under the lock (PLAN2 §P1.2).
+        let snapshots: Vec<CandidateSnapshot> = {
+            let now = Instant::now();
+            let sessions = self.sessions.load();
+            sessions
+                .values()
+                .filter_map(|handle| {
+                    let rt = handle.read();
+                    if rt.is_completed() {
+                        return None;
+                    }
 
-                // Sessions that have never produced any meaningful output (e.g. a
-                // process that starts up and then silently waits for a password or
-                // other input before printing anything) must still be considered:
-                // fall back to the spawn time so they are not permanently invisible
-                // to silence detection. `rt.spawned_at` never changes, so once such
-                // a session is notified it will not be re-notified unless real
-                // output eventually arrives and advances the epoch.
-                let last_output = rt.effective_output_epoch();
+                    // Sessions that have never produced any meaningful output (e.g. a
+                    // process that starts up and then silently waits for a password or
+                    // other input before printing anything) must still be considered:
+                    // fall back to the spawn time so they are not permanently invisible
+                    // to silence detection. `rt.spawned_at` never changes, so once such
+                    // a session is notified it will not be re-notified unless real
+                    // output eventually arrives and advances the epoch.
+                    let last_output = rt.effective_output_epoch();
 
-                // The newest user-driven activity of any kind: text input,
-                // mouse clicks/hover (delivered as input bytes), resizes,
-                // attach heartbeats and attaches themselves.
-                let user_activity = rt.user_activity_epoch();
+                    // The newest user-driven activity of any kind: text input,
+                    // mouse clicks/hover (delivered as input bytes), resizes,
+                    // attach heartbeats and attaches themselves.
+                    let user_activity = rt.user_activity_epoch();
 
-                // Silence is measured from the newest activity of any kind, so
-                // a user who is still interacting never looks "silent" and an
-                // old output epoch is never treated as an already-expired
-                // timer. This also covers recent attaches: someone who just
-                // opened the session has seen its current state, so there is
-                // nothing to notify about until the suppression window elapses.
-                let silence_epoch =
-                    user_activity.map_or(last_output, |activity| activity.max(last_output));
+                    // Silence is measured from the newest activity of any kind, so
+                    // a user who is still interacting never looks "silent" and an
+                    // old output epoch is never treated as an already-expired
+                    // timer. This also covers recent attaches: someone who just
+                    // opened the session has seen its current state, so there is
+                    // nothing to notify about until the suppression window elapses.
+                    let silence_epoch =
+                        user_activity.map_or(last_output, |activity| activity.max(last_output));
 
-                if now.duration_since(silence_epoch) < attach_suppression_window {
-                    trace!("silent because of recent user or output activity");
-                    return None;
-                }
+                    if now.duration_since(silence_epoch) < attach_suppression_window {
+                        trace!("silent because of recent user or output activity");
+                        return None;
+                    }
 
-                // Output that lands within `USER_ACTIVITY_WINDOW` of user
-                // activity is almost certainly a reaction to it — keystroke
-                // echo, a redraw after a resize, hover/click feedback — rather
-                // than the program asking for attention. The same is true when
-                // nothing came back at all (echo is off, e.g. a password
-                // prompt): the user is mid-interaction either way.
-                //
-                // Once the gap grows beyond the window the program clearly
-                // produced something on its own and then went quiet, which is
-                // exactly the "waiting for you" state worth notifying about.
-                let activity_driven = match user_activity {
-                    Some(activity) if last_output <= activity => true,
-                    Some(activity) => last_output.duration_since(activity) <= USER_ACTIVITY_WINDOW,
-                    None => false,
-                };
-                let should_notify = !activity_driven;
+                    // Output that lands within `USER_ACTIVITY_WINDOW` of user
+                    // activity is almost certainly a reaction to it — keystroke
+                    // echo, a redraw after a resize, hover/click feedback — rather
+                    // than the program asking for attention. The same is true when
+                    // nothing came back at all (echo is off, e.g. a password
+                    // prompt): the user is mid-interaction either way.
+                    //
+                    // Once the gap grows beyond the window the program clearly
+                    // produced something on its own and then went quiet, which is
+                    // exactly the "waiting for you" state worth notifying about.
+                    let activity_driven = match user_activity {
+                        Some(activity) if last_output <= activity => true,
+                        Some(activity) => {
+                            last_output.duration_since(activity) <= USER_ACTIVITY_WINDOW
+                        }
+                        None => false,
+                    };
+                    let should_notify = !activity_driven;
 
-                // Suppress rapid repeat notifications. `last_notified_at` is
-                // normally later than `last_output`, so compare it with `now`;
-                // subtracting it from the output epoch can underflow and kill
-                // the notification monitor task.
-                if should_notify
-                    && let Some(last_notified_at) = rt.last_notified_at
-                    && now.duration_since(last_notified_at) < min_notification_interval
-                {
-                    trace!("silent because notification was sent recently");
-                    return None;
-                }
+                    // Suppress rapid repeat notifications. `last_notified_at` is
+                    // normally later than `last_output`, so compare it with `now`;
+                    // subtracting it from the output epoch can underflow and kill
+                    // the notification monitor task.
+                    if should_notify
+                        && let Some(last_notified_at) = rt.last_notified_at
+                        && now.duration_since(last_notified_at) < min_notification_interval
+                    {
+                        trace!("silent because notification was sent recently");
+                        return None;
+                    }
 
-                if rt.notified_output_epoch == Some(last_output) {
-                    trace!("silent becase no changed since last nofification");
-                    return None;
-                }
+                    if rt.notified_output_epoch == Some(last_output) {
+                        trace!("silent becase no changed since last nofification");
+                        return None;
+                    }
 
-                debug!(
-                    session_id = rt.meta.id.as_str(),
-                    user_activity_at = ?user_activity,
-                    last_output_epoch = ?rt.last_output_epoch,
-                    last_notified_at = ?rt.last_notified_at,
-                    activity_driven,
-                    "silent candidate ready"
-                );
+                    debug!(
+                        session_id = rt.meta.id.as_str(),
+                        user_activity_at = ?user_activity,
+                        last_output_epoch = ?rt.last_output_epoch,
+                        last_notified_at = ?rt.last_notified_at,
+                        activity_driven,
+                        "silent candidate ready"
+                    );
 
-                // As this is most for matching some pattern from coding agent cli, most of them have input box under the bottom.
-                // And most of them are using alt screen, it is more accurate to just use the live tail logs.
-                // Silent can still be a fallback, just need to wait a little bit longer for the notification.
-                let excerpt = rt.render_logs(15, false, u16::MAX);
-                Some(SilentCandidate {
-                    session_id: rt.meta.id.clone(),
-                    session_title: rt.meta.title.clone(),
-                    excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
-                    output_epoch: last_output,
-                    silence_epoch,
-                    should_notify,
-                    enabled_for_channels: rt.notifications_enabled,
-                    last_total_bytes: rt.last_total_bytes,
+                    // As this is most for matching some pattern from coding agent cli, most of them have input box under the bottom.
+                    // And most of them are using alt screen, it is more accurate to just use the live tail logs.
+                    // Silent can still be a fallback, just need to wait a little bit longer for the notification.
+                    let rows = rt.snapshot_engine_rows(false, u16::MAX);
+                    Some(CandidateSnapshot {
+                        session_id: rt.meta.id.clone(),
+                        session_title: rt.meta.title.clone(),
+                        rows,
+                        output_epoch: last_output,
+                        silence_epoch,
+                        should_notify,
+                        enabled_for_channels: rt.notifications_enabled,
+                        last_total_bytes: rt.last_total_bytes,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        };
+
+        if snapshots.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 2: render the excerpts off the lock on the blocking
+        // pool.  Each candidate is independent, so a single
+        // `spawn_blocking` keeps the worker overhead trivial while
+        // ensuring the CPU pass never starves a writer waiting for the
+        // runtime lock.
+        tokio::task::spawn_blocking(move || {
+            snapshots
+                .into_iter()
+                .map(|snap| {
+                    let excerpt_vec =
+                        finish_render(snap.rows, /* tail */ 15, /* keep_color */ false);
+                    SilentCandidate {
+                        session_id: snap.session_id,
+                        session_title: snap.session_title,
+                        excerpt: String::from_utf8_lossy(&excerpt_vec).into_owned(),
+                        output_epoch: snap.output_epoch,
+                        silence_epoch: snap.silence_epoch,
+                        should_notify: snap.should_notify,
+                        enabled_for_channels: snap.enabled_for_channels,
+                        last_total_bytes: snap.last_total_bytes,
+                    }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Records a successful notification for `session_id` at `output_epoch`.
@@ -166,7 +221,7 @@ mod tests {
             Some(Duration::from_secs(10)),
         );
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
         assert!(candidates[0].should_notify);
@@ -186,7 +241,9 @@ mod tests {
         rt.write().last_input_at = Some(input_at);
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert_eq!(candidates.len(), 1);
         assert!(!candidates[0].should_notify);
@@ -211,7 +268,9 @@ mod tests {
         rt.write().last_input_at = Some(input_at);
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -236,7 +295,9 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(60));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -262,7 +323,9 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(30));
         let store = store_with(vec![rt.clone()], make_test_db().await);
 
-        let first = store.silent_candidates(suppression_window, min_interval);
+        let first = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
         assert_eq!(first.len(), 1);
         assert!(!first[0].should_notify);
         store.mark_input_required("abc1234", first[0].output_epoch);
@@ -271,13 +334,16 @@ mod tests {
         assert!(
             store
                 .silent_candidates(suppression_window, min_interval)
+                .await
                 .is_empty()
         );
 
         // The program prints on its own and then goes quiet.
         rt.write().last_output_epoch = Some(Instant::now() - Duration::from_secs(6));
 
-        let second = store.silent_candidates(suppression_window, min_interval);
+        let second = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
         assert_eq!(second.len(), 1);
         assert!(
             second[0].should_notify,
@@ -301,7 +367,9 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(60));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].silence_epoch, output_at);
@@ -322,7 +390,9 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_millis(300));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert!(candidates.is_empty());
     }
@@ -340,7 +410,9 @@ mod tests {
         rt.write().last_input_at = Some(Instant::now() - Duration::from_secs(2));
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert!(candidates.is_empty());
     }
@@ -381,7 +453,7 @@ mod tests {
             Some(Duration::from_millis(500)),
         );
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -405,7 +477,7 @@ mod tests {
             rt.notified_output_epoch = None;
         }
 
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -420,7 +492,7 @@ mod tests {
             Some(Duration::from_secs(10)),
         );
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -434,7 +506,7 @@ mod tests {
         let min_interval = Duration::from_secs(10);
         let rt = make_runtime("abc1234", SessionStatus::Running, "prompt> ", None);
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -454,7 +526,7 @@ mod tests {
             locked.spawned_at = Instant::now() - Duration::from_secs(10);
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
     }
@@ -472,7 +544,7 @@ mod tests {
             locked.spawned_at = Instant::now() - Duration::from_secs(10);
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(candidates.is_empty());
     }
 
@@ -494,7 +566,7 @@ mod tests {
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(
             candidates.is_empty(),
             "should suppress re-notification within min_notification_interval"
@@ -516,7 +588,7 @@ mod tests {
         let silence = Duration::from_secs(1);
         let min_interval = Duration::from_secs(10);
 
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert_eq!(
             candidates.len(),
             1,
@@ -548,7 +620,7 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].session_id, "abc1234");
@@ -571,7 +643,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         // First call returns a candidate with an output epoch.
-        let first = store.silent_candidates(silence, min_interval);
+        let first = store.silent_candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
         let id = &first[0].session_id;
         let epoch = first[0].output_epoch;
@@ -580,7 +652,7 @@ mod tests {
         store.mark_notified(id, epoch, Instant::now());
 
         // Second call: same output epoch → suppressed.
-        let second = store.silent_candidates(silence, min_interval);
+        let second = store.silent_candidates(silence, min_interval).await;
         assert!(
             second.is_empty(),
             "should suppress re-notification at same output epoch"
@@ -599,7 +671,7 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
 
-        let first = store.silent_candidates(silence, min_interval);
+        let first = store.silent_candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
         let id = &first[0].session_id;
         let epoch = first[0].output_epoch;
@@ -618,7 +690,7 @@ mod tests {
         }
 
         // New output epoch + expired notification cooldown should re-qualify.
-        let after_output = store.silent_candidates(silence, min_interval);
+        let after_output = store.silent_candidates(silence, min_interval).await;
         assert_eq!(after_output.len(), 1);
     }
 
@@ -634,14 +706,14 @@ mod tests {
         );
         let store = store_with(vec![rt], make_test_db().await);
 
-        let first = store.silent_candidates(silence, min_interval);
+        let first = store.silent_candidates(silence, min_interval).await;
         assert_eq!(first.len(), 1);
         let id = &first[0].session_id;
         let epoch = first[0].output_epoch;
         store.mark_notified(id, epoch, Instant::now());
 
         // Same output epoch -> suppressed.
-        let suppressed = store.silent_candidates(silence, min_interval);
+        let suppressed = store.silent_candidates(silence, min_interval).await;
         assert!(suppressed.is_empty());
 
         // Simulate time passing without any new output.
@@ -652,7 +724,7 @@ mod tests {
             rt.last_notified_at = Some(Instant::now() - Duration::from_secs(31));
         }
 
-        let still_suppressed = store.silent_candidates(silence, min_interval);
+        let still_suppressed = store.silent_candidates(silence, min_interval).await;
         assert!(
             still_suppressed.is_empty(),
             "should remain suppressed until new output advances epoch"
@@ -764,7 +836,7 @@ mod tests {
             locked.last_attach_activity_at = Some(Instant::now());
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(
             candidates.is_empty(),
             "should suppress notification while attach activity is inside suppression window"
@@ -799,7 +871,9 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -827,7 +901,9 @@ mod tests {
         }
         let store = store_with(vec![rt], make_test_db().await);
 
-        let candidates = store.silent_candidates(suppression_window, min_interval);
+        let candidates = store
+            .silent_candidates(suppression_window, min_interval)
+            .await;
 
         assert_eq!(candidates.len(), 1);
         assert!(
@@ -863,6 +939,7 @@ mod tests {
         assert!(
             store
                 .silent_candidates(suppression_window, min_interval)
+                .await
                 .is_empty(),
             "a fresh attach should suppress candidacy inside the suppression window"
         );
@@ -900,6 +977,7 @@ mod tests {
         assert!(
             store
                 .silent_candidates(suppression_window, min_interval)
+                .await
                 .is_empty(),
             "detach should keep the recent-activity suppression alive"
         );
@@ -920,7 +998,7 @@ mod tests {
             locked.last_notified_at = Some(Instant::now() - Duration::from_secs(3));
         }
         let store = store_with(vec![rt], make_test_db().await);
-        let candidates = store.silent_candidates(silence, min_interval);
+        let candidates = store.silent_candidates(silence, min_interval).await;
         assert!(
             candidates.is_empty(),
             "should drop candidates inside cooldown window"

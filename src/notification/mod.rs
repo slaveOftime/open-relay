@@ -63,8 +63,9 @@ pub(super) async fn run_notification_monitor(
             );
         }
 
-        let candidates: Vec<SilentCandidate> =
-            session_store.silent_candidates(suppression_window, min_notification_interval);
+        let candidates: Vec<SilentCandidate> = session_store
+            .silent_candidates(suppression_window, min_notification_interval)
+            .await;
 
         if !candidates.is_empty() {
             debug!(count = candidates.len(), "notification candidates detected");

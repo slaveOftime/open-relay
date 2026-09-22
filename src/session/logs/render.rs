@@ -129,13 +129,34 @@ pub fn render_log_file(
 /// content-bounded, tail-limited semantics as [`render_screen`]. Plain
 /// rows are truncated to `term_cols` characters; styled rows keep the
 /// session's PTY width so an SGR sequence is never split.
+///
+/// Production live-tail callers should use [`engine_content_rows`] +
+/// [`crate::session::logs::finish_render`] on `spawn_blocking` so the
+/// render doesn't hold the runtime read lock (PLAN2 §P1.2). This
+/// helper glues those two free functions back together for tests and
+/// single-step invocations; it lives here so the live-tail regression
+/// tests can validate the decomposition without re-implementing it.
+#[allow(dead_code)] // exercised by `src/session/logs/tests.rs`; not pulled into the main binary.
 pub fn render_engine_screen(
     engine: &crate::terminal::Terminal,
     tail: usize,
     keep_color: bool,
     term_cols: u16,
 ) -> Vec<u8> {
-    let content_rows: Vec<Vec<u8>> = if keep_color {
+    let content_rows = engine_content_rows(engine, keep_color, term_cols);
+    finish_render(content_rows, tail, keep_color)
+}
+
+/// Borrow the engine long enough to copy its visible rows. Requires
+/// `&Terminal`, so callers must already hold the runtime's read lock —
+/// see `SessionStore::render_live_logs` for the off-thread variant that
+/// snapshots this output and renders without holding the lock.
+pub fn engine_content_rows(
+    engine: &crate::terminal::Terminal,
+    keep_color: bool,
+    term_cols: u16,
+) -> Vec<Vec<u8>> {
+    if keep_color {
         engine.styled_screen_rows()
     } else {
         engine
@@ -143,15 +164,13 @@ pub fn render_engine_screen(
             .into_iter()
             .map(|row| truncate_chars(&row, usize::from(term_cols)).into_bytes())
             .collect()
-    };
-    finish_rows_for_display(content_rows, tail, keep_color)
+    }
 }
 
-fn truncate_chars(text: &str, max: usize) -> String {
-    text.chars().take(max).collect()
-}
-
-fn finish_rows_for_display(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: bool) -> Vec<u8> {
+/// Pure CPU step applied to a snapshot of engine rows. Lives outside
+/// the runtime lock so callers can drop the lock and run this on
+/// `tokio::task::spawn_blocking` (PLAN2 §P1.2).
+pub fn finish_render(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: bool) -> Vec<u8> {
     let rows = if let Some((first, last)) = content_bounds(&content_rows) {
         let visible_rows = &content_rows[first..=last];
         let skip = visible_rows.len().saturating_sub(tail);
@@ -160,6 +179,10 @@ fn finish_rows_for_display(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: 
         Vec::new()
     };
     format_rows_for_output(&rows, keep_color)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
 }
 
 /// Shared scrollback-seed formatting for engine rows: trim

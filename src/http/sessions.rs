@@ -778,6 +778,14 @@ pub async fn set_session_notifications(
             )
                 .into_response()
         }
+        Err(SessionError::Internal(message)) => {
+            warn!(session_id = %id, message = %message, "notification toggle: internal failure");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
     }
 }
 
