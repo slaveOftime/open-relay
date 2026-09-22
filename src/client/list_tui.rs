@@ -1558,6 +1558,25 @@ fn session_key(session: &SessionSummary) -> String {
     )
 }
 
+/// Display label used to sort sessions inside a folder. Mirrors what the
+/// tree-view renders: command + args + title. Title is appended last so
+/// sessions sharing a command line still bubble up in their own alpha
+/// order.
+fn session_sort_label(session: &SessionSummary) -> String {
+    let mut label = session.command.clone();
+    if !session.args.is_empty() {
+        label.push(' ');
+        label.push_str(&session.args.join(" "));
+    }
+    if let Some(title) = &session.title
+        && !title.is_empty()
+    {
+        label.push(' ');
+        label.push_str(title);
+    }
+    label
+}
+
 /// Longest shared path prefix of `paths` whose presence as a hidden prefix
 /// would still leave at least one hierarchical level visible.
 ///
@@ -1681,6 +1700,14 @@ fn walk_tree_branch(
         });
     }
 
+    // Subfolders first (file-explorer style: folders grouped at the top,
+    // sessions below), then the sessions hosted by this folder. Both
+    // lists are sorted alphabetically by `build_tree_nodes` so the walker
+    // just iterates them in deterministic order.
+    for &child_idx in &node.subfolders {
+        walk_tree_branch(nodes, child_idx, depth + 1, auto_depth, drilled, out);
+    }
+
     for session_idx in &node.direct_sessions {
         out.push(TreeEntry::Session {
             session: *session_idx,
@@ -1688,15 +1715,9 @@ fn walk_tree_branch(
         });
     }
 
-    // Stop descending when we are at (and not past) the auto-depth horizon
-    // *and* drill state isn't keeping the subtree open. If drill state is
-    // active, every descendant of `node.path` remains visible.
     if depth >= auto_depth && !is_in_drill_subtree(&node.path, drilled) {
-        return;
-    }
-
-    for &child_idx in &node.subfolders {
-        walk_tree_branch(nodes, child_idx, depth + 1, auto_depth, drilled, out);
+        // Stop descending; children past auto_depth must wait for the
+        // user to drill this path.
     }
 }
 
@@ -1901,13 +1922,28 @@ impl App {
     /// the previously selected session if it survives the rebuild, otherwise
     /// to the first row.
     fn rebuild_tree(&mut self) {
-        let previously_selected_session = self
+        // Snapshot the row the cursor is currently on so we can re-locate
+        // the same logical *row* (folder or session) after a refresh
+        // re-runs the walker. Folder rows move around whenever a sibling
+        // session appears or disappears, so the cursor must remember the
+        // folder by *path* — not just by index.
+        let previously_focused_session = self
             .tree
             .visible
             .get(self.tree.cursor)
             .and_then(|entry| match entry {
                 TreeEntry::Session { session, .. } => Some(*session),
                 TreeEntry::Folder { .. } => None,
+            });
+        let previously_focused_folder = self
+            .tree
+            .visible
+            .get(self.tree.cursor)
+            .and_then(|entry| match entry {
+                TreeEntry::Folder { node, .. } => {
+                    Some(self.tree.nodes[*node].path.clone())
+                }
+                TreeEntry::Session { .. } => None,
             });
 
         self.build_tree_nodes();
@@ -1930,11 +1966,22 @@ impl App {
         };
         self.tree.visible = visible;
 
-        // Restore cursor: prefer the same session, otherwise the last row.
-        self.tree.cursor = previously_selected_session
+        // Restore cursor: prefer the same session → the same folder →
+        // otherwise the last row. The folder fallback is what keeps
+        // arrow-key navigation alive across a daemon refresh tick that
+        // happens to land with the cursor on a parent row.
+        self.tree.cursor = previously_focused_session
             .and_then(|session_idx| {
                 self.tree.visible.iter().position(|entry| {
                     matches!(entry, TreeEntry::Session { session, .. } if *session == session_idx)
+                })
+            })
+            .or_else(|| {
+                previously_focused_folder.as_ref().and_then(|path| {
+                    self.tree.visible.iter().position(|entry| {
+                        matches!(entry, TreeEntry::Folder { node, .. }
+                            if self.tree.nodes[*node].path == *path)
+                    })
                 })
             })
             .unwrap_or_else(|| self.tree.visible.len().saturating_sub(1));
@@ -1996,6 +2043,38 @@ impl App {
             };
             let leaf_idx = ensure_tree_path(&mut self.tree, &effective);
             self.tree.nodes[leaf_idx].direct_sessions.push(index);
+        }
+
+        // Sort children folders and direct sessions alphabetically so the
+        // walker traverses them in a stable, easy-to-scan order across
+        // refreshes. Folder names and session labels are compared
+        // case-insensitively because human-friendly ordering should not
+        // depend on whether the cwd had capitals.
+        self.sort_tree_nodes();
+    }
+
+    /// Sort every node's `subfolders` (by `name`) and `direct_sessions`
+    /// (by cmd + args + title). Both lists are stable-sorted so existing
+    /// display ties keep their insertion order.
+    fn sort_tree_nodes(&mut self) {
+        let labels: Vec<String> = (0..self.sessions.len())
+            .map(|index| session_sort_label(&self.sessions[index]))
+            .collect();
+        // Snapshot folder names so the closures can borrow them immutably
+        // without re-borrowing the same `nodes` vector being mutated.
+        let folder_names: Vec<String> = self
+            .tree
+            .nodes
+            .iter()
+            .map(|node| node.name.to_lowercase())
+            .collect();
+        for node in &mut self.tree.nodes {
+            let mut children = node.subfolders.clone();
+            children.sort_by(|&a, &b| folder_names[a].cmp(&folder_names[b]));
+            node.subfolders = children;
+            let mut sessions = node.direct_sessions.clone();
+            sessions.sort_by(|&a, &b| labels[a].to_lowercase().cmp(&labels[b].to_lowercase()));
+            node.direct_sessions = sessions;
         }
     }
 
@@ -4818,6 +4897,69 @@ mod tests {
     }
 
     #[test]
+    fn tree_refresh_tick_preserves_focused_folder() {
+        // Regression: every `replace_sessions` round-trip (which happens on
+        // every daemon refresh tick) calls `rebuild_tree`, and the rebuild
+        // used to clobber `tree.cursor` and snap it to the last row when
+        // the user's focus was on a folder row. The fix is to remember the
+        // folder path so the rebuild can re-locate the same logical
+        // position. This test exercises the full refresh path — the same
+        // one used by the input loop.
+        let mut app = App::default();
+        app.replace_sessions(vec![
+            session_at("alpha", Some("/work/a")),
+            session_at("bravo", Some("/work/b")),
+            session_at("charlie", Some("/home/c")),
+        ]);
+        app.toggle_view_mode();
+
+        // Find the depth-1 `home` folder row and place the cursor there.
+        let home_index = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| match entry {
+                super::TreeEntry::Folder { node, .. } => {
+                    app.tree.nodes[*node].path
+                        == std::path::Path::new("home")
+                }
+                _ => false,
+            })
+            .expect("home folder should appear");
+        app.tree.cursor = home_index;
+
+        // Refresh cycle — `replace_sessions` re-runs `rebuild_tree`.
+        app.replace_sessions(vec![
+            session_at("alpha", Some("/work/a")),
+            session_at("bravo", Some("/work/b")),
+            session_at("charlie", Some("/home/c")),
+        ]);
+
+        // Cursor must snap back to the same folder row, not to the last
+        // row. Without the folder-path-restoration fix this would be
+        // `app.tree.visible.len() - 1`.
+        let still_home = app
+            .tree
+            .visible
+            .get(app.tree.cursor)
+            .copied()
+            .map(|entry| match entry {
+                super::TreeEntry::Folder { node, .. } => {
+                    app.tree.nodes[node].path == std::path::Path::new("home")
+                }
+                _ => false,
+            })
+            .unwrap_or(false);
+        assert!(
+            still_home,
+            "cursor should still be on the `home` folder after refresh, \
+             got visible[{}] = {:?}",
+            app.tree.cursor,
+            app.tree.visible.get(app.tree.cursor),
+        );
+    }
+
+    #[test]
     fn tree_walks_through_empty_middleman_folders() {
         let mut app = App::default();
         // `/a/b/c/something` has three empty middleman folders. With the
@@ -4935,6 +5077,96 @@ mod tests {
             app.tree.cursor,
             ((5isize) - 7).rem_euclid(total as isize) as usize
         );
+    }
+
+    #[test]
+    fn tree_orders_folders_then_sessions_alphabetically() {
+        let mut app = App::default();
+        // Five sessions split across two sibling folders under the same
+        // cwd-rooted parent. `session_at` only sets `id`+`cwd`, so we
+        // patch each session's `command` manually so the sort label has
+        // a unique alphabetic key per session.
+        let mut sessions = vec![
+            session_at("zeta", Some("/proj/zeta-target")),
+            session_at("alpha", Some("/proj/zeta-target")),
+            session_at("apple", Some("/other-apple-leaves")),
+            session_at("mango", Some("/proj/zeta-target")),
+            session_at("banana", Some("/other-apple-leaves")),
+        ];
+        let commands = ["zeta", "alpha", "apple", "mango", "banana"];
+        for (session, cmd) in sessions.iter_mut().zip(commands.iter()) {
+            session.command = (*cmd).to_string();
+        }
+        app.replace_sessions(sessions);
+        app.toggle_view_mode();
+
+        // Capture each visible row's display label. Folder rows use the
+        // folder's `name` (the last basename); session rows use the
+        // session's command — which is also the sort key, so the order
+        // of labels in the flat list reflects the sorted order directly.
+        let path_labels: Vec<String> = app
+            .tree
+            .nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect();
+        let mut sequence: Vec<&str> = Vec::new();
+        for entry in &app.tree.visible {
+            match entry {
+                super::TreeEntry::Folder { node, .. } => {
+                    sequence.push(path_labels[*node].as_str());
+                }
+                super::TreeEntry::Session { session, .. } => {
+                    sequence.push(app.sessions[*session].command.as_str());
+                }
+            }
+        }
+
+        // Verify folder-before-session ordering per parent: every session
+        // row must come after its enclosing folder row, and within each
+        // parent, sessions must be alphabetically sorted. The walker also
+        // sorts folder names alphabetically across siblings.
+        let other_idx = sequence
+            .iter()
+            .position(|label| *label == "other-apple-leaves")
+            .expect("other-apple-leaves folder should appear");
+        let proj_idx = sequence
+            .iter()
+            .position(|label| *label == "proj")
+            .expect("proj folder should appear");
+        let proj_target_idx = sequence
+            .iter()
+            .position(|label| *label == "zeta-target")
+            .expect("zeta-target folder should appear");
+        let apple_idx = sequence.iter().position(|l| *l == "apple").unwrap();
+        let banana_idx = sequence.iter().position(|l| *l == "banana").unwrap();
+        let alpha_idx = sequence.iter().position(|l| *l == "alpha").unwrap();
+        let mango_idx = sequence.iter().position(|l| *l == "mango").unwrap();
+        let zeta_idx = sequence.iter().position(|l| *l == "zeta").unwrap();
+
+        // Depth-1 folders sort alphabetically: `o` < `p`.
+        assert!(
+            other_idx < proj_idx,
+            "folders must be sorted alphabetically: {sequence:?}"
+        );
+
+        // The `zeta-target` leaf folder sits under `proj`, so it appears
+        // after the parent folder.
+        assert!(
+            proj_idx < proj_target_idx,
+            "leaf folder must follow its parent: {sequence:?}"
+        );
+
+        // Inside each folder, sessions follow the folder row and are
+        // themselves alphabetically ordered.
+        assert!(other_idx < apple_idx);
+        assert!(other_idx < banana_idx);
+        assert!(apple_idx < banana_idx);
+        assert!(proj_target_idx < alpha_idx);
+        assert!(proj_target_idx < mango_idx);
+        assert!(proj_target_idx < zeta_idx);
+        assert!(alpha_idx < mango_idx);
+        assert!(mango_idx < zeta_idx);
     }
 
     #[test]
