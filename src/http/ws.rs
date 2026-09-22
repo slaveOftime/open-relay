@@ -357,8 +357,7 @@ async fn handle_ws(
     // just future requests — watch the revocation epoch and re-validate the
     // connection's token before tearing the stream down.
     let reconnect_token =
-        crate::http::auth::extract_request_token_parts(&params.headers, None)
-            .unwrap_or_default();
+        crate::http::auth::extract_request_token_parts(&params.headers, None).unwrap_or_default();
 
     if let Some(node_name) = node.clone() {
         match AttachSource::relayed(
