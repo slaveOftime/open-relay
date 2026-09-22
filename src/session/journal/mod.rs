@@ -51,7 +51,7 @@ pub(crate) mod record;
 pub(crate) use record::crc32;
 pub use record::{Crc32, Record, RecordKind};
 pub(crate) use record::{
-    HEADER_LEN, MAX_PAYLOAD_LEN, RECORD_MAGIC, RECORD_VERSION, crc32_two, encode_record_header,
+    HEADER_LEN, MAX_PAYLOAD_LEN, RECORD_MAGIC, RECORD_VERSION, encode_record_header,
 };
 
 // Typed payload codecs for non-output records (PLAN2 S1.5 step 1).
@@ -282,7 +282,7 @@ mod tests {
         // Re-seal the CRC so only the continuity check can catch this.
         let header_end = first_len as usize + 32;
         let payload = bytes[first_len as usize + HEADER_LEN..].to_vec();
-        let crc = crc32_two(&bytes[first_len as usize..header_end], &payload);
+        let crc = super::record::crc32_two(&bytes[first_len as usize..header_end], &payload);
         bytes[first_len as usize + 32..first_len as usize + 36].copy_from_slice(&crc.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
 
