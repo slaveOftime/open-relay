@@ -427,6 +427,20 @@ Inside that directory, `oly` stores:
 - saved join configs on secondary nodes
 - optional `wwwroot` static content
 
+### Working on `oly` from a clone
+
+When iterating on `oly` itself, keep the dev daemons and the per-session
+journal directories **out** of the repo root. Set:
+
+```sh
+export OLY_STATE_DIR="$PWD/.dev-state"
+```
+
+before running `oly daemon start` (or `cargo run -- daemon start`). The
+repo's `.gitignore` already excludes `.dev-state/` and the per-session
+`<id>/` directories underneath it, so the working tree stays clean.
+`CONTRIBUTING.md` documents the same convention with examples.
+
 ### Tunable `config.json` keys
 
 These keys can be set in `config.json` (runtime overrides win over the file). Several are hot-reloaded when the file changes, so no daemon restart is needed:

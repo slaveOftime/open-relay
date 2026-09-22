@@ -4,6 +4,7 @@ node_modules
 /target
 /target-test
 /target-tests
+/.dev-state
 /web/dist
 /web/dev-dist
 /npm/README.md
