@@ -30,6 +30,8 @@ Phase summaries:
 | P1 | Off the async workers | low | S1 |
 | P2 | Hot-path costs | low | — |
 | P2.4 | **Bounded resize-history in `render_log_session`** — **DONE** | low | — |
+| P2.5 | **Byte-budget retention for live-session journals** — **DONE** | low | — |
+| P2.6 | **Wall-clock retention for stopped sessions** — **DONE** | low | — |
 | P3 | Caching & polling elimination | low | — |
 | X1 | Security quick wins | low | — (S4 helps X1.4) |
 | X2 | Credential verification hardening | medium | — |
@@ -428,6 +430,142 @@ call `resize_events` directly.
 **Acceptance:** all 662 unit tests + 21 e2e tests pass;
 `cargo clippy --locked --all-targets --all-features -- -D warnings` green;
 `cargo fmt --check` clean; `cargo build --release` green.
+
+### P2.5 Byte-budget retention for live-session journals — ✅ COMPLETE
+
+**Problem.** A long-running interactive session (or one inherited from
+a CI reuse pool) can grow its journal without bound; there was no
+per-session disk cap. 0.3.x had `max_output_log_bytes` acting on the
+(nonexistent in 0.5) `output.log`; 0.5 needed a forward-looking
+equivalent that respected ADR-0002 (the journal is the truth) and
+**must not fs-truncate a running journal**.
+
+**Design.** New config knob
+[`limits.max_journal_bytes_per_session`](MIGRATION.md) (default `0` =
+unlimited → pre-P2.5 behavior preserved exactly on upgrade). On every
+checkpoint, the runtime spawns one blocking-pool task that calls
+`journal::min_incarnation_for_byte_budget(journal_dir, cap)` and hands
+the result to the existing `retain_before(&dir, horizon)`.
+
+`min_incarnation_for_byte_budget` enforces three invariants:
+
+1. **Never crosses the gate.** The computed `horizon` is clamped to be
+   ≥ the latest checkpoint-bearing incarnation. The recovery anchor
+   (ADR-0002) stays untouched even when the user asks for `cap = 1`.
+2. **Whole-incarnation granularity.** Manifest entries are summed per
+   incarnation; a partially-purged incarnation would leave a corrupt
+   segment header. We either keep the whole inc or delete the whole
+   inc.
+3. **Recency bias.** Pre-gate incarnations are walked newest-to-oldest.
+   Each candidate is added to the kept set if-and-only-if its bytes
+   fit under the cap. The first over-budget candidate is rejected and
+   the loop continues, so a small but critical older incarnation
+   (e.g. one with a key resize event) is not penalized for being old.
+
+**Hot-reload.** The cap is held in an `Arc<AtomicU64>` shared between
+`SessionStore` and every `SessionRuntime`. Choosing a shared atomic
+over a `LiveConfig`-style swap was deliberate: the retention sweep
+reads the cap inside `std::thread::spawn` after the spawn point locks
+are released; the legacy `snapshot_at_spawn` pattern would have
+*frozen* the cap at session start. `daemon/reload.rs` calls
+`store.set_journal_byte_cap(new.limits.max_journal_bytes_per_session)`
+next to `set_eviction_seconds`.
+
+**Wire.** `SessionSummary` got four new `Option<u64>` fields,
+gated with `skip_serializing_if = "Option::is_none"`:
+`journal_byte_cap`, `journal_bytes_retained`,
+`journal_retention_sweeps`, `journal_incarnations_dropped`. Pre-P2.5
+sessions stay exactly as they were on the wire (`Option::None` is
+elided); new fields appear only after the first sweep runs.
+
+**Legacy alias.** `max_output_log_bytes` is accepted as an alias and
+re-mapped onto `max_journal_bytes_per_session` so existing 0.3.x
+`config.json` files keep working without edits, with a comment that
+the withdrawn trim sweep wakes back up here.
+
+**Files changed:** `src/config.rs` (LimitsConfig + impl_config_diff!),
+`src/session/journal/checkpoint.rs` (the byte-budget helper),
+`src/session/journal/mod.rs` (re-export, 2 unit tests),
+`src/session/store/mod.rs` (`with_journal_byte_cap`, atomic cap field),
+`src/session/store/lifecycle.rs` (extract cap from store),
+`src/session/runtime.rs` (`RetentionStats`/`RetentionHandle`,
+`run_retention_sweep`, retention call wired into `record_checkpoint_sequence`),
+`src/daemon/reload.rs` (hot-reload line),
+`src/daemon/lifecycle.rs` (construct with the cap),
+`src/protocol.rs` (4 new summary fields),
+plus all literal-vs-struct updates (`src/db.rs`, `src/http/sse.rs`,
+`src/http/sessions.rs`, `src/notification/prompt.rs`, every
+`SessionStore::new` test helper).
+
+**Trade-off.** The cap is satisfied **at checkpoint boundaries only**.
+A newly opened part of a live tail (≤ ~32 MiB filtered output, bounded
+by `segment_byte_budget`) can push the journal briefly over the cap
+before the next checkpoint reclaims it. We chose this over per-record
+trimming because:
+
+- per-record trimming would need a write at every `record_output`
+  call (it’s the hot path).
+- checkpoint-fenced trimming is the only way to keep
+  ADR-0002 honest (a checkpoint IS the recovery point; trimming
+  before it would silently invalidate a future recover).
+
+**Acceptance:** unit-test cover for `min_incarnation_for_byte_budget`
+covers five regimes: cap=0→`u64::MAX`; cap≥total→`1`; one inc
+drop→horizon moves to `2`; two incs drop→horizon moves to `3`;
+cap=1 → gate invariant holds (`3`). `retain_before` over the
+resulting horizon drops the expected incarnations and leaves the
+checkpoint-bearing one. Without a checkpoint, helper defaults
+the gate to the latest incarnation (correct: nothing older is
+recoverable, so retention can’t break anything). All 674 unit tests
++ 24 e2e tests pass.
+
+### P2.6 Wall-clock retention for stopped sessions — ✅ COMPLETE
+
+**Problem.** P2.5 governs a *live session’s* journal growth. The
+*stopped* tail (killed, failed, or cleanly exited sessions, possibly
+hundreds or thousands) had no equivalent — old CI sessions accumulate
+forever. Users asked for “auto-clean sessions older than N days”.
+
+**Design.** New config knob `limits.journal_retention_days`
+(default `0` = disabled, matching pre-P2.6 behavior). A new
+background sweeper `daemon::journal_retention::run_journal_retention_sweeper`
+runs every [`JOURNAL_RETENTION_SWEEP_INTERVAL`] (one hour). On each
+tick it:
+
+1. Reads `live_config.get().limits.journal_retention_days` (hot-reload).
+2. Asks the DB for `list_stopped_sessions_older_than(now - days)`,
+   which filters via SQL (`status IN ('stopped','killed','failed')
+   AND ended_at < cutoff`) so live sessions never appear.
+3. For each result: journal dir first (fs::remove_dir_all), then
+   `db.delete_session_by_id`. Order matters — if the daemon crashes
+   between the two, the next sweep reaps the orphan (the DB row is
+   still there).
+4. Logs each deletion with the session id, ended_at, cutoff, and
+   size-on-disk.
+
+**Why an hourly interval?** The knob is in *days*, so the cost of
+resolution (= 1 hour worst-case enforced latency) is negligible and
+files the loop into the same long-tail cadence as
+`run_config_reloader`. A spurious crash loop is bounded because
+`remove_dir_all` swallows `NotFound` and reports the actual error
+otherwise.
+
+**Files changed:** `src/config.rs` (LimitsConfig field +
+impl_config_diff!), `src/db.rs` (two methods +
+unit tests), `src/daemon/journal_retention.rs` (new file),
+`src/daemon/mod.rs` (mod dec), `src/daemon/lifecycle.rs` (spawn task
+alongside `run_config_reloader`).
+
+**Trade-off.** This deletes a stopped session’s journal directory and
+DB row, which is irreversible. We could have moved files to a
+quarantine bucket instead, but that pushes the storage problem to
+the user; explicit deletion matches `oly rm` semantics. Users who
+want audit-trail behavior should set `journal_retention_days = 0` and
+write their own cron job.
+
+**Acceptance:** DB unit tests cover the cutoff filter (fresh-stopped
+unaffected, midnight stopped un-affected, >cutoff picked up) and
+the delete-by-id idempotency. All 674 unit tests + 24 e2e tests pass.
 
 ---
 

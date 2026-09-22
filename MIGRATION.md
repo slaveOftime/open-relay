@@ -44,7 +44,7 @@ honest migration instead.
 | Attach stream framing | base64 chunks inside JSON lines | binary frames after the JSON init line | Only relevant to tooling that spoke IPC directly; update it or pipe through the 0.5.0 CLI. |
 | Federation | 0.3.x node handshake | fenced, deadline/keepalive-driven node links (M5-2…M5-4) | All nodes must run 0.5.0; re-`join` secondaries after upgrading. No rolling mixed-version federation. |
 | SSH auth | — | optional SSH key authentication with MITM protection (M5-4) | New `--ssh-key` flag on `oly join start`; primary serves host key via `GET /api/nodes/host-key`; no action for existing joins. |
-| Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed | Delete them from `config.json`. Unknown keys are **silently ignored** (the config parser is permissive by design), so a stale key will not error — it just does nothing. |
+| Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed; replaced by `limits.max_journal_bytes_per_session` (live sessions) and `limits.journal_retention_days` (stopped sessions); `max_output_log_bytes` continues to be honored as an alias for `max_journal_bytes_per_session` | Delete the old keys (or leave the alias); set new keys explicitly if you want caps. Both default to `0` (unlimited) so existing behavior is preserved exactly on upgrade. |
 | API keys | one all-powerful daemon key | scoped keys (M5-4) | Old keys stop working; create new scoped keys with `oly api-key`. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
 | Input handling | timing heuristics for paste/keys | event-driven; paste boundaries come from bracketed-paste markers only (ADR-0003) | No action; apps that enable bracketed paste get exact paste boundaries. |
@@ -137,6 +137,92 @@ Your old bytes are still useful:
 - Old sessions remain listed in 0.5.0 with size 0; asking for their logs or
   attaching produces an explicit `uses the pre-0.5 log format (output.log) …
   see MIGRATION.md` error rather than empty output.
+
+## New retention knobs (PLAN2 §P2.5, §P2.6)
+
+0.5.0 introduces two **independent, hot-reloadable** caps on persisted
+session state. They default to `0` (= disabled) so a stock install keeps
+the pre-0.5 behavior exactly; opt in only when you need them.
+
+### `limits.max_journal_bytes_per_session` (PLAN2 §P2.5)
+
+A byte cap on a **running** session's on-disk journal. When a checkpoint
+is sealed, the daemon computes how many pre-checkpoint incarnations it
+can keep while staying under the cap; the oldest of those are dropped
+(recency bias). Never drops anything from the incarnation that owns the
+checkpoint itself — that would invalidate the recovery anchor (ADR-0002).
+The cap is satisfied at checkpoint boundaries only, so the live tail can
+overshoot by at most one record (one journal part, ~32 MiB filtered
+output, bounded by `segment_byte_budget`), before the next sweep runs.
+
+This replaces 0.3.x's `max_output_log_bytes`, which is no longer
+recognized as a primary key but **is still accepted as an alias** so
+existing `config.json` files keep working without edits; both knobs are
+mirrored onto the same underlying setting.
+
+Accepts:
+
+```json
+{
+  "limits": {
+    "max_journal_bytes_per_session": 268435456
+  }
+}
+```
+
+If you prefer to keep the old spelling, this is equivalent:
+
+```json
+{
+  "limits": {
+    "max_output_log_bytes": 268435456
+  }
+}
+```
+
+You can fetch the live numbers via `oly list`:
+
+```text
+SESS…  echo hello  stopped  2024-01-15  1.2 MiB / 256 MiB cap  (3 sweeps, dropped 2 incs)
+```
+
+### `limits.journal_retention_days` (PLAN2 §P2.6)
+
+A wall-clock cap on **stopped** sessions only. A background sweeper
+(runs hourly) deletes the journal directory + DB row of any session whose
+`ended_at` is older than the configured number of days AND whose status
+is `stopped`, `killed`, or `failed`. Running sessions are never
+auto-deleted: the user did not consent to that, and live PTYs are owned
+by the daemon in ways that would race with a sweeper.
+
+Accepts:
+
+```json
+{
+  "limits": {
+    "journal_retention_days": 30
+  }
+}
+```
+
+Accepts a **post-mortem auto-clean** workflow typical of CI: kick hundreds
+of build sessions per day, never see them again after a month, get a
+fresh state directory the next morning. Set to `0` if you want to keep
+every stopped session forever (the default for backward compatibility;
+0.3.x never garbage-collected anything automatically).
+
+### Trade-offs
+
+- Both caps are honored per session. A daemon-wide `du` will still show
+  ~`cap * session_count` worst case — combine with `oly rm` or a
+  separate rotation script for shared hosts.
+- Checkpoint-gated retention can lag by up to one checkpoint interval
+  (~seconds under normal load) during a surge. If you need hard upper
+  bounds, also enable a separate journal directory quota via your OS
+  (e.g. `btrfs qgroup`, `xfs project quota`).
+- Disabling these caps is intentionally cheap (a single atomic load).
+  Enabling them costs one extra `retain_before` per checkpoint per
+  session — negligible compared to the I/O the checkpoint itself does.
 
 ## Rollback
 
