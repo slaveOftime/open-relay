@@ -284,10 +284,23 @@ pub(crate) fn make_runtime_writable_with_capacity(
 }
 pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
     use std::path::PathBuf;
+    // Per-call tempdir root so the spawned sessions land under
+    // `<temp>/oly_test_sessions_<uuid>/` rather than the process CWD.
+    // Pre-fix, `make_test_config` used `PathBuf::from(".")` for every
+    // path entry, and `SessionStore::start_session_via_handle` writes
+    // `<sessions_dir>/<id>/` for each spawned session — so every
+    // `cargo test --bin oly` run littered the repo root with a brute of
+    // hex-named directories. Funnelling through `std::env::temp_dir()`
+    // (which cargo wipes between runs on most setups, and where leftover
+    // dirs are at least not in the user's working tree) keeps `git
+    // status` and `ls` clean without changing the storage contract for
+    // anything but this test helper.
+    let tmp_root = std::env::temp_dir().join(format!("oly_test_sessions_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&tmp_root);
     AppConfig {
         paths: crate::config::PathsConfig {
-            state_dir: PathBuf::from("."),
-            sessions_dir: PathBuf::from("."),
+            state_dir: tmp_root.clone(),
+            sessions_dir: tmp_root,
             db_file: PathBuf::from("."),
             socket_name: "test.sock".into(),
             socket_file: PathBuf::from("."),
