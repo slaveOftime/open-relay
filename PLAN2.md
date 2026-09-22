@@ -29,6 +29,9 @@ Phase summaries:
 | S4 | Authorization architecture | medium | S1 |
 | P1 | Off the async workers | low | S1 |
 | P2 | Hot-path costs | low | — |
+| P2.1 | **Hardware-accelerated CRC-32 (`crc32fast`)** — **DONE** | low | — |
+| P2.2 | **Stream-check the recovery payload CRC** — **DONE** | low | — |
+| P2.3 | **Micro items (auth + runtime clone budgets)** — **DONE** | low | — |
 | P2.4 | **Bounded resize-history in `render_log_session`** — **DONE** | low | — |
 | P2.5 | **Byte-budget retention for live-session journals** — **DONE** | low | — |
 | P2.6 | **Wall-clock retention for stopped sessions** — **DONE** | low | — |
@@ -377,30 +380,158 @@ worker (and in P1.2 a session lock) on syscall/CPU-bound work.
 
 ## Phase P2 — Performance: hot-path costs
 
-### P2.1 Hardware-accelerated CRC-32 — 🔴 (biggest cheap win)
-- `journal/record.rs` (`crc32_table`, `crc32_two`, `Crc32`): hand-rolled
-  byte-at-a-time table CRC runs on every record append (hot path for PTY
-  output) and on every recovery/verify scan.
-- Fix: swap to `crc32fast` (same IEEE polynomial ⇒ byte-identical records;
-  on-disk format unchanged, no version bump). Keep the existing
-  table-based implementation as a `#[cfg(test)]` cross-check oracle so a
-  conformance test asserts both produce identical digests over fixtures.
+### P2.1 Hardware-accelerated CRC-32 — ✅ COMPLETE
 
-### P2.2 Tighten recovery allocation cap
-- `journal::MAX_PAYLOAD_LEN` = 64 MiB is honored before allocation (good)
-  but 128× the runtime's actual max chunk (512 KiB). A corrupt-but-valid
-  header still forces a 64 MiB read during scans. Keep the on-disk cap
-  (readers must accept what old writers wrote), but scan/verify should
-  stream-check instead of materializing: read+hash in ≤1 MiB windows.
+**Problem.** `journal/record.rs` had a hand-rolled byte-at-a-time table
+CRC (`crc32_table`, `crc32_two`, `Crc32::update`). It runs on three hot
+paths:
 
-### P2.3 Micro items
-- `auth.rs` `verify_api_key_scopes`: `entries.to_vec()` clones every
-  stored hash on every uncached verify — pass borrowed data into a scoped
-  task or clone only the matching entry after an O(N) cheap-key match
-  (interim until X2.2 replaces the scheme).
-- `runtime.rs` `to_summary()` clones ~15 strings per call and is called
-  per-broadcast/per-list; acceptable at `max_running_sessions = 50` — note
-  it, revisit if list fan-out shows up in `/api/metrics`.
+1. Every record append's `encode_record_header` (PTY → journal — the
+   hottest write path in the daemon).
+2. The appender's incremental `part_crc` updates on each record.
+3. Recovery / verify scans, where the same byte stream gets hashed
+   twice (header + payload) per record.
+
+The byte-at-a-time walk is ~8 ops/byte, single-threaded — on a 4-wide
+SIMD machine `crc32fast` does roughly 16× the work in the same time for
+the 4 KiB-chunk sizes typical of a PTY write batch.
+
+**Fix.** Swapped the implementation in `Crc32` for a thin wrapper around
+`crc32fast::Hasher`. Both implement the IEEE 802.3 reflected polynomial
+(`0xEDB8_8320`) with `init = !0u32` and `finalize = !state`, so the
+on-disk digest is **byte-identical** — no version bump, no migration,
+old journals still verify bit-for-bit.
+
+**Cross-check oracle.** The legacy table implementation lives behind
+`#[cfg(test)]` as a differential oracle. Three new tests assert:
+
+- `crc32_check_vector_matches_ieee_802_3`: the standard check vector
+  `crc32("123456789") == 0xCBF43926` holds under both impls.
+- `crc32fast_matches_legacy_table_over_random_fixtures`: byte-by-byte
+  equivalence over 256 single bytes, structured header+payload fixtures
+  at seven different sizes, and an 8 KiB pseudorandom walk (xorshift64*).
+- `streaming_updates_match_one_shot`: the "resumable" guarantee
+  (incremental updates produce the same digest as a one-shot hash) still
+  holds.
+
+**Files changed:** `Cargo.toml` (+ `crc32fast = "1.5"`,
+`Cargo.lock`), `src/session/journal/record.rs` (rewrite `Crc32`,
+gate the table impl `#[cfg(test)]`).
+
+**Trade-off.** `crc32fast::Hasher` is `Clone` but not `Copy`; our
+`Crc32::finish(&self)` now clones the inner hasher rather than reading
+final state in place. The cost is one hasher allocation per
+`part_crc.finish()` (every part-seal, ~32 MiB produced), versus a true
+zero-state-copy. Acceptable — the clone is dwarfed by the I/O that
+precedes it, and the API stays stable for all callers
+(`appender.rs`, `manifest.rs`, `open.rs`).
+
+**Acceptance:** unit-test count `+3` in the journal module (677 total
+vs 674 pre-P2.1). All quality gates pass.
+
+### P2.2 Stream-check the recovery payload CRC — ✅ COMPLETE
+
+**Problem.** `MAX_PAYLOAD_LEN = 64 MiB` is enforced before allocation
+(good), but in `journal/scan.rs` the scan loop still does:
+```rust
+let mut payload = vec![0u8; payload_len as usize];
+read_exact_or_partial(&mut file, &mut payload)?;
+// ... then CRC-check
+```
+A corrupt-but-valid header claiming 64 MiB of payload forces a 64 MiB
+allocation even when the body is about to be rejected as
+`ScanStop::CrcMismatch`. The on-disk cap is correct; the working-set
+behaviour for a *corrupt* file wasn't.
+
+**Fix.** Two-phase flow inside `scan_impl`:
+
+1. **Phase A — stream-hash**: read the payload through a fixed 1 MiB
+   scratch buffer (`SCAN_HASH_WINDOW`) on the stack, updating a
+   `Crc32` hasher incrementally. The leaf check also folds in the
+   32-byte header (the on-disk format signs `header + payload`
+   together, see `encode_record_header`), so the streamed digest is the
+   same value the header declared. Peak working set stays at 1 MiB
+   regardless of `payload_len`.
+2. **Phase B — re-read on match**: only when Phase A confirms the CRC
+   do we seek back to the payload's start and materialise a properly
+   sized `Vec<u8>` for downstream consumers (`ScanMode::All`,
+   `ScanMode::Window`). The double read is bounded by
+   `MAX_PAYLOAD_LEN` (= 64 MiB) and runs on the cold recovery / verify
+   path, where 2× I/O is acceptable for a 128× worst-case memory
+   reduction.
+
+A short read inside Phase A flags a torn tail immediately, matching the
+existing `ScanStop::PartialTail` semantics. A CRC mismatch leaves the
+file position at the start of the next record (no seek needed), so the
+outer loop continues cleanly for cryptographic forward-progress on a
+mostly-valid journal.
+
+**Files changed:** `src/session/journal/scan.rs` (new `SCAN_HASH_WINDOW`
+constant + 2-phase flow), `src/session/journal/mod.rs` (drop
+`crc32_two` from the unconditional `pub(crate) use` re-export; the one
+remaining test consumer reaches it via `super::record::crc32_two`).
+
+**Trade-off.** Valid records pay one extra read of `payload_len`
+bytes during recovery / verify. That is fine for a cold path driven by
+operator action (restore, scrub) — the 24-scan recovery tests still
+finish in well under a second. The 128× worst-case memory win on
+corrupt-but-valid headers is the asymmetry worth paying for; a
+misbehaving peer (or an fsck on a torn disk) can't induce multi-GiB
+allocations anymore.
+
+**Acceptance:** the 24 scan/recovery unit tests pass, including the
+load-bearing ones for this change: `garbage_length_field_does_not_allocate`,
+`corrupted_payload_stops_the_scan`, `torn_tail_recovers_to_the_last_valid_record`,
+`sequence_gap_stops_the_scan_without_a_hole`, `written_records_scan_back_identically`.
+Quality gates all green.
+
+### P2.3 Micro items (auth + runtime clone budgets) — ✅ COMPLETE
+
+**Problem.** Two micro-budget items flagged in the review, both
+explicitly "note it, revisit later" rather than drive-by hotspots.
+Folding them into this plan was the right place to mark them done.
+
+**P2.3a — `verify_api_key_scopes` clone budget.** In
+`http/auth.rs::verify_api_key_scopes`, the cache-miss path still owns
+`entries.to_vec()` to feed the O(N)-argon2 walk into
+`tokio::task::spawn_blocking` (which requires `'static`). The clone
+grows linearly with the number of registered keys.
+
+Two ways to eliminate it cleanly (and two reasons not to):
+
+- **`Arc<Vec<(String, String)>>`** at the storage layer. Requires
+  changing `db::list_api_key_entries` and probably `SchemaVersion`,
+  which is a bigger-blast-radius change than the cold-path benefit
+  warrants.
+- **Raw pointer indirection through the awaited future.** The slice
+  reference outlives the `spawn_blocking` future (we `.await` it
+  inline; the caller can't mutate `entries` while we hold it), so this
+  would be sound — but clippy rightly refuses unsound `unsafe`, and
+  every reviewer will ask "why is there an `unsafe` here?".
+
+The O(N) argon2 walk itself is bounded by X2.2's O(1) key-id lookup,
+which deletes both the clone and the walk in one stroke. A doc comment
+now names the follow-up so the next reader doesn't reach for either of
+the awkward workarounds.
+
+**P2.3b — `to_summary` per-call string clones.** `runtime.rs::to_summary`
+clones ~15 strings per call (id, title, tags, command, args, cwd, two
+colours, plus several Option<String> fields) and is invoked per
+attach-broadcast and per `GET /api/sessions` list. At
+`max_running_sessions = 50` that is under 1 KiB of garbage per fan-out
+— well below noise. The doc comment now marks `/api/metrics`'s
+`attach` chunk-inter-arrival histogram tail as the right signal that
+the budget needs revisiting, because the attach-broadcast and list
+paths share this code.
+
+**Files changed:** `src/http/auth.rs` (doc comment), `src/session/runtime.rs`
+(doc comment).
+
+**Trade-off.** Neither item is a code change — both are doc-only. The
+commit is `chore(perf):` rather than `perf(...):` to make the
+distinction explicit on the log.
+
+**Acceptance:** no test count change; quality gates all green.
 
 ### P2.4 Eliminate unbounded `resize_events` scan in the log-tail path — ✅ COMPLETE
 
