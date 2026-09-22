@@ -86,27 +86,57 @@ impl SessionStore {
         let prepared = store_handle.prepare_start_session(config, spec).await?;
 
         let PreparedStart {
-            mut meta,
+            meta,
             session_dir,
             rows,
             cols,
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
-        let runtime = match spawn_session(
-            &mut meta,
-            session_dir,
-            rows,
-            cols,
-            notifications_enabled,
-            config.limits.screen_scrollback_rows,
-            store_handle.event_tx.clone(),
-        ) {
-            Ok(runtime) => runtime,
-            Err(err) => {
+        // `spawn_session` performs mkdir + ShadowJournal recovery scan
+        // + fsyncs + PATH walks + PTY spawn, all of which block workers
+        // (PLAN2 §P1.1). Run it on the blocking pool so a dirty, large
+        // journal can't stall live attach pumps on a 4-worker runtime.
+        // The `SessionMeta` is shared by `Arc<Mutex<_>>` because
+        // `spawn_session` records the assigned pid back onto the meta;
+        // we unwrap the mutex once the join completes.
+        let screen_scrollback_rows = config.limits.screen_scrollback_rows;
+        let meta = Arc::new(parking_lot::Mutex::new(meta));
+        let runtime = match tokio::task::spawn_blocking({
+            let meta = Arc::clone(&meta);
+            let event_tx = store_handle.event_tx.clone();
+            move || {
+                let mut meta_guard = meta.lock();
+                spawn_session(
+                    &mut meta_guard,
+                    session_dir,
+                    rows,
+                    cols,
+                    notifications_enabled,
+                    screen_scrollback_rows,
+                    event_tx,
+                )
+            }
+        })
+        .await
+        {
+            Ok(Ok(runtime)) => runtime,
+            Ok(Err(err)) => {
                 let _ = store_handle.abort_started_session(&session_id).await;
                 return Err(err);
             }
+            Err(join_err) => {
+                let _ = store_handle.abort_started_session(&session_id).await;
+                return Err(AppError::Protocol(format!(
+                    "spawn_session worker join failed: {join_err}"
+                )));
+            }
+        };
+        let meta = match Arc::try_unwrap(meta) {
+            Ok(mutex) => mutex.into_inner(),
+            // Other Arcs shouldn't survive; if they do, the lock is
+            // uncontended and the join already finished above.
+            Err(arc) => arc.lock().clone(),
         };
         let cleanup_runtime = Arc::clone(&runtime);
 
@@ -788,6 +818,55 @@ mod tests {
             }
             _ => panic!("Expected MaxSessionsReached error, got {:?}", result),
         }
+    }
+
+    /// PLAN2 §P1.1 regression guard. Three concurrent
+    /// `start_session_via_handle` calls under a single-thread runtime
+    /// must finish in roughly the wall-clock time of a single call,
+    /// because the per-call blocking work runs on `spawn_blocking`
+    /// and so the three calls overlap on the blocking pool.  Without
+    /// that wrapper, the only worker would process them sequentially
+    /// (mkdir + journal recovery + PTY for each, end-to-end before
+    /// the next could even start), and the test budget would be
+    /// blown.  The bound is generous enough to absorb scheduler
+    /// jitter while still pinning a 3x sequential regression.
+    #[tokio::test(flavor = "current_thread")]
+    async fn p11_parallel_starts_overlap_on_the_blocking_pool() {
+        let store = Arc::new(store_with(vec![], make_test_db().await));
+        let config = make_test_config(8);
+
+        let make_spec = || StartSpec {
+            title: None,
+            tags: vec![],
+            cmd: "echo".into(),
+            args: vec!["hi".into()],
+            cwd: None,
+            rows: None,
+            cols: None,
+            notifications_enabled: false,
+        };
+
+        let single = std::time::Instant::now();
+        SessionStore::start_session_via_handle(&store, &config, make_spec())
+            .await
+            .expect("single start");
+        let single_ms = single.elapsed().as_millis().max(1);
+
+        let triple = std::time::Instant::now();
+        let (r1, r2, r3) = tokio::join!(
+            SessionStore::start_session_via_handle(&store, &config, make_spec()),
+            SessionStore::start_session_via_handle(&store, &config, make_spec()),
+            SessionStore::start_session_via_handle(&store, &config, make_spec()),
+        );
+        r1.expect("start 1");
+        r2.expect("start 2");
+        r3.expect("start 3");
+        let triple_ms = triple.elapsed().as_millis();
+
+        assert!(
+            triple_ms <= 3 * single_ms / 2,
+            "3 concurrent start_session calls took {triple_ms}ms (single baseline {single_ms}ms);              expected roughly the single-call time, not 3x sequential.              Did something drop the spawn_blocking wrapper?               (PLAN2 §P1.1)"
+        );
     }
 
     #[tokio::test]

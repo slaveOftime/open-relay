@@ -927,6 +927,18 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 /// Reader and writer threads are started automatically and share ownership via the Arc.
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
+/// Spawn a PTY-backed child process and return the runtime handle.
+///
+/// Synchronous by design: it creates the session directory, opens the
+/// shadow journal (which spawns the appender thread), walks PATH for
+/// the command, and PTY-spawns. All of those are blocking syscalls, so
+/// callers running inside an async fn must wrap this call in
+/// `tokio::task::spawn_blocking` to keep that worker free for attach
+/// pumps and SSE/WS multiplexing (PLAN2 §P1.1).
+///
+/// `meta` is mutated to record the assigned `pid` once the PTY child
+/// is live; wrap the caller's `SessionMeta` in a `Mutex` and unwrap
+/// the clone after the blocking task joins.
 pub fn spawn_session(
     meta: &mut SessionMeta,
     session_dir: PathBuf,

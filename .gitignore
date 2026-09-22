@@ -12,3 +12,8 @@ node_modules
 /npm/bin/oly-win32-x64.exe
 test-results
 .tli.claude/
+
+
+[0-9a-f]*/
+scripts/
+target-tests/
