@@ -12,7 +12,8 @@ use crate::{
     db::meta_to_summary,
     error::AppError,
     protocol::{
-        ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
+        ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SessionSummary,
+        SortOrder,
     },
     session::{
         SessionError, SessionStore, StartSpec,
@@ -22,6 +23,22 @@ use crate::{
 };
 
 use super::AppState;
+
+/// Annotate every session we proxy from a secondary with the node name we
+/// fetched it through. The owning daemon always emits `node = None` on its
+/// own summaries (`SessionRuntime::to_summary` hardcodes it), and HTTP
+/// callers have no way to recover that information from the proxy alone.
+/// Without this tagging the web client (and the SSE `replaceLocalSnapshot`
+/// cleanup keyed by `node\0id`) would store these items under the empty
+/// node prefix, diverging from later SSE forwards that carry
+/// `node = Some(node_name)`. Mirrors what `client::list` and
+/// `client::list_tui` already do for the same proxy path.
+fn tag_sessions_with_node(sessions: &mut [SessionSummary], node: &str) {
+    let node = node.to_string();
+    for session in sessions {
+        session.node = Some(node.clone());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared param for optional node routing
@@ -182,13 +199,19 @@ pub async fn list(
             query: query.clone(),
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::List { total, sessions }) => Json(serde_json::json!({
-                "items": sessions,
-                "total": total,
-                "offset": offset,
-                "limit": page_limit,
-            }))
-            .into_response(),
+            Ok(RpcResponse::List {
+                total,
+                mut sessions,
+            }) => {
+                tag_sessions_with_node(&mut sessions, node);
+                Json(serde_json::json!({
+                    "items": sessions,
+                    "total": total,
+                    "offset": offset,
+                    "limit": page_limit,
+                }))
+                .into_response()
+            }
             Ok(RpcResponse::Error { message }) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
@@ -378,7 +401,8 @@ pub async fn get_session(
             },
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::List { sessions, .. }) => {
+            Ok(RpcResponse::List { mut sessions, .. }) => {
+                tag_sessions_with_node(&mut sessions, node);
                 if let Some(s) = sessions.into_iter().find(|s| s.id == id) {
                     Json(s).into_response()
                 } else {
@@ -980,7 +1004,35 @@ pub async fn send_input(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{SessionMetadataBody, pathbuf_to_rpc_path};
+    use crate::protocol::SessionSummary;
+
+    use super::{SessionMetadataBody, pathbuf_to_rpc_path, tag_sessions_with_node};
+
+    fn empty_summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "bash".to_string(),
+            args: vec![],
+            pid: None,
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            ended_at: None,
+            cwd: None,
+            input_needed: false,
+            notifications_enabled: true,
+            node: None,
+            last_total_bytes: 0,
+            last_output_epoch: None,
+            rows: None,
+            cols: None,
+            attach_count: 0,
+            foreground_color: None,
+            background_color: None,
+        }
+    }
 
     #[test]
     fn session_metadata_body_accepts_notification_override() {
@@ -1013,6 +1065,27 @@ mod tests {
     fn rpc_upload_paths_use_forward_slashes() {
         let path = PathBuf::from("subdir").join("file.txt");
         assert_eq!(pathbuf_to_rpc_path(&path), "subdir/file.txt");
+    }
+
+    #[test]
+    fn tag_sessions_with_node_overrides_secondarys_none() {
+        // A proxy's response carries the secondary's raw summaries, which
+        // always have `node = None`. After tagging they must carry the
+        // node we fetched through, otherwise the web client stores them
+        // under the empty-node key and diverges from the live SSE stream
+        // that does forward `node = Some(name)`.
+        let mut summaries = vec![empty_summary("sess-1"), empty_summary("sess-2")];
+        // Mix of an ownership-side None (the typical secondary output) and
+        // a stale entry: the proxy path must overwrite either with the
+        // through-node so the web UI's SessionEventsStore keys match the
+        // SSE forwards that already carry `node = Some(name)`.
+        summaries[0].node = None;
+        summaries[1].node = Some("stale".to_string());
+
+        tag_sessions_with_node(&mut summaries, "worker-a");
+
+        assert_eq!(summaries[0].node.as_deref(), Some("worker-a"));
+        assert_eq!(summaries[1].node.as_deref(), Some("worker-a"));
     }
 }
 
