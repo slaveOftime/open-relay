@@ -595,6 +595,16 @@ pub enum RpcResponse {
     JoinList {
         joins: Vec<JoinSummary>,
     },
+    /// Outcome of the first attempt of a `JoinStart` request. The
+    /// connector keeps retrying in the background regardless — these
+    /// states are informational and the user is expected to check
+    /// `oly join ls` for the live view.
+    JoinStartStatus {
+        /// `"connected" | "joining" | "failed"`.
+        state: String,
+        /// Human-readable detail for `joining`/`failed`; empty for `connected`.
+        message: String,
+    },
     NodeList {
         nodes: Vec<String>,
     },

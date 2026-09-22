@@ -744,11 +744,49 @@ async fn handle_join_start(
     let join =
         client::join::build_join_config(url, name.clone(), key, ssh_key_path, ssh_known_hosts)?;
     client::join::save_join_config(config, &join)?;
-    let (abort, stop_tx) =
-        spawn_join_connector(join, Arc::clone(config), session_event_tx.subscribe());
+    // The connector reports its first-attempt outcome through a oneshot
+    // so the IPC handler can surface `joined` / `joining` / `failed` to
+    // the CLI synchronously instead of the user finding out about a
+    // rejected join only by absence in `oly join ls`.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let (abort, stop_tx) = spawn_join_connector(
+        join,
+        Arc::clone(config),
+        session_event_tx.subscribe(),
+        Some(tx),
+    );
     join_handles.lock().await.insert(name, (abort, stop_tx));
-    Ok(RpcResponse::Ack)
+    let outcome = match tokio::time::timeout(FIRST_JOIN_ATTEMPT_DEADLINE, rx).await {
+        Ok(Ok(super::rpc_nodes::JoinAttempt::Connected)) => ("connected", String::new()),
+        Ok(Ok(super::rpc_nodes::JoinAttempt::Failed(msg))) => ("failed", msg),
+        // The connector task ended before it could produce an outcome —
+        // treat it as a failed first attempt. This shouldn't normally
+        // happen unless `JoinStop` was raced against `JoinStart`.
+        Ok(Err(_canceled)) => (
+            "failed",
+            "join connector aborted before first response".to_string(),
+        ),
+        // Deadline elapsed: the connector hasn't reached a definitive
+        // state yet, but it keeps trying in the background. Tell the
+        // user we're still trying so they know it's not already done.
+        Err(_elapsed) => (
+            "joining",
+            format!(
+                "still waiting for first response after {} s; connector keeps retrying in the background; check `oly join ls` for status",
+                FIRST_JOIN_ATTEMPT_DEADLINE.as_secs()
+            ),
+        ),
+    };
+    Ok(RpcResponse::JoinStartStatus {
+        state: outcome.0.to_string(),
+        message: outcome.1,
+    })
 }
+
+/// Maximum time the synchronous `oly join start` path waits for the
+/// join connector's first attempt before reporting `joining`. The
+/// connector continues retrying in the background after the deadline.
+const FIRST_JOIN_ATTEMPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 async fn handle_join_stop(
     config: &AppConfig,

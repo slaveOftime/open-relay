@@ -149,10 +149,49 @@ pub async fn run_join(
     )
     .await
     {
-        Ok(RpcResponse::Ack) => {
-            println!(
-                "Joining primary as \"{name}\". Use `oly join stop --name {name}` to disconnect."
-            );
+        Ok(RpcResponse::JoinStartStatus { state, message }) => {
+            match state.as_str() {
+                "connected" => {
+                    println!(
+                        "Joined primary as \"{name}\". Use `oly join stop --name {name}` to disconnect."
+                    );
+                }
+                "joining" => {
+                    // Connector is still in its initial backoff loop; this
+                    // is the case `oly join start` can't escape from inside
+                    // the IPC deadline. Don't fail the command — the user is
+                    // expected to consult `oly join ls` for steady state.
+                    if message.is_empty() {
+                        eprintln!(
+                            "note: still joining primary as \"{name}\"; check `oly join ls` for status."
+                        );
+                    } else {
+                        eprintln!("note: {message}");
+                    }
+                }
+                "failed" => {
+                    // The first attempt was rejected synchronously by the
+                    // primary (or rejected by the connector's own validation
+                    // of the host key). Surface it loudly on stderr — the
+                    // connector keeps retrying, but if the user only ever
+                    // runs the CLI they would otherwise never see it.
+                    if message.is_empty() {
+                        eprintln!(
+                            "warning: join attempt for \"{name}\" failed; connector keeps retrying; check `oly join ls` for status."
+                        );
+                    } else {
+                        eprintln!("warning: join attempt for \"{name}\" failed: {message}");
+                        eprintln!(
+                            "note: connector keeps retrying in the background; check `oly join ls` for status."
+                        );
+                    }
+                }
+                other => {
+                    return Err(AppError::Protocol(format!(
+                        "unexpected join state from daemon: {other}"
+                    )));
+                }
+            }
             Ok(())
         }
         Err(AppError::DaemonUnavailable(_)) => {

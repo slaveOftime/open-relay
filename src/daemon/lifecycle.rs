@@ -590,10 +590,14 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let session_store = Arc::new(store);
     let event_tx = session_store.event_tx();
     for join in client::join::load_join_configs(&config) {
+        // Lifecycle replay runs at daemon startup before any IPC
+        // client is around; there's no caller to surface the first
+        // attempt outcome to, so don't pass an `on_attempt` oneshot.
         let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
             join.clone(),
             Arc::clone(&config),
             event_tx.subscribe(),
+            None,
         );
         join_handles
             .lock()

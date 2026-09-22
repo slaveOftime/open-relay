@@ -2029,3 +2029,62 @@ fn e2e_federation_cli_two_joins_same_key_different_names() {
     drop(secondary);
     drop(_primary);
 }
+
+// Regression guard: `oly join start` against a primary that doesn't have
+// the supplied API key must surface the rejection on stderr synchronously
+// rather than printing "Joined" and silently failing. Before the
+// AttemptReporter wiring, the CLI printed success immediately and the only
+// signal of failure was the silence in `oly join ls`.
+#[test]
+fn e2e_federation_join_start_reports_rejection_on_stderr() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    let primary_tmp = make_tmp_dir("e2e_fed_join_reject_primary");
+    let secondary_tmp = make_tmp_dir("e2e_fed_join_reject_secondary");
+    let port = pick_free_port();
+    let _primary = start_daemon_http(&primary_tmp, port);
+    let secondary = start_daemon(&secondary_tmp);
+
+    // NOTE: deliberately *not* registering the key on the primary so the
+    // first attempt lands in the primary's `verify_api_key_hash` and is
+    // rejected with "unauthorized".
+    let fake_key = "a".repeat(64);
+    let url = format!("http://127.0.0.1:{port}");
+
+    let out = oly_cmd(&secondary_tmp)
+        .args([
+            "join",
+            "start",
+            "--name",
+            "ghostworker",
+            "--key",
+            &fake_key,
+            &url,
+        ])
+        .output()
+        .expect("`oly join start` failed to execute");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // The command must still exit 0 (the daemon accepted the IPC; the
+    // connector will keep retrying) BUT stderr must surface the rejection.
+    assert!(
+        out.status.success(),
+        "`oly join start` should still succeed even when the first attempt fails;\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("warning") && stderr.contains("ghostworker"),
+        "expected stderr to carry the rejection warning for ghostworker; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("connector aborted"),
+        "rejection should carry the primary's reason, not a connector-abort fallback; got: {stderr}"
+    );
+
+    let _ = oly_cmd(&secondary_tmp)
+        .args(["join", "stop", "--name", "ghostworker"])
+        .output();
+    drop(secondary);
+    drop(_primary);
+}

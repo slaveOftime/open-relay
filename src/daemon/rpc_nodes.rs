@@ -23,14 +23,57 @@ use crate::{
     session::SessionEvent,
 };
 
+/// Outcome of the first attempt of a join connector. Reported exactly
+/// once (via `oneshot`) to whatever spawned the connector; subsequent
+/// retries/disconnects use the normal `Backoff` loop without further
+/// notification through this channel.
+#[derive(Debug)]
+pub(crate) enum JoinAttempt {
+    /// WS handshake completed and `NodeWsMessage::Joined` was received.
+    Connected,
+    /// WS handshake (or its prerequisites) failed before reaching
+    /// `Joined`; carries the reason from the connector.
+    Failed(String),
+}
+
+/// One-shot reporter for the first-attempt outcome. Holding this in the
+/// connector's state means we never forget to fire (or double-fire) the
+/// signal even across deep retry paths; `joined`/`fail` consume the
+/// inner sender so a later disconnect cannot accidentally signal again.
+struct AttemptReporter(Option<tokio::sync::oneshot::Sender<JoinAttempt>>);
+
+impl AttemptReporter {
+    fn empty() -> Self {
+        Self(None)
+    }
+    fn new(tx: tokio::sync::oneshot::Sender<JoinAttempt>) -> Self {
+        Self(Some(tx))
+    }
+    fn joined(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(JoinAttempt::Connected);
+        }
+    }
+    fn fail(&mut self, msg: impl Into<String>) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(JoinAttempt::Failed(msg.into()));
+        }
+    }
+}
+
 pub(super) fn spawn_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
     session_event_rx: broadcast::Receiver<SessionEvent>,
+    on_attempt: Option<tokio::sync::oneshot::Sender<JoinAttempt>>,
 ) -> (tokio::task::AbortHandle, watch::Sender<bool>) {
     let (stop_tx, stop_rx) = watch::channel(false);
+    let reporter = match on_attempt {
+        Some(tx) => AttemptReporter::new(tx),
+        None => AttemptReporter::empty(),
+    };
     let task = tokio::spawn(async move {
-        run_join_connector(join, local_config, session_event_rx, stop_rx).await;
+        run_join_connector(join, local_config, session_event_rx, stop_rx, reporter).await;
     });
     (task.abort_handle(), stop_tx)
 }
@@ -40,12 +83,21 @@ async fn run_join_connector(
     local_config: Arc<AppConfig>,
     mut session_event_rx: broadcast::Receiver<SessionEvent>,
     mut stop_rx: watch::Receiver<bool>,
+    mut attempt_report: AttemptReporter,
 ) {
     const BACKOFF: &[u64] = &[1, 2, 4, 8, 16, 32, 60];
     let mut attempt = 0usize;
 
     loop {
-        match connect_and_relay(&join, &local_config, &mut session_event_rx, &mut stop_rx).await {
+        match connect_and_relay(
+            &join,
+            &local_config,
+            &mut session_event_rx,
+            &mut stop_rx,
+            &mut attempt_report,
+        )
+        .await
+        {
             Ok(true) => {
                 info!(node = %join.name, "join connector stopped");
                 return;
@@ -54,6 +106,10 @@ async fn run_join_connector(
                 warn!(node = %join.name, "join connector disconnected");
             }
             Err(err) => {
+                // connect_and_relay already converts the reason into a
+                // `Failed(...)` signal when appropriate, but the helper
+                // can't reach every path; firefall here for any escape.
+                attempt_report.fail(err.to_string());
                 warn!(node = %join.name, %err, "join connector disconnected");
             }
         }
@@ -81,6 +137,7 @@ async fn connect_and_relay(
     local_config: &Arc<AppConfig>,
     session_event_rx: &mut broadcast::Receiver<SessionEvent>,
     stop_rx: &mut watch::Receiver<bool>,
+    attempt_report: &mut AttemptReporter,
 ) -> Result<bool> {
     let base = join.primary_url.trim_end_matches('/');
     let ws_url = if base.starts_with("https://") {
@@ -91,7 +148,10 @@ async fn connect_and_relay(
 
     let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
-        .map_err(|e| crate::error::AppError::Protocol(format!("WebSocket connect failed: {e}")))?;
+        .map_err(|e| {
+            attempt_report.fail(format!("WebSocket connect failed: {e}"));
+            crate::error::AppError::Protocol(format!("WebSocket connect failed: {e}"))
+        })?;
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
@@ -114,7 +174,10 @@ async fn connect_and_relay(
 
     let auth = if let Some(ssh_key_path) = &join.ssh_key_path {
         let signing_key = crate::sshauth::load_signing_key(std::path::Path::new(ssh_key_path))
-            .map_err(|e| crate::error::AppError::Protocol(format!("ssh key auth: {e}")))?;
+            .map_err(|e| {
+                attempt_report.fail(format!("ssh key auth: {e}"));
+                crate::error::AppError::Protocol(format!("ssh key auth: {e}"))
+            })?;
         let public_key = crate::sshauth::public_key_line(&signing_key);
 
         // Request the host-key challenge from the primary.
@@ -125,6 +188,7 @@ async fn connect_and_relay(
             ))
             .await
             .map_err(|e| {
+                attempt_report.fail(format!("host key request failed: {e}"));
                 crate::error::AppError::Protocol(format!("host key request failed: {e}"))
             })?;
 
@@ -136,33 +200,36 @@ async fn connect_and_relay(
                     host_signature,
                 }) => (public_key, nonce, host_signature),
                 Ok(NodeWsMessage::Error { message }) => {
-                    return Err(crate::error::AppError::Protocol(format!(
-                        "host key challenge rejected: {message}"
-                    )));
+                    let msg = format!("host key challenge rejected: {message}");
+                    attempt_report.fail(&msg);
+                    return Err(crate::error::AppError::Protocol(msg));
                 }
                 Ok(_) => {
-                    return Err(crate::error::AppError::Protocol(
-                        "unexpected response to get_host_key".into(),
-                    ));
+                    let msg = "unexpected response to get_host_key";
+                    attempt_report.fail(msg);
+                    return Err(crate::error::AppError::Protocol(msg.into()));
                 }
                 Err(e) => {
-                    return Err(crate::error::AppError::Protocol(format!(
-                        "invalid host key challenge: {e}"
-                    )));
+                    let msg = format!("invalid host key challenge: {e}");
+                    attempt_report.fail(&msg);
+                    return Err(crate::error::AppError::Protocol(msg));
                 }
             },
             _ => {
-                return Err(crate::error::AppError::Protocol(
-                    "no response to get_host_key".into(),
-                ));
+                let msg = "no response to get_host_key";
+                attempt_report.fail(msg);
+                return Err(crate::error::AppError::Protocol(msg.into()));
             }
         };
 
         let nonce_bytes = crate::sshauth::b64_decode(&nonce).map_err(|e| {
+            attempt_report.fail(format!("invalid challenge nonce: {e}"));
             crate::error::AppError::Protocol(format!("invalid challenge nonce: {e}"))
         })?;
         let nonce: [u8; crate::sshauth::NONCE_LEN] = nonce_bytes.try_into().map_err(|_| {
-            crate::error::AppError::Protocol("challenge nonce has unexpected length".into())
+            let msg = "challenge nonce has unexpected length";
+            attempt_report.fail(msg);
+            crate::error::AppError::Protocol(msg.into())
         })?;
 
         // The primary must prove ownership of its host key *on this
@@ -172,9 +239,11 @@ async fn connect_and_relay(
             &host_signature,
             &crate::sshauth::host_challenge_payload(&nonce),
         ) {
-            return Err(crate::error::AppError::Protocol(format!(
+            let msg = format!(
                 "host key self-signature for {host} is invalid; aborting before credentials are sent"
-            )));
+            );
+            attempt_report.fail(&msg);
+            return Err(crate::error::AppError::Protocol(msg));
         }
 
         // Pin/verify the host key against known_hosts (TOFU on first use).
@@ -187,9 +256,11 @@ async fn connect_and_relay(
                     let _ = crate::sshauth::append_known_hosts(kh, host, &host_public_key);
                 }
                 crate::sshauth::HostKeyStatus::Mismatch => {
-                    return Err(crate::error::AppError::Protocol(format!(
+                    let msg = format!(
                         "host key verification failed for {host}: key mismatch in {kh_path} (possible MITM)"
-                    )));
+                    );
+                    attempt_report.fail(&msg);
+                    return Err(crate::error::AppError::Protocol(msg));
                 }
             }
         }
@@ -217,32 +288,37 @@ async fn connect_and_relay(
     ws_tx
         .send(WsMessage::Binary(handshake_payload.into()))
         .await
-        .map_err(|e| crate::error::AppError::Protocol(e.to_string()))?;
+        .map_err(|e| {
+            attempt_report.fail(format!("send join handshake: {e}"));
+            crate::error::AppError::Protocol(e.to_string())
+        })?;
 
     match ws_rx.next().await {
         Some(Ok(frame)) => {
-            match decode_node_message(frame)
-                .map_err(|e| crate::error::AppError::Protocol(e.to_string()))?
-            {
+            match decode_node_message(frame).map_err(|e| {
+                attempt_report.fail(format!("decode join response: {e}"));
+                crate::error::AppError::Protocol(e.to_string())
+            })? {
                 NodeWsMessage::Joined => {
                     info!(node = %join.name, primary = %join.primary_url, "joined primary");
+                    attempt_report.joined();
                 }
                 NodeWsMessage::Error { message } => {
-                    return Err(crate::error::AppError::Protocol(format!(
-                        "join rejected: {message}"
-                    )));
+                    let msg = format!("join rejected: {message}");
+                    attempt_report.fail(&msg);
+                    return Err(crate::error::AppError::Protocol(msg));
                 }
                 _ => {
-                    return Err(crate::error::AppError::Protocol(
-                        "unexpected response to join".into(),
-                    ));
+                    let msg = "unexpected response to join";
+                    attempt_report.fail(msg);
+                    return Err(crate::error::AppError::Protocol(msg.into()));
                 }
             }
         }
         _ => {
-            return Err(crate::error::AppError::Protocol(
-                "no response to join handshake".into(),
-            ));
+            let msg = "no response to join handshake";
+            attempt_report.fail(msg);
+            return Err(crate::error::AppError::Protocol(msg.into()));
         }
     }
 
@@ -840,5 +916,51 @@ mod tests {
                 },
             }),
         }));
+    }
+
+    // ── AttemptReporter — first-attempt sync join feedback ─────────────────────
+    //
+    // The reporter is the channel `JoinStart` uses to tell the CLI whether
+    // the first handshake completed, failed, or is still in progress; the
+    // tests below pin its contract: `joined` consumes the inner sender
+    // exactly once, `fail` does the same, and an empty reporter stays
+    // silent (which is what lifecycle boot relies on when nobody is
+    // waiting on the IPC path).
+
+    #[test]
+    fn attempt_reporter_empty_silently_drops_reports() {
+        let mut reporter = super::AttemptReporter::empty();
+        // Both report methods must be safe no-ops without a sender.
+        reporter.joined();
+        reporter.fail("ignored");
+    }
+
+    #[test]
+    fn attempt_reporter_joined_delivers_connected_exactly_once() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut reporter = super::AttemptReporter::new(tx);
+        reporter.joined();
+        reporter.joined(); // second call must not panic (sender already taken).
+        let outcome = rx.blocking_recv().expect("oneshot deliver");
+        assert!(
+            matches!(outcome, super::JoinAttempt::Connected),
+            "expected Connected, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn attempt_reporter_fail_delivers_failed_with_message() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut reporter = super::AttemptReporter::new(tx);
+        reporter.fail("join rejected: unauthorized");
+        // Subsequent joined() must be a no-op even after a failure report.
+        reporter.joined();
+        let outcome = rx.blocking_recv().expect("oneshot deliver");
+        match outcome {
+            super::JoinAttempt::Failed(msg) => {
+                assert_eq!(msg, "join rejected: unauthorized");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
