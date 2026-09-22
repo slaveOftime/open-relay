@@ -469,7 +469,7 @@ const METRIC_ROUTES: &[&str] = &[
     "/api/auth/login",
     "/api/auth/logout",
     "/api/push/public-key",
-    "/api/push/subscribe",
+    "/api/push/subscriptions",
     "/api/sessions",
     "/api/sessions/{id}",
     "/api/sessions/{id}/metadata",
@@ -490,16 +490,12 @@ const METRIC_ROUTES: &[&str] = &[
 /// skipped: their lifetime is a connection duration, not handled work,
 /// and mixing them into latency histograms destroys the signal.
 async fn metrics_middleware(request: Request, next: axum::middleware::Next) -> Response {
-    let route = request
-        .extensions()
-        .get::<axum::extract::MatchedPath>()
-        .and_then(|matched| {
-            METRIC_ROUTES
-                .iter()
-                .find(|r| **r == matched.as_str())
-                .copied()
-        })
-        .unwrap_or("other");
+    let route = resolve_route_label(
+        request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|m| m.as_str()),
+    );
     let start = std::time::Instant::now();
     let response = next.run(request).await;
     let is_stream = response
@@ -537,10 +533,52 @@ async fn security_headers(request: Request, next: axum::middleware::Next) -> Res
     response
 }
 
+/// Resolve an HTTP `MatchedPath` template to the closed histogram label.
+/// Anything not in `METRIC_ROUTES` collapses to `"other"` to bound label
+/// cardinality. S3.3 made this a free function so a debug-only assertion
+/// can confirm every METRIC_ROUTES entry round-trips and that the drift
+/// the original `/api/push/subscribe` typo introduced cannot recur.
+fn resolve_route_label(matched: Option<&str>) -> &'static str {
+    let Some(matched) = matched else {
+        return "other";
+    };
+    METRIC_ROUTES
+        .iter()
+        .find(|r| **r == matched)
+        .copied()
+        .unwrap_or("other")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::static_request_candidates;
+    use super::{METRIC_ROUTES, resolve_route_label, static_request_candidates};
     use axum::http::Uri;
+
+    /// S3.3 regression guard: a previous version of `METRIC_ROUTES` had
+    /// `/api/push/subscribe` while the router served `/api/push/subscriptions`,
+    /// so every push subscription silently fell into the `"other"` bucket.
+    /// This test ensures the captured closure is reflected verbatim in the
+    /// const list.
+    #[test]
+    fn every_metric_route_round_trips_to_itself() {
+        for &entry in METRIC_ROUTES {
+            assert_eq!(
+                resolve_route_label(Some(entry)),
+                entry,
+                "METRIC_ROUTES entry `{entry}` must round-trip; otherwise METRIC_ROUTES is \
+                 drifting away from the actual router's MatchedPath strings, which lands \
+                 every request with that template in the `other` bucket."
+            );
+        }
+    }
+
+    /// Belt-and-suspenders: an unknown path falls into `"other"`, so a
+    /// wild-card route can never blow up label cardinality.
+    #[test]
+    fn unknown_paths_collapse_to_other() {
+        assert_eq!(resolve_route_label(Some("/api/this-is-fake")), "other");
+        assert_eq!(resolve_route_label(None), "other");
+    }
 
     #[test]
     fn static_request_candidates_reject_parent_segments() {

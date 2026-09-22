@@ -123,10 +123,12 @@ impl SessionError {
             Self::Busy => format!("session input queue is full: {id}"),
             Self::Persistence(message) => message.clone(),
             Self::StaleCursor { requested, current } => format!(
-                "stale resume cursor for {id}: cursor names incarnation {requested:?},                  session incarnation is {current:?}; resnapshot instead of resuming"
+                "stale resume cursor for {id}: cursor names incarnation {requested:?}, \
+                 session incarnation is {current:?}; resnapshot instead of resuming"
             ),
             Self::NotController => format!(
-                "not the controller of session {id}: attached as observer;                  take over control to send input or resize"
+                "not the controller of session {id}: attached as observer; \
+                 take over control to send input or resize"
             ),
             Self::StaleAttachment => {
                 format!("attachment is no longer registered for session {id}; re-attach")
