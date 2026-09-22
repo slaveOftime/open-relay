@@ -450,6 +450,14 @@ impl SessionRuntime {
     }
 
     /// Build a `SessionSummary` snapshot from the current runtime state.
+    ///
+    /// PLAN2 P2.3b (noted, not fixed): this clones ~15 strings per call
+    /// and is invoked per-broadcast (attach pump) and per-list
+    /// (`GET /api/sessions`). At `max_running_sessions = 50` that is
+    /// under 1 KiB of garbage per fan-out — well below noise. Revisit
+    /// the per-call allocation budget if `/api/metrics` shows the
+    /// `attach` chunk inter-arrival histogram tail creeping up under a
+    /// `GET /api/sessions` burst, since the two share this code path.
     pub fn to_summary(&self) -> SessionSummary {
         let sweep_count = self.retention.sweep_count();
         SessionSummary {
