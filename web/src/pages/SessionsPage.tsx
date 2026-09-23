@@ -1769,12 +1769,6 @@ export default function SessionsPage() {
                   </SelectContent>
                 </Select>
               </div>
-              <NodeSelector
-                nodes={nodes}
-                selected={selectedNode}
-                onChange={handleNodeChange}
-                className="w-full"
-              />
             </div>
           </div>
 
