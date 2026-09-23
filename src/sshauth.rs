@@ -1,4 +1,4 @@
-//! SSH Ed25519 authentication helpers for the node join protocol.
+﻿//! SSH Ed25519 authentication helpers for the node join protocol.
 //!
 //! # Key format
 //!
@@ -27,7 +27,7 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 /// AES-GCM AEAD instantiations of this module.
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, KeyInit, Payload, array::typenum::U12};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 
 use crate::error::{AppError, Result};
@@ -182,10 +182,10 @@ pub const SEALED_HEADER_LEN: usize = 1 + AEAD_NONCE_LEN;
 /// AAD is the message *kind* string so different message types are
 /// distinguishable inside the same channel.
 pub fn seal_frame(key: &[u8; AEAD_KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::try_from(key.as_slice()).expect("AEAD key must be 32 bytes"));
     let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
     rand::fill(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = <&Nonce<U12>>::try_from(nonce_bytes.as_slice()).expect("AEAD nonce must be 12 bytes");
     let ct = cipher
         .encrypt(
             nonce,
@@ -218,10 +218,10 @@ pub fn open_frame(key: &[u8; AEAD_KEY_LEN], aad: &[u8], frame: &[u8]) -> Result<
     }
     let nonce_bytes = &frame[1..1 + AEAD_NONCE_LEN];
     let ct = &frame[1 + AEAD_NONCE_LEN..];
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::try_from(key.as_slice()).expect("AEAD key must be 32 bytes"));
     cipher
         .decrypt(
-            Nonce::from_slice(nonce_bytes),
+            <&Nonce<U12>>::try_from(nonce_bytes).expect("AEAD nonce must be 12 bytes"),
             Payload {
                 msg: ct,
                 aad,
