@@ -44,7 +44,6 @@ import {
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
-  cwdBasename,
   formatByteSize,
   formatTimestamp,
   sessionDisplayName,
