@@ -441,10 +441,10 @@ function GroupHeaderLabel({
       </Badge>
     )
   }
-  if (groupBy !== 'command') return <>{keyLabel}</>
+  if (groupBy !== 'command') return <span className="break-all">{keyLabel}</span>
   const groupCommand = items[0]?.command ?? keyLabel
   return (
-    <span className="inline-flex items-center gap-2">
+    <span className="inline-flex items-center gap-2 wrap-break-word">
       <CommandLogo command={groupCommand} size={24} />
       <span>{keyLabel}</span>
     </span>
@@ -1329,7 +1329,7 @@ export default function SessionsPage() {
     if (groupBy === 'cwd') {
       const map = new Map<string, SessionSummary[]>()
       for (const s of pagedSessions) {
-        const k = cwdBasename(s.cwd) || '(no cwd)'
+        const k = s.cwd || '(no cwd)'
         if (!map.has(k)) map.set(k, [])
         map.get(k)!.push(s)
       }
@@ -1878,8 +1878,8 @@ export default function SessionsPage() {
               {grouped.map(({ key, items }) => (
                 <div key={key || '__flat__'}>
                   {groupBy !== 'none' && key && (
-                    <div className="flex flex-nowrap gap-1 items-center px-4 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
-                      <CaretDownIcon className='h-4 w-4' /> 
+                    <div className="flex flex-nowrap gap-1 items-center px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
+                      <CaretDownIcon className='h-4 w-4 shrink-0' /> 
                       <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                     </div>
                   )}
@@ -2001,7 +2001,7 @@ export default function SessionsPage() {
                       <TableRow>
                         <TableCell
                           colSpan={orderedTableColumns.length}
-                          className="px-3 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10"
+                          className="px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10"
                         >
                           <div className='flex items-center gap-1'>
                             <CaretDownIcon className='h-4 w-4' /> 
