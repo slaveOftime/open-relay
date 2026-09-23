@@ -543,9 +543,14 @@ enum ViewMode {
 #[derive(Debug)]
 struct TreeNode {
     path: PathBuf,
+    /// Full cwd for folders, even when the displayed path is abbreviated.
+    cwd: Option<String>,
+    /// Owner of this branch; keeps identical paths on different nodes distinct.
+    node: Option<String>,
+    is_node: bool,
     /// Cached `basename` of `path`; empty for the synthetic root.
     name: String,
-    /// Indices into `App::sessions` of sessions whose cwd equals `path`.
+    /// Sessions whose cwd resolves to this folder.
     direct_sessions: Vec<usize>,
     /// Indices of child folder nodes (in DFS order; not sorted).
     subfolders: Vec<usize>,
@@ -560,8 +565,8 @@ enum TreeEntry {
 }
 
 /// Folder-and-session tree built from `App::sessions`. The walker produces a
-/// flat list of `TreeEntry` rows in DFS order, skipping empty single-child
-/// folders and respecting `auto_depth` (folders deeper than this are hidden
+/// flat list of `TreeEntry` rows in DFS order, retaining parent folders
+/// and respecting `auto_depth` (folders deeper than this are hidden
 /// unless `drilled` contains an ancestor path).
 #[derive(Debug)]
 struct TreeView {
@@ -572,7 +577,8 @@ struct TreeView {
     /// deeper folders are hidden unless an ancestor path is in `drilled`.
     auto_depth: usize,
     /// Paths the user has explicitly drilled into (overrides `auto_depth`).
-    drilled: HashSet<PathBuf>,
+    drilled: HashSet<(Option<String>, PathBuf)>,
+    grouped_nodes: bool,
     /// Flat row list produced by `recompute_visible`.
     visible: Vec<TreeEntry>,
     /// Cursor index into `visible`.
@@ -584,6 +590,9 @@ impl TreeView {
         let mut nodes = Vec::with_capacity(64);
         nodes.push(TreeNode {
             path: PathBuf::new(),
+            cwd: None,
+            node: None,
+            is_node: false,
             name: String::new(),
             direct_sessions: Vec::new(),
             subfolders: Vec::new(),
@@ -593,6 +602,7 @@ impl TreeView {
             root: 0,
             auto_depth: TREE_AUTO_DEPTH,
             drilled: HashSet::new(),
+            grouped_nodes: false,
             visible: Vec::new(),
             cursor: 0,
         }
@@ -1150,7 +1160,21 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
 
     match key.code {
         _ if is_new_session_dialog_key(key) => {
-            app.clone_dialog = Some(CloneDialog::blank(list_node));
+            let mut dialog = CloneDialog::blank(list_node);
+            if app.view_mode == ViewMode::Tree
+                && let Some(TreeEntry::Folder { node, .. }) = app.tree.visible.get(app.tree.cursor)
+            {
+                let folder = &app.tree.nodes[*node];
+                if let Some(cwd) = &folder.cwd {
+                    dialog.cwd = EditText::new(cwd.clone());
+                }
+                // A folder in a node group belongs on that node, even in an
+                // unscoped multi-node list. A scoped list keeps its scope.
+                if list_node.is_none() {
+                    dialog.node = EditText::new(folder.node.clone().unwrap_or_default());
+                }
+            }
+            app.clone_dialog = Some(dialog);
             AppAction::None
         }
         _ if is_clone_dialog_key(key) => {
@@ -1577,21 +1601,19 @@ fn session_sort_label(session: &SessionSummary) -> String {
     label
 }
 
-/// Longest shared path prefix of `paths` whose presence as a hidden prefix
-/// would still leave at least one hierarchical level visible.
-///
-/// Always returns an **absolute** prefix so that callers can pass it
-/// directly to [`Path::strip_prefix`]. When the inputs span more than one
-/// cwd, the prefix reaches just deep enough to share without making every
-/// input equal to the prefix (which would swallow the whole tree). For a
-/// single-cwd input the prefix is just the root `/`; consumers strip the
-/// root and surface the rest as a normal chain of folders.
+/// Shared parent hidden by the tree. Keep the common cwd itself as a
+/// visible folder, so every session's directory can be read from the tree
+/// even if some sessions start in that shared directory.
 fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
     if paths.is_empty() {
         return Path::new("/").to_path_buf();
     }
     if paths.len() == 1 {
-        return Path::new("/").to_path_buf();
+        return paths[0]
+            .ancestors()
+            .find(|ancestor| ancestor.has_root() && ancestor.parent().is_none())
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
     }
     let mut iter = paths.iter();
     let first = iter.next().expect("non-empty").clone();
@@ -1603,24 +1625,25 @@ fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
             }
         }
     }
-    // If every input is identical, popping the trailing component guarantees
-    // the remaining chain still has hierarchy to display.
-    if paths.iter().all(|p| p == &prefix)
-        && let Some(parent) = prefix.parent()
-    {
-        return parent.to_path_buf();
-    }
-    prefix
+    // The basename of the shared path is always shown as a folder, including
+    // when one cwd equals that path and the others descend from it.
+    prefix.parent().map_or(prefix.clone(), Path::to_path_buf)
 }
 
 /// Walk the tree, creating intermediate folder nodes for any portion of
 /// `path` that does not yet exist. Returns the index of the deepest node
 /// matching `path` (creating it on demand).
-fn ensure_tree_path(tree: &mut TreeView, path: &Path) -> usize {
+fn ensure_tree_path(
+    tree: &mut TreeView,
+    parent: usize,
+    path: &Path,
+    cwd: &str,
+    node: &Option<String>,
+) -> usize {
     if path.as_os_str().is_empty() {
-        return tree.root;
+        return parent;
     }
-    let mut current = tree.root;
+    let mut current = parent;
     let mut accumulated = PathBuf::new();
     for component in path.components() {
         accumulated.push(component);
@@ -1635,13 +1658,39 @@ fn ensure_tree_path(tree: &mut TreeView, path: &Path) -> usize {
             .find(|&idx| tree.nodes[idx].path == accumulated);
         current = match next {
             Some(idx) => idx,
-            None => append_tree_node(tree, current, accumulated.clone()),
+            None => {
+                // Pop components from the original spelling of the cwd.
+                // A remote Unix path viewed on Windows must keep its slashes.
+                let mut absolute = PathBuf::from(cwd);
+                for _ in 0..path
+                    .components()
+                    .count()
+                    .saturating_sub(accumulated.components().count())
+                {
+                    absolute.pop();
+                }
+                append_tree_node(
+                    tree,
+                    current,
+                    accumulated.clone(),
+                    Some(absolute.to_string_lossy().into_owned()),
+                    node.clone(),
+                    false,
+                )
+            }
         };
     }
     current
 }
 
-fn append_tree_node(tree: &mut TreeView, parent: usize, path: PathBuf) -> usize {
+fn append_tree_node(
+    tree: &mut TreeView,
+    parent: usize,
+    path: PathBuf,
+    cwd: Option<String>,
+    node: Option<String>,
+    is_node: bool,
+) -> usize {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -1649,6 +1698,9 @@ fn append_tree_node(tree: &mut TreeView, parent: usize, path: PathBuf) -> usize 
     let idx = tree.nodes.len();
     tree.nodes.push(TreeNode {
         path,
+        cwd,
+        node,
+        is_node,
         name,
         direct_sessions: Vec::new(),
         subfolders: Vec::new(),
@@ -1656,8 +1708,6 @@ fn append_tree_node(tree: &mut TreeView, parent: usize, path: PathBuf) -> usize 
     tree.nodes[parent].subfolders.push(idx);
     idx
 }
-
-impl TreeView {}
 
 /// Free-function DFS over a tree-node snapshot. Operations that mutate the
 /// App live outside this walker; we only emit `TreeEntry` rows into the
@@ -1678,7 +1728,7 @@ fn walk_tree_branch(
     node_idx: usize,
     depth: usize,
     auto_depth: usize,
-    drilled: &HashSet<PathBuf>,
+    drilled: &HashSet<(Option<String>, PathBuf)>,
     out: &mut Vec<TreeEntry>,
 ) {
     let node = &nodes[node_idx];
@@ -1709,13 +1759,8 @@ fn walk_tree_branch(
     for session_idx in &node.direct_sessions {
         out.push(TreeEntry::Session {
             session: *session_idx,
-            depth,
+            depth: depth + 1,
         });
-    }
-
-    if depth >= auto_depth && !is_in_drill_subtree(&node.path, drilled) {
-        // Stop descending; children past auto_depth must wait for the
-        // user to drill this path.
     }
 }
 
@@ -1723,21 +1768,30 @@ impl TreeNode {
     /// Visibility rule for a single node at the given chain depth. Encoded
     /// into a method so tests can exercise it without rebuilding the whole
     /// tree.
-    fn is_visible(&self, depth: usize, auto_depth: usize, drilled: &HashSet<PathBuf>) -> bool {
+    fn is_visible(
+        &self,
+        depth: usize,
+        auto_depth: usize,
+        drilled: &HashSet<(Option<String>, PathBuf)>,
+    ) -> bool {
         if depth <= auto_depth {
             return true;
         }
-        is_in_drill_subtree(&self.path, drilled)
+        is_in_drill_subtree(&self.path, &self.node, drilled)
     }
 }
 
 /// True when this folder's path, or any of its ancestors, was explicitly
 /// drilled into. Walks up to the root so Enter-presses at depth auto_depth
 /// cascade visibility down to every descendant.
-fn is_in_drill_subtree(path: &Path, drilled: &HashSet<PathBuf>) -> bool {
+fn is_in_drill_subtree(
+    path: &Path,
+    node: &Option<String>,
+    drilled: &HashSet<(Option<String>, PathBuf)>,
+) -> bool {
     let mut cursor = Some(path.to_path_buf());
     while let Some(current) = cursor.take() {
-        if drilled.contains(&current) {
+        if drilled.contains(&(node.clone(), current.clone())) {
             return true;
         }
         match current.parent() {
@@ -1965,7 +2019,10 @@ impl App {
                 .visible
                 .get(self.tree.cursor)
                 .and_then(|entry| match entry {
-                    TreeEntry::Folder { node, .. } => Some(self.tree.nodes[*node].path.clone()),
+                    TreeEntry::Folder { node, .. } => Some((
+                        self.tree.nodes[*node].node.clone(),
+                        self.tree.nodes[*node].path.clone(),
+                    )),
                     TreeEntry::Session { .. } => None,
                 });
 
@@ -1978,13 +2035,17 @@ impl App {
                 ref drilled,
                 ..
             } = self.tree;
-            let children: Vec<usize> = nodes[root].subfolders.clone();
             let mut out: Vec<TreeEntry> = Vec::new();
-            for &child in &children {
-                // depth 1 = the synthetic root's direct subfolders are at
-                // chain depth 1, so they're visible by default.
-                walk_tree_branch(nodes, child, 1, auto_depth, drilled, &mut out);
-            }
+            // Include cwd-less sessions attached directly to the synthetic
+            // root as well as node and folder branches.
+            walk_tree_branch(
+                nodes,
+                root,
+                0,
+                auto_depth + usize::from(self.tree.grouped_nodes),
+                drilled,
+                &mut out,
+            );
             out
         };
         self.tree.visible = visible;
@@ -2003,7 +2064,7 @@ impl App {
                 previously_focused_folder.as_ref().and_then(|path| {
                     self.tree.visible.iter().position(|entry| {
                         matches!(entry, TreeEntry::Folder { node, .. }
-                            if self.tree.nodes[*node].path == *path)
+                            if self.tree.nodes[*node].node == path.0 && self.tree.nodes[*node].path == path.1)
                     })
                 })
             })
@@ -2017,6 +2078,9 @@ impl App {
         self.tree.nodes.clear();
         self.tree.nodes.push(TreeNode {
             path: PathBuf::new(),
+            cwd: None,
+            node: None,
+            is_node: false,
             name: String::new(),
             direct_sessions: Vec::new(),
             subfolders: Vec::new(),
@@ -2060,43 +2124,65 @@ impl App {
             .filter(|(index, session)| matches_filter(*index, session))
             .collect();
 
-        let cwds: Vec<PathBuf> = filtered_sessions
+        let mut node_names: Vec<Option<String>> = filtered_sessions
             .iter()
-            .map(|(_, session)| {
-                session
+            .map(|(_, session)| session.node.clone())
+            .collect();
+        node_names.sort();
+        node_names.dedup();
+        self.tree.grouped_nodes = node_names.len() > 1;
+
+        // Prefixes must be computed per node: a remote cwd must never
+        // abbreviate a local path (or a path on another remote machine).
+        for node_name in node_names {
+            let group_root = if self.tree.grouped_nodes {
+                let idx = append_tree_node(
+                    &mut self.tree,
+                    0,
+                    PathBuf::new(),
+                    None,
+                    node_name.clone(),
+                    true,
+                );
+                self.tree.nodes[idx].name =
+                    node_name.clone().unwrap_or_else(|| "local".to_string());
+                idx
+            } else {
+                self.tree.root
+            };
+            let group_sessions: Vec<_> = filtered_sessions
+                .iter()
+                .copied()
+                .filter(|(_, session)| session.node == node_name)
+                .collect();
+            let cwds: Vec<PathBuf> = group_sessions
+                .iter()
+                .filter_map(|(_, session)| session.cwd.as_deref().map(PathBuf::from))
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect();
+            let common = common_path_prefix(&cwds);
+            for (index, session) in group_sessions {
+                let cwd = session
                     .cwd
                     .as_deref()
                     .map(PathBuf::from)
-                    .unwrap_or_default()
-            })
-            .filter(|path| !path.as_os_str().is_empty())
-            .collect();
-        let common = common_path_prefix(&cwds);
-
-        for (index, session) in filtered_sessions {
-            let cwd = session
-                .cwd
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_default();
-            let effective = if cwd.as_os_str().is_empty() {
-                PathBuf::new()
-            } else {
-                cwd.strip_prefix(&common).map_or_else(
-                    |_| cwd.clone(),
-                    |stripped| {
-                        if stripped.as_os_str().is_empty() {
-                            PathBuf::new()
-                        } else {
-                            stripped.to_path_buf()
-                        }
-                    },
-                )
-            };
-            let leaf_idx = ensure_tree_path(&mut self.tree, &effective);
-            self.tree.nodes[leaf_idx].direct_sessions.push(index);
+                    .unwrap_or_default();
+                let effective = if cwd.as_os_str().is_empty() {
+                    PathBuf::new()
+                } else {
+                    cwd.strip_prefix(&common)
+                        .map_or_else(|_| cwd.clone(), |stripped| stripped.to_path_buf())
+                };
+                let leaf_idx = ensure_tree_path(
+                    &mut self.tree,
+                    group_root,
+                    &effective,
+                    session.cwd.as_deref().unwrap_or_default(),
+                    &node_name,
+                );
+                self.tree.nodes[leaf_idx].direct_sessions.push(index);
+            }
         }
-
         // Sort children folders and direct sessions alphabetically so the
         // walker traverses them in a stable, easy-to-scan order across
         // refreshes. Folder names and session labels are compared
@@ -2198,14 +2284,15 @@ impl App {
         // Drill toggles contribute nothing for folders that are already
         // visible by default; toggle only matters for folders whose
         // children sit below the auto-depth horizon.
-        if depth < self.tree.auto_depth {
+        if depth < self.tree.auto_depth + usize::from(self.tree.grouped_nodes) {
             return;
         }
-        let path = self.tree.nodes[node].path.clone();
-        if self.tree.drilled.contains(&path) {
-            self.tree.drilled.remove(&path);
-        } else {
-            self.tree.drilled.insert(path);
+        let key = (
+            self.tree.nodes[node].node.clone(),
+            self.tree.nodes[node].path.clone(),
+        );
+        if !self.tree.drilled.insert(key.clone()) {
+            self.tree.drilled.remove(&key);
         }
         self.rebuild_tree();
     }
@@ -2273,7 +2360,7 @@ impl App {
     fn tree_enter(&mut self) -> AppAction {
         match self.tree.visible.get(self.tree.cursor).copied() {
             Some(TreeEntry::Folder { depth, .. }) => {
-                if depth >= self.tree.auto_depth {
+                if depth >= self.tree.auto_depth + usize::from(self.tree.grouped_nodes) {
                     // Past the auto-depth horizon the children are
                     // hidden; pressing Enter is the only way to expose
                     // them, so drilling is the right action.
@@ -3584,7 +3671,7 @@ fn render_tree(
 ) -> (usize, usize, u16) {
     // Render the tree as a single Paragraph: rows are emitted as `Line`s
     // composed of indentation glyphs, the state icon, cmd+args, title, and
-    // a final column showing the sessions' relative cwd. No `Table` so the
+    // a final start-time column. No `Table` so the
     // file-explorer look matches what the user typed.
     let total = app.tree.visible.len();
     if total == 0 {
@@ -3613,10 +3700,11 @@ fn render_tree(
         let absolute_index = viewport_start + row;
         let is_selected = absolute_index == app.tree.cursor;
         match entry {
-            TreeEntry::Folder { node, depth } => {
-                lines.push(folder_line(&app.tree.nodes[node], depth, is_selected));
+            TreeEntry::Folder { node, .. } => {
+                let prefix = tree_connector(&app.tree.visible, absolute_index);
+                lines.push(folder_line(&app.tree.nodes[node], &prefix, is_selected));
             }
-            TreeEntry::Session { session, depth } => {
+            TreeEntry::Session { session, .. } => {
                 let Some(session_summary) = app.sessions.get(session) else {
                     lines.push(blank_line());
                     continue;
@@ -3624,25 +3712,24 @@ fn render_tree(
                 let line = session_line(
                     session_summary,
                     app.rates.get(&session_key(session_summary)),
-                    depth,
+                    &tree_connector(&app.tree.visible, absolute_index),
                     is_selected,
                     now,
                 );
                 lines.push(line);
                 if session_summary.input_needed && session_summary.notifications_enabled {
                     let row_y = area.y + row as u16;
-                    // State-cell pulse: a 1-cell wide highlight on the
-                    // glyph column. The pulse shines on the icon only; the
-                    // rest of the row keeps the session's own colours.
+                    // Match the table's per-row attention pulse, including
+                    // its distinct selected-row background.
                     attention_row_rects.push((
                         session_key(session_summary),
                         Rect {
-                            x: area.x + indent_width(depth),
+                            x: area.x + (app.tree.visible[absolute_index].depth() as u16) * 4,
                             y: row_y,
                             width: 1,
                             height: 1,
                         },
-                        false,
+                        is_selected,
                     ));
                 }
             }
@@ -3661,162 +3748,174 @@ fn render_tree(
     )
 }
 
-/// Indent for a tree row at the given display depth: two cells per level
-/// (`  ┌─`) since each folder row already shows one connector of its own.
-fn indent_width(depth: usize) -> u16 {
-    (depth as u16).saturating_mul(2)
+impl TreeEntry {
+    fn depth(self) -> usize {
+        match self {
+            Self::Folder { depth, .. } | Self::Session { depth, .. } => depth,
+        }
+    }
 }
 
-/// Spacer line used as a placeholder when a session-row renderer returns
-/// early because the underlying index is stale. Prevents the table from
-/// collapsing visibly during the very-rare slice between refresh swaps.
+/// Draw a real tree edge for each visible ancestor. Looking at the whole
+/// visible list (not just the viewport) keeps vertical lines continuous when
+/// the user scrolls past a sibling.
+fn tree_connector(entries: &[TreeEntry], index: usize) -> String {
+    let depth = entries[index].depth();
+    let has_next_sibling = |level: usize| {
+        entries[index + 1..]
+            .iter()
+            .find(|entry| entry.depth() <= level)
+            .is_some_and(|entry| entry.depth() == level)
+    };
+    let mut prefix = String::new();
+    for level in 1..depth {
+        prefix.push_str(if has_next_sibling(level) {
+            "│   "
+        } else {
+            "    "
+        });
+    }
+    prefix.push_str(if has_next_sibling(depth) {
+        "├── "
+    } else {
+        "└── "
+    });
+    prefix
+}
+
 fn blank_line() -> Line<'static> {
     Line::from(String::new())
 }
 
-fn folder_line(node: &TreeNode, depth: usize, selected: bool) -> Line<'static> {
-    let indent = "  ".repeat(depth);
-    let prefix = if depth > 0 { "┗ " } else { "" };
-    let label = if node.name.is_empty() {
+fn folder_line(node: &TreeNode, prefix: &str, selected: bool) -> Line<'static> {
+    let label = if node.is_node {
+        format!("{} (node)", node.name)
+    } else if node.name.is_empty() {
         "(root)".to_string()
     } else {
         format!("{}/", node.name)
     };
-    let count = node.direct_sessions.len();
-    let suffix = if count > 0 {
-        format!("  ({count})")
+    let marker_style = Style::default().fg(if selected {
+        Color::Cyan
     } else {
-        String::new()
-    };
-    let marker_style = if selected {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let label_style = if selected {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let suffix_style = Style::default().fg(Color::DarkGray);
-    Line::from(vec![
-        Span::raw(indent),
+        Color::DarkGray
+    });
+    let label_style = Style::default()
+        .fg(if node.is_node {
+            Color::Cyan
+        } else if selected {
+            Color::White
+        } else {
+            Color::Gray
+        })
+        .add_modifier(if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let line = Line::from(vec![
         Span::styled(prefix.to_string(), marker_style),
         Span::styled(label, label_style),
-        Span::styled(suffix, suffix_style),
-    ])
+    ]);
+    if selected {
+        line.style(Style::default().bg(SELECTED_ROW_BG))
+    } else {
+        line
+    }
 }
+
+const TREE_STATUS_WIDTH: usize = 9;
 
 fn session_line(
     session: &SessionSummary,
     rate: Option<&RateState>,
-    depth: usize,
+    prefix: &str,
     selected: bool,
     now: Instant,
 ) -> Line<'static> {
-    // Mirrors `session_row` format ("state icon | status text | cmd args
-    // | title | rate | cwd") without the table constraints. The state
-    // icon distils status into a single glyph so the column is exactly 1
-    // cell wide; the status word ("running" / "completed" / "attention"
-    // / "failed" ...) sits in its own span **sharing the same colour **
-    // as the glyph, so users never see the colour say one thing and the
-    // label say another.
     let active = is_active_status(&session.status);
-    let (glyph, glyph_color) = status_glyph(&session.status, session.input_needed);
-    let status_word = status_label(&session.status, session.input_needed);
-    // Pick the right status-cell colour: the inactive-session dimmer
-    // mirrors the glyph dim so they stay in lock-step.
-    let (glyph_color_resolved, status_color_resolved) = if !active {
-        let dim = if selected {
-            Color::Gray
-        } else {
-            Color::DarkGray
-        };
-        (dim, dim)
-    } else {
-        (glyph_color, glyph_color)
-    };
-    let mut status_style = Style::default().fg(status_color_resolved);
-    if session.input_needed {
-        status_style = status_style.add_modifier(Modifier::BOLD);
-    }
-    let status_text_style = status_style;
-    let glyph_style = status_style.fg(glyph_color_resolved);
-
+    let (glyph, status_style) = session_status_style(session, selected);
     let muted = if selected { Color::White } else { Color::Gray };
     let dim = Style::default().fg(if selected {
         Color::White
     } else {
         Color::DarkGray
     });
-
     let cmd_args = if session.args.is_empty() {
         session.command.clone()
     } else {
         format!("{} {}", session.command, session.args.join(" "))
     };
-
-    // Rate widget (compact 1-cell indicator: arrow + dim cell).
-    let tree_cwd = tree_relative_cwd(&session.cwd);
-    let (rate_glyph, rate_glyph_color) = rate_arrow(rate, now);
+    let current_rate = rate.map(|value| value.display_rate(now)).unwrap_or(0.0);
+    let animation_age = rate
+        .map(|value| now.saturating_duration_since(value.sampled_at))
+        .unwrap_or_default();
+    let color = if active {
+        rate_color(current_rate, animation_age)
+    } else {
+        Color::DarkGray
+    };
+    let started = session.started_at.unwrap_or(session.created_at);
     let title_text = session.title.clone().unwrap_or_default();
-    Line::from(vec![
-        Span::raw("  ".repeat(depth + 1)), // indent past the folder connector
-        Span::styled(glyph.to_string(), glyph_style),
+    let line = Line::from(vec![
+        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+        Span::styled(glyph.to_string(), status_style),
         Span::raw("  "),
-        Span::styled(status_word.to_string(), status_text_style),
+        Span::styled(
+            pad_truncated(
+                status_label(&session.status, session.input_needed),
+                TREE_STATUS_WIDTH,
+            ),
+            status_style,
+        ),
         Span::raw("  "),
         Span::styled(cmd_args, dim),
         Span::raw("  "),
         Span::styled(title_text, Style::default().fg(muted)),
         Span::raw("   "),
-        Span::styled(
-            rate_glyph.to_string(),
-            Style::default().fg(rate_glyph_color),
-        ),
+        Span::styled(sparkline(rate, SPARKLINE_WIDTH), Style::default().fg(color)),
         Span::raw(" "),
-        Span::styled(tree_cwd, dim),
-    ])
-}
-
-/// Strip the synthetic root (empty path) and turn long absolute cwds into a
-/// dot-prefixed display form so the trailing column stays one cell wide
-/// when possible. Empty cwd renders as `~` to mirror shell convention.
-fn tree_relative_cwd(cwd: &Option<String>) -> String {
-    match cwd.as_deref() {
-        None | Some("") => "~".to_string(),
-        Some(path) => {
-            let trailing = path.rsplit_terminator('/').next().unwrap_or(path);
-            if trailing.len() == path.len() {
-                format!("./{trailing}")
-            } else {
-                format!("…/{trailing}")
-            }
-        }
-    }
-}
-
-/// Compact activity indicator used in the trailing column of `session_line`.
-/// Returns the arrow glyph and its colour. Mirrors `session_row`'s rate
-/// widget: blanks for cold sessions, dim arrow on idle, cyan on hot.
-fn rate_arrow(rate: Option<&RateState>, now: Instant) -> (&'static str, Color) {
-    let Some(rate) = rate else {
-        return (" ", Color::DarkGray);
-    };
-    let value = rate.display_rate(now);
-    if value <= 0.0 {
-        ("·", Color::DarkGray)
-    } else if value < 1024.0 {
-        ("↑", Color::Cyan)
+        Span::styled(format_tree_start(started, Utc::now()), dim),
+    ]);
+    if selected {
+        line.style(Style::default().bg(SELECTED_ROW_BG))
     } else {
-        ("⇡", Color::Cyan)
+        line
     }
 }
 
+fn format_tree_start(started: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let elapsed = now.signed_duration_since(started);
+    if elapsed.num_seconds() <= 0 {
+        "just now".to_string()
+    } else if elapsed.num_hours() >= 24 {
+        super::list::format_timestamp_local(started)
+    } else if elapsed.num_hours() > 0 {
+        format!("{}h ago", elapsed.num_hours())
+    } else if elapsed.num_minutes() > 0 {
+        format!("{}m ago", elapsed.num_minutes())
+    } else {
+        format!("{}s ago", elapsed.num_seconds())
+    }
+}
+
+/// Shared semantic styling for the table and the tree. The attention glyph
+/// and label stay bold/yellow on a selected or pulsing row.
+fn session_status_style(session: &SessionSummary, selected: bool) -> (&'static str, Style) {
+    let (glyph, mut color) = status_glyph(&session.status, session.input_needed);
+    if !is_active_status(&session.status) {
+        color = if selected {
+            Color::Gray
+        } else {
+            Color::DarkGray
+        };
+    }
+    let mut style = Style::default().fg(color);
+    if session.input_needed {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    (glyph, style)
+}
 fn session_row(
     session: &SessionSummary,
     rate: Option<&RateState>,
@@ -3826,27 +3925,7 @@ fn session_row(
     selected: bool,
 ) -> Row<'static> {
     let active = is_active_status(&session.status);
-    let mut status = status_glyph(&session.status, session.input_needed);
-    if !active {
-        // The dimmed status of an inactive session must stay readable on the
-        // selection background.
-        status.1 = if selected {
-            Color::Gray
-        } else {
-            Color::DarkGray
-        };
-    }
-    // The status never yields its colour: neither the session's own terminal
-    // colours nor the selection highlight may wash out an attention/failure
-    // signal. Attention additionally renders bold so it pops even harder.
-    let status_style = {
-        let style = Style::default().fg(status.1);
-        if session.input_needed {
-            style.add_modifier(Modifier::BOLD)
-        } else {
-            style
-        }
-    };
+    let (status_glyph, status_style) = session_status_style(session, selected);
     // Purely decorative cells (ids, ages, byte counts) brighten on the
     // selected row; semantic colours (status, rate, node) never change.
     let muted = if selected {
@@ -3874,7 +3953,7 @@ fn session_row(
     let node_offset = usize::from(show_node);
     let mut cells = match mode {
         LayoutMode::Narrow => vec![
-            aligned_cell(Span::styled(status.0, status_style), alignments[0]),
+            aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
             aligned_cell(session.id.clone(), alignments[1 + node_offset])
                 .style(Style::default().fg(muted)),
             aligned_cell(name, alignments[2 + node_offset]),
@@ -3887,7 +3966,7 @@ fn session_row(
             .style(Style::default().fg(rate_color)),
         ],
         LayoutMode::Medium => vec![
-            aligned_cell(Span::styled(status.0, status_style), alignments[0]),
+            aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
             aligned_cell(session.id.clone(), alignments[1 + node_offset])
                 .style(Style::default().fg(muted)),
             aligned_cell(name, alignments[2 + node_offset]),
@@ -3910,7 +3989,7 @@ fn session_row(
                 format!("{} {}", session.command, session.args.join(" "))
             };
             vec![
-                aligned_cell(Span::styled(status.0, status_style), alignments[0]),
+                aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
                 aligned_cell(session.id.clone(), alignments[1 + node_offset])
                     .style(Style::default().fg(muted)),
                 aligned_cell(name, alignments[2 + node_offset]),
@@ -5139,11 +5218,17 @@ mod tests {
         // Middleman folders are emitted as rows so the user can keep
         // navigating through them.
         assert!(ids.iter().any(|id| id == "folder:a"), "ids={ids:?}");
-        assert!(ids.iter().any(|id| id == "folder:a/b"), "ids={ids:?}");
-        assert!(ids.iter().any(|id| id == "folder:a/b/c"), "ids={ids:?}");
+        let has_folder = |path: &str| {
+            ids.iter().any(|id| {
+                std::path::Path::new(id.strip_prefix("folder:").unwrap_or(""))
+                    == std::path::Path::new(path)
+            })
+        };
+        assert!(has_folder("a/b"), "ids={ids:?}");
+        assert!(has_folder("a/b/c"), "ids={ids:?}");
         // The depth-4 leaf folder hides until drilled on `a/b/c`.
         assert!(
-            !ids.iter().any(|id| id == "folder:a/b/c/something"),
+            !has_folder("a/b/c/something"),
             "leaf folder should sit past auto-depth, ids={ids:?}"
         );
         assert!(
@@ -5382,6 +5467,165 @@ mod tests {
     }
 
     #[test]
+    fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
+        let mut app = App::default();
+        let mut remote = session_at("remote", Some("/work/app"));
+        remote.node = Some("worker".into());
+        let local = session_at("local", Some("/work/app"));
+        app.replace_sessions(vec![remote, local]);
+        let ids = tree_visible_ids(&app);
+        assert_eq!(app.tree.nodes[app.tree.root].subfolders.len(), 2);
+        let local_pos = ids.iter().position(|id| id == "local").unwrap();
+        let remote_pos = ids.iter().position(|id| id == "remote").unwrap();
+        assert!(
+            local_pos < remote_pos,
+            "node branches must not mix: {ids:?}"
+        );
+        app.toggle_view_mode();
+        let rendered = render_app(&mut app, 120, 30);
+        assert!(rendered.contains("local (node)"));
+        assert!(rendered.contains("worker (node)"));
+    }
+
+    #[test]
+    fn tree_keeps_shared_cwd_visible_when_a_session_starts_there() {
+        let mut app = App::default();
+        app.replace_sessions(vec![
+            session_at("parent", Some("/work/app")),
+            session_at("child", Some("/work/app/sub")),
+        ]);
+        let folder = app
+            .tree
+            .visible
+            .iter()
+            .find_map(|entry| match entry {
+                super::TreeEntry::Folder { node, .. }
+                    if app.tree.nodes[*node].cwd.as_deref() == Some("/work/app") =>
+                {
+                    Some(*node)
+                }
+                _ => None,
+            })
+            .expect("shared cwd must have its own folder");
+        assert_eq!(app.tree.nodes[folder].name, "app");
+        assert!(app.tree.nodes[folder].direct_sessions.contains(&0));
+    }
+
+    #[test]
+    fn drilling_a_remote_path_does_not_open_the_same_local_path() {
+        let mut app = App::default();
+        let local = session_at("local", Some("/a/b/c/d/e"));
+        let mut remote = session_at("remote", Some("/a/b/c/d/e"));
+        remote.node = Some("worker".into());
+        app.replace_sessions(vec![local, remote]);
+        let target = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry,
+            super::TreeEntry::Folder { node, depth: 4 }
+                if app.tree.nodes[*node].node.as_deref() == Some("worker"))
+            })
+            .expect("remote folder at drill horizon");
+        app.tree.cursor = target;
+        app.toggle_tree_drill();
+        assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+            super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "remote")));
+        assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+            super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "local")));
+    }
+    #[test]
+    fn tree_draws_sibling_edges_and_continuing_ancestor_lines() {
+        let mut app = App::default();
+        let mut a = session_at("a", Some("/work/config"));
+        a.command = "project.yaml".into();
+        let mut b = session_at("b", Some("/work/config"));
+        b.command = "constraints.sdc".into();
+        let mut c = session_at("c", Some("/work/docs"));
+        c.command = "README.md".into();
+        app.replace_sessions(vec![a, b, c]);
+        app.toggle_view_mode();
+        let rendered = render_app(&mut app, 120, 30);
+        assert!(rendered.contains("├── config/"), "{rendered}");
+        assert!(rendered.contains("│   ├──"), "{rendered}");
+        assert!(rendered.contains("│   └──"), "{rendered}");
+        assert!(rendered.contains("└── docs/"), "{rendered}");
+        assert!(
+            !rendered.contains("(2)"),
+            "folder counts are redundant: {rendered}"
+        );
+    }
+
+    #[test]
+    fn ctrl_n_on_tree_folder_prefills_full_cwd_and_owning_node() {
+        let mut app = App::default();
+        let mut remote = session_at("remote", Some("/work/app/sub"));
+        remote.node = Some("worker".into());
+        let local = session_at("local", Some("/home/local"));
+        app.replace_sessions(vec![remote, local]);
+        app.toggle_view_mode();
+        app.tree.cursor = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry, super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].cwd.as_deref() == Some("/work/app"))
+            })
+            .expect("remote parent folder");
+        route_key(&mut app, ctrl(KeyCode::Char('n')), None);
+        let dialog = app.clone_dialog.as_ref().unwrap();
+        assert_eq!(dialog.cwd.value, "/work/app");
+        assert_eq!(dialog.node.value, "worker");
+        assert!(dialog.command.value.is_empty());
+    }
+
+    #[test]
+    fn tree_start_time_uses_relative_then_local_datetime() {
+        let now = Utc.with_ymd_and_hms(2026, 9, 23, 12, 0, 0).unwrap();
+        assert_eq!(
+            super::format_tree_start(now - chrono::Duration::minutes(1), now),
+            "1m ago"
+        );
+        assert_eq!(
+            super::format_tree_start(now - chrono::Duration::hours(23), now),
+            "23h ago"
+        );
+        let old = now - chrono::Duration::hours(24);
+        assert_eq!(
+            super::format_tree_start(old, now),
+            super::super::list::format_timestamp_local(old)
+        );
+        assert_eq!(
+            super::format_tree_start(now + chrono::Duration::minutes(1), now),
+            "just now"
+        );
+    }
+
+    #[test]
+    fn tree_session_uses_fixed_status_width_and_normal_sparkline() {
+        let mut item = session_at("live", Some("/work"));
+        item.title = Some("release".into());
+        let now = std::time::Instant::now();
+        let mut rate = super::RateState::new(&item, now);
+        rate.history.extend([4.0, 8.0, 2.0]);
+        let line = super::session_line(&item, Some(&rate), "├── ", false, now);
+        assert_eq!(line.spans[3].content.len(), super::TREE_STATUS_WIDTH);
+        assert_eq!(
+            line.spans[9].content.as_ref(),
+            super::sparkline(Some(&rate), super::SPARKLINE_WIDTH)
+        );
+        assert!(!line.spans.iter().any(|span| span.content.contains("/work")));
+        item.input_needed = true;
+        let attention = super::session_line(&item, Some(&rate), "├── ", true, now);
+        assert_eq!(attention.spans[3].content.len(), super::TREE_STATUS_WIDTH);
+        assert_eq!(
+            attention.spans[3].style.fg,
+            Some(ratatui::style::Color::Yellow)
+        );
+    }
+    #[test]
     fn tree_render_shows_status_word_with_matching_color() {
         // Regression: the tree view used to skip the status text entirely,
         // so users could only guess at session state from the icon. Worse,
@@ -5418,9 +5662,11 @@ mod tests {
             .enumerate()
             .find(|(_, line)| line.contains("test"))
             .expect("session row present");
-        // The icon is at indent_width(depth=2) = 4 cells in.
-        let icon_color = cell_at(session_row as u16, 4);
-        let word_color = cell_at(session_row as u16, 13); // "  " + icon(1) + " " (1) + word start
+        let icon_x = (0..buffer.area().width)
+            .find(|&x| buffer[(x, session_row as u16)].symbol() == "●")
+            .expect("running glyph");
+        let icon_color = cell_at(session_row as u16, icon_x);
+        let word_color = cell_at(session_row as u16, icon_x + 3);
         assert_eq!(
             icon_color, word_color,
             "icon and status word must share foreground color"
@@ -5559,7 +5805,7 @@ mod tests {
         ];
         assert_eq!(
             super::common_path_prefix(&paths),
-            std::path::PathBuf::from("/a/b")
+            std::path::PathBuf::from("/a")
         );
     }
 
