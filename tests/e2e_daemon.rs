@@ -5,7 +5,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::{
     fs,
-    path::Path,
     thread::sleep,
     time::{Duration, Instant},
 };

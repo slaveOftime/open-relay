@@ -50,7 +50,8 @@ impl SegmentWriter {
         })
     }
 
-    #[cfg(test)]
+    // Only exercised by the linux-gated disk-full test in journal/mod.rs.
+    #[cfg(all(test, target_os = "linux"))]
     pub fn open_append(path: &Path) -> io::Result<Self> {
         let file = fs::OpenOptions::new().append(true).open(path)?;
         let written = file.metadata()?.len();

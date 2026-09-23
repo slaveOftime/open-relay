@@ -33,7 +33,7 @@
 
 #[cfg(test)]
 use std::io::Write;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use std::path::PathBuf;
 #[cfg(test)]
 #[allow(unused_imports)] // used inside `mod tests`

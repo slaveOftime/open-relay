@@ -408,15 +408,24 @@ async fn connect_and_relay(
             incoming = ws_rx.next() => {
                 let Some(msg_result) = incoming else { break };
 
-                let node_msg = match msg_result {
+                let frame = match msg_result {
                     Ok(WsMessage::Close(_)) | Err(_) => break,
-                    Ok(frame) => match decode_node_message(frame, &phase) {
-                        Ok(message) => message,
-                        Err(err) => {
-                            warn!(node = %join.name, %err, "failed to decode primary node frame");
-                            continue;
-                        }
-                    },
+                    // Tungstenite already frames protocol-level Ping / Pong
+                    // handling on the WebSocket layer (auto-pong on inbound
+                    // pings, dropping inbound pongs), so anything left here
+                    // is application traffic — silently skip these rather
+                    // than emitting "unsupported node connector frame"
+                    // warnings that would otherwise drown the log every
+                    // keepalive tick.
+                    Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
+                    Ok(frame) => frame,
+                };
+                let node_msg = match decode_node_message(frame, &phase) {
+                    Ok(message) => message,
+                    Err(err) => {
+                        warn!(node = %join.name, %err, "failed to decode primary node frame");
+                        continue;
+                    }
                 };
 
                 match node_msg {

@@ -115,14 +115,23 @@ pub fn ed25519_pub_to_x25519(pub_ed: &ed25519_dalek::VerifyingKey) -> [u8; 32] {
 }
 
 /// Convert an Ed25519 signing key to an X25519 StaticSecret (the
-/// long-term secret-input key used for ECDH). Implemented by taking
-/// the same SHA-512 hash of the seed that ed25519 itself uses, then
-/// applying the clamped scalar — which is exactly the conversion
-/// [`ed25519_dalek::SigningKey::to_scalar`] performs. Result is
-/// suitable for `diffie_hellman` against a peer's `X25519Public`.
+/// long-term secret-input key used for ECDH).
+///
+/// We feed `static_secrets` the *raw* `SHA-512(seed) || ...` prefix
+/// bytes — i.e. [`ed25519_dalek::SigningKey::to_scalar_bytes`] — *not*
+/// the clamped, reduced form returned by [`SigningKey::to_scalar`]. The
+/// clamping + reduction that `to_scalar` performs changes the scalar
+/// value, and `x25519-dalek` cannot recover the unclamped bytes
+/// afterwards; that means ECDH between two conversions of the *same*
+/// Ed25519 keypair to X25519 (`to_montgomery` of the verifying key on
+/// one side, the `to_scalar`-derived secret on the other) does **not**
+/// agree, and the two sides land on different shared secrets. The raw
+/// `to_scalar_bytes` output is the documented input for
+/// `StaticSecret::from::<[u8; 32]>` and `x25519-dalek`'s
+/// `diffie_hellman` clamps the bytes itself before use, so the two
+/// peers end up on the same secret.
 pub fn ed25519_priv_to_x25519(sk: &ed25519_dalek::SigningKey) -> StaticSecret {
-    let scalar: curve25519_dalek::Scalar = sk.to_scalar();
-    StaticSecret::from(scalar.to_bytes())
+    StaticSecret::from(sk.to_scalar_bytes())
 }
 
 /// Derive the two per-direction channel keys from the long-term keys
@@ -528,5 +537,62 @@ mod tests {
         // accepted as the join signature.
         let bogus_payload = node_join_payload("worker-a", &canonical_host);
         assert!(!verify_signature(&canonical_node, &join_sig, &bogus_payload));
+    }
+
+    /// Both sides of an SSH-key channel must derive the same per-direction
+    /// keys from each others Ed25519 identity and end up with a usable
+    /// AEAD round-trip.
+    #[test]
+    fn channel_keys_agree_and_round_trip_through_aead() {
+        let primary_sk = test_signing_key(0xA1);
+        let secondary_sk = test_signing_key(0xB2);
+
+        let primary_pub_ed: [u8; 32] = primary_sk.verifying_key().to_bytes();
+        let secondary_pub_ed: [u8; 32] = secondary_sk.verifying_key().to_bytes();
+
+        // Each side derives its X25519 long-term secret via the same
+        // helper -- that's the path that broke when callers passed the
+        // clamped/reduced scalar bytes instead of the unclamped first-half
+        // of SHA-512(seed).
+        let primary_priv_x = ed25519_priv_to_x25519(&primary_sk);
+        let secondary_priv_x = ed25519_priv_to_x25519(&secondary_sk);
+
+        let primary_pub_x = ed25519_pub_to_x25519(&primary_sk.verifying_key());
+        let secondary_pub_x = ed25519_pub_to_x25519(&secondary_sk.verifying_key());
+
+        let primary_keys = derive_channel_keys(
+            &primary_priv_x,
+            &secondary_pub_x,
+            &primary_pub_ed,
+            &secondary_pub_ed,
+        );
+        let secondary_keys = derive_channel_keys(
+            &secondary_priv_x,
+            &primary_pub_x,
+            &primary_pub_ed,
+            &secondary_pub_ed,
+        );
+
+        assert_eq!(primary_keys.c2s, secondary_keys.c2s, "c2s mismatch");
+        assert_eq!(primary_keys.s2c, secondary_keys.s2c, "s2c mismatch");
+        assert_ne!(primary_keys.c2s, primary_keys.s2c, "c2s == s2c");
+
+        let payload = br#"{"type":"ping"}"#;
+        let sealed = seal_frame(&primary_keys.s2c, &[], payload).expect("primary seals");
+        assert!(is_sealed_frame(&sealed));
+        let opened = open_frame(&secondary_keys.s2c, &[], &sealed).expect("secondary opens");
+        assert_eq!(opened, payload, "primary -> secondary round-trip");
+
+        let sealed_back =
+            seal_frame(&secondary_keys.c2s, &[], payload).expect("secondary seals");
+        let opened_back =
+            open_frame(&primary_keys.c2s, &[], &sealed_back).expect("primary opens");
+        assert_eq!(opened_back, payload, "secondary -> primary round-trip");
+
+        let wrong_dir = open_frame(&secondary_keys.c2s, &[], &sealed);
+        assert!(
+            wrong_dir.is_err(),
+            "must NOT cross-decrypt with the other direction key"
+        );
     }
 }
