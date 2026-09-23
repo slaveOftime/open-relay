@@ -160,7 +160,7 @@ pub async fn run_join(
         match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
             Ok(Some(pub_key)) => {
                 println!(
-                    "Node SSH public key\n(register it on the primary with `oly node accept -n {name} -k \"<KEY>\"`):\n{pub_key}"
+                    "Register it on the primary node with `oly node accept --name {name} --ssh-pub-key \"{pub_key}\"`"
                 );
             }
             Ok(None) => {
