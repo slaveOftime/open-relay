@@ -9,10 +9,12 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::constants::{
-    CLONE_DIALOG_HELP, DIALOG_FIELD_BG, DIALOG_LABEL_WIDTH, UPDATE_DIALOG_HELP,
+    CLONE_DIALOG_HELP, DIALOG_FIELD_BG, DIALOG_LABEL_WIDTH, REMOVE_DIALOG_HELP, UPDATE_DIALOG_HELP,
 };
 use super::dialog::format_terminal_words;
-use super::dialog::{CloneDialog, CloneField, EditText, UPDATE_FIELDS, UpdateDialog, UpdateField};
+use super::dialog::{
+    CloneDialog, CloneField, EditText, RemoveDialog, UPDATE_FIELDS, UpdateDialog, UpdateField,
+};
 use super::table::{format_bytes, pad_truncated};
 use crate::protocol::SessionSummary;
 
@@ -86,6 +88,32 @@ pub fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
         } else {
             Color::Red
         },
+        lines,
+    );
+}
+
+pub fn render_remove_dialog(frame: &mut Frame<'_>, dialog: &RemoveDialog) {
+    let area = centered_rect(frame.area(), 72, 8);
+    let target = match dialog.target.node.as_deref() {
+        Some(node) => format!("{} on {node}", dialog.target.id),
+        None => dialog.target.id.clone(),
+    };
+    let lines = vec![
+        Line::from("Force-remove this session?"),
+        Line::from(Span::styled(
+            target,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        dialog_footer(None, REMOVE_DIALOG_HELP),
+    ];
+    render_dialog(
+        frame,
+        area,
+        " ⚠ Remove session? ".to_string(),
+        Color::Red,
         lines,
     );
 }

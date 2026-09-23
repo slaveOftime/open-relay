@@ -31,28 +31,29 @@ pub(super) use app::{
 pub(super) use constants::{
     ANIMATION_REDRAW_INTERVAL, ATTENTION_PULSE_BG, ATTENTION_PULSE_BG_SELECTED, CLONE_DIALOG_HELP,
     COMPACT_SPARKLINE_WIDTH, DIALOG_FIELD_BG, DIALOG_LABEL_WIDTH, INPUT_POLL_INTERVAL,
-    RATE_HISTORY_LEN, REDRAW_INTERVAL, REFRESH_INTERVAL, REFRESH_TIMEOUT, SELECTED_ROW_BG,
-    SPARK_BLOCKS, SPARKLINE_WIDTH, STOP_GRACE_SECONDS, TITLE_SAVE_BYTES, UPDATE_DIALOG_HELP,
+    RATE_HISTORY_LEN, REDRAW_INTERVAL, REFRESH_INTERVAL, REFRESH_TIMEOUT, REMOVE_DIALOG_HELP,
+    SELECTED_ROW_BG, SPARK_BLOCKS, SPARKLINE_WIDTH, STOP_GRACE_SECONDS, TITLE_SAVE_BYTES,
+    UPDATE_DIALOG_HELP,
 };
 #[cfg(test)]
 pub(super) use dialog::{
-    CLONE_FIELDS, CloneDialog, CloneField, EditText, UPDATE_FIELDS, UpdateDialog, UpdateField,
-    format_terminal_words, optional_text, parse_dimension, parse_terminal_words,
+    CLONE_FIELDS, CloneDialog, CloneField, EditText, RemoveDialog, UPDATE_FIELDS, UpdateDialog,
+    UpdateField, format_terminal_words, optional_text, parse_dimension, parse_terminal_words,
 };
 #[cfg(test)]
 pub(super) use dialog_render::{
     centered_rect, checkbox, checkbox_spans, clone_cursor_visible, clone_field_line,
     dialog_field_line, dialog_footer, dialog_value_width, display_words, edit_text_viewport,
-    format_dialog_timestamp, render_clone_dialog, render_dialog, render_update_dialog,
-    section_header, text_value_spans, tip_separator, update_field_line, update_read_only_line,
-    update_read_only_values,
+    format_dialog_timestamp, render_clone_dialog, render_dialog, render_remove_dialog,
+    render_update_dialog, section_header, text_value_spans, tip_separator, update_field_line,
+    update_read_only_line, update_read_only_values,
 };
 #[cfg(test)]
 pub(super) use effects::{attention_pulse_key, render_effects};
 #[cfg(test)]
 pub(super) use keys::{
     AppAction, is_clone_dialog_key, is_new_session_dialog_key, is_update_dialog_key,
-    route_clone_dialog_key, route_key, route_update_dialog_key,
+    route_clone_dialog_key, route_key, route_remove_dialog_key, route_update_dialog_key,
 };
 #[cfg(test)]
 pub(super) use proto::{CloneLaunch, SessionTarget, SessionUpdate, wrap_node};

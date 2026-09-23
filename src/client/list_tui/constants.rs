@@ -38,6 +38,7 @@ pub(crate) const CLONE_DIALOG_HELP: &str =
     " Quotes group words · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
 pub(crate) const UPDATE_DIALOG_HELP: &str =
     " Quotes group words · Tab/Shift+Tab · Space toggle · Enter save · Esc cancel";
+pub(crate) const REMOVE_DIALOG_HELP: &str = " Enter/Y remove · Esc/N cancel ";
 /// Width of the label column in the clone/update dialogs.
 pub(crate) const DIALOG_LABEL_WIDTH: usize = 15;
 /// Background of the active field's value, giving it an "input box" look.

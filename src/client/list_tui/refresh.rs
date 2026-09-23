@@ -152,32 +152,33 @@ pub async fn fetch_sessions(
             (target.node.clone(), result)
         }
     });
+    let results = futures_util::future::join_all(requests).await;
+    Ok(collect_session_results(results, query.limit))
+}
+
+fn collect_session_results(
+    results: impl IntoIterator<Item = (Option<String>, Result<Vec<SessionSummary>>)>,
+    limit: usize,
+) -> SessionRefresh {
     let mut sessions = Vec::new();
     let mut failed_nodes = HashSet::new();
     let mut failures = Vec::new();
-    let mut successful_targets = 0;
-    for (node, result) in futures_util::future::join_all(requests).await {
+    for (node, result) in results {
         match result {
-            Ok(target_sessions) => {
-                successful_targets += 1;
-                sessions.extend(target_sessions);
-            }
+            Ok(target_sessions) => sessions.extend(target_sessions),
             Err(error) => {
                 failures.push(format!("{}: {error}", node.as_deref().unwrap_or("local")));
                 failed_nodes.insert(node);
             }
         }
     }
-    if successful_targets == 0 {
-        return Err(AppError::Protocol(failures.join(" · ")));
-    }
     sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
-    sessions.truncate(query.limit);
-    Ok(SessionRefresh {
+    sessions.truncate(limit);
+    SessionRefresh {
         sessions,
         failed_nodes,
         failures,
-    })
+    }
 }
 
 /// Fire-and-forget `RpcRequest::Remove { force: true }` to the daemon,
@@ -292,5 +293,41 @@ pub fn set_update_error(app: &mut App, error: String) {
         dialog.error = Some(error);
     } else {
         app.set_action_message(Some(error));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_session_results;
+    use crate::error::AppError;
+    use std::collections::HashSet;
+
+    #[test]
+    fn all_failed_node_refreshes_are_retryable_results() {
+        let refresh = collect_session_results(
+            vec![(
+                Some("worker-a".to_string()),
+                Err(AppError::NodeNotConnected("worker-a".to_string())),
+            )],
+            100,
+        );
+
+        assert!(refresh.sessions.is_empty());
+        assert_eq!(
+            refresh.failed_nodes,
+            HashSet::from([Some("worker-a".to_string())])
+        );
+        assert_eq!(
+            refresh.warning().as_deref(),
+            Some("sync lost: worker-a: node not connected: worker-a")
+        );
+    }
+
+    #[test]
+    fn empty_target_refresh_is_a_valid_empty_snapshot() {
+        let refresh = collect_session_results(Vec::new(), 100);
+        assert!(refresh.sessions.is_empty());
+        assert!(refresh.failed_nodes.is_empty());
+        assert!(refresh.failures.is_empty());
     }
 }

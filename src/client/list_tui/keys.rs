@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::app::App;
-use super::dialog::{CloneDialog, EditText, UpdateDialog};
+use super::dialog::{CloneDialog, EditText, RemoveDialog, UpdateDialog};
 use super::proto::{CloneLaunch, SessionTarget, SessionUpdate};
 use super::tree::{TreeEntry, ViewMode};
 
@@ -18,8 +18,7 @@ pub enum AppAction {
     Update(SessionUpdate),
     Stop(SessionTarget),
     /// Force-remove a session from the daemon (matches `oly rm -f <id>`).
-    /// Always forces the removal so stopped/failed/stale sessions can
-    /// still be cleaned out of the list without a separate prompt.
+    /// The RPC is forceful; the TUI asks for confirmation before dispatch.
     Remove(SessionTarget),
 }
 
@@ -38,6 +37,9 @@ pub fn route_key(
     }
     if app.update_dialog.is_some() {
         return route_update_dialog_key(app, key);
+    }
+    if app.remove_dialog.is_some() {
+        return route_remove_dialog_key(app, key);
     }
 
     match key.code {
@@ -100,11 +102,7 @@ pub fn route_key(
             })
         }
         KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Ctrl+R removes the focused session from the daemon
-            // (`oly rm -f <id>`). The RPC is fire-and-forget on a spawned
-            // task so the UI does not block; a refusal surfaces on the
-            // next refresh cycle via `apply_refresh`'s standard
-            // "sync lost" warning.
+            // Require confirmation before force-removing the focused session (`oly rm -f <id>`).
             let Some(session) = app.focused_session() else {
                 app.set_action_message(Some("no session in focus to remove".to_string()));
                 return AppAction::None;
@@ -116,8 +114,8 @@ pub fn route_key(
                     .clone()
                     .or_else(|| list_node.map(str::to_string)),
             };
-            app.remove_session(&target.id, target.node.as_deref());
-            AppAction::Remove(target)
+            app.remove_dialog = Some(RemoveDialog::new(target));
+            AppAction::None
         }
         KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.toggle_status_filter();
@@ -175,6 +173,21 @@ pub fn route_key(
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
             app.push_filter(character);
+            AppAction::None
+        }
+        _ => AppAction::None,
+    }
+}
+
+pub fn route_remove_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y' | 'Y') => app
+            .remove_dialog
+            .take()
+            .map_or(AppAction::None, |dialog| AppAction::Remove(dialog.target)),
+        KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+            app.remove_dialog = None;
+            app.set_action_message(Some("removal cancelled".to_string()));
             AppAction::None
         }
         _ => AppAction::None,

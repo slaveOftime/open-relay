@@ -191,7 +191,7 @@ fn inactive_session_row_stays_dimmed_but_keeps_session_background() {
 }
 
 #[test]
-fn inactive_sessions_have_no_sparkline_in_table_or_tree_rows() {
+fn inactive_sessions_have_no_sparkline_and_tree_rows_are_compact() {
     let mut item = session("finished");
     item.status = "stopped".to_string();
     let buffer = render_session_row(&item);
@@ -201,17 +201,31 @@ fn inactive_sessions_have_no_sparkline_in_table_or_tree_rows() {
     assert!(
         !row.chars()
             .any(|symbol| super::SPARK_BLOCKS.contains(&symbol)),
-        "inactive table row should leave the rate cell blank: {row:?}"
+        "inactive table row should not render a sparkline: {row:?}"
     );
 
-    let line = super::session_line(&item, None, "", false, std::time::Instant::now());
+    let now = std::time::Instant::now();
+    let inactive_line = super::session_line(&item, None, "", false, now);
+    assert!(!inactive_line.spans.iter().any(|span| {
+        span.content
+            .chars()
+            .any(|symbol| super::SPARK_BLOCKS.contains(&symbol))
+    }));
+    let mut active = item.clone();
+    active.status = "running".to_string();
+    let active_line = super::session_line(&active, None, "", false, now);
+    let line_width = |line: &ratatui::text::Line<'_>| {
+        line.spans
+            .iter()
+            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>()
+    };
     assert_eq!(
-        line.spans[9].content.as_ref(),
-        " ".repeat(super::SPARKLINE_WIDTH),
-        "inactive tree row should leave the sparkline cell blank"
+        line_width(&active_line) - line_width(&inactive_line),
+        super::SPARKLINE_WIDTH + 2,
+        "inactive tree rows should reclaim the sparkline and its padding"
     );
 }
-
 #[test]
 fn session_row_without_terminal_colours_is_unchanged() {
     let mut item = session("plain");
@@ -528,7 +542,6 @@ fn ctrl_g_toggles_view_mode() {
 }
 
 #[test]
-#[test]
 fn switching_to_tree_drills_and_focuses_the_selected_session() {
     let mut app = App::default();
     app.replace_sessions(vec![
@@ -724,39 +737,27 @@ fn tree_refresh_tick_preserves_focused_folder() {
 #[test]
 fn tree_walks_through_empty_middleman_folders() {
     let mut app = App::default();
-    // `/a/b/c/something` has three empty middleman folders. With the
-    // default auto-depth horizon of 2, every prefix folder leading up to
-    // the depth-4 leaf is visible as a navigation row even though none
-    // of them holds a session directly — the leaf folder and its
-    // session only become visible after drilling.
+    assert_eq!(super::TREE_AUTO_DEPTH, 1);
     app.replace_sessions(vec![session_at("lint", Some("/a/b/c/something"))]);
     let ids = tree_visible_ids(&app);
-    // Middleman folders are emitted as rows so the user can keep
-    // navigating through them.
-    assert!(ids.iter().any(|id| id == "folder:a"), "ids={ids:?}");
     let has_folder = |path: &str| {
         ids.iter().any(|id| {
             std::path::Path::new(id.strip_prefix("folder:").unwrap_or(""))
                 == std::path::Path::new(path)
         })
     };
-    assert!(has_folder("a/b"), "ids={ids:?}");
-    // With auto-depth=2, the depth-3 folder hides until drilled.
     assert!(
-        !has_folder("a/b/c"),
-        "depth-3 folder should sit past auto-depth: {ids:?}"
-    );
-    // The depth-4 leaf folder hides until drilled on `a/b/c`.
-    assert!(
-        !has_folder("a/b/c/something"),
-        "leaf folder should sit past auto-depth, ids={ids:?}"
+        has_folder("a"),
+        "first folder level should be visible: {ids:?}"
     );
     assert!(
-        !ids.contains(&"lint".to_string()),
-        "leaf session should sit past auto-depth, ids={ids:?}"
+        !has_folder("a/b"),
+        "second folder level should require an explicit drill: {ids:?}"
     );
+    assert!(!has_folder("a/b/c"), "ids={ids:?}");
+    assert!(!has_folder("a/b/c/something"), "ids={ids:?}");
+    assert!(!ids.contains(&"lint".to_string()), "ids={ids:?}");
 }
-
 #[test]
 fn tree_enter_on_session_emits_open_inline() {
     let mut app = App::default();
@@ -779,15 +780,15 @@ fn tree_enter_on_deep_folder_toggles_drill() {
     // start from the un-drilled default state.
     app.tree.drilled.clear();
     app.rebuild_tree();
-    // Before drilling, `deep` and its tail folders at depth > 2 are
-    // hidden. Drill on a depth-2 ancestor should expose them.
+    // Before drilling, `deep` and its tail folders at depth > 1 are
+    // hidden. Drill on the visible depth-1 ancestor should expose them.
     let ids_before = tree_visible_ids(&app);
     assert!(
         !ids_before.contains(&"deep".to_string()),
         "deep session should be hidden before drilling: {ids_before:?}"
     );
 
-    // Find the depth-2 folder (`a/b`) by walking visible rows. The
+    // Find the depth-1 folder (`a`) by walking visible rows. The
     // walker emits folder rows at their chain depth; drilling the
     // outermost visible folder should expose the leaf session past the
     // horizon.
@@ -797,11 +798,11 @@ fn tree_enter_on_deep_folder_toggles_drill() {
         .iter()
         .position(|entry| match entry {
             super::TreeEntry::Folder { node, depth } => {
-                *depth == 2 && app.tree.nodes[*node].path == std::path::Path::new("a/b")
+                *depth == 1 && app.tree.nodes[*node].path == std::path::Path::new("a")
             }
             _ => false,
         })
-        .expect("depth-2 folder present");
+        .expect("depth-1 folder present");
     app.tree.cursor = target_position;
     let action = route_key(&mut app, key(KeyCode::Enter), None);
     assert_eq!(action, AppAction::None);
@@ -999,20 +1000,30 @@ fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
     remote.node = Some("worker".into());
     let local = session_at("local", Some("/work/app"));
     app.replace_sessions(vec![remote, local]);
-    let ids = tree_visible_ids(&app);
     assert_eq!(app.tree.nodes[app.tree.root].subfolders.len(), 2);
-    let local_pos = ids.iter().position(|id| id == "local").unwrap();
-    let remote_pos = ids.iter().position(|id| id == "remote").unwrap();
-    assert!(
-        local_pos < remote_pos,
-        "node branches must not mix: {ids:?}"
-    );
+    let default_ids = tree_visible_ids(&app);
+    assert!(!default_ids.contains(&"local".to_string()));
+    assert!(!default_ids.contains(&"remote".to_string()));
+
+    app.selected = app
+        .visible
+        .iter()
+        .position(|&index| app.sessions[index].id == "remote")
+        .expect("remote session in list");
     app.toggle_view_mode();
+    let drilled_ids = tree_visible_ids(&app);
+    assert!(
+        drilled_ids.contains(&"remote".to_string()),
+        "{drilled_ids:?}"
+    );
+    assert!(
+        !drilled_ids.contains(&"local".to_string()),
+        "{drilled_ids:?}"
+    );
     let rendered = render_app(&mut app, 120, 30);
     assert!(rendered.contains("local (node)"));
     assert!(rendered.contains("worker (node)"));
 }
-
 #[test]
 fn tree_keeps_shared_cwd_visible_when_a_session_starts_there() {
     let mut app = App::default();
@@ -1050,7 +1061,7 @@ fn drilling_a_remote_path_does_not_open_the_same_local_path() {
         .iter()
         .position(|entry| {
             matches!(entry,
-            super::TreeEntry::Folder { node, depth: 3 }
+            super::TreeEntry::Folder { node, depth: 2 }
                 if app.tree.nodes[*node].node.as_deref() == Some("worker"))
         })
         .expect("remote folder at drill horizon");
@@ -2245,7 +2256,7 @@ fn ctrl_k_routes_stoppable_selection_and_handles_empty_or_inactive_state() {
 }
 
 #[test]
-fn ctrl_r_routes_force_remove_for_the_focused_session() {
+fn ctrl_r_requires_confirmation_before_force_removal() {
     let mut app = App::default();
     assert_eq!(
         route_key(&mut app, ctrl(KeyCode::Char('r')), None),
@@ -2262,14 +2273,48 @@ fn ctrl_r_routes_force_remove_for_the_focused_session() {
 
     assert_eq!(
         route_key(&mut app, ctrl(KeyCode::Char('r')), None),
+        AppAction::None
+    );
+    assert_eq!(
+        app.sessions.len(),
+        1,
+        "opening confirmation must not remove the row"
+    );
+    assert_eq!(
+        app.remove_dialog.as_ref().map(|dialog| &dialog.target),
+        Some(&super::SessionTarget {
+            id: "remove-me".to_string(),
+            node: Some("worker-a".to_string()),
+        })
+    );
+    let rendered = render_app(&mut app, 100, 18);
+    assert!(rendered.contains("Force-remove this session?"));
+    assert!(rendered.contains("remove-me on worker-a"));
+
+    assert_eq!(
+        route_key(&mut app, key(KeyCode::Esc), None),
+        AppAction::None
+    );
+    assert!(app.remove_dialog.is_none());
+    assert_eq!(
+        app.sessions.len(),
+        1,
+        "cancelling must preserve the session"
+    );
+
+    route_key(&mut app, ctrl(KeyCode::Char('r')), None);
+    assert_eq!(
+        route_key(&mut app, key(KeyCode::Enter), None),
         AppAction::Remove(super::SessionTarget {
             id: "remove-me".to_string(),
             node: Some("worker-a".to_string()),
         })
     );
-    assert!(
-        app.sessions.is_empty(),
-        "the focused row is dismissed optimistically"
+    assert!(app.remove_dialog.is_none());
+    assert_eq!(
+        app.sessions.len(),
+        1,
+        "RPC dispatch owns the optimistic removal"
     );
 
     let request = super::remove_request(&super::SessionTarget {
@@ -2282,7 +2327,6 @@ fn ctrl_r_routes_force_remove_for_the_focused_session() {
     assert_eq!(node, "worker-a");
     assert!(matches!(*inner, RpcRequest::Remove { id, force: true } if id == "remove-me"));
 }
-
 #[test]
 fn refresh_keeps_selection_by_id() {
     let mut app = App::default();

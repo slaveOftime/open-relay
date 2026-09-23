@@ -1,7 +1,7 @@
 // Dialog state types: the small input-control struct (EditText), the two
 // modal dialogs (CloneDialog, UpdateDialog), their field enums, and the
 // helpers used to round-trip text inputs through the launch payload.
-use super::proto::{CloneLaunch, SessionUpdate};
+use super::proto::{CloneLaunch, SessionTarget, SessionUpdate};
 use crate::protocol::SessionSummary;
 use crate::session::{MAX_SESSION_TITLE_LEN, normalize_session_tags, normalize_session_title};
 
@@ -233,6 +233,18 @@ pub const UPDATE_FIELDS: [UpdateField; 3] = [
     UpdateField::Tags,
     UpdateField::Notifications,
 ];
+
+/// Confirmation modal for force-removing a session from the daemon.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RemoveDialog {
+    pub target: SessionTarget,
+}
+
+impl RemoveDialog {
+    pub fn new(target: SessionTarget) -> Self {
+        Self { target }
+    }
+}
 
 #[derive(Debug)]
 pub struct UpdateDialog {

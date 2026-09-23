@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local, Utc};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::{
     cli::ListArgs,
@@ -33,6 +34,44 @@ pub(super) fn list_targets(args: &ListArgs) -> Vec<ListTarget> {
             .map(|node| ListTarget { node: Some(node) }),
     );
     targets
+}
+
+pub(super) fn list_targets_for_all_nodes(
+    node_names: impl IntoIterator<Item = String>,
+    include_local: bool,
+) -> Vec<ListTarget> {
+    let mut nodes: Vec<_> = node_names.into_iter().collect();
+    nodes.sort();
+    nodes.dedup();
+    let mut targets = Vec::with_capacity(nodes.len() + usize::from(include_local));
+    if include_local {
+        targets.push(ListTarget { node: None });
+    }
+    targets.extend(
+        nodes
+            .into_iter()
+            .map(|node| ListTarget { node: Some(node) }),
+    );
+    targets
+}
+
+pub(super) async fn fetch_node_names(config: &AppConfig) -> Result<Vec<String>> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        ipc::send_request_checked(config, RpcRequest::NodeList),
+    )
+    .await
+    .map_err(|_| AppError::Protocol("node list refresh timed out".to_string()))??;
+    match response {
+        RpcResponse::NodeList { mut nodes } => {
+            nodes.sort();
+            nodes.dedup();
+            Ok(nodes)
+        }
+        _ => Err(AppError::Protocol(
+            "unexpected response to node list".to_string(),
+        )),
+    }
 }
 
 pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
@@ -326,6 +365,7 @@ mod tests {
             until: None,
             limit: 25,
             node: vec![],
+            node_all: false,
             node_local: false,
         };
 
@@ -349,6 +389,7 @@ mod tests {
             until: None,
             limit: 100,
             node: vec!["worker-a".into(), "worker-b".into(), "worker-a".into()],
+            node_all: false,
             node_local: true,
         };
 
@@ -357,6 +398,26 @@ mod tests {
         assert_eq!(targets[0].node, None);
         assert_eq!(targets[1].node.as_deref(), Some("worker-a"));
         assert_eq!(targets[2].node.as_deref(), Some("worker-b"));
+    }
+
+    #[test]
+    fn all_node_targets_are_sorted_deduplicated_and_optionally_local() {
+        let remote = super::list_targets_for_all_nodes(
+            vec![
+                "worker-b".to_string(),
+                "worker-a".to_string(),
+                "worker-b".to_string(),
+            ],
+            false,
+        );
+        assert_eq!(remote.len(), 2);
+        assert_eq!(remote[0].node.as_deref(), Some("worker-a"));
+        assert_eq!(remote[1].node.as_deref(), Some("worker-b"));
+
+        let including_local = super::list_targets_for_all_nodes(vec!["worker-a".to_string()], true);
+        assert_eq!(including_local.len(), 2);
+        assert_eq!(including_local[0].node, None);
+        assert_eq!(including_local[1].node.as_deref(), Some("worker-a"));
     }
 
     #[test]

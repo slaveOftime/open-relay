@@ -214,7 +214,7 @@ pub fn session_line(
     };
     let started = session.started_at.unwrap_or(session.created_at);
     let title_text = session.title.clone().unwrap_or_default();
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
         Span::styled(glyph.to_string(), status_style),
         Span::raw("  "),
@@ -229,18 +229,20 @@ pub fn session_line(
         Span::styled(cmd_args, dim),
         Span::raw("  "),
         Span::styled(title_text, Style::default().fg(muted)),
-        Span::raw("   "),
-        Span::styled(
-            if active {
-                sparkline(rate, SPARKLINE_WIDTH)
-            } else {
-                " ".repeat(SPARKLINE_WIDTH)
-            },
-            Style::default().fg(color),
-        ),
-        Span::raw(" "),
-        Span::styled(format_tree_start(started, Utc::now()), dim),
-    ]);
+    ];
+    if active {
+        spans.extend([
+            Span::raw("   "),
+            Span::styled(sparkline(rate, SPARKLINE_WIDTH), Style::default().fg(color)),
+            Span::raw(" "),
+        ]);
+    } else {
+        // Inactive sessions have no chart; also remove its surrounding
+        // padding so the timestamp follows the title compactly.
+        spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(format_tree_start(started, Utc::now()), dim));
+    let line = Line::from(spans);
     if selected {
         line.style(Style::default().bg(SELECTED_ROW_BG))
     } else {

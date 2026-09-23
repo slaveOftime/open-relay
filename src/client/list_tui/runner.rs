@@ -7,7 +7,7 @@ use std::{
 use crossterm::event::{Event, KeyEventKind};
 use futures_util::FutureExt;
 
-use super::super::list::ListTarget;
+use super::super::list::{ListTarget, fetch_node_names, list_targets_for_all_nodes};
 use super::app::App;
 use super::app::open_selected_inline;
 use super::constants::{
@@ -39,6 +39,26 @@ pub async fn run(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>) 
     }
 }
 
+async fn fetch_follow_refresh(
+    config: &AppConfig,
+    query: crate::protocol::ListQuery,
+    targets: &[ListTarget],
+    node_all: bool,
+    node_local: bool,
+    known_nodes: Vec<String>,
+) -> Result<SessionRefresh> {
+    let targets = if node_all {
+        let mut nodes = fetch_node_names(config).await?;
+        nodes.extend(known_nodes);
+        nodes.sort();
+        nodes.dedup();
+        list_targets_for_all_nodes(nodes, node_local)
+    } else {
+        targets.to_vec()
+    };
+    fetch_sessions(config, query, &targets).await
+}
+
 async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(AppError::Protocol(
@@ -50,7 +70,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
 
     let query = super::super::list::build_list_query(args)?;
     let mut app = App {
-        show_node: targets.len() > 1,
+        show_node: args.node_all || targets.len() > 1,
         ..Default::default()
     };
     // When the list shows exactly one node's sessions, dialogs that start or
@@ -61,10 +81,23 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
         [target] => target.node.as_deref(),
         _ => None,
     };
-    let refresh = fetch_sessions(config, query.clone(), &targets).await?;
+    let refresh = fetch_follow_refresh(
+        config,
+        query.clone(),
+        &targets,
+        args.node_all,
+        args.node_local,
+        Vec::new(),
+    )
+    .await;
     crate::metrics::mark("tui: sessions fetched");
-    app.set_refresh_message(refresh.warning());
-    app.replace_sessions(refresh.sessions);
+    match refresh {
+        Ok(refresh) => {
+            app.set_refresh_message(refresh.warning());
+            app.replace_sessions(refresh.sessions);
+        }
+        Err(error) => app.set_refresh_message(Some(format!("sync lost: {error}"))),
+    }
     let mut terminal = TuiTerminal::new()?;
     crate::metrics::mark("tui: terminal ready");
     let mut last_refresh = Instant::now();
@@ -115,9 +148,26 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
             let config = config.clone();
             let query = query.clone();
             let targets = targets.clone();
+            let node_all = args.node_all;
+            let node_local = args.node_local;
+            let known_nodes = app
+                .sessions
+                .iter()
+                .filter_map(|session| session.node.clone())
+                .collect();
             tokio::spawn(async move {
                 let _ = tx
-                    .send(fetch_sessions(&config, query, &targets).await)
+                    .send(
+                        fetch_follow_refresh(
+                            &config,
+                            query,
+                            &targets,
+                            node_all,
+                            node_local,
+                            known_nodes,
+                        )
+                        .await,
+                    )
                     .await;
             });
         }

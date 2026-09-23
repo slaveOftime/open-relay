@@ -224,8 +224,11 @@ pub struct ListArgs {
     )]
     pub limit: usize,
     /// Target a secondary node by name. Repeat to monitor multiple nodes.
-    #[arg(long, short = 'n', value_name = "NODE")]
+    #[arg(long, short = 'n', value_name = "NODE", conflicts_with = "node_all")]
     pub node: Vec<String>,
+    /// Target every currently connected secondary node (follow mode refreshes membership).
+    #[arg(long, conflicts_with = "node", requires = "follow")]
+    pub node_all: bool,
     /// Include sessions from the current (or primary) daemon.
     #[arg(long)]
     pub node_local: bool,
@@ -1072,6 +1075,22 @@ mod tests {
         };
         assert_eq!(args.node, vec!["worker-a", "worker-b"]);
         assert!(args.node_local);
+    }
+
+    #[test]
+    fn list_parses_node_all_for_follow_only() {
+        let cli =
+            Cli::try_parse_from(["oly", "ls", "--follow", "--node-all", "--node-local"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(args.node_all);
+        assert!(args.node_local);
+        assert!(Cli::try_parse_from(["oly", "ls", "--node-all"]).is_err());
+        assert!(
+            Cli::try_parse_from(["oly", "ls", "--follow", "--node-all", "--node", "worker"])
+                .is_err()
+        );
     }
 
     #[test]

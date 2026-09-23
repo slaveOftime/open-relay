@@ -189,7 +189,7 @@ use std::{
 
 use tachyonfx::{EffectManager, RefRect};
 
-use super::dialog::{CloneDialog, UpdateDialog};
+use super::dialog::{CloneDialog, RemoveDialog, UpdateDialog};
 use super::keys::AppAction;
 use super::spawn::{session_command, spawn_session_terminal, terminal_marker};
 use super::terminal::{TuiTerminal, wait_for_ctrl_d};
@@ -220,6 +220,7 @@ pub struct App {
     pub sort_strategy: SortStrategy,
     pub clone_dialog: Option<CloneDialog>,
     pub update_dialog: Option<UpdateDialog>,
+    pub remove_dialog: Option<RemoveDialog>,
     pub show_node: bool,
     pub view_mode: ViewMode,
     pub tree: TreeView,
@@ -345,14 +346,6 @@ impl App {
         if self.selected >= self.visible.len() && !self.visible.is_empty() {
             self.selected = self.visible.len() - 1;
         }
-    }
-
-    /// Hook used by the Ctrl+R route-key handler so the action feedback
-    /// ("removing session …") and the optimistic drop both happen on the
-    /// same call site. Splitting this from `remove_session_payload`
-    /// lets refresh::remove_session reuse the same drop logic.
-    pub(super) fn remove_session(&mut self, id: &str, node: Option<&str>) {
-        self.remove_session_payload(id, node);
     }
 
     pub(super) fn apply_updated_summary(&mut self, summary: SessionSummary) {
@@ -810,6 +803,7 @@ impl App {
         let Some(cwd) = session.cwd.as_deref() else {
             return;
         };
+        let session_node = session.node.clone();
         // Mirror the pipeline stripping: drop the shared ancestor so
         // drilled paths match what the walker emits under the (optional)
         // per-node branch.
@@ -817,7 +811,8 @@ impl App {
             &self
                 .sessions
                 .iter()
-                .filter_map(|session| session.cwd.as_deref().map(PathBuf::from))
+                .filter(|candidate| candidate.node.as_deref() == session_node.as_deref())
+                .filter_map(|candidate| candidate.cwd.as_deref().map(PathBuf::from))
                 .filter(|path| !path.as_os_str().is_empty())
                 .collect::<Vec<_>>(),
         );

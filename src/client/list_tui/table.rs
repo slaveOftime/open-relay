@@ -179,7 +179,7 @@ pub fn session_row(
                 if active {
                     sparkline(rate, COMPACT_SPARKLINE_WIDTH)
                 } else {
-                    " ".repeat(COMPACT_SPARKLINE_WIDTH)
+                    String::new()
                 },
                 alignments[5 + node_offset],
             )
@@ -200,7 +200,7 @@ pub fn session_row(
                         format_bytes(current_rate)
                     )
                 } else {
-                    format!("{:>13}", " ")
+                    String::new()
                 },
                 alignments[5 + node_offset],
             )
@@ -233,7 +233,7 @@ pub fn session_row(
                             format_bytes(current_rate)
                         )
                     } else {
-                        format!("{:>13}", " ")
+                        String::new()
                     },
                     alignments[6 + node_offset],
                 )

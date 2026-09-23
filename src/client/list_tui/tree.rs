@@ -95,7 +95,7 @@ impl TreeView {
 
 /// Maximum folder depth shown without an explicit drill. Pressing Enter on a
 /// folder at this depth reveals one more level of children.
-pub const TREE_AUTO_DEPTH: usize = 2;
+pub const TREE_AUTO_DEPTH: usize = 1;
 
 pub fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
     if paths.is_empty() {
