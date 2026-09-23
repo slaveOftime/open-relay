@@ -27,12 +27,6 @@ use crate::{
 // GET /api/nodes
 // ---------------------------------------------------------------------------
 
-pub async fn get_host_key(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "public_key": state.ssh_host_key.public_key(),
-    }))
-}
-
 pub async fn list_nodes(State(state): State<AppState>) -> Json<Vec<NodeSummary>> {
     let names = state.node_registry.connected_names().await;
     let summaries = names
@@ -77,12 +71,19 @@ pub async fn join_handler(
 async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::IpAddr) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // ── Step 1: handshake — optionally preceded by a host-key challenge ──
-    // A secondary using SSH-key auth first sends `get_host_key`; the primary
-    // replies with its host key plus a fresh nonce signed by the host key.
-    // That nonce is the challenge the join signature must cover, so it is
-    // scoped to this exact connection and cannot be replayed.
-    let mut issued_nonce: Option<[u8; sshauth::NONCE_LEN]> = None;
+    // ── Channel-mode state ───────────────────────────────────────────────────
+    // Tracks whether we are still exchanging plaintext handshake frames
+    // (Hello / Join) or post-handshake sealed traffic (the relay loop).
+    // The socket flips to Sealed once the primary has SSH-key-authenticated
+    // the secondary and derived the per-direction AES-256-GCM keys.
+    let mut phase = sshauth::ChannelPhase::Plain;
+
+    // ── Step 1: handshake — read Hello (optional for API-key flows) then
+    // the mandatory Join. There is no in-band host-key challenge: the
+    // primary's pubkey is whatever the operator pinned on the secondary
+    // with `--ssh-pub-key`, so a man-in-the-middle has no opportunity to
+    // substitute a different key during the handshake.
+    let mut hello_record: Option<String> = None; // secondary's canonical pubkey line
     let (name, auth) = loop {
         let first = match ws_rx.next().await {
             Some(Ok(Message::Binary(data))) => data,
@@ -98,24 +99,12 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
         };
 
         match handshake {
-            NodeWsMessage::GetHostKey => {
-                let Some(host_signing_key) = state.ssh_host_key.signing_key() else {
-                    send_error(&mut ws_tx, "host key authentication is not available").await;
-                    return;
-                };
-                let mut nonce = [0u8; sshauth::NONCE_LEN];
-                rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
-                let host_signature =
-                    sshauth::sign_b64(&host_signing_key, &sshauth::host_challenge_payload(&nonce));
-                issued_nonce = Some(nonce);
-                let reply = NodeWsMessage::HostKey {
-                    public_key: state.ssh_host_key.public_key().to_string(),
-                    nonce: sshauth::b64_encode(&nonce),
-                    host_signature,
-                };
-                if send_node_message(&mut ws_tx, &reply).await.is_err() {
-                    return;
-                }
+            NodeWsMessage::Hello { public_key } => {
+                // Stash the secondary's identity for channel-key
+                // derivation post-credential-verification, then keep
+                // waiting for the actual Join handshake. API-key flows
+                // that never send Hello still work — they just stay Plain.
+                hello_record = Some(public_key);
             }
             NodeWsMessage::Join { name, auth } => break (name, auth),
             _ => {
@@ -124,6 +113,11 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             }
         }
     };
+
+    // Capture the auth variant up front: the match below partially moves
+    // string payloads out of `auth`, so we can't grep its tag at the
+    // Sealed-phase decision point unless we record the choice here.
+    let auth_was_ssh = matches!(&auth, NodeJoinAuth::SshKey { .. });
 
     // ── Step 2: validate authentication ─────────────────────────────────────────────
     let verified = match auth {
@@ -151,16 +145,13 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             signature,
             public_key,
         } => {
-            // SSH-key auth is only valid against a challenge issued on this
-            // connection; never accept an out-of-band signature.
-            let Some(nonce) = issued_nonce else {
-                send_error(
-                    &mut ws_tx,
-                    "ssh key auth requires a get_host_key challenge first",
-                )
-                .await;
-                return;
-            };
+            // SSH-key auth proceeds without a per-connection host-key
+            // challenge — the operator pinned the primary's pubkey on
+            // the secondary out-of-band via `--ssh-pub-key`, and the
+            // accept-table on this side is the trust anchor that maps a
+            // node name to a registered signing pubkey. The signature
+            // covers `NODE_JOIN_CONTEXT || name || pubkey`, which binds
+            // it to the declared node identity.
             let canonical = match sshauth::normalize_public_key(&public_key) {
                 Ok(k) => k,
                 Err(_) => {
@@ -170,10 +161,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             };
             match state.db.get_ssh_key_entry(&canonical).await {
                 Ok(Some(_registered)) => {
-                    // The presented key must itself be registered; the
-                    // signature is verified against it, so a lookup miss or
-                    // a bad signature both fail closed with "unauthorized".
-                    let payload = sshauth::node_join_payload(&name, &nonce, &canonical);
+                    let payload = sshauth::node_join_payload(&name, &canonical);
                     tokio::task::spawn_blocking(move || {
                         sshauth::verify_signature(&canonical, &signature, &payload)
                     })
@@ -213,13 +201,90 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     let handle = NodeHandle { send_tx, pending };
     state.node_registry.connect(name.clone(), handle).await;
 
+    // ── Step 4b: derive channel keys for SSH-key joins. The `Joined`
+    // reply we send Plane is the *transition point* — both sides
+    // seal from the next frame onwards, so neither side ever tries
+    // to read a sealed message in pre-handshake phase. We only need the
+    // secondary's canonical Ed25519 ssh-line (Hello's `public_key`); the
+    // peer X25519 form is derived locally so it doesn't have to ride the
+    // wire.
+    let sealed_keys: Option<([u8; sshauth::AEAD_KEY_LEN], [u8; sshauth::AEAD_KEY_LEN])> =
+        if auth_was_ssh {
+            if let (Some(secondary_pub_line), Some(host_signing_key)) =
+                (hello_record.as_ref(), state.node_identity.signing_key())
+            {
+                let secondary_canon =
+                    match sshauth::normalize_public_key(secondary_pub_line) {
+                        Ok(k) => k,
+                        Err(err) => {
+                            send_error(
+                                &mut ws_tx,
+                                &format!("hello carried an invalid ssh-ed25519 line: {err}"),
+                            )
+                            .await;
+                            state.node_registry.disconnect(&name).await;
+                            return;
+                        }
+                    };
+                let secondary_pub_ed_bytes = match sshauth::b64_decode(
+                    secondary_canon.split_whitespace().next_back().unwrap_or(""),
+                ) {
+                    Ok(b) if b.len() == 32 => {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&b);
+                        a
+                    }
+                    _ => {
+                        send_error(&mut ws_tx, "hello pubkey decode failed").await;
+                        state.node_registry.disconnect(&name).await;
+                        return;
+                    }
+                };
+                let primary_pub_ed = {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&state.node_identity.public_key_bytes());
+                    a
+                };
+                let priv_x = sshauth::ed25519_priv_to_x25519(&host_signing_key);
+                let secondary_pub_x = sshauth::ed25519_pub_to_x25519(
+                    &ed25519_dalek::VerifyingKey::from_bytes(&secondary_pub_ed_bytes)
+                        .expect("secondary ed25519 pubkey from hello verified above"),
+                );
+                let keys = sshauth::derive_channel_keys(
+                    &priv_x,
+                    &secondary_pub_x,
+                    &primary_pub_ed,
+                    &secondary_pub_ed_bytes,
+                );
+                Some((keys.s2c, keys.c2s))
+            } else {
+                send_error(
+                    &mut ws_tx,
+                    "ssh-key join missing hello; refusing to fall back to plaintext",
+                )
+                .await;
+                state.node_registry.disconnect(&name).await;
+                return;
+            }
+        } else {
+            None
+        };
+
     // ── Step 5: send Joined (node is already visible in registry) ────────
-    if send_node_message(&mut ws_tx, &NodeWsMessage::Joined)
+    if send_node_message(&mut ws_tx, &NodeWsMessage::Joined, &phase)
         .await
         .is_err()
     {
         state.node_registry.disconnect(&name).await;
         return;
+    }
+
+    // Flip the channel to Sealed *after* Joined has been written, so the
+    // primary's outbound RPCs, pongs, and notifications use AES-256-GCM
+    // from here on. The connector performs the symmetric flip in its own
+    // loop right after reading Joined.
+    if let Some((send_key, recv_key)) = sealed_keys {
+        phase.seal(send_key, recv_key);
     }
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
@@ -245,7 +310,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                 let Some(ws_msg) = msg else {
                     break "node RPC relay channel closed".to_string();
                 };
-                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg).await {
+                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg, &phase).await {
                     break format!("failed to send proxied RPC to node WebSocket: {err}");
                 }
             }
@@ -258,7 +323,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                             Message::Close(frame) => {
                                 break close_frame_disconnect_reason(frame);
                             }
-                            other => match parse_node_message(other) {
+                            other => match parse_node_message(other, &phase) {
                                 Ok(message) => message,
                                 Err(err) => {
                                     warn!(node = %name, %err, "failed to decode secondary node frame");
@@ -323,6 +388,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                     if let Err(err) = send_node_message(
                                         &mut ws_tx,
                                         &NodeWsMessage::Pong,
+                                        &phase,
                                     )
                                     .await {
                                         break format!("failed to send pong to node WebSocket: {err}");
@@ -473,22 +539,31 @@ async fn send_error(
 async fn send_node_message(
     ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: &NodeWsMessage,
+    phase: &sshauth::ChannelPhase,
 ) -> Result<(), String> {
-    match encode_node_ws_payload(message) {
-        Ok(payload) => ws_tx
-            .send(Message::Binary(payload.into()))
-            .await
-            .map_err(|err| err.to_string()),
+    let payload = match sshauth::phase_encode_message(phase, message)
+        .or_else(|_| encode_node_ws_payload(message))
+    {
+        Ok(p) => p,
         Err(err) => {
             warn!(%err, "failed to encode node WebSocket frame");
-            Err(err.to_string())
+            return Err(err.to_string());
         }
-    }
+    };
+    ws_tx
+        .send(Message::Binary(payload.into()))
+        .await
+        .map_err(|err| err.to_string())
 }
 
-fn parse_node_message(frame: Message) -> std::io::Result<NodeWsMessage> {
+fn parse_node_message(
+    frame: Message,
+    phase: &sshauth::ChannelPhase,
+) -> std::io::Result<NodeWsMessage> {
     match frame {
-        Message::Binary(data) => decode_node_ws_payload(&data),
+        Message::Binary(data) => {
+            sshauth::phase_decode_payload(phase, &data).map_err(std::io::Error::other)
+        }
         _ => Err(std::io::Error::other("unsupported node WebSocket frame")),
     }
 }

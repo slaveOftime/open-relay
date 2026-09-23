@@ -13,14 +13,35 @@ pub async fn run_send(
     id: &str,
     node: Option<String>,
     chunks: Vec<String>,
+    // Free-text payload captured from the `--` separator in argv.
+    // Tri-state:
+    //   * `None`            — `--` was NOT used; legacy behaviour.
+    //   * `Some("")`        — `--` was the last argv token → usage
+    //                          error (we do NOT silently fall back to
+    //                          stdin in that case).
+    //   * `Some(content)`   — `--` followed by args; `content` is the
+    //                          single-space-joined literal blob to send
+    //                          as one chunk.
+    free_text: Option<String>,
 ) -> Result<()> {
     let has_chunks = !chunks.is_empty();
+    let has_free_text = free_text.as_ref().is_some_and(|s| !s.is_empty());
+    let had_separator = free_text.is_some();
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
-    if !has_chunks && stdin_is_terminal {
+    if !has_chunks && !has_free_text && stdin_is_terminal {
         return Err(AppError::Protocol(
             "no input provided; pass text/key chunks or pipe stdin. Example: oly send <id> \"hello\" key:enter"
                 .to_string(),
+        ));
+    }
+
+    // Trailing `--` with nothing after is a usage error, not a cue to
+    // silently fall back to stdin. The user typed the marker, so they
+    // meant free text — sending empty input would be surprising.
+    if had_separator && !has_free_text {
+        return Err(AppError::Protocol(
+            "trailing `--` was not followed by any free-text arguments".to_string(),
         ));
     }
 
@@ -33,10 +54,19 @@ pub async fn run_send(
         sent_any = true;
     }
 
-    // Piped stdin (only when no explicit chunks were given). Bytes are
-    // forwarded exactly as read — no UTF-8 validation or lossy
-    // conversion — so binary input survives (PLAN §5.1).
-    if !has_chunks && !stdin_is_terminal {
+    // Free-text payload from `--`: one literal blob, no per-token
+    // dispatch. `key:foo`, `oly-file:...`, `oly-clipboard`, etc. all
+    // pass through as ordinary text — the point of `--` is to opt out
+    // of the chunk classifier.
+    if let Some(blob) = free_text.as_deref().filter(|s| !s.is_empty()) {
+        send_data(config, id, blob.as_bytes().to_vec(), node.as_deref()).await?;
+        sent_any = true;
+    }
+
+    // Piped stdin (only when no explicit chunks AND `--` was not used).
+    // Bytes are forwarded exactly as read — no UTF-8 validation or
+    // lossy conversion — so binary input survives (PLAN §5.1).
+    if !has_chunks && !had_separator && !stdin_is_terminal {
         let mut bytes = Vec::new();
         std::io::stdin().read_to_end(&mut bytes)?;
         if !bytes.is_empty() {

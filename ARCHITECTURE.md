@@ -120,15 +120,34 @@ Join handshake (WS, binary JSON; `src/sshauth.rs`, `http/nodes.rs`):
 ```
 secondary                                      primary
    │ WS /api/nodes/join                          │
-   ├─ get_host_key ────────────────────────────► │
-   │ ◄── host_key {pub, nonce, sig} ─────────────┤ sig = Ed25519("oly-host-challenge-v1"‖nonce)
-   │  verify sig (live proof), TOFU-pin          │ — no credentials sent unless this verifies
-   │  against known_hosts (mismatch = abort)     │
-   ├─ join {name, auth} ───────────────────────► │ auth = api_key, or Ed25519 sig over
-   │ ◄── joined | error ─────────────────────────┤ "oly-node-join-v1"‖name‖nonce‖pubkey
-   │        (nonce is fresh per connection: no replay, no key substitution)
+   ├─ hello {public_key} ───────────────────────► │  secondary's Ed25519 pubkey
+   ├─ join {name, auth} ─────────────────────────► │  auth = api_key, or Ed25519 sig over
+   │ ◄── joined | error ─────────────────────────┤  "oly-node-join-v1"‖name‖pubkey
+   │        (no in-band host-key exchange: pin is trust root)
+   ├─ sealed frames (AES-256-GCM) ────────────────────► │  channel keys = ECDH(priv_x, peer_pub_x)
+   │                                              │  + HKDF("oly-channel-v1"‖peer_pub_ed
+   │                                              │  ‖self_pub_ed‖"c2s"‖"s2c")
    │  keepalive: primary pings every 15 s; node dropped after 45 s silent
 ```
+
+
+Both primary and secondary daemons auto-generate an Ed25519 identity
+key at first start (`<state>/ssh_host_key` / `.pub`); the same file
+serves as the channel-encryption identity on both ends of the
+federated connection. Operators exchange pub keys manually (the
+line is shown by `oly daemon status` on each side, registered into
+the accept-table on the primary via `oly node accept --name <n> -k
+<...>`, and pinned into the secondary via `oly join start
+--ssh-pub-key <...>`). There is **no in-band host-key exchange** —
+out-of-band pinning is the trust root. If the operator types a
+wrong primary pub key into `oly join start`, the post-Join ECDH
+channel silently breaks (no warning, just a dead socket). That
+trade-off is deliberate: the previous in-band host-key flow added
+an unnecessary MITM probe (a published pubkey can be substituted in
+transit by an active attacker; the signed challenge was redundant
+once the operator already pins a value). Channel encryption +
+the operator-typed pin + the primary's accept-table are the
+authoritative trust triplet.
 
 Once joined, exactly three flows run over the one WS connection
 (`NodeWsMessage`, `src/protocol.rs`):
@@ -173,9 +192,11 @@ browser / CLI ──WS──► primary ws.rs ── NodeRegistry::proxy_rpc_str
 Federation rules to preserve:
 
 - **Auth happens once, at join.** API keys are stored `0600` on the
-  secondary; SSH auth proves the primary live (host-key signature per
-  connection) and binds the secondary's signature to name + fresh nonce
-  + key. Join attempts are rate-limited and IP-locked on the primary.
+  secondary; SSH auth verifies the secondary's Ed25519 signature over
+  `"oly-node-join-v1"‖name‖pubkey` against the public key registered
+  in the primary's accept-table (no in-band nonce: the trust root is
+  the operator-typed pin, exercised post-Join via the channel ECDH).
+  Join attempts are rate-limited and IP-locked on the primary.
 - **The owning node is the only authority on its sessions.** The
   primary routes and displays; it never bypasses the secondary's lease
   or credit checks — everything goes through that node's own daemon.
@@ -186,8 +207,8 @@ Federation rules to preserve:
 Where to look: `src/node/registry.rs` (NodeRegistry, proxy_*),
 `src/daemon/rpc_nodes.rs` (secondary connector, nested-IPC relay,
 allowlists), `src/http/nodes.rs` (join endpoint, keepalive, event
-tagging), `src/sshauth.rs` (challenge-response),
-`src/client/join.rs` (join config + CLI).
+tagging), `src/sshauth.rs` (channel-key derivation + signature
+helpers), `src/client/join.rs` (join config + CLI).
 
 ## The invariants that matter
 

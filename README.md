@@ -134,6 +134,24 @@ oly send <id> key:ctrl+c
 oly send <id> key:up key:enter
 ```
 
+For arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force you to base64-encode and decode inside the target shell — use the free-text form. Once you pass `--`, every argument after it is sent as one literal blob joined with single spaces, with **no** per-token dispatch into `key:` / `oly-clipboard` / `oly-file:`:
+
+```sh
+# Multi-line body. The '--' opt-out lets you skip bash's quoting layers.
+oly send <id> -- 'echo "hello world"
+ls -la
+git status'
+
+# A token that happens to start with `key:` stays literal.
+oly send <id> -- echo "press key:enter to continue"
+
+# Compose with regular chunks before `--` (head still dispatches normally).
+oly send <id> key:enter -- echo "after the enter"
+```
+
+Free-text mode is the easiest way to drive other CLI tools or bash from `oly send` without round-tripping through base64 or fighting shell escaping.
+```
+
 ### 4. Keep a browser-accessible control plane
 
 By default, `oly daemon start -d` also serves a local web UI and HTTP API on `http://127.0.0.1:15443`.
@@ -188,7 +206,7 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
 | `oly attach [id] [--observer] [--node <name>]` | Reattach to a session (takes control by default) |
 | `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching (also `--screen`, `--from`, and wait modes — see below) |
-| `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session |
+| `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session. Use `--` to send arbitrary text verbatim without per-token dispatch (see "Let humans stay in the loop"). |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
 | `oly restart <id> [--force] [--node <name>]` | Start a new session from persisted launch metadata (`--force` first kills a running source) |
 | `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
@@ -259,8 +277,9 @@ oly logs <ID> --exit --timeout 30s                 # session exited
 | `oly api-key add <name>` | Create an API key on the primary and print it once |
 | `oly api-key ls` | List API key labels on the primary |
 | `oly api-key remove <name>` | Revoke an API key on the primary |
+| `oly node accept --name <name> -k <secondary-pub>` | Register a secondary's Ed25519 pub key on the primary (SSH key auth) |
 | `oly join start --name <name> --key <key> <url>` | Connect this daemon to a primary (API key auth) |
-| `oly join start --name <name> --ssh-key <key-path> <url>` | Connect this daemon to a primary (SSH key auth) |
+| `oly join start --name <name> --ssh-pub-key <primary-pub> <url>` | Connect this daemon to a primary (SSH key auth) |
 | `oly join stop --name <name>` | Disconnect and remove a saved join config |
 | `oly join ls` | List saved outbound join configs on this daemon |
 | `oly join ls --primary` | Ask the daemon for currently active primary-side joins |
@@ -283,45 +302,60 @@ oly join start --name myserver --key a3f4c1b2... http://192.168.1.100:15443
 
 **Method 2 — SSH key (challenge-response, MITM protected):**
 
+Every daemon (primary *and* secondary) auto-generates its own Ed25519
+identity key on first start at `<state>/ssh_host_key{,pub}`. To join over
+SSH, the operator copies the **secondary's** identity pub key to the
+**primary** and pins the **primary's** identity pub key on the
+**secondary**.
+
 ```bash
-# 1. Generate an Ed25519 key pair if you don't already have one
-#    (only unencrypted Ed25519 OpenSSH keys are supported)
-ssh-keygen -t ed25519 -f ~/.ssh/oly_secondary -N ""
-cat ~/.ssh/oly_secondary.pub   # copy the output
+# 1. Look up the identities with `oly daemon status` on each side:
+#      it prints "SSH PUB: ssh-ed25519 <base64...>" — the canonical line.
 
-# 2. On the primary, register the secondary's public key
-oly node accept-ssh-pubkey --name myserver --pub-key "ssh-ed25519 AAAA..."
+# 2. On the primary, register the secondary's identity pub key:
+oly node accept --name myserver -k "<secondary's SSH PUB>"
 
-# 3. On the secondary, start the join with your SSH private key.
-#    Pass --ssh-known-hosts to pin the primary's host key on first use
-#    (TOFU) and reject any later change — strongly recommended:
-oly join start --name myserver --ssh-key ~/.ssh/oly_secondary \
-    --ssh-known-hosts ~/.ssh/oly_known_hosts http://192.168.1.100:15443
+# 3. On the secondary, start the join, pinning the primary's identity:
+oly join start --name myserver --ssh-pub-key "<primary's SSH PUB>" http://192.168.1.100:15443
 ```
 
-`oly join start --ssh-key ...` prints the node's public key line, so you can
-copy it straight into `oly node accept-ssh-pubkey` on the primary. Real
-`ssh-keygen` public key lines (as pasted above) are accepted and normalized
-automatically; only Ed25519 keys are supported.
+`oly join ls` on the secondary prints the canonical pub key it just signed
+with, mirroring the line on the primary. Real `ssh-keygen` public key
+lines are accepted too (in addition to the canonical internal form) and
+normalized automatically; only Ed25519 keys are supported.
+
+**`--ssh-pub-key` is the trust root.** When you start the join, the
+secondary uses this pinned pub key to derive AES-256-GCM channel keys
+(static-static X25519 ECDH against its own identity). There is **no
+in-band host-key exchange** — no `GET /api/nodes/host-key` endpoint,
+no `get_host_key` / `host_key` wire frames, no per-connection nonce.
+If the primary's identity pub key is wrong (typo, restore from a
+different backup, MITM attempt), the connector's handshake still
+completes but the post-Join channel goes silent because both sides
+derive different shared secrets.
 
 **How SSH join works under the hood:**
 
-1. The secondary opens the WebSocket and sends `get_host_key`. The primary
-   replies with its Ed25519 host key plus a fresh random nonce *signed by
-   the host key* — the secondary refuses to send any credentials unless
-   that self-signature verifies, and (when `--ssh-known-hosts` is given)
-   the host key must match the pinned entry, or the join aborts (MITM
-   protection). Unknown hosts are pinned on first use (TOFU).
-2. The secondary then signs the challenge with its Ed25519 private key.
-   The signed payload covers a domain tag, the claimed node **name**, the
-   primary's **per-connection nonce** (so a captured handshake cannot be
-   replayed) and the signer's **public key** — no plaintext secret ever
-   crosses the wire.
-3. The primary checks that the signature covers the nonce it issued on
-   *this* connection and verifies against the registered public key.
+1. The secondary opens the WebSocket and sends a `hello` frame with
+   its own Ed25519 identity pub key (so the primary can derive the
+   channel keys).
+2. The secondary signs the join payload with its own Ed25519 identity
+   key. The signed payload covers a domain tag, the claimed node
+   **name**, and the signer's **public key** — no plaintext secret
+   ever crosses the wire.
+3. The primary verifies the signature against the public key registered
+   via `oly node accept`. After accepting, both sides derive the same
+   per-direction AES-256-GCM keys from `ED25519→X25519(their pub)` and
+   switch to sealed frames for everything that follows.
+4. The primary's WebSocket layer keeps `Joined` itself in plain, so
+   the secondary can flip its own phase to Sealed only after it sees
+   the success response — sealing begins from the first frame after
+   `Joined` on both sides.
 
-The primary's host key pair lives in its state dir (`ssh_host_key` /
-`ssh_host_key.pub`) and is also exposed at `GET /api/nodes/host-key`.
+The per-daemon identity key pair lives in the state dir
+(`ssh_host_key` / `ssh_host_key.pub`); when SSH join is used the *only*
+signing key is the one the daemon generated for itself — there is no
+user-managed key file and no TOFU file to hand-edit.
 
 **Combined steps for a typical pair:**
 
@@ -329,16 +363,20 @@ The primary's host key pair lives in its state dir (`ssh_host_key` /
 # --- On the primary ---
 oly daemon start
 
+# On the primary, capture its own identity pub key:
+oly daemon status   # note the "SSH PUB: ssh-ed25519 ..." line
+
 # --- On the secondary ---
-ssh-keygen -t ed25519 -f ~/.ssh/oly_secondary -N ""
-cat ~/.ssh/oly_secondary.pub   # copy the output
+# A separate SSH key file is no longer required — the daemon's identity
+# key lives in its own state dir. Run `oly daemon status` to read it:
+oly daemon status   # note the "SSH PUB: ..." line
 
-# On the primary (paste the copied public key):
-oly node accept-ssh-pubkey --name myserver --pub-key "ssh-ed25519 AAAA..."
+# On the primary (paste the secondary's pub key):
+oly node accept --name myserver -k "<secondary's SSH PUB>"
 
-# On the secondary:
-oly join start --name myserver --ssh-key ~/.ssh/oly_secondary \
-    --ssh-known-hosts ~/.ssh/oly_known_hosts http://192.168.1.100:15443
+# On the secondary (pin the primary's pub key you captured above):
+oly join start --name myserver --ssh-pub-key "<primary's SSH PUB>" \
+    http://192.168.1.100:15443
 ```
 
 **Reverse direction (secondary→primary commands):**

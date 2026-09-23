@@ -67,11 +67,13 @@ mime_guess = "2"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "migrate"] }
 p256 = { version = "0.14", features = ["ecdsa", "ecdh"] }
 ed25519-dalek = { version = "3", features = ["batch"] }
+curve25519-dalek = { version = "5", features = ["precomputed-tables"] }
 rand = "0.10"
 aes-gcm = "0.11"
 hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.11"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.23"
 argon2 = "0.6"
 rpassword = "7.5"

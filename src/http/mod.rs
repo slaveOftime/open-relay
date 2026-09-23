@@ -49,48 +49,89 @@ pub struct AppState {
     pub auth: Option<Arc<AuthState>>,
     /// Registry of connected secondary nodes (only populated on a primary daemon).
     pub node_registry: Arc<NodeRegistry>,
-    /// SSH host key pair for node join authentication (primary side).
-    /// The public key is served at GET /api/nodes/host-key.
-    pub ssh_host_key: SshHostKey,
+    /// Node identity used for SSH-key channel encryption. On a primary
+    /// it derives the AES-256-GCM channel keys for the post-handshake
+    /// phase using the secondary's pubkey announced in the `Hello`
+    /// frame. On a secondary it derives the matching keys using the
+    /// primary's pubkey pinned via `--ssh-pub-key`. A `disabled()`
+    /// identity causes the side to refuse SSH-key joins.
+    pub node_identity: NodeIdentity,
 }
 
-/// SSH host key pair: the primary proves ownership of this Ed25519 key on
-/// every node-join handshake (host-key challenge), so secondaries can
-/// authenticate the primary and pin its key via known_hosts.
+/// Node identity key pair (Ed25519): every daemon auto-generates one of
+/// these on first start, persisted as `<state>/ssh_host_key` (the seed,
+/// mode 0600) + `<state>/ssh_host_key.pub` (the canonical public line).
+///
+/// The same keypair serves both federation roles:
+///
+/// - On a **primary** it derives the per-direction channel keys
+///   (`PRIV_X * PEER_X25519_PUB` via the Ed25519→X25519 birational
+///   map and HKDF-Expand) for the post-handshake AES-256-GCM phase.
+/// - On a **secondary** it signs the join payload
+///   (`NODE_JOIN_CONTEXT || name || pubkey`) so the primary can
+///   authenticate the secondary against the public key registered via
+///   `oly node accept --name <n> -k <...>`, and it also participates
+///   in the same ECDH process to derive the channel keys.
+///
+/// Auth is end-to-end exact-pin (operator types the primary's pubkey on
+/// the secondary via `--ssh-pub-key`); there is no in-band host-key
+/// fetch, no TOFU, and no fallback. The pubkey the primary advertises
+/// is the same one `oly daemon status` prints on the primary's side.
+/// signed payload differs.
 #[derive(Clone)]
-pub struct SshHostKey {
+pub struct NodeIdentity {
     /// Canonical public key line: "ssh-ed25519 <base64(raw32)>".
     public_key: String,
     /// 32-byte Ed25519 private key seed (empty when disabled).
     seed: Vec<u8>,
 }
 
-impl SshHostKey {
-    /// A host key that cannot sign anything — used when HTTP is disabled or
-    /// key generation failed; SSH-key joins are then rejected.
+impl NodeIdentity {
+    /// A identity that cannot sign anything — used when key loading failed
+    /// at startup; SSH-key joins in either direction are then rejected.
     pub fn disabled() -> Self {
-        SshHostKey {
+        NodeIdentity {
             public_key: String::new(),
             seed: Vec::new(),
         }
     }
 
-    pub fn public_key(&self) -> &str {
-        &self.public_key
+    /// Returns an empty slice when this identity is `disabled()`.
+    pub fn public_key_bytes(&self) -> Vec<u8> {
+        // The canonical `public_key` line is `"ssh-ed25519 <b64(raw32)>"`;
+        // strip the prefix and decode when usable.
+        if self.public_key.is_empty() {
+            return Vec::new();
+        }
+        if let Some(b64) = self.public_key.split_whitespace().next_back() {
+            crate::sshauth::b64_decode(b64).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 
-    /// The host signing key, if this host key is usable.
+    /// The signing key, if this identity is usable.
     pub fn signing_key(&self) -> Option<ed25519_dalek::SigningKey> {
         let seed = <[u8; 32]>::try_from(self.seed.as_slice()).ok()?;
         Some(ed25519_dalek::SigningKey::from_bytes(&seed))
     }
 
-    /// Generate a new Ed25519 host key or load an existing one.
-    /// The seed is stored as `ssh_host_key` (0600) and the canonical public
-    /// key line as `ssh_host_key.pub`.
+    /// Path to `ssh_host_key.pub` (the on-disk public key) under a state dir.
+    pub fn pub_key_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+        state_dir.join("ssh_host_key.pub")
+    }
+
+    /// Path to `ssh_host_key` (the on-disk seed) under a state dir.
+    pub fn seed_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+        state_dir.join("ssh_host_key")
+    }
+
+    /// Generate a new Ed25519 identity key or load an existing one under
+    /// `state_dir`. The seed is persisted as `ssh_host_key` (0600) and the
+    /// canonical public key line as `ssh_host_key.pub`.
     pub async fn create_or_load(state_dir: &std::path::Path) -> std::io::Result<Self> {
-        let key_path = state_dir.join("ssh_host_key");
-        let pub_path = state_dir.join("ssh_host_key.pub");
+        let key_path = Self::seed_path(state_dir);
+        let pub_path = Self::pub_key_path(state_dir);
 
         let seed = if key_path.exists() {
             let seed = tokio::fs::read(&key_path).await?;
@@ -98,7 +139,7 @@ impl SshHostKey {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "host key {} has unexpected length {}",
+                        "node identity key {} has unexpected length {}",
                         key_path.display(),
                         seed.len()
                     ),
@@ -130,7 +171,21 @@ impl SshHostKey {
             crate::sshauth::public_key_line(&ed25519_dalek::SigningKey::from_bytes(&arr));
         tokio::fs::write(&pub_path, format!("{public_key}\n")).await?;
 
-        Ok(SshHostKey { public_key, seed })
+        Ok(NodeIdentity { public_key, seed })
+    }
+
+    /// Read the on-disk public key line for the daemon under `state_dir`,
+    /// if present. Used by `oly daemon status` to surface the identity
+    /// without having to talk to the running daemon.
+    pub fn read_published_pubkey(
+        state_dir: &std::path::Path,
+    ) -> std::io::Result<Option<String>> {
+        let path = Self::pub_key_path(state_dir);
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s.trim().to_string())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -207,7 +262,6 @@ pub async fn serve(state: AppState) {
         .route("/api/sessions/{id}/logs/tail", get(sessions::get_logs_tail))
         .route("/api/sessions/{id}/attach", get(ws::attach_handler))
         .route("/api/nodes", get(nodes::list_nodes))
-        .route("/api/nodes/host-key", get(nodes::get_host_key))
         .route("/api/metrics", get(metrics_endpoint))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -483,7 +537,6 @@ const METRIC_ROUTES: &[&str] = &[
     "/api/sessions/{id}/logs/tail",
     "/api/sessions/{id}/attach",
     "/api/nodes",
-    "/api/nodes/host-key",
     "/api/static/apps",
 ];
 

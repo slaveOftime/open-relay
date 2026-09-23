@@ -522,6 +522,12 @@ pub struct SendArgs {
     /// Prefix with oly-file:<path> to upload a local file and send the saved session path.
     /// Supported keys: enter, tab, esc, backspace, up/down/left/right, home/end,
     /// pgup/pgdn, del/ins, ctrl+<char>, alt+<char|key>, shift+tab, hex:<bytes>.
+    ///
+    /// Use `--` to switch into free-text mode: every argument after `--` is
+    /// sent as one literal blob joined with single spaces, with no
+    /// `key:` / `oly-clipboard` / `oly-file:` parsing. Useful for multi-line
+    /// scripts, embedded quotes, or text that happens to start with `key:`.
+    /// Example: `oly send <id> -- echo "hello world" key:enter`.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -531,6 +537,75 @@ pub struct SendArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+}
+
+/// Split the raw argv on a bare `--` token that appears AFTER the `oly send`
+/// subcommand, so the trailing slice can be sent as one literal blob.
+///
+/// clap's `Cli::parse_from` treats `--` as the standard end-of-options
+/// separator — once it sees `--`, every later token becomes a positional
+/// value of the next available arg. That layer is unpredictable for our
+/// trailing `chunks` Vec (it may or may not surface the bare `--` token),
+/// so we intercept argv ourselves. This only fires for the `send`
+/// subcommand; other subcommands are untouched.
+///
+/// Returns `(pre_args, free_text)`:
+/// - `pre_args` is the argv slice up to (but not including) the `--`. It is
+///   safe to feed to `Cli::parse_from` — no `--` remains.
+/// - `free_text` is `None` when no `--` was found (preserve legacy behavior),
+///   `Some(vec![])` when `--` was the last token (a usage error), or
+///   `Some(values)` to be joined with single spaces and sent verbatim.
+///
+/// Note: this intentionally matches the case-sensitive token `send` at any
+/// index. A session whose ID happens to equal `send` would interfere — but
+/// `(id=send)` is degenerate; users can quote those IDs to disambiguate.
+pub(crate) fn split_send_dashdash<I>(
+    raw: I,
+) -> (Vec<std::ffi::OsString>, Option<Vec<std::ffi::OsString>>)
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let raw: Vec<std::ffi::OsString> = raw.into_iter().collect();
+
+    let Some(subcmd_idx) = raw.iter().position(|a| a == "send") else {
+        return (raw, None);
+    };
+
+    let search_start = subcmd_idx + 1;
+    let dash_offset = raw[search_start..]
+        .iter()
+        .position(|a| a == "--");
+    let Some(dash_offset) = dash_offset else {
+        return (raw, None);
+    };
+
+    let dash_idx = search_start + dash_offset;
+    let pre = raw[..dash_idx].to_vec();
+    let post = raw[dash_idx + 1..].to_vec();
+    (pre, Some(post))
+}
+
+/// Take the `free_text` Vec produced by `split_send_dashdash` and join it
+/// into the single literal payload that is sent after `--`.
+/// - `None` (no `--`) is the legacy "no free text" signal.
+/// - `Some(empty)` is the trailing-`--`-with-no-text usage error.
+/// - `Some(vec)` is joined with single spaces to mirror how the user typed
+///   it on the command line.
+pub(crate) fn join_free_text(values: &[std::ffi::OsString]) -> Option<String> {
+    if values.is_empty() {
+        // Empty values list reaches here only from `Some(vec![])` above,
+        // which is the trailing-`--`-usage error. Returning Some("") lets
+        // the caller distinguish that from `None` (legacy / `--` absent).
+        Some(String::new())
+    } else {
+        Some(
+            values
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,19 +681,24 @@ pub enum NodeCommand {
     /// List all secondary nodes currently connected to this (primary) daemon.
     #[command(name = "ls")]
     List,
-    /// Register an SSH public key for a named secondary node.
-    #[command(name = "accept-ssh-pubkey")]
-    AcceptSshPubKey(AcceptSshPubKeyArgs),
+    /// Authorize a secondary node's identity pubkey so it can join this
+    /// primary over SSH-key auth. Pair this with the line printed by
+    /// `oly daemon status` (or `<state>/ssh_host_key.pub`) on the
+    /// secondary box.
+    #[command(name = "accept")]
+    Accept(AcceptArgs),
 }
 
 #[derive(Debug, Args)]
-pub struct AcceptSshPubKeyArgs {
+pub struct AcceptArgs {
     /// Name of the secondary node to register the SSH key for.
     #[arg(long, short = 'n')]
     pub name: String,
-    /// SSH public key in OpenSSH format (e.g. "ssh-ed25519 AAAA...").
-    #[arg(long, short = 'k', value_name = "KEY")]
-    pub pub_key: String,
+    /// Canonical SSH public key (`ssh-ed25519 <base64...>`) of the secondary,
+    /// e.g. the line printed by `oly daemon status` on the secondary box, or
+    /// the contents of `<state>/ssh_host_key.pub` on the secondary.
+    #[arg(long, short = 'k', value_name = "PUB_KEY")]
+    pub ssh_pub_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -626,15 +706,16 @@ pub struct JoinStartArgs {
     /// Name this daemon will be known as on the primary (must be unique per primary).
     #[arg(long, short = 'n')]
     pub name: String,
-    /// API key printed by `oly api-key add` on the primary.
-    #[arg(long, short = 'k')]
+    /// API key printed by `oly api-key add` on the primary (mutually exclusive with --ssh-pub-key).
+    #[arg(long, short = 'k', conflicts_with = "ssh_pub_key")]
     pub key: Option<String>,
-    /// Path to SSH private key for authentication (conflicts with --key).
-    #[arg(long, conflicts_with = "key", value_name = "PATH")]
-    pub ssh_key: Option<String>,
-    /// Path to known_hosts file for host key verification.
-    #[arg(long, value_name = "PATH")]
-    pub ssh_known_hosts: Option<String>,
+    /// Canonical SSH public key (`ssh-ed25519 <base64...>`) of the primary.
+    /// When provided, the secondary uses SSH-key auth, signs joins with its
+    /// own auto-generated identity key, and pins the primary to exactly the
+    /// public key you specify — copying `ssh_host_key.pub` from the primary
+    /// or the line printed by `oly daemon status` on the primary.
+    #[arg(long, value_name = "PRIMARY_PUB")]
+    pub ssh_pub_key: Option<String>,
     #[arg(help = "HTTP base URL of the primary daemon, e.g. http://primary-host:15443")]
     pub url: String,
 }
@@ -656,9 +737,11 @@ pub struct JoinListArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, parse_timeout_ms,
+        Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, join_free_text,
+        parse_timeout_ms, split_send_dashdash,
     };
     use clap::Parser;
+    use std::ffi::OsString;
 
     #[test]
     fn restart_parses_required_id_force_and_node() {
@@ -1067,5 +1150,179 @@ mod tests {
             panic!("expected daemon start subcommand");
         };
         assert_eq!(args.bind.as_deref(), Some("0.0.0.0"));
+    }
+
+    // ── split_send_dashdash ────────────────────────────────────────────────
+
+    fn os(raw: &[&str]) -> Vec<OsString> {
+        raw.iter().map(|s| OsString::from(*s)).collect()
+    }
+
+    fn to_strs(os: &[OsString]) -> Vec<String> {
+        os.iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn dashdash_split_no_separator_returns_none() {
+        let raw = os(&["oly", "send", "abc", "foo", "bar"]);
+        let (pre, post) = split_send_dashdash(raw.clone());
+        assert_eq!(to_strs(&pre), to_strs(&raw));
+        assert!(post.is_none());
+    }
+
+    #[test]
+    fn dashdash_split_other_subcommands_unaffected() {
+        // `--` inside an `oly start --cmd -- arg` form must NOT be intercepted.
+        let raw = os(&["oly", "start", "echo", "--", "hello"]);
+        let (pre, post) = split_send_dashdash(raw.clone());
+        assert_eq!(to_strs(&pre), to_strs(&raw));
+        assert!(post.is_none());
+    }
+
+    #[test]
+    fn dashdash_split_after_head_chunks() {
+        let raw = os(&["oly", "send", "abc", "key:enter", "--", "bar", "baz"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc", "key:enter"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["bar", "baz"]));
+    }
+
+    #[test]
+    fn dashdash_split_immediately_after_id() {
+        let raw = os(&["oly", "send", "abc", "--", "foo"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["foo"]));
+    }
+
+    #[test]
+    fn dashdash_split_no_id_no_chunks() {
+        let raw = os(&["oly", "send", "--", "foo"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["foo"]));
+    }
+
+    #[test]
+    fn dashdash_split_trailing_only_yields_empty_post() {
+        let raw = os(&["oly", "send", "abc", "--"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc"]));
+        assert_eq!(post.expect("free text"), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn dashdash_split_pre_dashdash_options_remain_in_pre() {
+        // --node appears BEFORE --  → node should still be parsed by clap.
+        let raw = os(&["oly", "send", "abc", "--node", "worker", "--", "bar"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(
+            to_strs(&pre),
+            svec(&["oly", "send", "abc", "--node", "worker"])
+        );
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["bar"]));
+    }
+
+    #[test]
+    fn dashdash_split_only_first_separator_wins() {
+        // A later `--` inside the free text is just another literal token.
+        let raw = os(&["oly", "send", "abc", "--", "echo", "--", "ok"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc"]));
+        assert_eq!(
+            to_strs(&post.expect("free text")),
+            svec(&["echo", "--", "ok"])
+        );
+    }
+
+    // ── join_free_text ─────────────────────────────────────────────────────
+
+    fn svec(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn join_free_text_single_space() {
+        let joined = join_free_text(&os(&["echo", "hello", "world"]));
+        assert_eq!(joined.as_deref(), Some("echo hello world"));
+    }
+
+    #[test]
+    fn join_free_text_keeps_key_colon_literal() {
+        // Whole point of `--`: a `key:foo` token in the tail is plain text.
+        let joined = join_free_text(&os(&["echo", "key:enter"]));
+        assert_eq!(joined.as_deref(), Some("echo key:enter"));
+    }
+
+    #[test]
+    fn join_free_text_keeps_oly_file_literal() {
+        // No file upload triggered for `oly-file:...` inside tail.
+        let joined = join_free_text(&os(&["cat", "oly-file:/should/not/upload"]));
+        assert_eq!(
+            joined.as_deref(),
+            Some("cat oly-file:/should/not/upload")
+        );
+    }
+
+    #[test]
+    fn join_free_text_keeps_oly_clipboard_literal() {
+        let joined = join_free_text(&os(&["echo", "oly-clipboard"]));
+        assert_eq!(joined.as_deref(), Some("echo oly-clipboard"));
+    }
+
+    #[test]
+    fn join_free_text_empty_vec_returns_empty_string_some() {
+        // Crucial: distinguishes "no --" (=None) from "--" alone (=Some("")).
+        let joined = join_free_text(&Vec::<OsString>::new());
+        assert_eq!(joined.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn join_free_text_single_token() {
+        let joined = join_free_text(&os(&["hello"]));
+        assert_eq!(joined.as_deref(), Some("hello"));
+    }
+
+    // ── end-to-end: split + parse_from ─────────────────────────────────────
+
+    #[test]
+    fn pre_args_parse_end_to_end_with_node_flag() {
+        // The shell already word-splits argv; `os` takes the same shape.
+        let raw = os(&["oly", "send", "abc", "--node", "worker", "--", "msg", "line"]);
+        let (pre, post) = split_send_dashdash(raw);
+        let cli = Cli::try_parse_from(pre).expect("clap should parse pre_args cleanly");
+        let Commands::Send(s) = cli.command else {
+            panic!("expected Send");
+        };
+        assert_eq!(s.id.as_deref(), Some("abc"));
+        assert_eq!(s.node.as_deref(), Some("worker"));
+        assert!(s.chunks.is_empty(), "head chunks are empty: {:?}", s.chunks);
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["msg", "line"]));
+    }
+
+    #[test]
+    fn pre_args_parse_end_to_end_with_chunks_before_separator() {
+        let raw = os(&["oly", "send", "abc", "yes", "key:enter", "--", "tail", "text"]);
+        let (pre, post) = split_send_dashdash(raw);
+        let cli = Cli::try_parse_from(pre).expect("clap should parse pre_args cleanly");
+        let Commands::Send(s) = cli.command else {
+            panic!("expected Send");
+        };
+        assert_eq!(s.id.as_deref(), Some("abc"));
+        assert_eq!(s.chunks, svec(&["yes", "key:enter"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["tail", "text"]));
+    }
+
+    #[test]
+    fn pre_args_parse_no_separator_unchanged() {
+        // Pure passthrough: no `--`, no split.
+        let raw = os(&["oly", "send", "abc", "yes", "key:enter"]);
+        let (pre, post) = split_send_dashdash(raw.clone());
+        let cli = Cli::try_parse_from(pre.clone()).expect("clap should parse cleanly");
+        let Commands::Send(s) = cli.command else {
+            panic!("expected Send");
+        };
+        assert_eq!(s.chunks, svec(&["yes", "key:enter"]));
+        assert!(post.is_none(), "post stays None when no `--` found");
     }
 }

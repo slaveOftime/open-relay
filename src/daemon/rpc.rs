@@ -25,8 +25,8 @@ use super::{
         handle_attach_subscribe, handle_observe_window, handle_session_cursor,
     },
     rpc_nodes::{
-        handle_node_accept_ssh_pubkey, handle_node_list, handle_node_proxy,
-        handle_node_proxy_streaming, spawn_join_connector,
+        handle_node_list, handle_node_proxy, handle_node_proxy_streaming, handle_node_accept,
+        spawn_join_connector,
     },
 };
 
@@ -260,8 +260,7 @@ async fn dispatch_request(
             url,
             name,
             key,
-            ssh_key_path,
-            ssh_known_hosts,
+            ssh_primary_pubkey,
         } => {
             handle_join_start(
                 config,
@@ -270,16 +269,15 @@ async fn dispatch_request(
                 url,
                 name,
                 key,
-                ssh_key_path,
-                ssh_known_hosts,
+                ssh_primary_pubkey,
             )
             .await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
         RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
         RpcRequest::NodeList => handle_node_list(node_registry).await,
-        RpcRequest::NodeAcceptSshPubKey { name, public_key } => {
-            handle_node_accept_ssh_pubkey(name, public_key, db).await
+        RpcRequest::NodeAccept { name, ssh_pub_key } => {
+            handle_node_accept(name, ssh_pub_key, db).await
         }
     };
 
@@ -746,11 +744,14 @@ async fn handle_join_start(
     url: String,
     name: String,
     key: Option<String>,
-    ssh_key_path: Option<String>,
-    ssh_known_hosts: Option<String>,
+    ssh_primary_pubkey: Option<String>,
 ) -> Result<RpcResponse> {
-    let join =
-        client::join::build_join_config(url, name.clone(), key, ssh_key_path, ssh_known_hosts)?;
+    let join = client::join::build_join_config(
+        url,
+        name.clone(),
+        key,
+        ssh_primary_pubkey,
+    )?;
     client::join::save_join_config(config, &join)?;
     // The connector reports its first-attempt outcome through a oneshot
     // so the IPC handler can surface `joined` / `joining` / `failed` to

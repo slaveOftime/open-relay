@@ -140,8 +140,7 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
     match message {
         NodeWsMessage::Join { .. } => "join",
         NodeWsMessage::Joined => "joined",
-        NodeWsMessage::HostKey { .. } => "host_key",
-        NodeWsMessage::GetHostKey => "get_host_key",
+        NodeWsMessage::Hello { .. } => "hello",
         NodeWsMessage::Error { .. } => "error",
         NodeWsMessage::Rpc { .. } => "rpc",
         NodeWsMessage::RpcResponse { .. } => "rpc_response",
@@ -160,10 +159,12 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
 pub enum NodeJoinAuth {
     /// Authenticate with a plaintext API key.
     ApiKey { key: String },
-    /// Authenticate with an Ed25519 SSH key signature over the challenge
-    /// nonce issued by the primary on this connection (see `sshauth`):
-    /// `sign("oly-node-join-v1" || name || nonce || public_key)`.
-    /// A `get_host_key` exchange must precede this message.
+    /// Authenticate with an Ed25519 SSH key signature. The connector
+    /// signs `sign("oly-node-join-v1" || name || public_key)` with the
+    /// privkey matching `public_key` (see `sshauth::node_join_payload`).
+    /// The pinned primary pubkey (typed via `--ssh-pub-key`) is the trust
+    /// root — there is no in-band host-key exchange, so a man-in-the-middle
+    /// has no opportunity to substitute a different key.
     SshKey {
         /// Base64 raw 64-byte Ed25519 signature.
         signature: String,
@@ -359,12 +360,16 @@ pub enum RpcRequest {
         name: String,
     },
     /// Signal the daemon to start a persistent outbound join connector.
+    /// Either `key` (API key auth) or `ssh_primary_pubkey` (SSH-key auth
+    /// using the daemon's auto-generated identity) must be set. With
+    /// `ssh_primary_pubkey`, the connector pins the primary's identity
+    /// to exactly that canonical public key — no TOFU file, no
+    /// interactive prompts.
     JoinStart {
         url: String,
         name: String,
         key: Option<String>,
-        ssh_key_path: Option<String>,
-        ssh_known_hosts: Option<String>,
+        ssh_primary_pubkey: Option<String>,
     },
     /// Signal the daemon to stop and remove an outbound join connector.
     JoinStop {
@@ -376,10 +381,15 @@ pub enum RpcRequest {
     },
     /// List all secondary nodes currently connected to this (primary) daemon.
     NodeList,
-    /// Register an SSH public key for a named secondary node on the primary.
-    NodeAcceptSshPubKey {
+    /// Register a secondary node's identity pubkey on the primary so
+    /// the primary can authenticate and (for plain-WS joins) encrypt
+    /// this secondary's traffic. `ssh_pub_key` is the canonical
+    /// `ssh-ed25519 <base64(raw32)>` line printed by `oly daemon
+    /// status` on the secondary (matched against the secondary's
+    /// `<state>/ssh_host_key.pub` on disk).
+    NodeAccept {
         name: String,
-        public_key: String,
+        ssh_pub_key: String,
     },
 }
 
@@ -418,7 +428,7 @@ impl RpcRequest {
             RpcRequest::JoinStop { .. } => "join_stop",
             RpcRequest::JoinList { .. } => "join_list",
             RpcRequest::NodeList => "node_list",
-            RpcRequest::NodeAcceptSshPubKey { .. } => "node_accept_ssh_pubkey",
+            RpcRequest::NodeAccept { .. } => "node_accept",
         }
     }
 }
@@ -655,20 +665,17 @@ pub enum NodeWsMessage {
         auth: NodeJoinAuth,
     },
 
-    /// Primary → Secondary: host-key proof and join challenge. The primary
-    /// signs `"oly-host-challenge-v1" || nonce` with its Ed25519 host key,
-    /// proving ownership on this very connection and issuing a fresh nonce
-    /// that the secondary must sign to complete SSH-key authentication.
-    HostKey {
+    /// Secondary → Primary: cleartext `hello` from the secondary announcing
+    /// its identity pubkey. The primary uses the canonical ssh-ed25519 line
+    /// to look up the secondary in its accept-table AND to derive the
+    /// AES-256-GCM channel keys (after converting the Ed25519 pubkey to
+    /// X25519 via `VerifyingKey::to_montgomery`). The X25519 form doesn't
+    /// need to be on the wire — both sides can derive it themselves from
+    /// the same canonical Ed25519 key.
+    Hello {
         public_key: String,
-        /// Base64 random challenge nonce (32 bytes).
-        nonce: String,
-        /// Base64 raw 64-byte Ed25519 signature over the challenge payload.
-        host_signature: String,
     },
 
-    /// Secondary → Primary: request the primary's SSH host key (before handshake).
-    GetHostKey,
     /// Primary → Secondary: handshake accepted.
     Joined,
     /// Primary → Secondary: handshake rejected or fatal error.
@@ -807,22 +814,14 @@ mod tests {
     }
 
     #[test]
-    fn node_ws_host_key_and_ssh_auth_round_trip() {
-        let host_key = NodeWsMessage::HostKey {
+    fn node_ws_hello_and_ssh_auth_round_trip() {
+        let hello = NodeWsMessage::Hello {
             public_key: "ssh-ed25519 AAAA".into(),
-            nonce: "AAEC".into(),
-            host_signature: "xyz".into(),
         };
-        let payload = encode_node_ws_payload(&host_key).expect("encode payload");
+        let payload = encode_node_ws_payload(&hello).expect("encode payload");
         match decode_node_ws_payload(&payload).expect("decode payload") {
-            NodeWsMessage::HostKey {
-                public_key,
-                nonce,
-                host_signature,
-            } => {
+            NodeWsMessage::Hello { public_key } => {
                 assert_eq!(public_key, "ssh-ed25519 AAAA");
-                assert_eq!(nonce, "AAEC");
-                assert_eq!(host_signature, "xyz");
             }
             other => panic!("unexpected decoded message: {other:?}"),
         }

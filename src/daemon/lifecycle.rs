@@ -243,6 +243,21 @@ pub async fn status(config: AppConfig) -> Result<()> {
 
     let effective = effective_status_config(&config, info.as_ref());
     print_detached_start_summary(&effective, no_http, no_auth);
+    // Surface the daemon's SSH-key identity so the operator can paste it
+    // onto a peer (or hand it to `oly node accept -k ...`). Reads from
+    // the on-disk `.pub` file (lifecycle creates it on daemon start) so
+    // status works even if the daemon was started after this CLI process.
+    match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
+        Ok(Some(pub_key)) => {
+            println!("SSH PUB:      {pub_key}");
+        }
+        Ok(None) => {
+            println!("SSH PUB:      (not generated; start the daemon at least once)");
+        }
+        Err(err) => {
+            eprintln!("warning: failed to read SSH pub key: {err}");
+        }
+    }
     Ok(())
 }
 
@@ -626,17 +641,18 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let live_config = LiveConfig::from_arc(Arc::clone(&config));
 
     let auth_state = auth_hash.map(AuthState::new);
-    let ssh_host_key = if no_http {
-        // HTTP disabled — no host key needed, use placeholder.
-        http::SshHostKey::disabled()
-    } else {
-        http::SshHostKey::create_or_load(&config.paths.state_dir)
-            .await
-            .inspect_err(
-                |e| warn!(%e, "failed to create SSH host key, SSH-key node joins will be rejected"),
-            )
-            .unwrap_or_else(|_| http::SshHostKey::disabled())
-    };
+    // Every daemon — primary or secondary, HTTP-enabled or not — auto-
+    // generates (or loads) an Ed25519 identity key at startup. The same
+    // keypair serves both federation roles: primaries use it to sign the
+    // host-challenge nonce, secondaries use it to sign the join payload.
+    // We still tolerate a failed load: in that case SSH-key joins in
+    // either direction are rejected (API key auth still works).
+    let node_identity = http::NodeIdentity::create_or_load(&config.paths.state_dir)
+        .await
+        .inspect_err(
+            |e| warn!(%e, "failed to create node identity key, SSH-key node joins will be rejected"),
+        )
+        .unwrap_or_else(|_| http::NodeIdentity::disabled());
     if !no_http {
         let http_state = http::AppState {
             store: session_store.clone(),
@@ -646,7 +662,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             event_tx: event_tx.clone(),
             auth: auth_state,
             node_registry: node_registry.clone(),
-            ssh_host_key,
+            node_identity: node_identity.clone(),
         };
         tokio::spawn(http::serve(http_state));
         info!("http server task spawned");

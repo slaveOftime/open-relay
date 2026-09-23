@@ -17,8 +17,7 @@ use crate::{
     ipc,
     node::NodeRegistry,
     protocol::{
-        NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload,
-        encode_node_ws_payload,
+        NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, encode_node_ws_payload,
     },
     session::SessionEvent,
 };
@@ -155,8 +154,19 @@ async fn connect_and_relay(
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-    // ── Step 1: SSH-key authentication — fetch host key, receive the
-    // primary's signed challenge, verify the host, then sign the join.
+    // ── Channel-mode (AES-256-GCM) state ───────────────────────────────
+    // The connector starts in plaintext: the primary needs to receive the
+    // secondary's pubkey (Hello) to derive channel keys, and that key
+    // announcement must itself land before sealing. As soon as the
+    // primary's HostKey reply has been verified and pinned, we send our
+    // own plain Hello and flip both sides to `Sealed` for everything
+    // that follows (Join, Joined, RPCs, events, keepalives).
+    let mut phase = crate::sshauth::ChannelPhase::Plain;
+
+    // ── Step 1: SSH-key authentication — derive channel keys, sign
+    // the join, send Hello. There is no in-band host-key challenge or
+    // nonce; the operator pinned the primary's pubkey with
+    // `--ssh-pub-key`, and that is the trust root.
     let host = join
         .primary_url
         .strip_prefix("http://")
@@ -172,110 +182,130 @@ async fn connect_and_relay(
         })
         .unwrap_or("localhost");
 
-    let auth = if let Some(ssh_key_path) = &join.ssh_key_path {
-        let signing_key = crate::sshauth::load_signing_key(std::path::Path::new(ssh_key_path))
-            .map_err(|e| {
-                attempt_report.fail(format!("ssh key auth: {e}"));
-                crate::error::AppError::Protocol(format!("ssh key auth: {e}"))
-            })?;
-        let public_key = crate::sshauth::public_key_line(&signing_key);
+    // If the SSH-key auth branch successfully derives channel keys
+    // during handshake, we stash them here so the connector-side loop
+    // can flip the phase to Sealed as soon as the primary confirms the
+    // join with `Joined`. Until then we keep sending plaintext so the
+    // auth-validating primary (which only transitions to Sealed after
+    // reading Join + verifying auth) and we stay wire-compatible.
+    let mut pending_phase_seal: Option<([u8; crate::sshauth::AEAD_KEY_LEN], [u8; crate::sshauth::AEAD_KEY_LEN])> = None;
 
-        // Request the host-key challenge from the primary.
-        let challenge_req = NodeWsMessage::GetHostKey;
-        ws_tx
-            .send(WsMessage::Binary(
-                encode_node_ws_payload(&challenge_req)?.into(),
-            ))
-            .await
-            .map_err(|e| {
-                attempt_report.fail(format!("host key request failed: {e}"));
-                crate::error::AppError::Protocol(format!("host key request failed: {e}"))
-            })?;
-
-        let (host_public_key, nonce, host_signature) = match ws_rx.next().await {
-            Some(Ok(frame)) => match decode_node_message(frame) {
-                Ok(NodeWsMessage::HostKey {
-                    public_key,
-                    nonce,
-                    host_signature,
-                }) => (public_key, nonce, host_signature),
-                Ok(NodeWsMessage::Error { message }) => {
-                    let msg = format!("host key challenge rejected: {message}");
-                    attempt_report.fail(&msg);
-                    return Err(crate::error::AppError::Protocol(msg));
-                }
-                Ok(_) => {
-                    let msg = "unexpected response to get_host_key";
-                    attempt_report.fail(msg);
-                    return Err(crate::error::AppError::Protocol(msg.into()));
-                }
-                Err(e) => {
-                    let msg = format!("invalid host key challenge: {e}");
-                    attempt_report.fail(&msg);
-                    return Err(crate::error::AppError::Protocol(msg));
-                }
-            },
-            _ => {
-                let msg = "no response to get_host_key";
-                attempt_report.fail(msg);
-                return Err(crate::error::AppError::Protocol(msg.into()));
-            }
-        };
-
-        let nonce_bytes = crate::sshauth::b64_decode(&nonce).map_err(|e| {
-            attempt_report.fail(format!("invalid challenge nonce: {e}"));
-            crate::error::AppError::Protocol(format!("invalid challenge nonce: {e}"))
-        })?;
-        let nonce: [u8; crate::sshauth::NONCE_LEN] = nonce_bytes.try_into().map_err(|_| {
-            let msg = "challenge nonce has unexpected length";
-            attempt_report.fail(msg);
-            crate::error::AppError::Protocol(msg.into())
-        })?;
-
-        // The primary must prove ownership of its host key *on this
-        // connection*. Abort before sending any credentials if not.
-        if !crate::sshauth::verify_signature(
-            &host_public_key,
-            &host_signature,
-            &crate::sshauth::host_challenge_payload(&nonce),
-        ) {
+    let auth = if let Some(pinned_primary_pubkey) = &join.ssh_primary_pubkey {
+        // Load this daemon's auto-generated identity seed. The file is
+        // the raw 32-byte Ed25519 seed written by NodeIdentity at startup
+        // (see http/mod.rs), NOT an OpenSSH-format file — load_raw_seed
+        // reads the bytes directly.
+        let identity_path = crate::http::NodeIdentity::seed_path(&local_config.paths.state_dir);
+        let seed = crate::sshauth::load_raw_seed(&identity_path).map_err(|e| {
             let msg = format!(
-                "host key self-signature for {host} is invalid; aborting before credentials are sent"
+                "ssh key auth: failed to load daemon identity from {}: {e}",
+                identity_path.display()
             );
             attempt_report.fail(&msg);
-            return Err(crate::error::AppError::Protocol(msg));
-        }
+            crate::error::AppError::Protocol(msg)
+        })?;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let public_key = crate::sshauth::public_key_line(&signing_key);
 
-        // Pin/verify the host key against known_hosts (TOFU on first use).
-        if let Some(kh_path) = &join.ssh_known_hosts {
-            let kh = std::path::Path::new(kh_path);
-            match crate::sshauth::lookup_known_hosts(kh, host, &host_public_key) {
-                crate::sshauth::HostKeyStatus::Match => {}
-                crate::sshauth::HostKeyStatus::Unknown => {
-                    info!(node = %join.name, %host, "trust-on-first-use: pinning primary host key");
-                    let _ = crate::sshauth::append_known_hosts(kh, host, &host_public_key);
-                }
-                crate::sshauth::HostKeyStatus::Mismatch => {
-                    let msg = format!(
-                        "host key verification failed for {host}: key mismatch in {kh_path} (possible MITM)"
-                    );
-                    attempt_report.fail(&msg);
-                    return Err(crate::error::AppError::Protocol(msg));
-                }
-            }
-        }
+        // Pins: any operator-supplied --ssh-pub-key must hash to a
+        // valid canonical ssh-ed25519 line. We don't probe the primary
+        // for the wire key — the operator is the source of truth.
+        let pinned_canonical = crate::sshauth::normalize_public_key(pinned_primary_pubkey)
+            .map_err(|e| {
+                let msg = format!(
+                "configured primary pubkey for {host} is not a valid ssh-ed25519 line: {e}");
+                attempt_report.fail(&msg);
+                crate::error::AppError::Protocol(msg)
+            })?;
 
-        // Sign the challenge: binds protocol, node name, the primary's
-        // fresh per-connection nonce, and our key.
-        let payload = crate::sshauth::node_join_payload(&join.name, &nonce, &public_key);
+        // Sign the join payload: protocol || name || pubkey. The
+        // accept-table on the primary is the trust anchor.
+        let payload = crate::sshauth::node_join_payload(&join.name, &public_key);
         let signature = crate::sshauth::sign_b64(&signing_key, &payload);
+
+        // Channel-key derivation: long-term Ed25519 identities on both
+        // sides get mapped to X25519 (birational map) so we can seal
+        // application traffic with static-static ECDH. Static keys are
+        // safe here because:
+        //   * both pubkeys are pinned out-of-band (--ssh-pub-key on the
+        //     connector + the primary's accept-table entry),
+        //   * and the per-direction keys are bound to BOTH identities +
+        //     direction labels via HKDF-Expand.
+        let primary_pub_ed: [u8; 32] = {
+            let raw = crate::sshauth::b64_decode(
+                pinned_canonical.split_whitespace().next_back().unwrap_or(""),
+            )
+            .map_err(|e| {
+                let msg = format!("primary pub-ed decode: {e}");
+                attempt_report.fail(&msg);
+                crate::error::AppError::Protocol(msg)
+            })?;
+            if raw.len() != 32 {
+                let msg = format!(
+                    "primary pub-ed length wrong: {} (expected 32)",
+                    raw.len()
+                );
+                attempt_report.fail(&msg);
+                return Err(crate::error::AppError::Protocol(msg));
+            }
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&raw);
+            b
+        };
+        let primary_verifying = ed25519_dalek::VerifyingKey::from_bytes(&primary_pub_ed)
+            .map_err(|e| {
+                let msg = format!("primary pub-ed invalid: {e}");
+                attempt_report.fail(&msg);
+                crate::error::AppError::Protocol(msg)
+            })?;
+        let primary_pub_x = crate::sshauth::ed25519_pub_to_x25519(&primary_verifying);
+        let priv_x = crate::sshauth::ed25519_priv_to_x25519(&signing_key);
+        let secondary_pub_ed: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let keys = crate::sshauth::derive_channel_keys(
+            &priv_x,
+            &primary_pub_x,
+            &primary_pub_ed,
+            &secondary_pub_ed,
+        );
+        pending_phase_seal = Some((keys.c2s, keys.s2c));
+
+        let _ = host; // (kept for log clarity in error paths)
+        let _ = primary_verifying;
+
+        // Send plain Hello so the primary knows *which* of its
+        // accepted keys is talking. Sealing begins AFTER the Join /
+        // Joined exchange because the primary's auth-validating branch
+        // only switches its own phase to Sealed after reading Join,
+        // validating auth, and deriving keys — and we want to receive
+        // the primary's `Joined` reply in plain so we don't
+        // chicken-and-egg ourselves into an unsealable dialogue.
+        let hello = NodeWsMessage::Hello {
+            public_key: public_key.clone(),
+        };
+        let hello_payload = crate::sshauth::phase_encode_message(&phase, &hello)
+            .or_else(|_| encode_node_ws_payload(&hello))
+            .map_err(|e| {
+                let msg = format!("encode hello: {e}");
+                attempt_report.fail(&msg);
+                crate::error::AppError::Protocol(msg)
+            })?;
+        ws_tx
+            .send(WsMessage::Binary(hello_payload.into()))
+            .await
+            .map_err(|e| {
+                attempt_report.fail(format!("send hello: {e}"));
+                crate::error::AppError::Protocol(format!("send hello: {e}"))
+            })?;
 
         NodeJoinAuth::SshKey {
             signature,
             public_key,
         }
     } else {
-        // API key authentication
+        // API key authentication — no channel encryption for now;
+        // operators wanting plaintext-safe secondary joins should
+        // either put the primary behind `https://` (TLS) or switch
+        // this connector to the SSH-key path.
         NodeJoinAuth::ApiKey {
             key: join.api_key.clone().unwrap_or_default(),
         }
@@ -284,7 +314,12 @@ async fn connect_and_relay(
         name: join.name.clone(),
         auth,
     };
-    let handshake_payload = encode_node_ws_payload(&handshake)?;
+    let handshake_payload = crate::sshauth::phase_encode_message(&phase, &handshake)
+        .or_else(|_| encode_node_ws_payload(&handshake))
+        .map_err(|e| {
+            attempt_report.fail(format!("encode join handshake: {e}"));
+            crate::error::AppError::Protocol(e.to_string())
+        })?;
     ws_tx
         .send(WsMessage::Binary(handshake_payload.into()))
         .await
@@ -295,13 +330,26 @@ async fn connect_and_relay(
 
     match ws_rx.next().await {
         Some(Ok(frame)) => {
-            match decode_node_message(frame).map_err(|e| {
+            let raw = match frame {
+                WsMessage::Binary(data) => data.to_vec(),
+                _ => Vec::new(),
+            };
+            match decode_node_message_bytes(&raw, &phase).map_err(|e| {
                 attempt_report.fail(format!("decode join response: {e}"));
                 crate::error::AppError::Protocol(e.to_string())
             })? {
                 NodeWsMessage::Joined => {
                     info!(node = %join.name, primary = %join.primary_url, "joined primary");
                     attempt_report.joined();
+                    // Seal-on-ack: with the primary's confirmation we
+                    // know our SSH-key challenge was accepted; flip
+                    // into Sealed so every subsequent frame (RPCs,
+                    // replies, events, keepalives) lives under
+                    // AES-256-GCM on the wire regardless of whether
+                    // the upstream transport itself was wss:// or ws://.
+                    if let Some((send_key, recv_key)) = pending_phase_seal {
+                        phase.seal(send_key, recv_key);
+                    }
                 }
                 NodeWsMessage::Error { message } => {
                     let msg = format!("join rejected: {message}");
@@ -353,7 +401,7 @@ async fn connect_and_relay(
                     response: response_json,
                     done,
                 };
-                if !send_node_message(&mut ws_tx, &reply).await {
+                if !send_node_message(&mut ws_tx, &reply, &phase).await {
                     break;
                 }
             }
@@ -362,7 +410,7 @@ async fn connect_and_relay(
 
                 let node_msg = match msg_result {
                     Ok(WsMessage::Close(_)) | Err(_) => break,
-                    Ok(frame) => match decode_node_message(frame) {
+                    Ok(frame) => match decode_node_message(frame, &phase) {
                         Ok(message) => message,
                         Err(err) => {
                             warn!(node = %join.name, %err, "failed to decode primary node frame");
@@ -424,7 +472,7 @@ async fn connect_and_relay(
                             id,
                             response: response_json,
                         };
-                        if !send_node_message(&mut ws_tx, &reply).await {
+                        if !send_node_message(&mut ws_tx, &reply, &phase).await {
                             break;
                         }
                     }
@@ -453,7 +501,7 @@ async fn connect_and_relay(
                         }
                     }
                     NodeWsMessage::Ping => {
-                        let _ = send_node_message(&mut ws_tx, &NodeWsMessage::Pong).await;
+                        let _ = send_node_message(&mut ws_tx, &NodeWsMessage::Pong, &phase).await;
                     }
                     _ => {}
                 }
@@ -463,7 +511,7 @@ async fn connect_and_relay(
                     Ok(event) => {
                         let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
                         debug!(node = %join.name, event = ?event, "relaying session event to primary");
-                        if !send_node_message(&mut ws_tx, &relay).await {
+                        if !send_node_message(&mut ws_tx, &relay, &phase).await {
                             break;
                         }
                     }
@@ -487,21 +535,35 @@ async fn send_node_message(
         WsMessage,
     >,
     message: &NodeWsMessage,
+    phase: &crate::sshauth::ChannelPhase,
 ) -> bool {
-    match encode_node_ws_payload(message) {
-        Ok(payload) => ws_tx.send(WsMessage::Binary(payload.into())).await.is_ok(),
+    let payload = match crate::sshauth::phase_encode_message(phase, message)
+        .or_else(|_| encode_node_ws_payload(message))
+    {
+        Ok(p) => p,
         Err(err) => {
             warn!(%err, "failed to encode node connector frame");
-            false
+            return false;
         }
+    };
+    ws_tx.send(WsMessage::Binary(payload.into())).await.is_ok()
+}
+
+fn decode_node_message(
+    frame: WsMessage,
+    phase: &crate::sshauth::ChannelPhase,
+) -> std::io::Result<NodeWsMessage> {
+    match frame {
+        WsMessage::Binary(data) => decode_node_message_bytes(&data, phase),
+        _ => Err(std::io::Error::other("unsupported node connector frame")),
     }
 }
 
-fn decode_node_message(frame: WsMessage) -> std::io::Result<NodeWsMessage> {
-    match frame {
-        WsMessage::Binary(data) => decode_node_ws_payload(&data),
-        _ => Err(std::io::Error::other("unsupported node connector frame")),
-    }
+fn decode_node_message_bytes(
+    bytes: &[u8],
+    phase: &crate::sshauth::ChannelPhase,
+) -> std::io::Result<NodeWsMessage> {
+    crate::sshauth::phase_decode_payload(phase, bytes).map_err(std::io::Error::other)
 }
 
 fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
@@ -663,14 +725,14 @@ pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcRe
     RpcResponse::NodeList { nodes }
 }
 
-pub(super) async fn handle_node_accept_ssh_pubkey(
+pub(super) async fn handle_node_accept(
     name: String,
-    public_key: String,
+    ssh_pub_key: String,
     db: &Arc<Database>,
 ) -> RpcResponse {
     // Validate and normalize the key so lookups at join time (which use the
     // canonical form) always match, regardless of how the key was pasted in.
-    let canonical = match crate::sshauth::normalize_public_key(&public_key) {
+    let canonical = match crate::sshauth::normalize_public_key(&ssh_pub_key) {
         Ok(key) => key,
         Err(e) => {
             return RpcResponse::Error {
@@ -683,7 +745,7 @@ pub(super) async fn handle_node_accept_ssh_pubkey(
             message: format!("failed to register SSH key: {e}"),
         };
     }
-    info!(node = %name, "registered SSH public key");
+    info!(node = %name, "registered accepted SSH public key");
     RpcResponse::Empty
 }
 

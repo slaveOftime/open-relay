@@ -160,7 +160,23 @@ async fn resolve_session_id(
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    // Intercept `--` for `oly send`. clap's behaviour around `--` is
+    // inconsistent when our trailing `chunks` Vec is in play — sometimes
+    // the bare `--` token bubbles through as a chunk, sometimes it
+    // disappears as a positional separator — so we strip it from argv
+    // before clap sees it and hand the trailing slice to `run_send`
+    // separately. For all other subcommands this is a no-op pass-through.
+    //
+    // `free_text` uses tri-state semantics for `run_send`:
+    //   * `None`            → `--` was NOT used (legacy behaviour).
+    //   * `Some("")`        → trailing `--` with no text after → usage error.
+    //   * `Some(content)`   → `--` followed by text → send as one literal.
+    let (cli_args, free_text_os) = cli::split_send_dashdash(std::env::args_os());
+    let cli = Cli::parse_from(cli_args);
+    let free_text: Option<String> = match free_text_os {
+        None => None,
+        Some(values) => cli::join_free_text(&values),
+    };
     let config = config::AppConfig::load()?;
 
     match cli.command {
@@ -491,7 +507,7 @@ async fn run() -> Result<()> {
         Commands::Send(send_args) => {
             let id =
                 resolve_session_id(&config, send_args.id.clone(), send_args.node.as_ref()).await?;
-            client::run_send(&config, &id, send_args.node, send_args.chunks).await
+            client::run_send(&config, &id, send_args.node, send_args.chunks, free_text).await
         }
 
         // ── API key management (primary side) ────────────────────────────────
@@ -576,13 +592,13 @@ async fn run() -> Result<()> {
                     _ => Err(AppError::Protocol("unexpected response".into())),
                 }
             }
-            NodeCommand::AcceptSshPubKey(args) => {
+            NodeCommand::Accept(args) => {
                 let name = args.name.clone();
                 match ipc::send_request_checked(
                     &config,
-                    RpcRequest::NodeAcceptSshPubKey {
+                    RpcRequest::NodeAccept {
                         name: args.name,
-                        public_key: args.pub_key,
+                        ssh_pub_key: args.ssh_pub_key,
                     },
                 )
                 .await?
@@ -604,8 +620,7 @@ async fn run() -> Result<()> {
                     args.url,
                     args.name,
                     args.key,
-                    args.ssh_key,
-                    args.ssh_known_hosts,
+                    args.ssh_pub_key,
                 )
                 .await
             }
