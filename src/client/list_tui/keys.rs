@@ -2,12 +2,12 @@
 // the top-level keyboard dispatcher `route_key`, and the per-dialog
 // dispatchers that consume keys while a clone or metadata-update dialog
 // owns the terminal.
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers};
 
-use super::proto::{CloneLaunch, SessionTarget, SessionUpdate};
+use super::app::App;
 use super::dialog::{CloneDialog, EditText, UpdateDialog};
+use super::proto::{CloneLaunch, SessionTarget, SessionUpdate};
 use super::tree::{TreeEntry, ViewMode};
-use super::App;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum AppAction {
@@ -23,7 +23,11 @@ pub enum AppAction {
     Remove(SessionTarget),
 }
 
-pub fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&str>) -> AppAction {
+pub fn route_key(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    list_node: Option<&str>,
+) -> AppAction {
     if matches!(key.code, KeyCode::Char('c' | 'C')) && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         return AppAction::Quit;

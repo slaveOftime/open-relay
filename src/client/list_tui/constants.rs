@@ -1,5 +1,5 @@
-use std::time::Duration;
 use ratatui::style::Color;
+use std::time::Duration;
 pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
@@ -43,3 +43,5 @@ pub(crate) const DIALOG_LABEL_WIDTH: usize = 15;
 /// Background of the active field's value, giving it an "input box" look.
 pub(crate) const DIALOG_FIELD_BG: Color = Color::Rgb(38, 44, 54);
 
+/// Background used for a selected session row while preserving semantic foreground colors.
+pub(crate) const SELECTED_ROW_BG: ratatui::style::Color = ratatui::style::Color::Rgb(25, 55, 72);

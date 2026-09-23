@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-
 impl Default for TreeView {
     fn default() -> Self {
         Self::new()
@@ -304,4 +303,12 @@ pub fn is_in_drill_subtree(
         }
     }
     false
+}
+
+impl TreeEntry {
+    pub fn depth(self) -> usize {
+        match self {
+            Self::Folder { depth, .. } | Self::Session { depth, .. } => depth,
+        }
+    }
 }

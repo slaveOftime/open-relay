@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use super::constants::{
+    LIST_WINDOW_TITLE, TITLE_RESTORE_BYTES, TITLE_SAVE_BYTES, TUI_RESTORE_BYTES,
+};
+use crate::error::Result;
 use crossterm::{
     cursor::{Hide, Show},
     event::{Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -6,8 +9,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
-use crate::error::Result;
-use super::constants::{LIST_WINDOW_TITLE, TITLE_RESTORE_BYTES, TITLE_SAVE_BYTES, TUI_RESTORE_BYTES};
+use std::io::{self, Write};
 
 pub fn wait_for_ctrl_d() -> Result<()> {
     println!("\nPress Ctrl+D to return to the session list");
@@ -163,11 +165,3 @@ pub fn write_list_title(writer: &mut impl Write) -> io::Result<()> {
     writer.write_all(LIST_WINDOW_TITLE.as_bytes())?;
     writer.write_all(b"\x07")
 }
-
-#[derive(Clone, Copy)]
-enum LayoutMode {
-    Wide,
-    Medium,
-    Narrow,
-}
-

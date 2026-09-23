@@ -4,7 +4,6 @@
 // dialog types it round-trips through call into these accessors.
 use crate::protocol::RpcRequest;
 
-
 #[derive(Debug, Eq, PartialEq)]
 pub struct SessionTarget {
     pub id: String,
@@ -65,7 +64,6 @@ impl CloneLaunch {
         )
     }
 }
-
 
 pub fn wrap_node(node: Option<&str>, inner: RpcRequest) -> RpcRequest {
     match node {

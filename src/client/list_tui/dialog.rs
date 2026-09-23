@@ -1,12 +1,9 @@
 // Dialog state types: the small input-control struct (EditText), the two
 // modal dialogs (CloneDialog, UpdateDialog), their field enums, and the
 // helpers used to round-trip text inputs through the launch payload.
-use std::result;
-
+use super::proto::{CloneLaunch, SessionUpdate};
 use crate::protocol::SessionSummary;
 use crate::session::{MAX_SESSION_TITLE_LEN, normalize_session_tags, normalize_session_title};
-use super::proto::{CloneLaunch, SessionUpdate};
-
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CloneField {
@@ -468,4 +465,3 @@ pub fn parse_dimension(label: &str, value: &str) -> std::result::Result<Option<u
 pub fn optional_text(value: &str) -> Option<String> {
     (!value.trim().is_empty()).then(|| value.to_string())
 }
-
