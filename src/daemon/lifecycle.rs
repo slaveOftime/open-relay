@@ -319,10 +319,10 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
     // status works even if the daemon was started after this CLI process.
     match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
         Ok(Some(pub_key)) => {
-            println!("SSH PUB KEY:  {pub_key}");
+            println!("SSH-PUB-KEY:  {pub_key}");
         }
         Ok(None) => {
-            println!("SSH PUB KEY:  (not generated; start the daemon at least once)");
+            println!("SSH-PUB-KEY:  (not generated; start the daemon at least once)");
         }
         Err(err) => {
             eprintln!("warning: failed to read SSH pub key: {err}");
