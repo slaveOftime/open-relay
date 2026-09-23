@@ -572,9 +572,7 @@ where
     };
 
     let search_start = subcmd_idx + 1;
-    let dash_offset = raw[search_start..]
-        .iter()
-        .position(|a| a == "--");
+    let dash_offset = raw[search_start..].iter().position(|a| a == "--");
     let Some(dash_offset) = dash_offset else {
         return (raw, None);
     };
@@ -1159,7 +1157,9 @@ mod tests {
     }
 
     fn to_strs(os: &[OsString]) -> Vec<String> {
-        os.iter().map(|s| s.to_string_lossy().into_owned()).collect()
+        os.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -1258,10 +1258,7 @@ mod tests {
     fn join_free_text_keeps_oly_file_literal() {
         // No file upload triggered for `oly-file:...` inside tail.
         let joined = join_free_text(&os(&["cat", "oly-file:/should/not/upload"]));
-        assert_eq!(
-            joined.as_deref(),
-            Some("cat oly-file:/should/not/upload")
-        );
+        assert_eq!(joined.as_deref(), Some("cat oly-file:/should/not/upload"));
     }
 
     #[test]
@@ -1288,7 +1285,9 @@ mod tests {
     #[test]
     fn pre_args_parse_end_to_end_with_node_flag() {
         // The shell already word-splits argv; `os` takes the same shape.
-        let raw = os(&["oly", "send", "abc", "--node", "worker", "--", "msg", "line"]);
+        let raw = os(&[
+            "oly", "send", "abc", "--node", "worker", "--", "msg", "line",
+        ]);
         let (pre, post) = split_send_dashdash(raw);
         let cli = Cli::try_parse_from(pre).expect("clap should parse pre_args cleanly");
         let Commands::Send(s) = cli.command else {
@@ -1302,7 +1301,16 @@ mod tests {
 
     #[test]
     fn pre_args_parse_end_to_end_with_chunks_before_separator() {
-        let raw = os(&["oly", "send", "abc", "yes", "key:enter", "--", "tail", "text"]);
+        let raw = os(&[
+            "oly",
+            "send",
+            "abc",
+            "yes",
+            "key:enter",
+            "--",
+            "tail",
+            "text",
+        ]);
         let (pre, post) = split_send_dashdash(raw);
         let cli = Cli::try_parse_from(pre).expect("clap should parse pre_args cleanly");
         let Commands::Send(s) = cli.command else {

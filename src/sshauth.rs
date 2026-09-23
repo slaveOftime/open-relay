@@ -1,4 +1,4 @@
-﻿//! SSH Ed25519 authentication helpers for the node join protocol.
+//! SSH Ed25519 authentication helpers for the node join protocol.
 //!
 //! # Key format
 //!
@@ -63,7 +63,8 @@ pub fn b64_encode(bytes: &[u8]) -> String {
 pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
     B64.decode(s.trim())
         .map_err(|e| AppError::Protocol(format!("invalid base64: {e}")))
-}/// Load the raw 32-byte Ed25519 seed from `<state>/ssh_host_key`. The
+}
+/// Load the raw 32-byte Ed25519 seed from `<state>/ssh_host_key`. The
 /// daemon writes this file at first start (see
 /// `NodeIdentity::create_or_load`); it contains the bare seed bytes — no
 /// OpenSSH framing, no PEM headers.
@@ -166,9 +167,8 @@ pub fn derive_channel_keys(
     let mut c2s = [0u8; AEAD_KEY_LEN];
     let mut s2c = [0u8; AEAD_KEY_LEN];
     for (dir_label, slot) in [(b"c2s" as &[u8], &mut c2s), (b"s2c", &mut s2c)] {
-        let mut info = Vec::with_capacity(
-            CHANNEL_INFO_PREFIX.len() + 1 + 32 + 1 + 32 + 1 + dir_label.len(),
-        );
+        let mut info =
+            Vec::with_capacity(CHANNEL_INFO_PREFIX.len() + 1 + 32 + 1 + 32 + 1 + dir_label.len());
         info.extend_from_slice(CHANNEL_INFO_PREFIX);
         info.push(b'|');
         info.extend_from_slice(primary_pub_ed);
@@ -191,10 +191,13 @@ pub const SEALED_HEADER_LEN: usize = 1 + AEAD_NONCE_LEN;
 /// AAD is the message *kind* string so different message types are
 /// distinguishable inside the same channel.
 pub fn seal_frame(key: &[u8; AEAD_KEY_LEN], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::try_from(key.as_slice()).expect("AEAD key must be 32 bytes"));
+    let cipher = Aes256Gcm::new(
+        <&Key<Aes256Gcm>>::try_from(key.as_slice()).expect("AEAD key must be 32 bytes"),
+    );
     let mut nonce_bytes = [0u8; AEAD_NONCE_LEN];
     rand::fill(&mut nonce_bytes);
-    let nonce = <&Nonce<U12>>::try_from(nonce_bytes.as_slice()).expect("AEAD nonce must be 12 bytes");
+    let nonce =
+        <&Nonce<U12>>::try_from(nonce_bytes.as_slice()).expect("AEAD nonce must be 12 bytes");
     let ct = cipher
         .encrypt(
             nonce,
@@ -227,14 +230,13 @@ pub fn open_frame(key: &[u8; AEAD_KEY_LEN], aad: &[u8], frame: &[u8]) -> Result<
     }
     let nonce_bytes = &frame[1..1 + AEAD_NONCE_LEN];
     let ct = &frame[1 + AEAD_NONCE_LEN..];
-    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::try_from(key.as_slice()).expect("AEAD key must be 32 bytes"));
+    let cipher = Aes256Gcm::new(
+        <&Key<Aes256Gcm>>::try_from(key.as_slice()).expect("AEAD key must be 32 bytes"),
+    );
     cipher
         .decrypt(
             <&Nonce<U12>>::try_from(nonce_bytes).expect("AEAD nonce must be 12 bytes"),
-            Payload {
-                msg: ct,
-                aad,
-            },
+            Payload { msg: ct, aad },
         )
         .map_err(|e| AppError::Protocol(format!("AEAD decryption failed: {e}")))
 }
@@ -296,10 +298,12 @@ pub fn phase_encode_message(
                 crate::protocol::encode_node_ws_payload(message)
             }
             _ => crate::protocol::encode_node_ws_payload(message),
-        }.map_err(|e| AppError::Protocol(format!("{e}"))),
+        }
+        .map_err(|e| AppError::Protocol(format!("{e}"))),
         ChannelPhase::Sealed { send, .. } => {
-            let plain_json = serde_json::to_vec(message)
-                .map_err(|e| AppError::Protocol(format!("failed to serialize sealed message: {e}")))?;
+            let plain_json = serde_json::to_vec(message).map_err(|e| {
+                AppError::Protocol(format!("failed to serialize sealed message: {e}"))
+            })?;
             seal_frame(send, &[], &plain_json)
         }
     }
@@ -339,8 +343,7 @@ pub fn phase_decode_payload(
             "received plain frame after channel keys established (downgrade attempt?)".into(),
         ));
     }
-    crate::protocol::decode_node_ws_payload(bytes)
-       .map_err(|e| AppError::Protocol(format!("{e}")))
+    crate::protocol::decode_node_ws_payload(bytes).map_err(|e| AppError::Protocol(format!("{e}")))
 }
 
 /// Stable "kind" string for a [`NodeWsMessage`] used as AEAD AAD when
@@ -536,7 +539,11 @@ mod tests {
         // identity != canonical_node, identical bytes) must not be
         // accepted as the join signature.
         let bogus_payload = node_join_payload("worker-a", &canonical_host);
-        assert!(!verify_signature(&canonical_node, &join_sig, &bogus_payload));
+        assert!(!verify_signature(
+            &canonical_node,
+            &join_sig,
+            &bogus_payload
+        ));
     }
 
     /// Both sides of an SSH-key channel must derive the same per-direction
@@ -583,10 +590,8 @@ mod tests {
         let opened = open_frame(&secondary_keys.s2c, &[], &sealed).expect("secondary opens");
         assert_eq!(opened, payload, "primary -> secondary round-trip");
 
-        let sealed_back =
-            seal_frame(&secondary_keys.c2s, &[], payload).expect("secondary seals");
-        let opened_back =
-            open_frame(&primary_keys.c2s, &[], &sealed_back).expect("primary opens");
+        let sealed_back = seal_frame(&secondary_keys.c2s, &[], payload).expect("secondary seals");
+        let opened_back = open_frame(&primary_keys.c2s, &[], &sealed_back).expect("primary opens");
         assert_eq!(opened_back, payload, "secondary -> primary round-trip");
 
         let wrong_dir = open_frame(&secondary_keys.c2s, &[], &sealed);

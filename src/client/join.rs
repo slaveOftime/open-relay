@@ -95,9 +95,7 @@ pub fn build_join_config(
     ssh_primary_pubkey: Option<String>,
 ) -> Result<JoinConfig> {
     let key_present = key.as_ref().is_some_and(|s| !s.is_empty());
-    let ssh_present = ssh_primary_pubkey
-        .as_ref()
-        .is_some_and(|s| !s.is_empty());
+    let ssh_present = ssh_primary_pubkey.as_ref().is_some_and(|s| !s.is_empty());
     if !key_present && !ssh_present {
         return Err(AppError::Protocol(
             "authentication required: pass --key <API_KEY> or --ssh-pub-key <PRIMARY_PUB>".into(),
@@ -128,13 +126,7 @@ pub fn build_join_config(
             ))
         })?;
     }
-    let api_key = key.and_then(|k| {
-        if k.is_empty() {
-            None
-        } else {
-            Some(k)
-        }
-    });
+    let api_key = key.and_then(|k| if k.is_empty() { None } else { Some(k) });
     Ok(JoinConfig {
         name,
         primary_url: url,
@@ -318,18 +310,16 @@ mod tests {
         )
         .expect("ssh pub key only is valid");
         assert!(cfg.api_key.is_none());
-        assert_eq!(cfg.ssh_primary_pubkey.as_deref(), Some(primary_pub.as_str()));
+        assert_eq!(
+            cfg.ssh_primary_pubkey.as_deref(),
+            Some(primary_pub.as_str())
+        );
     }
 
     #[test]
     fn build_join_config_rejects_missing_both() {
-        let err = build_join_config(
-            "http://primary:15443".into(),
-            "worker1".into(),
-            None,
-            None,
-        )
-        .expect_err("must fail without any auth");
+        let err = build_join_config("http://primary:15443".into(), "worker1".into(), None, None)
+            .expect_err("must fail without any auth");
         assert!(format!("{err}").contains("authentication required"));
     }
 
@@ -370,6 +360,9 @@ mod tests {
         )
         .expect("empty --key falls back to ssh");
         assert!(cfg.api_key.is_none());
-        assert_eq!(cfg.ssh_primary_pubkey.as_deref(), Some(primary_pub.as_str()));
+        assert_eq!(
+            cfg.ssh_primary_pubkey.as_deref(),
+            Some(primary_pub.as_str())
+        );
     }
 }

@@ -25,7 +25,7 @@ use super::{
         handle_attach_subscribe, handle_observe_window, handle_session_cursor,
     },
     rpc_nodes::{
-        handle_node_list, handle_node_proxy, handle_node_proxy_streaming, handle_node_accept,
+        handle_node_accept, handle_node_list, handle_node_proxy, handle_node_proxy_streaming,
         spawn_join_connector,
     },
 };
@@ -746,12 +746,7 @@ async fn handle_join_start(
     key: Option<String>,
     ssh_primary_pubkey: Option<String>,
 ) -> Result<RpcResponse> {
-    let join = client::join::build_join_config(
-        url,
-        name.clone(),
-        key,
-        ssh_primary_pubkey,
-    )?;
+    let join = client::join::build_join_config(url, name.clone(), key, ssh_primary_pubkey)?;
     client::join::save_join_config(config, &join)?;
     // The connector reports its first-attempt outcome through a oneshot
     // so the IPC handler can surface `joined` / `joining` / `failed` to

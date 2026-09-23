@@ -615,14 +615,7 @@ async fn run() -> Result<()> {
         // ── Join management (secondary side) ─────────────────────────────────
         Commands::Join(join_args) => match join_args.command {
             JoinCommand::Start(args) => {
-                client::run_join(
-                    &config,
-                    args.url,
-                    args.name,
-                    args.key,
-                    args.ssh_pub_key,
-                )
-                .await
+                client::run_join(&config, args.url, args.name, args.key, args.ssh_pub_key).await
             }
             JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
             JoinCommand::List(args) => {

@@ -213,19 +213,18 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             if let (Some(secondary_pub_line), Some(host_signing_key)) =
                 (hello_record.as_ref(), state.node_identity.signing_key())
             {
-                let secondary_canon =
-                    match sshauth::normalize_public_key(secondary_pub_line) {
-                        Ok(k) => k,
-                        Err(err) => {
-                            send_error(
-                                &mut ws_tx,
-                                &format!("hello carried an invalid ssh-ed25519 line: {err}"),
-                            )
-                            .await;
-                            state.node_registry.disconnect(&name).await;
-                            return;
-                        }
-                    };
+                let secondary_canon = match sshauth::normalize_public_key(secondary_pub_line) {
+                    Ok(k) => k,
+                    Err(err) => {
+                        send_error(
+                            &mut ws_tx,
+                            &format!("hello carried an invalid ssh-ed25519 line: {err}"),
+                        )
+                        .await;
+                        state.node_registry.disconnect(&name).await;
+                        return;
+                    }
+                };
                 let secondary_pub_ed_bytes = match sshauth::b64_decode(
                     secondary_canon.split_whitespace().next_back().unwrap_or(""),
                 ) {

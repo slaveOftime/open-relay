@@ -480,14 +480,7 @@ fn e2e_federation_ssh_key_join_handshake() {
         .expect("openssh public key line");
 
     let accept = oly_cmd(&tmp)
-        .args([
-            "node",
-            "accept",
-            "-n",
-            "worker1",
-            "-k",
-            &openssh_pub,
-        ])
+        .args(["node", "accept", "-n", "worker1", "-k", &openssh_pub])
         .output()
         .expect("`oly node accept` failed to execute");
     assert!(
@@ -668,14 +661,7 @@ fn e2e_federation_ssh_key_join_lifecycle() {
 
     // Register the secondary's identity pub key on the primary.
     let accept = oly_cmd(&primary_tmp)
-        .args([
-            "node",
-            "accept",
-            "-n",
-            "worker1",
-            "-k",
-            &secondary_pub,
-        ])
+        .args(["node", "accept", "-n", "worker1", "-k", &secondary_pub])
         .output()
         .expect("`oly node accept` failed to execute");
     assert!(

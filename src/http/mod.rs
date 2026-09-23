@@ -177,9 +177,7 @@ impl NodeIdentity {
     /// Read the on-disk public key line for the daemon under `state_dir`,
     /// if present. Used by `oly daemon status` to surface the identity
     /// without having to talk to the running daemon.
-    pub fn read_published_pubkey(
-        state_dir: &std::path::Path,
-    ) -> std::io::Result<Option<String>> {
+    pub fn read_published_pubkey(state_dir: &std::path::Path) -> std::io::Result<Option<String>> {
         let path = Self::pub_key_path(state_dir);
         match std::fs::read_to_string(&path) {
             Ok(s) => Ok(Some(s.trim().to_string())),

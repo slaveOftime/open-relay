@@ -16,9 +16,7 @@ use crate::{
     error::Result,
     ipc,
     node::NodeRegistry,
-    protocol::{
-        NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, encode_node_ws_payload,
-    },
+    protocol::{NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, encode_node_ws_payload},
     session::SessionEvent,
 };
 
@@ -188,7 +186,10 @@ async fn connect_and_relay(
     // join with `Joined`. Until then we keep sending plaintext so the
     // auth-validating primary (which only transitions to Sealed after
     // reading Join + verifying auth) and we stay wire-compatible.
-    let mut pending_phase_seal: Option<([u8; crate::sshauth::AEAD_KEY_LEN], [u8; crate::sshauth::AEAD_KEY_LEN])> = None;
+    let mut pending_phase_seal: Option<(
+        [u8; crate::sshauth::AEAD_KEY_LEN],
+        [u8; crate::sshauth::AEAD_KEY_LEN],
+    )> = None;
 
     let auth = if let Some(pinned_primary_pubkey) = &join.ssh_primary_pubkey {
         // Load this daemon's auto-generated identity seed. The file is
@@ -213,7 +214,8 @@ async fn connect_and_relay(
         let pinned_canonical = crate::sshauth::normalize_public_key(pinned_primary_pubkey)
             .map_err(|e| {
                 let msg = format!(
-                "configured primary pubkey for {host} is not a valid ssh-ed25519 line: {e}");
+                    "configured primary pubkey for {host} is not a valid ssh-ed25519 line: {e}"
+                );
                 attempt_report.fail(&msg);
                 crate::error::AppError::Protocol(msg)
             })?;
@@ -233,7 +235,10 @@ async fn connect_and_relay(
         //     direction labels via HKDF-Expand.
         let primary_pub_ed: [u8; 32] = {
             let raw = crate::sshauth::b64_decode(
-                pinned_canonical.split_whitespace().next_back().unwrap_or(""),
+                pinned_canonical
+                    .split_whitespace()
+                    .next_back()
+                    .unwrap_or(""),
             )
             .map_err(|e| {
                 let msg = format!("primary pub-ed decode: {e}");
@@ -241,10 +246,7 @@ async fn connect_and_relay(
                 crate::error::AppError::Protocol(msg)
             })?;
             if raw.len() != 32 {
-                let msg = format!(
-                    "primary pub-ed length wrong: {} (expected 32)",
-                    raw.len()
-                );
+                let msg = format!("primary pub-ed length wrong: {} (expected 32)", raw.len());
                 attempt_report.fail(&msg);
                 return Err(crate::error::AppError::Protocol(msg));
             }
@@ -252,8 +254,8 @@ async fn connect_and_relay(
             b.copy_from_slice(&raw);
             b
         };
-        let primary_verifying = ed25519_dalek::VerifyingKey::from_bytes(&primary_pub_ed)
-            .map_err(|e| {
+        let primary_verifying =
+            ed25519_dalek::VerifyingKey::from_bytes(&primary_pub_ed).map_err(|e| {
                 let msg = format!("primary pub-ed invalid: {e}");
                 attempt_report.fail(&msg);
                 crate::error::AppError::Protocol(msg)
