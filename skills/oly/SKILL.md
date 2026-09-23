@@ -71,6 +71,23 @@ oly send <ID> "cat " oly-file:/path/to/file key:enter
 - Raw hex: `key:hex:...`. Piped stdin is supported when no positional chunks are given.
 - Clipboard content uses `oly-clipboard`. Local file upload uses `oly-file:<path>`. This is normally used for remote node sessions.
 
+**Free-text mode (`--`).** When you need to send arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force base64 round-trips through a target shell — pass `--` and then the text. Everything after `--` is sent as one literal blob joined with single spaces, with **no** `key:` / `oly-clipboard` / `oly-file:` dispatch:
+
+```bash
+# Multi-line body — the `--` opt-outs out of bash quoting layers.
+oly send <ID> -- 'echo "hello world"
+ls -la
+printf "%s\n" done'
+
+# A token that happens to start with `key:` stays literal.
+oly send <ID> -- echo "press key:enter to continue"
+
+# Mix: regular chunks before `--` still dispatch normally.
+oly send <ID> key:enter -- echo "after the enter"
+```
+
+Use `--` whenever the payload contains `key:`, `oly-file:`, or `oly-clipboard`, has quotes / newlines, or is awkward to escape through the host shell. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
+
 **Input strategy:**
 
 | Scenario | Action |
