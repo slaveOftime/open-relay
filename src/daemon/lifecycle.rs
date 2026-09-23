@@ -243,21 +243,6 @@ pub async fn status(config: AppConfig) -> Result<()> {
 
     let effective = effective_status_config(&config, info.as_ref());
     print_detached_start_summary(&effective, no_http, no_auth);
-    // Surface the daemon's SSH-key identity so the operator can paste it
-    // onto a peer (or hand it to `oly node accept -k ...`). Reads from
-    // the on-disk `.pub` file (lifecycle creates it on daemon start) so
-    // status works even if the daemon was started after this CLI process.
-    match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
-        Ok(Some(pub_key)) => {
-            println!("SSH PUB:      {pub_key}");
-        }
-        Ok(None) => {
-            println!("SSH PUB:      (not generated; start the daemon at least once)");
-        }
-        Err(err) => {
-            eprintln!("warning: failed to read SSH pub key: {err}");
-        }
-    }
     Ok(())
 }
 
@@ -327,6 +312,23 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
         config.paths.state_dir.join("logs").display()
     );
     let _ = writeln!(out, "SESSIONS:     {}", config.paths.sessions_dir.display());
+
+    // Surface the daemon's SSH-key identity so the operator can paste it
+    // onto a peer (or hand it to `oly node accept -k ...`). Reads from
+    // the on-disk `.pub` file (lifecycle creates it on daemon start) so
+    // status works even if the daemon was started after this CLI process.
+    match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
+        Ok(Some(pub_key)) => {
+            println!("SSH PUB KEY:  {pub_key}");
+        }
+        Ok(None) => {
+            println!("SSH PUB KEY:  (not generated; start the daemon at least once)");
+        }
+        Err(err) => {
+            eprintln!("warning: failed to read SSH pub key: {err}");
+        }
+    }
+
     out
 }
 
