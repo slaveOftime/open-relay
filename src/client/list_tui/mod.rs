@@ -44,51 +44,12 @@ use crate::{
     protocol::{RpcRequest, RpcResponse, SessionSummary},
     session::{MAX_SESSION_TITLE_LEN, normalize_session_tags, normalize_session_title},
 };
-
-const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
-const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const REDRAW_INTERVAL: Duration = Duration::from_millis(250);
-/// Frame cadence while visual effects are running (~30 fps).
-const ANIMATION_REDRAW_INTERVAL: Duration = Duration::from_millis(33);
-/// The background tint a waiting session's row pulses toward: a dark amber
-/// that keeps every status/foreground colour readable on top of it.
-const ATTENTION_PULSE_BG: Color = Color::Rgb(90, 62, 4);
-/// A selected waiting row pulses toward this blend of the selection band and
-/// the attention tint, so the pulse stays visible without hiding that the
-/// row is selected.
-const ATTENTION_PULSE_BG_SELECTED: Color = Color::Rgb(58, 59, 38);
-const RATE_HISTORY_LEN: usize = 30;
-const COMPACT_SPARKLINE_WIDTH: usize = 3;
-const SPARKLINE_WIDTH: usize = 5;
-const STOP_GRACE_SECONDS: u64 = 15;
-const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-// `pub(crate)` so the Windows crash handler in `crate::client::crash` can
-// restore the terminal on unhandled exceptions. Visibility is the minimum
-// needed by the cross-module references introduced in PLAN2 S1.3.
-pub(crate) const TUI_RESTORE_BYTES: &[u8] = b"\x1b[?1049l\x1b[?2026l\x1b[0m\x1b[?25h\x1b[0 q\
-    \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
-/// Window title shown while the interactive session list owns the terminal.
-const LIST_WINDOW_TITLE: &str = "oly sessions";
-/// XTWINOPS 22;0 pushes the current icon + window title onto the terminal's
-/// title stack (same scheme as `terminal_guards`), so teardown can restore
-/// whatever the surrounding shell had set.
-const TITLE_SAVE_BYTES: &[u8] = b"\x1b[22;0t";
-/// XTWINOPS 23;0 pops the title saved by `TITLE_SAVE_BYTES`.
-// `pub(crate)` so the Windows crash handler in `crate::client::crash` can
-// restore the terminal on unhandled exceptions. Visibility is the minimum
-// needed by the cross-module references introduced in PLAN2 S1.3.
-pub(crate) const TITLE_RESTORE_BYTES: &[u8] = b"\x1b[23;0t";
-const CLONE_DIALOG_HELP: &str =
-    " Quotes group words · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";
-const UPDATE_DIALOG_HELP: &str =
-    " Quotes group words · Tab/Shift+Tab · Space toggle · Enter save · Esc cancel";
-/// Width of the label column in the clone/update dialogs.
-const DIALOG_LABEL_WIDTH: usize = 15;
-/// Background of the active field's value, giving it an "input box" look.
-const DIALOG_FIELD_BG: Color = Color::Rgb(38, 44, 54);
-
 use super::list::ListTarget;
+
+pub(super) mod constants;
+pub(super) use constants::{CLONE_DIALOG_HELP, DIALOG_FIELD_BG, DIALOG_LABEL_WIDTH, LIST_WINDOW_TITLE, TITLE_SAVE_BYTES, ATTENTION_PULSE_BG, ATTENTION_PULSE_BG_SELECTED, INPUT_POLL_INTERVAL, REDRAW_INTERVAL, REFRESH_INTERVAL, REFRESH_TIMEOUT, ANIMATION_REDRAW_INTERVAL, RATE_HISTORY_LEN, SPARK_BLOCKS, SPARKLINE_WIDTH, COMPACT_SPARKLINE_WIDTH, STOP_GRACE_SECONDS, UPDATE_DIALOG_HELP};
+pub(crate) use constants::{TITLE_RESTORE_BYTES, TUI_RESTORE_BYTES};
+
 
 struct SessionRefresh {
     sessions: Vec<SessionSummary>,
