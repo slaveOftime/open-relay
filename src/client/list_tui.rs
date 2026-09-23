@@ -179,6 +179,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
                         }
                         AppAction::Update(update) => update_session(config, &mut app, update).await,
                         AppAction::Stop(target) => stop_session(config, &mut app, target),
+                        AppAction::Remove(target) => remove_session(config, &mut app, target),
                     }
                     redraw = true;
                 }
@@ -377,6 +378,32 @@ async fn fetch_sessions(
         failed_nodes,
         failures,
     })
+}
+
+
+/// Fire-and-forget `RpcRequest::Remove { force: true }` to the daemon,
+/// matches what `oly rm -f <id>` does from the CLI. The row is also
+/// dropped locally so the user sees the dismissal immediately; if the
+/// daemon refuses, the next refresh tick surfaces the failure via
+/// `apply_refresh` warning.
+fn remove_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
+    let inner = RpcRequest::Remove {
+        id: target.id.clone(),
+        force: true,
+    };
+    let request = match target.node.as_deref() {
+        Some(node) => RpcRequest::NodeProxy {
+            node: node.to_string(),
+            inner: Box::new(inner),
+        },
+        None => inner,
+    };
+    let config = config.clone();
+    tokio::spawn(async move {
+        let _ = ipc::send_request_checked(&config, request).await;
+    });
+    app.remove_session_payload(&target.id, target.node.as_deref());
+    app.set_action_message(Some(format!("removing session {}", target.id)));
 }
 
 async fn start_clone(
@@ -611,7 +638,7 @@ impl TreeView {
 
 /// Maximum folder depth shown without an explicit drill. Pressing Enter on a
 /// folder at this depth reveals one more level of children.
-const TREE_AUTO_DEPTH: usize = 3;
+const TREE_AUTO_DEPTH: usize = 2;
 
 #[derive(Debug, Eq, PartialEq)]
 enum AppAction {
@@ -621,6 +648,10 @@ enum AppAction {
     Start(CloneLaunch),
     Update(SessionUpdate),
     Stop(SessionTarget),
+    /// Force-remove a session from the daemon (matches `oly rm -f <id>`).
+    /// Always forces the removal so stopped/failed/stale sessions can
+    /// still be cleaned out of the list without a separate prompt.
+    Remove(SessionTarget),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1217,6 +1248,26 @@ fn route_key(app: &mut App, key: crossterm::event::KeyEvent, list_node: Option<&
                     .or_else(|| list_node.map(str::to_string)),
             })
         }
+        KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+R removes the focused session from the daemon
+            // (`oly rm -f <id>`). The RPC is fire-and-forget on a spawned
+            // task so the UI does not block; a refusal surfaces on the
+            // next refresh cycle via `apply_refresh`'s standard
+            // "sync lost" warning.
+            let Some(session) = app.focused_session() else {
+                app.set_action_message(Some("no session in focus to remove".to_string()));
+                return AppAction::None;
+            };
+            let target = SessionTarget {
+                id: session.id.clone(),
+                node: session
+                    .node
+                    .clone()
+                    .or_else(|| list_node.map(str::to_string)),
+            };
+            app.remove_session(&target.id, target.node.as_deref());
+            AppAction::Remove(target)
+        }
         KeyCode::Char('s' | 'S') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.toggle_status_filter();
             AppAction::None
@@ -1646,6 +1697,13 @@ fn ensure_tree_path(
     let mut current = parent;
     let mut accumulated = PathBuf::new();
     for component in path.components() {
+        // Skip absolute-path roots: they would create an intermediate
+        // folder whose `file_name()` is `None` (rendered as "(root)")
+        // and contribute nothing to the visible tree. The walker already
+        // anchors the synthetic root; cwd paths are stored relative to it.
+        if matches!(component, std::path::Component::RootDir) {
+            continue;
+        }
         accumulated.push(component);
         // Linear-scan the parent's `subfolders` for an existing node with
         // this exact `accumulated` path. Trees are shallow (≤ a handful of
@@ -1664,6 +1722,7 @@ fn ensure_tree_path(
                 let mut absolute = PathBuf::from(cwd);
                 for _ in 0..path
                     .components()
+                    .filter(|c| !matches!(c, std::path::Component::RootDir))
                     .count()
                     .saturating_sub(accumulated.components().count())
                 {
@@ -1886,6 +1945,37 @@ impl App {
         if let Some(dialog) = self.update_dialog.as_mut() {
             dialog.sync_summary(summary.as_ref());
         }
+    }
+
+    /// Drop a session row from the local model so the user sees the
+    /// removal immediately; the next refresh tick will confirm with the
+    /// daemon. Used by Ctrl+R (`oly rm -f <id>`). The cursor is repaired
+    /// when it lands on the now-missing index, and per-session state
+    /// (rates, attention rows) is cleared.
+    fn remove_session_payload(&mut self, id: &str, node: Option<&str>) {
+        let attention_key = format!("{id:?}:{node:?}");
+        self.attention_rows.remove(&attention_key);
+        self.rates.remove(id);
+        let Some(position) = self
+            .sessions
+            .iter()
+            .position(|session| session.id == id && session.node.as_deref() == node)
+        else {
+            return;
+        };
+        self.sessions.remove(position);
+        self.rebuild_visible();
+        if self.selected >= self.visible.len() && !self.visible.is_empty() {
+            self.selected = self.visible.len() - 1;
+        }
+    }
+
+    /// Hook used by the Ctrl+R route-key handler so the action feedback
+    /// ("removing session …") and the optimistic drop both happen on the
+    /// same call site. Splitting this from `remove_session_payload`
+    /// lets refresh::remove_session reuse the same drop logic.
+    fn remove_session(&mut self, id: &str, node: Option<&str>) {
+        self.remove_session_payload(id, node);
     }
 
     fn apply_updated_summary(&mut self, summary: SessionSummary) {
@@ -2308,16 +2398,86 @@ impl App {
         // here, so a Ctrl+G round-trip leaves the user exactly where
         // they were in each mode last time. `focused_session` knows
         // which cursor to read for the active view.
-        self.view_mode = match self.view_mode {
+        let next_view = match self.view_mode {
             ViewMode::List => ViewMode::Tree,
             ViewMode::Tree => ViewMode::List,
         };
+        // When entering tree mode from list mode, drill into the path
+        // of the currently focused session so it remains visible past
+        // the auto-depth horizon. Round-trips back to list keep the
+        // drilled set so the same place can be revisited next toggle.
+        if next_view == ViewMode::Tree && self.view_mode == ViewMode::List {
+            self.drill_to_focused_list_selection();
+        }
+        self.view_mode = next_view;
         self.rebuild_tree();
+        self.focus_tree_on_focused_session();
         // Track and announce the new mode so users don't get disoriented.
         self.set_action_message(Some(match self.view_mode {
             ViewMode::List => "list view · Ctrl+G tree".to_string(),
             ViewMode::Tree => "tree view · Enter to drill · Ctrl+G list".to_string(),
         }));
+    }
+
+    /// Drill every ancestor of the list selection's cwd so the focused
+    /// session stays visible past the auto-depth horizon when switching
+    /// into tree mode. Sessions without a cwd sit on the synthetic root
+    /// and need no drilling.
+    fn drill_to_focused_list_selection(&mut self) {
+        let Some(index) = self.visible.get(self.selected).copied() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
+        let Some(cwd) = session.cwd.as_deref() else {
+            return;
+        };
+        // Mirror the pipeline stripping: drop the shared ancestor so
+        // drilled paths match what the walker emits under the (optional)
+        // per-node branch.
+        let common = common_path_prefix(
+            &self
+                .sessions
+                .iter()
+                .filter_map(|session| session.cwd.as_deref().map(PathBuf::from))
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<_>>(),
+        );
+        let stripped = match Path::new(cwd).strip_prefix(&common) {
+            Ok(path) => path.to_path_buf(),
+            Err(_) => PathBuf::from(cwd),
+        };
+        if stripped.as_os_str().is_empty() {
+            return;
+        }
+        let mut accumulated = PathBuf::new();
+        for component in stripped.components() {
+            if matches!(component, std::path::Component::RootDir) {
+                continue;
+            }
+            accumulated.push(component);
+            self.tree
+                .drilled
+                .insert((session.node.clone(), accumulated.clone()));
+        }
+    }
+
+    /// Move the tree cursor to the row belonging to the focused session,
+    /// if any. Falls back to the existing cursor position when the focused
+    /// session is missing or hidden.
+    fn focus_tree_on_focused_session(&mut self) {
+        if self.view_mode != ViewMode::Tree {
+            return;
+        }
+        let Some(index) = self.visible.get(self.selected).copied() else {
+            return;
+        };
+        if let Some(position) = self.tree.visible.iter().position(|entry| {
+            matches!(entry, TreeEntry::Session { session, .. } if *session == index)
+        }) {
+            self.tree.cursor = position;
+        }
     }
 
     /// Move the tree cursor by `offset`. The cursor wraps around the visible
@@ -3791,7 +3951,15 @@ fn folder_line(node: &TreeNode, prefix: &str, selected: bool) -> Line<'static> {
     let label = if node.is_node {
         format!("{} (node)", node.name)
     } else if node.name.is_empty() {
-        "(root)".to_string()
+        // Defensive fallback: the build pipeline must not produce empty
+        // names anymore (we strip `RootDir` components when inserting),
+        // but if anything ever slips past that, render the path so the
+        // user still sees a meaningful breadcrumb instead of a bare
+        // "(root)" stacked against siblings.
+        node.path
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string()
     } else {
         format!("{}/", node.name)
     };
@@ -3873,7 +4041,14 @@ fn session_line(
         Span::raw("  "),
         Span::styled(title_text, Style::default().fg(muted)),
         Span::raw("   "),
-        Span::styled(sparkline(rate, SPARKLINE_WIDTH), Style::default().fg(color)),
+        Span::styled(
+            if active {
+                sparkline(rate, SPARKLINE_WIDTH)
+            } else {
+                " ".repeat(SPARKLINE_WIDTH)
+            },
+            Style::default().fg(color),
+        ),
         Span::raw(" "),
         Span::styled(format_tree_start(started, Utc::now()), dim),
     ]);
@@ -3960,7 +4135,11 @@ fn session_row(
             aligned_cell(status_text.to_string(), alignments[3 + node_offset]).style(status_style),
             aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
             aligned_cell(
-                sparkline(rate, COMPACT_SPARKLINE_WIDTH),
+                if active {
+                    sparkline(rate, COMPACT_SPARKLINE_WIDTH)
+                } else {
+                    " ".repeat(COMPACT_SPARKLINE_WIDTH)
+                },
                 alignments[5 + node_offset],
             )
             .style(Style::default().fg(rate_color)),
@@ -3973,11 +4152,15 @@ fn session_row(
             aligned_cell(status_text.to_string(), alignments[3 + node_offset]).style(status_style),
             aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
             aligned_cell(
-                format!(
-                    "{} {:>6}/s",
-                    sparkline(rate, SPARKLINE_WIDTH),
-                    format_bytes(current_rate)
-                ),
+                if active {
+                    format!(
+                        "{} {:>6}/s",
+                        sparkline(rate, SPARKLINE_WIDTH),
+                        format_bytes(current_rate)
+                    )
+                } else {
+                    format!("{:>13}", " ")
+                },
                 alignments[5 + node_offset],
             )
             .style(Style::default().fg(rate_color)),
@@ -4002,11 +4185,15 @@ fn session_row(
                     .style(status_style),
                 aligned_cell(age, alignments[5 + node_offset]).style(Style::default().fg(muted)),
                 aligned_cell(
-                    format!(
-                        "{} {:>6}/s",
-                        sparkline(rate, SPARKLINE_WIDTH),
-                        format_bytes(current_rate)
-                    ),
+                    if active {
+                        format!(
+                            "{} {:>6}/s",
+                            sparkline(rate, SPARKLINE_WIDTH),
+                            format_bytes(current_rate)
+                        )
+                    } else {
+                        format!("{:>13}", " ")
+                    },
                     alignments[6 + node_offset],
                 )
                 .style(Style::default().fg(rate_color)),
@@ -5086,8 +5273,12 @@ mod tests {
         assert!(ids.iter().any(|id| id == "folder:work"), "ids = {ids:?}");
         // Sessions render after their enclosing folder chain.
         assert!(ids.contains(&"ls".to_string()), "ids = {ids:?}");
-        assert!(ids.contains(&"vim".to_string()), "ids = {ids:?}");
         assert!(ids.contains(&"build".to_string()), "ids = {ids:?}");
+        // `vim` lives under work/proj/sub, past the depth-2 horizon.
+        assert!(
+            !ids.contains(&"vim".to_string()),
+            "vim should sit past auto-depth: {ids:?}"
+        );
     }
 
     #[test]
@@ -5209,7 +5400,7 @@ mod tests {
     fn tree_walks_through_empty_middleman_folders() {
         let mut app = App::default();
         // `/a/b/c/something` has three empty middleman folders. With the
-        // default auto-depth horizon of 3, every prefix folder leading up to
+        // default auto-depth horizon of 2, every prefix folder leading up to
         // the depth-4 leaf is visible as a navigation row even though none
         // of them holds a session directly — the leaf folder and its
         // session only become visible after drilling.
@@ -5225,7 +5416,11 @@ mod tests {
             })
         };
         assert!(has_folder("a/b"), "ids={ids:?}");
-        assert!(has_folder("a/b/c"), "ids={ids:?}");
+        // With auto-depth=2, the depth-3 folder hides until drilled.
+        assert!(
+            !has_folder("a/b/c"),
+            "depth-3 folder should sit past auto-depth: {ids:?}"
+        );
         // The depth-4 leaf folder hides until drilled on `a/b/c`.
         assert!(
             !has_folder("a/b/c/something"),
@@ -5250,18 +5445,24 @@ mod tests {
     #[test]
     fn tree_enter_on_deep_folder_toggles_drill() {
         let mut app = App::default();
-        // Build a tree where a leaf at depth 5 needs drilling.
+        // Build a tree where a leaf at depth 5 needs drilling. We drill
+        // the path by hand so the auto-drill on toggle doesn't pre-expose
+        // `deep`; the assertions below exercise the user-driven drill.
         app.replace_sessions(vec![session_at("deep", Some("/a/b/c/d/e"))]);
         app.toggle_view_mode();
-        // Before drilling, `deep` and its tail folders at depth > 3 are
-        // hidden. Drill on a depth-3 ancestor should expose them.
+        // Clear any drills the auto-focus path may have applied so we
+        // start from the un-drilled default state.
+        app.tree.drilled.clear();
+        app.rebuild_tree();
+        // Before drilling, `deep` and its tail folders at depth > 2 are
+        // hidden. Drill on a depth-2 ancestor should expose them.
         let ids_before = tree_visible_ids(&app);
         assert!(
             !ids_before.contains(&"deep".to_string()),
             "deep session should be hidden before drilling: {ids_before:?}"
         );
 
-        // Find the depth-3 folder (`a/b/c`) by walking visible rows. The
+        // Find the depth-2 folder (`a/b`) by walking visible rows. The
         // walker emits folder rows at their chain depth; drilling the
         // outermost visible folder should expose the leaf session past the
         // horizon.
@@ -5271,11 +5472,11 @@ mod tests {
             .iter()
             .position(|entry| match entry {
                 super::TreeEntry::Folder { node, depth } => {
-                    *depth == 3 && app.tree.nodes[*node].path == std::path::Path::new("a/b/c")
+                    *depth == 2 && app.tree.nodes[*node].path == std::path::Path::new("a/b")
                 }
                 _ => false,
             })
-            .expect("depth-3 folder present");
+            .expect("depth-2 folder present");
         app.tree.cursor = target_position;
         let action = route_key(&mut app, key(KeyCode::Enter), None);
         assert_eq!(action, AppAction::None);
@@ -5524,7 +5725,7 @@ mod tests {
             .iter()
             .position(|entry| {
                 matches!(entry,
-            super::TreeEntry::Folder { node, depth: 4 }
+            super::TreeEntry::Folder { node, depth: 3 }
                 if app.tree.nodes[*node].node.as_deref() == Some("worker"))
             })
             .expect("remote folder at drill horizon");
