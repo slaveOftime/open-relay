@@ -95,8 +95,14 @@ pub enum Commands {
 #[derive(Debug, Args)]
 pub struct SkillArgs {
     /// Skill about how to create oly app.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["subagent", "daemon"])]
     pub apps: bool,
+    /// Skill about supervising an agent CLI through oly.
+    #[arg(long, conflicts_with_all = ["apps", "daemon"])]
+    pub subagent: bool,
+    /// Skill about configuring the oly daemon (hot reload, prompt_patterns).
+    #[arg(long, conflicts_with_all = ["apps", "subagent"])]
+    pub daemon: bool,
 }
 
 #[derive(Debug, Args)]

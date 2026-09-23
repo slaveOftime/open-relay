@@ -213,7 +213,7 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
 | `oly update <id> ...` | Override a session's title, tags, and notification setting |
-| `oly skill` | Print the bundled `oly` skill markdown |
+| `oly skill [--apps \| --subagent \| --daemon]` | Print the bundled general, app, agent-CLI supervision, or daemon configuration skill |
 | `oly daemon status` | Show the running daemon's effective flags and HTTP endpoint |
 
 The interactive view can monitor several nodes at once, for example `oly ls --follow --node worker-a --node worker-b`. Add `--node-local` to include sessions from the current daemon (or the primary itself); the table shows a node column when multiple sources are selected. `Ctrl+D` opens a clone editor prefilled from the selected session, while `Ctrl+U` opens an update editor for the selected session's title, tags, and notification setting. `Tab`/`Ctrl+Tab` move between dialog fields, `Space` toggles notifications, and `Enter` submits the current dialog. Use `Ctrl+K` to stop the selected running session, `Enter` to open it inline, `Ctrl+Enter` to open it in another terminal window, and `Ctrl+C` to exit the list view.

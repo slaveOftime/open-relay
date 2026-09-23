@@ -142,6 +142,72 @@ fn skill_command_prints_embedded_markdown() {
     );
 }
 
+#[test]
+fn skill_subagent_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("subagent_skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--subagent"])
+        .output()
+        .expect("failed to run oly skill --subagent");
+
+    assert!(
+        output.status.success(),
+        "`oly skill --subagent` should exit 0"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        include_str!("../skills/oly-subagent/SKILL.md")
+    );
+}
+
+#[test]
+fn skill_daemon_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("daemon_skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--daemon"])
+        .output()
+        .expect("failed to run oly skill --daemon");
+
+    assert!(
+        output.status.success(),
+        "`oly skill --daemon` should exit 0"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        include_str!("../skills/oly-daemon/SKILL.md")
+    );
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        body.contains("DEFAULT_PROMPT_PATTERNS"),
+        "skill should embed the live prompt patterns"
+    );
+}
+
+#[test]
+fn skill_daemon_mutually_excludes_other_flags() {
+    let tmp = make_tmp_dir("skill_daemon_conflict");
+    let combined = oly_cmd(&tmp)
+        .args(["skill", "--daemon", "--subagent"])
+        .output()
+        .expect("compose");
+    assert!(!combined.status.success());
+
+    let apps = oly_cmd(&tmp)
+        .args(["skill", "--daemon", "--apps"])
+        .output()
+        .expect("compose with apps");
+    assert!(!apps.status.success());
+}
+#[test]
+fn skill_subagent_and_apps_are_mutually_exclusive() {
+    let tmp = make_tmp_dir("skill_flags_conflict");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--subagent", "--apps"])
+        .output()
+        .expect("failed to run oly skill with conflicting flags");
+    assert!(!output.status.success());
+}
+
 // ---------------------------------------------------------------------------
 // oly stop – daemon unavailable
 // ---------------------------------------------------------------------------

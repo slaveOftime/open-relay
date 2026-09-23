@@ -18,12 +18,10 @@ Do **not** use `oly` for short, non-interactive commands — a normal terminal i
 
 ## Prerequisite
 
-All commands talk to the daemon. If a command fails to connect, start it first:
+All commands talk to the daemon. Check with `oly daemon status`; start it with `oly daemon start --detach` **only if it is confirmed stopped**. In a restricted sandbox, `Access is denied` may mean the daemon's IPC is inaccessible even though it is running. Retry the failed `oly` command through the available approval/escalation mechanism; do not stop or start another daemon to work around permissions. If escalation is unavailable, report the limitation.
 
-```bash
-oly daemon status            # check
-oly daemon start --detach    # start if needed
-```
+
+> For more daemon operation related things you can run `oly skill --daemon`.
 
 ## Principles
 
@@ -31,7 +29,8 @@ oly daemon start --detach    # start if needed
 - **Small tails first.** Use `--tail 40`; expand only when context is insufficient.
 - **Fewer polls, longer waits.** Set `--timeout` to match the expected next checkpoint — reduces churn and token cost.
 - **Machine-readable listing.** Use `oly ls --json --status running` for scripting or structured decisions.
-- **ID optional.** Most commands target the most recently created session when the ID is omitted — pass the ID explicitly when juggling multiple sessions.
+- **ID optional.** Most commands target the most recently created session when the ID is omitted — use the returned ID explicitly when supervising, sending input, or stopping a particular session.
+- **Observe after input.** `oly send` confirms delivery to the PTY, not that the program processed the input. After a TUI keypress, allow its next redraw, check `oly logs <ID> --screen`, and confirm the state or requested action. A blank screen during startup/compilation is not a failure.
 
 ## Workflow
 
@@ -56,6 +55,7 @@ oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 10s
 - `--wait-for-prompt` — blocks until the session likely needs input or timeout expires.
 - `--timeout` — accepts `250ms`, `10s`, `5m`, `1h` (default `5m`). Shorten for fast tasks; lengthen for slow ones.
 - On timeout it prints only the `Waiting for session ...` line and exits 0 with no log output — treat that as "nothing new, decide whether to wait again."
+- `--screen` shows a snapshot of the current TUI; use it after interactive input and check again after the next redraw if necessary.
 - Start with `--tail 40`; increase only when recent context is insufficient.
 
 ### 3) Send input
@@ -86,7 +86,7 @@ oly send <ID> -- echo "press key:enter to continue"
 oly send <ID> key:enter -- echo "after the enter"
 ```
 
-Use `--` whenever the payload contains `key:`, `oly-file:`, or `oly-clipboard`, has quotes / newlines, or is awkward to escape through the host shell. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
+Use `--` whenever the payload contains `key:`, `oly-file:`, or `oly-clipboard`, has quotes / newlines, or is awkward to escape through the host shell. Send `key:enter` in a separate `oly send` call after free-text mode; anything after `--` is literal. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
 
 **Input strategy:**
 
@@ -125,7 +125,7 @@ oly notify send <ID> --title "Done" --description "Summary." --body "Details."
 
 - `<ID>` is optional — include it to link the notification to a specific session. It must be a **running** session; omit the ID if the session already ended.
 - Toggle per-session notifications: `oly notify enable <ID>` / `oly notify disable <ID>`.
-- Notifications go to the **human** (desktop / configured notification hook), never to another session. To message another session, use `oly send` with the report-back protocol below.
+- Notifications go to the **human** (desktop / configured notification hook), never to another session. For agent-to-agent supervision use the dedicated `oly-subagent` skill (`oly skill --subagent`).
 
 ### Help
 
@@ -157,9 +157,10 @@ oly logs <ID> --after <off> --pattern 'DONE|FAILED'
 oly logs <ID> --pattern 'ERROR' --screen         # block on a match, then show the screen
 ```
 
-- **Poll with cursors, not guesses.** Record `offset` from `observe`, then
-  `logs --from <offset> --after <offset> --json` waits for new output and
-  returns exactly the new window in one call; repeat from its `next` offset.
+- **Poll with cursors, not guesses.** Use `oly logs <ID> --from 0 --json`
+  to get an initial `next` offset, then
+  `oly logs <ID> --from <next> --after <next> --json` to wait for and read
+  new output. Continue from each returned `next` offset.
 - **`--idle-ms` means "quiet", never "done".** A silent session may be
   thinking, blocked, or crashed. Treat idle as a hint to look, not as success.
 - **`--pattern` searches only output produced after `--after`** and prints the
@@ -176,60 +177,26 @@ interactive client (CLI or browser attach takes control on arrival and
 resizes the session to its viewport). `oly send` is an ungated operator
 action and always works, regardless of who is attached.
 
-- Check `oly status <ID>` / the attach count before typing into a session a
-  human might be driving; prefer `oly send` over racing them.
-- After any handoff, resume observation from your last cursor (`observe` +
-  `history --from`); never assume the screen you last saw is current.
+- Check `oly ls --json` for the session's `attach_count` before typing into a
+  session a human might be driving; coordinate rather than racing them.
+- After any handoff, resume reading with `oly logs <ID> --from <next> --json`;
+  never assume the screen you last saw is current.
 
 ## Recipes
 
-### Supervise an agent session and push it forward
-
-User: "Run the fixer agent and keep it moving until the tests pass."
-
-1. Start it and note the returned ID:
-   ```bash
-   oly start --title "fix tests" --cwd /repo --detach <agent-cmd>
-   ```
-2. Loop until done — wait, read, decide, act:
-   ```bash
-   oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 5m
-   ```
-   Judge the tail: asking for approval? stuck on a menu? finished?
-   ```bash
-   oly send <ID> "yes" key:enter        # unblock a confirmation
-   oly send <ID> key:ctrl+c             # interrupt a hang, then re-prompt
-   ```
-   Repeat with a timeout that matches the task's pace.
-3. When the task completes, summarize the outcome for the user. Use `oly stop <ID>` if the process is still lingering, and optionally alert them:
-   ```bash
-   oly notify send <ID> --title "fix tests" --description "Done — tests pass."
-   ```
-
-Do NOT answer prompts blindly — when a decision is consequential (destructive action, credentials, ambiguous choice), report to the user instead of guessing.
-
-### Delegate to a worker agent session
-
-Hand a task to another agent CLI and have it report back to you:
-
-1. Start the worker and note the ID:
-   ```bash
-   oly start --title "worker" --cwd /repo --detach pi
-   ```
-2. Optional — switch its model interactively: send `/model` `key:enter`, type a filter, then `key:enter`. Pause ~2s between TUI steps and verify each with `oly logs` before sending the next.
-3. In the task prompt, tell the worker to run `oly skill` itself to learn the CLI — do NOT paste the reference into the prompt. The prompt must include: the task, your own session ID, and the report-back protocol below.
-4. Supervise with the loop from the previous recipe; `oly stop <ID>` when done.
-
-**Report-back protocol (busy-safe).** Sending to another session is not guaranteed: a stopped session rejects input outright (exit 1), and a busy TUI may queue or swallow it. So the sender must check, send, confirm, and retry:
+### Supervise an interactive command
 
 ```bash
-oly ls --json --status running          # 1. receiver must be running
-oly send <TARGET> "worker <ID> DONE branch=... commit=... summary=..." key:enter   # 2. send
-oly logs <TARGET> --tail 15             # 3. confirm your text landed in its output
-sleep 10                                # 4. if missing: wait and resend, up to 3 tries
+oly start --title "interactive task" --cwd /repo --detach <command> [args...]
+oly logs <ID> --tail 40 --wait-for-prompt --timeout 5m
+oly logs <ID> --screen  # inspect the current TUI before deciding what to send
 ```
 
-Make report text self-identifying (sender session ID, status, key results) — a busy receiver may only act on the message later.
+If the program asks for input, check its actual prompt and the task's authorization before responding. After `oly send <ID> ...`, inspect the next output/screen. Confirm completion from the program's result and exit status, not from an idle interval, echoed input, or a successful send.
+
+### Drive another agent CLI
+
+For a coding agent supervising a worker CLI, including scoped prompts, approvals, progress checks, and completion criteria, read the dedicated `oly-subagent` skill (`oly skill --subagent`). Do not treat echoed input or a successful `oly send` as proof of completion.
 
 ### Watch several sessions at once
 
