@@ -34,7 +34,7 @@ pub struct TreeNode {
     pub is_node: bool,
     /// Cached `basename` of `path`; empty for the synthetic root.
     pub name: String,
-    /// Sessions whose cwd resolves to this folder.
+    /// Sessions whose cwd or storage fallback resolves to this folder.
     pub direct_sessions: Vec<usize>,
     /// Indices of child folder nodes (in DFS order; not sorted).
     pub subfolders: Vec<usize>,
@@ -62,6 +62,8 @@ pub struct TreeView {
     pub drilled: HashSet<TreeFolderKey>,
     /// Folders explicitly collapsed by the user, overriding auto expansion.
     pub collapsed: HashSet<TreeFolderKey>,
+    /// Search/status filters reveal all matching folder ancestors by default.
+    pub auto_expand_all: bool,
     pub grouped_nodes: bool,
     /// Flat row list produced by `recompute_visible`.
     pub visible: Vec<TreeEntry>,
@@ -87,6 +89,7 @@ impl TreeView {
             auto_depth: TREE_AUTO_DEPTH,
             drilled: HashSet::new(),
             collapsed: HashSet::new(),
+            auto_expand_all: false,
             grouped_nodes: false,
             visible: Vec::new(),
             cursor: 0,
@@ -225,7 +228,9 @@ impl TreeView {
         if self.collapsed.contains(&key) {
             return false;
         }
-        self.drilled.contains(&key) || depth < self.auto_depth + usize::from(self.grouped_nodes)
+        self.drilled.contains(&key)
+            || self.auto_expand_all
+            || depth < self.auto_depth + usize::from(self.grouped_nodes)
     }
 }
 
@@ -271,13 +276,12 @@ pub fn walk_tree_branch(
                 out,
             );
         }
-    }
-
-    for session_idx in &node.direct_sessions {
-        out.push(TreeEntry::Session {
-            session: *session_idx,
-            depth: depth + 1,
-        });
+        for session_idx in &node.direct_sessions {
+            out.push(TreeEntry::Session {
+                session: *session_idx,
+                depth: depth + 1,
+            });
+        }
     }
 }
 impl TreeEntry {

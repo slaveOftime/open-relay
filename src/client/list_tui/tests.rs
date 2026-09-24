@@ -549,8 +549,10 @@ fn expand_all_tree_folders(app: &mut App) {
                 let super::TreeEntry::Folder { node, depth } = *entry else {
                     return None;
                 };
-                (!app.tree.nodes[node].subfolders.is_empty() && !app.tree.is_expanded(node, depth))
-                    .then_some(position)
+                ((!app.tree.nodes[node].subfolders.is_empty()
+                    || !app.tree.nodes[node].direct_sessions.is_empty())
+                    && !app.tree.is_expanded(node, depth))
+                .then_some(position)
             });
         let Some(position) = next else {
             break;
@@ -654,6 +656,7 @@ fn tree_arrow_keys_move_tree_cursor_only() {
         session_at("charlie", Some("/home/c")),
     ]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     expand_all_tree_folders(&mut app);
     let previous_selected = app.selected;
     let total = app.tree.visible.len();
@@ -790,11 +793,96 @@ fn tree_enter_on_session_emits_open_inline() {
     let mut app = App::default();
     app.replace_sessions(vec![session_at("only", Some("/p"))]);
     app.toggle_view_mode();
-    // Cursor lands on the only session.
+    expand_all_tree_folders(&mut app);
+    let session_position = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "only")
+        })
+        .expect("leaf folder expands to its session");
+    app.tree.cursor = session_position;
     let action = route_key(&mut app, key(KeyCode::Enter), None);
     assert_eq!(action, AppAction::OpenInline);
 }
 
+#[test]
+fn folder_with_only_sessions_can_toggle_its_direct_session_rows() {
+    let mut app = App::default();
+    app.replace_sessions(vec![session_at("only", Some("/work/project"))]);
+    app.toggle_view_mode();
+
+    let work = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].path == std::path::Path::new("work"))
+        })
+        .expect("first cwd folder is visible");
+    app.tree.cursor = work;
+    route_key(&mut app, key(KeyCode::Enter), None);
+
+    let project = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].path == std::path::Path::new("work/project"))
+        })
+        .expect("session-only leaf folder is visible");
+    let super::TreeEntry::Folder { node, depth } = app.tree.visible[project] else {
+        unreachable!()
+    };
+    assert!(app.tree.nodes[node].subfolders.is_empty());
+    assert_eq!(app.tree.nodes[node].direct_sessions.len(), 1);
+    assert!(!app.tree.is_expanded(node, depth));
+    let collapsed = super::folder_line(
+        &app.tree.nodes[node],
+        ratatui::text::Line::default(),
+        false,
+        None,
+        true,
+        false,
+    );
+    assert_eq!(collapsed.spans.last().unwrap().content, "▸ project/");
+
+    app.tree.cursor = project;
+    route_key(&mut app, key(KeyCode::Enter), None);
+    assert!(app.tree.is_expanded(node, depth));
+    assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "only")));
+    let expanded = super::folder_line(
+        &app.tree.nodes[node],
+        ratatui::text::Line::default(),
+        false,
+        None,
+        true,
+        true,
+    );
+    assert_eq!(expanded.spans.last().unwrap().content, "▾ project/");
+
+    let project = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node: current, .. } if *current == node)
+        })
+        .unwrap();
+    app.tree.cursor = project;
+    route_key(&mut app, key(KeyCode::Enter), None);
+    assert!(!app.tree.is_expanded(node, depth));
+    assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "only")));
+}
 #[test]
 fn tree_enter_expands_one_folder_at_a_time_and_can_collapse() {
     let mut app = App::default();
@@ -809,7 +897,10 @@ fn tree_enter_expands_one_folder_at_a_time_and_can_collapse() {
     assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
         super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
 
-    for (step, path) in ["a", "a/b", "a/b/c", "a/b/c/d"].iter().enumerate() {
+    for (step, path) in ["a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e"]
+        .iter()
+        .enumerate()
+    {
         let position = app
             .tree
             .visible
@@ -826,7 +917,7 @@ fn tree_enter_expands_one_folder_at_a_time_and_can_collapse() {
             AppAction::None
         );
         assert!(tree_has_folder(&app, path));
-        if step < 3 {
+        if step < 4 {
             assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
                 super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
         }
@@ -863,6 +954,7 @@ fn tree_navigation_wraps_around_visible_rows() {
     }
     app.replace_sessions(sessions);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     let total = app.tree.visible.len();
     assert!(total > 1, "test needs at least two visible rows");
     app.tree.cursor = 0;
@@ -1035,6 +1127,10 @@ fn tree_filter_sessions_by_search_text() {
                 super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "s2")),
             "tree search should match {filter:?}"
         );
+        if filter == "build-target" {
+            assert!(tree_has_folder(&app, "proj"));
+            assert!(tree_has_folder(&app, "proj/build-target"));
+        }
     }
     app.normalized_filter = "build".into();
     app.rebuild_visible();
@@ -1057,6 +1153,47 @@ fn tree_filter_sessions_by_search_text() {
     );
 }
 
+#[test]
+fn cwdless_sessions_use_their_oly_storage_directory_in_tree_and_filter_paths() {
+    let storage = std::path::PathBuf::from(r"C:\oly-state\sessions");
+    let expected_local_dir = storage.join("orphan-local");
+    let mut local = session("orphan-local");
+    local.cwd = None;
+    let mut remote = session("orphan-remote");
+    remote.cwd = None;
+    remote.node = Some("worker-a".to_string());
+    let mut app = App {
+        session_storage_dir: Some(storage),
+        ..Default::default()
+    };
+    app.replace_sessions(vec![local, remote]);
+
+    let local_index = app
+        .tree
+        .nodes
+        .iter()
+        .find(|node| node.direct_sessions.contains(&0))
+        .expect("local session directory leaf");
+    assert_eq!(local_index.cwd.as_deref(), expected_local_dir.to_str());
+    let remote_index = app
+        .tree
+        .nodes
+        .iter()
+        .find(|node| node.direct_sessions.contains(&1))
+        .expect("remote session directory leaf");
+    let expected_remote_dir = std::path::PathBuf::from("sessions").join("orphan-remote");
+    assert_eq!(remote_index.cwd.as_deref(), expected_remote_dir.to_str());
+
+    app.filter = "orphan-local".to_string();
+    app.update_text_filter();
+    assert!(app.tree.auto_expand_all);
+    assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "orphan-local")));
+    for folder in ["oly-state", "sessions", "orphan-local"] {
+        assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+            super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].name == folder)));
+    }
+}
 #[test]
 fn tree_folders_show_attention_before_descendant_running_state() {
     let mut attention = session_at("attention", Some("/workspace/project/needs/input"));
@@ -1186,6 +1323,19 @@ fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
         .expect("remote work folder is initially visible");
     app.tree.cursor = remote_work;
     route_key(&mut app, key(KeyCode::Enter), None);
+    let remote_app = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].node.as_deref() == Some("worker")
+                    && app.tree.nodes[*node].path == std::path::Path::new("work/app"))
+        })
+        .expect("remote app folder appears after expanding work");
+    app.tree.cursor = remote_app;
+    route_key(&mut app, key(KeyCode::Enter), None);
     let drilled_ids = tree_visible_ids(&app);
     assert!(
         drilled_ids.contains(&"remote".to_string()),
@@ -1281,6 +1431,7 @@ fn tree_keeps_shared_cwd_visible_when_a_session_starts_there() {
         session_at("parent", Some("/work/app")),
         session_at("child", Some("/work/app/sub")),
     ]);
+    app.toggle_view_mode();
     let folder = app
         .tree
         .visible
@@ -1294,6 +1445,16 @@ fn tree_keeps_shared_cwd_visible_when_a_session_starts_there() {
             _ => None,
         })
         .expect("shared cwd must have its own folder");
+    app.tree.cursor = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. } if *node == folder)
+        })
+        .unwrap();
+    route_key(&mut app, key(KeyCode::Enter), None);
     assert_eq!(app.tree.nodes[folder].name, "app");
     assert!(app.tree.nodes[folder].direct_sessions.contains(&0));
 }
@@ -1306,7 +1467,7 @@ fn drilling_a_remote_path_does_not_open_the_same_local_path() {
     remote.node = Some("worker".into());
     app.replace_sessions(vec![local, remote]);
 
-    for path in ["a", "a/b", "a/b/c", "a/b/c/d"] {
+    for path in ["a", "a/b", "a/b/c", "a/b/c/d", "a/b/c/d/e"] {
         let target = app
             .tree
             .visible
@@ -1320,7 +1481,7 @@ fn drilling_a_remote_path_does_not_open_the_same_local_path() {
             .unwrap_or_else(|| panic!("remote folder {path:?} is not visible yet"));
         app.tree.cursor = target;
         app.toggle_tree_drill();
-        if path != "a/b/c/d" {
+        if path != "a/b/c/d/e" {
             assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
                 super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "remote")));
         }
@@ -1343,10 +1504,10 @@ fn tree_draws_sibling_edges_and_continuing_ancestor_lines() {
     app.toggle_view_mode();
     expand_all_tree_folders(&mut app);
     let rendered = render_app(&mut app, 120, 30);
-    assert!(rendered.contains("├── config/"), "{rendered}");
+    assert!(rendered.contains("├── ▾ config/"), "{rendered}");
     assert!(rendered.contains("│   ├──"), "{rendered}");
     assert!(rendered.contains("│   └──"), "{rendered}");
-    assert!(rendered.contains("└── docs/"), "{rendered}");
+    assert!(rendered.contains("└── ▾ docs/"), "{rendered}");
     assert!(
         !rendered.contains("(2)"),
         "folder counts are redundant: {rendered}"
@@ -1434,6 +1595,7 @@ fn tree_render_shows_status_word_with_matching_color() {
     s.status = "running".into();
     app.replace_sessions(vec![s]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     let buffer = render_app_buffer(&mut app, 120, 6);
     let symbols = buffer_symbols(&buffer, 4);
     // The status label "running" must appear on the same line as the

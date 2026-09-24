@@ -66,7 +66,8 @@ pub fn render_tree(
                     &folder_colors,
                     is_selected,
                 );
-                let expandable = !app.tree.nodes[node].subfolders.is_empty();
+                let expandable = !app.tree.nodes[node].subfolders.is_empty()
+                    || !app.tree.nodes[node].direct_sessions.is_empty();
                 let expanded = app.tree.is_expanded(node, depth);
                 lines.push(folder_line(
                     &app.tree.nodes[node],

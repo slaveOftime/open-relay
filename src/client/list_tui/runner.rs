@@ -70,6 +70,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
     let query = super::super::list::build_list_query(args)?;
     let mut app = App {
         show_node: args.node_all || targets.len() > 1,
+        session_storage_dir: Some(config.paths.sessions_dir.clone()),
         ..Default::default()
     };
     // When the list shows exactly one node's sessions, dialogs that start or

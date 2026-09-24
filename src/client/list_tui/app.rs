@@ -201,7 +201,6 @@ pub fn session_sort_label(session: &SessionSummary) -> String {
 
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
     process::Command,
     time::Duration,
 };
@@ -243,6 +242,8 @@ pub struct App {
     pub show_node: bool,
     pub view_mode: ViewMode,
     pub tree: TreeView,
+    /// Local session storage root used to place cwd-less sessions in the tree.
+    pub session_storage_dir: Option<PathBuf>,
     /// Shader-like visual effects (tachyonfx) processed on every frame.
     pub effects: EffectManager<String>,
     /// Timestamp of the previous frame, used to derive the effect tick delta.
@@ -517,22 +518,21 @@ impl App {
                 ref nodes,
                 root,
                 auto_depth,
+                grouped_nodes,
+                auto_expand_all,
                 ref drilled,
                 ref collapsed,
                 ..
             } = self.tree;
+            let auto_depth = if auto_expand_all {
+                usize::MAX
+            } else {
+                auto_depth + usize::from(grouped_nodes)
+            };
             let mut out: Vec<TreeEntry> = Vec::new();
             // Include cwd-less sessions attached directly to the synthetic
             // root as well as node and folder branches.
-            walk_tree_branch(
-                nodes,
-                root,
-                0,
-                auto_depth + usize::from(self.tree.grouped_nodes),
-                drilled,
-                collapsed,
-                &mut out,
-            );
+            walk_tree_branch(nodes, root, 0, auto_depth, drilled, collapsed, &mut out);
             out
         };
         self.tree.visible = visible;
@@ -561,6 +561,22 @@ impl App {
     /// Phase 1 of tree rebuild: clear the prior nodes and re-derive them
     /// from `self.sessions`. Sessions without a `cwd` (or whose cwd matches
     /// the shared prefix) are bucketed onto the synthetic root.
+    fn session_tree_cwd(&self, session: &SessionSummary) -> PathBuf {
+        if let Some(cwd) = session.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            return PathBuf::from(cwd);
+        }
+        // A secondary node's storage root is opaque to this client. Use a
+        // logical sessions/<id> path under that node's tree branch.
+        let root = if session.node.is_none() {
+            self.session_storage_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("sessions"))
+        } else {
+            PathBuf::from("sessions")
+        };
+        root.join(&session.id)
+    }
+
     pub(super) fn build_tree_nodes(&mut self) {
         self.tree.nodes.clear();
         self.tree.nodes.push(TreeNode {
@@ -576,6 +592,8 @@ impl App {
         if self.tree.auto_depth == 0 {
             self.tree.auto_depth = TREE_AUTO_DEPTH;
         }
+        self.tree.auto_expand_all =
+            !self.normalized_filter.is_empty() || self.status_filter != StatusFilter::All;
 
         // Strip the longest shared path prefix so sessions are bucketed under
         // their first differing ancestor. Sessions with no `cwd` and sessions
@@ -644,18 +662,15 @@ impl App {
                 .collect();
             let cwds: Vec<PathBuf> = group_sessions
                 .iter()
-                .filter_map(|(_, session)| session.cwd.as_deref().map(PathBuf::from))
+                .map(|(_, session)| self.session_tree_cwd(session))
                 .filter(|path| !path.as_os_str().is_empty())
                 .collect();
             let common = common_path_prefix(&cwds);
             for (index, session) in group_sessions {
-                let cwd = session
-                    .cwd
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .unwrap_or_default();
-                let effective = if cwd.as_os_str().is_empty() {
-                    PathBuf::new()
+                let cwd = self.session_tree_cwd(session);
+                let cwd_text = cwd.to_string_lossy().into_owned();
+                let effective = if self.tree.auto_expand_all {
+                    cwd.clone()
                 } else {
                     cwd.strip_prefix(&common)
                         .map_or_else(|_| cwd.clone(), |stripped| stripped.to_path_buf())
@@ -664,7 +679,7 @@ impl App {
                     &mut self.tree,
                     group_root,
                     &effective,
-                    session.cwd.as_deref().unwrap_or_default(),
+                    &cwd_text,
                     &node_name,
                 );
                 self.tree.nodes[leaf_idx].direct_sessions.push(index);
@@ -767,7 +782,9 @@ impl App {
         else {
             return;
         };
-        if self.tree.nodes[node].subfolders.is_empty() {
+        if self.tree.nodes[node].subfolders.is_empty()
+            && self.tree.nodes[node].direct_sessions.is_empty()
+        {
             return;
         }
 
@@ -824,22 +841,22 @@ impl App {
             self.tree.cursor = position;
             return;
         }
-        let Some(cwd) = session.cwd.as_deref() else {
-            return;
-        };
+        let cwd = self.session_tree_cwd(session);
         let session_node = session.node.as_deref();
         let common = common_path_prefix(
             &self
                 .sessions
                 .iter()
                 .filter(|candidate| candidate.node.as_deref() == session_node)
-                .filter_map(|candidate| candidate.cwd.as_deref().map(PathBuf::from))
-                .filter(|path| !path.as_os_str().is_empty())
+                .map(|candidate| self.session_tree_cwd(candidate))
                 .collect::<Vec<_>>(),
         );
-        let effective = Path::new(cwd)
-            .strip_prefix(&common)
-            .map_or_else(|_| PathBuf::from(cwd), PathBuf::from);
+        let effective = if self.tree.auto_expand_all {
+            cwd.clone()
+        } else {
+            cwd.strip_prefix(&common)
+                .map_or_else(|_| cwd.clone(), |stripped| stripped.to_path_buf())
+        };
         if let Some((_, position)) = self
             .tree
             .visible
@@ -849,7 +866,7 @@ impl App {
                 TreeEntry::Folder { node, .. } => {
                     let folder = &self.tree.nodes[*node];
                     (folder.node.as_deref() == session_node
-                        && (folder.path.as_os_str().is_empty()
+                        && (folder.is_node && folder.path.as_os_str().is_empty()
                             || effective.starts_with(&folder.path)))
                     .then_some((folder.path.components().count(), position))
                 }
@@ -919,7 +936,12 @@ impl App {
     }
 
     pub(super) fn update_text_filter(&mut self) {
-        self.normalized_filter = self.filter.to_lowercase();
+        let normalized = self.filter.to_lowercase();
+        if normalized != self.normalized_filter {
+            self.tree.drilled.clear();
+            self.tree.collapsed.clear();
+        }
+        self.normalized_filter = normalized;
         self.rebuild_visible();
         // Reset the cursor that matches the active view: `self.selected`
         // for list mode (via `first()`), `tree.cursor` for tree mode so
@@ -975,6 +997,8 @@ impl App {
             StatusFilter::Active => StatusFilter::Inactive,
             StatusFilter::Inactive => StatusFilter::All,
         };
+        self.tree.drilled.clear();
+        self.tree.collapsed.clear();
         self.rebuild_visible();
         if self.view_mode == ViewMode::Tree {
             // `first()` only drives the flat-list cursor, so reset the
