@@ -19,7 +19,7 @@ pub enum AppAction {
     Stop(SessionTarget),
     /// Force-remove a session from the daemon (matches `oly rm -f <id>`).
     /// The RPC is forceful; the TUI asks for confirmation before dispatch.
-    Remove(SessionTarget),
+    Remove(Vec<SessionTarget>),
 }
 
 pub fn route_key(
@@ -102,9 +102,38 @@ pub fn route_key(
             })
         }
         KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            // Require confirmation before force-removing the focused session (`oly rm -f <id>`).
+            if app.view_mode == ViewMode::Tree
+                && let Some(TreeEntry::Folder { node, .. }) =
+                    app.tree.visible.get(app.tree.cursor).copied()
+            {
+                let folder = &app.tree.nodes[node];
+                let label = if folder.is_node {
+                    format!("{} (node)", folder.name)
+                } else {
+                    folder
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| format!("{}/", folder.name))
+                };
+                let display_node = (!folder.is_node)
+                    .then(|| {
+                        folder
+                            .node
+                            .clone()
+                            .or_else(|| list_node.map(str::to_string))
+                    })
+                    .flatten();
+                let targets = app.sessions_under_tree_folder(node, list_node);
+                if targets.is_empty() {
+                    app.set_action_message(Some(format!("no sessions under {label} to remove")));
+                    return AppAction::None;
+                }
+                app.remove_dialog = Some(RemoveDialog::for_folder(targets, label, display_node));
+                return AppAction::None;
+            }
+
             let Some(session) = app.focused_session() else {
-                app.set_action_message(Some("no session in focus to remove".to_string()));
+                app.set_action_message(Some("no session or folder in focus to remove".to_string()));
                 return AppAction::None;
             };
             let target = SessionTarget {
@@ -184,7 +213,7 @@ pub fn route_remove_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -
         KeyCode::Enter | KeyCode::Char('y' | 'Y') => app
             .remove_dialog
             .take()
-            .map_or(AppAction::None, |dialog| AppAction::Remove(dialog.target)),
+            .map_or(AppAction::None, |dialog| AppAction::Remove(dialog.targets)),
         KeyCode::Esc | KeyCode::Char('n' | 'N') => {
             app.remove_dialog = None;
             app.set_action_message(Some("removal cancelled".to_string()));

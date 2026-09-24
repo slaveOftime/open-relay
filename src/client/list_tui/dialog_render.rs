@@ -108,17 +108,14 @@ pub fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
 }
 
 pub fn render_remove_dialog(frame: &mut Frame<'_>, dialog: &RemoveDialog) {
-    let area = centered_rect(frame.area(), 72, 8);
-    let target = match dialog.target.node.as_deref() {
-        Some(node) => format!("{} on {node}", dialog.target.id),
-        None => dialog.target.id.clone(),
-    };
+    let area = centered_rect(frame.area(), 100, 8);
+
     let lines = vec![
-        Line::from(" Force-remove this session?"),
+        Line::from(format!(" {}", dialog.prompt)),
         Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                target,
+                dialog.detail.clone(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

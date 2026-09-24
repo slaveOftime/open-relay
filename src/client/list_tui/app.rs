@@ -209,6 +209,7 @@ use tachyonfx::{EffectManager, RefRect};
 
 use super::dialog::{CloneDialog, RemoveDialog, UpdateDialog};
 use super::keys::AppAction;
+use super::proto::SessionTarget;
 use super::spawn::{session_command, spawn_session_terminal, terminal_marker};
 use super::terminal::{TuiTerminal, wait_for_ctrl_d};
 use super::tree::{
@@ -425,6 +426,48 @@ impl App {
         self.rebuild_tree();
     }
 
+    pub(super) fn sessions_under_tree_folder(
+        &self,
+        folder_index: usize,
+        list_node: Option<&str>,
+    ) -> Vec<SessionTarget> {
+        let Some(folder) = self.tree.nodes.get(folder_index) else {
+            return Vec::new();
+        };
+        let folder_node = folder.node.as_deref().or(list_node);
+        let folder_path = folder.cwd.as_deref().map(PathBuf::from);
+        let mut targets = Vec::new();
+        for session in &self.sessions {
+            let session_node = session.node.as_deref().or(list_node);
+            if session_node != folder_node {
+                continue;
+            }
+            let belongs = if folder.is_node {
+                true
+            } else {
+                let session_path = self.session_tree_cwd(session);
+                folder_path
+                    .as_ref()
+                    .is_some_and(|path| session_path.starts_with(path))
+                    || session_path.ends_with(&folder.path)
+            };
+            if belongs {
+                let target = SessionTarget {
+                    id: session.id.clone(),
+                    node: session
+                        .node
+                        .clone()
+                        .or_else(|| list_node.map(str::to_string)),
+                };
+                if !targets.iter().any(|existing: &SessionTarget| {
+                    existing.id == target.id && existing.node == target.node
+                }) {
+                    targets.push(target);
+                }
+            }
+        }
+        targets
+    }
     pub(super) fn selected_session(&self) -> Option<&SessionSummary> {
         self.visible
             .contains(&self.selected)

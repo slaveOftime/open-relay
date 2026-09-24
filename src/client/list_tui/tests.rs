@@ -32,6 +32,7 @@ fn session(id: &str) -> SessionSummary {
         created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         started_at: None,
         ended_at: None,
+        resume_command: None,
         cwd: None,
         input_needed: false,
         // Mirrors the daemon default: notifications on unless disabled.
@@ -2798,7 +2799,7 @@ fn ctrl_delete_requires_confirmation_before_force_removal() {
     );
     assert_eq!(
         app.message.as_deref(),
-        Some("no session in focus to remove")
+        Some("no session or folder in focus to remove")
     );
 
     assert_eq!(
@@ -2824,11 +2825,15 @@ fn ctrl_delete_requires_confirmation_before_force_removal() {
         "opening confirmation must not remove the row"
     );
     assert_eq!(
-        app.remove_dialog.as_ref().map(|dialog| &dialog.target),
-        Some(&super::SessionTarget {
-            id: "remove-me".to_string(),
-            node: Some("worker-a".to_string()),
-        })
+        app.remove_dialog
+            .as_ref()
+            .map(|dialog| dialog.targets.as_slice()),
+        Some(
+            &[super::SessionTarget {
+                id: "remove-me".to_string(),
+                node: Some("worker-a".to_string()),
+            }][..]
+        )
     );
     let rendered = render_app(&mut app, 100, 18);
     assert!(rendered.contains("Force-remove this session?"));
@@ -2865,10 +2870,10 @@ fn ctrl_delete_requires_confirmation_before_force_removal() {
     route_key(&mut app, ctrl(KeyCode::Delete), None);
     assert_eq!(
         route_key(&mut app, key(KeyCode::Enter), None),
-        AppAction::Remove(super::SessionTarget {
+        AppAction::Remove(vec![super::SessionTarget {
             id: "remove-me".to_string(),
             node: Some("worker-a".to_string()),
-        })
+        }])
     );
     assert!(app.remove_dialog.is_none());
     assert_eq!(
@@ -2901,6 +2906,87 @@ fn removing_a_nonselected_session_preserves_the_selected_session() {
         app.selected_session().map(|session| session.id.as_str()),
         Some("selected")
     );
+}
+#[test]
+fn ctrl_delete_on_folder_removes_all_descendant_sessions_even_when_filtered() {
+    let mut direct = session_at("direct", Some("/work/project"));
+    direct.command = "matches-filter".into();
+    let mut hidden = session_at("nested", Some("/work/project/sub/deep"));
+    hidden.command = "does-not-match".into();
+    let mut outside = session_at("outside", Some("/work/other"));
+    outside.command = "matches-filter".into();
+    let mut app = App::default();
+    app.replace_sessions(vec![direct, hidden, outside]);
+    app.filter = "matches-filter".into();
+    app.update_text_filter();
+    app.toggle_view_mode();
+
+    assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "nested")));
+    let folder = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].cwd.as_deref() == Some("/work/project"))
+        })
+        .expect("project folder in the filtered tree");
+    app.tree.cursor = folder;
+    assert_eq!(
+        route_key(&mut app, ctrl(KeyCode::Delete), None),
+        AppAction::None
+    );
+    let dialog = app
+        .remove_dialog
+        .as_ref()
+        .expect("folder removal confirmation");
+    let ids = dialog
+        .targets
+        .iter()
+        .map(|target| target.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["direct", "nested"]);
+    assert!(dialog.prompt.contains("2 sessions"));
+    assert!(dialog.detail.contains("/work/project"));
+    assert_eq!(
+        app.sessions.len(),
+        3,
+        "confirmation is not optimistic removal"
+    );
+
+    route_key(&mut app, key(KeyCode::Esc), None);
+    assert!(app.remove_dialog.is_none());
+    assert_eq!(app.sessions.len(), 3);
+
+    app.tree.cursor = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+        super::TreeEntry::Folder { node, .. }
+            if app.tree.nodes[*node].cwd.as_deref() == Some("/work/project"))
+        })
+        .unwrap();
+    route_key(&mut app, ctrl(KeyCode::Delete), None);
+    let AppAction::Remove(targets) = route_key(&mut app, key(KeyCode::Enter), None) else {
+        panic!("confirm should dispatch the folder session batch");
+    };
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| target.id.as_str())
+            .collect::<Vec<_>>(),
+        ["direct", "nested"]
+    );
+    assert!(targets.iter().all(|target| {
+        matches!(
+            super::remove_request(target),
+            RpcRequest::Remove { force: true, .. }
+        )
+    }));
 }
 #[test]
 fn refresh_keeps_selection_by_id() {

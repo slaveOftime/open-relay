@@ -16,7 +16,7 @@ use super::constants::{
 use super::keys::{AppAction, route_key};
 use super::refresh::{
     SessionRefresh, apply_refresh, drain_pending_events, fetch_sessions, panic_payload_message,
-    read_terminal_event, remove_session, start_clone, stop_session, update_session,
+    read_terminal_event, remove_sessions, start_clone, stop_session, update_session,
 };
 use super::terminal::TuiTerminal;
 use super::view::render;
@@ -125,7 +125,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
                         }
                         AppAction::Update(update) => update_session(config, &mut app, update).await,
                         AppAction::Stop(target) => stop_session(config, &mut app, target),
-                        AppAction::Remove(target) => remove_session(config, &mut app, target),
+                        AppAction::Remove(targets) => remove_sessions(config, &mut app, targets),
                     }
                     redraw = true;
                 }

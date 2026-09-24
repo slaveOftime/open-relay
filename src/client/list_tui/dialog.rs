@@ -260,18 +260,38 @@ pub const UPDATE_FIELDS: [UpdateField; 3] = [
     UpdateField::Notifications,
 ];
 
-/// Confirmation modal for force-removing a session from the daemon.
+/// Confirmation modal for force-removing one session or a folder's sessions.
 #[derive(Debug, Eq, PartialEq)]
 pub struct RemoveDialog {
-    pub target: SessionTarget,
+    pub targets: Vec<SessionTarget>,
+    pub prompt: String,
+    pub detail: String,
 }
 
 impl RemoveDialog {
     pub fn new(target: SessionTarget) -> Self {
-        Self { target }
+        let detail = match target.node.as_deref() {
+            Some(node) => format!("{} on {node}", target.id),
+            None => target.id.clone(),
+        };
+        Self {
+            targets: vec![target],
+            prompt: "Force-remove this session?".to_string(),
+            detail,
+        }
+    }
+
+    pub fn for_folder(targets: Vec<SessionTarget>, folder: String, node: Option<String>) -> Self {
+        let count = targets.len();
+        let noun = if count == 1 { "session" } else { "sessions" };
+        let detail = node.map_or(folder.clone(), |node| format!("{folder} on {node}"));
+        Self {
+            targets,
+            prompt: format!("Force-remove {count} {noun} in this folder?"),
+            detail,
+        }
     }
 }
-
 #[derive(Debug)]
 pub struct UpdateDialog {
     pub target_id: String,

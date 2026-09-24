@@ -196,16 +196,30 @@ pub fn remove_request(target: &SessionTarget) -> RpcRequest {
     )
 }
 
-pub fn remove_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
-    let request = remove_request(&target);
+pub fn remove_sessions(config: &AppConfig, app: &mut App, targets: Vec<SessionTarget>) {
+    if targets.is_empty() {
+        return;
+    }
+    let requests = targets.iter().map(remove_request).collect::<Vec<_>>();
     let config = config.clone();
     tokio::spawn(async move {
-        let _ = ipc::send_request_checked(&config, request).await;
+        let _ = futures_util::future::join_all(
+            requests
+                .into_iter()
+                .map(|request| ipc::send_request_checked(&config, request)),
+        )
+        .await;
     });
-    app.remove_session_payload(&target.id, target.node.as_deref());
-    app.set_action_message(Some(format!("removing session {}", target.id)));
+    for target in &targets {
+        app.remove_session_payload(&target.id, target.node.as_deref());
+    }
+    let message = if targets.len() == 1 {
+        format!("removing session {}", targets[0].id)
+    } else {
+        format!("removing {} sessions", targets.len())
+    };
+    app.set_action_message(Some(message));
 }
-
 /// Apply the force-remove result only after the duplicate was created. A
 /// refusal leaves the original in the list and makes the partial success
 /// visible instead of silently pretending the original was removed.

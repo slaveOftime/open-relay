@@ -61,8 +61,8 @@ pub(super) use proto::{CloneLaunch, SessionTarget, SessionUpdate, wrap_node};
 pub(super) use refresh::{
     SessionRefresh, apply_refresh, apply_update_response, drain_pending_events,
     drain_pending_events_with, fetch_sessions, is_transient_terminal_error, panic_payload_message,
-    read_terminal_event, read_terminal_event_with, remove_request, remove_session, set_clone_error,
-    set_update_error, start_clone, stop_session, update_session,
+    read_terminal_event, read_terminal_event_with, remove_request, remove_sessions,
+    set_clone_error, set_update_error, start_clone, stop_session, update_session,
 };
 #[cfg(test)]
 pub(super) use spawn::{
