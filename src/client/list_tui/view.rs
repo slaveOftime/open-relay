@@ -13,7 +13,9 @@ use ratatui::{
 
 use super::app::App;
 use super::app::session_key;
-use super::dialog_render::{render_clone_dialog, render_remove_dialog, render_update_dialog};
+use super::dialog_render::{
+    render_clone_dialog, render_remove_dialog, render_resume_dialog, render_update_dialog,
+};
 use super::effects::render_effects;
 use super::table::{
     LayoutMode, aggregate_sparkline_data, format_bytes, rate_color, session_row,
@@ -277,6 +279,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     if let Some(dialog) = app.remove_dialog.as_ref() {
         render_remove_dialog(frame, dialog);
+    } else if let Some(dialog) = app.resume_dialog.as_ref() {
+        render_resume_dialog(frame, dialog);
     } else if let Some(dialog) = app.clone_dialog.as_ref() {
         render_clone_dialog(frame, dialog);
     } else if let Some(dialog) = app.update_dialog.as_ref() {

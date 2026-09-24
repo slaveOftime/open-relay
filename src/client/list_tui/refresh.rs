@@ -268,6 +268,7 @@ pub async fn start_clone(
     match ipc::send_request_checked(config, launch.request()).await {
         Ok(RpcResponse::Start { session_id }) => {
             app.clone_dialog = None;
+            app.resume_dialog = None;
             let (feedback, removal_failed) = if let Some(source) = &launch.remove_source {
                 // Never force-remove the newly created session even if a
                 // buggy daemon were to return the original ID on the same node.
@@ -294,8 +295,12 @@ pub async fn start_clone(
                 }
             }
         }
-        Ok(_) => {
-            set_clone_error(app, "unexpected response type".to_string());
+        Ok(_) if app.resume_dialog.is_some() => {
+            set_resume_error(app, "unexpected response type".to_string());
+        }
+        Ok(_) => set_clone_error(app, "unexpected response type".to_string()),
+        Err(error) if app.resume_dialog.is_some() => {
+            set_resume_error(app, format!("resume failed: {error}"));
         }
         Err(error) => set_clone_error(app, format!("start failed: {error}")),
     }
@@ -356,6 +361,14 @@ pub fn stop_session(config: &AppConfig, app: &mut App, target: SessionTarget) {
 
 pub fn set_clone_error(app: &mut App, error: String) {
     if let Some(dialog) = app.clone_dialog.as_mut() {
+        dialog.error = Some(error);
+    } else {
+        app.set_action_message(Some(error));
+    }
+}
+
+pub fn set_resume_error(app: &mut App, error: String) {
+    if let Some(dialog) = app.resume_dialog.as_mut() {
         dialog.error = Some(error);
     } else {
         app.set_action_message(Some(error));

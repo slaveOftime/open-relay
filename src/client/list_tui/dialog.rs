@@ -292,6 +292,183 @@ impl RemoveDialog {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeField {
+    Command,
+    Args,
+    Cwd,
+    Title,
+    Tags,
+    Node,
+    Rows,
+    Cols,
+    DisableNotifications,
+    AttachAfterStart,
+    RemoveOriginal,
+}
+
+pub const RESUME_FIELDS: [ResumeField; 11] = [
+    ResumeField::Command,
+    ResumeField::Args,
+    ResumeField::Cwd,
+    ResumeField::Title,
+    ResumeField::Tags,
+    ResumeField::Node,
+    ResumeField::Rows,
+    ResumeField::Cols,
+    ResumeField::DisableNotifications,
+    ResumeField::AttachAfterStart,
+    ResumeField::RemoveOriginal,
+];
+
+/// Editable launch form initialized from a persisted resume hint and the
+/// source session's metadata. Enter is the explicit confirmation to resume.
+#[derive(Debug)]
+pub struct ResumeDialog {
+    pub source: SessionSummary,
+    pub source_node: Option<String>,
+    pub active: usize,
+    pub command: EditText,
+    pub args: EditText,
+    pub cwd: EditText,
+    pub title: EditText,
+    pub tags: EditText,
+    pub node: EditText,
+    pub rows: EditText,
+    pub cols: EditText,
+    pub disable_notifications: bool,
+    pub attach_after_start: bool,
+    pub remove_original: bool,
+    pub error: Option<String>,
+}
+
+impl ResumeDialog {
+    pub fn from_session(session: &SessionSummary, list_node: Option<&str>) -> Option<Self> {
+        let resume_command = session
+            .resume_command
+            .as_deref()
+            .filter(|command| !command.trim().is_empty())?;
+        let (command, args, error) = match parse_terminal_words("resume command", resume_command) {
+            Ok(mut words) if !words.is_empty() => {
+                let command = words.remove(0);
+                (command, format_terminal_words(&words), None)
+            }
+            Ok(_) => (
+                String::new(),
+                String::new(),
+                Some("resume command is required".to_string()),
+            ),
+            Err(error) => (resume_command.to_string(), String::new(), Some(error)),
+        };
+        Some(Self {
+            source: session.clone(),
+            source_node: session
+                .node
+                .clone()
+                .or_else(|| list_node.map(str::to_string)),
+            active: 0,
+            command: EditText::new(command),
+            args: EditText::new(args),
+            cwd: EditText::new(session.cwd.clone().unwrap_or_default()),
+            title: EditText::new(session.title.clone().unwrap_or_default()),
+            tags: EditText::new(format_terminal_words(&session.tags)),
+            node: EditText::new(
+                session
+                    .node
+                    .as_deref()
+                    .or(list_node)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            rows: EditText::new(
+                session
+                    .rows
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            cols: EditText::new(
+                session
+                    .cols
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            ),
+            disable_notifications: !session.notifications_enabled,
+            attach_after_start: false,
+            remove_original: false,
+            error,
+        })
+    }
+
+    pub fn active_field(&self) -> ResumeField {
+        RESUME_FIELDS[self.active]
+    }
+
+    pub fn next(&mut self) {
+        self.active = (self.active + 1) % RESUME_FIELDS.len();
+        self.error = None;
+    }
+
+    pub fn previous(&mut self) {
+        self.active = (self.active + RESUME_FIELDS.len() - 1) % RESUME_FIELDS.len();
+        self.error = None;
+    }
+
+    pub fn active_text_mut(&mut self) -> Option<&mut EditText> {
+        match self.active_field() {
+            ResumeField::Command => Some(&mut self.command),
+            ResumeField::Args => Some(&mut self.args),
+            ResumeField::Cwd => Some(&mut self.cwd),
+            ResumeField::Title => Some(&mut self.title),
+            ResumeField::Tags => Some(&mut self.tags),
+            ResumeField::Node => Some(&mut self.node),
+            ResumeField::Rows => Some(&mut self.rows),
+            ResumeField::Cols => Some(&mut self.cols),
+            ResumeField::DisableNotifications
+            | ResumeField::AttachAfterStart
+            | ResumeField::RemoveOriginal => None,
+        }
+    }
+
+    pub fn toggle_active(&mut self) {
+        match self.active_field() {
+            ResumeField::DisableNotifications => {
+                self.disable_notifications = !self.disable_notifications;
+            }
+            ResumeField::AttachAfterStart => {
+                self.attach_after_start = !self.attach_after_start;
+            }
+            ResumeField::RemoveOriginal => {
+                self.remove_original = !self.remove_original;
+            }
+            _ => {}
+        }
+        self.error = None;
+    }
+
+    pub fn launch(&self) -> std::result::Result<CloneLaunch, String> {
+        let command = optional_text(&self.command.value).ok_or("command is required")?;
+        let args = parse_terminal_words("args", &self.args.value)?;
+        let tags = parse_terminal_words("tags", &self.tags.value)?;
+        let rows = parse_dimension("rows", &self.rows.value)?;
+        let cols = parse_dimension("cols", &self.cols.value)?;
+        Ok(CloneLaunch {
+            title: optional_text(&self.title.value),
+            tags,
+            command,
+            args,
+            cwd: optional_text(&self.cwd.value),
+            node: optional_text(&self.node.value),
+            rows,
+            cols,
+            disable_notifications: self.disable_notifications,
+            attach_after_start: self.attach_after_start,
+            remove_source: self.remove_original.then(|| SessionTarget {
+                id: self.source.id.clone(),
+                node: self.source_node.clone(),
+            }),
+        })
+    }
+}
 #[derive(Debug)]
 pub struct UpdateDialog {
     pub target_id: String,

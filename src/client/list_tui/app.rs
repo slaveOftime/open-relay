@@ -207,7 +207,7 @@ use std::{
 
 use tachyonfx::{EffectManager, RefRect};
 
-use super::dialog::{CloneDialog, RemoveDialog, UpdateDialog};
+use super::dialog::{CloneDialog, RemoveDialog, ResumeDialog, UpdateDialog};
 use super::keys::AppAction;
 use super::proto::SessionTarget;
 use super::spawn::{session_command, spawn_session_terminal, terminal_marker};
@@ -240,6 +240,7 @@ pub struct App {
     pub clone_dialog: Option<CloneDialog>,
     pub update_dialog: Option<UpdateDialog>,
     pub remove_dialog: Option<RemoveDialog>,
+    pub resume_dialog: Option<ResumeDialog>,
     pub show_node: bool,
     pub view_mode: ViewMode,
     pub tree: TreeView,

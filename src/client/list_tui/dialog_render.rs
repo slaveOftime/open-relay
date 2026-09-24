@@ -9,11 +9,13 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::constants::{
-    CLONE_DIALOG_HELP, DIALOG_FIELD_BG, DIALOG_LABEL_WIDTH, REMOVE_DIALOG_HELP, UPDATE_DIALOG_HELP,
+    CLONE_DIALOG_HELP, DIALOG_FIELD_BG, DIALOG_LABEL_WIDTH, REMOVE_DIALOG_HELP, RESUME_DIALOG_HELP,
+    UPDATE_DIALOG_HELP,
 };
 use super::dialog::format_terminal_words;
 use super::dialog::{
-    CloneDialog, CloneField, EditText, RemoveDialog, UPDATE_FIELDS, UpdateDialog, UpdateField,
+    CloneDialog, CloneField, EditText, RemoveDialog, ResumeDialog, ResumeField, UPDATE_FIELDS,
+    UpdateDialog, UpdateField,
 };
 use super::table::{format_bytes, pad_truncated};
 use crate::protocol::SessionSummary;
@@ -76,6 +78,123 @@ pub fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
     );
 }
 
+fn resume_field_line(
+    dialog: &ResumeDialog,
+    field: ResumeField,
+    width: u16,
+    cursor_visible: bool,
+) -> Line<'static> {
+    let active = dialog.active_field() == field;
+    let value_width = dialog_value_width(width);
+    let (label, value_spans) = match field {
+        ResumeField::Command => (
+            "Command",
+            text_value_spans(
+                &dialog.command,
+                active,
+                value_width,
+                cursor_visible,
+                "‹required›",
+            ),
+        ),
+        ResumeField::Args => (
+            "Arguments",
+            text_value_spans(&dialog.args, active, value_width, cursor_visible, "‹none›"),
+        ),
+        ResumeField::Cwd => (
+            "Directory",
+            text_value_spans(
+                &dialog.cwd,
+                active,
+                value_width,
+                cursor_visible,
+                "‹default›",
+            ),
+        ),
+        ResumeField::Title => (
+            "Title",
+            text_value_spans(&dialog.title, active, value_width, cursor_visible, "‹auto›"),
+        ),
+        ResumeField::Tags => (
+            "Tags",
+            text_value_spans(&dialog.tags, active, value_width, cursor_visible, "‹none›"),
+        ),
+        ResumeField::Node => (
+            "Node",
+            text_value_spans(&dialog.node, active, value_width, cursor_visible, "‹local›"),
+        ),
+        ResumeField::Rows => (
+            "Rows",
+            text_value_spans(&dialog.rows, active, value_width, cursor_visible, "‹auto›"),
+        ),
+        ResumeField::Cols => (
+            "Columns",
+            text_value_spans(&dialog.cols, active, value_width, cursor_visible, "‹auto›"),
+        ),
+        ResumeField::DisableNotifications => (
+            "Notifications",
+            checkbox_spans(!dialog.disable_notifications, active, None),
+        ),
+        ResumeField::AttachAfterStart => (
+            "Attach",
+            checkbox_spans(dialog.attach_after_start, active, Some("after start")),
+        ),
+        ResumeField::RemoveOriginal => (
+            "Remove original",
+            checkbox_spans(
+                dialog.remove_original,
+                active,
+                Some("force after successful start"),
+            ),
+        ),
+    };
+    dialog_field_line(active, label, value_spans)
+}
+
+pub fn render_resume_dialog(frame: &mut Frame<'_>, dialog: &ResumeDialog) {
+    let area = centered_rect(frame.area(), 96, 20);
+    let cursor_visible = clone_cursor_visible();
+    let field_line = |field| resume_field_line(dialog, field, area.width, cursor_visible);
+    let mut lines = vec![section_header("PROCESS")];
+    lines.extend(
+        [ResumeField::Command, ResumeField::Args, ResumeField::Cwd]
+            .into_iter()
+            .map(field_line),
+    );
+    lines.push(Line::default());
+    lines.push(section_header("METADATA"));
+    lines.extend(
+        [ResumeField::Title, ResumeField::Tags, ResumeField::Node]
+            .into_iter()
+            .map(field_line),
+    );
+    lines.push(Line::default());
+    lines.push(section_header("OPTIONS"));
+    lines.extend(
+        [
+            ResumeField::Rows,
+            ResumeField::Cols,
+            ResumeField::DisableNotifications,
+            ResumeField::AttachAfterStart,
+            ResumeField::RemoveOriginal,
+        ]
+        .into_iter()
+        .map(field_line),
+    );
+    lines.push(tip_separator(area.width));
+    lines.push(dialog_footer(dialog.error.as_deref(), RESUME_DIALOG_HELP));
+    render_dialog(
+        frame,
+        area,
+        format!(
+            " ↻ Resume {} ({}) ",
+            dialog.source.id,
+            dialog.source_node.as_deref().unwrap_or("local")
+        ),
+        Color::Cyan,
+        lines,
+    );
+}
 pub fn render_update_dialog(frame: &mut Frame<'_>, dialog: &UpdateDialog) {
     let area = centered_rect(frame.area(), 110, 22);
     let cursor_visible = clone_cursor_visible();

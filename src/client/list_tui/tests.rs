@@ -2047,6 +2047,122 @@ fn clone_dialog_uses_sections_placeholders_and_focused_input_styles() {
 }
 
 #[test]
+fn ctrl_r_opens_editable_resume_form_for_sessions_with_saved_commands() {
+    let mut app = App::default();
+    assert_eq!(
+        route_key(&mut app, ctrl(KeyCode::Char('r')), None),
+        AppAction::None
+    );
+    assert_eq!(
+        app.message.as_deref(),
+        Some("no session in focus to resume")
+    );
+
+    let mut stopped = session("resume-me");
+    stopped.status = "stopped".into();
+    stopped.title = Some("Research".into());
+    stopped.tags = vec!["notes".into()];
+    stopped.cwd = Some(r"C:\work\agent".into());
+    stopped.node = Some("worker-a".into());
+    stopped.rows = Some(36);
+    stopped.cols = Some(120);
+    stopped.notifications_enabled = true;
+    stopped.resume_command = Some(r#"pi --session 'C:\Users\me\My Sessions\session.jsonl'"#.into());
+    app.replace_sessions(vec![stopped]);
+
+    assert_eq!(
+        route_key(&mut app, ctrl(KeyCode::Char('r')), None),
+        AppAction::None
+    );
+    let dialog = app.resume_dialog.as_ref().expect("resume dialog opened");
+    assert_eq!(dialog.command.value, "pi");
+    assert!(dialog.args.value.contains("My Sessions"));
+    assert_eq!(dialog.cwd.value, r"C:\work\agent");
+    assert_eq!(dialog.title.value, "Research");
+    assert_eq!(dialog.tags.value, "notes");
+    assert_eq!(dialog.node.value, "worker-a");
+    assert_eq!(dialog.rows.value, "36");
+    assert_eq!(dialog.cols.value, "120");
+    assert!(!dialog.disable_notifications);
+    assert!(!dialog.attach_after_start, "resume attach is opt-in");
+    assert!(!dialog.remove_original, "removing the source is opt-in");
+    assert!(dialog.launch().unwrap().remove_source.is_none());
+    let rendered = render_app(&mut app, 120, 30);
+    assert!(rendered.contains("Resume resume-me (worker-a)"));
+    assert!(rendered.contains("Arguments"));
+    assert!(rendered.contains("Directory"));
+    assert!(rendered.contains("Notifications"));
+    assert!(rendered.contains("Attach"));
+    assert!(rendered.contains("Remove original"));
+
+    assert_eq!(
+        route_key(&mut app, key(KeyCode::Tab), None),
+        AppAction::None
+    );
+    assert_eq!(
+        app.resume_dialog.as_ref().unwrap().active_field(),
+        super::ResumeField::Args
+    );
+    assert_eq!(
+        route_key(&mut app, key(KeyCode::Esc), None),
+        AppAction::None
+    );
+    assert!(app.resume_dialog.is_none());
+
+    route_key(&mut app, ctrl(KeyCode::Char('r')), None);
+    app.resume_dialog.as_mut().unwrap().command = super::EditText::new("agent-cli".into());
+    app.resume_dialog.as_mut().unwrap().args =
+        super::EditText::new(r#"--resume "token with spaces""#.into());
+    app.resume_dialog.as_mut().unwrap().cwd = super::EditText::new(r"D:\resume work".into());
+    app.resume_dialog.as_mut().unwrap().title = super::EditText::new("Resumed agent".into());
+    app.resume_dialog.as_mut().unwrap().tags = super::EditText::new("recovered important".into());
+    app.resume_dialog.as_mut().unwrap().node = super::EditText::new("worker-b".into());
+    app.resume_dialog.as_mut().unwrap().rows = super::EditText::new("50".into());
+    app.resume_dialog.as_mut().unwrap().cols = super::EditText::new("160".into());
+    for active in [8, 9, 10] {
+        app.resume_dialog.as_mut().unwrap().active = active;
+        route_key(&mut app, key(KeyCode::Char(' ')), None);
+    }
+
+    let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), None) else {
+        panic!("Enter should start the edited resume command");
+    };
+    assert_eq!(launch.command, "agent-cli");
+    assert_eq!(launch.args, ["--resume", "token with spaces"]);
+    assert_eq!(launch.cwd.as_deref(), Some(r"D:\resume work"));
+    assert_eq!(launch.node.as_deref(), Some("worker-b"));
+    assert_eq!(launch.title.as_deref(), Some("Resumed agent"));
+    assert_eq!(launch.tags, ["recovered", "important"]);
+    assert_eq!(launch.rows, Some(50));
+    assert_eq!(launch.cols, Some(160));
+    assert!(launch.disable_notifications);
+    assert!(launch.attach_after_start);
+    assert_eq!(
+        launch.remove_source,
+        Some(super::SessionTarget {
+            id: "resume-me".to_string(),
+            node: Some("worker-a".to_string()),
+        })
+    );
+    let RpcRequest::NodeProxy { node, inner } = launch.request() else {
+        panic!("resume launch should target the edited node");
+    };
+    assert_eq!(node, "worker-b");
+    assert!(matches!(*inner, RpcRequest::Start { cmd, args, .. }
+        if cmd == "agent-cli" && args == ["--resume", "token with spaces"]));
+
+    let mut no_hint = App::default();
+    let mut inactive = session("without-hint");
+    inactive.status = "stopped".into();
+    no_hint.replace_sessions(vec![inactive]);
+    route_key(&mut no_hint, ctrl(KeyCode::Char('r')), None);
+    assert!(no_hint.resume_dialog.is_none());
+    assert_eq!(
+        no_hint.message.as_deref(),
+        Some("session without-hint has no saved resume command")
+    );
+}
+#[test]
 fn ctrl_c_is_the_only_list_exit_and_ctrl_v_no_longer_clones() {
     let mut app = App::default();
     app.replace_sessions(vec![session("source")]);

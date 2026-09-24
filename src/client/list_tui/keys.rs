@@ -5,7 +5,7 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use super::app::App;
-use super::dialog::{CloneDialog, EditText, RemoveDialog, UpdateDialog};
+use super::dialog::{CloneDialog, EditText, RemoveDialog, ResumeDialog, UpdateDialog};
 use super::proto::{CloneLaunch, SessionTarget, SessionUpdate};
 use super::tree::{TreeEntry, ViewMode};
 
@@ -41,6 +41,9 @@ pub fn route_key(
     if app.remove_dialog.is_some() {
         return route_remove_dialog_key(app, key);
     }
+    if app.resume_dialog.is_some() {
+        return route_resume_dialog_key(app, key);
+    }
 
     match key.code {
         _ if is_new_session_dialog_key(key) => {
@@ -75,6 +78,21 @@ pub fn route_key(
                 return AppAction::None;
             };
             app.update_dialog = Some(UpdateDialog::from_session(session, list_node));
+            AppAction::None
+        }
+        KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let Some(session) = app.focused_session() else {
+                app.set_action_message(Some("no session in focus to resume".to_string()));
+                return AppAction::None;
+            };
+            let session_id = session.id.clone();
+            let Some(dialog) = ResumeDialog::from_session(session, list_node) else {
+                app.set_action_message(Some(format!(
+                    "session {session_id} has no saved resume command"
+                )));
+                return AppAction::None;
+            };
+            app.resume_dialog = Some(dialog);
             AppAction::None
         }
         KeyCode::Char('g' | 'G') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -223,6 +241,69 @@ pub fn route_remove_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -
     }
 }
 
+pub fn route_resume_dialog_key(app: &mut App, key: crossterm::event::KeyEvent) -> AppAction {
+    if key.code == KeyCode::Esc {
+        app.resume_dialog = None;
+        app.set_action_message(Some("resume cancelled".to_string()));
+        return AppAction::None;
+    }
+
+    let dialog = app.resume_dialog.as_mut().expect("dialog checked above");
+    match key.code {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => dialog.previous(),
+        KeyCode::Tab => dialog.next(),
+        KeyCode::BackTab => dialog.previous(),
+        KeyCode::Enter => match dialog.launch() {
+            Ok(launch) => return AppAction::Start(launch),
+            Err(error) => dialog.error = Some(error),
+        },
+        KeyCode::Char(' ') if dialog.active_text_mut().is_none() => dialog.toggle_active(),
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            if let Some(field) = dialog.active_text_mut() {
+                field.insert(character);
+                dialog.error = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.backspace();
+                dialog.error = None;
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.delete();
+                dialog.error = None;
+            }
+        }
+        KeyCode::Left => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.right();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.cursor = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(field) = dialog.active_text_mut() {
+                field.cursor = field.value.chars().count();
+            }
+        }
+        _ => {}
+    }
+    AppAction::None
+}
 pub fn is_clone_dialog_key(key: crossterm::event::KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('\u{4}'))
         || (key.modifiers.contains(KeyModifiers::CONTROL)
