@@ -369,7 +369,7 @@ pub struct RemoveArgs {
     /// Session ID to delete. If omitted, uses the most recently created session.
     pub id: Option<String>,
     /// Delete even if the session is still running (it is killed first).
-    #[arg(long, short = "f")]
+    #[arg(long, short = 'f')]
     pub force: bool,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
