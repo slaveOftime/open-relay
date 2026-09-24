@@ -499,7 +499,10 @@ pub async fn set_session_metadata(
             notifications_enabled: body.notifications_enabled,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::Session { summary }) => Json(summary).into_response(),
+            Ok(RpcResponse::Session { mut summary }) => {
+                tag_sessions_with_node(std::slice::from_mut(&mut summary), node);
+                Json(summary).into_response()
+            }
             Ok(RpcResponse::Error { message }) => (
                 if message.starts_with("session not found:") {
                     StatusCode::NOT_FOUND

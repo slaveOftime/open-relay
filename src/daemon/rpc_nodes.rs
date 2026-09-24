@@ -432,46 +432,47 @@ async fn connect_and_relay(
 
                 match node_msg {
                     NodeWsMessage::Rpc { id, request } => {
-                        let req = match serde_json::from_value::<RpcRequest>(request) {
-                            Ok(r) => {
-                                if is_supported_proxied_rpc(&r) {
-                                    r
-                                } else {
-                                    warn!(%id, request_type = r.name(), "unsupported proxied RPC method");
+                        let response = match serde_json::from_value::<RpcRequest>(request) {
+                            Ok(req) if is_supported_proxied_rpc(&req) => {
+                                if matches!(req, RpcRequest::AttachSubscribe { .. }) {
+                                    let local_cfg = Arc::clone(local_config);
+                                    let rpc_id = id.clone();
+                                    let frame_tx = stream_frame_tx.clone();
+                                    let (msg_tx, msg_rx) = mpsc::channel::<RpcRequest>(64);
+                                    streams.insert(rpc_id.clone(), msg_tx);
+                                    tokio::spawn(async move {
+                                        if let Err(err) =
+                                            relay_streaming_rpc(&local_cfg, req, &rpc_id, &frame_tx, msg_rx).await
+                                        {
+                                            warn!(%err, id = %rpc_id, "streaming relay failed");
+                                            let resp = RpcResponse::Error {
+                                                message: err.to_string(),
+                                            };
+                                            let _ = frame_tx.send((rpc_id, resp, true)).await;
+                                        }
+                                    });
                                     continue;
+                                }
+
+                                match ipc::send_request(local_config, req).await {
+                                    Ok(r) => r,
+                                    Err(err) => RpcResponse::Error {
+                                        message: err.to_string(),
+                                    },
+                                }
+                            }
+                            Ok(req) => {
+                                warn!(%id, request_type = req.name(), "unsupported proxied RPC method");
+                                RpcResponse::Error {
+                                    message: format!("unsupported proxied RPC method: {}", req.name()),
                                 }
                             }
                             Err(err) => {
                                 warn!(%err, id = %id, "failed to deserialise proxied RPC");
-                                continue;
-                            }
-                        };
-
-                        if matches!(req, RpcRequest::AttachSubscribe { .. }) {
-                            let local_cfg = Arc::clone(local_config);
-                            let rpc_id = id.clone();
-                            let frame_tx = stream_frame_tx.clone();
-                            let (msg_tx, msg_rx) = mpsc::channel::<RpcRequest>(64);
-                            streams.insert(rpc_id.clone(), msg_tx);
-                            tokio::spawn(async move {
-                                if let Err(err) =
-                                    relay_streaming_rpc(&local_cfg, req, &rpc_id, &frame_tx, msg_rx).await
-                                {
-                                    warn!(%err, id = %rpc_id, "streaming relay failed");
-                                    let resp = RpcResponse::Error {
-                                        message: err.to_string(),
-                                    };
-                                    let _ = frame_tx.send((rpc_id, resp, true)).await;
+                                RpcResponse::Error {
+                                    message: format!("invalid proxied RPC request: {err}"),
                                 }
-                            });
-                            continue;
-                        }
-
-                        let response = match ipc::send_request(local_config, req).await {
-                            Ok(r) => r,
-                            Err(err) => RpcResponse::Error {
-                                message: err.to_string(),
-                            },
+                            }
                         };
 
                         let response_json = match serde_json::to_value(&response) {
@@ -583,16 +584,21 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
         RpcRequest::Health
             | RpcRequest::List { .. }
             | RpcRequest::Start { .. }
+            | RpcRequest::SessionMetadataSet { .. }
             | RpcRequest::NotifySet { .. }
             | RpcRequest::NotifySend { .. }
             | RpcRequest::AttachSubscribe { .. }
             | RpcRequest::AttachInput { .. }
+            | RpcRequest::SessionCursor { .. }
+            | RpcRequest::ObserveWindow { .. }
             | RpcRequest::AttachBusy { .. }
             | RpcRequest::UploadFile { .. }
             | RpcRequest::AttachResize { .. }
             | RpcRequest::AttachDetach { .. }
             | RpcRequest::Stop { .. }
+            | RpcRequest::Restart { .. }
             | RpcRequest::Kill { .. }
+            | RpcRequest::Remove { .. }
             | RpcRequest::LogsWait { .. }
             | RpcRequest::LogsTail { .. }
             | RpcRequest::LogsPagination { .. }
@@ -968,6 +974,44 @@ mod tests {
             description: Some("Build finished".to_string()),
             body: Some("Open the session for details.".to_string()),
             url: None,
+        }));
+    }
+
+    /// Session-scoped commands exposed by the CLI and web API must reach
+    /// the owning daemon, while daemon administration stays local.
+    #[test]
+    fn session_scoped_methods_are_proxyable() {
+        for req in [
+            RpcRequest::SessionMetadataSet {
+                id: "s".into(),
+                title: Some("new title".into()),
+                tags: Some(vec!["project".into()]),
+                notifications_enabled: None,
+            },
+            RpcRequest::SessionCursor { id: "s".into() },
+            RpcRequest::ObserveWindow {
+                id: "s".into(),
+                from: 0,
+                max_bytes: 1024,
+            },
+            RpcRequest::Restart {
+                id: "s".into(),
+                force: false,
+            },
+            RpcRequest::Remove {
+                id: "s".into(),
+                force: false,
+            },
+        ] {
+            assert!(is_supported_proxied_rpc(&req), "{} must relay", req.name());
+            assert!(
+                !is_stream_message_relayable(&req),
+                "{} must not ride an attach stream",
+                req.name()
+            );
+        }
+        assert!(!is_supported_proxied_rpc(&RpcRequest::DaemonStop {
+            grace_seconds: 0,
         }));
     }
 

@@ -852,6 +852,49 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         "local list unexpectedly included remote session id.\nOutput:\n{local_ls_out}"
     );
 
+    // The browser's metadata endpoint must proxy updates to the owning node
+    // rather than leaving the caller to hit the 30-second RPC deadline.
+    let metadata = rt.block_on(async {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("build HTTP client")
+            .post(format!(
+                "http://127.0.0.1:{port}/api/sessions/{session_id}/metadata?node=worker1"
+            ))
+            .header("content-type", "application/json")
+            .body(
+                json!({
+                    "title": "Remote title",
+                    "tags": ["remote", "edited"],
+                    "notifications_enabled": false,
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("remote metadata update should answer promptly")
+    });
+    assert_eq!(metadata.status(), reqwest::StatusCode::OK);
+    let updated_body = rt
+        .block_on(metadata.text())
+        .expect("metadata response body");
+    let updated: serde_json::Value = serde_json::from_str(&updated_body).expect("metadata JSON");
+    assert_eq!(updated["title"], "Remote title");
+    assert_eq!(updated["node"], "worker1");
+    assert_eq!(updated["tags"], json!(["remote", "edited"]));
+    assert_eq!(updated["notifications_enabled"], false);
+
+    let remote_ls_after_update = oly_cmd(&primary_tmp)
+        .args(["ls", "--node", "worker1"])
+        .output()
+        .expect("`oly ls --node` after update failed to execute");
+    assert!(remote_ls_after_update.status.success());
+    assert!(
+        String::from_utf8_lossy(&remote_ls_after_update.stdout).contains("Remote title"),
+        "updated title must be stored on the secondary"
+    );
+
     const REMOTE_MARKER: &str = "oly_federation_remote_marker";
     let input = oly_cmd(&primary_tmp)
         .args([
@@ -883,6 +926,29 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         fetch_logs_node(&primary_tmp, "worker1", &session_id)
     );
 
+    // Agent-facing bounded history uses a separate pair of one-shot RPCs.
+    let remote_window = oly_cmd(&primary_tmp)
+        .args([
+            "logs",
+            &session_id,
+            "--node",
+            "worker1",
+            "--from",
+            "0",
+            "--limit",
+            "4096",
+        ])
+        .output()
+        .expect("`oly logs --from --node` failed to execute");
+    assert!(
+        remote_window.status.success(),
+        "remote history read failed: {}",
+        String::from_utf8_lossy(&remote_window.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&remote_window.stdout).contains(REMOTE_MARKER),
+        "remote history window missing marker"
+    );
     const REMOTE_FILE_MARKER: &str = "oly_federation_remote_file_marker";
     let upload_source = primary_tmp.join("remote-send-source.txt");
     fs::write(&upload_source, REMOTE_FILE_MARKER).expect("write remote send source file");
