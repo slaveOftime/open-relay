@@ -54,6 +54,55 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
     r"(?i)press (?:enter|return|any key)",
 ];
 
+/// A resume hint advertised in the rendered tail of a completed session.
+/// `program` matches the child executable's basename (case-insensitive),
+/// ignoring .exe/.cmd/.bat. `pattern` is a Rust regex with at least one
+/// capture group; `command` expands `$1`, `$2`, etc. from the match.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ResumePattern {
+    pub program: String,
+    pub pattern: String,
+    pub command: String,
+}
+
+/// Defaults live here so operators can replace them with `resume_patterns`
+/// or append to them with `additional_resume_patterns` in config.json.
+/// For example, to keep codex/pi and add another agent:
+///
+/// ```json
+/// {
+///   "additional_resume_patterns": [{
+///     "program": "agent",
+///     "pattern": "agent --resume ([a-z0-9-]+)",
+///     "command": "agent --restore $1"
+///   }]
+/// }
+/// ```
+///
+/// Set `"resume_patterns": []` to disable built-in detection, or supply an
+/// array of rules to replace it. The last matching hint in the tail wins.
+pub fn default_resume_patterns() -> Vec<ResumePattern> {
+    vec![
+        ResumePattern {
+            program: "codex".into(),
+            pattern: r"(?i)(?:^|[^a-z0-9_])codex(?:\.exe)?[ \t]+resume[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[^a-z0-9-])".into(),
+            command: "codex resume $1".into(),
+        },
+        ResumePattern {
+            program: "pi".into(),
+            pattern: r#"(?i)(?:^|[^a-z0-9_])pi(?:\.exe)?[ \t]+--session[ \t]+("[a-z0-9_./:\\~ -]{1,1024}"|'[a-z0-9_./:\\~ -]{1,1024}'|[a-z0-9_./:\\~-]{1,1024})"#.into(),
+            command: "pi --session $1".into(),
+        },
+    ]
+}
+
+/// Configured rules for deriving a resume hint. The detected text is a
+/// suggestion only; the daemon must never execute it automatically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeConfig {
+    pub patterns: Vec<ResumePattern>,
+}
+
 // ── Hot-reload diff helper (S3.4) ──────────────────────────────────────────
 //
 // `AppConfig::hot_reload_changes` and `restart_required_changes` used to be
@@ -182,6 +231,7 @@ impl_config_diff!(WebPushConfig {
     vapid_private_key,
     proxy,
 });
+impl_config_diff!(ResumeConfig { patterns });
 
 /// CLI/runtime flag overrides that take precedence over `config.json`.
 ///
@@ -204,6 +254,7 @@ pub struct AppConfig {
     pub notify: NotifyConfig,
     pub limits: LimitsConfig,
     pub web_push: WebPushConfig,
+    pub resume: ResumeConfig,
     pub log_level: String,
     /// CLI/runtime flag overrides, recorded so hot reloads can re-apply them:
     /// a value passed on the command line keeps winning over `config.json`
@@ -254,6 +305,8 @@ struct AppConfigOverrides {
     web_push: WebPushOverrides,
     #[serde(flatten)]
     limits: LimitsOverrides,
+    #[serde(flatten)]
+    resume: ResumeOverrides,
     log_level: Option<String>,
 }
 
@@ -274,6 +327,14 @@ struct NotifyOverrides {
     notification_min_interval_seconds: Option<u64>,
     notification_hook: Option<String>,
     prompt_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResumeOverrides {
+    /// Replace the defaults (an empty array disables detection).
+    resume_patterns: Option<Vec<ResumePattern>>,
+    /// Append to the chosen base patterns (defaults unless replaced).
+    additional_resume_patterns: Option<Vec<ResumePattern>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -315,11 +376,25 @@ impl AppConfig {
         let state_dir = crate::storage::resolve_state_dir();
         ensure_config_file(&state_dir);
         let overrides = load_overrides(&state_dir);
-        Ok(Self::resolve(state_dir, overrides))
+        let config = Self::resolve(state_dir, overrides);
+        config
+            .validate_resume_patterns()
+            .map_err(crate::error::AppError::Protocol)?;
+        Ok(config)
     }
 
     /// Build a fully-resolved config from parsed `config.json` overrides.
     fn resolve(state_dir: PathBuf, overrides: AppConfigOverrides) -> Self {
+        let mut resume_patterns = overrides
+            .resume
+            .resume_patterns
+            .unwrap_or_else(default_resume_patterns);
+        resume_patterns.extend(
+            overrides
+                .resume
+                .additional_resume_patterns
+                .unwrap_or_default(),
+        );
         let paths = PathsConfig {
             state_dir: state_dir.clone(),
             sessions_dir: state_dir.join("sessions"),
@@ -407,6 +482,9 @@ impl AppConfig {
             notify,
             limits,
             web_push,
+            resume: ResumeConfig {
+                patterns: resume_patterns,
+            },
             log_level,
             runtime_overrides: RuntimeOverrides::default(),
         }
@@ -423,7 +501,26 @@ impl AppConfig {
         let mut next = Self::resolve(self.paths.state_dir.clone(), overrides);
         next.runtime_overrides = self.runtime_overrides.clone();
         next.apply_runtime_overrides();
+        next.validate_resume_patterns()?;
         Ok(next)
+    }
+
+    fn validate_resume_patterns(&self) -> std::result::Result<(), String> {
+        for (index, rule) in self.resume.patterns.iter().enumerate() {
+            if rule.program.trim().is_empty() || rule.command.trim().is_empty() {
+                return Err(format!(
+                    "resume pattern {index}: program and command must not be empty"
+                ));
+            }
+            let regex = regex::Regex::new(&rule.pattern)
+                .map_err(|err| format!("resume pattern {index}: invalid regex: {err}"))?;
+            if regex.captures_len() < 2 {
+                return Err(format!(
+                    "resume pattern {index}: regex must have a capture group"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Names of hot-reloadable fields that differ between `self` and `other`.
@@ -439,6 +536,7 @@ impl AppConfig {
         changed.extend(self.notify.diff(&other.notify));
         changed.extend(self.limits.diff(&other.limits));
         changed.extend(self.web_push.diff(&other.web_push));
+        changed.extend(self.resume.diff(&other.resume));
         if self.log_level != other.log_level {
             changed.push("log_level");
         }
@@ -663,6 +761,9 @@ mod tests {
                 vapid_private_key: None,
                 proxy: Some("http://config-proxy:8080".to_string()),
             },
+            resume: crate::config::ResumeConfig {
+                patterns: crate::config::default_resume_patterns(),
+            },
             log_level: "info".to_string(),
             runtime_overrides: Default::default(),
         }
@@ -732,6 +833,64 @@ mod tests {
 
         let empty: super::AppConfigOverrides = serde_json::from_str("{}").expect("parse empty");
         assert_eq!(empty.limits.screen_scrollback_rows, None);
+    }
+
+    #[test]
+    fn resume_patterns_can_replace_append_or_disable_defaults() {
+        let custom = r#"{"program":"agent","pattern":"agent --resume ([a-z0-9-]+)","command":"agent --restore $1"}"#;
+        let state_dir = PathBuf::from("test-state");
+        let defaults = AppConfig::resolve(state_dir.clone(), Default::default());
+        assert_eq!(defaults.resume.patterns.len(), 2);
+
+        let appended: super::AppConfigOverrides =
+            serde_json::from_str(&format!(r#"{{"additional_resume_patterns":[{custom}]}}"#))
+                .expect("parse appended matcher");
+        let with_extra = AppConfig::resolve(state_dir.clone(), appended);
+        assert_eq!(with_extra.resume.patterns.len(), 3);
+        assert_eq!(with_extra.resume.patterns[2].program, "agent");
+        assert_eq!(defaults.hot_reload_changes(&with_extra), vec!["patterns"]);
+
+        let replaced: super::AppConfigOverrides =
+            serde_json::from_str(&format!(r#"{{"resume_patterns":[{custom}]}}"#))
+                .expect("parse replacement matcher");
+        assert_eq!(
+            AppConfig::resolve(state_dir.clone(), replaced)
+                .resume
+                .patterns
+                .len(),
+            1
+        );
+        let disabled: super::AppConfigOverrides =
+            serde_json::from_str(r#"{"resume_patterns":[]}"#).expect("parse empty matchers");
+        assert!(
+            AppConfig::resolve(state_dir, disabled)
+                .resume
+                .patterns
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_resume_regex_rejects_hot_reload_without_losing_config() {
+        let state_dir =
+            std::env::temp_dir().join(format!("oly_config_resume_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let config_path = state_dir.join("config.json");
+        std::fs::write(&config_path, r#"{"additional_resume_patterns":[{"program":"agent","pattern":"(","command":"agent $1"}]}"#)
+            .expect("write config");
+        let mut config = test_config();
+        config.paths.state_dir = state_dir.clone();
+        assert!(config.try_reload().unwrap_err().contains("invalid regex"));
+        std::fs::write(&config_path, r#"{"resume_patterns":[]}"#).expect("rewrite config");
+        assert!(
+            config
+                .try_reload()
+                .expect("valid reload")
+                .resume
+                .patterns
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&state_dir);
     }
 
     /// S3.4 follow-up: legacy single-word `bind` JSON key must keep

@@ -103,8 +103,8 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at, notifications_enabled, foreground_color, background_color) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at, notifications_enabled, foreground_color, background_color, resume_command) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )
         .bind(&meta.id)
         .bind(&meta.title)
@@ -121,13 +121,15 @@ impl Database {
         .bind(meta.notifications_enabled)
         .bind(&meta.foreground_color)
         .bind(&meta.background_color)
+        .bind(&meta.resume_command)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    /// Update mutable fields of an existing session row.
+    /// Update mutable fields of an existing session row. The derived resume
+    /// hint is updated separately to avoid overwriting concurrent scans.
     pub async fn update_session(&self, meta: &SessionMeta) -> Result<()> {
         let args = serde_json::to_string(&meta.args)?;
         let tags = serde_json::to_string(&meta.tags)?;
@@ -159,6 +161,16 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Store a derived resume hint without overwriting concurrent title/tag/status edits.
+    pub async fn set_resume_command(&self, id: &str, command: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET resume_command=?1 WHERE id=?2")
+            .bind(command)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -205,7 +217,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions WHERE id=?1",
         )
         .bind(id)
@@ -253,7 +265,7 @@ impl Database {
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions WHERE 1=1",
         );
 
@@ -303,7 +315,7 @@ impl Database {
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions
              WHERE status IN (",
         );
@@ -343,7 +355,7 @@ impl Database {
         let rows = sqlx::query(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions
              WHERE ended_at IS NOT NULL \
                AND ended_at < ?1 \
@@ -440,6 +452,7 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
     let notifications_enabled: bool = r.get(12);
     let foreground_color: Option<String> = r.get(13);
     let background_color: Option<String> = r.get(14);
+    let resume_command: Option<String> = r.get(15);
 
     build_meta(
         id,
@@ -457,6 +470,7 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
         notifications_enabled,
         foreground_color,
         background_color,
+        resume_command,
     )
 }
 
@@ -477,6 +491,7 @@ fn build_meta(
     notifications_enabled: bool,
     foreground_color: Option<String>,
     background_color: Option<String>,
+    resume_command: Option<String>,
 ) -> SessionMeta {
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
@@ -494,6 +509,7 @@ fn build_meta(
         created_at,
         started_at,
         ended_at,
+        resume_command,
         status: parse_status(&status_str),
         pid: pid.map(|p| p as u32),
         exit_code: exit_code.map(|c| c as i32),
@@ -532,6 +548,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         created_at: meta.created_at,
         started_at: meta.started_at,
         ended_at: meta.ended_at,
+        resume_command: meta.resume_command.clone(),
         cwd: meta.cwd.clone(),
         input_needed,
         notifications_enabled: meta.notifications_enabled,
@@ -680,6 +697,7 @@ mod tests {
             created_at: now,
             started_at: Some(now),
             ended_at: ended,
+            resume_command: None,
             notifications_enabled: true,
             foreground_color: None,
             background_color: None,

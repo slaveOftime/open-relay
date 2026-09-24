@@ -29,7 +29,11 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, trace, warn};
 
-use crate::{db::Database, session::SessionEventTx};
+use crate::{
+    config::{ResumePattern, default_resume_patterns},
+    db::Database,
+    session::SessionEventTx,
+};
 
 use super::{SessionError, SessionMeta, SessionStatus, runtime::SessionRuntime};
 
@@ -100,6 +104,8 @@ pub struct SessionStore {
     /// process sees the same value (0 = unlimited). Updated on the
     /// daemon's config hot-reload pass.
     pub(super) journal_byte_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Reloadable rules applied when a completed journal is scanned.
+    pub(super) resume_patterns: ArcSwap<Vec<ResumePattern>>,
     pub(super) db: Arc<Database>,
     pub(super) event_tx: SessionEventTx,
 }
@@ -143,6 +149,7 @@ impl SessionStore {
             journal_byte_cap: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 journal_byte_cap,
             )),
+            resume_patterns: ArcSwap::from_pointee(default_resume_patterns()),
             db,
             event_tx,
         }
@@ -177,6 +184,10 @@ impl SessionStore {
     pub fn set_journal_byte_cap(&self, bytes: u64) {
         self.journal_byte_cap
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_resume_patterns(&self, patterns: Vec<ResumePattern>) {
+        self.resume_patterns.store(Arc::new(patterns));
     }
 
     pub fn event_tx(&self) -> SessionEventTx {

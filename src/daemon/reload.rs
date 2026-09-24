@@ -82,6 +82,7 @@ pub(super) async fn run_config_reloader(
 
         store.set_eviction_seconds(new.limits.session_eviction_seconds);
         store.set_journal_byte_cap(new.limits.max_journal_bytes_per_session);
+        store.set_resume_patterns(new.resume.patterns.clone());
         live.replace(new.clone());
 
         if rebuild_notifier {

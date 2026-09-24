@@ -1,13 +1,13 @@
 ---
 name: oly-daemon
-description: Use when an agent or operator needs to read or update the oly daemon's `config.json`-style settings, decide whether each field is hot-reloadable, and edit prompt_patterns to detect interactive prompts in supervised sessions. For running, querying, and supervising sessions, consult the `oly` skill instead.
+description: Use when an agent or operator needs to read or update the oly daemon's `config.json`-style settings, decide whether each field is hot-reloadable, or configure prompt and session-resume detection patterns. For running, querying, and supervising sessions, consult the `oly` skill instead.
 ---
 
 # Configure and hot-reload the oly daemon
 
 This skill covers the **daemon's configuration**: the JSON file at `<STATE_DIR>/config.json`, the file's resolution rules, the override precedence, and how hot reload actually behaves. It does not cover running individual sessions, the interactive TUI, or `oly send` recipes — see the bundled `oly` skill for those.
 
-The daemon's configuration is hot-reload aware: every loop tick the daemon re-reads `config.json`, swaps in a freshly parsed snapshot, and applies the side effects that cannot be picked up lazily (rebuild notification channels, adjust the eviction TTL and journal byte cap, reinstall the log filter). The reload task itself runs every `CONFIG_RELOAD_POLL_INTERVAL` (≈2 s), so most edits land within a few seconds.
+The daemon's configuration is hot-reload aware: the reloader polls `config.json` every `CONFIG_RELOAD_POLL_INTERVAL` (≈2 s) and, after a successful parse, swaps in a new snapshot and applies side effects (rebuild notification channels, update eviction and journal limits and resume patterns, reinstall the log filter). Most edits land within a few seconds.
 
 ## State directory and CLI/start vs config-file precedence
 
@@ -60,6 +60,8 @@ Always look at both diffs when you change something — `restart_required_change
 | `notification_min_interval_seconds` | Hot reload. The notify monitor reseeds its debounce window. Default: `10` (`1` after clamp). |
 | `notification_hook` | Hot reload. Triggered a notification-pipeline rebuild the next time `notify` matches a session prompt. `null`/empty disables. |
 | `prompt_patterns` | Hot reload. Live-read by the prompt-detection sweep on every tick. |
+| `resume_patterns` | Hot reload. Replaces built-in Codex/Pi resume rules; `[]` disables them unless additional rules are supplied. Applies to future scans, not previously scanned sessions. |
+| `additional_resume_patterns` | Hot reload. Appends rules to the built-ins (or to `resume_patterns` when specified). Applies to future scans. |
 | `web_push_subject` | Hot reload. Triggers a notification-pipeline rebuild. |
 | `web_push_vapid_public_key` | Hot reload. Triggers a notification-pipeline rebuild. |
 | `web_push_vapid_private_key` | Hot reload. Triggers a notification-pipeline rebuild. |
@@ -197,6 +199,32 @@ To add a fourth example of your own without keeping the whole list, just write t
 
 After saving, run `oly logs <ID>` on a session you know is waiting at a prompt and confirm the daemon log line for that PID switches from waiting/idle to the prompt-detected pathway. If it does not, your pattern is too narrow or your shell is overwriting the prompt before the journal sees it.
 
+## Session resume hints (`resume_patterns` and `additional_resume_patterns`)
+
+Resume patterns are **not** `prompt_patterns`: they inspect the *rendered journal tail* after a child process has completed, PTY output has closed, and the journal is durable. The daemon stores the most recent matching suggestion as `resume_command` in SQLite session metadata; it is also returned in session summaries and `oly ls --json`. It is a hint for a future resume workflow, **not a command the daemon executes**. Existing sessions whose tails have already been scanned are not rescanned when configuration changes.
+
+Each rule has three required strings:
+
+- `program`: the actual session child executable's basename, case-insensitive; `.exe`, `.cmd` and `.bat` suffixes are ignored. A session launched as `bash` or a wrapper such as `npx` does not match a rule for the tool inside it.
+- `pattern`: a Rust `regex` against the rendered tail, with **at least one capture group** for the session identifier or path. Escape regex backslashes twice in JSON (`\\s`, `\\.`).
+- `command`: the saved suggestion template. `$1`, `$2`, etc. expand from capture groups; for example, `agent --restore $1`.
+
+Absent keys retain the built-in Codex (`codex resume <UUID>`) and Pi (`pi --session <path>`) rules from `src/config.rs`. To **add** a tool without copying defaults, set `additional_resume_patterns`:
+
+```json
+{
+  "additional_resume_patterns": [{
+    "program": "agent",
+    "pattern": "agent --resume ([a-z0-9-]+)",
+    "command": "agent --restore $1"
+  }]
+}
+```
+
+To **replace** the built-ins, use `resume_patterns` with your own array; `"resume_patterns": []` disables detection unless `additional_resume_patterns` supplies rules. Both keys may appear together: the additional rules append to the replacement array. If several rules match, the last matching occurrence in the tail wins.
+
+Edits hot-reload into the session store. The reload diff reports `patterns` (the `ResumeConfig` field). An invalid regex, missing capture group or empty `program`/`command` rejects a hot reload and preserves the previous configuration; check the daemon log for `config reload failed`. No restart is required after a valid edit. To verify a rule, finish a session whose **child executable** matches `program`, then inspect its `resume_command` via `oly ls --json` after the completed-output scan.
+
 ## Common pitfalls
 
 - **CLI flags out-rank the file.** `oly daemon start --port 17000` keeps `http_port=17000` even after you set `http_port: 15443` in the file. Stop the daemon and start it without the flag to let the file win.
@@ -204,6 +232,7 @@ After saving, run `oly logs <ID>` on a session you know is waiting at a prompt a
 - **Parse errors silently keep the old config.** Validate with `jq . config.json` before saving; the daemon logs `config reload failed; keeping current configuration` if the new file is bad.
 - **Env vars are read only at startup.** `OLY_WEB_PUSH_PROXY` does not re-trigger on hot reload — drop it in `config.json` if you want it to follow file edits.
 - **`prompt_patterns: []` is not the same as omitting the key.** An explicit empty array disables prompt detection; omitting the key restores the defaults.
+- **`resume_patterns: []` also disables its defaults.** To keep Codex/Pi and add a rule, use `additional_resume_patterns`; a rule for the wrong child executable never matches.
 - **Wrong key names silently no-op.** Typos such as `notification_hookk` make it look like the daemon ignored you, when actually nothing was set. The reload log won't mention them because no diff exists. Cross-check the JSON key in the table above.
 
 ## Verify and self-check
@@ -214,10 +243,3 @@ After every config edit, in order:
 2. In the daemon log: `config.json reloaded changed=["..."]`. If you expected a restart-required field, also expect the `config changes require a daemon restart` warning.
 3. Restart the daemon if any field in the restart-only set changed.
 4. Trigger the behaviour you changed (start a session that prompts, push an HTTP request to the new port, switch the log level and watch verbosity change) and confirm the runtime reflects the new value.
-
-## Reference
-
-- Full source of the loader and diff helpers: `src/config.rs` (`AppConfig::resolve`, `hot_reload_changes`, `restart_required_changes`, `apply_runtime_overrides`).
-- Reload task: `src/daemon/reload.rs` (`run_config_reloader`).
-- Notification pipeline rebuild: `src/daemon/reload.rs` and `notification::build_notifier`.
-- Field-to-sub-struct map (`#[serde(flatten)]` keeps the JSON keys flat): the `*Overrides` structs at `src/config.rs:HttpOverrides`, `NotifyOverrides`, `WebPushOverrides`, `LimitsOverrides`.

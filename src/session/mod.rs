@@ -73,6 +73,9 @@ pub struct SessionMeta {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    /// Best-effort resume command advertised by the child near shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<String>,
     pub status: SessionStatus,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,

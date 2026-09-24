@@ -611,6 +611,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             config.limits.max_journal_bytes_per_session,
             db.clone(),
         );
+        store.set_resume_patterns(config.resume.patterns.clone());
         let startup_failed_sessions = store.load_running_stopping_sessions().await;
         (store, startup_failed_sessions)
     };
@@ -843,6 +844,7 @@ async fn drain_sessions_for_shutdown(session_store: &SessionStoreHandle) {
     if !drained {
         warn!("shutdown drain finished with sessions still running");
     }
+    session_store.flush_resume_hints_on_shutdown().await;
 }
 
 #[cfg(test)]
@@ -888,6 +890,9 @@ mod tests {
                 vapid_public_key: None,
                 vapid_private_key: None,
                 proxy: None,
+            },
+            resume: crate::config::ResumeConfig {
+                patterns: crate::config::default_resume_patterns(),
             },
             log_level: "info".to_string(),
             runtime_overrides: Default::default(),

@@ -139,6 +139,13 @@ impl SequencerCore {
         self.degraded.is_some()
     }
 
+    /// True only when a sync ack covers every published record, including
+    /// the final PTY output and completion fact. Readers must not infer
+    /// this from EOF alone: the appender writes asynchronously.
+    pub fn is_fully_durable(&self) -> bool {
+        !self.is_degraded() && self.durable_seq >= self.next_seq - 1
+    }
+
     pub fn degraded_reason(&self) -> Option<&str> {
         self.degraded.as_deref()
     }
@@ -622,5 +629,30 @@ pub(crate) fn appender_loop(
         && let Err(err) = writer.seal_part()
     {
         fail(&ack_tx, &mut dead, format!("journal seal failed: {err}"));
+    }
+}
+
+#[cfg(test)]
+mod resume_hint_tests {
+    use super::*;
+
+    #[test]
+    fn final_output_requires_sync_before_derived_metadata_is_read() {
+        let mut core = SequencerCore::new(1);
+        core.publish(
+            RecordKind::Output,
+            bytes::Bytes::from_static(b"resume hint"),
+        );
+        assert!(!core.is_fully_durable());
+        core.note_journaled(1);
+        assert!(!core.is_fully_durable());
+        core.note_durable(1);
+        assert!(core.is_fully_durable());
+        core.publish(RecordKind::Lifecycle, bytes::Bytes::from_static(b"ended"));
+        assert!(!core.is_fully_durable());
+        core.note_durable(2);
+        assert!(core.is_fully_durable());
+        core.degrade("disk error");
+        assert!(!core.is_fully_durable());
     }
 }

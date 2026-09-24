@@ -11,6 +11,7 @@ mod metrics;
 mod node;
 mod notification;
 mod protocol;
+mod resume_hint;
 mod session;
 mod sshauth;
 mod storage;

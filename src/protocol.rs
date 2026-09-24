@@ -892,6 +892,9 @@ pub struct SessionSummary {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    /// Suggested command extracted from the completed session's journal tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]

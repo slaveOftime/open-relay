@@ -242,6 +242,8 @@ pub struct SessionRuntime {
     pub shared_modes: Arc<SharedModes>,
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
+    /// True once the closed journal tail was inspected for a resume command.
+    pub resume_scanned: bool,
     /// Terminal completion fact waiting for the output stream to drain
     /// before it may be journaled. Process exit and PTY EOF are separate
     /// facts (PLAN.md I10): completion must be sequenced after the final
@@ -471,6 +473,7 @@ impl SessionRuntime {
             created_at: self.meta.created_at,
             started_at: self.meta.started_at,
             ended_at: self.meta.ended_at,
+            resume_command: self.meta.resume_command.clone(),
             cwd: self.meta.cwd.clone(),
             input_needed: self.input_needed(),
             notifications_enabled: self.meta.notifications_enabled,
@@ -1320,6 +1323,7 @@ pub fn spawn_session(
         title_user_set: meta.title.is_some(),
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
+        resume_scanned: false,
         pending_journal_completion: None,
         last_journal_checkpoint_at: 0,
         journaled_modes: None,
@@ -1741,6 +1745,7 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             ended_at: None,
             status,
+            resume_command: None,
             pid: None,
             exit_code: None,
             notifications_enabled: true,
@@ -1781,6 +1786,7 @@ mod tests {
             title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
+            resume_scanned: false,
             pending_journal_completion: None,
             last_journal_checkpoint_at: 0,
             journaled_modes: None,
@@ -2719,6 +2725,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
@@ -2760,6 +2767,7 @@ mod tests {
             title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
+            resume_scanned: false,
             pending_journal_completion: None,
             last_journal_checkpoint_at: 0,
             journaled_modes: None,

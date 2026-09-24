@@ -266,6 +266,7 @@ fn session_json(session: &SessionSummary) -> Value {
         "created_at": session.created_at.to_rfc3339() ,
         "started_at": session.started_at.map(|dt| dt.to_rfc3339()),
         "ended_at": session.ended_at.map(|dt| dt.to_rfc3339()),
+        "resume_command": session.resume_command,
         "input_needed": session.input_needed,
         "last_total_bytes": session.last_total_bytes,
         "last_output_epoch": session.last_output_epoch.map(|dt| dt.to_rfc3339()),
@@ -422,6 +423,7 @@ mod tests {
             created_at,
             started_at: None,
             ended_at: None,
+            resume_command: Some("codex resume 0199e6e2-b60e-715d-851f-b8713b7064df".into()),
             cwd: Some("C:/work".to_string()),
             input_needed: true,
             notifications_enabled: false,
@@ -446,6 +448,10 @@ mod tests {
         );
         assert_eq!(value["input_needed"], serde_json::json!(true));
         assert_eq!(value["last_total_bytes"], serde_json::json!(4096));
+        assert_eq!(
+            value["resume_command"],
+            serde_json::json!("codex resume 0199e6e2-b60e-715d-851f-b8713b7064df")
+        );
     }
 
     #[test]

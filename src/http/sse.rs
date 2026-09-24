@@ -251,6 +251,7 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap(),
             started_at: None,
             ended_at: None,
+            resume_command: None,
             cwd: Some("C:\\work".to_string()),
             input_needed: true,
             notifications_enabled: false,

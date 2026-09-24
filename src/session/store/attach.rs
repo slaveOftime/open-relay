@@ -1248,6 +1248,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
             ended_at: Some(chrono::Utc::now()),
+            resume_command: None,
             status: SessionStatus::Stopped,
             pid: None,
             exit_code,

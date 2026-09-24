@@ -307,6 +307,7 @@ impl SessionStore {
             created_at,
             started_at: Some(created_at),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
@@ -675,7 +676,8 @@ impl SessionStore {
     async fn prune_evicted_sessions(&self) {
         let now = Instant::now();
         let mut to_persist: Vec<SessionMeta> = Vec::new();
-        let mut evicted_ids: Vec<String> = Vec::new();
+        let mut resume_candidates = Vec::new();
+        let resume_patterns = self.resume_patterns.load_full();
         let sessions = self.sessions.load_full();
 
         for (id, handle) in sessions.iter() {
@@ -686,19 +688,31 @@ impl SessionStore {
                 to_persist.push(rt.meta.clone());
                 rt.persisted = true;
             }
-
-            if rt.is_completed() {
-                let Some(completed_at) = rt.completed_at else {
-                    rt.completed_at = Some(now);
-                    continue;
-                };
-                if now.duration_since(completed_at) >= self.eviction_ttl() {
-                    tracing::info!(
+            // Process exit alone is too early: the PTY reader may still be
+            // draining the final resume line into the journal. EOF also
+            // precedes the async appender's durability acknowledgement.
+            if rt.is_completed() && rt.output_closed && !rt.resume_scanned {
+                let (ready, degraded) = rt.journal.as_ref().map_or((true, false), |journal| {
+                    let mut journal = journal.lock();
+                    journal.poll_acks();
+                    if !journal.core.is_fully_durable() {
+                        journal.request_sync();
+                    }
+                    (journal.core.is_fully_durable(), journal.core.is_degraded())
+                });
+                if degraded {
+                    warn!(
                         session_id = id,
-                        age_seconds = now.duration_since(completed_at).as_secs(),
-                        "evicting completed session from memory after eviction TTL"
+                        "journal degraded; no reliable resume hint available"
                     );
-                    evicted_ids.push(id.clone());
+                    rt.resume_scanned = true;
+                } else if ready {
+                    resume_candidates.push((
+                        id.clone(),
+                        rt.dir.clone(),
+                        rt.meta.command.clone(),
+                        handle.clone(),
+                    ));
                 }
             }
         }
@@ -708,6 +722,52 @@ impl SessionStore {
             debug!(session_id = %meta.id, status = meta.status.as_str(), "persisting completed session metadata");
             if let Err(err) = self.db.update_session(&meta).await {
                 tracing::error!(%err, session_id = meta.id, "failed to persist completed session");
+            }
+        }
+
+        for (id, dir, command, handle) in resume_candidates {
+            let patterns = resume_patterns.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::resume_hint::from_journal(&dir, &command, &patterns)
+            })
+            .await;
+            match result {
+                Ok(Ok(Some(resume_command))) => {
+                    if let Err(err) = self.db.set_resume_command(&id, &resume_command).await {
+                        warn!(session_id = %id, %err, "failed to persist resume hint; will retry");
+                        continue;
+                    }
+                    let mut rt = handle.write();
+                    rt.meta.resume_command = Some(resume_command);
+                    rt.resume_scanned = true;
+                    drop(rt);
+                    if let Some(summary) = self.get_summary(&id) {
+                        let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
+                    }
+                }
+                Ok(Ok(None)) => handle.write().resume_scanned = true,
+                Ok(Err(err)) => {
+                    warn!(session_id = %id, %err, "failed to read resume hint; will retry")
+                }
+                Err(err) => warn!(session_id = %id, %err, "resume scan worker failed; will retry"),
+            }
+        }
+
+        let mut evicted_ids: Vec<String> = Vec::new();
+        for (id, handle) in sessions.iter() {
+            let mut rt = handle.write();
+            if !rt.is_completed() {
+                continue;
+            }
+            let completed_at = *rt.completed_at.get_or_insert(now);
+            if now.duration_since(completed_at) >= self.eviction_ttl()
+                && (!rt.output_closed || rt.resume_scanned)
+            {
+                tracing::info!(
+                    session_id = id,
+                    "evicting completed session from memory after eviction TTL"
+                );
+                evicted_ids.push(id.clone());
             }
         }
 
@@ -732,6 +792,22 @@ impl SessionStore {
         Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl());
     }
 
+    /// Give freshly stopped children a bounded window to drain their PTY
+    /// before the daemon goes away (the periodic sweep no longer runs then).
+    pub async fn flush_resume_hints_on_shutdown(&self) {
+        for _ in 0..20 {
+            self.prune_evicted_sessions().await;
+            let pending = self.sessions.load().values().any(|handle| {
+                let rt = handle.read();
+                rt.is_completed() && !rt.resume_scanned
+            });
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     fn evict_old_tombstones(
         evicted_sessions: &mut HashMap<String, Instant>,
         now: Instant,
@@ -754,6 +830,103 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn completed_resume_hint_is_saved_only_after_output_drains() {
+        for (id, status, command, output, expected) in [
+            (
+                "resume-stop",
+                SessionStatus::Stopped,
+                "codex",
+                "To resume: codex resume 0199e6e2-b60e-715d-851f-b8713b7064df\r\n",
+                "codex resume 0199e6e2-b60e-715d-851f-b8713b7064df",
+            ),
+            (
+                "resume-kill",
+                SessionStatus::Killed,
+                "pi",
+                "To resume: pi --session '/tmp/a b/session.jsonl'\r\n",
+                "pi --session '/tmp/a b/session.jsonl'",
+            ),
+            (
+                "resume-custom",
+                SessionStatus::Stopped,
+                "agent",
+                "To resume: agent --resume custom-42\r\n",
+                "agent --restore custom-42",
+            ),
+        ] {
+            let rt = make_runtime(id, status, output, None);
+            {
+                let mut runtime = rt.write();
+                runtime.meta.command = command.to_string();
+                runtime.meta.ended_at = Some(Utc::now());
+                runtime.completed_at = Some(Instant::now());
+            }
+            let db = make_test_db().await;
+            db.insert_session(&rt.read().meta)
+                .await
+                .expect("insert session");
+            let store = store_with(vec![rt.clone()], db.clone());
+            if command == "agent" {
+                store.set_resume_patterns(vec![crate::config::ResumePattern {
+                    program: "agent".into(),
+                    pattern: r"agent --resume ([a-z0-9-]+)".into(),
+                    command: "agent --restore $1".into(),
+                }]);
+            }
+
+            store.run_maintenance().await;
+            assert_eq!(
+                db.get_session(id).await.unwrap().unwrap().resume_command,
+                None
+            );
+
+            rt.write().output_closed = true;
+            store.run_maintenance().await;
+            assert_eq!(
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resume_command
+                    .as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                store.get_summary(id).unwrap().resume_command.as_deref(),
+                Some(expected)
+            );
+            let query = crate::protocol::ListQuery {
+                search: None,
+                tags: vec![],
+                statuses: vec![],
+                since: None,
+                until: None,
+                limit: 10,
+                offset: 0,
+                sort: Default::default(),
+                order: Default::default(),
+            };
+            assert_eq!(
+                store.list_summaries(&query).await.unwrap()[0]
+                    .resume_command
+                    .as_deref(),
+                Some(expected)
+            );
+            store.run_maintenance().await; // idempotent
+            assert_eq!(
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resume_command
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_run_maintenance_evicts_completed_session_after_ttl() {
         let rt = make_runtime("evict001", SessionStatus::Stopped, "", None);

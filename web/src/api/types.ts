@@ -68,6 +68,8 @@ export interface SessionSummary {
   created_at: string // ISO 8601
   started_at: string | null // ISO 8601
   ended_at: string | null // ISO 8601
+  /** Best-effort resume command advertised at shutdown; never auto-execute. */
+  resume_command?: string | null
   cwd: string | null
   input_needed: boolean
   notifications_enabled: boolean

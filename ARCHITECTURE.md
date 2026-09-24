@@ -17,7 +17,11 @@ core concern:
 1. **One journal.** Every session persists a single ordered stream — raw PTY
    output, resizes, lifecycle transitions, checkpoints — in a per-session
    journal (`src/session/journal.rs`). Nothing else is persisted per
-   session. Everything else (the filtered display stream, resize history,
+   session. Shared SQLite session metadata may cache *derived hints* (for
+   example, a `resume_command` discovered from the rendered journal tail
+   after both child exit and PTY EOF using configurable `resume_patterns`);
+   it is not another recording.
+   Everything else (the filtered display stream, resize history,
    logs, attach snapshots) is *derived* from the journal at read time
    (`src/session/replay.rs`), so derived state can never silently disagree
    with the recording. Replay is checkpoint-anchored: anchored v2

@@ -1028,6 +1028,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: None,
             ended_at: None,
+            resume_command: None,
             cwd: None,
             input_needed: false,
             notifications_enabled: true,
