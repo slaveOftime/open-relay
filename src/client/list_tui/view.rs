@@ -233,13 +233,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let help = if app.filter.is_empty() {
         match mode {
             LayoutMode::Narrow => {
-                " filter ^N new ^D dup ^K stop ^R rm ^O sort ⏎ open ^C quit".to_string()
+                " filter ^N new ^D dup ^K stop ^Del rm ^O sort ⏎ open ^C quit".to_string()
             }
             LayoutMode::Medium => {
-                " filter · ^N new · ^D dup · ^K stop · ^R rm · ^O sort · ⏎ open · ^C quit".to_string()
+                " filter · ^N new · ^D dup · ^K stop · ^Del rm · ^O sort · ⏎ open · ^C quit".to_string()
             }
             LayoutMode::Wide => {
-                " filter · ^N new · ^D duplicate · ^U update · ^K stop · ^R remove · ^S status · ^O sort · ⏎ open · ^⏎ window · ^C quit"
+                " filter · ^N new · ^D duplicate · ^U update · ^K stop · ^Del remove · ^S status · ^O sort · ⏎ open · ^⏎ window · ^C quit"
                     .to_string()
             }
         }

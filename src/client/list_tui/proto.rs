@@ -1,5 +1,5 @@
 // Wire-payload dumps: types carried from the modal dialogs and Ctrl+K
-// Ctrl+R hotkeys out to the daemon's RPC layer. The companion methods
+// Ctrl+Delete hotkeys out to the daemon's RPC layer. The companion methods
 // (`CloneLaunch::request`, `SessionUpdate::request`) live here too. The
 // dialog types it round-trips through call into these accessors.
 use crate::protocol::RpcRequest;

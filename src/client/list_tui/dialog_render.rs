@@ -114,13 +114,16 @@ pub fn render_remove_dialog(frame: &mut Frame<'_>, dialog: &RemoveDialog) {
         None => dialog.target.id.clone(),
     };
     let lines = vec![
-        Line::from("Force-remove this session?"),
-        Line::from(Span::styled(
-            target,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
+        Line::from(" Force-remove this session?"),
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                target,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::default(),
         dialog_footer(None, REMOVE_DIALOG_HELP),
     ];

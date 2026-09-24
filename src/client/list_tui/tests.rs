@@ -2331,6 +2331,8 @@ fn list_tips_are_compact_and_dialog_tips_keep_their_top_divider() {
     let list = render_app(&mut app, 120, 30);
     let last_line = list.lines().last().unwrap_or_default();
     assert!(last_line.contains("^D duplicate"));
+    assert!(last_line.contains("^Del remove"));
+    assert!(!last_line.contains("^R"));
     assert!(!last_line.contains('\u{2500}'));
 
     route_key(&mut app, ctrl(KeyCode::Char('d')), None);
@@ -2788,10 +2790,10 @@ fn ctrl_k_routes_stoppable_selection_and_handles_empty_or_inactive_state() {
 }
 
 #[test]
-fn ctrl_r_requires_confirmation_before_force_removal() {
+fn ctrl_delete_requires_confirmation_before_force_removal() {
     let mut app = App::default();
     assert_eq!(
-        route_key(&mut app, ctrl(KeyCode::Char('r')), None),
+        route_key(&mut app, ctrl(KeyCode::Delete), None),
         AppAction::None
     );
     assert_eq!(
@@ -2799,12 +2801,21 @@ fn ctrl_r_requires_confirmation_before_force_removal() {
         Some("no session in focus to remove")
     );
 
+    assert_eq!(
+        route_key(&mut app, ctrl(KeyCode::Char('r')), None),
+        AppAction::None
+    );
+    assert!(
+        app.remove_dialog.is_none(),
+        "Ctrl+R is reserved and must not delete a session"
+    );
+
     let mut selected = session("remove-me");
     selected.node = Some("worker-a".to_string());
     app.replace_sessions(vec![selected]);
 
     assert_eq!(
-        route_key(&mut app, ctrl(KeyCode::Char('r')), None),
+        route_key(&mut app, ctrl(KeyCode::Delete), None),
         AppAction::None
     );
     assert_eq!(
@@ -2822,6 +2833,23 @@ fn ctrl_r_requires_confirmation_before_force_removal() {
     let rendered = render_app(&mut app, 100, 18);
     assert!(rendered.contains("Force-remove this session?"));
     assert!(rendered.contains("remove-me on worker-a"));
+    let message_line = rendered
+        .lines()
+        .find(|line| line.contains("Force-remove this session?"))
+        .unwrap();
+    let target_line = rendered
+        .lines()
+        .find(|line| line.contains("remove-me on worker-a"))
+        .unwrap();
+    let actions_line = rendered
+        .lines()
+        .find(|line| line.contains("Enter/Y remove"))
+        .unwrap();
+    assert_eq!(
+        message_line.find("Force-remove"),
+        actions_line.find("Enter/Y")
+    );
+    assert_eq!(target_line.find("remove-me"), actions_line.find("Enter/Y"));
 
     assert_eq!(
         route_key(&mut app, key(KeyCode::Esc), None),
@@ -2834,7 +2862,7 @@ fn ctrl_r_requires_confirmation_before_force_removal() {
         "cancelling must preserve the session"
     );
 
-    route_key(&mut app, ctrl(KeyCode::Char('r')), None);
+    route_key(&mut app, ctrl(KeyCode::Delete), None);
     assert_eq!(
         route_key(&mut app, key(KeyCode::Enter), None),
         AppAction::Remove(super::SessionTarget {

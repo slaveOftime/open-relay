@@ -101,7 +101,7 @@ pub fn route_key(
                     .or_else(|| list_node.map(str::to_string)),
             })
         }
-        KeyCode::Char('r' | 'R') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Require confirmation before force-removing the focused session (`oly rm -f <id>`).
             let Some(session) = app.focused_session() else {
                 app.set_action_message(Some("no session in focus to remove".to_string()));
