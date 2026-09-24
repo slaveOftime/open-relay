@@ -8,6 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use super::constants::INACTIVE_LOG_TAIL_LINES;
+
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WindowRect {
@@ -101,6 +103,7 @@ pub fn session_command(
     ];
     if !attach {
         args.push("--keep-color".to_string());
+        args.extend(["--tail".to_string(), INACTIVE_LOG_TAIL_LINES.to_string()]);
     }
     if let Some(node) = node {
         args.extend(["--node".to_string(), node.to_string()]);

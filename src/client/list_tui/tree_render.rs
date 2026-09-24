@@ -7,7 +7,7 @@ use super::constants::SPARKLINE_WIDTH;
 use super::table::{
     LayoutMode, pad_truncated, rate_color, session_status_style, sparkline, status_label,
 };
-use super::tree::{TreeEntry, TreeNode};
+use super::tree::{TreeEntry, TreeNode, TreeView};
 use crate::protocol::SessionSummary;
 use chrono::{DateTime, Utc};
 use ratatui::{
@@ -40,6 +40,7 @@ pub fn render_tree(
     }
 
     // Centre the cursor inside the viewport so drill toggles feel snappy.
+    let folder_colors = folder_status_colors(&app.tree, &app.sessions);
     let viewport_len = area.height as usize;
     let viewport_start = app
         .tree
@@ -57,19 +58,40 @@ pub fn render_tree(
         let absolute_index = viewport_start + row;
         let is_selected = absolute_index == app.tree.cursor;
         match entry {
-            TreeEntry::Folder { node, .. } => {
-                let prefix = tree_connector(&app.tree.visible, absolute_index);
-                lines.push(folder_line(&app.tree.nodes[node], &prefix, is_selected));
+            TreeEntry::Folder { node, depth } => {
+                let status_color = folder_colors[node];
+                let connector = tree_connector_line(
+                    &app.tree.visible,
+                    absolute_index,
+                    &folder_colors,
+                    is_selected,
+                );
+                let expandable = !app.tree.nodes[node].subfolders.is_empty();
+                let expanded = app.tree.is_expanded(node, depth);
+                lines.push(folder_line(
+                    &app.tree.nodes[node],
+                    connector,
+                    is_selected,
+                    status_color,
+                    expandable,
+                    expanded,
+                ));
             }
             TreeEntry::Session { session, .. } => {
                 let Some(session_summary) = app.sessions.get(session) else {
                     lines.push(blank_line());
                     continue;
                 };
-                let line = session_line(
+                let connector = tree_connector_line(
+                    &app.tree.visible,
+                    absolute_index,
+                    &folder_colors,
+                    is_selected,
+                );
+                let line = session_line_with_connector(
                     session_summary,
                     app.rates.get(&session_key(session_summary)),
-                    &tree_connector(&app.tree.visible, absolute_index),
+                    connector,
                     is_selected,
                     now,
                 );
@@ -105,26 +127,29 @@ pub fn render_tree(
     )
 }
 
+/// Whether another visible row continues this branch at the requested depth.
+fn has_next_sibling(entries: &[TreeEntry], index: usize, level: usize) -> bool {
+    entries[index + 1..]
+        .iter()
+        .find(|entry| entry.depth() <= level)
+        .is_some_and(|entry| entry.depth() == level)
+}
+
 /// Draw a real tree edge for each visible ancestor. Looking at the whole
 /// visible list (not just the viewport) keeps vertical lines continuous when
 /// the user scrolls past a sibling.
+#[cfg(test)]
 pub fn tree_connector(entries: &[TreeEntry], index: usize) -> String {
     let depth = entries[index].depth();
-    let has_next_sibling = |level: usize| {
-        entries[index + 1..]
-            .iter()
-            .find(|entry| entry.depth() <= level)
-            .is_some_and(|entry| entry.depth() == level)
-    };
     let mut prefix = String::new();
     for level in 1..depth {
-        prefix.push_str(if has_next_sibling(level) {
+        prefix.push_str(if has_next_sibling(entries, index, level) {
             "│   "
         } else {
             "    "
         });
     }
-    prefix.push_str(if has_next_sibling(depth) {
+    prefix.push_str(if has_next_sibling(entries, index, depth) {
         "├── "
     } else {
         "└── "
@@ -132,16 +157,112 @@ pub fn tree_connector(entries: &[TreeEntry], index: usize) -> String {
     prefix
 }
 
+/// Aggregate status across a folder and all of its descendants. Attention
+/// takes precedence over running so a collapsed branch still signals the
+/// most actionable session it contains.
+pub(super) fn folder_status_colors(
+    tree: &TreeView,
+    sessions: &[SessionSummary],
+) -> Vec<Option<Color>> {
+    fn visit(
+        node_index: usize,
+        tree: &TreeView,
+        sessions: &[SessionSummary],
+        colors: &mut [Option<Color>],
+    ) -> (bool, bool) {
+        let node = &tree.nodes[node_index];
+        let mut needs_attention = false;
+        let mut has_active = false;
+        for &session_index in &node.direct_sessions {
+            if let Some(session) = sessions.get(session_index) {
+                needs_attention |= session.input_needed;
+                has_active |= is_active_status(&session.status);
+            }
+        }
+        for &child_index in &node.subfolders {
+            let (child_attention, child_active) = visit(child_index, tree, sessions, colors);
+            needs_attention |= child_attention;
+            has_active |= child_active;
+        }
+        colors[node_index] = if needs_attention {
+            Some(Color::Yellow)
+        } else if has_active {
+            Some(Color::Green)
+        } else {
+            None
+        };
+        (needs_attention, has_active)
+    }
+
+    let mut colors = vec![None; tree.nodes.len()];
+    if !tree.nodes.is_empty() {
+        visit(tree.root, tree, sessions, &mut colors);
+    }
+    colors
+}
+
+/// Color each tree-rail segment from its owning ancestor folder, and color
+/// the branch glyph from the current folder (or its parent for a session).
+pub(super) fn tree_connector_line(
+    entries: &[TreeEntry],
+    index: usize,
+    folder_colors: &[Option<Color>],
+    selected: bool,
+) -> Line<'static> {
+    let entry = entries[index];
+    let depth = entry.depth();
+    // Only the branch for the folder on this row carries that folder's
+    // aggregate state. Ancestor rails stay neutral so a running sibling does
+    // not make inactive sessions beneath a parent look active.
+    let (branch_color, is_folder) = match entry {
+        TreeEntry::Folder { node, .. } => (folder_colors.get(node).copied().flatten(), true),
+        TreeEntry::Session { .. } => (None, false),
+    };
+    let selected_color = if selected && is_folder {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+    let mut spans = Vec::with_capacity(depth);
+    for level in 1..depth {
+        let connector = if has_next_sibling(entries, index, level) {
+            "│   "
+        } else {
+            "    "
+        };
+        spans.push(Span::styled(
+            connector,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let branch = if has_next_sibling(entries, index, depth) {
+        "├── "
+    } else {
+        "└── "
+    };
+    spans.push(Span::styled(
+        branch,
+        Style::default().fg(branch_color.unwrap_or(selected_color)),
+    ));
+    Line::from(spans)
+}
 pub fn blank_line() -> Line<'static> {
     Line::from(String::new())
 }
 
-pub fn folder_line(node: &TreeNode, prefix: &str, selected: bool) -> Line<'static> {
+pub fn folder_line(
+    node: &TreeNode,
+    prefix: Line<'static>,
+    selected: bool,
+    status_color: Option<Color>,
+    expandable: bool,
+    expanded: bool,
+) -> Line<'static> {
     let label = if node.is_node {
         format!("{} (node)", node.name)
     } else if node.name.is_empty() {
         // Defensive fallback: the build pipeline must not produce empty
-        // names anymore (we strip `RootDir` components when inserting),
+        // names anymore (we strip RootDir components when inserting),
         // but if anything ever slips past that, render the path so the
         // user still sees a meaningful breadcrumb instead of a bare
         // "(root)" stacked against siblings.
@@ -152,41 +273,58 @@ pub fn folder_line(node: &TreeNode, prefix: &str, selected: bool) -> Line<'stati
     } else {
         format!("{}/", node.name)
     };
-    let marker_style = Style::default().fg(if selected {
-        Color::Cyan
+    let label = if expandable {
+        format!("{} {label}", if expanded { "▾" } else { "▸" })
     } else {
-        Color::DarkGray
+        label
+    };
+    let label_color = status_color.unwrap_or(if node.is_node {
+        Color::Cyan
+    } else if selected {
+        Color::White
+    } else {
+        Color::Gray
     });
-    let label_style = Style::default()
-        .fg(if node.is_node {
-            Color::Cyan
-        } else if selected {
-            Color::White
-        } else {
-            Color::Gray
-        })
-        .add_modifier(if selected {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
-    let line = Line::from(vec![
-        Span::styled(prefix.to_string(), marker_style),
-        Span::styled(label, label_style),
-    ]);
+    let label_style = Style::default().fg(label_color).add_modifier(if selected {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    });
+    let mut spans = prefix.spans;
+    spans.push(Span::styled(label, label_style));
+    let line = Line::from(spans);
     if selected {
         line.style(Style::default().bg(SELECTED_ROW_BG))
     } else {
         line
     }
 }
-
 pub const TREE_STATUS_WIDTH: usize = 9;
 
+#[cfg(test)]
 pub fn session_line(
     session: &SessionSummary,
     rate: Option<&RateState>,
     prefix: &str,
+    selected: bool,
+    now: Instant,
+) -> Line<'static> {
+    session_line_with_connector(
+        session,
+        rate,
+        Line::from(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        selected,
+        now,
+    )
+}
+
+fn session_line_with_connector(
+    session: &SessionSummary,
+    rate: Option<&RateState>,
+    connector: Line<'static>,
     selected: bool,
     now: Instant,
 ) -> Line<'static> {
@@ -214,8 +352,8 @@ pub fn session_line(
     };
     let started = session.started_at.unwrap_or(session.created_at);
     let title_text = session.title.clone().unwrap_or_default();
-    let mut spans = vec![
-        Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+    let mut spans = connector.spans;
+    spans.extend([
         Span::styled(glyph.to_string(), status_style),
         Span::raw("  "),
         Span::styled(
@@ -229,7 +367,7 @@ pub fn session_line(
         Span::styled(cmd_args, dim),
         Span::raw("  "),
         Span::styled(title_text, Style::default().fg(muted)),
-    ];
+    ]);
     if active {
         spans.extend([
             Span::raw("   "),
@@ -249,7 +387,6 @@ pub fn session_line(
         line
     }
 }
-
 pub fn format_tree_start(started: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let elapsed = now.signed_duration_since(started);
     if elapsed.num_seconds() <= 0 {

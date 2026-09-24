@@ -44,7 +44,6 @@ async fn fetch_follow_refresh(
     query: crate::protocol::ListQuery,
     targets: &[ListTarget],
     node_all: bool,
-    node_local: bool,
     known_nodes: Vec<String>,
 ) -> Result<SessionRefresh> {
     let targets = if node_all {
@@ -52,7 +51,7 @@ async fn fetch_follow_refresh(
         nodes.extend(known_nodes);
         nodes.sort();
         nodes.dedup();
-        list_targets_for_all_nodes(nodes, node_local)
+        list_targets_for_all_nodes(nodes)
     } else {
         targets.to_vec()
     };
@@ -81,15 +80,8 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
         [target] => target.node.as_deref(),
         _ => None,
     };
-    let refresh = fetch_follow_refresh(
-        config,
-        query.clone(),
-        &targets,
-        args.node_all,
-        args.node_local,
-        Vec::new(),
-    )
-    .await;
+    let refresh =
+        fetch_follow_refresh(config, query.clone(), &targets, args.node_all, Vec::new()).await;
     crate::metrics::mark("tui: sessions fetched");
     match refresh {
         Ok(refresh) => {
@@ -149,7 +141,6 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
             let query = query.clone();
             let targets = targets.clone();
             let node_all = args.node_all;
-            let node_local = args.node_local;
             let known_nodes = app
                 .sessions
                 .iter()
@@ -158,15 +149,7 @@ async fn run_inner(config: &AppConfig, args: &ListArgs, targets: Vec<ListTarget>
             tokio::spawn(async move {
                 let _ = tx
                     .send(
-                        fetch_follow_refresh(
-                            &config,
-                            query,
-                            &targets,
-                            node_all,
-                            node_local,
-                            known_nodes,
-                        )
-                        .await,
+                        fetch_follow_refresh(&config, query, &targets, node_all, known_nodes).await,
                     )
                     .await;
             });

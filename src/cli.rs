@@ -226,10 +226,10 @@ pub struct ListArgs {
     /// Target a secondary node by name. Repeat to monitor multiple nodes.
     #[arg(long, short = 'n', value_name = "NODE", conflicts_with = "node_all")]
     pub node: Vec<String>,
-    /// Target every currently connected secondary node (follow mode refreshes membership).
+    /// Target the local daemon and every connected secondary node; follow mode refreshes membership.
     #[arg(long, conflicts_with = "node", requires = "follow")]
     pub node_all: bool,
-    /// Include sessions from the current (or primary) daemon.
+    /// Include the current (or primary) daemon; already included by --node-all.
     #[arg(long)]
     pub node_local: bool,
 }
@@ -1086,6 +1086,12 @@ mod tests {
         };
         assert!(args.node_all);
         assert!(args.node_local);
+        let cli = Cli::try_parse_from(["oly", "ls", "--follow", "--node-all"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(args.node_all);
+        assert!(!args.node_local);
         assert!(Cli::try_parse_from(["oly", "ls", "--node-all"]).is_err());
         assert!(
             Cli::try_parse_from(["oly", "ls", "--follow", "--node-all", "--node", "worker"])

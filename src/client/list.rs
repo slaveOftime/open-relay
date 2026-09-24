@@ -38,15 +38,12 @@ pub(super) fn list_targets(args: &ListArgs) -> Vec<ListTarget> {
 
 pub(super) fn list_targets_for_all_nodes(
     node_names: impl IntoIterator<Item = String>,
-    include_local: bool,
 ) -> Vec<ListTarget> {
     let mut nodes: Vec<_> = node_names.into_iter().collect();
     nodes.sort();
     nodes.dedup();
-    let mut targets = Vec::with_capacity(nodes.len() + usize::from(include_local));
-    if include_local {
-        targets.push(ListTarget { node: None });
-    }
+    let mut targets = Vec::with_capacity(nodes.len() + 1);
+    targets.push(ListTarget { node: None });
     targets.extend(
         nodes
             .into_iter()
@@ -54,7 +51,6 @@ pub(super) fn list_targets_for_all_nodes(
     );
     targets
 }
-
 pub(super) async fn fetch_node_names(config: &AppConfig) -> Result<Vec<String>> {
     let response = tokio::time::timeout(
         Duration::from_secs(2),
@@ -401,25 +397,17 @@ mod tests {
     }
 
     #[test]
-    fn all_node_targets_are_sorted_deduplicated_and_optionally_local() {
-        let remote = super::list_targets_for_all_nodes(
-            vec![
-                "worker-b".to_string(),
-                "worker-a".to_string(),
-                "worker-b".to_string(),
-            ],
-            false,
-        );
-        assert_eq!(remote.len(), 2);
-        assert_eq!(remote[0].node.as_deref(), Some("worker-a"));
-        assert_eq!(remote[1].node.as_deref(), Some("worker-b"));
-
-        let including_local = super::list_targets_for_all_nodes(vec!["worker-a".to_string()], true);
-        assert_eq!(including_local.len(), 2);
-        assert_eq!(including_local[0].node, None);
-        assert_eq!(including_local[1].node.as_deref(), Some("worker-a"));
+    fn all_node_targets_include_local_and_deduplicate_connected_nodes() {
+        let targets = super::list_targets_for_all_nodes(vec![
+            "worker-b".to_string(),
+            "worker-a".to_string(),
+            "worker-b".to_string(),
+        ]);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].node, None);
+        assert_eq!(targets[1].node.as_deref(), Some("worker-a"));
+        assert_eq!(targets[2].node.as_deref(), Some("worker-b"));
     }
-
     #[test]
     fn session_json_includes_iso_time_and_input_required_fields() {
         let created_at = Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap();

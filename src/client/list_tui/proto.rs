@@ -45,6 +45,8 @@ pub struct CloneLaunch {
     pub cols: Option<u16>,
     pub disable_notifications: bool,
     pub attach_after_start: bool,
+    /// Only set for duplicate sessions when the user opts into removing the source.
+    pub remove_source: Option<SessionTarget>,
 }
 
 impl CloneLaunch {

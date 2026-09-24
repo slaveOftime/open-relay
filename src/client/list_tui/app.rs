@@ -142,7 +142,19 @@ impl RateState {
 }
 
 pub fn session_search_text(session: &SessionSummary) -> String {
-    let mut text = format!("{}\n{}", session.id, session.command);
+    let mut text = format!("{}\n{}\n{}", session.id, session.command, session.status);
+    for argument in &session.args {
+        text.push('\n');
+        text.push_str(argument);
+    }
+    for tag in &session.tags {
+        text.push('\n');
+        text.push_str(tag);
+    }
+    if let Some(cwd) = &session.cwd {
+        text.push('\n');
+        text.push_str(cwd);
+    }
     if let Some(node) = &session.node {
         text.push('\n');
         text.push_str(node);
@@ -150,6 +162,13 @@ pub fn session_search_text(session: &SessionSummary) -> String {
     if let Some(title) = &session.title {
         text.push('\n');
         text.push_str(title);
+    }
+    if session.input_needed {
+        text.push_str("\nattention");
+    }
+    if let Some(pid) = session.pid {
+        text.push('\n');
+        text.push_str(&pid.to_string());
     }
     text.to_lowercase()
 }
@@ -325,15 +344,9 @@ impl App {
         }
     }
 
-    /// Drop a session row from the local model so the user sees the
-    /// removal immediately; the next refresh tick will confirm with the
-    /// daemon. Used by Ctrl+R (`oly rm -f <id>`). The cursor is repaired
-    /// when it lands on the now-missing index, and per-session state
-    /// (rates, attention rows) is cleared.
+    /// Drop a confirmed or optimistically removed session, preserving the
+    /// surviving selection and cleaning up state keyed by both node and ID.
     pub(super) fn remove_session_payload(&mut self, id: &str, node: Option<&str>) {
-        let attention_key = format!("{id:?}:{node:?}");
-        self.attention_rows.remove(&attention_key);
-        self.rates.remove(id);
         let Some(position) = self
             .sessions
             .iter()
@@ -341,13 +354,25 @@ impl App {
         else {
             return;
         };
+        let selected_key = self.sessions.get(self.selected).map(session_key);
+        let removed_key = session_key(&self.sessions[position]);
+        self.attention_rows.remove(&removed_key);
+        self.effects
+            .cancel_unique_effect(super::effects::attention_pulse_key(&removed_key));
+        self.rates.remove(&removed_key);
+        self.opened.remove(&removed_key);
         self.sessions.remove(position);
+        self.search_text = self.sessions.iter().map(session_search_text).collect();
+        self.selected = selected_key
+            .filter(|key| key != &removed_key)
+            .and_then(|key| {
+                self.sessions
+                    .iter()
+                    .position(|session| session_key(session) == key)
+            })
+            .unwrap_or_else(|| position.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
-        if self.selected >= self.visible.len() && !self.visible.is_empty() {
-            self.selected = self.visible.len() - 1;
-        }
     }
-
     pub(super) fn apply_updated_summary(&mut self, summary: SessionSummary) {
         let key = session_key(&summary);
         let Some(index) = self
@@ -493,6 +518,7 @@ impl App {
                 root,
                 auto_depth,
                 ref drilled,
+                ref collapsed,
                 ..
             } = self.tree;
             let mut out: Vec<TreeEntry> = Vec::new();
@@ -504,6 +530,7 @@ impl App {
                 0,
                 auto_depth + usize::from(self.tree.grouped_nodes),
                 drilled,
+                collapsed,
                 &mut out,
             );
             out
@@ -735,28 +762,25 @@ impl App {
     }
 
     pub(super) fn toggle_tree_drill(&mut self) {
-        let Some(entry) = self.tree.visible.get(self.tree.cursor).copied() else {
+        let Some(TreeEntry::Folder { node, depth }) =
+            self.tree.visible.get(self.tree.cursor).copied()
+        else {
             return;
         };
-        let TreeEntry::Folder { node, depth } = entry else {
-            return;
-        };
-        // Drill toggles contribute nothing for folders that are already
-        // visible by default; toggle only matters for folders whose
-        // children sit below the auto-depth horizon.
-        if depth < self.tree.auto_depth + usize::from(self.tree.grouped_nodes) {
+        if self.tree.nodes[node].subfolders.is_empty() {
             return;
         }
-        let key = (
-            self.tree.nodes[node].node.clone(),
-            self.tree.nodes[node].path.clone(),
-        );
-        if !self.tree.drilled.insert(key.clone()) {
+
+        let key = self.tree.nodes[node].expansion_key();
+        if self.tree.is_expanded(node, depth) {
             self.tree.drilled.remove(&key);
+            self.tree.collapsed.insert(key);
+        } else {
+            self.tree.collapsed.remove(&key);
+            self.tree.drilled.insert(key);
         }
         self.rebuild_tree();
     }
-
     /// Switch between list and tree presentations. The flat-list `visible`
     /// continues to reflect current sessions so a Ctrl+G <-> Ctrl+G round
     /// trip leaves selection unchanged.
@@ -772,72 +796,18 @@ impl App {
             ViewMode::List => ViewMode::Tree,
             ViewMode::Tree => ViewMode::List,
         };
-        // When entering tree mode from list mode, drill into the path
-        // of the currently focused session so it remains visible past
-        // the auto-depth horizon. Round-trips back to list keep the
-        // drilled set so the same place can be revisited next toggle.
-        if next_view == ViewMode::Tree && self.view_mode == ViewMode::List {
-            self.drill_to_focused_list_selection();
-        }
         self.view_mode = next_view;
         self.rebuild_tree();
         self.focus_tree_on_focused_session();
         // Track and announce the new mode so users don't get disoriented.
         self.set_action_message(Some(match self.view_mode {
             ViewMode::List => "list view · Ctrl+G tree".to_string(),
-            ViewMode::Tree => "tree view · Enter to drill · Ctrl+G list".to_string(),
+            ViewMode::Tree => "tree view · Enter expand/collapse · Ctrl+G list".to_string(),
         }));
     }
 
-    /// Drill every ancestor of the list selection's cwd so the focused
-    /// session stays visible past the auto-depth horizon when switching
-    /// into tree mode. Sessions without a cwd sit on the synthetic root
-    /// and need no drilling.
-    pub(super) fn drill_to_focused_list_selection(&mut self) {
-        let Some(index) = self.visible.get(self.selected).copied() else {
-            return;
-        };
-        let Some(session) = self.sessions.get(index) else {
-            return;
-        };
-        let Some(cwd) = session.cwd.as_deref() else {
-            return;
-        };
-        let session_node = session.node.clone();
-        // Mirror the pipeline stripping: drop the shared ancestor so
-        // drilled paths match what the walker emits under the (optional)
-        // per-node branch.
-        let common = common_path_prefix(
-            &self
-                .sessions
-                .iter()
-                .filter(|candidate| candidate.node.as_deref() == session_node.as_deref())
-                .filter_map(|candidate| candidate.cwd.as_deref().map(PathBuf::from))
-                .filter(|path| !path.as_os_str().is_empty())
-                .collect::<Vec<_>>(),
-        );
-        let stripped = match Path::new(cwd).strip_prefix(&common) {
-            Ok(path) => path.to_path_buf(),
-            Err(_) => PathBuf::from(cwd),
-        };
-        if stripped.as_os_str().is_empty() {
-            return;
-        }
-        let mut accumulated = PathBuf::new();
-        for component in stripped.components() {
-            if matches!(component, std::path::Component::RootDir) {
-                continue;
-            }
-            accumulated.push(component);
-            self.tree
-                .drilled
-                .insert((session.node.clone(), accumulated.clone()));
-        }
-    }
-
-    /// Move the tree cursor to the row belonging to the focused session,
-    /// if any. Falls back to the existing cursor position when the focused
-    /// session is missing or hidden.
+    /// Focus the selected list session if it is visible; otherwise focus its
+    /// deepest visible folder ancestor without expanding additional levels.
     pub(super) fn focus_tree_on_focused_session(&mut self) {
         if self.view_mode != ViewMode::Tree {
             return;
@@ -845,13 +815,51 @@ impl App {
         let Some(index) = self.visible.get(self.selected).copied() else {
             return;
         };
+        let Some(session) = self.sessions.get(index) else {
+            return;
+        };
         if let Some(position) = self.tree.visible.iter().position(
             |entry| matches!(entry, TreeEntry::Session { session, .. } if *session == index),
         ) {
             self.tree.cursor = position;
+            return;
+        }
+        let Some(cwd) = session.cwd.as_deref() else {
+            return;
+        };
+        let session_node = session.node.as_deref();
+        let common = common_path_prefix(
+            &self
+                .sessions
+                .iter()
+                .filter(|candidate| candidate.node.as_deref() == session_node)
+                .filter_map(|candidate| candidate.cwd.as_deref().map(PathBuf::from))
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect::<Vec<_>>(),
+        );
+        let effective = Path::new(cwd)
+            .strip_prefix(&common)
+            .map_or_else(|_| PathBuf::from(cwd), PathBuf::from);
+        if let Some((_, position)) = self
+            .tree
+            .visible
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| match entry {
+                TreeEntry::Folder { node, .. } => {
+                    let folder = &self.tree.nodes[*node];
+                    (folder.node.as_deref() == session_node
+                        && (folder.path.as_os_str().is_empty()
+                            || effective.starts_with(&folder.path)))
+                    .then_some((folder.path.components().count(), position))
+                }
+                TreeEntry::Session { .. } => None,
+            })
+            .max_by_key(|(depth, _)| *depth)
+        {
+            self.tree.cursor = position;
         }
     }
-
     /// Move the tree cursor by `offset`. The cursor wraps around the visible
     /// row range (vim-style) so repeated Up/Down in tree mode feels
     /// continuous and matches what the flat-list cursor does in list mode.
@@ -884,43 +892,20 @@ impl App {
         }
     }
 
-    /// Enter pressed in tree mode: drill on a folder at depth
-    /// `>= auto_depth`, descend into a folder whose children are already
-    /// auto-visible, or open a session inline. Returns the action the
-    /// caller should fan out to (only `AppAction::OpenInline` is ever
-    /// produced; drilling and descending are internal cursor moves).
+    /// Enter toggles a folder's child-folder expansion or opens a session.
     pub(super) fn tree_enter(&mut self) -> AppAction {
         match self.tree.visible.get(self.tree.cursor).copied() {
-            Some(TreeEntry::Folder { depth, .. }) => {
-                if depth >= self.tree.auto_depth + usize::from(self.tree.grouped_nodes) {
-                    // Past the auto-depth horizon the children are
-                    // hidden; pressing Enter is the only way to expose
-                    // them, so drilling is the right action.
-                    self.toggle_tree_drill();
-                } else {
-                    // The folder's children are already on screen. Treat
-                    // Enter as "descend into this folder": move the
-                    // cursor one row down so the user lands on the
-                    // first item inside. Without this, Enter on a
-                    // shallow folder felt like a dead key.
-                    let next =
-                        (self.tree.cursor + 1).min(self.tree.visible.len().saturating_sub(1));
-                    self.tree.cursor = next;
-                }
+            Some(TreeEntry::Folder { .. }) => {
+                self.toggle_tree_drill();
                 AppAction::None
             }
             Some(TreeEntry::Session { session, .. }) => {
-                // Mirror the focused session into `self.selected` so any
-                // follow-on helper that still reads `self.selected`
-                // (e.g. terminal open) lands on the right row when the
-                // action handler runs.
                 self.selected = session;
                 AppAction::OpenInline
             }
             None => AppAction::None,
         }
     }
-
     pub(super) fn first(&mut self) {
         if let Some(index) = self.visible.first() {
             self.selected = *index;

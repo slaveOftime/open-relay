@@ -48,20 +48,20 @@ pub enum TreeEntry {
     Session { session: usize, depth: usize },
 }
 
-/// Folder-and-session tree built from `App::sessions`. The walker produces a
-/// flat list of `TreeEntry` rows in DFS order, retaining parent folders
-/// and respecting `auto_depth` (folders deeper than this are hidden
-/// unless `drilled` contains an ancestor path).
+/// Folder-and-session tree built from session summaries. The visible walker
+/// emits folder rows according to per-folder expansion state while retaining
+/// direct session rows under collapsed folders.
 #[derive(Debug)]
 pub struct TreeView {
     pub nodes: Vec<TreeNode>,
     /// Index of the synthetic root node (path = `PathBuf::new()`).
     pub root: usize,
-    /// Auto-drill horizon. Folders at depth ≤ this are visible by default;
-    /// deeper folders are hidden unless an ancestor path is in `drilled`.
+    /// Number of folder levels expanded automatically from each tree root.
     pub auto_depth: usize,
-    /// Paths the user has explicitly drilled into (overrides `auto_depth`).
-    pub drilled: HashSet<(Option<String>, PathBuf)>,
+    /// Folders explicitly expanded by the user.
+    pub drilled: HashSet<TreeFolderKey>,
+    /// Folders explicitly collapsed by the user, overriding auto expansion.
+    pub collapsed: HashSet<TreeFolderKey>,
     pub grouped_nodes: bool,
     /// Flat row list produced by `recompute_visible`.
     pub visible: Vec<TreeEntry>,
@@ -86,6 +86,7 @@ impl TreeView {
             root: 0,
             auto_depth: TREE_AUTO_DEPTH,
             drilled: HashSet::new(),
+            collapsed: HashSet::new(),
             grouped_nodes: false,
             visible: Vec::new(),
             cursor: 0,
@@ -93,10 +94,12 @@ impl TreeView {
     }
 }
 
-/// Maximum folder depth shown without an explicit drill. Pressing Enter on a
-/// folder at this depth reveals one more level of children.
+/// Number of path-folder levels expanded by default under each tree root.
 pub const TREE_AUTO_DEPTH: usize = 1;
 
+/// Stable expansion key distinguishes a grouped node root from the synthetic
+/// root, which share the same empty path.
+pub type TreeFolderKey = (Option<String>, PathBuf, bool);
 pub fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
     if paths.is_empty() {
         return Path::new("/").to_path_buf();
@@ -210,35 +213,36 @@ pub fn append_tree_node(
     idx
 }
 
-/// Free-function DFS over a tree-node snapshot. Operations that mutate the
-/// App live outside this walker; we only emit `TreeEntry` rows into the
-/// supplied `out: &mut Vec`.
-///
-/// Visibility semantics:
-///   * A node at depth ≤ `auto_depth` is always auto-visible.
-///   * A node at depth > `auto_depth` is visible iff any of its ancestors
-///     (whose path is in `drilled`) opens up the subtree below the horizon.
-///   * Empty folders with neither sessions nor descendants are skipped —
-///     empty labels communicate nothing.
-///
-/// Drilling is intentionally "open the *whole* subtree": once a folder is
-/// drilled, every descendant of it remains visible without further user
-/// action (they will be hidden again if the user un-drills the same path).
+impl TreeNode {
+    pub fn expansion_key(&self) -> TreeFolderKey {
+        (self.node.clone(), self.path.clone(), self.is_node)
+    }
+}
+
+impl TreeView {
+    pub fn is_expanded(&self, node_index: usize, depth: usize) -> bool {
+        let key = self.nodes[node_index].expansion_key();
+        if self.collapsed.contains(&key) {
+            return false;
+        }
+        self.drilled.contains(&key) || depth < self.auto_depth + usize::from(self.grouped_nodes)
+    }
+}
+
+/// Walk the folder tree into visible rows. Expansion is one level at a time:
+/// an expanded folder shows its immediate child folders, while direct sessions
+/// remain visible regardless of the folder's expanded state.
 pub fn walk_tree_branch(
     nodes: &[TreeNode],
     node_idx: usize,
     depth: usize,
     auto_depth: usize,
-    drilled: &HashSet<(Option<String>, PathBuf)>,
+    drilled: &HashSet<TreeFolderKey>,
+    collapsed: &HashSet<TreeFolderKey>,
     out: &mut Vec<TreeEntry>,
 ) {
     let node = &nodes[node_idx];
-
     if node.direct_sessions.is_empty() && node.subfolders.is_empty() {
-        return;
-    }
-
-    if !node.is_visible(depth, auto_depth, drilled) {
         return;
     }
 
@@ -249,12 +253,24 @@ pub fn walk_tree_branch(
         });
     }
 
-    // Subfolders first (file-explorer style: folders grouped at the top,
-    // sessions below), then the sessions hosted by this folder. Both
-    // lists are sorted alphabetically by `build_tree_nodes` so the walker
-    // just iterates them in deterministic order.
-    for &child_idx in &node.subfolders {
-        walk_tree_branch(nodes, child_idx, depth + 1, auto_depth, drilled, out);
+    let key = node.expansion_key();
+    let expanded = if collapsed.contains(&key) {
+        false
+    } else {
+        drilled.contains(&key) || depth < auto_depth
+    };
+    if expanded {
+        for &child_idx in &node.subfolders {
+            walk_tree_branch(
+                nodes,
+                child_idx,
+                depth + 1,
+                auto_depth,
+                drilled,
+                collapsed,
+                out,
+            );
+        }
     }
 
     for session_idx in &node.direct_sessions {
@@ -264,47 +280,6 @@ pub fn walk_tree_branch(
         });
     }
 }
-
-impl TreeNode {
-    /// Visibility rule for a single node at the given chain depth. Encoded
-    /// into a method so tests can exercise it without rebuilding the whole
-    /// tree.
-    pub fn is_visible(
-        &self,
-        depth: usize,
-        auto_depth: usize,
-        drilled: &HashSet<(Option<String>, PathBuf)>,
-    ) -> bool {
-        if depth <= auto_depth {
-            return true;
-        }
-        is_in_drill_subtree(&self.path, &self.node, drilled)
-    }
-}
-
-/// True when this folder's path, or any of its ancestors, was explicitly
-/// drilled into. Walks up to the root so Enter-presses at depth auto_depth
-/// cascade visibility down to every descendant.
-pub fn is_in_drill_subtree(
-    path: &Path,
-    node: &Option<String>,
-    drilled: &HashSet<(Option<String>, PathBuf)>,
-) -> bool {
-    let mut cursor = Some(path.to_path_buf());
-    while let Some(current) = cursor.take() {
-        if drilled.contains(&(node.clone(), current.clone())) {
-            return true;
-        }
-        match current.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => {
-                cursor = Some(parent.to_path_buf());
-            }
-            _ => return false,
-        }
-    }
-    false
-}
-
 impl TreeEntry {
     pub fn depth(self) -> usize {
         match self {

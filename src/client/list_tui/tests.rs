@@ -530,6 +530,35 @@ fn tree_visible_ids(app: &App) -> Vec<String> {
         .collect()
 }
 
+fn tree_has_folder(app: &App, path: &str) -> bool {
+    app.tree.visible.iter().any(|entry| match entry {
+        super::TreeEntry::Folder { node, .. } => {
+            app.tree.nodes[*node].path == std::path::Path::new(path)
+        }
+        super::TreeEntry::Session { .. } => false,
+    })
+}
+fn expand_all_tree_folders(app: &mut App) {
+    loop {
+        let next = app
+            .tree
+            .visible
+            .iter()
+            .enumerate()
+            .find_map(|(position, entry)| {
+                let super::TreeEntry::Folder { node, depth } = *entry else {
+                    return None;
+                };
+                (!app.tree.nodes[node].subfolders.is_empty() && !app.tree.is_expanded(node, depth))
+                    .then_some(position)
+            });
+        let Some(position) = next else {
+            break;
+        };
+        app.tree.cursor = position;
+        app.toggle_tree_drill();
+    }
+}
 #[test]
 fn ctrl_g_toggles_view_mode() {
     let mut app = App::default();
@@ -542,7 +571,7 @@ fn ctrl_g_toggles_view_mode() {
 }
 
 #[test]
-fn switching_to_tree_drills_and_focuses_the_selected_session() {
+fn switching_to_tree_expands_one_level_and_focuses_the_nearest_folder() {
     let mut app = App::default();
     app.replace_sessions(vec![
         session_at("shallow", Some("/work")),
@@ -563,16 +592,13 @@ fn switching_to_tree_drills_and_focuses_the_selected_session() {
         route_key(&mut app, ctrl(KeyCode::Char('g')), None),
         AppAction::None
     );
-    let entry = app
-        .tree
-        .visible
-        .get(app.tree.cursor)
-        .copied()
-        .expect("tree cursor row");
-    assert!(matches!(entry, super::TreeEntry::Session { session, .. }
-        if app.sessions[session].id == "selected-deep"));
+    let ids = tree_visible_ids(&app);
+    assert!(!ids.contains(&"selected-deep".to_string()), "{ids:?}");
+    let focused = app.tree.visible.get(app.tree.cursor).copied();
+    assert!(matches!(focused,
+        Some(super::TreeEntry::Folder { node, .. })
+            if app.tree.nodes[node].path == std::path::Path::new("work")));
 }
-
 #[test]
 fn absolute_tree_paths_do_not_create_empty_root_folders() {
     let mut tree = super::TreeView::new();
@@ -628,6 +654,7 @@ fn tree_arrow_keys_move_tree_cursor_only() {
         session_at("charlie", Some("/home/c")),
     ]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     let previous_selected = app.selected;
     let total = app.tree.visible.len();
     assert!(total > 1, "tree needs at least two rows for this test");
@@ -769,50 +796,60 @@ fn tree_enter_on_session_emits_open_inline() {
 }
 
 #[test]
-fn tree_enter_on_deep_folder_toggles_drill() {
+fn tree_enter_expands_one_folder_at_a_time_and_can_collapse() {
     let mut app = App::default();
-    // Build a tree where a leaf at depth 5 needs drilling. We drill
-    // the path by hand so the auto-drill on toggle doesn't pre-expose
-    // `deep`; the assertions below exercise the user-driven drill.
     app.replace_sessions(vec![session_at("deep", Some("/a/b/c/d/e"))]);
     app.toggle_view_mode();
-    // Clear any drills the auto-focus path may have applied so we
-    // start from the un-drilled default state.
     app.tree.drilled.clear();
+    app.tree.collapsed.clear();
     app.rebuild_tree();
-    // Before drilling, `deep` and its tail folders at depth > 1 are
-    // hidden. Drill on the visible depth-1 ancestor should expose them.
-    let ids_before = tree_visible_ids(&app);
-    assert!(
-        !ids_before.contains(&"deep".to_string()),
-        "deep session should be hidden before drilling: {ids_before:?}"
-    );
 
-    // Find the depth-1 folder (`a`) by walking visible rows. The
-    // walker emits folder rows at their chain depth; drilling the
-    // outermost visible folder should expose the leaf session past the
-    // horizon.
-    let target_position = app
+    assert!(tree_has_folder(&app, "a"));
+    assert!(!tree_has_folder(&app, "a/b"));
+    assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
+
+    for (step, path) in ["a", "a/b", "a/b/c", "a/b/c/d"].iter().enumerate() {
+        let position = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry,
+                super::TreeEntry::Folder { node, .. }
+                    if app.tree.nodes[*node].path == std::path::Path::new(path))
+            })
+            .unwrap_or_else(|| panic!("folder {path:?} should appear before its drill"));
+        app.tree.cursor = position;
+        assert_eq!(
+            route_key(&mut app, key(KeyCode::Enter), None),
+            AppAction::None
+        );
+        assert!(tree_has_folder(&app, path));
+        if step < 3 {
+            assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+                super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
+        }
+    }
+    assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
+
+    let root_position = app
         .tree
         .visible
         .iter()
-        .position(|entry| match entry {
-            super::TreeEntry::Folder { node, depth } => {
-                *depth == 1 && app.tree.nodes[*node].path == std::path::Path::new("a")
-            }
-            _ => false,
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].path == std::path::Path::new("a"))
         })
-        .expect("depth-1 folder present");
-    app.tree.cursor = target_position;
-    let action = route_key(&mut app, key(KeyCode::Enter), None);
-    assert_eq!(action, AppAction::None);
-    let ids_after = tree_visible_ids(&app);
-    assert!(
-        ids_after.contains(&"deep".to_string()),
-        "deep session should be visible after drilling: {ids_after:?}"
-    );
+        .unwrap();
+    app.tree.cursor = root_position;
+    route_key(&mut app, key(KeyCode::Enter), None);
+    assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "deep")));
+    assert!(tree_has_folder(&app, "a"));
 }
-
 #[test]
 fn tree_navigation_wraps_around_visible_rows() {
     let mut app = App::default();
@@ -866,6 +903,7 @@ fn tree_enter_on_session_uses_cursor_not_stale_selected() {
 
     // Stay in tree mode for the whole test.
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     // The tree view shows both sessions grouped under `work/`.
     assert!(!app.tree.visible.is_empty());
 
@@ -908,6 +946,7 @@ fn ctrl_d_in_tree_mode_uses_tree_cursor_session() {
     vim.command = "vim".into();
     app.replace_sessions(vec![ls, vim]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     // Put the cursor on the second session row.
     let vim_row = app
         .tree
@@ -940,8 +979,12 @@ fn tree_filter_sessions_by_search_text() {
     lint.command = "lint".into();
     let mut build = session_at("s2", Some("/proj/build-target"));
     build.command = "build".into();
+    build.args = vec!["--special-arg".into()];
+    build.title = Some("Review Notes".into());
+    build.tags = vec!["release-tag".into()];
     app.replace_sessions(vec![lint, build]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     let pre_filter_session_count = app
         .tree
         .visible
@@ -970,8 +1013,29 @@ fn tree_filter_sessions_by_search_text() {
         "no folders should be visible when filter hides every host session"
     );
 
-    // Apply a filter that matches exactly one session — the path to
-    // that session must remain visible.
+    // Every session field used by the UI can locate the matching row in
+    // both views; tree filtering must also retain the path to that session.
+    for filter in [
+        "build",
+        "build-target",
+        "special-arg",
+        "review notes",
+        "release-tag",
+    ] {
+        app.normalized_filter = filter.into();
+        app.rebuild_visible();
+        assert!(
+            app.visible
+                .iter()
+                .any(|&index| app.sessions[index].id == "s2"),
+            "list search should match {filter:?}"
+        );
+        assert!(
+            app.tree.visible.iter().any(|entry| matches!(entry,
+                super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "s2")),
+            "tree search should match {filter:?}"
+        );
+    }
     app.normalized_filter = "build".into();
     app.rebuild_visible();
     let partial_session_count = app
@@ -994,6 +1058,99 @@ fn tree_filter_sessions_by_search_text() {
 }
 
 #[test]
+fn tree_folders_show_attention_before_descendant_running_state() {
+    let mut attention = session_at("attention", Some("/workspace/project/needs/input"));
+    attention.input_needed = true;
+    let active = session_at("active", Some("/workspace/running/build"));
+    let mut inactive = session_at("stopped", Some("/workspace/stopped/archive"));
+    inactive.status = "stopped".to_string();
+    let mut app = App::default();
+    app.replace_sessions(vec![attention, active, inactive]);
+
+    let visible_ids = tree_visible_ids(&app);
+    assert!(!visible_ids.contains(&"attention".to_string()));
+    let colors = super::tree_render::folder_status_colors(&app.tree, &app.sessions);
+    let color_for_folder = |name: &str| {
+        let index = app
+            .tree
+            .nodes
+            .iter()
+            .position(|node| node.name == name)
+            .expect("folder exists");
+        colors[index]
+    };
+    assert_eq!(
+        color_for_folder("workspace"),
+        Some(ratatui::style::Color::Yellow)
+    );
+    let project_index = app
+        .tree
+        .nodes
+        .iter()
+        .position(|node| node.name == "project")
+        .expect("project folder exists");
+    let project_line = super::folder_line(
+        &app.tree.nodes[project_index],
+        ratatui::text::Line::default(),
+        false,
+        colors[project_index],
+        true,
+        false,
+    );
+    assert_eq!(
+        project_line.spans.last().unwrap().style.fg,
+        Some(ratatui::style::Color::Yellow)
+    );
+    assert_eq!(
+        color_for_folder("running"),
+        Some(ratatui::style::Color::Green)
+    );
+    assert_eq!(color_for_folder("stopped"), None);
+}
+
+#[test]
+fn folder_branches_show_their_own_status_without_tinting_inactive_rows() {
+    let entries = [
+        super::TreeEntry::Folder { node: 1, depth: 1 },
+        super::TreeEntry::Folder { node: 2, depth: 2 },
+        super::TreeEntry::Folder { node: 3, depth: 2 },
+        super::TreeEntry::Folder { node: 4, depth: 1 },
+    ];
+    let colors = [
+        None,
+        Some(ratatui::style::Color::Yellow),
+        Some(ratatui::style::Color::Green),
+        Some(ratatui::style::Color::Red),
+        None,
+    ];
+    let connector = super::tree_render::tree_connector_line(&entries, 1, &colors, false);
+    assert_eq!(
+        connector
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        super::tree_connector(&entries, 1)
+    );
+    assert_eq!(
+        connector.spans[0].style.fg,
+        Some(ratatui::style::Color::DarkGray)
+    );
+    assert_eq!(
+        connector.spans[1].style.fg,
+        Some(ratatui::style::Color::Green)
+    );
+
+    let inactive_session_connector =
+        super::tree_render::tree_connector_line(&entries, 3, &colors, false);
+    assert!(
+        inactive_session_connector
+            .spans
+            .iter()
+            .all(|span| span.style.fg == Some(ratatui::style::Color::DarkGray))
+    );
+}
+#[test]
 fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
     let mut app = App::default();
     let mut remote = session_at("remote", Some("/work/app"));
@@ -1011,6 +1168,24 @@ fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
         .position(|&index| app.sessions[index].id == "remote")
         .expect("remote session in list");
     app.toggle_view_mode();
+    let focused = app.tree.visible.get(app.tree.cursor).copied();
+    assert!(matches!(focused,
+        Some(super::TreeEntry::Folder { node, .. })
+            if app.tree.nodes[node].node.as_deref() == Some("worker")));
+
+    let remote_work = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, .. }
+                if app.tree.nodes[*node].node.as_deref() == Some("worker")
+                    && app.tree.nodes[*node].path == std::path::Path::new("work"))
+        })
+        .expect("remote work folder is initially visible");
+    app.tree.cursor = remote_work;
+    route_key(&mut app, key(KeyCode::Enter), None);
     let drilled_ids = tree_visible_ids(&app);
     assert!(
         drilled_ids.contains(&"remote".to_string()),
@@ -1023,6 +1198,81 @@ fn tree_groups_by_node_before_cwd_and_keeps_identical_paths_separate() {
     let rendered = render_app(&mut app, 120, 30);
     assert!(rendered.contains("local (node)"));
     assert!(rendered.contains("worker (node)"));
+}
+#[test]
+fn auto_expanded_node_root_can_be_collapsed_and_reexpanded() {
+    let mut local = session_at("local", Some("/home/binwenw/Dev/project"));
+    local.command = "local".into();
+    let mut remote = session_at("remote", Some("/srv/worker/job"));
+    remote.node = Some("worker".into());
+    let mut app = App::default();
+    app.replace_sessions(vec![local, remote]);
+    app.toggle_view_mode();
+
+    let local_root = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, depth: 1 }
+                if app.tree.nodes[*node].is_node && app.tree.nodes[*node].node.is_none())
+        })
+        .expect("local node root is visible");
+    let super::TreeEntry::Folder { node, depth } = app.tree.visible[local_root] else {
+        unreachable!()
+    };
+    assert!(app.tree.is_expanded(node, depth));
+    let expanded_label = super::folder_line(
+        &app.tree.nodes[node],
+        ratatui::text::Line::default(),
+        false,
+        None,
+        true,
+        true,
+    );
+    assert_eq!(
+        expanded_label.spans.last().unwrap().content,
+        "▾ local (node)"
+    );
+    assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Folder { node, .. }
+            if app.tree.nodes[*node].node.is_none() && !app.tree.nodes[*node].is_node)));
+
+    app.tree.cursor = local_root;
+    route_key(&mut app, key(KeyCode::Enter), None);
+    assert!(!app.tree.is_expanded(node, depth));
+    let collapsed_label = super::folder_line(
+        &app.tree.nodes[node],
+        ratatui::text::Line::default(),
+        false,
+        None,
+        true,
+        false,
+    );
+    assert_eq!(
+        collapsed_label.spans.last().unwrap().content,
+        "▸ local (node)"
+    );
+    assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Folder { node, .. }
+            if app.tree.nodes[*node].node.is_none() && !app.tree.nodes[*node].is_node)));
+
+    let local_root = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry,
+            super::TreeEntry::Folder { node, depth: 1 }
+                if app.tree.nodes[*node].is_node && app.tree.nodes[*node].node.is_none())
+        })
+        .unwrap();
+    app.tree.cursor = local_root;
+    route_key(&mut app, key(KeyCode::Enter), None);
+    assert!(app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Folder { node, .. }
+            if app.tree.nodes[*node].node.is_none() && !app.tree.nodes[*node].is_node)));
 }
 #[test]
 fn tree_keeps_shared_cwd_visible_when_a_session_starts_there() {
@@ -1055,22 +1305,30 @@ fn drilling_a_remote_path_does_not_open_the_same_local_path() {
     let mut remote = session_at("remote", Some("/a/b/c/d/e"));
     remote.node = Some("worker".into());
     app.replace_sessions(vec![local, remote]);
-    let target = app
-        .tree
-        .visible
-        .iter()
-        .position(|entry| {
-            matches!(entry,
-            super::TreeEntry::Folder { node, depth: 2 }
-                if app.tree.nodes[*node].node.as_deref() == Some("worker"))
-        })
-        .expect("remote folder at drill horizon");
-    app.tree.cursor = target;
-    app.toggle_tree_drill();
+
+    for path in ["a", "a/b", "a/b/c", "a/b/c/d"] {
+        let target = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry,
+                super::TreeEntry::Folder { node, .. }
+                    if app.tree.nodes[*node].node.as_deref() == Some("worker")
+                        && app.tree.nodes[*node].path == std::path::Path::new(path))
+            })
+            .unwrap_or_else(|| panic!("remote folder {path:?} is not visible yet"));
+        app.tree.cursor = target;
+        app.toggle_tree_drill();
+        if path != "a/b/c/d" {
+            assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
+                super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "remote")));
+        }
+    }
     assert!(app.tree.visible.iter().any(|entry| matches!(entry,
-            super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "remote")));
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "remote")));
     assert!(!app.tree.visible.iter().any(|entry| matches!(entry,
-            super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "local")));
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "local")));
 }
 #[test]
 fn tree_draws_sibling_edges_and_continuing_ancestor_lines() {
@@ -1083,6 +1341,7 @@ fn tree_draws_sibling_edges_and_continuing_ancestor_lines() {
     c.command = "README.md".into();
     app.replace_sessions(vec![a, b, c]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     let rendered = render_app(&mut app, 120, 30);
     assert!(rendered.contains("├── config/"), "{rendered}");
     assert!(rendered.contains("│   ├──"), "{rendered}");
@@ -1102,6 +1361,7 @@ fn ctrl_n_on_tree_folder_prefills_full_cwd_and_owning_node() {
     let local = session_at("local", Some("/home/local"));
     app.replace_sessions(vec![remote, local]);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     app.tree.cursor = app
         .tree
         .visible
@@ -1230,6 +1490,7 @@ fn tree_orders_folders_then_sessions_alphabetically() {
     }
     app.replace_sessions(sessions);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
 
     // Capture each visible row's display label. Folder rows use the
     // folder's `name` (the last basename); session rows use the
@@ -1313,6 +1574,7 @@ fn tree_render_emits_no_table_widget() {
     sessions[0].input_needed = true;
     app.replace_sessions(sessions);
     app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
     let buffer = render_app_buffer(&mut app, 120, 24);
     let area = *buffer.area();
     let mut saw_attention = false;
@@ -1466,6 +1728,7 @@ fn ctrl_d_opens_complete_prefilled_clone_dialog() {
     );
     let dialog = app.clone_dialog.as_ref().unwrap();
     assert_eq!(dialog.source_id.as_deref(), Some("source"));
+    assert_eq!(dialog.source_node.as_deref(), Some("worker-a"));
     assert_eq!(dialog.command.value, "copilot");
     assert_eq!(dialog.args.value, r#"--model "gpt 5""#);
     assert_eq!(dialog.cwd.value, "D:\\work tree");
@@ -1476,6 +1739,8 @@ fn ctrl_d_opens_complete_prefilled_clone_dialog() {
     assert_eq!(dialog.cols.value, "132");
     assert!(!dialog.disable_notifications);
     assert!(!dialog.attach_after_start);
+    assert!(!dialog.remove_original);
+    assert!(render_app(&mut app, 120, 30).contains("Duplicate source (worker-a)"));
 }
 
 #[test]
@@ -1492,6 +1757,7 @@ fn ctrl_n_opens_blank_new_session_dialog_scoped_to_the_viewed_node() {
     );
     let dialog = app.clone_dialog.as_ref().unwrap();
     assert!(dialog.source_id.is_none());
+    assert!(dialog.source_node.is_none());
     assert!(dialog.command.value.is_empty());
     assert!(dialog.args.value.is_empty());
     assert!(dialog.cwd.value.is_empty());
@@ -1505,10 +1771,12 @@ fn ctrl_n_opens_blank_new_session_dialog_scoped_to_the_viewed_node() {
     assert!(dialog.cols.value.is_empty());
     assert!(!dialog.disable_notifications);
     assert!(!dialog.attach_after_start);
+    assert!(!dialog.remove_original);
 
     let rendered = render_app(&mut app, 120, 30);
     assert!(rendered.contains("New Session"));
     assert!(!rendered.contains("Duplicate source"));
+    assert!(!rendered.contains("Remove original"));
 }
 
 #[test]
@@ -1536,6 +1804,7 @@ fn new_session_enter_launches_on_the_viewed_node() {
     };
     assert_eq!(launch.node.as_deref(), Some("worker-a"));
     assert_eq!(launch.command, "bash");
+    assert!(launch.remove_source.is_none());
     let request = launch.request();
     let RpcRequest::NodeProxy { node, inner } = request else {
         panic!("node-scoped launch must be wrapped in NodeProxy");
@@ -2153,10 +2422,102 @@ fn tab_and_ctrl_tab_navigate_clone_fields() {
     route_key(&mut app, key(KeyCode::BackTab), None);
     assert_eq!(
         app.clone_dialog.as_ref().unwrap().active_field(),
-        CloneField::AttachAfterStart
+        CloneField::RemoveOriginal
     );
 }
 
+#[test]
+fn duplicate_remove_original_is_opt_in_and_skipped_for_new_sessions() {
+    let mut app = App::default();
+    let mut source = session("source");
+    source.node = Some("original-node".to_string());
+    app.replace_sessions(vec![source]);
+    route_key(&mut app, ctrl(KeyCode::Char('d')), None);
+    assert!(!app.clone_dialog.as_ref().unwrap().remove_original);
+    assert!(
+        app.clone_dialog
+            .as_ref()
+            .unwrap()
+            .launch()
+            .unwrap()
+            .remove_source
+            .is_none()
+    );
+    assert!(render_app(&mut app, 120, 30).contains("Remove original"));
+
+    // This checkbox is reachable by keyboard, and its source node is not
+    // affected by editing the target node for the new session.
+    app.clone_dialog.as_mut().unwrap().active = super::CLONE_FIELDS.len() - 1;
+    route_key(&mut app, key(KeyCode::Char(' ')), None);
+    assert!(app.clone_dialog.as_ref().unwrap().remove_original);
+    app.clone_dialog.as_mut().unwrap().node = super::EditText::new("new-node".to_string());
+    let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), None) else {
+        panic!("duplicate must produce a start action");
+    };
+    assert_eq!(launch.node.as_deref(), Some("new-node"));
+    let source = launch.remove_source.expect("remove-original option");
+    assert_eq!(source.id, "source");
+    assert_eq!(source.node.as_deref(), Some("original-node"));
+    let RpcRequest::NodeProxy { node, inner } = super::remove_request(&source) else {
+        panic!("original removal must route to original node");
+    };
+    assert_eq!(node, "original-node");
+    assert!(matches!(*inner, RpcRequest::Remove { id, force: true } if id == "source"));
+
+    let mut blank = super::CloneDialog::blank(Some("new-node"));
+    blank.command = super::EditText::new("echo".to_string());
+    blank.previous();
+    assert_eq!(blank.active_field(), CloneField::AttachAfterStart);
+    blank.remove_original = true;
+    assert!(blank.launch().unwrap().remove_source.is_none());
+}
+#[test]
+fn duplicate_remove_reports_failures_and_cleans_the_original_node_only_on_success() {
+    let mut app = App::default();
+    let local = session("same-id");
+    let mut remote = session("same-id");
+    remote.node = Some("worker".to_string());
+    app.replace_sessions(vec![local, remote]);
+    let target = super::SessionTarget {
+        id: "same-id".to_string(),
+        node: Some("worker".to_string()),
+    };
+    assert!(app.rates.contains_key("same-id"));
+    assert!(app.rates.contains_key("worker\0same-id"));
+
+    let (message, failed) = super::refresh::apply_clone_remove_response(
+        &mut app,
+        "new-session",
+        &target,
+        Err(AppError::NodeNotConnected("worker".to_string())),
+    );
+    assert!(failed);
+    assert!(message.contains("original same-id was not removed"));
+    assert_eq!(app.sessions.len(), 2);
+
+    let (message, failed) = super::refresh::apply_clone_remove_response(
+        &mut app,
+        "new-session",
+        &target,
+        Ok(RpcResponse::Remove { removed: false }),
+    );
+    assert!(failed);
+    assert!(message.contains("not found"));
+    assert_eq!(app.sessions.len(), 2);
+
+    let (message, failed) = super::refresh::apply_clone_remove_response(
+        &mut app,
+        "new-session",
+        &target,
+        Ok(RpcResponse::Remove { removed: true }),
+    );
+    assert!(!failed);
+    assert!(message.contains("removed original same-id"));
+    assert_eq!(app.sessions.len(), 1);
+    assert!(app.sessions[0].node.is_none());
+    assert!(app.rates.contains_key("same-id"));
+    assert!(!app.rates.contains_key("worker\0same-id"));
+}
 #[test]
 fn enter_confirms_complete_modified_launch_and_request_payload() {
     let mut app = App::default();
@@ -2173,6 +2534,7 @@ fn enter_confirms_complete_modified_launch_and_request_payload() {
     dialog.cols = super::EditText::new("160".to_string());
     dialog.disable_notifications = true;
     dialog.attach_after_start = true;
+    dialog.remove_original = true;
 
     let expected = CloneLaunch {
         title: Some("Cloned agent".to_string()),
@@ -2185,6 +2547,10 @@ fn enter_confirms_complete_modified_launch_and_request_payload() {
         cols: Some(160),
         disable_notifications: true,
         attach_after_start: true,
+        remove_source: Some(super::SessionTarget {
+            id: "source".to_string(),
+            node: None,
+        }),
     };
     assert_eq!(
         route_key(&mut app, key(KeyCode::Enter), None),
@@ -2194,6 +2560,10 @@ fn enter_confirms_complete_modified_launch_and_request_payload() {
     let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), None) else {
         panic!("expected start action");
     };
+    assert!(matches!(
+        super::remove_request(launch.remove_source.as_ref().unwrap()),
+        RpcRequest::Remove { id, force: true } if id == "source"
+    ));
     match launch.request() {
         RpcRequest::NodeProxy { node, inner } => {
             assert_eq!(node, "worker-b");
@@ -2326,6 +2696,21 @@ fn ctrl_r_requires_confirmation_before_force_removal() {
     };
     assert_eq!(node, "worker-a");
     assert!(matches!(*inner, RpcRequest::Remove { id, force: true } if id == "remove-me"));
+}
+#[test]
+fn removing_a_nonselected_session_preserves_the_selected_session() {
+    let mut app = App::default();
+    app.replace_sessions(vec![session("first"), session("selected")]);
+    app.selected = app
+        .sessions
+        .iter()
+        .position(|session| session.id == "selected")
+        .unwrap();
+    app.remove_session_payload("first", None);
+    assert_eq!(
+        app.selected_session().map(|session| session.id.as_str()),
+        Some("selected")
+    );
 }
 #[test]
 fn refresh_keeps_selection_by_id() {
@@ -2690,7 +3075,23 @@ fn powershell_script_is_encoded_as_utf16le() {
 #[test]
 fn inactive_session_uses_logs_command() {
     let (_, args) = super::session_command("abc", Some("worker"), false).unwrap();
-    assert_eq!(args, ["logs", "abc", "--keep-color", "--node", "worker"]);
+    assert_eq!(
+        args,
+        [
+            "logs",
+            "abc",
+            "--keep-color",
+            "--tail",
+            "1000",
+            "--node",
+            "worker"
+        ]
+    );
+    let (_, local_args) = super::session_command("abc", None, false).unwrap();
+    assert_eq!(
+        local_args,
+        ["logs", "abc", "--keep-color", "--tail", "1000"]
+    );
     let (_, args) = super::session_command("abc", None, true).unwrap();
     assert_eq!(args, ["attach", "abc"]);
 }
@@ -2923,7 +3324,7 @@ fn rebuild_visible_repairs_stale_search_index() {
 
     app.rebuild_visible();
 
-    assert_eq!(app.search_text, vec!["a\ncmd".to_string()]);
+    assert_eq!(app.search_text, vec!["a\ncmd\nrunning".to_string()]);
     assert_eq!(app.visible, vec![0]);
 }
 

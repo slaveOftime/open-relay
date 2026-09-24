@@ -16,6 +16,7 @@ pub(crate) const ATTENTION_PULSE_BG_SELECTED: Color = Color::Rgb(58, 59, 38);
 pub(crate) const RATE_HISTORY_LEN: usize = 30;
 pub(crate) const COMPACT_SPARKLINE_WIDTH: usize = 3;
 pub(crate) const SPARKLINE_WIDTH: usize = 5;
+pub(crate) const INACTIVE_LOG_TAIL_LINES: usize = 1000;
 pub(crate) const STOP_GRACE_SECONDS: u64 = 15;
 pub(crate) const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 // `pub(crate)` so the Windows crash handler in `crate::client::crash` can

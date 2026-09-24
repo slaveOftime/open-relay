@@ -206,6 +206,45 @@ pub fn remove_session(config: &AppConfig, app: &mut App, target: SessionTarget) 
     app.set_action_message(Some(format!("removing session {}", target.id)));
 }
 
+/// Apply the force-remove result only after the duplicate was created. A
+/// refusal leaves the original in the list and makes the partial success
+/// visible instead of silently pretending the original was removed.
+pub(super) fn apply_clone_remove_response(
+    app: &mut App,
+    new_id: &str,
+    source: &SessionTarget,
+    response: Result<RpcResponse>,
+) -> (String, bool) {
+    let started = format!("started new session {new_id}");
+    match response {
+        Ok(RpcResponse::Remove { removed: true }) => {
+            app.remove_session_payload(&source.id, source.node.as_deref());
+            (format!("{started} · removed original {}", source.id), false)
+        }
+        Ok(RpcResponse::Remove { removed: false }) => (
+            format!(
+                "{started} · original {} was not removed (not found)",
+                source.id
+            ),
+            true,
+        ),
+        Ok(_) => (
+            format!(
+                "{started} · original {} was not removed (unexpected response)",
+                source.id
+            ),
+            true,
+        ),
+        Err(error) => (
+            format!(
+                "{started} · original {} was not removed: {error}",
+                source.id
+            ),
+            true,
+        ),
+    }
+}
+
 pub async fn start_clone(
     config: &AppConfig,
     terminal: &mut TuiTerminal,
@@ -215,9 +254,30 @@ pub async fn start_clone(
     match ipc::send_request_checked(config, launch.request()).await {
         Ok(RpcResponse::Start { session_id }) => {
             app.clone_dialog = None;
-            app.set_action_message(Some(format!("started new session {session_id}")));
+            let (feedback, removal_failed) = if let Some(source) = &launch.remove_source {
+                // Never force-remove the newly created session even if a
+                // buggy daemon were to return the original ID on the same node.
+                if source.id == session_id && source.node.as_deref() == launch.node.as_deref() {
+                    (
+                        format!(
+                            "started new session {session_id} · original was not removed (same ID)"
+                        ),
+                        true,
+                    )
+                } else {
+                    let response = ipc::send_request_checked(config, remove_request(source)).await;
+                    apply_clone_remove_response(app, &session_id, source, response)
+                }
+            } else {
+                (format!("started new session {session_id}"), false)
+            };
+            app.set_action_message(Some(feedback.clone()));
             if launch.attach_after_start {
                 open_session_inline(terminal, app, &session_id, launch.node.as_deref(), true)?;
+                if removal_failed {
+                    let attach_feedback = app.message.as_deref().unwrap_or_default();
+                    app.set_action_message(Some(format!("{feedback} · {attach_feedback}")));
+                }
             }
         }
         Ok(_) => {

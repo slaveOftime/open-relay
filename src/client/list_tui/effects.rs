@@ -98,8 +98,9 @@ pub fn render_effects(
     }
 
     // Fade a clone/update dialog in when it opens.
-    let dialog = if app.clone_dialog.is_some() {
-        Some(("clone-fade", centered_rect(frame.area(), 96, 14)))
+    let dialog = if let Some(clone) = app.clone_dialog.as_ref() {
+        let height = if clone.source_id.is_some() { 20 } else { 19 };
+        Some(("clone-fade", centered_rect(frame.area(), 96, height)))
     } else if app.update_dialog.is_some() {
         Some(("update-fade", centered_rect(frame.area(), 110, 19)))
     } else {

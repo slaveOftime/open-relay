@@ -19,7 +19,11 @@ use super::table::{format_bytes, pad_truncated};
 use crate::protocol::SessionSummary;
 
 pub fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
-    let area = centered_rect(frame.area(), 96, 19);
+    let area = centered_rect(
+        frame.area(),
+        96,
+        if dialog.source_id.is_some() { 20 } else { 19 },
+    );
     let cursor_visible = clone_cursor_visible();
     let field_line = |field| clone_field_line(dialog, field, area.width, cursor_visible);
     let mut lines = vec![section_header("PROCESS")];
@@ -45,6 +49,12 @@ pub fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
             CloneField::AttachAfterStart,
         ]
         .into_iter()
+        .chain(
+            dialog
+                .source_id
+                .is_some()
+                .then_some(CloneField::RemoveOriginal),
+        )
         .map(field_line),
     );
     lines.push(tip_separator(area.width));
@@ -54,7 +64,12 @@ pub fn render_clone_dialog(frame: &mut Frame<'_>, dialog: &CloneDialog) {
         area,
         dialog.source_id.as_ref().map_or_else(
             || " ✚ New Session ".to_string(),
-            |source_id| format!(" ⧉ Duplicate {source_id} "),
+            |source_id| {
+                format!(
+                    " ⧉ Duplicate {source_id} ({}) ",
+                    dialog.source_node.as_deref().unwrap_or("local")
+                )
+            },
         ),
         Color::Cyan,
         lines,
@@ -459,6 +474,14 @@ pub fn clone_field_line(
         CloneField::AttachAfterStart => (
             "Attach",
             checkbox_spans(dialog.attach_after_start, active, Some("on start")),
+        ),
+        CloneField::RemoveOriginal => (
+            "Remove original",
+            checkbox_spans(
+                dialog.remove_original,
+                active,
+                Some("force after successful start"),
+            ),
         ),
     };
     dialog_field_line(active, label, value_spans)

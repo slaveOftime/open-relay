@@ -83,7 +83,7 @@ pub(super) use terminal::{
 #[cfg(test)]
 pub(super) use tree::{
     TREE_AUTO_DEPTH, TreeEntry, TreeNode, TreeView, ViewMode, append_tree_node, common_path_prefix,
-    ensure_tree_path, is_in_drill_subtree, walk_tree_branch,
+    ensure_tree_path, walk_tree_branch,
 };
 #[cfg(test)]
 pub(super) use tree_render::{

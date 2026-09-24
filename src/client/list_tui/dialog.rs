@@ -17,9 +17,10 @@ pub enum CloneField {
     Cols,
     DisableNotifications,
     AttachAfterStart,
+    RemoveOriginal,
 }
 
-pub const CLONE_FIELDS: [CloneField; 10] = [
+pub const CLONE_FIELDS: [CloneField; 11] = [
     CloneField::Command,
     CloneField::Args,
     CloneField::Cwd,
@@ -30,6 +31,7 @@ pub const CLONE_FIELDS: [CloneField; 10] = [
     CloneField::Cols,
     CloneField::DisableNotifications,
     CloneField::AttachAfterStart,
+    CloneField::RemoveOriginal,
 ];
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -89,6 +91,8 @@ impl EditText {
 #[derive(Debug, Eq, PartialEq)]
 pub struct CloneDialog {
     pub source_id: Option<String>,
+    /// The original node remains fixed when the new session target is edited.
+    pub source_node: Option<String>,
     pub active: usize,
     pub command: EditText,
     pub args: EditText,
@@ -100,6 +104,7 @@ pub struct CloneDialog {
     pub cols: EditText,
     pub disable_notifications: bool,
     pub attach_after_start: bool,
+    pub remove_original: bool,
     pub error: Option<String>,
 }
 
@@ -107,6 +112,7 @@ impl CloneDialog {
     pub fn from_session(session: &SessionSummary, list_node: Option<&str>) -> Self {
         Self {
             source_id: Some(session.id.clone()),
+            source_node: session.node.clone(),
             active: 0,
             command: EditText::new(session.command.clone()),
             args: EditText::new(format_terminal_words(&session.args)),
@@ -135,6 +141,7 @@ impl CloneDialog {
             ),
             disable_notifications: !session.notifications_enabled,
             attach_after_start: false,
+            remove_original: false,
             error: None,
         }
     }
@@ -142,6 +149,7 @@ impl CloneDialog {
     pub fn blank(list_node: Option<&str>) -> Self {
         Self {
             source_id: None,
+            source_node: None,
             active: 0,
             command: EditText::new(String::new()),
             args: EditText::new(String::new()),
@@ -155,6 +163,7 @@ impl CloneDialog {
             cols: EditText::new(String::new()),
             disable_notifications: false,
             attach_after_start: false,
+            remove_original: false,
             error: None,
         }
     }
@@ -163,13 +172,17 @@ impl CloneDialog {
         CLONE_FIELDS[self.active]
     }
 
+    fn field_count(&self) -> usize {
+        CLONE_FIELDS.len() - usize::from(self.source_id.is_none())
+    }
+
     pub fn next(&mut self) {
-        self.active = (self.active + 1) % CLONE_FIELDS.len();
+        self.active = (self.active + 1) % self.field_count();
         self.error = None;
     }
 
     pub fn previous(&mut self) {
-        self.active = (self.active + CLONE_FIELDS.len() - 1) % CLONE_FIELDS.len();
+        self.active = (self.active + self.field_count() - 1) % self.field_count();
         self.error = None;
     }
 
@@ -183,7 +196,9 @@ impl CloneDialog {
             CloneField::Node => Some(&mut self.node),
             CloneField::Rows => Some(&mut self.rows),
             CloneField::Cols => Some(&mut self.cols),
-            CloneField::DisableNotifications | CloneField::AttachAfterStart => None,
+            CloneField::DisableNotifications
+            | CloneField::AttachAfterStart
+            | CloneField::RemoveOriginal => None,
         }
     }
 
@@ -193,6 +208,9 @@ impl CloneDialog {
                 self.disable_notifications = !self.disable_notifications
             }
             CloneField::AttachAfterStart => self.attach_after_start = !self.attach_after_start,
+            CloneField::RemoveOriginal if self.source_id.is_some() => {
+                self.remove_original = !self.remove_original;
+            }
             _ => {}
         }
         self.error = None;
@@ -217,6 +235,14 @@ impl CloneDialog {
             cols,
             disable_notifications: self.disable_notifications,
             attach_after_start: self.attach_after_start,
+            remove_source: self
+                .source_id
+                .as_ref()
+                .filter(|_| self.remove_original)
+                .map(|id| SessionTarget {
+                    id: id.clone(),
+                    node: self.source_node.clone(),
+                }),
         })
     }
 }
