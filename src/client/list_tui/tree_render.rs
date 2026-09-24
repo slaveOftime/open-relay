@@ -356,7 +356,7 @@ fn session_line_with_connector(
     let mut spans = connector.spans;
     spans.extend([
         Span::styled(glyph.to_string(), status_style),
-        Span::raw("  "),
+        Span::raw(" "),
         Span::styled(
             pad_truncated(
                 status_label(&session.status, session.input_needed),
@@ -364,7 +364,7 @@ fn session_line_with_connector(
             ),
             status_style,
         ),
-        Span::raw("  "),
+        Span::raw(" "),
         Span::styled(cmd_args, dim),
         Span::raw("  "),
         Span::styled(title_text, Style::default().fg(muted)),
