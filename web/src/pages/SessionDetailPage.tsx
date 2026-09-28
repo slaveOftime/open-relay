@@ -30,6 +30,7 @@ import NewSessionDialog from '@/components/NewSessionDialog'
 import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/SessionMetadataDialog'
 import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
+import SessionDeleteConfirmDialog from '@/components/SessionDeleteConfirmDialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { getTransferredFiles } from '@/components/ui/file-transfer'
@@ -65,6 +66,7 @@ import {
   ReloadIcon,
   StopIcon,
   TrackNextIcon,
+  TrashIcon,
 } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
 import AttachPanel from '@/components/AttachPanel'
@@ -150,6 +152,7 @@ function SessionDetailPageContent() {
   const [connectTrace, setConnectTrace] = useState<string[]>([])
   const [exitCode, setExitCode] = useState<number | null | undefined>(undefined)
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [replaySpeed] = useState(0.5)
@@ -1461,6 +1464,12 @@ function SessionDetailPageContent() {
                 Run Again
               </Button>
             )}
+            {session && (
+              <Button size="sm" variant="destructive" onClick={() => setShowDeleteConfirm(true)}>
+                <TrashIcon className="h-4 w-4" />
+                Delete
+              </Button>
+            )}
             {mode === 'logs' && isRunning && (
               <Button
                 size="sm"
@@ -1499,6 +1508,16 @@ function SessionDetailPageContent() {
                   <DropdownMenuItem touch onClick={() => setShowNewSessionDialog(true)}>
                     <CopyIcon className="w-4 h-4" />
                     Run Again
+                  </DropdownMenuItem>
+                )}
+                {session && (
+                  <DropdownMenuItem
+                    touch
+                    className="text-[hsl(var(--destructive))] focus:text-[hsl(var(--destructive))]"
+                    onClick={() => setShowDeleteConfirm(true)}
+                  >
+                    <TrashIcon className="w-4 h-4" />
+                    Delete
                   </DropdownMenuItem>
                 )}
                 {(mode === 'attach' || isRunning) && (
@@ -1802,6 +1821,15 @@ function SessionDetailPageContent() {
           }}
           onClose={() => setPendingAction(null)}
         />
+        {session && (
+          <SessionDeleteConfirmDialog
+            open={showDeleteConfirm}
+            session={session}
+            node={node ?? undefined}
+            onClose={() => setShowDeleteConfirm(false)}
+            onRemoved={() => navigate('/', { replace: true })}
+          />
+        )}
         <NewSessionDialog
           open={showNewSessionDialog}
           onClose={() => setShowNewSessionDialog(false)}

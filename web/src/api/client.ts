@@ -193,12 +193,24 @@ export function stopSession(
   })
 }
 
+/** Removes a stopped session, or force-removes a running session when requested. */
+export function removeSession(
+  id: string,
+  node?: string,
+  force = false
+): Promise<{ removed: boolean }> {
+  const params = new URLSearchParams()
+  if (force) params.set('force', 'true')
+  if (node) params.set('node', node)
+  const query = params.size > 0 ? `?${params}` : ''
+  return req(`${BASE}/sessions/${encodeURIComponent(id)}${query}`, { method: 'DELETE' })
+}
+
 /** Force-removes the session and its files, like `oly rm <id> -f`. */
 export function forceRemoveSession(id: string, node?: string): Promise<{ removed: boolean }> {
-  const params = new URLSearchParams({ force: 'true' })
-  if (node) params.set('node', node)
-  return req(`${BASE}/sessions/${encodeURIComponent(id)}?${params}`, { method: 'DELETE' })
+  return removeSession(id, node, true)
 }
+
 export function killSession(id: string, node?: string): Promise<{ killed: boolean }> {
   const q = node ? `?node=${encodeURIComponent(node)}` : ''
   return req(`${BASE}/sessions/${id}/kill${q}`, { method: 'POST', body: '{}' })

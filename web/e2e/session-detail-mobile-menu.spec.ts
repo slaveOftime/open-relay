@@ -41,6 +41,13 @@ test('session detail mobile actions have thumb-sized targets and remain usable o
       }),
     })
   )
+  let removeRequests = 0
+  await page.route('**/api/sessions/mobile-session?**', (route) => {
+    removeRequests += 1
+    expect(route.request().method()).toBe('DELETE')
+    expect(new URL(route.request().url()).searchParams.get('force')).toBe('true')
+    return route.fulfill({ status: 200, contentType: 'application/json', body: '{"removed":true}' })
+  })
   await page.route('**/api/sessions/mobile-session/logs**', (route) => {
     if (new URL(route.request().url()).pathname.endsWith('/tail')) {
       return route.fulfill({ status: 200, body: '', headers: { 'x-log-resizes': '[]' } })
@@ -61,7 +68,7 @@ test('session detail mobile actions have thumb-sized targets and remain usable o
 
   await trigger.click()
   const items = page.getByRole('menuitem')
-  await expect(items).toHaveCount(5)
+  await expect(items).toHaveCount(6)
   for (const item of await items.all()) {
     const box = await item.boundingBox()
     expect(box?.height).toBeGreaterThanOrEqual(44)
@@ -75,8 +82,18 @@ test('session detail mobile actions have thumb-sized targets and remain usable o
   await items.last().scrollIntoViewIfNeeded()
   await expect(items.last()).toBeVisible()
   await page.keyboard.press('Escape')
+  await trigger.click()
+  await page.getByRole('menuitem', { name: 'Delete' }).click()
+  const confirm = page.getByRole('alertdialog')
+  await expect(confirm).toContainText('The running process will be killed first.')
+  await confirm.getByRole('button', { name: 'Cancel' }).click()
+  expect(removeRequests).toBe(0)
 
   await page.setViewportSize({ width: 1024, height: 768 })
   await expect(trigger).toBeHidden()
   await expect(page.getByRole('button', { name: 'Refresh' })).toBeVisible()
+  await page.getByRole('button', { name: 'Delete', exact: true }).click()
+  await confirm.getByRole('button', { name: 'Delete session' }).click()
+  await expect.poll(() => removeRequests).toBe(1)
+  await expect(page).toHaveURL('/')
 })

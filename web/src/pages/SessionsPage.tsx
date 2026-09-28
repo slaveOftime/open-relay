@@ -22,6 +22,7 @@ import NewSessionDialog from '@/components/NewSessionDialog'
 import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/SessionMetadataDialog'
 import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
+import SessionDeleteConfirmDialog from '@/components/SessionDeleteConfirmDialog'
 import {
   clampSessionTableColumnSize,
   coerceSessionTableColumnSettings,
@@ -41,6 +42,7 @@ import {
   type SessionPageEventContext,
   type SessionPageEventHandlers,
 } from './sessions-page-events'
+import { nodeAfterSwipe } from './sessions-node-swipe'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -101,6 +103,7 @@ import {
   PlusIcon,
   ReloadIcon,
   StopIcon,
+  TrashIcon,
 } from '@radix-ui/react-icons'
 import {
   disablePushNotifications,
@@ -462,6 +465,7 @@ function SessionRow({
   onTogglePin,
   onRunAgain,
   onEditSession,
+  onRequestDelete,
   notificationsPending,
   node,
   columns,
@@ -475,6 +479,7 @@ function SessionRow({
   onTogglePin: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
   onEditSession: (session: SessionSummary) => void
+  onRequestDelete: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
   columns: SessionTableColumn[]
@@ -606,7 +611,7 @@ function SessionRow({
       case 'actions':
         return (
           <TableCell key={columnKey} className="px-3 py-1" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-1">
+            <div className="flex flex-wrap items-center gap-1">
               {isRunning && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -683,6 +688,20 @@ function SessionRow({
                 </TooltipTrigger>
                 <TooltipContent>Run Again</TooltipContent>
               </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="destructive"
+                    size="icon"
+                    className="shrink-0"
+                    onClick={() => onRequestDelete(session)}
+                    aria-label="Delete session"
+                  >
+                    <TrashIcon className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Delete session</TooltipContent>
+              </Tooltip>
             </div>
           </TableCell>
         )
@@ -724,6 +743,7 @@ function SessionCard({
   onTogglePin,
   onRunAgain,
   onEditSession,
+  onRequestDelete,
   notificationsPending,
   node,
 }: {
@@ -736,6 +756,7 @@ function SessionCard({
   onTogglePin: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
   onEditSession: (session: SessionSummary) => void
+  onRequestDelete: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
 }) {
@@ -766,7 +787,10 @@ function SessionCard({
       >
         <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1 relative">
           {/* Row 1: id, status, pid, created at */}
-          <div className="z-10 flex items-center gap-2 overflow-x-auto whitespace-nowrap">
+          <div
+            data-node-swipe-ignore
+            className="z-10 flex items-center gap-2 overflow-x-auto whitespace-nowrap"
+          >
             <button
               className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold hover:text-[hsl(var(--primary))] transition-colors"
               onClick={() => onEditSession(session)}
@@ -832,6 +856,7 @@ function SessionCard({
 
         {/* Action bar */}
         <CardFooter
+          data-node-swipe-ignore
           className="flex items-center gap-2 px-3.5 py-2 overflow-x-auto"
           onClick={(e) => e.stopPropagation()}
         >
@@ -894,6 +919,20 @@ function SessionCard({
               </Button>
             </TooltipTrigger>
             <TooltipContent>Run Again</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="destructive"
+                size="icon"
+                className="h-11 w-11 shrink-0"
+                onClick={() => onRequestDelete(session)}
+                aria-label="Delete session"
+              >
+                <TrashIcon className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Delete session</TooltipContent>
           </Tooltip>
         </CardFooter>
       </Card>
@@ -975,6 +1014,7 @@ export default function SessionsPage() {
   const [showNewSession, setShowNewSession] = useState(false)
   const [rerunSession, setRerunSession] = useState<SessionSummary | null>(null)
   const [editingSession, setEditingSession] = useState<SessionSummary | null>(null)
+  const [deletingSession, setDeletingSession] = useState<SessionSummary | null>(null)
   const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set())
   const [notificationRequestIds, setNotificationRequestIds] = useState<Set<string>>(new Set())
   const [showFilters, setShowFilters] = useState(false)
@@ -993,6 +1033,8 @@ export default function SessionsPage() {
 
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const delayedReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const mobileTouchStartRef = useRef<{ x: number; y: number } | null>(null)
+  const lastNodeSwipeAtRef = useRef(0)
   const tableResizeRef = useRef<{
     columnKey: SessionTableColumnKey
     startX: number
@@ -1432,6 +1474,41 @@ export default function SessionsPage() {
       },
       { replace: true }
     )
+  }
+
+  function handleMobileTouchStart(event: React.TouchEvent<HTMLDivElement>) {
+    mobileTouchStartRef.current = null
+    lastNodeSwipeAtRef.current = 0
+    if (event.touches.length !== 1) return
+    const target = event.target
+    const x = event.touches[0].clientX
+    const interactive =
+      target instanceof Element &&
+      target.closest('[data-node-swipe-ignore], button, a, input, textarea, select, [role="button"]')
+    if (x < 24 || x > window.innerWidth - 24 || interactive) return
+    mobileTouchStartRef.current = { x, y: event.touches[0].clientY }
+  }
+
+  function handleMobileTouchEnd(event: React.TouchEvent<HTMLDivElement>) {
+    const start = mobileTouchStartRef.current
+    mobileTouchStartRef.current = null
+    if (!start || event.changedTouches.length !== 1) return
+    const touch = event.changedTouches[0]
+    const next = nodeAfterSwipe(
+      selectedNode,
+      nodes,
+      touch.clientX - start.x,
+      touch.clientY - start.y
+    )
+    if (next === undefined) return
+    lastNodeSwipeAtRef.current = Date.now()
+    handleNodeChange(next)
+  }
+
+  function handleDeleted(id: string) {
+    removeLoadedSession(id)
+    setPinnedKeys((prev) => prev.filter((key) => key !== sessionPinKey(id, selectedNode)))
+    void reloadSessions({ background: true })
   }
 
   async function handleStop(id: string) {
@@ -1904,7 +1981,30 @@ export default function SessionsPage() {
         </header>
 
         {/* ── Mobile list ── */}
-        <div className="flex-1 md:hidden">
+        <div
+          className="flex-1 md:hidden"
+          data-testid="mobile-session-list"
+          onPointerDownCapture={(event) => {
+            if (event.pointerType !== 'touch') lastNodeSwipeAtRef.current = 0
+          }}
+          onTouchStart={handleMobileTouchStart}
+          onTouchEnd={handleMobileTouchEnd}
+          onTouchCancel={() => {
+            mobileTouchStartRef.current = null
+          }}
+          onClickCapture={(event) => {
+            if (lastNodeSwipeAtRef.current && Date.now() - lastNodeSwipeAtRef.current < 350) {
+              event.preventDefault()
+              event.stopPropagation()
+              lastNodeSwipeAtRef.current = 0
+            }
+          }}
+        >
+          {nodes.length > 0 && (
+            <p className="px-4 py-1 text-center text-[11px] text-[hsl(var(--muted-foreground))]">
+              Swipe left or right to switch nodes
+            </p>
+          )}
           {loading &&
             sessions.length === 0 &&
             Array.from({ length: 5 }).map((_, i) => <SkeletonCard key={i} />)}
@@ -1933,6 +2033,7 @@ export default function SessionsPage() {
                       onTogglePin={handleTogglePin}
                       onRunAgain={handleRunAgain}
                       onEditSession={handleEditSession}
+                      onRequestDelete={setDeletingSession}
                       notificationsPending={notificationRequestIds.has(s.id)}
                       node={selectedNode ?? undefined}
                     />
@@ -2060,6 +2161,7 @@ export default function SessionsPage() {
                         onTogglePin={handleTogglePin}
                         onRunAgain={handleRunAgain}
                         onEditSession={handleEditSession}
+                        onRequestDelete={setDeletingSession}
                         notificationsPending={notificationRequestIds.has(s.id)}
                         node={selectedNode ?? undefined}
                         columns={orderedTableColumns}
@@ -2108,6 +2210,15 @@ export default function SessionsPage() {
           )}
         </div>
 
+        {deletingSession && (
+          <SessionDeleteConfirmDialog
+            open
+            session={sessions.find((item) => item.id === deletingSession.id) ?? deletingSession}
+            node={selectedNode ?? undefined}
+            onClose={() => setDeletingSession(null)}
+            onRemoved={() => handleDeleted(deletingSession.id)}
+          />
+        )}
         <NewSessionDialog
           open={showNewSession}
           onClose={() => {
