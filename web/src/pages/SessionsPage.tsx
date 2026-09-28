@@ -994,6 +994,8 @@ export default function SessionsPage() {
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
+  const requestVersionRef = useRef(0)
+  const selectedNodeRef = useRef(selectedNode)
   const sseStatus = useSseConnectionState()
 
   // Ids currently rendered on the page (the SSE handler must not invent rows).
@@ -1054,7 +1056,13 @@ export default function SessionsPage() {
 
   const loadLocal = useCallback(
     async (opts?: { background?: boolean }) => {
-      if (selectedNode) return
+      if (selectedNode || selectedNodeRef.current !== selectedNode) return
+
+      const requestVersion = ++requestVersionRef.current
+      const isCurrent = () =>
+        isMounted.current &&
+        requestVersionRef.current === requestVersion &&
+        selectedNodeRef.current === selectedNode
 
       const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
       if (shouldShowSkeleton || !opts || opts?.background === false) setLoading(true)
@@ -1070,22 +1078,23 @@ export default function SessionsPage() {
           order: sortOrder,
         }
         const res = await fetchSessionsOnce(params)
-        if (!isMounted.current) return
-        if (selectedNode) return
+        if (!isCurrent()) return
 
         hasLoadedRef.current = true
         applySessionItems(res.items)
         setRemoteTotal(res.total)
       } catch (error) {
-        if (isMounted.current && !opts?.background) {
+        if (isCurrent() && !opts?.background) {
           setLoadError({
             title: 'Unable to load sessions',
             message: getErrorMessage(error, 'Failed to load local sessions.'),
           })
         }
       } finally {
-        setLoading(false)
-        setRefreshing(false)
+        if (isCurrent()) {
+          setLoading(false)
+          setRefreshing(false)
+        }
       }
     },
     [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
@@ -1093,7 +1102,13 @@ export default function SessionsPage() {
 
   const loadRemote = useCallback(
     async (opts?: { background?: boolean }) => {
-      if (!selectedNode) return
+      if (!selectedNode || selectedNodeRef.current !== selectedNode) return
+
+      const requestVersion = ++requestVersionRef.current
+      const isCurrent = () =>
+        isMounted.current &&
+        requestVersionRef.current === requestVersion &&
+        selectedNodeRef.current === selectedNode
 
       const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
       if (shouldShowSkeleton) setLoading(true)
@@ -1110,20 +1125,20 @@ export default function SessionsPage() {
           node: selectedNode,
         }
         const res = await fetchSessionsOnce(params)
-        if (!isMounted.current || !selectedNode) return
+        if (!isCurrent()) return
 
         hasLoadedRef.current = true
         applySessionItems(res.items)
         setRemoteTotal(res.total)
       } catch (error) {
-        if (isMounted.current && !opts?.background) {
+        if (isCurrent() && !opts?.background) {
           setLoadError({
             title: 'Unable to load sessions',
             message: getErrorMessage(error, 'Failed to load remote sessions.'),
           })
         }
       } finally {
-        if (isMounted.current) {
+        if (isCurrent()) {
           if (shouldShowSkeleton) setLoading(false)
           setRefreshing(false)
         }
@@ -1206,17 +1221,28 @@ export default function SessionsPage() {
 
   useEffect(() => {
     if (!selectedNode) {
-      // Deferred to a microtask: loadLocal synchronously sets loading
-      // state, which must not run inside the effect body itself.
-      queueMicrotask(() => void loadLocal())
+      // Cancel a queued load if the filters/node change before it runs.
+      let cancelled = false
+      queueMicrotask(() => {
+        if (!cancelled) void loadLocal()
+      })
+      return () => {
+        cancelled = true
+        requestVersionRef.current += 1
+      }
     }
   }, [loadLocal, selectedNode])
 
   useEffect(() => {
     if (selectedNode) {
-      // Deferred to a microtask: loadRemote synchronously sets loading
-      // state, which must not run inside the effect body itself.
-      queueMicrotask(() => void loadRemote())
+      let cancelled = false
+      queueMicrotask(() => {
+        if (!cancelled) void loadRemote()
+      })
+      return () => {
+        cancelled = true
+        requestVersionRef.current += 1
+      }
     }
   }, [loadRemote, selectedNode])
 
@@ -1376,6 +1402,17 @@ export default function SessionsPage() {
   }
 
   function handleNodeChange(node: string | null) {
+    if (node === selectedNode) return
+    selectedNodeRef.current = node
+    requestVersionRef.current += 1
+    if (delayedReloadTimerRef.current) clearTimeout(delayedReloadTimerRef.current)
+    delayedReloadTimerRef.current = null
+    hasLoadedRef.current = false
+    prevIdsRef.current = new Set()
+    setSessions([])
+    setRemoteTotal(0)
+    setLoading(true)
+    setRefreshing(false)
     setSelectedNode(node)
     setPage(0)
     setSearchParams(

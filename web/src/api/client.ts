@@ -367,37 +367,43 @@ export function subscribeEvents(
     const evUrl = tok
       ? `${BASE}/sessions/events?token=${encodeURIComponent(tok)}`
       : `${BASE}/sessions/events`
-    es = new EventSource(evUrl)
+    const source = new EventSource(evUrl)
+    es = source
 
-    es.addEventListener('snapshot', (e: MessageEvent) => {
+    source.addEventListener('snapshot', (e: MessageEvent) => {
+      if (stopped || es !== source) return
       try {
         cb({ event: 'snapshot', data: JSON.parse(e.data) })
       } catch {
         /* ignore */
       }
     })
-    es.addEventListener('session_created', (e: MessageEvent) => {
+    source.addEventListener('session_created', (e: MessageEvent) => {
+      if (stopped || es !== source) return
       try {
         cb({ event: 'session_created', data: JSON.parse(e.data) })
       } catch {
         /* ignore */
       }
     })
-    es.addEventListener('session_updated', (e: MessageEvent) => {
+    source.addEventListener('session_updated', (e: MessageEvent) => {
+      if (stopped || es !== source) return
       try {
         cb({ event: 'session_updated', data: JSON.parse(e.data) })
       } catch {
         /* ignore */
       }
     })
-    es.addEventListener('session_deleted', (e: MessageEvent) => {
+    source.addEventListener('session_deleted', (e: MessageEvent) => {
+      if (stopped || es !== source) return
       try {
         cb({ event: 'session_deleted', data: JSON.parse(e.data) })
       } catch {
         /* ignore */
       }
     })
-    es.addEventListener('session_notification', (e: MessageEvent) => {
+    source.addEventListener('session_notification', (e: MessageEvent) => {
+      if (stopped || es !== source) return
       try {
         cb({ event: 'session_notification', data: JSON.parse(e.data) })
       } catch {
@@ -405,23 +411,23 @@ export function subscribeEvents(
       }
     })
 
-    es.onerror = () => {
-      es?.close()
+    source.onerror = () => {
+      if (stopped || es !== source) return
+      source.close()
       es = null
-      if (!stopped) {
-        setState(
-          typeof navigator !== 'undefined' && !navigator.onLine
-            ? 'offline'
-            : everOpened || attempts > 1
-              ? 'reconnecting'
-              : 'connecting'
-        )
-        scheduleReconnect()
-        retryDelay = Math.min(retryDelay * 2, 30_000)
-      }
+      setState(
+        typeof navigator !== 'undefined' && !navigator.onLine
+          ? 'offline'
+          : everOpened || attempts > 1
+            ? 'reconnecting'
+            : 'connecting'
+      )
+      scheduleReconnect()
+      retryDelay = Math.min(retryDelay * 2, 30_000)
     }
 
-    es.onopen = () => {
+    source.onopen = () => {
+      if (stopped || es !== source) return
       everOpened = true
       setState('live')
       retryDelay = 1000
@@ -430,8 +436,10 @@ export function subscribeEvents(
 
   const handleOnline = () => {
     if (stopped) return
-    // connect() reports the new attempt state synchronously.
-    es?.close()
+    // An online notification supersedes a scheduled retry, not an active stream.
+    if (es) return
+    if (retryTimer) clearTimeout(retryTimer)
+    retryTimer = null
     connect()
   }
 
@@ -439,6 +447,7 @@ export function subscribeEvents(
     if (stopped) return
     setState('offline')
     es?.close()
+    es = null
   }
 
   window.addEventListener('online', handleOnline)

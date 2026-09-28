@@ -210,9 +210,14 @@ export function ingestSessionSummaries(items: SessionSummary[]): void {
   sessionEventsStore.seedSessions(items)
 }
 
+// A stable subscribe function avoids tearing down and re-adding the store
+// listener on every table render (e.g. when activity sparklines update).
+const subscribeConnectionStore = (listener: StoreListener) =>
+  sessionEventsStore.subscribeStore(listener)
+
 export function useSseConnectionState(): SseConnectionState {
   return useSyncExternalStore(
-    (listener) => sessionEventsStore.subscribeStore(listener),
+    subscribeConnectionStore,
     () => sessionEventsStore.getConnectionState(),
     () => 'connecting'
   )
@@ -223,7 +228,7 @@ export function useLiveSessionSummary(
   node?: string | null
 ): SessionSummary | null {
   return useSyncExternalStore(
-    (listener) => sessionEventsStore.subscribeStore(listener),
+    subscribeConnectionStore,
     () => sessionEventsStore.getSession(id, node),
     () => null
   )
