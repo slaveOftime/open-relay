@@ -3,26 +3,31 @@
 // without sharing non-component exports.
 
 const SPARKLINE_NUM_BUCKETS = 40
-const SPARKLINE_BUCKET_MS = 2_000
+// The backend polls output summaries every 500 ms. Match that cadence
+// without increasing SSE traffic or work done on every React render.
+export const SPARKLINE_BUCKET_MS = 500
 
-/** Rolling activity history using time-bucketed counts (bucketMs-wide slots). */
+type Entry = {
+  counts: number[]
+  snapshot: number[]
+  lastBucket: number
+  lastTotalBytes: number | null
+}
+
+/** Rolling output-byte history, with notifications scoped to the affected session. */
 export class SparklineStore {
   private readonly numBuckets = SPARKLINE_NUM_BUCKETS
   private readonly bucketMs = SPARKLINE_BUCKET_MS
-  private readonly listeners = new Set<() => void>()
+  private readonly listeners = new Map<string, Set<() => void>>()
   private readonly emptySeries = new Array(this.numBuckets).fill(0)
   private decayTimer: ReturnType<typeof setInterval> | null = null
-
-  private data = new Map<
-    string,
-    { counts: number[]; snapshot: number[]; lastBucket: number; lastTotalBytes: number | null }
-  >()
+  private data = new Map<string, Entry>()
 
   private nowBucket(): number {
     return Math.floor(Date.now() / this.bucketMs)
   }
 
-  private getOrCreate(id: string) {
+  private getOrCreate(id: string): Entry {
     let entry = this.data.get(id)
     if (!entry) {
       const counts = new Array(this.numBuckets).fill(0)
@@ -37,70 +42,66 @@ export class SparklineStore {
     return entry
   }
 
-  subscribe(listener: () => void): () => void {
-    this.listeners.add(listener)
-    this.ensureDecayTimer()
+  subscribe(id: string, listener: () => void): () => void {
+    let listeners = this.listeners.get(id)
+    if (!listeners) {
+      listeners = new Set()
+      this.listeners.set(id, listeners)
+    }
+    listeners.add(listener)
+    // An unmounted/hidden graph may have missed several buckets.
+    const entry = this.data.get(id)
+    if (entry && this.advance(entry)) this.emitChange(id)
+    if (entry?.counts.some((value) => value !== 0)) this.ensureDecayTimer()
     return () => {
-      this.listeners.delete(listener)
-      if (this.listeners.size === 0) {
-        this.stopDecayTimer()
-      }
+      listeners.delete(listener)
+      if (listeners.size === 0) this.listeners.delete(id)
+      if (this.listeners.size === 0) this.stopDecayTimer()
     }
   }
 
-  private emitChange(): void {
-    this.listeners.forEach((listener) => listener())
+  private emitChange(id: string): void {
+    this.listeners.get(id)?.forEach((listener) => listener())
   }
 
   private ensureDecayTimer(): void {
-    if (this.decayTimer !== null || typeof window === 'undefined') {
-      return
-    }
+    if (this.decayTimer !== null || typeof window === 'undefined') return
+    // One timer only while mounted charts have recent activity; no per-row timer.
     this.decayTimer = window.setInterval(() => {
-      let changed = false
-      for (const entry of this.data.values()) {
-        changed = this.advance(entry) || changed
+      let active = false
+      for (const id of this.listeners.keys()) {
+        const entry = this.data.get(id)
+        if (entry && this.advance(entry)) this.emitChange(id)
+        if (entry?.counts.some((value) => value !== 0)) active = true
       }
-      if (changed) {
-        this.emitChange()
-      }
+      if (!active) this.stopDecayTimer()
     }, this.bucketMs)
   }
 
   private stopDecayTimer(): void {
-    if (this.decayTimer === null) {
-      return
-    }
+    if (this.decayTimer === null) return
     clearInterval(this.decayTimer)
     this.decayTimer = null
   }
 
-  private refreshSnapshot(entry: {
-    counts: number[]
-    snapshot: number[]
-    lastBucket: number
-    lastTotalBytes: number | null
-  }): void {
-    entry.snapshot = [...entry.counts]
-  }
-
-  /** Advance the ring buffer to the current bucket, zero-filling gaps. */
-  private advance(entry: {
-    counts: number[]
-    snapshot: number[]
-    lastBucket: number
-    lastTotalBytes: number | null
-  }): boolean {
+  /** Shift expired buckets; an all-zero history needs no copy or repaint. */
+  private advance(entry: Entry): boolean {
     const now = this.nowBucket()
     const delta = now - entry.lastBucket
     if (delta <= 0) return false
     const gap = Math.min(delta, this.numBuckets)
-    for (let i = 0; i < gap; i++) {
-      entry.counts.shift()
-      entry.counts.push(0)
-    }
     entry.lastBucket = now
-    this.refreshSnapshot(entry)
+    if (!entry.counts.some((value) => value !== 0)) return false
+
+    if (gap === this.numBuckets) {
+      entry.counts.fill(0)
+    } else {
+      for (let i = 0; i < gap; i++) {
+        entry.counts.shift()
+        entry.counts.push(0)
+      }
+    }
+    entry.snapshot = [...entry.counts]
     return true
   }
 
@@ -111,41 +112,42 @@ export class SparklineStore {
   /** Increment the current time bucket for this session. */
   touch(id: string, value = 1): void {
     const entry = this.getOrCreate(id)
-    this.advance(entry)
-    entry.counts[entry.counts.length - 1] += value
-    this.refreshSnapshot(entry)
-    this.emitChange()
+    const advanced = this.advance(entry)
+    if (value > 0) {
+      entry.counts[entry.counts.length - 1] += value
+      entry.snapshot = [...entry.counts]
+    }
+    if (value > 0 && this.listeners.has(id)) this.ensureDecayTimer()
+    if (advanced || value > 0) this.emitChange(id)
   }
 
-  /** Record absolute byte totals and add the positive delta into the current bucket. */
+  /** Record absolute byte totals and add only new bytes to the current bucket. */
   recordTotal(id: string, totalBytes: number, previousTotalBytes?: number): void {
+    if (!Number.isFinite(totalBytes) || totalBytes < 0) return
     const entry = this.getOrCreate(id)
     const advanced = this.advance(entry)
-    const baseline = previousTotalBytes ?? entry.lastTotalBytes ?? totalBytes
+    // An older REST response or SSE event must not roll the baseline back and
+    // manufacture a spike when the next current total arrives.
+    const baseline = Math.max(
+      entry.lastTotalBytes ?? previousTotalBytes ?? totalBytes,
+      previousTotalBytes ?? 0
+    )
     const delta = Math.max(totalBytes - baseline, 0)
-    entry.lastTotalBytes = totalBytes
+    entry.lastTotalBytes = Math.max(entry.lastTotalBytes ?? totalBytes, totalBytes)
     if (delta > 0) {
       entry.counts[entry.counts.length - 1] += delta
-      this.refreshSnapshot(entry)
-      this.emitChange()
-      return
+      entry.snapshot = [...entry.counts]
     }
-    if (advanced) {
-      this.emitChange()
-    }
+    if (delta > 0 && this.listeners.has(id)) this.ensureDecayTimer()
+    if (advanced || delta > 0) this.emitChange(id)
   }
 
-  /** Returns the current bucket series (advances to now first). */
+  /** A stable, side-effect-free snapshot for useSyncExternalStore. */
   getSeries(id: string): number[] {
-    const entry = this.data.get(id)
-    if (!entry) return this.emptySeries
-    this.advance(entry)
-    return entry.snapshot
+    return this.data.get(id)?.snapshot ?? this.emptySeries
   }
 
-  remove(id: string) {
-    if (this.data.delete(id)) {
-      this.emitChange()
-    }
+  remove(id: string): void {
+    if (this.data.delete(id)) this.emitChange(id)
   }
 }

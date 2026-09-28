@@ -81,16 +81,24 @@ test('switching nodes ignores old list responses and keeps the live indicator st
   await page.addInitScript(() => {
     // Keep the mocked stream open while the table and its activity cells render.
     class OpenEventSource extends EventTarget {
+      static latest: OpenEventSource | null = null
       onopen: ((event: Event) => void) | null = null
       onerror: ((event: Event) => void) | null = null
       constructor(url: string) {
         super()
         void url
+        OpenEventSource.latest = this
         setTimeout(() => this.onopen?.(new Event('open')), 0)
       }
       close() {}
     }
     Object.defineProperty(window, 'EventSource', { value: OpenEventSource })
+    ;(window as Window & { emitSessionUpdate?: (data: unknown) => void }).emitSessionUpdate = (
+      data
+    ) =>
+      OpenEventSource.latest?.dispatchEvent(
+        new MessageEvent('session_updated', { data: JSON.stringify(data) })
+      )
   })
 
   await page.route('**/api/auth/status', (route) =>
@@ -123,7 +131,9 @@ test('switching nodes ignores old list responses and keeps the live indicator st
   })
   let releaseLocal: (() => void) | undefined
   let releaseWorkerA: (() => void) | undefined
+  let listRequests = 0
   await page.route('**/api/sessions?**', async (route) => {
+    listRequests += 1
     const node = new URL(route.request().url()).searchParams.get('node')
     if (node === null)
       await new Promise<void>((resolve) => {
@@ -169,6 +179,36 @@ test('switching nodes ignores old list responses and keeps the live indicator st
   // Let both fetch continuations and their React updates commit before asserting.
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())))
   await expect(page.locator('table').getByText('worker-b session')).toBeVisible()
+  const activity = page.locator('table span[aria-label*="activity"]').first()
+  await expect(activity).toHaveAttribute('aria-label', /Recent: 0 B\/s/)
+  // A foreign node's session with the same id must not alter this chart.
+  const workerB = session('worker-b session', 'worker-b')
+  const requestsBeforeActivity = listRequests
+  await page.evaluate(
+    (data) => {
+      ;(window as Window & { emitSessionUpdate?: (data: unknown) => void }).emitSessionUpdate?.(
+        data
+      )
+    },
+    { ...workerB, node: 'worker-a', last_total_bytes: 2048 }
+  )
+  await expect(activity).toHaveAttribute('aria-label', /Recent: 0 B\/s/)
+  await page.evaluate(
+    (data) => {
+      ;(window as Window & { emitSessionUpdate?: (data: unknown) => void }).emitSessionUpdate?.(
+        data
+      )
+    },
+    { ...workerB, last_total_bytes: 1024 }
+  )
+  await expect(activity).toHaveAttribute('aria-label', /Recent: 512 B\/s/)
+  const firstPath = await page.locator('table svg path[stroke-width="2"]').first().getAttribute('d')
+  await expect
+    .poll(() => page.locator('table svg path[stroke-width="2"]').first().getAttribute('d'), {
+      timeout: 1_500,
+    })
+    .not.toBe(firstPath)
+  expect(listRequests).toBe(requestsBeforeActivity)
   await expect(page.locator('table').getByText('worker-a session')).toHaveCount(0)
   await expect(page.locator('table').getByText('local session')).toHaveCount(0)
   await expect(page.getByText('Live', { exact: true })).toBeVisible()

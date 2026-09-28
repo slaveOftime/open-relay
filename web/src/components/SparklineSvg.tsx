@@ -1,9 +1,12 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-
-const SPARKLINE_BUCKET_SECONDS = 2
-const RECENT_RATE_BUCKETS = 5
+import {
+  calculateAverageBytesPerSecond,
+  calculatePeakBytesPerSecond,
+  calculateRecentBytesPerSecond,
+  formatBytesPerSecond,
+} from './sparklineMetrics'
 
 interface Props {
   series: number[]
@@ -280,34 +283,4 @@ function buildAreaPath(points: SparklinePoint[], baselineY: number): string {
     `L ${last.x.toFixed(2)} ${baselineY.toFixed(2)}`,
     'Z',
   ].join(' ')
-}
-
-function calculateRecentBytesPerSecond(series: number[]): number {
-  const recent = series.slice(-RECENT_RATE_BUCKETS)
-  if (recent.length === 0) return 0
-  const total = recent.reduce((sum, value) => sum + value, 0)
-  return total / (recent.length * SPARKLINE_BUCKET_SECONDS)
-}
-
-function calculatePeakBytesPerSecond(series: number[]): number {
-  return Math.max(...series, 0) / SPARKLINE_BUCKET_SECONDS
-}
-
-function calculateAverageBytesPerSecond(series: number[]): number {
-  if (series.length === 0) return 0
-  const total = series.reduce((sum, value) => sum + value, 0)
-  return total / (series.length * SPARKLINE_BUCKET_SECONDS)
-}
-
-function formatBytesPerSecond(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return '0 B/s'
-  const units = ['B/s', 'KiB/s', 'MiB/s', 'GiB/s', 'TiB/s']
-  let scaled = value
-  let unitIndex = 0
-  while (scaled >= 1024 && unitIndex < units.length - 1) {
-    scaled /= 1024
-    unitIndex += 1
-  }
-  const digits = scaled >= 100 || unitIndex === 0 ? 0 : scaled >= 10 ? 1 : 2
-  return `${scaled.toFixed(digits)} ${units[unitIndex]}`
 }

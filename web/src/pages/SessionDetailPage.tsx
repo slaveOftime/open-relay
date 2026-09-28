@@ -1754,6 +1754,7 @@ function SessionDetailPageContent() {
                   {session && (
                     <SessionActivitySparkline
                       sessionId={session.id}
+                      node={node}
                       isRunning={isSessionRunning(session)}
                       fullWidth
                       height={24}

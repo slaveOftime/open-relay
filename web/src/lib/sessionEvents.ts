@@ -157,7 +157,11 @@ class SessionEventsStore {
         break
     }
 
-    ingestSessionActivityEvent(event)
+    // Snapshot/update/created summaries already record bytes in upsertSession.
+    // Only deletion and notifications need separate activity-store handling.
+    if (event.event === 'session_deleted' || event.event === 'session_notification') {
+      ingestSessionActivityEvent(event)
+    }
     this.eventListeners.forEach((listener) => listener(event))
     if (changed) {
       this.emitStore()

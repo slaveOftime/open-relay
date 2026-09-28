@@ -586,7 +586,12 @@ function SessionRow({
       case 'activity':
         return (
           <TableCell key={columnKey} className="px-3 py-1">
-            <SessionActivitySparkline sessionId={session.id} isRunning={isRunning} fullWidth />
+            <SessionActivitySparkline
+              sessionId={session.id}
+              node={node}
+              isRunning={isRunning}
+              fullWidth
+            />
           </TableCell>
         )
       case 'pid':
@@ -812,6 +817,7 @@ function SessionCard({
             <div className="pt-1 w-full opacity-20 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
               <SessionActivitySparkline
                 sessionId={session.id}
+                node={node}
                 isRunning={isRunning}
                 fullWidth
                 height={60}
