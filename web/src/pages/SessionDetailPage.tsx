@@ -1478,17 +1478,25 @@ function SessionDetailPageContent() {
           <div className="sm:hidden shrink-0">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" aria-label="Session actions">
-                  <DotsVerticalIcon className="h-4 w-4" />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Session actions"
+                  className="h-11 w-11"
+                >
+                  <DotsVerticalIcon className="h-5 w-5" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={handleManualRefresh}>
+              <DropdownMenuContent
+                align="end"
+                className="min-w-48 max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto overscroll-contain p-1.5"
+              >
+                <DropdownMenuItem touch onClick={handleManualRefresh}>
                   <ReloadIcon className="w-4 h-4" />
                   Refresh
                 </DropdownMenuItem>
                 {session && (
-                  <DropdownMenuItem onClick={() => setShowNewSessionDialog(true)}>
+                  <DropdownMenuItem touch onClick={() => setShowNewSessionDialog(true)}>
                     <CopyIcon className="w-4 h-4" />
                     Run Again
                   </DropdownMenuItem>
@@ -1497,6 +1505,7 @@ function SessionDetailPageContent() {
                   <>
                     {mode === 'attach' && (
                       <DropdownMenuItem
+                        touch
                         onClick={() =>
                           setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
                         }
@@ -1506,13 +1515,14 @@ function SessionDetailPageContent() {
                       </DropdownMenuItem>
                     )}
                     {mode === 'attach' && (
-                      <DropdownMenuItem onClick={() => setConnectTraceOpen(true)}>
+                      <DropdownMenuItem touch onClick={() => setConnectTraceOpen(true)}>
                         <TrackNextIcon className="w-4 h-4" />
                         Trace
                       </DropdownMenuItem>
                     )}
                     {isRunning && (
                       <DropdownMenuItem
+                        touch
                         className="text-amber-400 focus:text-amber-300"
                         onClick={() => setPendingAction('stop')}
                       >
@@ -1522,6 +1532,7 @@ function SessionDetailPageContent() {
                     )}
                     {isRunning && (
                       <DropdownMenuItem
+                        touch
                         className="text-red-400 focus:text-red-300"
                         onClick={() => setPendingAction('kill')}
                       >
@@ -1531,6 +1542,7 @@ function SessionDetailPageContent() {
                     )}
                     {mode === 'logs' && isRunning && (
                       <DropdownMenuItem
+                        touch
                         className="text-indigo-400 focus:text-indigo-300"
                         onClick={() =>
                           setSearchParams(node ? { mode: 'attach', node } : { mode: 'attach' })
