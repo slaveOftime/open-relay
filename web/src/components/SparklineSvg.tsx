@@ -2,11 +2,14 @@ import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 're
 
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
-  easeOutCubic,
+  animationEase,
+  animationWindow,
   interpolateSparklinePoints,
+  isBucketShift,
   sameSparklinePoints,
   type SparklinePoint,
 } from './sparklineGeometry'
+import { SPARKLINE_BUCKET_MS } from './sparklineStore'
 import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,
@@ -45,7 +48,7 @@ const RUNNING_PALETTE: SparklinePalette = {
 }
 
 const TRANSITION_MS = 220
-const FRAME_MS = 1000 / 30
+const FRAME_MS = 1000 / 60
 
 const IDLE_PALETTE: SparklinePalette = {
   stroke: '#7D8B97',
@@ -109,6 +112,8 @@ export default function SparklineSvg({
   const shinePathRef = useRef<SVGPathElement>(null)
   const lastDotRef = useRef<SVGCircleElement>(null)
   const currentPointsRef = useRef<SparklinePoint[] | null>(null)
+  const previousSeriesRef = useRef(series)
+  const scrollEndAtRef = useRef<number | null>(null)
   const lastWidthRef = useRef(renderWidth)
   const frameRef = useRef<number | null>(null)
   const reducedMotion =
@@ -135,6 +140,8 @@ export default function SparklineSvg({
     }
 
     const from = currentPointsRef.current
+    const bucketShifted = isBucketShift(previousSeriesRef.current, series)
+    previousSeriesRef.current = series
     const widthChanged = lastWidthRef.current !== renderWidth
     lastWidthRef.current = renderWidth
     if (
@@ -147,6 +154,7 @@ export default function SparklineSvg({
       !hostRef.current?.getClientRects().length ||
       sameSparklinePoints(from, model.points)
     ) {
+      scrollEndAtRef.current = null
       currentPointsRef.current = model.points
       draw(model.points)
       return cancel
@@ -155,20 +163,38 @@ export default function SparklineSvg({
     // React just committed the target d; restore the displayed frame before paint.
     draw(from)
     const startedAt = performance.now()
-    let lastDrawnAt = -Infinity
+    const { duration, scrollEnd } = animationWindow(
+      startedAt,
+      bucketShifted,
+      scrollEndAtRef.current,
+      SPARKLINE_BUCKET_MS,
+      TRANSITION_MS
+    )
+    scrollEndAtRef.current = scrollEnd
+    const scrolling = scrollEnd !== null && scrollEnd > startedAt
+    let lastTickAt = startedAt
+    let frameBudget = 0
+    let painted = false
     const step = (now: number) => {
-      const progress = Math.max(0, Math.min((now - startedAt) / TRANSITION_MS, 1))
-      if (progress === 1 || now - lastDrawnAt >= FRAME_MS) {
-        const points = interpolateSparklinePoints(from, model.points, easeOutCubic(progress))
+      frameBudget += Math.max(0, now - lastTickAt)
+      lastTickAt = now
+      const progress = Math.max(0, Math.min((now - startedAt) / duration, 1))
+      if (!painted || progress === 1 || frameBudget >= FRAME_MS) {
+        const points = interpolateSparklinePoints(
+          from,
+          model.points,
+          animationEase(progress, scrolling)
+        )
         draw(points)
         currentPointsRef.current = points
-        lastDrawnAt = now
+        frameBudget %= FRAME_MS
+        painted = true
       }
       frameRef.current = progress < 1 ? requestAnimationFrame(step) : null
     }
     frameRef.current = requestAnimationFrame(step)
     return cancel
-  }, [enableAnimation, model.baselineY, model.points, reducedMotion, renderWidth])
+  }, [enableAnimation, model.baselineY, model.points, reducedMotion, renderWidth, series])
 
   const areaGradientId = `${gradientSeed}-area`
   const glowGradientId = `${gradientSeed}-glow`

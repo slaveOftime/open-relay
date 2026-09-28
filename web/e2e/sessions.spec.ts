@@ -234,21 +234,16 @@ test('switching nodes ignores old list responses and keeps the live indicator st
     )
     .toBeGreaterThan(3)
   const graphPath = page.locator('table svg path[stroke-width="2"]').first()
-  const firstPath = await graphPath.getAttribute('d')
-  // Opening the next empty 500 ms bucket must not draw a drop to the baseline.
-  await expect
-    .poll(
-      async () => {
-        const path = await graphPath.getAttribute('d')
-        if (!path || path === firstPath) return false
-        const points = [...path.matchAll(/[ML] [\d.]+ ([\d.]+)/g)]
-        const previousY = Number(points.at(-2)?.[1])
-        const latestY = Number(points.at(-1)?.[1])
-        return latestY === previousY && latestY < 19
-      },
-      { timeout: 2_000 }
-    )
-    .toBe(true)
+  // After the initial output tween, the graph should keep gliding across the
+  // next bucket boundary even with no additional SSE message.
+  await page.waitForTimeout(300)
+  const beforeShift = await graphPath.getAttribute('d')
+  await expect.poll(() => graphPath.getAttribute('d'), { timeout: 1_200 }).not.toBe(beforeShift)
+  const midShift = await graphPath.getAttribute('d')
+  const latestY = Number([...midShift!.matchAll(/[ML] [\d.]+ ([\d.]+)/g)].at(-1)?.[1])
+  expect(latestY).toBeLessThan(19) // no flash to the baseline while the bucket opens
+  await page.waitForTimeout(80)
+  expect(await graphPath.getAttribute('d')).not.toBe(midShift)
   expect(listRequests).toBe(requestsBeforeActivity)
   await expect(page.locator('table').getByText('worker-a session')).toHaveCount(0)
   await expect(page.locator('table').getByText('local session')).toHaveCount(0)
