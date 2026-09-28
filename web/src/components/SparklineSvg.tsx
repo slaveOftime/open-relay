@@ -1,10 +1,17 @@
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import {
+  easeOutCubic,
+  interpolateSparklinePoints,
+  sameSparklinePoints,
+  type SparklinePoint,
+} from './sparklineGeometry'
 import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,
   calculateRecentBytesPerSecond,
+  carryOpenBucket,
   formatBytesPerSecond,
 } from './sparklineMetrics'
 
@@ -15,11 +22,6 @@ interface Props {
   fullWidth?: boolean
   className?: string
   enableAnimation: boolean
-}
-
-type SparklinePoint = {
-  x: number
-  y: number
 }
 
 type SparklinePalette = {
@@ -41,6 +43,9 @@ const RUNNING_PALETTE: SparklinePalette = {
   dot: '#34C85B',
   baseline: '#34c85b86',
 }
+
+const TRANSITION_MS = 220
+const FRAME_MS = 1000 / 30
 
 const IDLE_PALETTE: SparklinePalette = {
   stroke: '#7D8B97',
@@ -92,10 +97,79 @@ export default function SparklineSvg({
       `${enableAnimation ? 'Running' : 'Stopped'} activity\nRecent: ${formatBytesPerSecond(recentRate)}\nPeak: ${formatBytesPerSecond(peakRate)}\nAverage: ${formatBytesPerSecond(averageRate)}`,
     [averageRate, enableAnimation, peakRate, recentRate]
   )
+  const displaySeries = useMemo(() => carryOpenBucket(series), [series])
   const model = useMemo(
-    () => buildSparklineModel(series, renderWidth, height, enableAnimation),
-    [enableAnimation, height, renderWidth, series]
+    () => buildSparklineModel(displaySeries, renderWidth, height, enableAnimation),
+    [displaySeries, enableAnimation, height, renderWidth]
   )
+  const areaPathRef = useRef<SVGPathElement>(null)
+  const glowPathRef = useRef<SVGPathElement>(null)
+  const highlightPathRef = useRef<SVGPathElement>(null)
+  const linePathRef = useRef<SVGPathElement>(null)
+  const shinePathRef = useRef<SVGPathElement>(null)
+  const lastDotRef = useRef<SVGCircleElement>(null)
+  const currentPointsRef = useRef<SparklinePoint[] | null>(null)
+  const lastWidthRef = useRef(renderWidth)
+  const frameRef = useRef<number | null>(null)
+  const reducedMotion =
+    typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+
+  useLayoutEffect(() => {
+    const cancel = () => {
+      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current)
+      frameRef.current = null
+    }
+    cancel()
+
+    const draw = (points: SparklinePoint[]) => {
+      const line = buildSmoothLinePath(points)
+      areaPathRef.current?.setAttribute('d', buildAreaPath(points, model.baselineY, line))
+      for (const path of [glowPathRef, highlightPathRef, linePathRef, shinePathRef]) {
+        path.current?.setAttribute('d', line)
+      }
+      const last = points[points.length - 1]
+      if (lastDotRef.current && last) {
+        lastDotRef.current.setAttribute('cx', String(last.x))
+        lastDotRef.current.setAttribute('cy', String(last.y))
+      }
+    }
+
+    const from = currentPointsRef.current
+    const widthChanged = lastWidthRef.current !== renderWidth
+    lastWidthRef.current = renderWidth
+    if (
+      !from ||
+      from.length !== model.points.length ||
+      widthChanged ||
+      !enableAnimation ||
+      reducedMotion ||
+      document.hidden ||
+      !hostRef.current?.getClientRects().length ||
+      sameSparklinePoints(from, model.points)
+    ) {
+      currentPointsRef.current = model.points
+      draw(model.points)
+      return cancel
+    }
+
+    // React just committed the target d; restore the displayed frame before paint.
+    draw(from)
+    const startedAt = performance.now()
+    let lastDrawnAt = -Infinity
+    const step = (now: number) => {
+      const progress = Math.max(0, Math.min((now - startedAt) / TRANSITION_MS, 1))
+      if (progress === 1 || now - lastDrawnAt >= FRAME_MS) {
+        const points = interpolateSparklinePoints(from, model.points, easeOutCubic(progress))
+        draw(points)
+        currentPointsRef.current = points
+        lastDrawnAt = now
+      }
+      frameRef.current = progress < 1 ? requestAnimationFrame(step) : null
+    }
+    frameRef.current = requestAnimationFrame(step)
+    return cancel
+  }, [enableAnimation, model.baselineY, model.points, reducedMotion, renderWidth])
+
   const areaGradientId = `${gradientSeed}-area`
   const glowGradientId = `${gradientSeed}-glow`
 
@@ -131,8 +205,9 @@ export default function SparklineSvg({
               stroke={model.palette.baseline}
               strokeWidth="1"
             />
-            <path d={model.areaPath} fill={`url(#${areaGradientId})`} />
+            <path ref={areaPathRef} d={model.areaPath} fill={`url(#${areaGradientId})`} />
             <path
+              ref={glowPathRef}
               d={model.linePath}
               fill="none"
               stroke={`url(#${glowGradientId})`}
@@ -142,6 +217,7 @@ export default function SparklineSvg({
               opacity="0.12"
             />
             <path
+              ref={highlightPathRef}
               d={model.linePath}
               fill="none"
               stroke={`url(#${glowGradientId})`}
@@ -151,6 +227,7 @@ export default function SparklineSvg({
               opacity="0.24"
             />
             <path
+              ref={linePathRef}
               d={model.linePath}
               fill="none"
               stroke={model.palette.stroke}
@@ -159,6 +236,7 @@ export default function SparklineSvg({
               strokeLinejoin="round"
             />
             <path
+              ref={shinePathRef}
               d={model.linePath}
               fill="none"
               stroke={model.palette.strokeHighlight}
@@ -168,13 +246,14 @@ export default function SparklineSvg({
               opacity="0.62"
             />
             <circle
+              ref={lastDotRef}
               cx={model.lastPoint.x}
               cy={model.lastPoint.y}
               r="1.7"
               fill={model.palette.dot}
               opacity="0.72"
             >
-              {enableAnimation ? (
+              {enableAnimation && !reducedMotion ? (
                 <>
                   <animate
                     attributeName="r"
@@ -221,6 +300,7 @@ function buildSparklineModel(
   areaPath: string
   linePath: string
   lastPoint: SparklinePoint
+  points: SparklinePoint[]
   baselineY: number
   palette: SparklinePalette
 } {
@@ -234,6 +314,7 @@ function buildSparklineModel(
     areaPath,
     linePath,
     lastPoint: points[points.length - 1] ?? { x: width, y: baselineY },
+    points,
     baselineY,
     palette,
   }
@@ -272,14 +353,18 @@ function buildSmoothLinePath(points: SparklinePoint[]): string {
   ].join(' ')
 }
 
-function buildAreaPath(points: SparklinePoint[], baselineY: number): string {
+function buildAreaPath(
+  points: SparklinePoint[],
+  baselineY: number,
+  linePath = buildSmoothLinePath(points)
+): string {
   if (points.length === 0) return ''
   const first = points[0]
   const last = points[points.length - 1]
   return [
     `M ${first.x.toFixed(2)} ${baselineY.toFixed(2)}`,
     `L ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
-    buildSmoothLinePath(points).slice(1),
+    linePath.slice(1),
     `L ${last.x.toFixed(2)} ${baselineY.toFixed(2)}`,
     'Z',
   ].join(' ')

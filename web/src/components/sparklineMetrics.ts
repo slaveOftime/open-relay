@@ -4,6 +4,16 @@ const BUCKET_SECONDS = SPARKLINE_BUCKET_MS / 1000
 // Two seconds of output, including silence, so Recent falls back to zero promptly.
 const RECENT_RATE_BUCKETS = 4
 
+/** The newest time bucket is still open. Keep its visual endpoint level until
+ * it receives bytes or the following bucket starts; rates still use raw data. */
+export function carryOpenBucket(series: number[]): number[] {
+  const last = series.length - 1
+  if (last < 1 || series[last] !== 0 || series[last - 1] === 0) return series
+  const display = series.slice()
+  display[last] = series[last - 1]
+  return display
+}
+
 export function calculateRecentBytesPerSecond(series: number[]): number {
   const recent = series.slice(-RECENT_RATE_BUCKETS)
   if (recent.length === 0) return 0

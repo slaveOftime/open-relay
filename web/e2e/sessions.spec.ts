@@ -181,6 +181,26 @@ test('switching nodes ignores old list responses and keeps the live indicator st
   await expect(page.locator('table').getByText('worker-b session')).toBeVisible()
   const activity = page.locator('table span[aria-label*="activity"]').first()
   await expect(activity).toHaveAttribute('aria-label', /Recent: 0 B\/s/)
+  await page.evaluate(() => {
+    const path = document.querySelector('table svg path[stroke-width="2"]')
+    if (!path) throw new Error('Missing sparkline path')
+    const monitor = { changes: 0 }
+    new MutationObserver((records) => {
+      monitor.changes += records.length
+    }).observe(path, {
+      attributes: true,
+      attributeFilter: ['d'],
+    })
+    ;(window as Window & { sparklineMonitor?: typeof monitor }).sparklineMonitor = monitor
+  })
+  // A flat graph must not schedule a permanent idle animation loop.
+  await page.waitForTimeout(100)
+  expect(
+    await page.evaluate(
+      () =>
+        (window as Window & { sparklineMonitor?: { changes: number } }).sparklineMonitor?.changes
+    )
+  ).toBe(0)
   // A foreign node's session with the same id must not alter this chart.
   const workerB = session('worker-b session', 'worker-b')
   const requestsBeforeActivity = listRequests
@@ -202,12 +222,33 @@ test('switching nodes ignores old list responses and keeps the live indicator st
     { ...workerB, last_total_bytes: 1024 }
   )
   await expect(activity).toHaveAttribute('aria-label', /Recent: 512 B\/s/)
-  const firstPath = await page.locator('table svg path[stroke-width="2"]').first().getAttribute('d')
   await expect
-    .poll(() => page.locator('table svg path[stroke-width="2"]').first().getAttribute('d'), {
-      timeout: 1_500,
-    })
-    .not.toBe(firstPath)
+    .poll(
+      () =>
+        page.evaluate(
+          () =>
+            (window as Window & { sparklineMonitor?: { changes: number } }).sparklineMonitor
+              ?.changes ?? 0
+        ),
+      { timeout: 1_000 }
+    )
+    .toBeGreaterThan(3)
+  const graphPath = page.locator('table svg path[stroke-width="2"]').first()
+  const firstPath = await graphPath.getAttribute('d')
+  // Opening the next empty 500 ms bucket must not draw a drop to the baseline.
+  await expect
+    .poll(
+      async () => {
+        const path = await graphPath.getAttribute('d')
+        if (!path || path === firstPath) return false
+        const points = [...path.matchAll(/[ML] [\d.]+ ([\d.]+)/g)]
+        const previousY = Number(points.at(-2)?.[1])
+        const latestY = Number(points.at(-1)?.[1])
+        return latestY === previousY && latestY < 19
+      },
+      { timeout: 2_000 }
+    )
+    .toBe(true)
   expect(listRequests).toBe(requestsBeforeActivity)
   await expect(page.locator('table').getByText('worker-a session')).toHaveCount(0)
   await expect(page.locator('table').getByText('local session')).toHaveCount(0)

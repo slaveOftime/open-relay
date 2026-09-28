@@ -5,6 +5,7 @@ import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,
   calculateRecentBytesPerSecond,
+  carryOpenBucket,
 } from './sparklineMetrics'
 
 afterEach(() => {
@@ -128,5 +129,16 @@ describe('sparkline rates', () => {
     series[36] = 0
     series[38] = 0
     expect(calculateRecentBytesPerSecond(series)).toBe(0)
+  })
+})
+
+describe('sparkline display', () => {
+  it('continues the previous point through a newly opened empty bucket', () => {
+    const samples = [0, 120, 0]
+    expect(carryOpenBucket(samples)).toEqual([0, 120, 120])
+    expect(samples).toEqual([0, 120, 0]) // measured rates stay unchanged
+    expect(carryOpenBucket([0, 120, 60])).toEqual([0, 120, 60])
+    expect(carryOpenBucket([120, 0, 0])).toEqual([120, 0, 0])
+    expect(carryOpenBucket([])).toEqual([])
   })
 })
