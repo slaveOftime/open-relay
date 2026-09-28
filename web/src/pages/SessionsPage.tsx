@@ -676,6 +676,7 @@ function SessionRow({
                     size="icon"
                     className="shrink-0"
                     onClick={() => onRunAgain(session)}
+                    aria-label="Run Again"
                   >
                     <CopyIcon className="h-4 w-4" />
                   </Button>
@@ -887,6 +888,7 @@ function SessionCard({
                 size="icon"
                 className="shrink-0"
                 onClick={() => onRunAgain(session)}
+                aria-label="Run Again"
               >
                 <CopyIcon className="h-4 w-4" />
               </Button>

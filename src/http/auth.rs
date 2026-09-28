@@ -834,6 +834,10 @@ mod tests {
             SCOPE_MANAGE
         );
         assert_eq!(
+            required_scope_for(&Method::DELETE, "/api/sessions/abc"),
+            SCOPE_MANAGE
+        );
+        assert_eq!(
             required_scope_for(&Method::POST, "/api/sessions/abc/metadata"),
             SCOPE_MANAGE
         );

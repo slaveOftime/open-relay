@@ -193,6 +193,12 @@ export function stopSession(
   })
 }
 
+/** Force-removes the session and its files, like `oly rm <id> -f`. */
+export function forceRemoveSession(id: string, node?: string): Promise<{ removed: boolean }> {
+  const params = new URLSearchParams({ force: 'true' })
+  if (node) params.set('node', node)
+  return req(`${BASE}/sessions/${encodeURIComponent(id)}?${params}`, { method: 'DELETE' })
+}
 export function killSession(id: string, node?: string): Promise<{ killed: boolean }> {
   const q = node ? `?node=${encodeURIComponent(node)}` : ''
   return req(`${BASE}/sessions/${id}/kill${q}`, { method: 'POST', body: '{}' })

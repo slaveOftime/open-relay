@@ -1793,6 +1793,7 @@ function SessionDetailPageContent() {
         <NewSessionDialog
           open={showNewSessionDialog}
           onClose={() => setShowNewSessionDialog(false)}
+          onRemovedOriginal={() => navigate('/', { replace: true })}
           initialValues={session ? buildNewSessionInitialValues(session) : undefined}
           node={node ?? undefined}
         />

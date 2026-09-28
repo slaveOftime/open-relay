@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
-import { startSession } from '@/api/client'
+import { forceRemoveSession, startSession } from '@/api/client'
 import { parseSessionTagInput } from '@/lib/sessionMetadata'
+import { cn } from '@/lib/utils'
 import { parseArgString } from '@/utils/format'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { FormActions, FormError, FormField } from '@/components/ui/form-field'
 import NotificationToggle from '@/components/NotificationToggle'
@@ -13,11 +15,13 @@ import type { NewSessionInitialValues } from './new-session-dialog-values'
 export default function NewSessionDialog({
   open,
   onClose,
+  onRemovedOriginal,
   initialValues,
   node,
 }: {
   open: boolean
   onClose: () => void
+  onRemovedOriginal?: () => void
   initialValues?: NewSessionInitialValues
   node?: string
 }) {
@@ -27,9 +31,17 @@ export default function NewSessionDialog({
   const [tags, setTags] = useState('')
   const [cwd, setCwd] = useState('')
   const [notificationsEnabled, setNotificationsEnabled] = useState(true)
+  const [removeOriginal, setRemoveOriginal] = useState(false)
+  const [startedSessionId, setStartedSessionId] = useState<string | null>(null)
+  const [creationUncertain, setCreationUncertain] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const wasOpenRef = useRef(false)
+  const submitPendingRef = useRef(false)
+  const sameSessionAsSource =
+    startedSessionId !== null &&
+    startedSessionId === initialValues?.sourceSession.id &&
+    (node ?? null) === initialValues.sourceSession.node
 
   useEffect(() => {
     const wasOpen = wasOpenRef.current
@@ -41,33 +53,66 @@ export default function NewSessionDialog({
     setTags(initialValues?.tags ?? '')
     setCwd(initialValues?.cwd ?? '')
     setNotificationsEnabled(initialValues?.notifications_enabled ?? true)
+    setRemoveOriginal(false)
+    setStartedSessionId(null)
+    setCreationUncertain(false)
     setLoading(false)
+    submitPendingRef.current = false
     setError(null)
   }, [initialValues, open])
 
   async function handleSubmit() {
-    if (!cmd.trim()) {
+    if (submitPendingRef.current || creationUncertain) return
+    if (!startedSessionId && !cmd.trim()) {
       setError('Command is required')
       return
     }
+    submitPendingRef.current = true
     setLoading(true)
     setError(null)
+    let newSessionId = startedSessionId
+    const source = initialValues?.sourceSession
     try {
-      const argList = args.trim() ? parseArgString(args.trim()) : []
-      await startSession({
-        cmd: cmd.trim(),
-        args: argList,
-        title: title.trim() || undefined,
-        tags: parseSessionTagInput(tags),
-        cwd: cwd.trim() || undefined,
-        disable_notifications: !notificationsEnabled,
-        node: node ?? undefined,
-      })
+      if (!newSessionId) {
+        const argList = args.trim() ? parseArgString(args.trim()) : []
+        const created = await startSession({
+          cmd: cmd.trim(),
+          args: argList,
+          title: title.trim() || undefined,
+          tags: parseSessionTagInput(tags),
+          cwd: cwd.trim() || undefined,
+          disable_notifications: !notificationsEnabled,
+          node: node ?? undefined,
+        })
+        if (typeof created.session_id !== 'string' || !created.session_id.trim()) {
+          setCreationUncertain(true)
+          throw new Error(
+            'Server did not return a new session ID. Original was not removed; close this dialog and verify the sessions list before trying again.'
+          )
+        }
+        newSessionId = created.session_id.trim()
+        if (removeOriginal && source) setStartedSessionId(newSessionId)
+      }
+      if (removeOriginal && source) {
+        // Mirror the TUI's safety check: never delete the newly created session.
+        if (newSessionId === source.id && (node ?? null) === source.node) {
+          throw new Error('new session has the same ID as the original')
+        }
+        const { removed } = await forceRemoveSession(source.id, source.node ?? undefined)
+        if (!removed) throw new Error('original session was not found')
+      }
       onClose()
+      if (removeOriginal && source) onRemovedOriginal?.()
       resetForm()
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start session')
+      const message = err instanceof Error ? err.message : 'Operation failed'
+      setError(
+        newSessionId && removeOriginal && source
+          ? `New session ${newSessionId} started, but original ${source.id} was not removed: ${message}. ${newSessionId === source.id && (node ?? null) === source.node ? 'Turn off removal or close this dialog.' : 'Retry removal or close this dialog.'}`
+          : message
+      )
     } finally {
+      submitPendingRef.current = false
       setLoading(false)
     }
   }
@@ -79,10 +124,14 @@ export default function NewSessionDialog({
     setTags('')
     setCwd('')
     setNotificationsEnabled(true)
+    setRemoveOriginal(false)
+    setStartedSessionId(null)
+    setCreationUncertain(false)
     setError(null)
   }
 
   function handleClose() {
+    if (loading) return
     resetForm()
     onClose()
   }
@@ -91,10 +140,10 @@ export default function NewSessionDialog({
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
-        if (!nextOpen) handleClose()
+        if (!nextOpen && !loading) handleClose()
       }}
     >
-      <DialogContent className="max-w-md">
+      <DialogContent className="max-w-md" showCloseButton={!loading}>
         <DialogHeader>
           <DialogTitle>New Session</DialogTitle>
         </DialogHeader>
@@ -117,6 +166,7 @@ export default function NewSessionDialog({
               placeholder="claude, bash, python…"
               required
               autoFocus
+              disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="arguments" label="Arguments">
@@ -124,6 +174,7 @@ export default function NewSessionDialog({
               value={args}
               onChange={(event) => setArgs(event.target.value)}
               placeholder="--model sonnet-3.7 (space-separated)"
+              disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="title" label="Title">
@@ -131,6 +182,7 @@ export default function NewSessionDialog({
               value={title}
               onChange={(event) => setTitle(event.target.value)}
               placeholder="Optional display name"
+              disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="tags" label="Tags" description="Separate tags with commas.">
@@ -138,6 +190,7 @@ export default function NewSessionDialog({
               value={tags}
               onChange={(event) => setTags(event.target.value)}
               placeholder="prod, release"
+              disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="cwd" label="Working Directory">
@@ -145,19 +198,77 @@ export default function NewSessionDialog({
               value={cwd}
               onChange={(event) => setCwd(event.target.value)}
               placeholder="/path/to/project"
+              disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <NotificationToggle
             checked={notificationsEnabled}
             onCheckedChange={setNotificationsEnabled}
+            disabled={loading || startedSessionId !== null || creationUncertain}
           />
+          {initialValues?.sourceSession && (
+            <div
+              className={cn(
+                'flex items-center justify-between gap-3 rounded-md border px-3 py-2.5 transition-colors',
+                removeOriginal
+                  ? 'border-[hsl(var(--destructive))]/50 bg-[hsl(var(--destructive))]/10'
+                  : 'border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40'
+              )}
+            >
+              <div className="flex min-w-0 flex-col gap-0.5">
+                <label
+                  htmlFor="remove-original-session"
+                  className={cn(
+                    'cursor-pointer text-xs font-medium',
+                    removeOriginal
+                      ? 'text-[hsl(var(--destructive))]'
+                      : 'text-[hsl(var(--foreground))]'
+                  )}
+                >
+                  Remove original session
+                </label>
+                <span className="text-[11px] text-[hsl(var(--muted-foreground))]">
+                  After starting, force-remove the original (kill it and delete its files).
+                </span>
+              </div>
+              <Switch
+                id="remove-original-session"
+                checked={removeOriginal}
+                disabled={loading}
+                onCheckedChange={setRemoveOriginal}
+                aria-label="Remove original session"
+                tone="destructive"
+              />
+            </div>
+          )}
           {error && error !== 'Command is required' ? <FormError>{error}</FormError> : null}
           <FormActions>
-            <Button type="button" variant="ghost" size="sm" onClick={handleClose}>
-              Cancel
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={handleClose}
+              disabled={loading}
+            >
+              {startedSessionId || creationUncertain ? 'Close' : 'Cancel'}
             </Button>
-            <Button type="submit" size="sm" disabled={loading}>
-              {loading ? 'Starting…' : 'Start Session'}
+            <Button
+              type="submit"
+              size="sm"
+              variant={removeOriginal ? 'destructive' : 'default'}
+              disabled={loading || creationUncertain || (sameSessionAsSource && removeOriginal)}
+            >
+              {loading
+                ? startedSessionId
+                  ? 'Removing…'
+                  : 'Starting…'
+                : startedSessionId
+                  ? removeOriginal
+                    ? 'Retry removal'
+                    : 'Keep original'
+                  : removeOriginal
+                    ? 'Start & remove original'
+                    : 'Start Session'}
             </Button>
           </FormActions>
         </Form.Root>

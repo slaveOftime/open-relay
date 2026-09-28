@@ -8,12 +8,13 @@ export type NewSessionInitialValues = {
   tags: string
   cwd: string
   notifications_enabled: boolean
+  sourceSession: { id: string; node: string | null }
 }
 
 export function buildNewSessionInitialValues(
   session: Pick<
     SessionSummary,
-    'command' | 'args' | 'title' | 'tags' | 'cwd' | 'notifications_enabled'
+    'id' | 'node' | 'command' | 'args' | 'title' | 'tags' | 'cwd' | 'notifications_enabled'
   >
 ): NewSessionInitialValues {
   return {
@@ -25,5 +26,6 @@ export function buildNewSessionInitialValues(
     tags: formatSessionTagInput(session.tags),
     cwd: session.cwd ?? '',
     notifications_enabled: session.notifications_enabled,
+    sourceSession: { id: session.id, node: session.node ?? null },
   }
 }

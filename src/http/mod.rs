@@ -240,7 +240,10 @@ pub async fn serve(state: AppState) {
         )
         .route("/api/sessions", get(sessions::list).post(sessions::create))
         .route("/api/sessions/events", get(sse::events_handler))
-        .route("/api/sessions/{id}", get(sessions::get_session))
+        .route(
+            "/api/sessions/{id}",
+            get(sessions::get_session).delete(sessions::remove_session),
+        )
         .route(
             "/api/sessions/{id}/metadata",
             post(sessions::set_session_metadata),

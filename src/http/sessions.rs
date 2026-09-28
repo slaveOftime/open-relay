@@ -680,6 +680,85 @@ pub async fn kill_session(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Remove (equivalent to `oly rm <id> --force` when force=true)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RemoveSessionParams {
+    pub node: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn remove_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<RemoveSessionParams>,
+) -> impl IntoResponse {
+    if let Some(ref node) = params.node {
+        let rpc = RpcRequest::Remove {
+            id: id.clone(),
+            force: params.force,
+        };
+        return match state.node_registry.proxy_rpc(node, &rpc).await {
+            Ok(RpcResponse::Remove { removed: true }) => {
+                Json(serde_json::json!({ "removed": true })).into_response()
+            }
+            Ok(RpcResponse::Remove { removed: false }) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session not found: {id}") })),
+            )
+                .into_response(),
+            Ok(RpcResponse::Error { message }) => (
+                if message.starts_with("session not found:") {
+                    StatusCode::NOT_FOUND
+                } else if message.contains("session is still running:") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "unexpected response from node" })),
+            )
+                .into_response(),
+        };
+    }
+
+    match state.store.delete_session(&id, params.force).await {
+        Ok(true) => {
+            info!(session_id = %id, force = params.force, "session removed via HTTP");
+            Json(serde_json::json!({ "removed": true })).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("session not found: {id}") })),
+        )
+            .into_response(),
+        Err(AppError::Protocol(message)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Err(error) => {
+            error!(session_id = %id, %error, "failed to remove session via HTTP");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
 #[derive(Debug, Deserialize)]
 pub struct SessionNotificationsBody {
     pub enabled: bool,
@@ -1017,7 +1096,9 @@ mod tests {
 
     use crate::protocol::SessionSummary;
 
-    use super::{SessionMetadataBody, pathbuf_to_rpc_path, tag_sessions_with_node};
+    use super::{
+        RemoveSessionParams, SessionMetadataBody, pathbuf_to_rpc_path, tag_sessions_with_node,
+    };
 
     fn empty_summary(id: &str) -> SessionSummary {
         SessionSummary {
@@ -1050,6 +1131,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn remove_defaults_to_non_force_but_accepts_force_and_node() {
+        let default: RemoveSessionParams =
+            serde_json::from_value(serde_json::json!({})).expect("defaults parse");
+        assert!(!default.force);
+        assert!(default.node.is_none());
+
+        let forced: RemoveSessionParams = serde_json::from_value(serde_json::json!({
+            "force": true,
+            "node": "worker-a"
+        }))
+        .expect("force and node parse");
+        assert!(forced.force);
+        assert_eq!(forced.node.as_deref(), Some("worker-a"));
+    }
     #[test]
     fn session_metadata_body_accepts_notification_override() {
         let body: SessionMetadataBody = serde_json::from_value(serde_json::json!({
