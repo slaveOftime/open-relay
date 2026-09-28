@@ -280,7 +280,36 @@ impl App {
         self.message = message;
     }
 
+    /// Keep tree focus on the same session across changes to `sessions`;
+    /// tree entries store indices, which become stale when rows are removed
+    /// or a refresh reorders them.
+    fn tree_focused_session_key(&self) -> Option<String> {
+        match self.tree.visible.get(self.tree.cursor)? {
+            TreeEntry::Session { session, .. } => self.sessions.get(*session).map(session_key),
+            TreeEntry::Folder { .. } => None,
+        }
+    }
+
+    fn restore_tree_session_focus(&mut self, key: Option<String>, cursor: usize) {
+        if let Some(key) = key {
+            self.tree.cursor = self
+                .tree
+                .visible
+                .iter()
+                .position(|entry| match entry {
+                    TreeEntry::Session { session, .. } => self
+                        .sessions
+                        .get(*session)
+                        .is_some_and(|item| session_key(item) == key),
+                    TreeEntry::Folder { .. } => false,
+                })
+                .unwrap_or_else(|| cursor.min(self.tree.visible.len().saturating_sub(1)));
+        }
+    }
+
     pub(super) fn replace_sessions(&mut self, mut sessions: Vec<SessionSummary>) {
+        let tree_focus = self.tree_focused_session_key();
+        let tree_cursor = self.tree.cursor;
         sort_sessions(&mut sessions, self.sort_strategy);
         let selected_key = self.sessions.get(self.selected).map(session_key);
         let now = Instant::now();
@@ -318,7 +347,7 @@ impl App {
             })
             .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
-        self.rebuild_tree();
+        self.restore_tree_session_focus(tree_focus, tree_cursor);
         self.sync_update_dialog();
     }
 
@@ -357,8 +386,11 @@ impl App {
         else {
             return;
         };
+        let tree_focus = self.tree_focused_session_key();
+        let tree_cursor = self.tree.cursor;
         let selected_key = self.sessions.get(self.selected).map(session_key);
         let removed_key = session_key(&self.sessions[position]);
+        let removed_selected = selected_key.as_ref() == Some(&removed_key);
         self.attention_rows.remove(&removed_key);
         self.effects
             .cancel_unique_effect(super::effects::attention_pulse_key(&removed_key));
@@ -375,6 +407,18 @@ impl App {
             })
             .unwrap_or_else(|| position.min(self.sessions.len().saturating_sub(1)));
         self.rebuild_visible();
+        if removed_selected {
+            // Prefer the next visible session; when there is none, select
+            // the previous one instead of jumping to the top of the list.
+            self.selected = self
+                .visible
+                .iter()
+                .copied()
+                .find(|&index| index >= position)
+                .or_else(|| self.visible.last().copied())
+                .unwrap_or(0);
+        }
+        self.restore_tree_session_focus(tree_focus, tree_cursor);
     }
     pub(super) fn apply_updated_summary(&mut self, summary: SessionSummary) {
         let key = session_key(&summary);
@@ -529,7 +573,7 @@ impl App {
     /// Rebuild the folder tree from `self.sessions` and recompute its visible
     /// flat row list. Tree state and cursor are preserved: the cursor snaps to
     /// the previously selected session if it survives the rebuild, otherwise
-    /// to the first row.
+    /// to the nearest row.
     pub(super) fn rebuild_tree(&mut self) {
         // Snapshot the row the cursor is currently on so we can re-locate
         // the same logical *row* (folder or session) after a refresh
@@ -582,8 +626,8 @@ impl App {
         self.tree.visible = visible;
 
         // Restore cursor: prefer the same session → the same folder →
-        // otherwise the last row. The folder fallback is what keeps
-        // arrow-key navigation alive across a daemon refresh tick that
+        // otherwise the same row position (or the preceding last row).
+        // This keeps arrow-key navigation alive across a daemon refresh tick that
         // happens to land with the cursor on a parent row.
         self.tree.cursor = previously_focused_session
             .and_then(|session_idx| {
@@ -599,7 +643,7 @@ impl App {
                     })
                 })
             })
-            .unwrap_or_else(|| self.tree.visible.len().saturating_sub(1));
+            .unwrap_or_else(|| self.tree.cursor.min(self.tree.visible.len().saturating_sub(1)));
     }
 
     /// Phase 1 of tree rebuild: clear the prior nodes and re-derive them

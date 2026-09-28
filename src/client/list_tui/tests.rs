@@ -3024,6 +3024,112 @@ fn removing_a_nonselected_session_preserves_the_selected_session() {
     );
 }
 #[test]
+fn removing_selected_session_picks_nearest_visible_list_row() {
+    let mut app = App::default();
+    let mut hidden = session("hidden");
+    hidden.command = "other".into();
+    let matching = |id| {
+        let mut item = session(id);
+        item.command = "match".into();
+        item
+    };
+    app.replace_sessions(vec![
+        matching("first"),
+        matching("deleted"),
+        hidden,
+        matching("next"),
+        matching("last"),
+    ]);
+    app.filter = "match".into();
+    app.update_text_filter();
+
+    app.selected = app.sessions.iter().position(|s| s.id == "deleted").unwrap();
+    app.remove_session_payload("deleted", None);
+    assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("next"));
+
+    app.selected = app.sessions.iter().position(|s| s.id == "last").unwrap();
+    app.remove_session_payload("last", None);
+    assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("next"));
+
+    app.remove_session_payload("next", None);
+    assert_eq!(app.selected_session().map(|s| s.id.as_str()), Some("first"));
+
+    app.remove_session_payload("first", None);
+    assert!(app.selected_session().is_none());
+}
+
+#[test]
+fn removing_tree_session_selects_nearest_row_and_preserves_survivors() {
+    let mut app = App::default();
+    let sessions = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|id| {
+            let mut item = session_at(id, Some("/work"));
+            item.command = id.into();
+            item
+        })
+        .collect();
+    app.replace_sessions(sessions);
+    app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
+
+    let focus = |app: &mut App, id: &str| {
+        app.tree.cursor = app
+            .tree
+            .visible
+            .iter()
+            .position(|entry| {
+                matches!(entry, super::TreeEntry::Session { session, .. }
+                if app.sessions[*session].id == id)
+            })
+            .unwrap();
+    };
+    let focused = |app: &App| match app.tree.visible[app.tree.cursor] {
+        super::TreeEntry::Session { session, .. } => app.sessions[session].id.clone(),
+        _ => panic!("expected session focus"),
+    };
+
+    focus(&mut app, "b");
+    app.remove_session_payload("b", None);
+    assert_eq!(focused(&app), "c", "select the next tree row, not the last");
+
+    // Removing an earlier row must not make the old session index point
+    // at an unrelated survivor.
+    app.remove_session_payload("a", None);
+    assert_eq!(focused(&app), "c");
+
+    focus(&mut app, "d");
+    app.remove_session_payload("d", None);
+    assert_eq!(focused(&app), "c", "last row falls back to the prior row");
+}
+#[test]
+fn tree_refresh_keeps_focused_session_after_list_reorders() {
+    let mut app = App::default();
+    let mut first = session_at("first", Some("/work"));
+    first.command = "a".into();
+    let mut second = session_at("second", Some("/work"));
+    second.command = "b".into();
+    app.replace_sessions(vec![first.clone(), second.clone()]);
+    app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
+    app.tree.cursor = app
+        .tree
+        .visible
+        .iter()
+        .position(|entry| {
+            matches!(entry, super::TreeEntry::Session { session, .. }
+            if app.sessions[*session].id == "second")
+        })
+        .unwrap();
+
+    // Reverse the list ordering without changing the tree's alphabetical
+    // display order. Its old session index must not be treated as identity.
+    second.created_at += chrono::Duration::seconds(1);
+    app.replace_sessions(vec![first, second]);
+    assert!(matches!(app.tree.visible[app.tree.cursor],
+        super::TreeEntry::Session { session, .. } if app.sessions[session].id == "second"));
+}
+#[test]
 fn ctrl_delete_on_folder_removes_all_descendant_sessions_even_when_filtered() {
     let mut direct = session_at("direct", Some("/work/project"));
     direct.command = "matches-filter".into();
