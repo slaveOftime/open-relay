@@ -38,6 +38,7 @@ use html::{
 use manifest::APP_MANIFEST_FILE;
 use manifest::{build_manifest_app_definition, load_app_manifest};
 use proxy_targets::build_proxy_target_urls;
+pub(super) use proxy_targets::filtered_proxy_query;
 use resolve::{
     app_local_request_candidates, find_existing_app_local_asset, find_existing_redirect_asset,
     local_asset_exists, split_app_request_path,

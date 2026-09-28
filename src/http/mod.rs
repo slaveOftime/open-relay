@@ -11,8 +11,8 @@ use axum::{
     Router,
     extract::ws::rejection::WebSocketUpgradeRejection,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State, WebSocketUpgrade},
-    http::{HeaderValue, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use rust_embed::RustEmbed;
@@ -298,6 +298,8 @@ pub async fn serve(state: AppState) {
     let router = Router::new()
         .route("/api/nodes/join", get(nodes::join_handler))
         .route("/api/static/apps", get(apps::list_static_apps))
+        // Keep the login shell accessible even if wwwroot/login.html exists.
+        .route("/login", get(serve_login_page))
         .merge(protected_router)
         .layer(CompressionLayer::new())
         .layer(cors)
@@ -374,7 +376,7 @@ async fn serve_static_or_proxy(
             )
             .await
             {
-                return response;
+                return redirect_unauthorized_proxy_navigation(&method, &headers, &uri, response);
             }
             return reverse_proxy::proxy(
                 Request::from_parts(parts, body),
@@ -434,6 +436,49 @@ async fn serve_static_or_proxy(
     StatusCode::NOT_FOUND.into_response()
 }
 
+async fn serve_login_page() -> Response {
+    match WebAssets::get("index.html") {
+        Some(asset) => build_bytes_response("index.html", asset.data.into_owned()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Only document navigations should enter the password flow. API calls,
+/// subresource requests, and WebSocket handshakes still receive their 401.
+fn redirect_unauthorized_proxy_navigation(
+    method: &Method,
+    headers: &HeaderMap,
+    uri: &Uri,
+    response: Response,
+) -> Response {
+    if response.status() != StatusCode::UNAUTHORIZED
+        || (method != Method::GET && method != Method::HEAD)
+        || !headers
+            .get(header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|accept| {
+                accept
+                    .split(',')
+                    .any(|part| part.trim().starts_with("text/html"))
+            })
+        || headers
+            .get("sec-fetch-dest")
+            .is_some_and(|dest| dest != "document")
+    {
+        return response;
+    }
+
+    // Preserve deep links and ordinary query parameters, but never reflect a
+    // credential from the URL into the login page's address or browser history.
+    let mut next = uri.path().to_owned();
+    if let Some(query) = apps::filtered_proxy_query(uri.query()) {
+        next.push('?');
+        next.push_str(&query);
+    }
+    let mut login = reqwest::Url::parse("http://localhost/login").expect("static login URL");
+    login.query_pairs_mut().append_pair("next", &next);
+    Redirect::to(&format!("/login?{}", login.query().expect("next query"))).into_response()
+}
 fn static_request_candidates(uri: &Uri) -> Result<Vec<String>, StatusCode> {
     let path = uri.path().trim_start_matches('/');
     let normalized = normalize_static_path(path).ok_or(StatusCode::NOT_FOUND)?;
@@ -606,8 +651,14 @@ fn resolve_route_label(matched: Option<&str>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{METRIC_ROUTES, resolve_route_label, static_request_candidates};
-    use axum::http::Uri;
+    use super::{
+        METRIC_ROUTES, redirect_unauthorized_proxy_navigation, resolve_route_label,
+        static_request_candidates,
+    };
+    use axum::{
+        http::{HeaderMap, Method, StatusCode, Uri, header},
+        response::IntoResponse,
+    };
 
     /// S3.3 regression guard: a previous version of `METRIC_ROUTES` had
     /// `/api/push/subscribe` while the router served `/api/push/subscriptions`,
@@ -635,6 +686,71 @@ mod tests {
         assert_eq!(resolve_route_label(None), "other");
     }
 
+    #[test]
+    fn unauthorized_proxy_document_redirects_to_login_and_preserves_safe_deep_link() {
+        let uri: Uri = "/apps/reports/details?tab=logs&token=secret&page=2"
+            .parse()
+            .expect("URI should parse");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml".parse().unwrap(),
+        );
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+
+        let response = redirect_unauthorized_proxy_navigation(
+            &Method::GET,
+            &headers,
+            &uri,
+            StatusCode::UNAUTHORIZED.into_response(),
+        );
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+        let login = reqwest::Url::parse(&format!("http://localhost{location}")).unwrap();
+        assert_eq!(login.path(), "/login");
+        assert_eq!(
+            login
+                .query_pairs()
+                .find(|(key, _)| key == "next")
+                .unwrap()
+                .1,
+            "/apps/reports/details?tab=logs&page=2"
+        );
+        assert!(!location.contains("secret"));
+    }
+
+    #[test]
+    fn proxy_unauthorized_non_navigation_requests_keep_their_status() {
+        let uri: Uri = "/apps/reports/data".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "text/html".parse().unwrap());
+        for (method, dest, status) in [
+            (Method::POST, "document", StatusCode::UNAUTHORIZED),
+            (Method::GET, "script", StatusCode::UNAUTHORIZED),
+            (Method::GET, "document", StatusCode::FORBIDDEN),
+        ] {
+            headers.insert("sec-fetch-dest", dest.parse().unwrap());
+            let response = redirect_unauthorized_proxy_navigation(
+                &method,
+                &headers,
+                &uri,
+                status.into_response(),
+            );
+            assert_eq!(response.status(), status);
+        }
+        headers.remove(header::ACCEPT);
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        assert_eq!(
+            redirect_unauthorized_proxy_navigation(
+                &Method::GET,
+                &headers,
+                &uri,
+                StatusCode::UNAUTHORIZED.into_response(),
+            )
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
     #[test]
     fn static_request_candidates_reject_parent_segments() {
         let uri: Uri = "/../secret.txt".parse().expect("URI should parse");

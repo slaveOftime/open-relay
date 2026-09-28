@@ -1,6 +1,7 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import LoginDialog from './components/LoginDialog'
+import { proxyLoginDestination } from './lib/proxyLogin'
 import { getAuthStatus, getToken } from './api/client'
 import { startSessionEvents, stopSessionEvents } from '@/lib/sessionEvents'
 import {
@@ -19,7 +20,7 @@ function LastRoutePersistence() {
 
   useEffect(() => {
     const current = `${location.pathname}${location.search}${location.hash}`
-    localStorage.setItem(LAST_ROUTE_KEY, current)
+    if (location.pathname !== '/login') localStorage.setItem(LAST_ROUTE_KEY, current)
   }, [location.pathname, location.search, location.hash])
 
   return null
@@ -115,28 +116,35 @@ export default function App() {
   // null = still loading, false = no auth required, true = auth required
   const [authRequired, setAuthRequired] = useState<boolean | null>(null)
   const [isAuthed, setIsAuthed] = useState(false)
+  const isLoginPage = window.location.pathname === '/login'
+  const loginDestination = proxyLoginDestination(window.location.href)
 
   useEffect(() => {
     getAuthStatus()
       .then(({ auth_required }) => {
         setAuthRequired(auth_required)
         if (!auth_required) {
+          if (isLoginPage) window.location.replace(loginDestination ?? '/')
           setIsAuthed(true)
         } else {
-          // If a token is already in sessionStorage, trust it until the first
+          // If a token is already in localStorage, trust it until the first
           // 401 response (the interceptor in req() will clear it + re-trigger).
-          if (getToken()) setIsAuthed(true)
+          if (!isLoginPage && getToken()) setIsAuthed(true)
         }
       })
       .catch(() => {
         // If we can't even reach /api/auth/status, show login (daemon may be starting)
         setAuthRequired(true)
       })
-  }, [])
+  }, [isLoginPage, loginDestination])
 
   const handleLoginSuccess = useCallback(() => {
-    setIsAuthed(true)
-  }, [])
+    if (isLoginPage) {
+      window.location.replace(loginDestination ?? '/')
+    } else {
+      setIsAuthed(true)
+    }
+  }, [isLoginPage, loginDestination])
 
   // Re-authenticate when any fetch triggers a 401.
   useEffect(() => {
@@ -165,6 +173,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<SessionsPage />} />
             <Route path="/session/:id" element={<SessionDetailPage />} />
+            <Route path="/login" element={null} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

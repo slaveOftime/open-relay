@@ -74,7 +74,7 @@ fn origin_root_url(entry_url: &Url) -> Url {
     root
 }
 
-fn filtered_proxy_query(query: Option<&str>) -> Option<String> {
+pub(in crate::http) fn filtered_proxy_query(query: Option<&str>) -> Option<String> {
     let query = query?;
     let filtered = query
         .split('&')
