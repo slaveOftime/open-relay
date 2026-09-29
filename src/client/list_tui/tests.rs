@@ -250,13 +250,16 @@ fn selected_row_keeps_status_colours_and_brightens_decorative_cells() {
 
     let buffer = render_session_row_selected(&item, true);
 
-    // The attention glyph and label keep their yellow even on the
-    // selection band — the highlight must never hide them.
+    // The attention glyph keeps its yellow on the selection band — the
+    // highlight must never hide semantic status colours. The session id
+    // ("waiting") and the status label ("attention") are rendered in the
+    // same coloured cell, immediately adjacent: "<id> <status>".
     let glyph = &buffer[(0, 0)];
     assert_eq!(glyph.symbol(), "◆");
     assert_eq!(glyph.fg, ratatui::style::Color::Yellow);
     assert_eq!(glyph.bg, super::SELECTED_ROW_BG);
-    let label_x = find_text(&buffer, "attention").expect("status label rendered");
+    let label_x =
+        find_text(&buffer, "waiting attention").expect("id rendered immediately before status");
     let label = &buffer[(label_x, 0)];
     assert_eq!(label.fg, ratatui::style::Color::Yellow);
     assert_eq!(label.bg, super::SELECTED_ROW_BG);
@@ -1570,7 +1573,16 @@ fn tree_session_uses_fixed_status_width_and_normal_sparkline() {
     let mut rate = super::RateState::new(&item, now);
     rate.history.extend([4.0, 8.0, 2.0]);
     let line = super::session_line(&item, Some(&rate), "├── ", false, now);
-    assert_eq!(line.spans[3].content.len(), super::TREE_STATUS_WIDTH);
+    // The id precedes the status label inside spans[3]: "live <running>",
+    // padded to id.len() + 1 + TREE_STATUS_WIDTH columns.
+    let expected = item.id.len() + 1 + super::TREE_STATUS_WIDTH;
+    assert_eq!(
+        line.spans[3].content.len(),
+        expected,
+        "id + status should keep the fixed-status width cell aligned: {:?}",
+        line.spans[3].content
+    );
+    assert!(line.spans[3].content.starts_with(&item.id));
     assert_eq!(
         line.spans[9].content.as_ref(),
         super::sparkline(Some(&rate), super::SPARKLINE_WIDTH)
@@ -1578,7 +1590,10 @@ fn tree_session_uses_fixed_status_width_and_normal_sparkline() {
     assert!(!line.spans.iter().any(|span| span.content.contains("/work")));
     item.input_needed = true;
     let attention = super::session_line(&item, Some(&rate), "├── ", true, now);
-    assert_eq!(attention.spans[3].content.len(), super::TREE_STATUS_WIDTH);
+    assert_eq!(
+        attention.spans[3].content.len(),
+        item.id.len() + 1 + super::TREE_STATUS_WIDTH
+    );
     assert_eq!(
         attention.spans[3].style.fg,
         Some(ratatui::style::Color::Yellow)
@@ -1626,10 +1641,50 @@ fn tree_render_shows_status_word_with_matching_color() {
         .find(|&x| buffer[(x, session_row as u16)].symbol() == "●")
         .expect("running glyph");
     let icon_color = cell_at(session_row as u16, icon_x);
-    let word_color = cell_at(session_row as u16, icon_x + 3);
+    // The session id is rendered immediately to the left of the status
+    // label, both wearing the same foreground as the icon.
+    let id_x = icon_x + 2;
+    let id_color = cell_at(session_row as u16, id_x);
+    let status_x = id_x + "only".len() as u16 + 1;
+    let word_color = cell_at(session_row as u16, status_x);
+    assert_eq!(
+        icon_color, id_color,
+        "icon and session id must share foreground color"
+    );
     assert_eq!(
         icon_color, word_color,
         "icon and status word must share foreground color"
+    );
+    // The id and the status word must be adjacent: there should be no
+    // intermediate cell whose foreground colour disagrees with the
+    // shared semantic palette between the id and the status label.
+    assert_eq!(
+        cell_at(session_row as u16, status_x - 1),
+        icon_color,
+        "the separator between id and status must inherit the status colour"
+    );
+}
+
+#[test]
+fn tree_renders_session_id_immediately_before_status_word() {
+    let mut app = App::default();
+    let mut s = session_at("ident42", Some("/proj"));
+    s.command = "ls".into();
+    s.status = "running".into();
+    app.replace_sessions(vec![s]);
+    app.toggle_view_mode();
+    expand_all_tree_folders(&mut app);
+    let rendered = render_app(&mut app, 120, 6);
+    let row = rendered
+        .lines()
+        .find(|line| line.contains("ls"))
+        .expect("tree row present");
+    let ident_pos = row.find("ident42").expect("id rendered");
+    let status_pos = row.find("running").expect("status rendered");
+    assert_eq!(
+        ident_pos + "ident42".len() + 1,
+        status_pos,
+        "id and status must be adjacent: {row:?}"
     );
 }
 
@@ -1843,8 +1898,9 @@ fn wide_mode_columns_follow_the_same_order_as_narrow_modes() {
         .expect("wide header rendered");
     let position = |label: &str| header.find(label).expect("column header present");
 
-    // status, ID, SESSION, PID, STATE, AGE, RATE, OUTPUT, COMMAND
-    assert!(position("ID") < position("SESSION"));
+    // status, SESSION, PID, STATE, AGE, RATE, OUTPUT, COMMAND. The session
+    // id is rendered inline immediately to the left of the status text,
+    // so the table no longer carries a dedicated ID column.
     assert!(position("SESSION") < position("PID"));
     assert!(position("PID") < position("STATE"));
     assert!(position("STATE") < position("AGE"));
@@ -3667,16 +3723,15 @@ fn multi_node_table_displays_node_and_keeps_duplicate_ids_distinct() {
 fn table_headers_share_each_modes_cell_alignments() {
     assert_eq!(
         super::session_table_alignments(super::LayoutMode::Narrow, false),
-        vec![Alignment::Left; 6]
+        vec![Alignment::Left; 5]
     );
     assert_eq!(
         super::session_table_alignments(super::LayoutMode::Medium, false),
-        vec![Alignment::Left; 6]
+        vec![Alignment::Left; 5]
     );
     assert_eq!(
         super::session_table_alignments(super::LayoutMode::Wide, false),
         vec![
-            Alignment::Left,
             Alignment::Left,
             Alignment::Left,
             Alignment::Right,

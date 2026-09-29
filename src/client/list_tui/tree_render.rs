@@ -353,17 +353,25 @@ fn session_line_with_connector(
     };
     let started = session.started_at.unwrap_or(session.created_at);
     let title_text = session.title.clone().unwrap_or_default();
+    // The session id sits immediately to the left of the status label,
+    // separated only by a single space. The id wears the same status
+    // colour so the eye can scan from id → status without an extra
+    // visual hop. The full id (length < TREE_STATUS_WIDTH) is rendered;
+    // pad_truncated still widens the surrounding cell so disabled vs
+    // active rows line up.
+    let mut status_with_id = String::with_capacity(session.id.len() + TREE_STATUS_WIDTH + 1);
+    status_with_id.push_str(&session.id);
+    status_with_id.push(' ');
+    let label = pad_truncated(
+        status_label(&session.status, session.input_needed),
+        TREE_STATUS_WIDTH,
+    );
+    status_with_id.push_str(&label);
     let mut spans = connector.spans;
     spans.extend([
         Span::styled(glyph.to_string(), status_style),
         Span::raw(" "),
-        Span::styled(
-            pad_truncated(
-                status_label(&session.status, session.input_needed),
-                TREE_STATUS_WIDTH,
-            ),
-            status_style,
-        ),
+        Span::styled(status_with_id, status_style),
         Span::raw(" "),
         Span::styled(cmd_args, dim),
         Span::raw("  "),

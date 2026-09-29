@@ -30,32 +30,33 @@ pub enum LayoutMode {
 }
 
 pub fn session_table_widths(mode: LayoutMode, show_node: bool) -> Vec<Constraint> {
+    // The session id is rendered inline immediately to the left of the
+    // STATE column, so the table no longer carries a dedicated ID column.
+    // STATE is now wide enough to hold `<8-char-id> <status-word>` plus a
+    // separator (so the inherited status width of 9 became 18).
     let mut widths = match mode {
         LayoutMode::Narrow => vec![
             Constraint::Length(1),
-            Constraint::Length(8),
             Constraint::Fill(1),
-            Constraint::Length(9),
+            Constraint::Length(18),
             Constraint::Length(5),
             Constraint::Length(COMPACT_SPARKLINE_WIDTH as u16),
         ],
         LayoutMode::Medium => vec![
             Constraint::Length(1),
-            Constraint::Length(8),
             Constraint::Fill(1),
-            Constraint::Length(9),
+            Constraint::Length(18),
             Constraint::Length(5),
             Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
         ],
-        // Same column order as the narrower modes (ID before SESSION before
-        // STATE before AGE before RATE); PID slots in after SESSION, OUTPUT
-        // after RATE and the flexible COMMAND column goes last.
+        // Same column order as the narrower modes (SESSION before PID
+        // before STATE before AGE before RATE before OUTPUT before COMMAND);
+        // the ID is rendered inline inside the STATE column.
         LayoutMode::Wide => vec![
             Constraint::Length(1),
-            Constraint::Length(8),
             Constraint::Length(22),
             Constraint::Length(6),
-            Constraint::Length(9),
+            Constraint::Length(20),
             Constraint::Length(5),
             Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
             Constraint::Length(8),
@@ -70,9 +71,8 @@ pub fn session_table_widths(mode: LayoutMode, show_node: bool) -> Vec<Constraint
 
 pub fn session_table_alignments(mode: LayoutMode, show_node: bool) -> Vec<Alignment> {
     let mut alignments = match mode {
-        LayoutMode::Narrow | LayoutMode::Medium => vec![Alignment::Left; 6],
+        LayoutMode::Narrow | LayoutMode::Medium => vec![Alignment::Left; 5],
         LayoutMode::Wide => vec![
-            Alignment::Left,
             Alignment::Left,
             Alignment::Left,
             Alignment::Right,
@@ -90,11 +90,14 @@ pub fn session_table_alignments(mode: LayoutMode, show_node: bool) -> Vec<Alignm
 }
 
 pub fn session_table_header(mode: LayoutMode, show_node: bool) -> Row<'static> {
+    // The session id is rendered inline immediately to the left of the
+    // status text in each row, so the ID column is intentionally absent
+    // from the header.
     let mut labels = match mode {
-        LayoutMode::Narrow => vec!["", "ID", "SESSION", "STATE", "AGE", "I/O"],
-        LayoutMode::Medium => vec!["", "ID", "SESSION", "STATE", "AGE", "RATE"],
+        LayoutMode::Narrow => vec!["", "SESSION", "STATE", "AGE", "I/O"],
+        LayoutMode::Medium => vec!["", "SESSION", "STATE", "AGE", "RATE"],
         LayoutMode::Wide => vec![
-            "", "ID", "SESSION", "PID", "STATE", "AGE", "RATE", "OUTPUT", "COMMAND",
+            "", "SESSION", "PID", "STATE", "AGE", "RATE", "OUTPUT", "COMMAND",
         ],
     };
     if show_node {
@@ -150,6 +153,13 @@ pub fn session_row(
         Color::DarkGray
     };
     let status_text = status_label(&session.status, session.input_needed);
+    // The session id sits immediately to the left of the status text so
+    // the eye can correlate the human-friendly status word with the
+    // daemon-reported id (the column previously used solely for the id).
+    let mut status_with_id = String::with_capacity(session.id.len() + status_text.len() + 1);
+    status_with_id.push_str(&session.id);
+    status_with_id.push(' ');
+    status_with_id.push_str(status_text);
     let name = session
         .title
         .clone()
@@ -170,28 +180,24 @@ pub fn session_row(
     let mut cells = match mode {
         LayoutMode::Narrow => vec![
             aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
-            aligned_cell(session.id.clone(), alignments[1 + node_offset])
-                .style(Style::default().fg(muted)),
-            aligned_cell(name, alignments[2 + node_offset]),
-            aligned_cell(status_text.to_string(), alignments[3 + node_offset]).style(status_style),
-            aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
+            aligned_cell(name, alignments[1 + node_offset]),
+            aligned_cell(status_with_id.clone(), alignments[2 + node_offset]).style(status_style),
+            aligned_cell(age, alignments[3 + node_offset]).style(Style::default().fg(muted)),
             aligned_cell(
                 if active {
                     sparkline(rate, COMPACT_SPARKLINE_WIDTH)
                 } else {
                     String::new()
                 },
-                alignments[5 + node_offset],
+                alignments[4 + node_offset],
             )
             .style(Style::default().fg(rate_color)),
         ],
         LayoutMode::Medium => vec![
             aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
-            aligned_cell(session.id.clone(), alignments[1 + node_offset])
-                .style(Style::default().fg(muted)),
-            aligned_cell(name, alignments[2 + node_offset]),
-            aligned_cell(status_text.to_string(), alignments[3 + node_offset]).style(status_style),
-            aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
+            aligned_cell(name, alignments[1 + node_offset]),
+            aligned_cell(status_with_id.clone(), alignments[2 + node_offset]).style(status_style),
+            aligned_cell(age, alignments[3 + node_offset]).style(Style::default().fg(muted)),
             aligned_cell(
                 if active {
                     format!(
@@ -202,7 +208,7 @@ pub fn session_row(
                 } else {
                     String::new()
                 },
-                alignments[5 + node_offset],
+                alignments[4 + node_offset],
             )
             .style(Style::default().fg(rate_color)),
         ],
@@ -214,17 +220,15 @@ pub fn session_row(
             };
             vec![
                 aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
-                aligned_cell(session.id.clone(), alignments[1 + node_offset])
-                    .style(Style::default().fg(muted)),
-                aligned_cell(name, alignments[2 + node_offset]),
+                aligned_cell(name, alignments[1 + node_offset]),
                 aligned_cell(
                     session.pid.map_or("-".into(), |pid| pid.to_string()),
-                    alignments[3 + node_offset],
+                    alignments[2 + node_offset],
                 )
                 .style(Style::default().fg(muted)),
-                aligned_cell(status_text.to_string(), alignments[4 + node_offset])
+                aligned_cell(status_with_id.clone(), alignments[3 + node_offset])
                     .style(status_style),
-                aligned_cell(age, alignments[5 + node_offset]).style(Style::default().fg(muted)),
+                aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
                 aligned_cell(
                     if active {
                         format!(
@@ -235,15 +239,15 @@ pub fn session_row(
                     } else {
                         String::new()
                     },
-                    alignments[6 + node_offset],
+                    alignments[5 + node_offset],
                 )
                 .style(Style::default().fg(rate_color)),
                 aligned_cell(
                     format_bytes(session.last_total_bytes as f64),
-                    alignments[7 + node_offset],
+                    alignments[6 + node_offset],
                 )
                 .style(Style::default().fg(muted)),
-                aligned_cell(command, alignments[8 + node_offset]),
+                aligned_cell(command, alignments[7 + node_offset]),
             ]
         }
     };
