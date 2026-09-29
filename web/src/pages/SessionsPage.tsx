@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
+import { memo, useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import type { ListParams } from '@/api/client'
 import {
@@ -457,7 +457,7 @@ function GroupHeaderLabel({
 
 // ── Session Row ────────────────────────────────────────────────────────────
 
-function SessionRow({
+const SessionRow = memo(function SessionRow({
   session,
   animateIn,
   pinned,
@@ -731,11 +731,11 @@ function SessionRow({
       />
     </>
   )
-}
+})
 
 // ── Session Card (mobile) ──────────────────────────────────────────────────
 
-function SessionCard({
+const SessionCard = memo(function SessionCard({
   session,
   animateIn,
   pinned,
@@ -854,7 +854,7 @@ function SessionCard({
           
           {/* Row 4: activity sparkline */}
           {session.status === 'running' && (
-            <div className="pt-1 w-full opacity-20 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
+            <div className="pt-1 w-full opacity-30 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
               <SessionActivitySparkline
                 sessionId={session.id}
                 node={node}
@@ -943,7 +943,7 @@ function SessionCard({
       />
     </>
   )
-}
+})
 
 // ── Sort indicator ─────────────────────────────────────────────────────────
 
@@ -1433,26 +1433,26 @@ export default function SessionsPage() {
     return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
   }, [groupBy, pagedSessions])
 
-  function handleRunAgain(session: SessionSummary) {
+  const handleRunAgain = useCallback((session: SessionSummary) => {
     setRerunSession(session)
     setShowNewSession(true)
-  }
+  }, [])
 
-  function handleEditSession(session: SessionSummary) {
+  const handleEditSession = useCallback((session: SessionSummary) => {
     setEditingSession(session)
-  }
+  }, [])
 
   function isSessionPinned(session: SessionSummary): boolean {
     return pinnedKeySet.has(sessionPinKey(session.id, selectedNode))
   }
 
-  function handleTogglePin(session: SessionSummary) {
+  const handleTogglePin = useCallback((session: SessionSummary) => {
     if (!sessionIsPinnable(session)) return
     const key = sessionPinKey(session.id, selectedNode)
     setPinnedKeys((prev) =>
       prev.includes(key) ? prev.filter((entry) => entry !== key) : [key, ...prev]
     )
-  }
+  }, [selectedNode])
 
   function handleNodeChange(node: string | null) {
     if (node === selectedNode) return
@@ -1608,16 +1608,17 @@ export default function SessionsPage() {
     void reloadSessions({ background: true })
   }
 
-  async function handleStop(id: string) {
+  const handleStop = useCallback(async (id: string) => {
     await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
-  }
-  async function handleKill(id: string) {
+  }, [loadRemote, selectedNode])
+
+  const handleKill = useCallback(async (id: string) => {
     await killSession(id, selectedNode ?? undefined).catch(() => {})
     if (selectedNode) void loadRemote()
-  }
+  }, [loadRemote, selectedNode])
 
-  async function handleToggleNotifications(session: SessionSummary) {
+  const handleToggleNotifications = useCallback(async (session: SessionSummary) => {
     const isRunning =
       session.status === 'running' || session.status === 'stopping' || session.status === 'created'
     if (!isRunning) return
@@ -1641,7 +1642,7 @@ export default function SessionsPage() {
         return next
       })
     }
-  }
+  }, [selectedNode, setLoadedSessionNotifications])
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
   const pageTitle = sessionPageTitle(selectedNode)

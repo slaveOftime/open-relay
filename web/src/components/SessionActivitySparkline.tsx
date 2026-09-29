@@ -1,7 +1,13 @@
-import SparklineSvg from '@/components/SparklineSvg'
-import { useSessionActivitySeries } from '@/lib/sessionActivity'
+import { memo, useCallback } from 'react'
 
-export default function SessionActivitySparkline({
+import SparklineSvg from '@/components/SparklineSvg'
+import {
+  getSessionActivitySnapshot,
+  sessionActivityKey,
+  subscribeSessionActivity,
+} from '@/lib/sessionActivity'
+
+function SessionActivitySparkline({
   sessionId,
   node,
   isRunning,
@@ -16,11 +22,20 @@ export default function SessionActivitySparkline({
   height?: number
   className?: string
 }) {
-  const series = useSessionActivitySeries(sessionId, node)
+  const readActivity = useCallback(
+    () => getSessionActivitySnapshot(sessionId, node),
+    [node, sessionId]
+  )
+  const subscribeActivity = useCallback(
+    (listener: () => void) => subscribeSessionActivity(sessionId, node, listener),
+    [node, sessionId]
+  )
 
   return (
     <SparklineSvg
-      series={series}
+      key={sessionActivityKey(sessionId, node)}
+      readActivity={readActivity}
+      subscribeActivity={subscribeActivity}
       fullWidth={fullWidth}
       height={height}
       className={className}
@@ -28,3 +43,5 @@ export default function SessionActivitySparkline({
     />
   )
 }
+
+export default memo(SessionActivitySparkline)

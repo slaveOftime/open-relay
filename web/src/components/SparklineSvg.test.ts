@@ -42,6 +42,21 @@ describe('SparklineStore', () => {
     expect(series.at(-1)).toBe(50)
   })
 
+  it('tracks the last real output separately from bucket ticks and stale totals', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    const store = new SparklineStore()
+    store.recordTotal('session-1', 100)
+    expect(store.getLastOutputAt('session-1')).toBeNull()
+    vi.setSystemTime(1_125)
+    store.recordTotal('session-1', 180)
+    expect(store.getLastOutputAt('session-1')).toBe(1_125)
+    expect(store.getBucketIndex('session-1')).toBe(2)
+    vi.setSystemTime(1_700)
+    store.recordTotal('session-1', 120)
+    expect(store.getLastOutputAt('session-1')).toBe(1_125)
+    expect(store.getBucketIndex('session-1')).toBe(3)
+  })
   it('ignores non-increasing totals', () => {
     const store = new SparklineStore()
 

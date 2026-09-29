@@ -14,6 +14,18 @@ export function carryOpenBucket(series: number[]): number[] {
   return display
 }
 
+/** Compute the newest point for a live update without rebuilding SVG path strings. */
+export function calculateSparklineLastY(series: number[], height: number): number {
+  const baselineY = Math.max(2, height - 3)
+  if (series.length < 2) return baselineY
+  let maxValue = 0
+  for (const value of series) maxValue = Math.max(maxValue, value)
+  const latestValue = series[series.length - 1] ?? 0
+  const normalized = maxValue <= 0 ? 0 : Math.log10(latestValue + 1) / Math.log10(maxValue + 1)
+  const emphasis = normalized <= 0 ? 0 : Math.pow(normalized, 0.86)
+  const range = Math.max(height - 2 - 3, 1)
+  return height - 3 - emphasis * range
+}
 export function calculateRecentBytesPerSecond(series: number[]): number {
   const recent = series.slice(-RECENT_RATE_BUCKETS)
   if (recent.length === 0) return 0

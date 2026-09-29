@@ -1,32 +1,35 @@
-import { useCallback, useSyncExternalStore } from 'react'
-
 import type { SessionEvent, SessionNotificationData, SessionSummary } from '@/api/types'
-import { SparklineStore } from '@/components/sparklineStore'
+import { SparklineStore, type SparklineActivitySnapshot } from '@/components/sparklineStore'
 
 const sparklineStore = new SparklineStore()
 const EMPTY_ACTIVITY_SERIES: number[] = []
+const EMPTY_ACTIVITY_SNAPSHOT: SparklineActivitySnapshot = {
+  series: EMPTY_ACTIVITY_SERIES,
+  bucketIndex: 0,
+  lastOutputAt: null,
+}
 
 // Session ids can recur across connected nodes; never mix their byte totals.
 export function sessionActivityKey(id: string, node?: string | null): string {
   return `${node?.trim() || ''}\0${id}`
 }
 
-export function useSessionActivitySeries(sessionId?: string | null, node?: string | null): number[] {
-  const key = sessionId ? sessionActivityKey(sessionId, node) : null
-  // Keep the subscription stable across row renders and listen only to this
-  // session; an update on another node/row must not wake every sparkline.
-  const subscribe = useCallback(
-    (listener: () => void) =>
-      key ? sparklineStore.subscribe(key, listener) : () => {},
-    [key]
-  )
-  const getSnapshot = useCallback(
-    () => (key ? sparklineStore.getSeries(key) : EMPTY_ACTIVITY_SERIES),
-    [key]
-  )
-  return useSyncExternalStore(subscribe, getSnapshot, () => EMPTY_ACTIVITY_SERIES)
+export function getSessionActivitySnapshot(
+  sessionId?: string | null,
+  node?: string | null
+): SparklineActivitySnapshot {
+  return sessionId ? sparklineStore.getActivitySnapshot(sessionActivityKey(sessionId, node)) : EMPTY_ACTIVITY_SNAPSHOT
 }
 
+export function subscribeSessionActivity(
+  sessionId: string | null | undefined,
+  node: string | null | undefined,
+  listener: () => void
+): () => void {
+  return sessionId
+    ? sparklineStore.subscribe(sessionActivityKey(sessionId, node), listener)
+    : () => {}
+}
 export function recordSessionActivity(
   session: Pick<SessionSummary, 'id' | 'node' | 'last_total_bytes'>
 ): void {

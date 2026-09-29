@@ -239,11 +239,38 @@ test('switching nodes ignores old list responses and keeps the live indicator st
   await page.waitForTimeout(300)
   const beforeShift = await graphPath.getAttribute('d')
   await expect.poll(() => graphPath.getAttribute('d'), { timeout: 1_200 }).not.toBe(beforeShift)
-  const midShift = await graphPath.getAttribute('d')
-  const latestY = Number([...midShift!.matchAll(/[ML] [\d.]+ ([\d.]+)/g)].at(-1)?.[1])
-  expect(latestY).toBeLessThan(19) // no flash to the baseline while the bucket opens
+  const pointNearHead = (path: string | null) => {
+    const points = [...(path ?? '').matchAll(/[ML] ([\d.]+) ([\d.]+)/g)].map((point) => ({
+      x: Number(point[1]),
+      y: Number(point[2]),
+    }))
+    const oldestActivity = points.find((point) => point.y < 18.99)
+    return {
+      x: oldestActivity?.x ?? NaN,
+      y: oldestActivity?.y ?? NaN,
+      headY: points.at(-1)?.y ?? NaN,
+    }
+  }
+  const before = pointNearHead(await graphPath.getAttribute('d'))
+  expect(before.headY).toBeLessThan(19) // no flash to baseline as the bucket opens
+  expect(before.y).toBeLessThan(19)
   await page.waitForTimeout(80)
-  expect(await graphPath.getAttribute('d')).not.toBe(midShift)
+  const after = pointNearHead(await graphPath.getAttribute('d'))
+  expect(after.x).toBeLessThan(before.x) // existing samples physically travel left
+  expect(after.y).toBe(before.y) // their heights do not morph like a worm
+  await page.evaluate(
+    (data) => {
+      ;(window as Window & { emitSessionUpdate?: (data: unknown) => void }).emitSessionUpdate?.(
+        data
+      )
+    },
+    { ...workerB, last_total_bytes: 1536 }
+  )
+  await expect(activity).toHaveAttribute('aria-label', /Recent: 768 B\/s/)
+  await page.waitForTimeout(80)
+  const withNewHead = pointNearHead(await graphPath.getAttribute('d'))
+  expect(withNewHead.y).toBe(after.y) // incoming bytes only change the head
+  expect(withNewHead.x).toBeLessThan(after.x)
   expect(listRequests).toBe(requestsBeforeActivity)
   await expect(page.locator('table').getByText('worker-a session')).toHaveCount(0)
   await expect(page.locator('table').getByText('local session')).toHaveCount(0)

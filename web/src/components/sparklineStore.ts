@@ -7,11 +7,19 @@ const SPARKLINE_NUM_BUCKETS = 40
 // without increasing SSE traffic or work done on every React render.
 export const SPARKLINE_BUCKET_MS = 500
 
+export type SparklineActivitySnapshot = {
+  series: number[]
+  bucketIndex: number
+  lastOutputAt: number | null
+}
+
 type Entry = {
   counts: number[]
   snapshot: number[]
   lastBucket: number
   lastTotalBytes: number | null
+  lastOutputAt: number | null
+  activitySnapshot: SparklineActivitySnapshot
 }
 
 /** Rolling output-byte history, with notifications scoped to the affected session. */
@@ -20,6 +28,11 @@ export class SparklineStore {
   private readonly bucketMs = SPARKLINE_BUCKET_MS
   private readonly listeners = new Map<string, Set<() => void>>()
   private readonly emptySeries = new Array(this.numBuckets).fill(0)
+  private readonly emptyActivitySnapshot: SparklineActivitySnapshot = {
+    series: this.emptySeries,
+    bucketIndex: 0,
+    lastOutputAt: null,
+  }
   private decayTimer: ReturnType<typeof setInterval> | null = null
   private data = new Map<string, Entry>()
 
@@ -31,11 +44,15 @@ export class SparklineStore {
     let entry = this.data.get(id)
     if (!entry) {
       const counts = new Array(this.numBuckets).fill(0)
+      const lastBucket = this.nowBucket()
+      const snapshot = [...counts]
       entry = {
         counts,
-        snapshot: [...counts],
-        lastBucket: this.nowBucket(),
+        snapshot,
+        lastBucket,
         lastTotalBytes: null,
+        lastOutputAt: null,
+        activitySnapshot: { series: snapshot, bucketIndex: lastBucket, lastOutputAt: null },
       }
       this.data.set(id, entry)
     }
@@ -102,6 +119,11 @@ export class SparklineStore {
       }
     }
     entry.snapshot = [...entry.counts]
+    entry.activitySnapshot = {
+      series: entry.snapshot,
+      bucketIndex: now,
+      lastOutputAt: entry.lastOutputAt,
+    }
     return true
   }
 
@@ -116,6 +138,11 @@ export class SparklineStore {
     if (value > 0) {
       entry.counts[entry.counts.length - 1] += value
       entry.snapshot = [...entry.counts]
+      entry.activitySnapshot = {
+        series: entry.snapshot,
+        bucketIndex: entry.lastBucket,
+        lastOutputAt: entry.lastOutputAt,
+      }
     }
     if (value > 0 && this.listeners.has(id)) this.ensureDecayTimer()
     if (advanced || value > 0) this.emitChange(id)
@@ -135,13 +162,30 @@ export class SparklineStore {
     const delta = Math.max(totalBytes - baseline, 0)
     entry.lastTotalBytes = Math.max(entry.lastTotalBytes ?? totalBytes, totalBytes)
     if (delta > 0) {
+      entry.lastOutputAt = Date.now()
       entry.counts[entry.counts.length - 1] += delta
       entry.snapshot = [...entry.counts]
+      entry.activitySnapshot = {
+        series: entry.snapshot,
+        bucketIndex: entry.lastBucket,
+        lastOutputAt: entry.lastOutputAt,
+      }
     }
     if (delta > 0 && this.listeners.has(id)) this.ensureDecayTimer()
     if (advanced || delta > 0) this.emitChange(id)
   }
 
+  getActivitySnapshot(id: string): SparklineActivitySnapshot {
+    return this.data.get(id)?.activitySnapshot ?? this.emptyActivitySnapshot
+  }
+
+  getBucketIndex(id: string): number {
+    return this.data.get(id)?.lastBucket ?? 0
+  }
+
+  getLastOutputAt(id: string): number | null {
+    return this.data.get(id)?.lastOutputAt ?? null
+  }
   /** A stable, side-effect-free snapshot for useSyncExternalStore. */
   getSeries(id: string): number[] {
     return this.data.get(id)?.snapshot ?? this.emptySeries
