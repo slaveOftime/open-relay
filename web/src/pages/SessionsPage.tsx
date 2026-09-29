@@ -854,7 +854,7 @@ const SessionCard = memo(function SessionCard({
           
           {/* Row 4: activity sparkline */}
           {session.status === 'running' && (
-            <div className="pt-1 w-full opacity-30 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
+            <div className="pt-1 w-full opacity-20 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
               <SessionActivitySparkline
                 sessionId={session.id}
                 node={node}

@@ -183,7 +183,7 @@ export default function NewSessionDialog({
             event.preventDefault()
             void handleSubmit()
           }}
-          className="mt-1 flex flex-col gap-4"
+          className="mt-1 flex flex-col gap-3"
         >
           <FormField
             name="command"
@@ -209,24 +209,14 @@ export default function NewSessionDialog({
             />
           </FormField>
           {resumeCommand ? (
-            <div className="flex items-center justify-between gap-3 rounded-md border border-dashed border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 px-3 py-2">
-              <span
-                className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]"
-                title={resumeCommand}
-              >
-                resume: {resumeCommand}
-              </span>
-              <Button
-                type="button"
-                variant={resumeApplied ? 'secondary' : 'outline'}
-                size="sm"
-                className="shrink-0"
+              <button
+                className="w-full rounded-md p-1 outline-dashed outline-1 outline-neutral-500 opacity-60 hover:opacity-80 focus:opacity-80 -mt-1 whitespace-normal max-h-12 align-top overflow-y-auto"
                 onClick={handleToggleResumeCommand}
                 disabled={loading || startedSessionId !== null || creationUncertain}
               >
-                {resumeApplied ? 'Revert to original' : 'Use resume command'}
-              </Button>
-            </div>
+                  {resumeApplied ? 'Revert: ' : 'Resume: '}
+                  {resumeCommand}
+              </button>
           ) : null}
           <FormField name="title" label="Title">
             <Input
@@ -236,11 +226,11 @@ export default function NewSessionDialog({
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
-          <FormField name="tags" label="Tags" description="Separate tags with commas.">
+          <FormField name="tags" label="Tags">
             <Input
               value={tags}
               onChange={(event) => setTags(event.target.value)}
-              placeholder="prod, release"
+              placeholder="prod, release (Separate tags with commas)"
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
