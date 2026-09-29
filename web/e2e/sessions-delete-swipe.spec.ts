@@ -6,14 +6,15 @@ async function swipe(
   fromX: number,
   toX: number,
   fromY = 240,
-  toY = 247
+  toY = 247,
+  inspectMove?: () => Promise<void>
 ) {
   await page.evaluate(
     ({ selector, fromX, toX, fromY, toY }) => {
       const target = document.querySelector(selector)
       if (!target) throw new Error(`Missing swipe target: ${selector}`)
       const start = new Touch({ identifier: 1, target, clientX: fromX, clientY: fromY })
-      const end = new Touch({ identifier: 1, target, clientX: toX, clientY: toY })
+      const moved = new Touch({ identifier: 1, target, clientX: toX, clientY: toY })
       target.dispatchEvent(
         new TouchEvent('touchstart', {
           bubbles: true,
@@ -24,6 +25,24 @@ async function swipe(
         })
       )
       target.dispatchEvent(
+        new TouchEvent('touchmove', {
+          bubbles: true,
+          cancelable: true,
+          touches: [moved],
+          targetTouches: [moved],
+          changedTouches: [moved],
+        })
+      )
+    },
+    { selector, fromX, toX, fromY, toY }
+  )
+  await inspectMove?.()
+  await page.evaluate(
+    ({ selector, toX, toY }) => {
+      const target = document.querySelector(selector)
+      if (!target) throw new Error(`Missing swipe target: ${selector}`)
+      const end = new Touch({ identifier: 1, target, clientX: toX, clientY: toY })
+      target.dispatchEvent(
         new TouchEvent('touchend', {
           bubbles: true,
           cancelable: true,
@@ -33,7 +52,7 @@ async function swipe(
         })
       )
     },
-    { selector, fromX, toX, fromY, toY }
+    { selector, toX, toY }
   )
 }
 
@@ -83,7 +102,26 @@ test('mobile node swipes respect scrolling and deletion confirms force only for 
     last_total_bytes: 0,
   })
   const removed = new Set<string>()
-  await page.route('**/api/sessions?**', (route) => {
+  let listRequests = 0
+  let holdNextList = false
+  let failNextList = false
+  let resumeRefresh: (() => void) | undefined
+  await page.route('**/api/sessions?**', async (route) => {
+    listRequests += 1
+    if (holdNextList) {
+      holdNextList = false
+      await new Promise<void>((resolve) => {
+        resumeRefresh = resolve
+      })
+    }
+    if (failNextList) {
+      failNextList = false
+      return route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: '{"error":"network unavailable"}',
+      })
+    }
     const node = new URL(route.request().url()).searchParams.get('node')
     const source = makeSession(node, node === 'worker-a' ? 'running' : 'stopped')
     const items = removed.has(source.id) ? [] : [source]
@@ -115,16 +153,131 @@ test('mobile node swipes respect scrolling and deletion confirms force only for 
 
   await page.goto('/')
   const list = page.getByTestId('mobile-session-list')
+  const content = list.getByTestId('mobile-session-content')
+  const swipeX = () =>
+    content.evaluate((el) => new DOMMatrixReadOnly(getComputedStyle(el).transform).m41)
   await expect(list.getByText('Local session')).toBeVisible()
-  await swipe(page, '[data-testid="mobile-session-list"]', 250, 110)
+  const indicator = list.getByTestId('mobile-pull-indicator')
+  const pullY = () =>
+    content.evaluate((el) => new DOMMatrixReadOnly(getComputedStyle(el).transform).m42)
+  const beforeRefresh = listRequests
+  await swipe(page, '[data-testid="mobile-session-list"]', 170, 170, 140, 190, async () => {
+    await expect.poll(pullY).toBeGreaterThan(20)
+    await expect(indicator).toContainText('Pull to refresh')
+  })
+  await expect.poll(pullY).toBeCloseTo(0, 0)
+  expect(listRequests).toBe(beforeRefresh)
+
+  holdNextList = true
+  await swipe(page, '[data-testid="mobile-session-list"]', 170, 170, 140, 280, async () => {
+    await expect.poll(pullY).toBeGreaterThan(50)
+    await expect(indicator).toContainText('Release to refresh')
+    await expect(page).toHaveURL('/') // refresh only starts on release
+  })
+  await expect.poll(() => listRequests).toBe(beforeRefresh + 1)
+  await expect(indicator).toContainText('Refreshing…')
+  await expect(indicator).toHaveAttribute('aria-hidden', 'false')
+  await expect(indicator.locator('svg')).toHaveClass(/animate-spin/)
+  await expect.poll(pullY).toBeGreaterThan(50)
+  await swipe(page, '[data-testid="mobile-session-list"]', 250, 110, 240, 247)
+  await expect(page).toHaveURL('/')
+  await expect(indicator).toContainText('Refreshing…') // a second gesture cannot interrupt it
+  resumeRefresh?.()
+  await expect.poll(pullY).toBeCloseTo(0, 0)
+  await expect(indicator).toHaveAttribute('aria-hidden', 'true')
+  await swipe(page, '[data-node-swipe-ignore]', 170, 170, 140, 280, async () => {
+    expect(await pullY()).toBe(0)
+  })
+  expect(listRequests).toBe(beforeRefresh + 1)
+
+  const scrolled = await page.evaluate(() => {
+    const listElement = document.querySelector('[data-testid="mobile-session-list"]') as HTMLElement
+    const spacer = document.createElement('div')
+    spacer.dataset.pullTestSpacer = 'true'
+    spacer.style.height = '1000px'
+    listElement.appendChild(spacer)
+    const documentScroller = document.scrollingElement as HTMLElement
+    const scroller =
+      documentScroller.scrollHeight > documentScroller.clientHeight ? documentScroller : listElement
+    if (scroller === listElement) {
+      listElement.style.height = '300px'
+      listElement.style.overflowY = 'auto'
+    }
+    scroller.scrollTop = 160
+    return scroller.scrollTop
+  })
+  expect(scrolled).toBeGreaterThan(0)
+  await swipe(page, '[data-testid="mobile-session-list"]', 170, 170, 140, 280, async () => {
+    expect(await pullY()).toBe(0)
+    await expect(indicator).toHaveAttribute('aria-hidden', 'true')
+  })
+  expect(listRequests).toBe(beforeRefresh + 1)
+  await page.evaluate(() => {
+    document.scrollingElement!.scrollTop = 0
+    const listElement = document.querySelector('[data-testid="mobile-session-list"]') as HTMLElement
+    listElement.scrollTop = 0
+    listElement.style.height = ''
+    listElement.style.overflowY = ''
+    document.querySelector('[data-pull-test-spacer]')?.remove()
+  })
+
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  holdNextList = true
+  await swipe(page, '[data-testid="mobile-session-list"]', 170, 170, 140, 280, async () => {
+    await page.waitForTimeout(50)
+    expect(await pullY()).toBe(0)
+    await expect(indicator).toContainText('Release to refresh')
+    await expect(indicator).toHaveCSS('opacity', '1')
+  })
+  await expect.poll(() => listRequests).toBe(beforeRefresh + 2)
+  await expect(indicator).toContainText('Refreshing…')
+  await expect(indicator.locator('svg')).not.toHaveClass(/animate-spin/)
+  resumeRefresh?.()
+  await expect(indicator).toHaveAttribute('aria-hidden', 'true')
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
+
+  failNextList = true
+  const beforeFailure = listRequests
+  await swipe(page, '[data-testid="mobile-session-list"]', 170, 170, 140, 280)
+  await expect.poll(() => listRequests).toBe(beforeFailure + 1)
+  const errorDialog = page.getByRole('dialog')
+  await expect(errorDialog).toContainText('network unavailable')
+  await expect(list.getByText('Local session')).toBeVisible()
+  await errorDialog.getByRole('button', { name: 'Close' }).first().click()
+  await expect(indicator).toHaveAttribute('aria-hidden', 'true')
+
+  await swipe(page, '[data-testid="mobile-session-list"]', 250, 215, 240, 247, async () => {
+    await expect.poll(swipeX).toBeLessThan(-8)
+  })
+  await expect(page).toHaveURL('/') // short drags give feedback but do not navigate
+  await expect.poll(swipeX).toBeCloseTo(0, 0)
+  await swipe(page, '[data-testid="mobile-session-list"]', 250, 110, 240, 247, async () => {
+    await expect.poll(swipeX).toBeLessThan(-15)
+    await expect(page).toHaveURL('/') // preview begins before switching nodes
+  })
+  await expect.poll(swipeX).toBeCloseTo(0, 0)
   await expect(page).toHaveURL(/node=worker-a/)
   await expect(list.getByText('worker-a session')).toBeVisible()
-  await swipe(page, '[data-node-swipe-ignore]', 250, 110)
+  await swipe(page, '[data-node-swipe-ignore]', 250, 110, 240, 247, async () => {
+    expect(await swipeX()).toBe(0)
+  })
   await expect(page).toHaveURL(/node=worker-a/)
-  await swipe(page, '[data-testid="mobile-session-list"]', 250, 180, 110, 300)
+  await swipe(page, '[data-testid="mobile-session-list"]', 250, 180, 110, 300, async () => {
+    expect(await swipeX()).toBe(0)
+  })
   await expect(page).toHaveURL(/node=worker-a/)
   await swipe(page, '[data-testid="mobile-session-list"]', 250, 110)
   await expect(page).toHaveURL(/node=worker-b/)
+  await swipe(page, '[data-testid="mobile-session-list"]', 110, 250)
+  await expect(page).toHaveURL(/node=worker-a/)
+
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await swipe(page, '[data-testid="mobile-session-list"]', 250, 110, 240, 247, async () => {
+    await page.waitForTimeout(50)
+    expect(await swipeX()).toBe(0)
+  })
+  await expect(page).toHaveURL(/node=worker-b/)
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
   await swipe(page, '[data-testid="mobile-session-list"]', 110, 250)
   await expect(page).toHaveURL(/node=worker-a/)
 

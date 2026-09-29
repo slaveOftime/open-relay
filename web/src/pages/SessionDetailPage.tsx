@@ -1510,16 +1510,6 @@ function SessionDetailPageContent() {
                     Run Again
                   </DropdownMenuItem>
                 )}
-                {session && (
-                  <DropdownMenuItem
-                    touch
-                    className="text-[hsl(var(--destructive))] focus:text-[hsl(var(--destructive))]"
-                    onClick={() => setShowDeleteConfirm(true)}
-                  >
-                    <TrashIcon className="w-4 h-4" />
-                    Delete
-                  </DropdownMenuItem>
-                )}
                 {(mode === 'attach' || isRunning) && (
                   <>
                     {mode === 'attach' && (
@@ -1537,6 +1527,16 @@ function SessionDetailPageContent() {
                       <DropdownMenuItem touch onClick={() => setConnectTraceOpen(true)}>
                         <TrackNextIcon className="w-4 h-4" />
                         Trace
+                      </DropdownMenuItem>
+                    )}
+                    {session && (
+                      <DropdownMenuItem
+                        touch
+                        className="text-[hsl(var(--destructive))] focus:text-[hsl(var(--destructive))]"
+                        onClick={() => setShowDeleteConfirm(true)}
+                      >
+                        <TrashIcon className="w-4 h-4" />
+                        Delete
                       </DropdownMenuItem>
                     )}
                     {isRunning && (
@@ -1584,7 +1584,7 @@ function SessionDetailPageContent() {
             <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={24} />
               <div
-                className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
+                className={`mt-0.5 space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
                 onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}
               >
                 {session?.title && (

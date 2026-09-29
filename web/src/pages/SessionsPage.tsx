@@ -42,7 +42,7 @@ import {
   type SessionPageEventContext,
   type SessionPageEventHandlers,
 } from './sessions-page-events'
-import { nodeAfterSwipe } from './sessions-node-swipe'
+import { nodeAfterSwipe, pullDragOffset, shouldRefreshOnPull, swipeDragOffset } from './sessions-node-swipe'
 import { NodeSelector } from '@/components/NodeSelector'
 import {
   agentName,
@@ -137,6 +137,8 @@ type LoadErrorState = {
   title: string
   message: string
 }
+
+type LoadOptions = { background?: boolean; reportError?: boolean }
 
 function normalizeStatusFilter(value: unknown): SessionStatusFilter {
   return isSessionStatusFilter(value) ? value : 'all'
@@ -776,6 +778,21 @@ function SessionCard({
       ? 'opacity-60'
       : ''
 
+  const deleteButton = <Tooltip>
+    <TooltipTrigger asChild>
+      <Button
+        variant="kill"
+        size="icon"
+        className="shrink-0"
+        onClick={() => onRequestDelete(session)}
+        aria-label="Delete session"
+      >
+        <TrashIcon className="h-4 w-4" />
+      </Button>
+    </TooltipTrigger>
+    <TooltipContent>Delete session</TooltipContent>
+  </Tooltip>;
+
   function openSession(mode: 'attach' | 'logs') {
     navigate(buildSessionHref(session.id, mode, node))
   }
@@ -809,15 +826,13 @@ function SessionCard({
 
           {/* Row 2: command + title */}
           <div className="z-10" onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
-            <div className={`flex min-w-0 items-center gap-2 ${titleTone}`}>
-              <div className="shrink-0 pt-0.5">
-                <CommandLogo command={session.command} size={36} />
-              </div>
+            <div className={`flex min-w-0 items-center gap-1 ${titleTone}`}>
+              <CommandLogo command={session.command} size={36} />
               <div className="min-w-0 flex-1 line-clamp-5 break-all">
                 {session.title?.trim() && (
-                  <span className="block text-[hsl(var(--primary))]">{session.title.trim()}</span>
+                  <span className="block leading-4 text-[hsl(var(--primary))]">{session.title.trim()}</span>
                 )}
-                <span className="block text-base font-medium">{sessionDisplayName(session)}</span>
+                <span className="block leading-4">{sessionDisplayName(session)}</span>
               </div>
             </div>
           </div>
@@ -857,7 +872,7 @@ function SessionCard({
         {/* Action bar */}
         <CardFooter
           data-node-swipe-ignore
-          className="flex items-center gap-2 px-3.5 py-2 overflow-x-auto"
+          className="flex items-center gap-1 px-2 py-1 overflow-x-auto"
           onClick={(e) => e.stopPropagation()}
         >
           {isRunning && (
@@ -883,14 +898,7 @@ function SessionCard({
                 </TooltipTrigger>
                 <TooltipContent>Stop</TooltipContent>
               </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="kill" size="icon" onClick={() => setPendingAction('kill')}>
-                    <Cross2Icon className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Kill</TooltipContent>
-              </Tooltip>
+              {deleteButton}
               <SessionNotificationButton
                 enabled={session.notifications_enabled}
                 disabled={!isRunning}
@@ -901,6 +909,7 @@ function SessionCard({
             </>
           )}
           <div className="flex-1"></div>
+          {!isRunning && deleteButton}
           <Button asChild variant="ghost" size="icon">
             <Link to={logsHref} aria-label="Logs">
               <FileTextIcon className="h-4 w-4" />
@@ -919,20 +928,6 @@ function SessionCard({
               </Button>
             </TooltipTrigger>
             <TooltipContent>Run Again</TooltipContent>
-          </Tooltip>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="destructive"
-                size="icon"
-                className="h-11 w-11 shrink-0"
-                onClick={() => onRequestDelete(session)}
-                aria-label="Delete session"
-              >
-                <TrashIcon className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Delete session</TooltipContent>
           </Tooltip>
         </CardFooter>
       </Card>
@@ -1033,7 +1028,14 @@ export default function SessionsPage() {
 
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const delayedReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const mobileTouchStartRef = useRef<{ x: number; y: number } | null>(null)
+  const mobileTouchStartRef = useRef<{ x: number; y: number; canPull: boolean } | null>(null)
+  const mobileSwipeContentRef = useRef<HTMLDivElement | null>(null)
+  const mobilePullIndicatorRef = useRef<HTMLDivElement | null>(null)
+  const mobilePullLabelRef = useRef<HTMLSpanElement | null>(null)
+  const mobileSwipeFrameRef = useRef<number | null>(null)
+  const pendingMobileOffsetRef = useRef(0)
+  const pendingPullOffsetRef = useRef(0)
+  const pullRefreshingRef = useRef(false)
   const lastNodeSwipeAtRef = useRef(0)
   const tableResizeRef = useRef<{
     columnKey: SessionTableColumnKey
@@ -1105,7 +1107,7 @@ export default function SessionsPage() {
   }, [])
 
   const loadLocal = useCallback(
-    async (opts?: { background?: boolean }) => {
+    async (opts?: LoadOptions) => {
       if (selectedNode || selectedNodeRef.current !== selectedNode) return
 
       const requestVersion = ++requestVersionRef.current
@@ -1134,7 +1136,7 @@ export default function SessionsPage() {
         applySessionItems(res.items)
         setRemoteTotal(res.total)
       } catch (error) {
-        if (isCurrent() && !opts?.background) {
+        if (isCurrent() && (!opts?.background || opts?.reportError)) {
           setLoadError({
             title: 'Unable to load sessions',
             message: getErrorMessage(error, 'Failed to load local sessions.'),
@@ -1151,7 +1153,7 @@ export default function SessionsPage() {
   )
 
   const loadRemote = useCallback(
-    async (opts?: { background?: boolean }) => {
+    async (opts?: LoadOptions) => {
       if (!selectedNode || selectedNodeRef.current !== selectedNode) return
 
       const requestVersion = ++requestVersionRef.current
@@ -1181,7 +1183,7 @@ export default function SessionsPage() {
         applySessionItems(res.items)
         setRemoteTotal(res.total)
       } catch (error) {
-        if (isCurrent() && !opts?.background) {
+        if (isCurrent() && (!opts?.background || opts?.reportError)) {
           setLoadError({
             title: 'Unable to load sessions',
             message: getErrorMessage(error, 'Failed to load remote sessions.'),
@@ -1198,13 +1200,13 @@ export default function SessionsPage() {
   )
 
   const reloadSessions = useCallback(
-    async (opts?: { background?: boolean }) => {
+    async (opts?: LoadOptions) => {
       void fetchNodes()
         .then((nextNodes) => {
           if (isMounted.current) setNodes(nextNodes)
         })
         .catch((error) => {
-          if (isMounted.current && !opts?.background) {
+          if (isMounted.current && (!opts?.background || opts?.reportError)) {
             setLoadError({
               title: 'Unable to load nodes',
               message: getErrorMessage(error, 'Failed to refresh connected nodes.'),
@@ -1357,6 +1359,7 @@ export default function SessionsPage() {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
       if (delayedReloadTimerRef.current) clearTimeout(delayedReloadTimerRef.current)
+      if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
     }
   }, [])
 
@@ -1476,8 +1479,75 @@ export default function SessionsPage() {
     )
   }
 
+  function drawMobileGesture(animate: boolean) {
+    const content = mobileSwipeContentRef.current
+    if (!content) return
+    const indicator = mobilePullIndicatorRef.current
+    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    const x = reducedMotion ? 0 : pendingMobileOffsetRef.current
+    const y = reducedMotion ? 0 : pendingPullOffsetRef.current
+    const pulling = pendingPullOffsetRef.current > 0
+    const transition =
+      animate && !reducedMotion
+        ? 'transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 180ms ease-out'
+        : 'none'
+    content.style.transition = transition
+    content.style.transform = `translate3d(${x}px, ${y}px, 0)`
+    content.style.opacity = String(1 - Math.abs(x) / 48 * 0.12)
+    if (indicator) {
+      indicator.style.transition = transition
+      const indicatorOpacity =
+        pullRefreshingRef.current || (reducedMotion && pulling) ? 1 : Math.min(1, y / 48)
+      indicator.style.opacity = String(indicatorOpacity)
+      indicator.style.transform = reducedMotion ? 'none' : `translateY(${Math.min(y - 48, 0)}px)`
+      indicator.setAttribute('aria-hidden', !pulling && !pullRefreshingRef.current ? 'true' : 'false')
+      indicator
+        .querySelector('svg')
+        ?.classList.toggle('animate-spin', pullRefreshingRef.current && !reducedMotion)
+    }
+  }
+
+  function resetMobileGesture(animate = true) {
+    if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
+    mobileSwipeFrameRef.current = null
+    pendingMobileOffsetRef.current = 0
+    pendingPullOffsetRef.current = 0
+    drawMobileGesture(animate)
+  }
+
+  function handleMobileTouchMove(event: React.TouchEvent<HTMLDivElement>) {
+    const start = mobileTouchStartRef.current
+    if (!start || event.touches.length !== 1) return
+    const touch = event.touches[0]
+    const deltaX = touch.clientX - start.x
+    const deltaY = touch.clientY - start.y
+    const canSwitch = nodeAfterSwipe(selectedNode, nodes, deltaX < 0 ? -80 : 80, 0) !== undefined
+    const nextX = swipeDragOffset(deltaX, deltaY, canSwitch)
+    const nextY = pullDragOffset(deltaX, deltaY, start.canPull)
+    if (nextX === pendingMobileOffsetRef.current && nextY === pendingPullOffsetRef.current) return
+    const previousX = pendingMobileOffsetRef.current
+    const previousY = pendingPullOffsetRef.current
+    pendingMobileOffsetRef.current = nextX
+    pendingPullOffsetRef.current = nextY
+    if (nextY > 0 && mobilePullLabelRef.current) {
+      mobilePullLabelRef.current.textContent = shouldRefreshOnPull(deltaX, deltaY, start.canPull)
+        ? 'Release to refresh'
+        : 'Pull to refresh'
+    }
+    if (nextX === 0 && nextY === 0 && (previousX !== 0 || previousY !== 0)) {
+      resetMobileGesture()
+      return
+    }
+    if (mobileSwipeFrameRef.current !== null) return
+    mobileSwipeFrameRef.current = requestAnimationFrame(() => {
+      mobileSwipeFrameRef.current = null
+      drawMobileGesture(false)
+    })
+  }
   function handleMobileTouchStart(event: React.TouchEvent<HTMLDivElement>) {
     mobileTouchStartRef.current = null
+    if (pullRefreshingRef.current) return
+    resetMobileGesture(false)
     lastNodeSwipeAtRef.current = 0
     if (event.touches.length !== 1) return
     const target = event.target
@@ -1486,20 +1556,47 @@ export default function SessionsPage() {
       target instanceof Element &&
       target.closest('[data-node-swipe-ignore], button, a, input, textarea, select, [role="button"]')
     if (x < 24 || x > window.innerWidth - 24 || interactive) return
-    mobileTouchStartRef.current = { x, y: event.touches[0].clientY }
+    const canPull =
+      !loading &&
+      !refreshing &&
+      event.currentTarget.scrollTop <= 0 &&
+      (document.scrollingElement?.scrollTop ?? window.scrollY) <= 0
+    mobileTouchStartRef.current = { x, y: event.touches[0].clientY, canPull }
   }
 
   function handleMobileTouchEnd(event: React.TouchEvent<HTMLDivElement>) {
     const start = mobileTouchStartRef.current
     mobileTouchStartRef.current = null
-    if (!start || event.changedTouches.length !== 1) return
+    if (!start || event.changedTouches.length !== 1) {
+      if (!pullRefreshingRef.current) resetMobileGesture()
+      return
+    }
     const touch = event.changedTouches[0]
-    const next = nodeAfterSwipe(
-      selectedNode,
-      nodes,
-      touch.clientX - start.x,
-      touch.clientY - start.y
-    )
+    const deltaX = touch.clientX - start.x
+    const deltaY = touch.clientY - start.y
+    if (shouldRefreshOnPull(deltaX, deltaY, start.canPull) && !loading && !refreshing) {
+      if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
+      mobileSwipeFrameRef.current = null
+      pendingMobileOffsetRef.current = 0
+      pendingPullOffsetRef.current = 56
+      pullRefreshingRef.current = true
+      if (mobilePullLabelRef.current) mobilePullLabelRef.current.textContent = 'Refreshing…'
+      drawMobileGesture(true)
+      lastNodeSwipeAtRef.current = Date.now()
+      void reloadSessions({ background: true, reportError: true }).finally(() => {
+        pullRefreshingRef.current = false
+        resetMobileGesture()
+        if (mobilePullLabelRef.current) mobilePullLabelRef.current.textContent = 'Pull to refresh'
+      })
+      return
+    }
+    const wasPulling = pendingPullOffsetRef.current > 0
+    resetMobileGesture()
+    if (wasPulling) {
+      lastNodeSwipeAtRef.current = Date.now() // don't open a card on a canceled pull
+      return
+    }
+    const next = nodeAfterSwipe(selectedNode, nodes, deltaX, deltaY)
     if (next === undefined) return
     lastNodeSwipeAtRef.current = Date.now()
     handleNodeChange(next)
@@ -1982,15 +2079,17 @@ export default function SessionsPage() {
 
         {/* ── Mobile list ── */}
         <div
-          className="flex-1 md:hidden"
+          className="flex-1 overflow-x-clip md:hidden"
           data-testid="mobile-session-list"
           onPointerDownCapture={(event) => {
             if (event.pointerType !== 'touch') lastNodeSwipeAtRef.current = 0
           }}
           onTouchStart={handleMobileTouchStart}
+          onTouchMove={handleMobileTouchMove}
           onTouchEnd={handleMobileTouchEnd}
           onTouchCancel={() => {
             mobileTouchStartRef.current = null
+            if (!pullRefreshingRef.current) resetMobileGesture()
           }}
           onClickCapture={(event) => {
             if (lastNodeSwipeAtRef.current && Date.now() - lastNodeSwipeAtRef.current < 350) {
@@ -2000,48 +2099,60 @@ export default function SessionsPage() {
             }
           }}
         >
-          {nodes.length > 0 && (
-            <p className="px-4 py-1 text-center text-[11px] text-[hsl(var(--muted-foreground))]">
-              Swipe left or right to switch nodes
-            </p>
-          )}
-          {loading &&
-            sessions.length === 0 &&
-            Array.from({ length: 5 }).map((_, i) => <SkeletonCard key={i} />)}
-          {!loading && sessions.length === 0 && (
-            <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
-          )}
-          {!loading && sessions.length > 0 && (
-            <div className="pb-4">
-              {grouped.map(({ key, items }) => (
-                <div key={key || '__flat__'}>
-                  {groupBy !== 'none' && key && (
-                    <div className="flex flex-nowrap gap-1 items-center px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
-                      <CaretDownIcon className='h-4 w-4 shrink-0' /> 
-                      <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
+          <div className="relative">
+            <div
+              ref={mobilePullIndicatorRef}
+              data-testid="mobile-pull-indicator"
+              role="status"
+              aria-live="polite"
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 top-0 z-10 flex h-12 items-center justify-center gap-2 text-xs font-medium text-[hsl(var(--muted-foreground))] opacity-0"
+            >
+              <span className="inline-flex items-center gap-2 rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 px-3 py-1.5 shadow-sm">
+                <ReloadIcon className="h-4 w-4" />
+                <span ref={mobilePullLabelRef}>Pull to refresh</span>
+              </span>
+            </div>
+            <div ref={mobileSwipeContentRef} data-testid="mobile-session-content">
+              {loading &&
+                sessions.length === 0 &&
+                Array.from({ length: 5 }).map((_, i) => <SkeletonCard key={i} />)}
+              {!loading && sessions.length === 0 && (
+                <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
+              )}
+              {!loading && sessions.length > 0 && (
+                <div className="pb-4">
+                  {grouped.map(({ key, items }) => (
+                    <div key={key || '__flat__'}>
+                      {groupBy !== 'none' && key && (
+                        <div className="flex flex-nowrap gap-1 items-center px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
+                          <CaretDownIcon className='h-4 w-4 shrink-0' />
+                          <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
+                        </div>
+                      )}
+                      {items.map((s) => (
+                        <SessionCard
+                          key={s.id}
+                          session={s}
+                          animateIn={enteringIds.has(s.id)}
+                          pinned={isSessionPinned(s)}
+                          onStop={handleStop}
+                          onKill={handleKill}
+                          onToggleNotifications={handleToggleNotifications}
+                          onTogglePin={handleTogglePin}
+                          onRunAgain={handleRunAgain}
+                          onEditSession={handleEditSession}
+                          onRequestDelete={setDeletingSession}
+                          notificationsPending={notificationRequestIds.has(s.id)}
+                          node={selectedNode ?? undefined}
+                        />
+                      ))}
                     </div>
-                  )}
-                  {items.map((s) => (
-                    <SessionCard
-                      key={s.id}
-                      session={s}
-                      animateIn={enteringIds.has(s.id)}
-                      pinned={isSessionPinned(s)}
-                      onStop={handleStop}
-                      onKill={handleKill}
-                      onToggleNotifications={handleToggleNotifications}
-                      onTogglePin={handleTogglePin}
-                      onRunAgain={handleRunAgain}
-                      onEditSession={handleEditSession}
-                      onRequestDelete={setDeletingSession}
-                      notificationsPending={notificationRequestIds.has(s.id)}
-                      node={selectedNode ?? undefined}
-                    />
                   ))}
                 </div>
-              ))}
+              )}
             </div>
-          )}
+          </div>
         </div>
 
         {/* ── Desktop table ── */}
