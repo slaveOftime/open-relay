@@ -8,13 +8,23 @@ export type NewSessionInitialValues = {
   tags: string
   cwd: string
   notifications_enabled: boolean
+  /** Best-effort resume command advertised by the source session, if any. */
+  resumeCommand: string | null
   sourceSession: { id: string; node: string | null }
 }
 
 export function buildNewSessionInitialValues(
   session: Pick<
     SessionSummary,
-    'id' | 'node' | 'command' | 'args' | 'title' | 'tags' | 'cwd' | 'notifications_enabled'
+    | 'id'
+    | 'node'
+    | 'command'
+    | 'args'
+    | 'title'
+    | 'tags'
+    | 'cwd'
+    | 'notifications_enabled'
+    | 'resume_command'
   >
 ): NewSessionInitialValues {
   return {
@@ -26,6 +36,7 @@ export function buildNewSessionInitialValues(
     tags: formatSessionTagInput(session.tags),
     cwd: session.cwd ?? '',
     notifications_enabled: session.notifications_enabled,
+    resumeCommand: session.resume_command?.trim() || null,
     sourceSession: { id: session.id, node: session.node ?? null },
   }
 }

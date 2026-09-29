@@ -12,6 +12,11 @@ import { FormActions, FormError, FormField } from '@/components/ui/form-field'
 import NotificationToggle from '@/components/NotificationToggle'
 import type { NewSessionInitialValues } from './new-session-dialog-values'
 
+function splitResumeCommand(command: string): { cmd: string; args: string } {
+  const match = command.match(/^(\S+)(?:\s+([\s\S]*))?$/)
+  return { cmd: match?.[1] ?? command, args: (match?.[2] ?? '').trim() }
+}
+
 export default function NewSessionDialog({
   open,
   onClose,
@@ -36,8 +41,11 @@ export default function NewSessionDialog({
   const [creationUncertain, setCreationUncertain] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [resumeApplied, setResumeApplied] = useState(false)
+  const resumeRestoreRef = useRef<{ cmd: string; args: string } | null>(null)
   const wasOpenRef = useRef(false)
   const submitPendingRef = useRef(false)
+  const resumeCommand = initialValues?.resumeCommand ?? null
   const sameSessionAsSource =
     startedSessionId !== null &&
     startedSessionId === initialValues?.sourceSession.id &&
@@ -58,6 +66,8 @@ export default function NewSessionDialog({
     setCreationUncertain(false)
     setLoading(false)
     submitPendingRef.current = false
+    setResumeApplied(false)
+    resumeRestoreRef.current = null
     setError(null)
   }, [initialValues, open])
 
@@ -117,6 +127,25 @@ export default function NewSessionDialog({
     }
   }
 
+  function handleToggleResumeCommand() {
+    if (!resumeCommand) return
+    if (resumeApplied) {
+      const previous = resumeRestoreRef.current
+      if (previous) {
+        setCmd(previous.cmd)
+        setArgs(previous.args)
+      }
+      resumeRestoreRef.current = null
+      setResumeApplied(false)
+      return
+    }
+    resumeRestoreRef.current = { cmd, args }
+    const parsed = splitResumeCommand(resumeCommand)
+    setCmd(parsed.cmd)
+    setArgs(parsed.args)
+    setResumeApplied(true)
+  }
+
   function resetForm() {
     setCmd('')
     setArgs('')
@@ -127,6 +156,8 @@ export default function NewSessionDialog({
     setRemoveOriginal(false)
     setStartedSessionId(null)
     setCreationUncertain(false)
+    setResumeApplied(false)
+    resumeRestoreRef.current = null
     setError(null)
   }
 
@@ -177,6 +208,26 @@ export default function NewSessionDialog({
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
+          {resumeCommand ? (
+            <div className="flex items-center justify-between gap-3 rounded-md border border-dashed border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 px-3 py-2">
+              <span
+                className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]"
+                title={resumeCommand}
+              >
+                resume: {resumeCommand}
+              </span>
+              <Button
+                type="button"
+                variant={resumeApplied ? 'secondary' : 'outline'}
+                size="sm"
+                className="shrink-0"
+                onClick={handleToggleResumeCommand}
+                disabled={loading || startedSessionId !== null || creationUncertain}
+              >
+                {resumeApplied ? 'Revert to original' : 'Use resume command'}
+              </Button>
+            </div>
+          ) : null}
           <FormField name="title" label="Title">
             <Input
               value={title}
