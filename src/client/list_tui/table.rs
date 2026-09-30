@@ -152,14 +152,11 @@ pub fn session_row(
     } else {
         Color::DarkGray
     };
-    let status_text = status_label(&session.status, session.input_needed);
-    // The session id sits immediately to the left of the status text so
-    // the eye can correlate the human-friendly status word with the
-    // daemon-reported id (the column previously used solely for the id).
-    let mut status_with_id = String::with_capacity(session.id.len() + status_text.len() + 1);
-    status_with_id.push_str(&session.id);
-    status_with_id.push(' ');
-    status_with_id.push_str(status_text);
+    // The status text was retired: the icon plus its semantic colour is
+    // both the visual signal and the colour signal, so the human-readable
+    // status word is no longer needed. Only the session id is shown in
+    // this cell so the eye can pair an icon with the daemon-reported id.
+    let status_with_id = session.id.clone();
     let name = session
         .title
         .clone()

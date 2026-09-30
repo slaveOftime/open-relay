@@ -163,13 +163,17 @@ fn session_row_keeps_attention_status_more_noticeable_than_session_colours() {
 
     let buffer = render_session_row(&item);
 
-    // Attention glyph stays yellow with its dedicated emphasis...
+    // The attention glyph keeps the dedicated attention yellow even
+    // when the session's own terminal colours announce a louder
+    // foreground; the human-readable status word has been retired,
+    // so the icon alone carries the attention signal.
     let glyph = &buffer[(0, 0)];
     assert_eq!(glyph.symbol(), "◆");
     assert_eq!(glyph.fg, ratatui::style::Color::Yellow);
-    // ...and the status label too.
-    let label_x = find_text(&buffer, "attention").expect("status label rendered");
-    assert_eq!(buffer[(label_x, 0)].fg, ratatui::style::Color::Yellow);
+    assert!(
+        find_text(&buffer, "attention").is_none(),
+        "status word `attention` must no longer be rendered"
+    );
 }
 
 #[test]
@@ -252,17 +256,16 @@ fn selected_row_keeps_status_colours_and_brightens_decorative_cells() {
 
     // The attention glyph keeps its yellow on the selection band — the
     // highlight must never hide semantic status colours. The session id
-    // ("waiting") and the status label ("attention") are rendered in the
-    // same coloured cell, immediately adjacent: "<id> <status>".
+    // sits in the same coloured cell, also wearing the status YELLOW
+    // so the icon and the id are visually anchored to each other.
     let glyph = &buffer[(0, 0)];
     assert_eq!(glyph.symbol(), "◆");
     assert_eq!(glyph.fg, ratatui::style::Color::Yellow);
     assert_eq!(glyph.bg, super::SELECTED_ROW_BG);
-    let label_x =
-        find_text(&buffer, "waiting attention").expect("id rendered immediately before status");
-    let label = &buffer[(label_x, 0)];
-    assert_eq!(label.fg, ratatui::style::Color::Yellow);
-    assert_eq!(label.bg, super::SELECTED_ROW_BG);
+    let id_x = find_text(&buffer, "waiting").expect("id rendered beside the glyph");
+    let id_cell = &buffer[(id_x, 0)];
+    assert_eq!(id_cell.fg, ratatui::style::Color::Yellow);
+    assert_eq!(id_cell.bg, super::SELECTED_ROW_BG);
 
     // The session name is bright white on the selection band (its own
     // session colours yield to the selection).
@@ -281,6 +284,8 @@ fn selected_row_keeps_failure_status_red() {
 
     let buffer = render_session_row_selected(&item, true);
 
+    // The failure glyph and the session id share the error-pulse red so
+    // the eye still pairs an icon with an identifying id.
     let glyph = &buffer[(0, 0)];
     assert_eq!(glyph.symbol(), "×");
     // Inactive statuses stay muted, but must remain readable on the
@@ -1573,13 +1578,12 @@ fn tree_session_uses_fixed_status_width_and_normal_sparkline() {
     let mut rate = super::RateState::new(&item, now);
     rate.history.extend([4.0, 8.0, 2.0]);
     let line = super::session_line(&item, Some(&rate), "├── ", false, now);
-    // The id precedes the status label inside spans[3]: "live <running>",
-    // padded to id.len() + 1 + TREE_STATUS_WIDTH columns.
-    let expected = item.id.len() + 1 + super::TREE_STATUS_WIDTH;
+    // The status text was retired: spans[3] now carries the padded id
+    // alone, occupying TREE_STATUS_WIDTH columns so rows still line up.
     assert_eq!(
         line.spans[3].content.len(),
-        expected,
-        "id + status should keep the fixed-status width cell aligned: {:?}",
+        super::TREE_STATUS_WIDTH,
+        "id cell should keep the fixed status-width column: {:?}",
         line.spans[3].content
     );
     assert!(line.spans[3].content.starts_with(&item.id));
@@ -1590,21 +1594,20 @@ fn tree_session_uses_fixed_status_width_and_normal_sparkline() {
     assert!(!line.spans.iter().any(|span| span.content.contains("/work")));
     item.input_needed = true;
     let attention = super::session_line(&item, Some(&rate), "├── ", true, now);
-    assert_eq!(
-        attention.spans[3].content.len(),
-        item.id.len() + 1 + super::TREE_STATUS_WIDTH
-    );
+    assert_eq!(attention.spans[3].content.len(), super::TREE_STATUS_WIDTH);
     assert_eq!(
         attention.spans[3].style.fg,
         Some(ratatui::style::Color::Yellow)
     );
 }
 #[test]
-fn tree_render_shows_status_word_with_matching_color() {
+fn tree_render_icon_and_session_id_share_foreground_color() {
     // Regression: the tree view used to skip the status text entirely,
-    // so users could only guess at session state from the icon. Worse,
-    // when the status text DID appear, it picked an independent colour
-    // from the icon, so the colour and the label could disagree.
+    // then added a status label that picked an independent colour from
+    // the icon. The status text has now been retired in favour of the
+    // icon + its semantic colour; the session id anchored next to the
+    // icon must still wear the same foreground colour so the icon
+    // stays visually tied to its identifier.
     let mut app = App::default();
     let mut s = session_at("only", Some("/a"));
     s.command = "test".into();
@@ -1614,24 +1617,9 @@ fn tree_render_shows_status_word_with_matching_color() {
     expand_all_tree_folders(&mut app);
     let buffer = render_app_buffer(&mut app, 120, 6);
     let symbols = buffer_symbols(&buffer, 4);
-    // The status label "running" must appear on the same line as the
-    // session command.
-    let row_hit = symbols
-        .iter()
-        .any(|line| line.contains("running") && line.contains("test"));
-    assert!(
-        row_hit,
-        "tree row must contain both the status label and the command. Got: {symbols:?}"
-    );
-    // Status colour and label must come from the same display cell:
-    // glyph at the icon column and the word "running" must share the
-    // same foreground colour when the session is active.
     let cell_at = |row: u16, col: u16| -> ratatui::style::Color {
         buffer.cell((col, row)).map(|c| c.fg).unwrap_or_default()
     };
-    // Find the row containing the session and the icon column (the
-    // first non-space glyph). Use a rough heuristic: the first row
-    // containing "test" is our session row.
     let (session_row, _) = symbols
         .iter()
         .enumerate()
@@ -1641,32 +1629,25 @@ fn tree_render_shows_status_word_with_matching_color() {
         .find(|&x| buffer[(x, session_row as u16)].symbol() == "●")
         .expect("running glyph");
     let icon_color = cell_at(session_row as u16, icon_x);
-    // The session id is rendered immediately to the left of the status
-    // label, both wearing the same foreground as the icon.
+    // The id cell lives one space-gap after the icon: both share the
+    // running-glyph green so the user can pair an icon with an id.
     let id_x = icon_x + 2;
     let id_color = cell_at(session_row as u16, id_x);
-    let status_x = id_x + "only".len() as u16 + 1;
-    let word_color = cell_at(session_row as u16, status_x);
     assert_eq!(
         icon_color, id_color,
-        "icon and session id must share foreground color"
+        "icon and session id must share foreground color: row text={:?}",
+        symbols[session_row]
     );
-    assert_eq!(
-        icon_color, word_color,
-        "icon and status word must share foreground color"
-    );
-    // The id and the status word must be adjacent: there should be no
-    // intermediate cell whose foreground colour disagrees with the
-    // shared semantic palette between the id and the status label.
-    assert_eq!(
-        cell_at(session_row as u16, status_x - 1),
-        icon_color,
-        "the separator between id and status must inherit the status colour"
+    // The status text has been retired: no "running" word should appear
+    // in any rendered row.
+    assert!(
+        symbols.iter().all(|line| !line.contains("running")),
+        "no row should render the status word `running`: {symbols:?}"
     );
 }
 
 #[test]
-fn tree_renders_session_id_immediately_before_status_word() {
+fn tree_renders_session_id_immediately_after_icon() {
     let mut app = App::default();
     let mut s = session_at("ident42", Some("/proj"));
     s.command = "ls".into();
@@ -1679,12 +1660,16 @@ fn tree_renders_session_id_immediately_before_status_word() {
         .lines()
         .find(|line| line.contains("ls"))
         .expect("tree row present");
+    let icon_pos = row.find("●").expect("running glyph");
     let ident_pos = row.find("ident42").expect("id rendered");
-    let status_pos = row.find("running").expect("status rendered");
-    assert_eq!(
-        ident_pos + "ident42".len() + 1,
-        status_pos,
-        "id and status must be adjacent: {row:?}"
+    let sep = &row[icon_pos + "●".len()..ident_pos];
+    assert!(
+        sep.chars().all(|c| c == ' '),
+        "id should be one space away from the icon: {row:?}"
+    );
+    assert!(
+        !row.contains("running"),
+        "status text `running` must not be rendered anymore: {row:?}"
     );
 }
 
