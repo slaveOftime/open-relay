@@ -157,11 +157,12 @@ export function moveQuickKey(keys: QuickKey[], from: number, to: number): QuickK
 
 /**
  * Radial layout math. Keys fan over a half circle on the free side of the
- * pad (screen-bottom around the left to screen-top; the pad hugs the right
- * edge so the right quarter stays empty). The customize button reserves the
- * bottom slot of the inner ring, keys are placed counter-clockwise starting
- * next to it, and any keys that no longer fit at a tappable spacing spill
- * onto further concentric rings.
+ * pad: starting at the bottom and marching clockwise (bottom -> left ->
+ * top of the on-screen arc); the pad hugs the right edge so the right
+ * quarter stays empty. The customize button reserves the bottom slot of
+ * the inner ring, keys are start-aligned next to it at a fixed even step
+ * (they do NOT stretch to fill the arc), and keys that run past the arc
+ * spill onto further concentric rings.
  */
 export const BASE_RING_RADIUS_PX = 72
 export const RING_GAP_PX = 60
@@ -186,19 +187,15 @@ export function layoutRing(keysCount: number, maxRadius: number): RingLayout {
     const naturalRadius = BASE_RING_RADIUS_PX + ring * RING_GAP_PX
     const atLimit = naturalRadius >= maxRadius
     const radius = Math.min(naturalRadius, Math.max(maxRadius, BASE_RING_RADIUS_PX))
-    // Even angular spacing keeps centers at least RING_MIN_SPACING_PX apart.
-    const capacity = Math.max(Math.floor((Math.PI * radius) / RING_MIN_SPACING_PX), 1) + (ring === 0 ? 0 : 1)
+    // Fixed even angular step; slots fill from the arc start (bottom).
+    const step = RING_MIN_SPACING_PX / radius
+    // The half circle fits floor(pi / step) steps; the inner ring's slot 0
+    // belongs to the customize button.
+    const capacity = Math.max(Math.floor(Math.PI / step), 1) + (ring === 0 ? 0 : 1)
     const remaining = keysCount - start
     const count = atLimit || remaining <= capacity ? remaining : capacity
     for (let local = 0; local < count; local += 1) {
-      // Inner ring: slot 0 belongs to customize, keys take slots 1..count
-      // so the arc still ends at the top. Outer rings span bottom..top.
-      const angle =
-        ring === 0
-          ? Math.PI / 2 + ((local + 1) / count) * Math.PI
-          : count === 1
-            ? Math.PI / 2
-            : Math.PI / 2 + (local / (count - 1)) * Math.PI
+      const angle = Math.PI / 2 + (local + (ring === 0 ? 1 : 0)) * step
       positions[start + local] = { dx: Math.cos(angle) * radius, dy: Math.sin(angle) * radius }
     }
     if (ring === 0) customize = { dx: 0, dy: radius }

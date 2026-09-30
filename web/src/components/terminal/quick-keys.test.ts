@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   BASE_RING_RADIUS_PX,
   DEFAULT_QUICK_KEYS,
+  RING_MIN_SPACING_PX,
   describeData,
   encodeCombo,
   formatCombo,
@@ -97,13 +98,19 @@ describe('layoutRing', () => {
   it('reserves the bottom slot for customize and starts keys next to it', () => {
     const layout = layoutRing(4, 400)
     expect(layout.customize).toEqual({ dx: 0, dy: BASE_RING_RADIUS_PX })
-    // First key sits counter-clockwise from customize: lower-left quadrant.
-    expect(layout.positions[0].dx).toBeLessThan(0)
-    expect(layout.positions[0].dy).toBeGreaterThan(0)
-    // Last key reaches the top of the arc.
+    // Keys are start-aligned: they march clockwise (bottom -> left -> top)
+    // from the customize slot at a fixed even step and do NOT stretch to
+    // fill the half circle.
+    const step = RING_MIN_SPACING_PX / BASE_RING_RADIUS_PX
+    for (let i = 0; i < 4; i += 1) {
+      const angle = Math.PI / 2 + (i + 1) * step
+      expect(layout.positions[i].dx).toBeCloseTo(Math.cos(angle) * BASE_RING_RADIUS_PX, 6)
+      expect(layout.positions[i].dy).toBeCloseTo(Math.sin(angle) * BASE_RING_RADIUS_PX, 6)
+    }
+    // With only 4 keys the arc ends well short of the top.
     const last = layout.positions[3]
-    expect(last.dy).toBeCloseTo(-BASE_RING_RADIUS_PX, 3)
-    expect(Math.abs(last.dx)).toBeLessThan(1e-12)
+    expect(Math.hypot(last.dx, last.dy)).toBeCloseTo(BASE_RING_RADIUS_PX, 3)
+    expect(Math.atan2(last.dy, last.dx)).toBeLessThan(Math.PI * 1.5 - 0.1)
   })
 
   it('spills onto a second ring when keys do not fit the first', () => {
