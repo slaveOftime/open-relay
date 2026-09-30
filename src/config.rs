@@ -65,40 +65,12 @@ pub struct ResumePattern {
     pub command: String,
 }
 
-/// Defaults live here so operators can replace them with `resume_patterns`
-/// or append to them with `additional_resume_patterns` in config.json.
-/// For example, to keep codex/pi and add another agent:
-///
-/// ```json
-/// {
-///   "additional_resume_patterns": [{
-///     "program": "agent",
-///     "pattern": "agent --resume ([a-z0-9-]+)",
-///     "command": "agent --restore $1"
-///   }]
-/// }
-/// ```
-///
-/// Set `"resume_patterns": []` to disable built-in detection, or supply an
-/// array of rules to replace it. The last matching hint in the tail wins.
-pub fn default_resume_patterns() -> Vec<ResumePattern> {
-    vec![
-        ResumePattern {
-            program: "codex".into(),
-            pattern: r"(?i)(?:^|[^a-z0-9_])codex(?:\.exe)?[ \t]+resume[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[^a-z0-9-])".into(),
-            command: "codex resume $1".into(),
-        },
-        ResumePattern {
-            program: "pi".into(),
-            pattern: r#"(?i)(?:^|[^a-z0-9_])pi(?:\.exe)?[ \t]+--session[ \t]+("[a-z0-9_./:\\~ -]{1,1024}"|'[a-z0-9_./:\\~ -]{1,1024}'|[a-z0-9_./:\\~-]{1,1024})"#.into(),
-            command: "pi --session $1".into(),
-        },
-    ]
-}
-
 /// Configured rules for deriving a resume hint. The detected text is a
-/// suggestion only; the daemon must never execute it automatically.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// suggestion only; the daemon must never execute it automatically. The
+/// rules come exclusively from the `resume_patterns` key in `config.json`;
+/// there are no built-in defaults, so an absent or empty list disables
+/// resume detection entirely.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResumeConfig {
     pub patterns: Vec<ResumePattern>,
 }
@@ -331,10 +303,8 @@ struct NotifyOverrides {
 
 #[derive(Debug, Default, Deserialize)]
 struct ResumeOverrides {
-    /// Replace the defaults (an empty array disables detection).
+    /// The complete rule list. Absent or empty disables detection.
     resume_patterns: Option<Vec<ResumePattern>>,
-    /// Append to the chosen base patterns (defaults unless replaced).
-    additional_resume_patterns: Option<Vec<ResumePattern>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -385,16 +355,7 @@ impl AppConfig {
 
     /// Build a fully-resolved config from parsed `config.json` overrides.
     fn resolve(state_dir: PathBuf, overrides: AppConfigOverrides) -> Self {
-        let mut resume_patterns = overrides
-            .resume
-            .resume_patterns
-            .unwrap_or_else(default_resume_patterns);
-        resume_patterns.extend(
-            overrides
-                .resume
-                .additional_resume_patterns
-                .unwrap_or_default(),
-        );
+        let resume_patterns = overrides.resume.resume_patterns.unwrap_or_default();
         let paths = PathsConfig {
             state_dir: state_dir.clone(),
             sessions_dir: state_dir.join("sessions"),
@@ -761,9 +722,7 @@ mod tests {
                 vapid_private_key: None,
                 proxy: Some("http://config-proxy:8080".to_string()),
             },
-            resume: crate::config::ResumeConfig {
-                patterns: crate::config::default_resume_patterns(),
-            },
+            resume: crate::config::ResumeConfig::default(),
             log_level: "info".to_string(),
             runtime_overrides: Default::default(),
         }
@@ -836,30 +795,22 @@ mod tests {
     }
 
     #[test]
-    fn resume_patterns_can_replace_append_or_disable_defaults() {
+    fn resume_patterns_are_the_only_source_and_can_be_disabled() {
         let custom = r#"{"program":"agent","pattern":"agent --resume ([a-z0-9-]+)","command":"agent --restore $1"}"#;
         let state_dir = PathBuf::from("test-state");
-        let defaults = AppConfig::resolve(state_dir.clone(), Default::default());
-        assert_eq!(defaults.resume.patterns.len(), 2);
 
-        let appended: super::AppConfigOverrides =
-            serde_json::from_str(&format!(r#"{{"additional_resume_patterns":[{custom}]}}"#))
-                .expect("parse appended matcher");
-        let with_extra = AppConfig::resolve(state_dir.clone(), appended);
-        assert_eq!(with_extra.resume.patterns.len(), 3);
-        assert_eq!(with_extra.resume.patterns[2].program, "agent");
-        assert_eq!(defaults.hot_reload_changes(&with_extra), vec!["patterns"]);
+        // Absent key: detection is disabled; there are no built-in rules.
+        let unset = AppConfig::resolve(state_dir.clone(), Default::default());
+        assert!(unset.resume.patterns.is_empty());
 
-        let replaced: super::AppConfigOverrides =
+        let configured: super::AppConfigOverrides =
             serde_json::from_str(&format!(r#"{{"resume_patterns":[{custom}]}}"#))
-                .expect("parse replacement matcher");
-        assert_eq!(
-            AppConfig::resolve(state_dir.clone(), replaced)
-                .resume
-                .patterns
-                .len(),
-            1
-        );
+                .expect("parse matcher");
+        let configured = AppConfig::resolve(state_dir.clone(), configured);
+        assert_eq!(configured.resume.patterns.len(), 1);
+        assert_eq!(configured.resume.patterns[0].program, "agent");
+        assert_eq!(unset.hot_reload_changes(&configured), vec!["patterns"]);
+
         let disabled: super::AppConfigOverrides =
             serde_json::from_str(r#"{"resume_patterns":[]}"#).expect("parse empty matchers");
         assert!(
@@ -876,7 +827,7 @@ mod tests {
             std::env::temp_dir().join(format!("oly_config_resume_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let config_path = state_dir.join("config.json");
-        std::fs::write(&config_path, r#"{"additional_resume_patterns":[{"program":"agent","pattern":"(","command":"agent $1"}]}"#)
+        std::fs::write(&config_path, r#"{"resume_patterns":[{"program":"agent","pattern":"(","command":"agent $1"}]}"#)
             .expect("write config");
         let mut config = test_config();
         config.paths.state_dir = state_dir.clone();

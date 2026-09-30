@@ -30,7 +30,7 @@ use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, trace, warn};
 
 use crate::{
-    config::{ResumePattern, default_resume_patterns},
+    config::ResumePattern,
     db::Database,
     session::SessionEventTx,
 };
@@ -149,7 +149,7 @@ impl SessionStore {
             journal_byte_cap: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 journal_byte_cap,
             )),
-            resume_patterns: ArcSwap::from_pointee(default_resume_patterns()),
+            resume_patterns: ArcSwap::from_pointee(Vec::new()),
             db,
             event_tx,
         }

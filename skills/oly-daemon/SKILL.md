@@ -60,8 +60,7 @@ Always look at both diffs when you change something — `restart_required_change
 | `notification_min_interval_seconds` | Hot reload. The notify monitor reseeds its debounce window. Default: `10` (`1` after clamp). |
 | `notification_hook` | Hot reload. Triggered a notification-pipeline rebuild the next time `notify` matches a session prompt. `null`/empty disables. |
 | `prompt_patterns` | Hot reload. Live-read by the prompt-detection sweep on every tick. |
-| `resume_patterns` | Hot reload. Replaces built-in Codex/Pi resume rules; `[]` disables them unless additional rules are supplied. Applies to future scans, not previously scanned sessions. |
-| `additional_resume_patterns` | Hot reload. Appends rules to the built-ins (or to `resume_patterns` when specified). Applies to future scans. |
+| `resume_patterns` | Hot reload. The complete list of session-resume detection rules. Absent or `[]` disables detection — there are no built-in rules. Applies to future scans, not previously scanned sessions. |
 | `web_push_subject` | Hot reload. Triggers a notification-pipeline rebuild. |
 | `web_push_vapid_public_key` | Hot reload. Triggers a notification-pipeline rebuild. |
 | `web_push_vapid_private_key` | Hot reload. Triggers a notification-pipeline rebuild. |
@@ -199,29 +198,38 @@ To add a fourth example of your own without keeping the whole list, just write t
 
 After saving, run `oly logs <ID>` on a session you know is waiting at a prompt and confirm the daemon log line for that PID switches from waiting/idle to the prompt-detected pathway. If it does not, your pattern is too narrow or your shell is overwriting the prompt before the journal sees it.
 
-## Session resume hints (`resume_patterns` and `additional_resume_patterns`)
+## Session resume hints (`resume_patterns`)
 
 Resume patterns are **not** `prompt_patterns`: they inspect the *rendered journal tail* after a child process has completed, PTY output has closed, and the journal is durable. The daemon stores the most recent matching suggestion as `resume_command` in SQLite session metadata; it is also returned in session summaries and `oly ls --json`. It is a hint for a future resume workflow, **not a command the daemon executes**. Existing sessions whose tails have already been scanned are not rescanned when configuration changes.
+
+`resume_patterns` is the single source of truth: **there are no built-in rules**. An absent or empty `resume_patterns` key simply disables resume detection; to detect a tool's resume hint you add an explicit rule.
 
 Each rule has three required strings:
 
 - `program`: the actual session child executable's basename, case-insensitive; `.exe`, `.cmd` and `.bat` suffixes are ignored. A session launched as `bash` or a wrapper such as `npx` does not match a rule for the tool inside it.
 - `pattern`: a Rust `regex` against the rendered tail, with **at least one capture group** for the session identifier or path. Escape regex backslashes twice in JSON (`\\s`, `\\.`).
-- `command`: the saved suggestion template. `$1`, `$2`, etc. expand from capture groups; for example, `agent --restore $1`.
+- `command`: the saved suggestion template. `$1`, `$2`, etc. expand from capture groups.
 
-Absent keys retain the built-in Codex (`codex resume <UUID>`) and Pi (`pi --session <path>`) rules from `src/config.rs`. To **add** a tool without copying defaults, set `additional_resume_patterns`:
+Example rules for Codex and Pi (the shapes their CLIs print on exit):
 
 ```json
 {
-  "additional_resume_patterns": [{
-    "program": "agent",
-    "pattern": "agent --resume ([a-z0-9-]+)",
-    "command": "agent --restore $1"
-  }]
+  "resume_patterns": [
+    {
+      "program": "codex",
+      "pattern": "(?i)(?:^|[^a-z0-9_])codex(?:\\.exe)?[ \\t]+resume[ \\t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[^a-z0-9-])",
+      "command": "codex resume $1"
+    },
+    {
+      "program": "pi",
+      "pattern": "(?i)(?:^|[^a-z0-9_])pi(?:\\.exe)?[ \\t]+--session[ \\t]+(\"[a-z0-9_./:\\\\~ -]{1,1024}\"|'[a-z0-9_./:\\\\~ -]{1,1024}'|[a-z0-9_./:\\\\~-]{1,1024})",
+      "command": "pi --session $1"
+    }
+  ]
 }
 ```
 
-To **replace** the built-ins, use `resume_patterns` with your own array; `"resume_patterns": []` disables detection unless `additional_resume_patterns` supplies rules. Both keys may appear together: the additional rules append to the replacement array. If several rules match, the last matching occurrence in the tail wins.
+A rule for your own tool looks the same: `"program": "agent"`, `"pattern": "agent --resume ([a-z0-9-]+)"`, `"command": "agent --restore $1"`. If several rules match, the last matching occurrence in the tail wins.
 
 Edits hot-reload into the session store. The reload diff reports `patterns` (the `ResumeConfig` field). An invalid regex, missing capture group or empty `program`/`command` rejects a hot reload and preserves the previous configuration; check the daemon log for `config reload failed`. No restart is required after a valid edit. To verify a rule, finish a session whose **child executable** matches `program`, then inspect its `resume_command` via `oly ls --json` after the completed-output scan.
 
@@ -232,7 +240,7 @@ Edits hot-reload into the session store. The reload diff reports `patterns` (the
 - **Parse errors silently keep the old config.** Validate with `jq . config.json` before saving; the daemon logs `config reload failed; keeping current configuration` if the new file is bad.
 - **Env vars are read only at startup.** `OLY_WEB_PUSH_PROXY` does not re-trigger on hot reload — drop it in `config.json` if you want it to follow file edits.
 - **`prompt_patterns: []` is not the same as omitting the key.** An explicit empty array disables prompt detection; omitting the key restores the defaults.
-- **`resume_patterns: []` also disables its defaults.** To keep Codex/Pi and add a rule, use `additional_resume_patterns`; a rule for the wrong child executable never matches.
+- **`resume_patterns` has no built-in rules.** Omitting the key disables resume detection entirely; every rule — including the Codex/Pi ones — must be listed explicitly. A rule for the wrong child executable never matches.
 - **Wrong key names silently no-op.** Typos such as `notification_hookk` make it look like the daemon ignored you, when actually nothing was set. The reload log won't mention them because no diff exists. Cross-check the JSON key in the table above.
 
 ## Verify and self-check

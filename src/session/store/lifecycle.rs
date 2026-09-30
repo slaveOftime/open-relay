@@ -868,13 +868,23 @@ mod tests {
                 .await
                 .expect("insert session");
             let store = store_with(vec![rt.clone()], db.clone());
-            if command == "agent" {
-                store.set_resume_patterns(vec![crate::config::ResumePattern {
+            store.set_resume_patterns(vec![
+                crate::config::ResumePattern {
+                    program: "codex".into(),
+                    pattern: r"(?i)(?:^|[^a-z0-9_])codex(?:\.exe)?[ \t]+resume[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[^a-z0-9-])".into(),
+                    command: "codex resume $1".into(),
+                },
+                crate::config::ResumePattern {
+                    program: "pi".into(),
+                    pattern: r#"(?i)(?:^|[^a-z0-9_])pi(?:\.exe)?[ \t]+--session[ \t]+("[a-z0-9_./:\\~ -]{1,1024}"|'[a-z0-9_./:\\~ -]{1,1024}'|[a-z0-9_./:\\~-]{1,1024})"#.into(),
+                    command: "pi --session $1".into(),
+                },
+                crate::config::ResumePattern {
                     program: "agent".into(),
                     pattern: r"agent --resume ([a-z0-9-]+)".into(),
                     command: "agent --restore $1".into(),
-                }]);
-            }
+                },
+            ]);
 
             store.run_maintenance().await;
             assert_eq!(

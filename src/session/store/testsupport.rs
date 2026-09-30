@@ -335,9 +335,7 @@ pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
             vapid_private_key: None,
             proxy: None,
         },
-        resume: crate::config::ResumeConfig {
-            patterns: crate::config::default_resume_patterns(),
-        },
+        resume: crate::config::ResumeConfig::default(),
         log_level: "info".into(),
         runtime_overrides: Default::default(),
     }

@@ -94,10 +94,26 @@ pub(crate) fn from_journal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::default_resume_patterns;
+
+    /// Example operator-configured rules for the documented codex/pi
+    /// tools; resume detection itself has no built-in rules.
+    fn configured_patterns() -> Vec<ResumePattern> {
+        vec![
+            ResumePattern {
+                program: "codex".into(),
+                pattern: r"(?i)(?:^|[^a-z0-9_])codex(?:\.exe)?[ \t]+resume[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[^a-z0-9-])".into(),
+                command: "codex resume $1".into(),
+            },
+            ResumePattern {
+                program: "pi".into(),
+                pattern: r#"(?i)(?:^|[^a-z0-9_])pi(?:\.exe)?[ \t]+--session[ \t]+("[a-z0-9_./:\\~ -]{1,1024}"|'[a-z0-9_./:\\~ -]{1,1024}'|[a-z0-9_./:\\~-]{1,1024})"#.into(),
+                command: "pi --session $1".into(),
+            },
+        ]
+    }
 
     fn detect(command: &str, tail: &str) -> Option<String> {
-        super::detect(command, tail, &default_resume_patterns())
+        super::detect(command, tail, &configured_patterns())
     }
 
     const ID: &str = "0199e6e2-b60e-715d-851f-b8713b7064df";
@@ -151,19 +167,19 @@ mod tests {
         output.extend_from_slice(late.as_bytes());
         crate::session::store::testsupport::seed_journal_output(&dir, &output);
         assert_eq!(
-            from_journal(&dir, "codex", &default_resume_patterns())
+            from_journal(&dir, "codex", &configured_patterns())
                 .unwrap()
                 .as_deref(),
             Some("codex resume 0199e6e2-b60e-715d-851f-b8713b7064d0")
         );
         assert_eq!(
-            from_journal(&dir, "bash", &default_resume_patterns()).unwrap(),
+            from_journal(&dir, "bash", &configured_patterns()).unwrap(),
             None
         );
     }
 
     #[test]
-    fn custom_rules_match_the_last_hint_and_can_replace_defaults() {
+    fn custom_rules_match_the_last_hint() {
         let custom = ResumePattern {
             program: "agent".into(),
             pattern: r"agent --resume ([a-z0-9-]+)".into(),
@@ -176,7 +192,7 @@ mod tests {
         );
         assert_eq!(super::detect("codex", tail, &[custom.clone()]), None);
         assert_eq!(
-            super::detect("codex", tail, &default_resume_patterns()).as_deref(),
+            super::detect("codex", tail, &configured_patterns()).as_deref(),
             Some("codex resume 0199e6e2-b60e-715d-851f-b8713b7064df")
         );
         assert_eq!(

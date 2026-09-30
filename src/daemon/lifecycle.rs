@@ -891,9 +891,7 @@ mod tests {
                 vapid_private_key: None,
                 proxy: None,
             },
-            resume: crate::config::ResumeConfig {
-                patterns: crate::config::default_resume_patterns(),
-            },
+            resume: crate::config::ResumeConfig::default(),
             log_level: "info".to_string(),
             runtime_overrides: Default::default(),
         }
