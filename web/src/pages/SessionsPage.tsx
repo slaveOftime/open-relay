@@ -613,7 +613,7 @@ const SessionRow = memo(function SessionRow({
       case 'actions':
         return (
           <TableCell key={columnKey} className="px-3 py-1" onClick={(e) => e.stopPropagation()}>
-            <div className="flex flex-wrap items-center gap-1">
+            <div className="flex items-center gap-1">
               {isRunning && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -748,6 +748,7 @@ const SessionCard = memo(function SessionCard({
   onRequestDelete,
   notificationsPending,
   node,
+  showCwd
 }: {
   session: SessionSummary
   animateIn?: boolean
@@ -761,6 +762,7 @@ const SessionCard = memo(function SessionCard({
   onRequestDelete: (session: SessionSummary) => void
   notificationsPending?: boolean
   node?: string
+  showCwd?: boolean
 }) {
   const navigate = useNavigate()
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
@@ -826,7 +828,7 @@ const SessionCard = memo(function SessionCard({
 
           {/* Row 2: command + title */}
           <div className="z-10" onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
-            <div className={`flex min-w-0 items-center gap-1 ${titleTone}`}>
+            <div className={`flex min-w-0 items-center gap-2 ${titleTone}`}>
               <CommandLogo command={session.command} size={36} />
               <div className="min-w-0 flex-1 line-clamp-5 break-all">
                 {session.title?.trim() && (
@@ -838,8 +840,8 @@ const SessionCard = memo(function SessionCard({
           </div>
 
           {/* Row 3: cwd */}
-          {session.cwd && (
-            <div className="z-10 text-sm leading-snug text-[hsl(var(--muted-foreground))] font-mono break-all">
+          {showCwd && session.cwd && (
+            <div className="z-10 text-sm leading-4 text-[hsl(var(--muted-foreground))] font-mono break-all">
               {session.cwd}
             </div>
           )}
@@ -2146,6 +2148,7 @@ export default function SessionsPage() {
                           onRequestDelete={setDeletingSession}
                           notificationsPending={notificationRequestIds.has(s.id)}
                           node={selectedNode ?? undefined}
+                          showCwd={groupBy !== "cwd"}
                         />
                       ))}
                     </div>

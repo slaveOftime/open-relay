@@ -195,7 +195,7 @@ export default function CommandLogo({
         <img
           src={visual.src}
           alt=""
-          className={cn('h-full w-full object-contain p-[2px]', visual.monochrome && 'dark:invert')}
+          className={cn('h-full w-full object-contain', visual.monochrome && 'dark:invert')}
         />
       ) : (
         <span

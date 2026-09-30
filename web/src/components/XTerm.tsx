@@ -576,8 +576,8 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         onPointerCancel={handleScrollDragEnd}
         onContextMenu={(event) => event.preventDefault()}
         className={cn(
-          'absolute right-2 bottom-80 z-10 flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/80 text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
-          scrollDragActive ? 'opacity-90' : 'opacity-50'
+          'absolute right-2 bottom-80 z-10 flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
+          scrollDragActive ? 'opacity-90' : 'opacity-80'
         )}
       >
         <ChevronsUpDown className="h-4 w-4" />
