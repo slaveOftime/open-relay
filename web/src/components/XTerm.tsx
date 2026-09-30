@@ -1,9 +1,13 @@
-import { useRef, useEffect, useImperativeHandle, forwardRef, useState } from 'react'
+import { useRef, useEffect, useImperativeHandle, useLayoutEffect, forwardRef, useState } from 'react'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { ChevronsUpDown } from 'lucide-react'
 import { hasTransferredFiles } from './ui/file-transfer'
 import { cn } from '@/lib/utils'
+import QuickKeysMenu from './terminal/QuickKeysMenu'
+import QuickKeysDialog from './terminal/QuickKeysDialog'
+import { useReducedMotion } from './terminal/use-reduced-motion'
+import type { QuickKey } from './terminal/quick-keys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 import './XTerm.css'
@@ -24,6 +28,14 @@ const TERMINAL_FONT_VARIANTS = [
 // scrolls continuously, with speed proportional to the offset distance.
 const SCROLL_DRAG_DEADZONE_PX = 8
 const SCROLL_LINES_PER_SECOND_PER_PX = 2
+
+// A press below these limits counts as a tap and toggles the quick-keys ring.
+const QUICK_KEYS_TAP_MAX_PX = 12
+const QUICK_KEYS_TAP_MAX_MS = 350
+// While the ring is open the pad docks bottom-center, so the full ring fits
+// away from the screen edges.
+const QUICK_KEYS_DOCK_BOTTOM_PX = 150
+const QUICK_KEYS_DOCK_MIN_TOP_PX = 180
 
 function loadEmbeddedTerminalFont(): Promise<void> {
   if (typeof document === 'undefined' || !('fonts' in document)) {
@@ -167,6 +179,12 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   const scrollDragRafRef = useRef(0)
   const scrollButtonRef = useRef<HTMLButtonElement>(null)
   const [scrollDragActive, setScrollDragActive] = useState(false)
+  const controlsRef = useRef<HTMLDivElement>(null)
+  const tapRef = useRef<{ x: number; y: number; startedAt: number; moved: boolean } | null>(null)
+  const [quickKeysOpen, setQuickKeysOpen] = useState(false)
+  const [quickKeysDialogOpen, setQuickKeysDialogOpen] = useState(false)
+  const [dockOffset, setDockOffset] = useState({ x: 0, y: 0 })
+  const reducedMotion = useReducedMotion()
 
   // Keep callbacks up to date without re-running the mount effect
   useEffect(() => {
@@ -531,10 +549,15 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     event.preventDefault()
     event.stopPropagation()
     event.currentTarget.setPointerCapture(event.pointerId)
+    tapRef.current = { x: event.clientX, y: event.clientY, startedAt: Date.now(), moved: false }
     beginScrollDrag(event.clientY)
   }
 
   const handleScrollDragMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const tap = tapRef.current
+    if (tap && !tap.moved && Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > QUICK_KEYS_TAP_MAX_PX) {
+      tap.moved = true
+    }
     if (!scrollDragRef.current) {
       // Some touchpads cancel the pointer stream when a drag begins, so
       // (re)start the drag on any pressed move over the handle.
@@ -547,6 +570,11 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   }
 
   const handleScrollDragEnd = (event: React.PointerEvent<HTMLButtonElement>) => {
+    const tap = tapRef.current
+    tapRef.current = null
+    if (tap && !tap.moved && Date.now() - tap.startedAt <= QUICK_KEYS_TAP_MAX_MS) {
+      setQuickKeysOpen((open) => !open)
+    }
     if (!scrollDragRef.current) return
     scrollDragRef.current = null
     setScrollDragActive(false)
@@ -559,6 +587,42 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     }
   }
 
+  // Dock the pad to bottom-center while the ring is open. The rect is
+  // measured before the transform applies (offset starts at zero on open).
+  useLayoutEffect(() => {
+    if (!quickKeysOpen) {
+      setDockOffset({ x: 0, y: 0 })
+      return
+    }
+    const el = controlsRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    const targetY = Math.max(window.innerHeight - QUICK_KEYS_DOCK_BOTTOM_PX, QUICK_KEYS_DOCK_MIN_TOP_PX)
+    setDockOffset({
+      x: window.innerWidth / 2 - (rect.left + rect.width / 2),
+      y: targetY - (rect.top + rect.height / 2),
+    })
+  }, [quickKeysOpen])
+
+  useEffect(() => {
+    if (!quickKeysOpen) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setQuickKeysOpen(false)
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [quickKeysOpen])
+
+  const sendQuickKey = (key: QuickKey) => {
+    const term = termRef.current
+    if (!term) return
+    // input() routes through term.onData — the same path as typed keys.
+    term.input(key.data)
+    if (onDataRef.current) term.focus()
+  }
+
+  const docked = quickKeysOpen && (dockOffset.x !== 0 || dockOffset.y !== 0)
+
   return (
     <div className={cn('relative', className)}>
       <div
@@ -566,22 +630,43 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         className="h-full w-full"
         style={{ overflow: 'hidden', touchAction: 'none' }}
       />
-      <button
-        ref={scrollButtonRef}
-        type="button"
-        aria-label="Scroll terminal"
-        onPointerDown={handleScrollDragStart}
-        onPointerMove={handleScrollDragMove}
-        onPointerUp={handleScrollDragEnd}
-        onPointerCancel={handleScrollDragEnd}
-        onContextMenu={(event) => event.preventDefault()}
+      {quickKeysOpen ? (
+        <div aria-hidden className="fixed inset-0 z-20" onClick={() => setQuickKeysOpen(false)} />
+      ) : null}
+      <div
+        ref={controlsRef}
         className={cn(
-          'absolute right-2 bottom-80 z-10 flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
-          scrollDragActive ? 'opacity-90' : 'opacity-80'
+          'absolute right-2 bottom-70 z-10 transition-transform duration-200 ease-out md:hidden',
+          quickKeysOpen && 'z-30',
+          reducedMotion && 'duration-0'
         )}
+        style={docked ? { transform: `translate(${dockOffset.x}px, ${dockOffset.y}px)` } : undefined}
       >
-        <ChevronsUpDown className="h-4 w-4" />
-      </button>
+        <button
+          ref={scrollButtonRef}
+          type="button"
+          aria-label="Scroll terminal"
+          aria-expanded={quickKeysOpen}
+          onPointerDown={handleScrollDragStart}
+          onPointerMove={handleScrollDragMove}
+          onPointerUp={handleScrollDragEnd}
+          onPointerCancel={handleScrollDragEnd}
+          onContextMenu={(event) => event.preventDefault()}
+          className={cn(
+            'relative flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] transition-opacity md:hidden',
+            scrollDragActive ? 'opacity-90' : 'opacity-80'
+          )}
+        >
+          <ChevronsUpDown className="h-4 w-4" />
+        </button>
+        <QuickKeysMenu
+          open={quickKeysOpen}
+          onSend={sendQuickKey}
+          onClose={() => setQuickKeysOpen(false)}
+          onCustomize={() => setQuickKeysDialogOpen(true)}
+        />
+      </div>
+      <QuickKeysDialog open={quickKeysDialogOpen} onOpenChange={setQuickKeysDialogOpen} />
     </div>
   )
 })
