@@ -2,10 +2,28 @@ import { useRef, useState, useSyncExternalStore } from 'react'
 import { GripVertical, Plus, RotateCcw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
-import { getQuickKeys, resetQuickKeys, setQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
-import { describeData, encodeCombo, formatCombo, moveQuickKey, nextQuickKeyColor, QUICK_KEY_COLORS, type QuickKey } from './quick-keys'
+import {
+  getQuickKeys,
+  resetQuickKeys,
+  setQuickKeys,
+  subscribeQuickKeys,
+} from '@/lib/quickKeysStorage'
+import {
+  describeData,
+  encodeCombo,
+  formatCombo,
+  moveQuickKey,
+  QUICK_KEY_COLORS,
+  type QuickKey,
+} from './quick-keys'
 
 /** Fixed row height (h-14) + vertical margin (mb-2) used for drag math. */
 const ROW_STRIDE_PX = 64
@@ -58,11 +76,11 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
   const keys = useSyncExternalStore(subscribeQuickKeys, getQuickKeys)
   const [combo, setCombo] = useState('')
   const [label, setLabel] = useState('')
-  const [color, setColor] = useState<string | undefined>(undefined)
+  const [paletteFor, setPaletteFor] = useState<string | null>(null)
   const dragRef = useRef<DragState | null>(null)
   const [dragView, setDragView] = useState<{ id: string; delta: number } | null>(null)
 
-  const preview = combo.trim() ? encodeCombo(combo.trim()) ?? combo.trim() : ''
+  const preview = combo.trim() ? (encodeCombo(combo.trim()) ?? combo.trim()) : ''
 
   function handleAdd() {
     const trimmed = combo.trim()
@@ -73,25 +91,23 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
       label: (label.trim() || formatCombo(trimmed)).slice(0, 4),
       data,
       combo: trimmed.toLowerCase(),
-      ...(color ? { color } : {}),
     }
     setQuickKeys([...getQuickKeys(), key])
     setCombo('')
     setLabel('')
-    setColor(undefined)
   }
 
-  function handleColorCycle(id: string) {
+  function handleColorSet(id: string, color: string | undefined) {
     setQuickKeys(
       getQuickKeys().map((key) => {
         if (key.id !== id) return key
-        const next = nextQuickKeyColor(key.color)
-        if (next) return { ...key, color: next }
+        if (color) return { ...key, color }
         const rest = { ...key }
         delete rest.color
         return rest
       })
     )
+    setPaletteFor(null)
   }
 
   function handleRemove(id: string) {
@@ -101,6 +117,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
   function handleDragStart(event: React.PointerEvent<HTMLElement>, index: number, id: string) {
     event.preventDefault()
     event.currentTarget.setPointerCapture(event.pointerId)
+    setPaletteFor(null)
     dragRef.current = { id, index, originY: event.clientY }
     setDragView({ id, delta: 0 })
   }
@@ -133,8 +150,8 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
         <DialogHeader>
           <DialogTitle>Quick Keys</DialogTitle>
           <DialogDescription>
-            Tap to send · drag the handle to reorder. Keys are sent to the terminal as soon as the
-            round button is tapped.
+            Tap to send · drag the handle to reorder · tap a label to recolor it. Keys are sent to
+            the terminal as soon as the round button is tapped.
           </DialogDescription>
         </DialogHeader>
 
@@ -146,58 +163,84 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
           ) : null}
           {keys.map((key, index) => {
             const dragging = dragView?.id === key.id
+            const paletteOpen = paletteFor === key.id
             return (
-              <div
-                key={key.id}
-                role="listitem"
-                style={
-                  dragging
-                    ? { transform: `translateY(${dragView?.delta ?? 0}px)`, zIndex: 10 }
-                    : undefined
-                }
-                className={cn(
-                  'relative mb-2 flex h-14 items-center gap-2 rounded-lg border px-2',
-                  'border-[hsl(var(--border))] bg-[hsl(var(--background))]',
-                  dragging && 'border-[hsl(var(--ring))] shadow-lg'
-                )}
-              >
-                <button
-                  type="button"
-                  aria-label={`Reorder ${key.label}`}
-                  onPointerDown={(event) => handleDragStart(event, index, key.id)}
-                  onPointerMove={handleDragMove}
-                  onPointerUp={handleDragEnd}
-                  onPointerCancel={handleDragEnd}
-                  className="flex h-11 w-11 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] active:cursor-grabbing"
-                >
-                  <GripVertical className="h-4 w-4" />
-                </button>
-                <button
-                  type="button"
-                  aria-label={`Change color of ${key.label} (current: ${key.color ?? 'default'}), tap to cycle`}
-                  onClick={() => handleColorCycle(key.id)}
-                  style={key.color ? { color: key.color } : undefined}
+              <div key={key.id} role="listitem" className="relative mb-2">
+                <div
+                  style={
+                    dragging
+                      ? { transform: `translateY(${dragView?.delta ?? 0}px)`, zIndex: 10 }
+                      : undefined
+                  }
                   className={cn(
-                    'flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] font-mono text-[10px] font-semibold leading-none',
-                    !key.color && 'text-[hsl(var(--foreground))]'
+                    'relative flex h-14 items-center gap-2 rounded-lg border px-2',
+                    'border-[hsl(var(--border))] bg-[hsl(var(--background))]',
+                    dragging && 'border-[hsl(var(--ring))] shadow-lg'
                   )}
                 >
-                  {key.label}
-                </button>
-                <span className="flex min-w-0 flex-col gap-0.5">
-                  <span className="truncate text-xs font-medium">{formatCombo(key.combo)}</span>
-                  <span className="truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
-                    {describeData(key.data)}
+                  <button
+                    type="button"
+                    aria-label={`Reorder ${key.label}`}
+                    onPointerDown={(event) => handleDragStart(event, index, key.id)}
+                    onPointerMove={handleDragMove}
+                    onPointerUp={handleDragEnd}
+                    onPointerCancel={handleDragEnd}
+                    className="flex h-11 w-11 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] active:cursor-grabbing"
+                  >
+                    <GripVertical className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Change color of ${key.label}`}
+                    aria-expanded={paletteOpen}
+                    onClick={() => setPaletteFor(paletteOpen ? null : key.id)}
+                    style={key.color ? { color: key.color, borderColor: key.color } : undefined}
+                    className={cn(
+                      'flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] font-mono text-[10px] font-semibold leading-none transition-transform active:scale-90',
+                      !key.color && 'text-[hsl(var(--foreground))]',
+                      paletteOpen && 'border-[hsl(var(--ring))]'
+                    )}
+                  >
+                    {key.label}
+                  </button>
+                  <span className="flex min-w-0 flex-col gap-0.5">
+                    <span className="truncate text-xs font-medium">{formatCombo(key.combo)}</span>
+                    <span className="truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
+                      {describeData(key.data)}
+                    </span>
                   </span>
-                </span>
-                <button
-                  type="button"
-                  aria-label={`Remove ${key.label}`}
-                  onClick={() => handleRemove(key.id)}
-                  className="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--destructive))]"
-                >
-                  <X className="h-4 w-4" />
-                </button>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${key.label}`}
+                    onClick={() => handleRemove(key.id)}
+                    className="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--destructive))]"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+                {paletteOpen ? (
+                  <div
+                    className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/50 p-2 pt-2"
+                    role="radiogroup"
+                    aria-label={`Color of ${key.label}`}
+                  >
+                    <Swatch
+                      color={undefined}
+                      selected={!key.color}
+                      onSelect={(next) => handleColorSet(key.id, next)}
+                      label="Default color"
+                    />
+                    {QUICK_KEY_COLORS.map((option) => (
+                      <Swatch
+                        key={option}
+                        color={option}
+                        selected={key.color === option}
+                        onSelect={(next) => handleColorSet(key.id, next)}
+                        label={`Color ${option}`}
+                      />
+                    ))}
+                  </div>
+                ) : null}
               </div>
             )
           })}
@@ -227,26 +270,11 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
               maxLength={4}
             />
           </div>
-          <div className="flex items-center gap-1.5" role="radiogroup" aria-label="Label color">
-            <Swatch
-              color={undefined}
-              selected={color === undefined}
-              onSelect={setColor}
-              label="Default color"
-            />
-            {QUICK_KEY_COLORS.map((option) => (
-              <Swatch
-                key={option}
-                color={option}
-                selected={color === option}
-                onSelect={setColor}
-                label={`Color ${option}`}
-              />
-            ))}
-          </div>
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
-              {preview ? `Sends: ${describeData(preview)}` : 'e.g. ctrl+c, shift+tab, alt+f, or any text'}
+              {preview
+                ? `Sends: ${describeData(preview)}`
+                : 'e.g. ctrl+c, shift+tab, alt+f, or any text'}
             </span>
             <Button type="submit" size="sm" variant="outline" disabled={!combo.trim()}>
               <Plus className="h-4 w-4" />

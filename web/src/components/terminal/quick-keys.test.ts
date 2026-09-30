@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest'
 import {
   BASE_RING_RADIUS_PX,
   DEFAULT_QUICK_KEYS,
-  nextQuickKeyColor,
   QUICK_KEY_COLORS,
   RING_MIN_SPACING_PX,
   describeData,
@@ -63,8 +62,7 @@ describe('formatCombo', () => {
     expect(formatCombo('ctrl+c')).toBe('Ctrl+C')
     expect(formatCombo('shift+tab')).toBe('Shift+Tab')
     expect(formatCombo('up')).toBe('↑')
-    expect(formatCombo('!')).toBe('!'
-    )
+    expect(formatCombo('!')).toBe('!')
   })
 })
 
@@ -139,14 +137,6 @@ describe('layoutRing', () => {
   })
 })
 
-describe('nextQuickKeyColor', () => {
-  it('cycles through the palette and back to none', () => {
-    expect(nextQuickKeyColor(undefined)).toBe(QUICK_KEY_COLORS[0])
-    expect(nextQuickKeyColor(QUICK_KEY_COLORS[0])).toBe(QUICK_KEY_COLORS[1])
-    expect(nextQuickKeyColor(QUICK_KEY_COLORS[QUICK_KEY_COLORS.length - 1])).toBeUndefined()
-  })
-})
-
 describe('quick keys storage', () => {
   it('falls back to defaults when nothing is stored', () => {
     expect(loadQuickKeys(fakeStorage())).toEqual(DEFAULT_QUICK_KEYS)
@@ -154,12 +144,14 @@ describe('quick keys storage', () => {
 
   it('keeps an optional color through the round trip', () => {
     const port = fakeStorage()
-    saveQuickKeys([{ ...DEFAULT_QUICK_KEYS[0], color: '#22c55e' }], port)
-    expect(loadQuickKeys(port)[0].color).toBe('#22c55e')
+    saveQuickKeys([{ ...DEFAULT_QUICK_KEYS[0], color: QUICK_KEY_COLORS[3] }], port)
+    expect(loadQuickKeys(port)[0].color).toBe(QUICK_KEY_COLORS[3])
   })
 
   it('rejects malformed colors', () => {
-    expect(normalizeQuickKeys([{ id: 'a', label: 'A', data: '\x03', combo: 'ctrl+c', color: 'red' }])).toBeNull()
+    expect(
+      normalizeQuickKeys([{ id: 'a', label: 'A', data: '\x03', combo: 'ctrl+c', color: 'red' }])
+    ).toBeNull()
   })
 
   it('round-trips through a storage port', () => {

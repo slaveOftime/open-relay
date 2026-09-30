@@ -31,14 +31,6 @@ export const QUICK_KEY_COLORS: string[] = [
   '#ec4899', // pink
 ]
 
-/** Next color when cycling through swatches; undefined loops back to none. */
-export function nextQuickKeyColor(current?: string): string | undefined {
-  if (!current) return QUICK_KEY_COLORS[0]
-  const index = QUICK_KEY_COLORS.indexOf(current)
-  if (index === -1 || index === QUICK_KEY_COLORS.length - 1) return undefined
-  return QUICK_KEY_COLORS[index + 1]
-}
-
 const MODIFIER_ALIASES: Record<string, 'ctrl' | 'shift' | 'alt'> = {
   ctrl: 'ctrl',
   control: 'ctrl',
