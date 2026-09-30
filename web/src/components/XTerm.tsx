@@ -1,4 +1,4 @@
-import { useRef, useEffect, useImperativeHandle, useLayoutEffect, forwardRef, useState } from 'react'
+import { useRef, useEffect, useImperativeHandle, forwardRef, useState } from 'react'
 import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { ChevronsUpDown } from 'lucide-react'
@@ -6,7 +6,6 @@ import { hasTransferredFiles } from './ui/file-transfer'
 import { cn } from '@/lib/utils'
 import QuickKeysMenu from './terminal/QuickKeysMenu'
 import QuickKeysDialog from './terminal/QuickKeysDialog'
-import { useReducedMotion } from './terminal/use-reduced-motion'
 import type { QuickKey } from './terminal/quick-keys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
@@ -32,10 +31,6 @@ const SCROLL_LINES_PER_SECOND_PER_PX = 2
 // A press below these limits counts as a tap and toggles the quick-keys ring.
 const QUICK_KEYS_TAP_MAX_PX = 12
 const QUICK_KEYS_TAP_MAX_MS = 350
-// While the ring is open the pad docks bottom-center, so the full ring fits
-// away from the screen edges.
-const QUICK_KEYS_DOCK_BOTTOM_PX = 150
-const QUICK_KEYS_DOCK_MIN_TOP_PX = 180
 
 function loadEmbeddedTerminalFont(): Promise<void> {
   if (typeof document === 'undefined' || !('fonts' in document)) {
@@ -179,12 +174,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   const scrollDragRafRef = useRef(0)
   const scrollButtonRef = useRef<HTMLButtonElement>(null)
   const [scrollDragActive, setScrollDragActive] = useState(false)
-  const controlsRef = useRef<HTMLDivElement>(null)
   const tapRef = useRef<{ x: number; y: number; startedAt: number; moved: boolean } | null>(null)
   const [quickKeysOpen, setQuickKeysOpen] = useState(false)
   const [quickKeysDialogOpen, setQuickKeysDialogOpen] = useState(false)
-  const [dockOffset, setDockOffset] = useState({ x: 0, y: 0 })
-  const reducedMotion = useReducedMotion()
 
   // Keep callbacks up to date without re-running the mount effect
   useEffect(() => {
@@ -587,23 +579,6 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     }
   }
 
-  // Dock the pad to bottom-center while the ring is open. The rect is
-  // measured before the transform applies (offset starts at zero on open).
-  useLayoutEffect(() => {
-    if (!quickKeysOpen) {
-      setDockOffset({ x: 0, y: 0 })
-      return
-    }
-    const el = controlsRef.current
-    if (!el) return
-    const rect = el.getBoundingClientRect()
-    const targetY = Math.max(window.innerHeight - QUICK_KEYS_DOCK_BOTTOM_PX, QUICK_KEYS_DOCK_MIN_TOP_PX)
-    setDockOffset({
-      x: window.innerWidth / 2 - (rect.left + rect.width / 2),
-      y: targetY - (rect.top + rect.height / 2),
-    })
-  }, [quickKeysOpen])
-
   useEffect(() => {
     if (!quickKeysOpen) return
     const onKeyDown = (event: KeyboardEvent) => {
@@ -621,8 +596,6 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     if (onDataRef.current) term.focus()
   }
 
-  const docked = quickKeysOpen && (dockOffset.x !== 0 || dockOffset.y !== 0)
-
   return (
     <div className={cn('relative', className)}>
       <div
@@ -634,13 +607,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         <div aria-hidden className="fixed inset-0 z-20" onClick={() => setQuickKeysOpen(false)} />
       ) : null}
       <div
-        ref={controlsRef}
-        className={cn(
-          'absolute right-2 bottom-70 z-10 transition-transform duration-200 ease-out md:hidden',
-          quickKeysOpen && 'z-30',
-          reducedMotion && 'duration-0'
-        )}
-        style={docked ? { transform: `translate(${dockOffset.x}px, ${dockOffset.y}px)` } : undefined}
+        className={cn('absolute right-2 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}
       >
         <button
           ref={scrollButtonRef}

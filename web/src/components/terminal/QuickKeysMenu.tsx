@@ -1,14 +1,28 @@
-import { useEffect, useState, useSyncExternalStore, type CSSProperties } from 'react'
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type CSSProperties,
+} from 'react'
 import { SlidersHorizontal } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
 import { useReducedMotion } from './use-reduced-motion'
 import type { QuickKey } from './quick-keys'
 
-const BASE_RADIUS_PX = 76
+const BASE_RADIUS_PX = 92
+const MIN_RADIUS_PX = 64
 /** Minimum center-to-center distance so adjacent buttons stay 44px targets. */
 const MIN_SPACING_PX = 52
-const CUSTOMIZE_OFFSET_PX = 104
+/** Gap between the key arc and the inner customize button. */
+const CUSTOMIZE_INSET_PX = 60
+/** Never let the inner customize button sit on top of the pad itself. */
+const CUSTOMIZE_MIN_DX_PX = 52
+/** Keep this much clearance between popped keys and the screen edges. */
+const EDGE_MARGIN_PX = 10
+const ITEM_HALF_PX = 22
 const ENTER_DURATION_MS = 260
 const STAGGER_MS = 24
 /** Slight overshoot so keys feel like they "pop" out of the pad. */
@@ -22,12 +36,14 @@ interface Props {
   onCustomize: () => void
 }
 
-function ringPosition(index: number, count: number, radius: number) {
-  const angle = ((index / Math.max(count, 1)) * Math.PI * 2) % (Math.PI * 2)
-  return {
-    dx: Math.cos(angle - Math.PI / 2) * radius,
-    dy: Math.sin(angle - Math.PI / 2) * radius,
-  }
+/**
+ * Fan the keys over a half circle on the free side of the pad: straight up,
+ * around the left, to straight down. The pad hugs the right screen edge, so
+ * the right quarter is deliberately left empty.
+ */
+function arcPosition(index: number, count: number, radius: number) {
+  const angle = count > 1 ? -Math.PI / 2 - (index / (count - 1)) * Math.PI : -Math.PI / 2
+  return { dx: Math.cos(angle) * radius, dy: Math.sin(angle) * radius }
 }
 
 export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Props) {
@@ -36,18 +52,31 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
   // Items mount collapsed at the pad center and slide out on the next
   // frame so the CSS transform transition actually runs.
   const [armed, setArmed] = useState(false)
+  const anchorRef = useRef<HTMLDivElement>(null)
+  const [radius, setRadius] = useState(BASE_RADIUS_PX)
   useEffect(() => {
     if (!open) return
     const raf = requestAnimationFrame(() => setArmed(true))
     return () => cancelAnimationFrame(raf)
   }, [open])
 
+  // Grow the arc so keys keep a tappable spacing, then shrink it back down
+  // to whatever fits between the pad center and the screen edges.
+  useLayoutEffect(() => {
+    const el = anchorRef.current
+    if (!el) return
+    const { left, top } = el.getBoundingClientRect()
+    const freeSpace = Math.min(
+      top - EDGE_MARGIN_PX,
+      left - EDGE_MARGIN_PX,
+      window.innerHeight - top - EDGE_MARGIN_PX
+    )
+    const wanted = Math.max(BASE_RADIUS_PX, (Math.max(keys.length - 1, 1) * MIN_SPACING_PX) / Math.PI)
+    setRadius(Math.max(MIN_RADIUS_PX, Math.min(wanted, freeSpace - ITEM_HALF_PX)))
+  }, [keys.length, open])
+
   if (!open) return null
 
-  const wantedRadius = Math.max(BASE_RADIUS_PX, (keys.length * MIN_SPACING_PX) / (Math.PI * 2))
-  // Never let the ring grow past what fits on screen around the dock point.
-  const maxRadius = Math.min(window.innerWidth, window.innerHeight) / 2 - 60
-  const radius = Math.max(BASE_RADIUS_PX, Math.min(wantedRadius, maxRadius))
   const stagger = reducedMotion ? 0 : STAGGER_MS
   const duration = reducedMotion ? 0 : ENTER_DURATION_MS
 
@@ -61,12 +90,14 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
     transitionDelay: `${index * stagger}ms`,
   })
 
+  const customizeDx = -Math.max(radius - CUSTOMIZE_INSET_PX, CUSTOMIZE_MIN_DX_PX)
+
   return (
-    // The ring is centered on the main pad button (wrapper center); the root
+    // The arc is centered on the pad button (wrapper center); the root
     // itself ignores pointers so the pad underneath stays draggable.
-    <div className="pointer-events-none absolute left-1/2 top-1/2">
+    <div ref={anchorRef} className="pointer-events-none absolute left-1/2 top-1/2">
       {keys.map((key, index) => {
-        const { dx, dy } = ringPosition(index, keys.length, radius)
+        const { dx, dy } = arcPosition(index, keys.length, radius)
         return (
           <button
             key={key.id}
@@ -97,7 +128,7 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
           event.stopPropagation()
           onCustomize()
         }}
-        style={popStyle(0, CUSTOMIZE_OFFSET_PX, keys.length)}
+        style={popStyle(customizeDx, 0, keys.length)}
         className={cn(
           'pointer-events-auto absolute left-1/2 top-1/2 flex h-11 w-11 touch-none select-none',
           'items-center justify-center rounded-full border border-dashed border-[hsl(var(--border))]',
