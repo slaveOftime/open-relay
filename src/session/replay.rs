@@ -205,6 +205,71 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
     Ok((collected, filtered_pos))
 }
 
+/// Derive the filtered display stream **and** the resize history of the
+/// latest incarnation in a single journal pass (`oly logs` reads both;
+/// deriving them together halves the replay cost versus
+/// [`filtered_stream_from`] + [`resize_events_from`]).
+///
+/// Resize offsets are absolute filtered-stream offsets, exactly like
+/// [`resize_events_from`]'s. Unlike [`resize_events_from`] the resize
+/// scan is bounded by the stream pass itself (it stops where the bytes
+/// stop), which for the render path is exactly the window it needs.
+pub fn filtered_stream_and_resizes_from(
+    session_dir: &Path,
+    from_offset: u64,
+) -> io::Result<(Vec<u8>, u64, Vec<LogResize>)> {
+    let journal_dir = session_dir.join(JOURNAL_DIR_NAME);
+    let incarnations = match journal::list_incarnations(&journal_dir) {
+        Ok(incarnations) => incarnations,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), 0, Vec::new()));
+        }
+        Err(err) => return Err(err),
+    };
+    let Some(&incarnation) = incarnations.last() else {
+        return Ok((Vec::new(), 0, Vec::new()));
+    };
+
+    let (mut stream, mut filtered_pos) = replay_stream(session_dir, incarnation, from_offset)?;
+    let mut scanner = PtyScanner::new();
+    let mut out = ScanOut::default();
+    let mut collected: Vec<u8> = Vec::new();
+    let mut resizes = Vec::new();
+
+    loop {
+        let records = stream.next_batch(REPLAY_BATCH_BYTES)?;
+        if records.is_empty() {
+            break;
+        }
+        for record in &records {
+            match record.kind {
+                RecordKind::Output => {
+                    scanner.scan(&record.payload, &mut out);
+                    let batch = &out.filtered;
+                    let batch_start = filtered_pos;
+                    filtered_pos = filtered_pos.saturating_add(batch.len() as u64);
+                    if filtered_pos > from_offset {
+                        let skip = from_offset.saturating_sub(batch_start) as usize;
+                        collected.extend_from_slice(&batch[skip.min(batch.len())..]);
+                    }
+                }
+                RecordKind::Resize => {
+                    if let Some((rows, cols)) = journal::decode_resize_payload(&record.payload) {
+                        resizes.push(LogResize {
+                            offset: filtered_pos,
+                            rows,
+                            cols,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok((collected, filtered_pos, resizes))
+}
+
 /// Derive the resize history of the latest incarnation by walking the
 /// journal: one [`LogResize`] per resize record, where `offset` is the
 /// filtered-stream length at the moment the resize was recorded. This is

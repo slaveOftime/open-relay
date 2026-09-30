@@ -76,8 +76,8 @@ pub(crate) mod scan;
 #[allow(unused_imports)]
 // re-exported for sibling modules; consumed via short name by `stream.rs`.
 pub(crate) use scan::{
-    ReadPiece, SPARSE_INDEX_STRIDE_BYTES, ScanMode, ScanStart, ScanStop, read_exact_or_partial,
-    scan_impl, scan_segment_stats_from,
+    ReadPiece, SCAN_READ_BUFFER_BYTES, SPARSE_INDEX_STRIDE_BYTES, ScanMode, ScanStart, ScanStop,
+    read_exact_or_partial, scan_impl, scan_segment_stats_from,
 };
 #[cfg(test)]
 pub(crate) use scan::{scan_segment, scan_segment_stats};

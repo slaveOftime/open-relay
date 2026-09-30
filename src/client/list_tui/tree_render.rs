@@ -4,9 +4,7 @@ use super::super::list::format_timestamp_local;
 use super::app::{App, RateState, is_active_status, session_key};
 use super::constants::SELECTED_ROW_BG;
 use super::constants::SPARKLINE_WIDTH;
-use super::table::{
-    LayoutMode, pad_truncated, rate_color, session_status_style, sparkline, status_label,
-};
+use super::table::{LayoutMode, pad_truncated, rate_color, session_status_style, sparkline};
 use super::tree::{TreeEntry, TreeNode, TreeView};
 use crate::protocol::SessionSummary;
 use chrono::{DateTime, Utc};

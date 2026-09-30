@@ -366,6 +366,10 @@ pub fn pad_truncated(value: &str, width: usize) -> String {
     format!("{value}{}", " ".repeat(padding))
 }
 
+/// Short attention-vs-status label for list rows. The tree renderer uses
+/// `session_status_style` directly; this helper stays for the table
+/// renderers' tests and the `list_tui` re-export surface.
+#[allow(dead_code)]
 pub fn status_label(status: &str, input_needed: bool) -> &str {
     if input_needed { "attention" } else { status }
 }

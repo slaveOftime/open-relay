@@ -50,25 +50,25 @@ pub fn render_log_session(
     // Checkpoint-anchored tail replay (PLAN §5.3): start at the newest
     // anchored checkpoint and walk older anchors only until the replayed
     // suffix covers the requested tail. Cost is bounded by the checkpoint
-    // cadence, not by total recording size.
+    // cadence, not by total recording size. Bytes and resize history are
+    // derived in the SAME pass — a tail render never scans the journal
+    // more than once per candidate start.
     let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
     let mut starts: Vec<u64> = anchors.iter().rev().copied().collect();
     starts.push(0);
     let mut rendered: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
     for start in starts {
-        let (bytes, end) = crate::session::replay::filtered_stream_from(session_dir, start)?;
+        let (bytes, end, resizes) =
+            crate::session::replay::filtered_stream_and_resizes_from(session_dir, start)?;
         let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
         debug_assert_eq!(tail_bytes.end_offset + start, end);
         // start_offset > 0 means the window found enough lines inside the
         // suffix; otherwise widen the replay at an older anchor.
         if tail_bytes.start_offset > 0 || start == 0 {
             let start_offset = start + tail_bytes.start_offset;
-            // M6-2: resize history is derived from the journal
-            // (append-ordered with output), not the retired events.log.
-            // Anchored: only resizes inside the replayed window are derived
-            // — a bounded replay that breaks once we're 64 MiB past the
-            // window, never a full re-scan of the recording.
-            let resizes = crate::session::replay::resize_events_from(session_dir, start_offset)?;
+            // M6-2: resize history comes from the journal (append-ordered
+            // with output), not the retired events.log; the pass above
+            // already derived the resizes this window can see.
             rendered = Some((tail_bytes.bytes, start_offset, end, resizes));
             break;
         }

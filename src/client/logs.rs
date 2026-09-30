@@ -173,7 +173,13 @@ async fn run_logs_local(
         )));
     }
 
-    let (output, _resizes) = render_log_session(&session_dir, tail, keep_color, term_cols, None)?;
+    // Off-thread render: a tail replay of a long recording is a multi-
+    // second CPU burst and must not run on the CLI's async main thread.
+    let (output, _resizes) = tokio::task::spawn_blocking(move || {
+        render_log_session(&session_dir, tail, keep_color, term_cols, None)
+    })
+    .await
+    .map_err(|err| AppError::Protocol(format!("log render failed: {err}")))??;
 
     print_log_output(output, keep_color, id, Some(session.status.as_str()))
 }
