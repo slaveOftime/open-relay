@@ -220,7 +220,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
                 </div>
                 {paletteOpen ? (
                   <div
-                    className="flex flex-wrap items-center gap-1.5 rounded-lg border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/50 p-2 pt-2"
+                    className="flex flex-wrap items-center gap-1.5 p-2"
                     role="radiogroup"
                     aria-label={`Color of ${key.label}`}
                   >
