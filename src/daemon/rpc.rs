@@ -533,9 +533,6 @@ async fn handle_logs_tail(
             status,
         };
     }
-    let __t = std::time::Instant::now();
-    eprintln!("[dbg-daemon-rpc] logs_tail {id} enter (live path missed)");
-
     let session_dir = match db.get_session_dir(&id).await {
         Ok(Some(dir)) => dir,
         Ok(None) => {
@@ -553,15 +550,11 @@ async fn handle_logs_tail(
     // Journal replay + engine render is a multi-hundred-millisecond CPU
     // burst for long recordings; keep it off the async workers (PLAN2
     // §P1.2 — same rule the live-tail path follows).
-    let (lines, resizes) =
-        match tokio::task::spawn_blocking(move || {
-            let t = std::time::Instant::now();
-            let r = render_log_session(&session_dir, tail, keep_color, term_cols, None);
-            eprintln!("[dbg-daemon-render] {}x{} took {:?}", tail, term_cols, t.elapsed());
-            r
-        })
-        .await
-        {
+    let (lines, resizes) = match tokio::task::spawn_blocking(move || {
+        render_log_session(&session_dir, tail, keep_color, term_cols, None)
+    })
+    .await
+    {
             Ok(Ok((output, resizes))) => (output, resizes),
             Ok(Err(err)) => {
                 return RpcResponse::Error {
@@ -581,8 +574,6 @@ async fn handle_logs_tail(
         .ok()
         .flatten()
         .map(|meta| meta.status.as_str().to_string());
-    eprintln!("[dbg-daemon-rpc] logs_tail {id} total {:?}", __t.elapsed());
-
     RpcResponse::LogsTail {
         output: lines,
         resizes,
