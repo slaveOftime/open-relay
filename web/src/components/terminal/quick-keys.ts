@@ -155,6 +155,58 @@ export function moveQuickKey(keys: QuickKey[], from: number, to: number): QuickK
   return next
 }
 
+/**
+ * Radial layout math. Keys fan over a half circle on the free side of the
+ * pad (screen-bottom around the left to screen-top; the pad hugs the right
+ * edge so the right quarter stays empty). The customize button reserves the
+ * bottom slot of the inner ring, keys are placed counter-clockwise starting
+ * next to it, and any keys that no longer fit at a tappable spacing spill
+ * onto further concentric rings.
+ */
+export const BASE_RING_RADIUS_PX = 72
+export const RING_GAP_PX = 60
+export const RING_MIN_SPACING_PX = 52
+
+export interface RingPosition {
+  dx: number
+  dy: number
+}
+
+export interface RingLayout {
+  /** One position per key, in list order (index 0 sits next to customize). */
+  positions: RingPosition[]
+  customize: RingPosition
+}
+
+export function layoutRing(keysCount: number, maxRadius: number): RingLayout {
+  const positions: RingPosition[] = []
+  let customize: RingPosition = { dx: 0, dy: BASE_RING_RADIUS_PX }
+  let start = 0
+  for (let ring = 0; start < keysCount; ring += 1) {
+    const naturalRadius = BASE_RING_RADIUS_PX + ring * RING_GAP_PX
+    const atLimit = naturalRadius >= maxRadius
+    const radius = Math.min(naturalRadius, Math.max(maxRadius, BASE_RING_RADIUS_PX))
+    // Even angular spacing keeps centers at least RING_MIN_SPACING_PX apart.
+    const capacity = Math.max(Math.floor((Math.PI * radius) / RING_MIN_SPACING_PX), 1) + (ring === 0 ? 0 : 1)
+    const remaining = keysCount - start
+    const count = atLimit || remaining <= capacity ? remaining : capacity
+    for (let local = 0; local < count; local += 1) {
+      // Inner ring: slot 0 belongs to customize, keys take slots 1..count
+      // so the arc still ends at the top. Outer rings span bottom..top.
+      const angle =
+        ring === 0
+          ? Math.PI / 2 + ((local + 1) / count) * Math.PI
+          : count === 1
+            ? Math.PI / 2
+            : Math.PI / 2 + (local / (count - 1)) * Math.PI
+      positions[start + local] = { dx: Math.cos(angle) * radius, dy: Math.sin(angle) * radius }
+    }
+    if (ring === 0) customize = { dx: 0, dy: radius }
+    start += count
+  }
+  return { positions, customize }
+}
+
 function quickKey(combo: string, label: string): QuickKey {
   const data = encodeCombo(combo)
   if (data === null) throw new Error(`invalid default quick key combo: ${combo}`)

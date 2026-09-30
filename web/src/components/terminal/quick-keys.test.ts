@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 import {
+  BASE_RING_RADIUS_PX,
   DEFAULT_QUICK_KEYS,
   describeData,
   encodeCombo,
   formatCombo,
+  layoutRing,
   moveQuickKey,
   parseCombo,
 } from './quick-keys'
@@ -85,6 +87,46 @@ describe('moveQuickKey', () => {
   it('returns the same list for no-op moves', () => {
     expect(moveQuickKey(DEFAULT_QUICK_KEYS, 1, 1)).toBe(DEFAULT_QUICK_KEYS)
     expect(moveQuickKey(DEFAULT_QUICK_KEYS, 0, 99)).toBe(DEFAULT_QUICK_KEYS)
+  })
+})
+
+describe('layoutRing', () => {
+  const distance = (a: { dx: number; dy: number }, b: { dx: number; dy: number }) =>
+    Math.hypot(a.dx - b.dx, a.dy - b.dy)
+
+  it('reserves the bottom slot for customize and starts keys next to it', () => {
+    const layout = layoutRing(4, 400)
+    expect(layout.customize).toEqual({ dx: 0, dy: BASE_RING_RADIUS_PX })
+    // First key sits counter-clockwise from customize: lower-left quadrant.
+    expect(layout.positions[0].dx).toBeLessThan(0)
+    expect(layout.positions[0].dy).toBeGreaterThan(0)
+    // Last key reaches the top of the arc.
+    const last = layout.positions[3]
+    expect(last.dy).toBeCloseTo(-BASE_RING_RADIUS_PX, 3)
+    expect(Math.abs(last.dx)).toBeLessThan(1e-12)
+  })
+
+  it('spills onto a second ring when keys do not fit the first', () => {
+    const layout = layoutRing(12, 500)
+    expect(layout.positions).toHaveLength(12)
+    const inner = layout.positions.filter((p) => Math.hypot(p.dx, p.dy) < 100)
+    expect(inner.length).toBeGreaterThan(0)
+    expect(inner.length).toBeLessThan(12)
+    // Neighboring keys keep a tappable distance everywhere.
+    for (let i = 1; i < layout.positions.length; i += 1) {
+      expect(distance(layout.positions[i - 1], layout.positions[i])).toBeGreaterThanOrEqual(50)
+    }
+  })
+
+  it('places every key even when the radius is heavily clamped', () => {
+    const layout = layoutRing(10, 80)
+    expect(layout.positions).toHaveLength(10)
+  })
+
+  it('handles an empty list', () => {
+    const layout = layoutRing(0, 400)
+    expect(layout.positions).toEqual([])
+    expect(layout.customize.dy).toBe(BASE_RING_RADIUS_PX)
   })
 })
 
