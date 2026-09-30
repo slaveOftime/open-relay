@@ -5,10 +5,41 @@ import { Input } from '@/components/ui/input'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 import { getQuickKeys, resetQuickKeys, setQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
-import { describeData, encodeCombo, formatCombo, moveQuickKey, type QuickKey } from './quick-keys'
+import { describeData, encodeCombo, formatCombo, moveQuickKey, nextQuickKeyColor, QUICK_KEY_COLORS, type QuickKey } from './quick-keys'
 
 /** Fixed row height (h-14) + vertical margin (mb-2) used for drag math. */
 const ROW_STRIDE_PX = 64
+
+function Swatch({
+  color,
+  selected,
+  onSelect,
+  label,
+}: {
+  color: string | undefined
+  selected: boolean
+  onSelect: (color: string | undefined) => void
+  label: string
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      aria-label={label}
+      onClick={() => onSelect(color)}
+      style={color ? { color } : undefined}
+      className={cn(
+        'flex h-8 w-8 shrink-0 items-center justify-center rounded-full border font-mono text-[11px] font-bold leading-none',
+        selected
+          ? 'border-[hsl(var(--ring))] bg-[hsl(var(--accent))]'
+          : 'border-[hsl(var(--border))] bg-[hsl(var(--muted))]'
+      )}
+    >
+      A
+    </button>
+  )
+}
 
 interface DragState {
   id: string
@@ -27,6 +58,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
   const keys = useSyncExternalStore(subscribeQuickKeys, getQuickKeys)
   const [combo, setCombo] = useState('')
   const [label, setLabel] = useState('')
+  const [color, setColor] = useState<string | undefined>(undefined)
   const dragRef = useRef<DragState | null>(null)
   const [dragView, setDragView] = useState<{ id: string; delta: number } | null>(null)
 
@@ -41,10 +73,25 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
       label: (label.trim() || formatCombo(trimmed)).slice(0, 4),
       data,
       combo: trimmed.toLowerCase(),
+      ...(color ? { color } : {}),
     }
     setQuickKeys([...getQuickKeys(), key])
     setCombo('')
     setLabel('')
+    setColor(undefined)
+  }
+
+  function handleColorCycle(id: string) {
+    setQuickKeys(
+      getQuickKeys().map((key) => {
+        if (key.id !== id) return key
+        const next = nextQuickKeyColor(key.color)
+        if (next) return { ...key, color: next }
+        const rest = { ...key }
+        delete rest.color
+        return rest
+      })
+    )
   }
 
   function handleRemove(id: string) {
@@ -125,9 +172,18 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
                 >
                   <GripVertical className="h-4 w-4" />
                 </button>
-                <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] font-mono text-[10px] font-semibold leading-none">
+                <button
+                  type="button"
+                  aria-label={`Change color of ${key.label} (current: ${key.color ?? 'default'}), tap to cycle`}
+                  onClick={() => handleColorCycle(key.id)}
+                  style={key.color ? { color: key.color } : undefined}
+                  className={cn(
+                    'flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] font-mono text-[10px] font-semibold leading-none',
+                    !key.color && 'text-[hsl(var(--foreground))]'
+                  )}
+                >
                   {key.label}
-                </span>
+                </button>
                 <span className="flex min-w-0 flex-col gap-0.5">
                   <span className="truncate text-xs font-medium">{formatCombo(key.combo)}</span>
                   <span className="truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
@@ -170,6 +226,23 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
               aria-label="Button label"
               maxLength={4}
             />
+          </div>
+          <div className="flex items-center gap-1.5" role="radiogroup" aria-label="Label color">
+            <Swatch
+              color={undefined}
+              selected={color === undefined}
+              onSelect={setColor}
+              label="Default color"
+            />
+            {QUICK_KEY_COLORS.map((option) => (
+              <Swatch
+                key={option}
+                color={option}
+                selected={color === option}
+                onSelect={setColor}
+                label={`Color ${option}`}
+              />
+            ))}
           </div>
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">

@@ -17,6 +17,9 @@ export interface StoragePort {
 function isQuickKey(value: unknown): value is QuickKey {
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
+  const colorOk =
+    record.color === undefined ||
+    (typeof record.color === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(record.color))
   return (
     typeof record.id === 'string' &&
     record.id !== '' &&
@@ -24,7 +27,8 @@ function isQuickKey(value: unknown): value is QuickKey {
     record.label !== '' &&
     typeof record.data === 'string' &&
     record.data !== '' &&
-    typeof record.combo === 'string'
+    typeof record.combo === 'string' &&
+    colorOk
   )
 }
 
@@ -36,7 +40,9 @@ export function normalizeQuickKeys(raw: unknown): QuickKey[] | null {
     if (!isQuickKey(entry)) return null
     if (seen.has(entry.id)) return null
     seen.add(entry.id)
-    keys.push({ id: entry.id, label: entry.label, data: entry.data, combo: entry.combo })
+    const key: QuickKey = { id: entry.id, label: entry.label, data: entry.data, combo: entry.combo }
+    if (entry.color !== undefined) key.color = entry.color
+    keys.push(key)
   }
   return keys
 }

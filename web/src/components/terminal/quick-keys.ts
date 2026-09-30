@@ -15,6 +15,28 @@ export interface QuickKey {
   data: string
   /** Combo the key was created from, shown in the editor ("ctrl+c"). */
   combo: string
+  /** Optional CSS hex color for the button label; unset = theme foreground. */
+  color?: string
+}
+
+/** Label colors offered in the editor, in tap-to-cycle order. */
+export const QUICK_KEY_COLORS: string[] = [
+  '#ef4444', // red
+  '#f97316', // orange
+  '#eab308', // yellow
+  '#22c55e', // green
+  '#06b6d4', // cyan
+  '#3b82f6', // blue
+  '#a855f7', // purple
+  '#ec4899', // pink
+]
+
+/** Next color when cycling through swatches; undefined loops back to none. */
+export function nextQuickKeyColor(current?: string): string | undefined {
+  if (!current) return QUICK_KEY_COLORS[0]
+  const index = QUICK_KEY_COLORS.indexOf(current)
+  if (index === -1 || index === QUICK_KEY_COLORS.length - 1) return undefined
+  return QUICK_KEY_COLORS[index + 1]
 }
 
 const MODIFIER_ALIASES: Record<string, 'ctrl' | 'shift' | 'alt'> = {

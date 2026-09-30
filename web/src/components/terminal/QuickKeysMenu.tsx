@@ -72,6 +72,9 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
     transitionDelay: `${index * stagger}ms`,
   })
 
+  const labelStyle = (color?: string): CSSProperties | undefined =>
+    color ? { color } : undefined
+
   return (
     // The rings are centered on the pad button (wrapper center); the root
     // itself ignores pointers so the pad underneath stays draggable.
@@ -86,12 +89,12 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
             onSend(key)
             onClose()
           }}
-          style={popStyle(positions[index].dx, positions[index].dy, index)}
+          style={{ ...popStyle(positions[index].dx, positions[index].dy, index), ...labelStyle(key.color) }}
           className={cn(
             'pointer-events-auto absolute left-1/2 top-1/2 flex h-11 w-11 touch-none select-none',
             'items-center justify-center rounded-full border border-[hsl(var(--border))]',
             'bg-[hsl(var(--card))]/95 font-mono text-[10px] font-semibold leading-none',
-            'text-[hsl(var(--foreground))] shadow-lg backdrop-blur-sm',
+            'text-[hsl(var(--foreground))] shadow-xl backdrop-blur-sm',
             'transition-[transform,opacity] active:opacity-70'
           )}
         >
@@ -109,7 +112,7 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
         className={cn(
           'pointer-events-auto absolute left-1/2 top-1/2 flex h-11 w-11 touch-none select-none',
           'items-center justify-center rounded-full border border-dashed border-[hsl(var(--border))]',
-          'bg-[hsl(var(--muted))]/95 text-[hsl(var(--muted-foreground))] shadow-lg backdrop-blur-sm',
+          'bg-[hsl(var(--muted))]/95 text-[hsl(var(--muted-foreground))] shadow-xl backdrop-blur-sm',
           'transition-[transform,opacity] active:opacity-70'
         )}
       >
