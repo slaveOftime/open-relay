@@ -42,14 +42,14 @@ import {
   type SessionPageEventContext,
   type SessionPageEventHandlers,
 } from './sessions-page-events'
-import { nodeAfterSwipe, pullDragOffset, shouldRefreshOnPull, swipeDragOffset } from './sessions-node-swipe'
-import { NodeSelector } from '@/components/NodeSelector'
 import {
-  agentName,
-  formatByteSize,
-  formatTimestamp,
-  sessionDisplayName,
-} from '@/utils/format'
+  nodeAfterSwipe,
+  pullDragOffset,
+  shouldRefreshOnPull,
+  swipeDragOffset,
+} from './sessions-node-swipe'
+import { NodeSelector } from '@/components/NodeSelector'
+import { agentName, formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
 import {
   loadPinnedSessionKeys,
   orderSessionPage,
@@ -748,7 +748,7 @@ const SessionCard = memo(function SessionCard({
   onRequestDelete,
   notificationsPending,
   node,
-  showCwd
+  showCwd,
 }: {
   session: SessionSummary
   animateIn?: boolean
@@ -780,20 +780,22 @@ const SessionCard = memo(function SessionCard({
       ? 'opacity-60'
       : ''
 
-  const deleteButton = <Tooltip>
-    <TooltipTrigger asChild>
-      <Button
-        variant="kill"
-        size="icon"
-        className="shrink-0"
-        onClick={() => onRequestDelete(session)}
-        aria-label="Delete session"
-      >
-        <TrashIcon className="h-4 w-4" />
-      </Button>
-    </TooltipTrigger>
-    <TooltipContent>Delete session</TooltipContent>
-  </Tooltip>;
+  const deleteButton = (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="kill"
+          size="icon"
+          className="shrink-0"
+          onClick={() => onRequestDelete(session)}
+          aria-label="Delete session"
+        >
+          <TrashIcon className="h-4 w-4" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>Delete session</TooltipContent>
+    </Tooltip>
+  )
 
   function openSession(mode: 'attach' | 'logs') {
     navigate(buildSessionHref(session.id, mode, node))
@@ -832,7 +834,9 @@ const SessionCard = memo(function SessionCard({
               <CommandLogo command={session.command} size={36} />
               <div className="min-w-0 flex-1 line-clamp-5 break-all">
                 {session.title?.trim() && (
-                  <span className="block leading-4 text-[hsl(var(--primary))]">{session.title.trim()}</span>
+                  <span className="block leading-4 text-[hsl(var(--primary))]">
+                    {session.title.trim()}
+                  </span>
                 )}
                 <span className="block leading-4">{sessionDisplayName(session)}</span>
               </div>
@@ -853,7 +857,7 @@ const SessionCard = memo(function SessionCard({
               </div>
             )}
           </div>
-          
+
           {/* Row 4: activity sparkline */}
           {session.status === 'running' && (
             <div className="pt-1 w-full opacity-20 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
@@ -1201,6 +1205,42 @@ export default function SessionsPage() {
     [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
   )
 
+  // The primary's SSE carries session_updated events for every connected
+  // node through the join-WS forwarder, but in practice the per-byte churn
+  // on a secondary doesn't always reach the forwarder. Re-pull summaries for
+  // the currently-selected remote node so the sparklines refresh without
+  // requiring the user to tap the reload button.
+  useEffect(() => {
+    if (!selectedNode) return
+    let stopped = false
+    const tick = async () => {
+      if (stopped || !isMounted.current || selectedNodeRef.current !== selectedNode) return
+      try {
+        const params: ListParams = {
+          search: search || undefined,
+          status: statusFilter === 'all' ? undefined : statusFilter,
+          limit: PAGE_SIZE,
+          offset: page * PAGE_SIZE,
+          sort: sortField,
+          order: sortOrder,
+          node: selectedNode,
+        }
+        const res = await fetchSessions(params)
+        if (stopped || !isMounted.current || selectedNodeRef.current !== selectedNode) return
+        // Pipe straight into the activity store; the SessionsPage rows are
+        // already accurate, so we don't want to overwrite their state.
+        ingestSessionSummaries(res.items)
+      } catch {
+        /* swallow — the next tick retries */
+      }
+    }
+    const id = window.setInterval(tick, 2500)
+    return () => {
+      stopped = true
+      window.clearInterval(id)
+    }
+  }, [page, search, selectedNode, sortField, sortOrder, statusFilter])
+
   const reloadSessions = useCallback(
     async (opts?: LoadOptions) => {
       void fetchNodes()
@@ -1448,13 +1488,16 @@ export default function SessionsPage() {
     return pinnedKeySet.has(sessionPinKey(session.id, selectedNode))
   }
 
-  const handleTogglePin = useCallback((session: SessionSummary) => {
-    if (!sessionIsPinnable(session)) return
-    const key = sessionPinKey(session.id, selectedNode)
-    setPinnedKeys((prev) =>
-      prev.includes(key) ? prev.filter((entry) => entry !== key) : [key, ...prev]
-    )
-  }, [selectedNode])
+  const handleTogglePin = useCallback(
+    (session: SessionSummary) => {
+      if (!sessionIsPinnable(session)) return
+      const key = sessionPinKey(session.id, selectedNode)
+      setPinnedKeys((prev) =>
+        prev.includes(key) ? prev.filter((entry) => entry !== key) : [key, ...prev]
+      )
+    },
+    [selectedNode]
+  )
 
   function handleNodeChange(node: string | null) {
     if (node === selectedNode) return
@@ -1495,14 +1538,17 @@ export default function SessionsPage() {
         : 'none'
     content.style.transition = transition
     content.style.transform = `translate3d(${x}px, ${y}px, 0)`
-    content.style.opacity = String(1 - Math.abs(x) / 48 * 0.12)
+    content.style.opacity = String(1 - (Math.abs(x) / 48) * 0.12)
     if (indicator) {
       indicator.style.transition = transition
       const indicatorOpacity =
         pullRefreshingRef.current || (reducedMotion && pulling) ? 1 : Math.min(1, y / 48)
       indicator.style.opacity = String(indicatorOpacity)
       indicator.style.transform = reducedMotion ? 'none' : `translateY(${Math.min(y - 48, 0)}px)`
-      indicator.setAttribute('aria-hidden', !pulling && !pullRefreshingRef.current ? 'true' : 'false')
+      indicator.setAttribute(
+        'aria-hidden',
+        !pulling && !pullRefreshingRef.current ? 'true' : 'false'
+      )
       indicator
         .querySelector('svg')
         ?.classList.toggle('animate-spin', pullRefreshingRef.current && !reducedMotion)
@@ -1556,7 +1602,9 @@ export default function SessionsPage() {
     const x = event.touches[0].clientX
     const interactive =
       target instanceof Element &&
-      target.closest('[data-node-swipe-ignore], button, a, input, textarea, select, [role="button"]')
+      target.closest(
+        '[data-node-swipe-ignore], button, a, input, textarea, select, [role="button"]'
+      )
     if (x < 24 || x > window.innerWidth - 24 || interactive) return
     const canPull =
       !loading &&
@@ -1610,41 +1658,52 @@ export default function SessionsPage() {
     void reloadSessions({ background: true })
   }
 
-  const handleStop = useCallback(async (id: string) => {
-    await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
-    if (selectedNode) void loadRemote()
-  }, [loadRemote, selectedNode])
+  const handleStop = useCallback(
+    async (id: string) => {
+      await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
+      if (selectedNode) void loadRemote()
+    },
+    [loadRemote, selectedNode]
+  )
 
-  const handleKill = useCallback(async (id: string) => {
-    await killSession(id, selectedNode ?? undefined).catch(() => {})
-    if (selectedNode) void loadRemote()
-  }, [loadRemote, selectedNode])
+  const handleKill = useCallback(
+    async (id: string) => {
+      await killSession(id, selectedNode ?? undefined).catch(() => {})
+      if (selectedNode) void loadRemote()
+    },
+    [loadRemote, selectedNode]
+  )
 
-  const handleToggleNotifications = useCallback(async (session: SessionSummary) => {
-    const isRunning =
-      session.status === 'running' || session.status === 'stopping' || session.status === 'created'
-    if (!isRunning) return
+  const handleToggleNotifications = useCallback(
+    async (session: SessionSummary) => {
+      const isRunning =
+        session.status === 'running' ||
+        session.status === 'stopping' ||
+        session.status === 'created'
+      if (!isRunning) return
 
-    const nextEnabled = !session.notifications_enabled
-    setNotificationRequestIds((prev) => new Set(prev).add(session.id))
-    setLoadedSessionNotifications(session.id, nextEnabled)
+      const nextEnabled = !session.notifications_enabled
+      setNotificationRequestIds((prev) => new Set(prev).add(session.id))
+      setLoadedSessionNotifications(session.id, nextEnabled)
 
-    try {
-      await setSessionNotifications(session.id, nextEnabled, selectedNode ?? undefined)
-    } catch (error) {
-      setLoadedSessionNotifications(session.id, session.notifications_enabled)
-      setLoadError({
-        title: nextEnabled ? 'Failed to enable notifications' : 'Failed to disable notifications',
-        message: getErrorMessage(error, 'Failed to update session notifications.'),
-      })
-    } finally {
-      setNotificationRequestIds((prev) => {
-        const next = new Set(prev)
-        next.delete(session.id)
-        return next
-      })
-    }
-  }, [selectedNode, setLoadedSessionNotifications])
+      try {
+        await setSessionNotifications(session.id, nextEnabled, selectedNode ?? undefined)
+      } catch (error) {
+        setLoadedSessionNotifications(session.id, session.notifications_enabled)
+        setLoadError({
+          title: nextEnabled ? 'Failed to enable notifications' : 'Failed to disable notifications',
+          message: getErrorMessage(error, 'Failed to update session notifications.'),
+        })
+      } finally {
+        setNotificationRequestIds((prev) => {
+          const next = new Set(prev)
+          next.delete(session.id)
+          return next
+        })
+      }
+    },
+    [selectedNode, setLoadedSessionNotifications]
+  )
 
   const totalPages = Math.ceil(total / PAGE_SIZE)
   const pageTitle = sessionPageTitle(selectedNode)
@@ -2121,7 +2180,10 @@ export default function SessionsPage() {
                 sessions.length === 0 &&
                 Array.from({ length: 5 }).map((_, i) => <SkeletonCard key={i} />)}
               {!loading && sessions.length === 0 && (
-                <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
+                <EmptyState
+                  selectedNode={selectedNode}
+                  onNewSession={() => setShowNewSession(true)}
+                />
               )}
               {!loading && sessions.length > 0 && (
                 <div className="pb-4">
@@ -2129,7 +2191,7 @@ export default function SessionsPage() {
                     <div key={key || '__flat__'}>
                       {groupBy !== 'none' && key && (
                         <div className="flex flex-nowrap gap-1 items-center px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10">
-                          <CaretDownIcon className='h-4 w-4 shrink-0' />
+                          <CaretDownIcon className="h-4 w-4 shrink-0" />
                           <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                         </div>
                       )}
@@ -2148,7 +2210,7 @@ export default function SessionsPage() {
                           onRequestDelete={setDeletingSession}
                           notificationsPending={notificationRequestIds.has(s.id)}
                           node={selectedNode ?? undefined}
-                          showCwd={groupBy !== "cwd"}
+                          showCwd={groupBy !== 'cwd'}
                         />
                       ))}
                     </div>
@@ -2257,8 +2319,8 @@ export default function SessionsPage() {
                           colSpan={orderedTableColumns.length}
                           className="px-2 py-1 text-xs text-[hsl(var(--muted-foreground))] font-medium bg-[hsl(var(--primary))]/10"
                         >
-                          <div className='flex items-center gap-1'>
-                            <CaretDownIcon className='h-4 w-4' /> 
+                          <div className="flex items-center gap-1">
+                            <CaretDownIcon className="h-4 w-4" />
                             <GroupHeaderLabel groupBy={groupBy} keyLabel={key} items={items} />
                           </div>
                         </TableCell>
