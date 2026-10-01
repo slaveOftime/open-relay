@@ -9,10 +9,10 @@
 //!      `ScanStart`, `scan_impl`, `outcome`, `ReadPiece`,
 //!      `read_exact_or_partial`).
 //!
-//! No body code was rewritten in S1.5/S1.6. P2.2 then rewrote the
-//! payload-validation path inside `scan_impl` to stream-check the CRC
-//! over a 1 MiB scratch buffer before allocating the payload Vec, so a
-//! corrupt-but-valid header never forces a 64 MiB allocation.
+//! No body code was rewritten in S1.5/S1.6. P2.2 rewrote the
+//! payload-validation path inside `scan_impl` to stream-check large
+//! payloads over a 1 MiB scratch buffer before allocating the retained
+//! payload Vec, so corrupt-but-valid headers do not force a 64 MiB allocation.
 //!
 //! Visibility widened to `pub(crate)` on items reached from sibling
 //! submodules (`stream`, `segment`, `appender`, `open`) and from
@@ -31,13 +31,16 @@ use super::{
     RecordKind,
 }; // used as field type at line 159 (cfg(test) for index_entries.push)
 
-/// Chunk size used to CRC-validate payloads that a scan does not retain
-/// (out-of-window records and `Stats` scans). A corrupt-but-valid header
-/// claiming a 64 MiB payload is validated without materialising it, and
-/// the scratch lives on the heap (a 1 MiB stack array overflowed the
-/// CLI's 1 MiB main-thread stack on Windows). Retained records are
-/// read exactly once and CRC-checked in place.
+/// Chunk size used to CRC-validate payloads before materialising them.
+/// A corrupt-but-valid header claiming a 64 MiB payload is validated
+/// without allocating that payload, and the scratch lives on the heap (a
+/// 1 MiB stack array overflowed the CLI's 1 MiB main-thread stack on
+/// Windows).
 pub(crate) const SCAN_HASH_WINDOW: usize = 1024 * 1024;
+
+/// Avoid a second pass for the common small retained records while
+/// keeping CRC failures from forcing large allocations.
+const SCAN_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Read-side buffering for segment scans: record headers are 36 bytes
 /// and payloads are typically kilobytes, so unbuffered reads issue one
@@ -291,13 +294,11 @@ pub(crate) fn scan_impl(
             stop!(ScanStop::CleanEof);
         }
 
-        // Validate the stored CRC exactly once per payload. Records the
-        // scan retains are read once into their final `Vec` and hashed in
-        // place; records it skips (out-of-window, `Stats`, `Index`) are
-        // hashed through a bounded heap scratch and never materialised.
-        // The header's `payload_len` is already capped by
-        // `MAX_PAYLOAD_LEN` (checked above), so the retained allocation
-        // is bounded regardless of what a corrupt header claims.
+        // Retain small records in one read. For larger retained records,
+        // validate the CRC through bounded scratch first, then seek back
+        // and materialise only after the CRC passes. This preserves the
+        // corrupt-payload memory bound without reintroducing a seek for
+        // every ordinary PTY record.
         let keep = match &mode {
             ScanMode::Window(window) => seq >= window.from_seq,
             #[cfg(test)]
@@ -306,50 +307,55 @@ pub(crate) fn scan_impl(
             ScanMode::Index => false,
             ScanMode::Stats => false,
         };
+        let stored_crc = u32::from_le_bytes(header[32..36].try_into().unwrap());
+        let inline_keep = keep && payload_len as usize <= SCAN_INLINE_PAYLOAD_BYTES;
         let mut hasher = Crc32::new();
         // The stored CRC covers `header[..32] + payload` (see
-        // `encode_record_header`). Mix the header into the streaming
-        // hash so a CRC mismatch here really means "the bytes on disk
-        // disagree with what the header declared", not "we forgot
-        // 32 bytes".
+        // `encode_record_header`). Mix the header into the streaming hash.
         hasher.update(&header[..32]);
-        let payload = if keep {
+        let payload = if inline_keep {
             let mut payload = vec![0u8; payload_len as usize];
             match read_exact_or_partial(&mut file, &mut payload)? {
                 ReadPiece::Complete => {}
-                // A short read on a payload that hasn't finished is a
-                // torn tail by definition: the record claims more bytes
-                // than the segment holds.
                 ReadPiece::Partial | ReadPiece::Empty => stop!(ScanStop::PartialTail),
             }
             hasher.update(&payload);
+            if hasher.finish() != stored_crc {
+                stop!(ScanStop::CrcMismatch);
+            }
             payload
         } else {
             let scratch = crc_scratch.get_or_insert_with(|| vec![0u8; SCAN_HASH_WINDOW]);
             let mut remaining = payload_len as usize;
-            let mut torn_tail = false;
             while remaining > 0 {
                 let want = scratch.len().min(remaining);
                 match read_exact_or_partial(&mut file, &mut scratch[..want])? {
                     ReadPiece::Complete => {}
-                    ReadPiece::Partial | ReadPiece::Empty => torn_tail = true,
-                }
-                if torn_tail {
-                    break;
+                    ReadPiece::Partial | ReadPiece::Empty => stop!(ScanStop::PartialTail),
                 }
                 hasher.update(&scratch[..want]);
                 remaining -= want;
             }
-            if torn_tail {
-                stop!(ScanStop::PartialTail);
+            if hasher.finish() != stored_crc {
+                stop!(ScanStop::CrcMismatch);
             }
-            Vec::new()
+            if keep {
+                // Large retained payloads are materialised only after CRC
+                // validation. The bounded BufReader makes the reread
+                // sequential apart from this one seek per large record.
+                file.seek(SeekFrom::Start(offset + HEADER_LEN as u64))?;
+                let mut payload = vec![0u8; payload_len as usize];
+                match read_exact_or_partial(&mut file, &mut payload)? {
+                    ReadPiece::Complete => {}
+                    ReadPiece::Partial | ReadPiece::Empty => {
+                        stop!(ScanStop::PartialTail)
+                    }
+                }
+                payload
+            } else {
+                Vec::new()
+            }
         };
-
-        let stored_crc = u32::from_le_bytes(header[32..36].try_into().unwrap());
-        if hasher.finish() != stored_crc {
-            stop!(ScanStop::CrcMismatch);
-        }
 
         if let Some(expected) = expected_seq
             && seq != expected

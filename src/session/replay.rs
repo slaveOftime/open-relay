@@ -29,10 +29,9 @@ use crate::protocol::LogResize;
 /// independent, so batch size never affects the derived stream.
 const REPLAY_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
-/// How far past `from_offset` a resize-history derivation scans. Resizes
-/// further ahead cannot affect a bounded render window, so the scan stays
-/// bounded even for arbitrarily long-lived sessions (PLAN §5.3).
-const MAX_RESIZE_EVENTS_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum filtered-stream lookahead included in resize history for a tail.
+/// Resizes further ahead cannot affect a bounded render window (PLAN §5.3).
+pub(crate) const MAX_RESIZE_EVENTS_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolve the replay anchor for a target filtered offset: the newest
 /// anchored (v2, scanner-idle) checkpoint at or before the target, or no
@@ -67,19 +66,21 @@ fn replay_stream(
     }
 }
 
-/// Anchored checkpoint offsets of the latest incarnation, ascending.
-/// `oly logs` uses these to bound tail replays (PLAN §5.3).
-pub fn replay_anchors(session_dir: &Path) -> io::Result<Vec<u64>> {
+/// Anchors of the latest incarnation, ascending by filtered offset.
+/// `oly logs` reuses these records to avoid rescanning the journal for each
+/// candidate tail start (PLAN §5.3).
+pub(crate) fn replay_anchors(session_dir: &Path) -> io::Result<Vec<CheckpointAnchor>> {
     let Some(incarnation) = latest_incarnation(session_dir)? else {
         return Ok(Vec::new());
     };
-    let mut offsets: Vec<u64> = journal::checkpoint_anchors(session_dir, incarnation)?
+    let mut anchors: Vec<_> = journal::checkpoint_anchors(session_dir, incarnation)?
         .into_iter()
         .filter(|anchor| anchor.filtered_offset > 0)
-        .map(|anchor| anchor.filtered_offset)
         .collect();
-    offsets.sort_unstable();
-    Ok(offsets)
+    // Stable ordering preserves journal order for duplicate offsets, so the
+    // latest checkpoint at an equal offset is considered first by callers.
+    anchors.sort_by_key(|anchor| anchor.filtered_offset);
+    Ok(anchors)
 }
 
 /// Latest journal incarnation for a session directory, if any.
@@ -211,9 +212,10 @@ pub fn filtered_stream_from(session_dir: &Path, from_offset: u64) -> io::Result<
 /// [`filtered_stream_from`] + [`resize_events_from`]).
 ///
 /// Resize offsets are absolute filtered-stream offsets, exactly like
-/// [`resize_events_from`]'s. Unlike [`resize_events_from`] the resize
-/// scan is bounded by the stream pass itself (it stops where the bytes
-/// stop), which for the render path is exactly the window it needs.
+/// [`resize_events_from`]'s. The caller can trim the returned history to
+/// the bounded resize window relevant to its tail, matching
+/// [`resize_events_from`]'s 64 MiB forward-scan policy.
+#[cfg(test)]
 pub fn filtered_stream_and_resizes_from(
     session_dir: &Path,
     from_offset: u64,
@@ -230,7 +232,40 @@ pub fn filtered_stream_and_resizes_from(
         return Ok((Vec::new(), 0, Vec::new()));
     };
 
-    let (mut stream, mut filtered_pos) = replay_stream(session_dir, incarnation, from_offset)?;
+    let (stream, filtered_pos) = replay_stream(session_dir, incarnation, from_offset)?;
+    derive_stream_and_resizes(stream, filtered_pos, from_offset)
+}
+
+/// Derive a stream from an already-discovered checkpoint anchor. The anchor
+/// is reused only while it still belongs to the latest incarnation; if the
+/// session restarted after discovery, replay safely falls back to its start.
+pub(crate) fn filtered_stream_and_resizes_from_anchor(
+    session_dir: &Path,
+    from_offset: u64,
+    anchor: Option<&CheckpointAnchor>,
+) -> io::Result<(Vec<u8>, u64, Vec<LogResize>, u64)> {
+    let Some(incarnation) = latest_incarnation(session_dir)? else {
+        return Ok((Vec::new(), 0, Vec::new(), 0));
+    };
+    let stale_anchor = anchor.is_some_and(|anchor| anchor.cursor.incarnation != incarnation);
+    let from_offset = if stale_anchor { 0 } else { from_offset };
+    let anchor = anchor.filter(|anchor| anchor.cursor.incarnation == incarnation);
+    let (stream, filtered_pos) = match anchor {
+        Some(anchor) => (
+            SegmentStream::open_at(session_dir, incarnation, anchor)?,
+            anchor.filtered_offset,
+        ),
+        None => (SegmentStream::open(session_dir, incarnation)?, 0),
+    };
+    let (bytes, end, resizes) = derive_stream_and_resizes(stream, filtered_pos, from_offset)?;
+    Ok((bytes, end, resizes, from_offset))
+}
+
+fn derive_stream_and_resizes(
+    mut stream: SegmentStream,
+    mut filtered_pos: u64,
+    from_offset: u64,
+) -> io::Result<(Vec<u8>, u64, Vec<LogResize>)> {
     let mut scanner = PtyScanner::new();
     let mut out = ScanOut::default();
     let mut collected: Vec<u8> = Vec::new();
@@ -495,6 +530,203 @@ mod tests {
         assert_eq!(end3, 16);
         assert!(empty.is_empty());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn combined_stream_and_resize_replay_matches_separate_derivations() {
+        let dir = journal_dir("combined");
+        {
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"abc"))
+                .unwrap();
+            journal.record_resize(24, 80).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"defgh"))
+                .unwrap();
+            journal.record_resize(30, 100).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"ij"))
+                .unwrap();
+            flush(&mut journal, 5);
+        }
+
+        let (bytes, end, resizes) = filtered_stream_and_resizes_from(&dir, 0).unwrap();
+        assert_eq!(bytes, b"abcdefghij");
+        assert_eq!(end, 10);
+        assert_eq!(
+            resizes,
+            vec![
+                LogResize {
+                    offset: 3,
+                    rows: 24,
+                    cols: 80,
+                },
+                LogResize {
+                    offset: 8,
+                    rows: 30,
+                    cols: 100,
+                },
+            ]
+        );
+
+        let (tail, end, tail_resizes) = filtered_stream_and_resizes_from(&dir, 4).unwrap();
+        assert_eq!(tail, b"efghij");
+        assert_eq!(end, 10);
+        assert_eq!(tail_resizes, resize_events_from(&dir, 4).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn combined_replay_preserves_resize_history_across_multiple_anchors() {
+        let dir = journal_dir("combined_anchors");
+        {
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"aa"))
+                .unwrap();
+            journal.record_resize(24, 80).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"bb"))
+                .unwrap();
+            journal
+                .record_checkpoint(&journal::Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: 4,
+                    program: bytes::Bytes::from_static(b"restore"),
+                })
+                .unwrap();
+            journal.record_resize(30, 100).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"cc"))
+                .unwrap();
+            journal.record_resize(40, 120).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"dd"))
+                .unwrap();
+            journal
+                .record_checkpoint(&journal::Checkpoint {
+                    rows: 40,
+                    cols: 120,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: 8,
+                    program: bytes::Bytes::from_static(b"restore"),
+                })
+                .unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"ee"))
+                .unwrap();
+            journal.record_resize(50, 140).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"ff"))
+                .unwrap();
+            flush(&mut journal, 12);
+        }
+
+        let anchors = replay_anchors(&dir).unwrap();
+        assert_eq!(
+            anchors
+                .iter()
+                .map(|anchor| anchor.filtered_offset)
+                .collect::<Vec<_>>(),
+            vec![4, 8]
+        );
+        for anchor in &anchors {
+            let offset = anchor.filtered_offset;
+            let (bytes, end, resizes, replay_start) =
+                filtered_stream_and_resizes_from_anchor(&dir, offset, Some(anchor)).unwrap();
+            assert_eq!(replay_start, offset);
+            assert_eq!(end, 12);
+            assert_eq!(bytes, b"aabbccddeeff"[offset as usize..]);
+            assert_eq!(resizes, resize_events_from(&dir, offset).unwrap());
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_anchors_keep_journal_order_for_duplicate_offsets() {
+        let dir = journal_dir("duplicate_anchor_offsets");
+        {
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            journal
+                .record_output(bytes::Bytes::from_static(b"prefix"))
+                .unwrap();
+            for _ in 0..2 {
+                journal
+                    .record_checkpoint(&journal::Checkpoint {
+                        rows: 24,
+                        cols: 80,
+                        cursor: (1, 1),
+                        alt_screen: false,
+                        app_cursor_keys: false,
+                        bracketed_paste: false,
+                        filtered_offset: 6,
+                        program: bytes::Bytes::from_static(b"restore"),
+                    })
+                    .unwrap();
+            }
+            journal
+                .record_output(bytes::Bytes::from_static(b"tail"))
+                .unwrap();
+            flush(&mut journal, 4);
+        }
+
+        let anchors = replay_anchors(&dir).unwrap();
+        assert_eq!(anchors.len(), 2);
+        assert_eq!(anchors[0].filtered_offset, 6);
+        assert_eq!(anchors[1].filtered_offset, 6);
+        assert!(anchors[0].cursor.seq < anchors[1].cursor.seq);
+
+        let (bytes, end, _, start) =
+            filtered_stream_and_resizes_from_anchor(&dir, 6, Some(&anchors[1])).unwrap();
+        assert_eq!(bytes, b"tail");
+        assert_eq!(end, 10);
+        assert_eq!(start, 6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn explicit_replay_anchor_matches_discovered_anchor_and_ignores_stale_incarnations() {
+        let dir = journaled_stream_with_checkpoints(
+            "explicit_anchor",
+            &[b"aaaa", b"bbbb", b"cccc"],
+            &[(2, 8)],
+        );
+        let anchors = replay_anchors(&dir).unwrap();
+        assert_eq!(anchors.len(), 1);
+        let (expected, expected_end, expected_resizes) =
+            filtered_stream_and_resizes_from(&dir, 8).unwrap();
+        let (actual, actual_end, actual_resizes, actual_start) =
+            filtered_stream_and_resizes_from_anchor(&dir, 8, Some(&anchors[0])).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual_end, expected_end);
+        assert_eq!(actual_resizes, expected_resizes);
+        assert_eq!(actual_start, 8);
+
+        // Reopening creates a new incarnation; a stale anchor must never be
+        // used to skip the new incarnation's prefix.
+        {
+            let (mut journal, incarnation, _) = ShadowJournal::open(&dir).unwrap();
+            assert_eq!(incarnation, 2);
+            journal
+                .record_output(bytes::Bytes::from_static(b"fresh"))
+                .unwrap();
+            flush(&mut journal, 1);
+        }
+        let (fresh, end, _, fresh_start) =
+            filtered_stream_and_resizes_from_anchor(&dir, 8, Some(&anchors[0])).unwrap();
+        assert_eq!(fresh, b"fresh");
+        assert_eq!(end, 5);
+        assert_eq!(fresh_start, 0, "stale offset must be reset on restart");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -25,6 +25,11 @@ const PARSER_COLS: u16 = 2000;
 /// is visible in the retained log tail.
 const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 
+/// Resize history is returned in the HTTP `x-log-resizes` header, so keep it
+/// safely below common per-header size limits. The renderer still uses the
+/// full history internally.
+const MAX_LOG_RESIZE_EVENTS: usize = 64;
+
 /// Render a session's persisted output for `oly logs` / the HTTP tail
 /// endpoint from the journal-derived filtered stream. Pre-1.0 sessions
 /// that only have `output.log` are rejected (M6-2 removed the fallback;
@@ -54,21 +59,39 @@ pub fn render_log_session(
     // derived in the SAME pass — a tail render never scans the journal
     // more than once per candidate start.
     let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
-    let mut starts: Vec<u64> = anchors.iter().rev().copied().collect();
-    starts.push(0);
+    let mut starts: Vec<_> = anchors.iter().rev().map(Some).collect();
+    starts.push(None);
     let mut rendered: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
-    for start in starts {
-        let (bytes, end, resizes) =
-            crate::session::replay::filtered_stream_and_resizes_from(session_dir, start)?;
+    for anchor in starts {
+        let requested_start = anchor.map(|anchor| anchor.filtered_offset).unwrap_or(0);
+        let (bytes, end, resizes, start) =
+            crate::session::replay::filtered_stream_and_resizes_from_anchor(
+                session_dir,
+                requested_start,
+                anchor,
+            )?;
         let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
         debug_assert_eq!(tail_bytes.end_offset + start, end);
         // start_offset > 0 means the window found enough lines inside the
         // suffix; otherwise widen the replay at an older anchor.
         if tail_bytes.start_offset > 0 || start == 0 {
             let start_offset = start + tail_bytes.start_offset;
-            // M6-2: resize history comes from the journal (append-ordered
-            // with output), not the retired events.log; the pass above
-            // already derived the resizes this window can see.
+            // Match the previous bounded resize lookup: it starts at the
+            // newest anchor at/before the rendered window and scans no more
+            // than 64 MiB beyond that window. The combined pass may have
+            // gathered earlier/later events to avoid another journal read.
+            let resize_start = anchors
+                .iter()
+                .rev()
+                .find(|anchor| anchor.filtered_offset <= start_offset)
+                .map(|anchor| anchor.filtered_offset)
+                .unwrap_or(0);
+            let resize_end =
+                start_offset.saturating_add(crate::session::replay::MAX_RESIZE_EVENTS_SCAN_BYTES);
+            let resizes = resizes
+                .into_iter()
+                .filter(|resize| resize.offset >= resize_start && resize.offset <= resize_end)
+                .collect();
             rendered = Some((tail_bytes.bytes, start_offset, end, resizes));
             break;
         }
@@ -82,17 +105,43 @@ pub fn render_log_session(
         viewport_resize_plan(&resizes, start_offset, end_offset)
     };
 
+    let output = render_log_bytes(
+        &bytes,
+        tail,
+        keep_color,
+        term_cols,
+        viewport,
+        &viewport_plan,
+    );
     Ok((
-        render_log_bytes(
-            &bytes,
-            tail,
-            keep_color,
-            term_cols,
-            viewport,
-            &viewport_plan,
-        ),
-        resizes,
+        output,
+        bound_resize_history(resizes, start_offset, end_offset),
     ))
+}
+
+/// Bound resize metadata returned with a rendered tail while preserving the
+/// geometry in effect at the start and the newest transitions inside it.
+fn bound_resize_history(
+    mut events: Vec<LogResize>,
+    start_offset: u64,
+    end_offset: u64,
+) -> Vec<LogResize> {
+    events.retain(|event| event.offset <= end_offset);
+    if events.len() <= MAX_LOG_RESIZE_EVENTS {
+        return events;
+    }
+
+    let first_after_start = events.partition_point(|event| event.offset <= start_offset);
+    let initial = first_after_start.checked_sub(1).map(|index| events[index]);
+    let keep_after_start = (MAX_LOG_RESIZE_EVENTS - usize::from(initial.is_some()))
+        .min(events.len() - first_after_start);
+    let recent_start = events.len() - keep_after_start;
+    let mut bounded = Vec::with_capacity(keep_after_start + usize::from(initial.is_some()));
+    if let Some(initial) = initial {
+        bounded.push(initial);
+    }
+    bounded.extend_from_slice(&events[recent_start..]);
+    bounded
 }
 
 /// Renders a standalone stream file. Used by the transcript golden tests;
@@ -615,4 +664,36 @@ fn trim_styled_row_end(row: &[u8]) -> &[u8] {
         }
     }
     &row[..last_content_end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_response_is_bounded_and_keeps_start_geometry_and_recent_events() {
+        let events = (0..10_000)
+            .map(|offset| LogResize {
+                offset,
+                rows: 24,
+                cols: 80,
+            })
+            .collect();
+
+        let bounded = bound_resize_history(events, 5_000, 9_000);
+        assert_eq!(bounded.len(), MAX_LOG_RESIZE_EVENTS);
+        assert_eq!(bounded[0].offset, 5_000, "preserve start geometry");
+        assert_eq!(bounded[1].offset, 8_938, "keep recent transitions");
+        assert_eq!(bounded.last().unwrap().offset, 9_000);
+
+        let worst_case = vec![
+            LogResize {
+                offset: u64::MAX,
+                rows: u16::MAX,
+                cols: u16::MAX,
+            };
+            MAX_LOG_RESIZE_EVENTS
+        ];
+        assert!(serde_json::to_vec(&worst_case).unwrap().len() < 4096);
+    }
 }

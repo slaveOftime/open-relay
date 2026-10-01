@@ -164,12 +164,15 @@ pub fn checkpoint_anchors(
     let mut anchors = Vec::new();
     let mut expected_seq = 1u64;
     'parts: for (part, path) in &parts {
-        // Buffered sequential scan: payloads are skipped by discarding
-        // (bulk sequential reads), never one seek syscall per record.
-        let mut file = io::BufReader::with_capacity(
-            SCAN_READ_BUFFER_BYTES,
-            fs::File::open(path)?,
-        );
+        // Buffered sequential scan: relative seeks within the BufReader's
+        // window only advance its cursor; large checkpoint programs can
+        // still be skipped without copying them through a scratch buffer.
+        let mut file = io::BufReader::with_capacity(SCAN_READ_BUFFER_BYTES, fs::File::open(path)?);
+        // Seeking past EOF succeeds on regular files. Snapshot the part length
+        // so a torn payload cannot be mistaken for a valid anchor. If the
+        // active part grows during this pass, missing newer anchors only make
+        // replay start earlier; it cannot make replay skip valid data.
+        let part_len = file.get_ref().metadata()?.len();
         let mut byte_pos = 0u64;
         let mut header = [0u8; HEADER_LEN];
         loop {
@@ -191,6 +194,9 @@ pub fn checkpoint_anchors(
             let kind = u16::from_le_bytes(header[6..8].try_into().unwrap());
             let payload_len = u32::from_le_bytes(header[28..32].try_into().unwrap()) as u64;
             let record_end = byte_pos + HEADER_LEN as u64 + payload_len;
+            if record_end > part_len {
+                break 'parts;
+            }
             let mut skip = payload_len;
             if kind == RecordKind::CheckpointRef as u16 {
                 // Only the fixed header is needed; skip the restore
@@ -213,7 +219,7 @@ pub fn checkpoint_anchors(
                     skip = payload_len - CHECKPOINT_FIXED_HEADER_LEN as u64;
                 }
             }
-            if !skip_remaining(&mut file, skip) {
+            if file.seek_relative(skip as i64).is_err() {
                 break 'parts;
             }
             byte_pos = record_end;
@@ -221,24 +227,6 @@ pub fn checkpoint_anchors(
         }
     }
     Ok(anchors)
-}
-
-/// Skip `len` bytes sequentially (buffered reads, no per-record seek).
-/// Returns false on a truncated part — the caller stops trusting
-/// further records.
-fn skip_remaining<R: io::Read>(reader: &mut io::BufReader<R>, len: u64) -> bool {
-    let mut buf = [0u8; 8 * 1024];
-    let mut remaining = len;
-    while remaining > 0 {
-        let want = (remaining as usize).min(buf.len());
-        match reader.read(&mut buf[..want]) {
-            Ok(0) => return false,
-            Ok(n) => remaining -= n as u64,
-            Err(ref err) if err.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return false,
-        }
-    }
-    true
 }
 
 /// The incarnation holding the newest checkpoint record, if any. Scans

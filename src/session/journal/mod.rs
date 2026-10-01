@@ -260,6 +260,29 @@ mod tests {
     }
 
     #[test]
+    fn large_corrupt_retained_payload_stops_at_crc_mismatch() {
+        let path = test_path("large_corrupt.seg");
+        let _ = fs::remove_file(&path);
+
+        let payload = vec![b'x'; 128 * 1024];
+        let mut writer = SegmentWriter::create(&path).unwrap();
+        writer
+            .append_record(RecordKind::Output, 1, 0, &payload)
+            .unwrap();
+        drop(writer);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[HEADER_LEN] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        let scanned = scan_segment(&path).unwrap();
+        assert_eq!(scanned.stop, ScanStop::CrcMismatch);
+        assert_eq!(scanned.valid_len, 0);
+        assert!(scanned.records.is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn sequence_gap_stops_the_scan_without_a_hole() {
         let path = test_path("seqgap.seg");
         let _ = fs::remove_file(&path);
@@ -1275,6 +1298,31 @@ mod tests {
             "one anchor per checkpoint, in journal order"
         );
         assert_eq!(anchors[0].cursor.incarnation, incarnation);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkpoint_anchors_reject_a_truncated_checkpoint_payload() {
+        let dir = test_session_dir("truncated_anchor");
+        let (mut shadow, incarnation, _) = ShadowJournal::open(&dir).unwrap();
+        shadow
+            .record_checkpoint(&test_checkpoint(b"restore program"))
+            .unwrap();
+        shadow.shutdown();
+
+        let segment = segment_path(&dir.join(JOURNAL_DIR_NAME), incarnation, 1);
+        let len = std::fs::metadata(&segment).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment)
+            .unwrap()
+            .set_len(len - 1)
+            .unwrap();
+
+        assert!(
+            checkpoint_anchors(&dir, incarnation).unwrap().is_empty(),
+            "an incomplete checkpoint record must not become a replay anchor"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
