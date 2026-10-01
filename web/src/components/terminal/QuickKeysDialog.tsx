@@ -146,7 +146,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-sm">
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] max-w-sm flex-col overflow-hidden">
         <DialogHeader>
           <DialogTitle>Quick Keys</DialogTitle>
           <DialogDescription>
@@ -155,7 +155,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
           </DialogDescription>
         </DialogHeader>
 
-        <div role="list" aria-label="Quick keys" className="-mx-1 max-h-[45vh] overflow-y-auto">
+        <div role="list" aria-label="Quick keys" className="-mx-1 min-h-0 flex-1 overflow-y-auto">
           {keys.length === 0 ? (
             <p className="py-3 text-center text-sm text-[hsl(var(--muted-foreground))]">
               No quick keys. Add one below or restore the defaults.
