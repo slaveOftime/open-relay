@@ -1,7 +1,17 @@
 import type { SessionEvent, SessionNotificationData, SessionSummary } from '@/api/types'
 import { SparklineStore, type SparklineActivitySnapshot } from '@/components/sparklineStore'
 
-const sparklineStore = new SparklineStore()
+// Pin the singleton on globalThis so Vite HMR (or any future module-system
+// replacement) keeps the same instance instead of rebuilding a fresh one and
+// dropping totals / subscriptions on every dependency edit. This guarantees
+// the SessionsPage row sparkline and the SessionDetailPage header sparkline
+// share the same backing data across navigations and reloads.
+declare global {
+  var __olySparklineStore: SparklineStore | undefined
+}
+
+const sparklineStore: SparklineStore = globalThis.__olySparklineStore ?? new SparklineStore()
+if (!globalThis.__olySparklineStore) globalThis.__olySparklineStore = sparklineStore
 const EMPTY_ACTIVITY_SERIES: number[] = []
 const EMPTY_ACTIVITY_SNAPSHOT: SparklineActivitySnapshot = {
   series: EMPTY_ACTIVITY_SERIES,
@@ -18,7 +28,9 @@ export function getSessionActivitySnapshot(
   sessionId?: string | null,
   node?: string | null
 ): SparklineActivitySnapshot {
-  return sessionId ? sparklineStore.getActivitySnapshot(sessionActivityKey(sessionId, node)) : EMPTY_ACTIVITY_SNAPSHOT
+  return sessionId
+    ? sparklineStore.getActivitySnapshot(sessionActivityKey(sessionId, node))
+    : EMPTY_ACTIVITY_SNAPSHOT
 }
 
 export function subscribeSessionActivity(

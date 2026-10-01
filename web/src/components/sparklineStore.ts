@@ -73,7 +73,11 @@ export class SparklineStore {
     return () => {
       listeners.delete(listener)
       if (listeners.size === 0) this.listeners.delete(id)
-      if (this.listeners.size === 0) this.stopDecayTimer()
+      // Intentionally keep the decay timer running: row data persists across
+      // page navigations and SSE-driven records must keep bucket windows
+      // advancing while no UI is mounted. Stopping here wiped visible history
+      // for users that briefly navigated away (more than 20 s away caused
+      // every bucket to expire before the next subscribe could advance).
     }
   }
 
@@ -83,13 +87,16 @@ export class SparklineStore {
 
   private ensureDecayTimer(): void {
     if (this.decayTimer !== null || typeof window === 'undefined') return
-    // One timer only while mounted charts have recent activity; no per-row timer.
+    // One timer only while there is any history worth aging. Crucially, we
+    // iterate `this.data` (not `this.listeners`): even if no UI is mounted
+    // we still advance bucket windows so that on remount we don't see a
+    // giant gap that flips the visible series to all zeros.
     this.decayTimer = window.setInterval(() => {
       let active = false
-      for (const id of this.listeners.keys()) {
-        const entry = this.data.get(id)
-        if (entry && this.advance(entry)) this.emitChange(id)
-        if (entry?.counts.some((value) => value !== 0)) active = true
+      for (const [id, entry] of this.data) {
+        if (entry.counts.some((value) => value !== 0)) active = true
+        if (!this.advance(entry)) continue
+        this.listeners.get(id)?.forEach((listener) => listener())
       }
       if (!active) this.stopDecayTimer()
     }, this.bucketMs)
@@ -144,7 +151,7 @@ export class SparklineStore {
         lastOutputAt: entry.lastOutputAt,
       }
     }
-    if (value > 0 && this.listeners.has(id)) this.ensureDecayTimer()
+    if (value > 0) this.ensureDecayTimer()
     if (advanced || value > 0) this.emitChange(id)
   }
 
@@ -171,7 +178,7 @@ export class SparklineStore {
         lastOutputAt: entry.lastOutputAt,
       }
     }
-    if (delta > 0 && this.listeners.has(id)) this.ensureDecayTimer()
+    if (delta > 0) this.ensureDecayTimer()
     if (advanced || delta > 0) this.emitChange(id)
   }
 

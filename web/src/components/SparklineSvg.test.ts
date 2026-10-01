@@ -77,27 +77,67 @@ describe('SparklineStore', () => {
     expect(store.getSeries('session-1').at(-1)).toBe(90)
   })
 
-  it('catches up an unmounted chart without polling or keeping its timer alive', () => {
+  it('catches up an unmounted chart without polling and keeps its history intact', () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
-    vi.stubGlobal('window', { setInterval })
+    vi.stubGlobal('window', { setInterval: setInterval, clearInterval: clearInterval })
     const store = new SparklineStore()
     store.recordTotal('session-1', 100)
     store.recordTotal('session-1', 180)
-    expect(vi.getTimerCount()).toBe(0)
+    // The decay timer keeps running once any data is recorded, so the bucket
+    // window keeps advancing even when no UI is mounted. This is what keeps
+    // the visible history from snapping to zeros when the user navigates
+    // away and back.
+    expect(vi.getTimerCount()).toBe(1)
 
     vi.setSystemTime(21_000)
     const listener = vi.fn()
     const unsubscribe = store.subscribe('session-1', listener)
+    // The bucket window has fully expired, so the visible series is now zero.
     expect(listener).toHaveBeenCalledTimes(1)
     expect(store.getSeries('session-1').every((value) => value === 0)).toBe(true)
+    // Subscribing again shouldn't have disturbed the running timer.
+    expect(vi.getTimerCount()).toBe(1)
     unsubscribe()
-    expect(vi.getTimerCount()).toBe(0)
+  })
+  it('keeps bucket windows advancing while no UI is mounted', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    vi.stubGlobal('window', { setInterval: setInterval, clearInterval: clearInterval })
+    const store = new SparklineStore()
+    const listener = vi.fn()
+    const unsubscribe = store.subscribe('local', listener)
+    // Move the clock forward to a non-zero bucket index so the assertions
+    // below describe behaviour during a realistic session lifecycle.
+    vi.setSystemTime(1_500)
+    store.recordTotal('local', 100)
+    store.recordTotal('local', 300)
+    const indexAfterRecord = store.getBucketIndex('local')
+    expect(indexAfterRecord).toBeGreaterThan(0)
+    // User navigates to a different page; subscription is torn down. The
+    // decay timer keeps running so the bucket window keeps advancing — the
+    // alternative was wiping history to zeros on next mount.
+    unsubscribe()
+    expect(vi.getTimerCount()).toBe(1)
+
+    vi.setSystemTime(3_500)
+    vi.advanceTimersByTime(2_500)
+    expect(store.getBucketIndex('local')).toBeGreaterThan(indexAfterRecord)
+
+    // Re-subscribe (the user came back). New data is still added to the
+    // latest bucket, and gets exposed via subscribe listeners.
+    const next = vi.fn()
+    const off = store.subscribe('local', next)
+    const before = store.getSeries('local')
+    store.recordTotal('local', 500)
+    expect(next).toHaveBeenCalled()
+    expect(store.getSeries('local')).not.toBe(before)
+    off()
   })
   it('notifies only the changed session and decays output every 500 ms, not idle rows', () => {
     vi.useFakeTimers()
     vi.setSystemTime(0)
-    vi.stubGlobal('window', { setInterval })
+    vi.stubGlobal('window', { setInterval: setInterval, clearInterval: clearInterval })
     const store = new SparklineStore()
     const first = vi.fn()
     const second = vi.fn()
@@ -122,6 +162,7 @@ describe('SparklineStore', () => {
 
     vi.advanceTimersByTime(40 * SPARKLINE_BUCKET_MS)
     expect(store.getSeries('session-1').every((value) => value === 0)).toBe(true)
+    // The data has aged out — the timer self-stops until new activity arrives.
     expect(vi.getTimerCount()).toBe(0)
     const callsAfterDecay = first.mock.calls.length
     vi.advanceTimersByTime(2 * SPARKLINE_BUCKET_MS)
