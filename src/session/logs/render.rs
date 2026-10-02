@@ -30,17 +30,40 @@ const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 /// full history internally.
 const MAX_LOG_RESIZE_EVENTS: usize = 64;
 
-/// Render a session's persisted output for `oly logs` / the HTTP tail
-/// endpoint from the journal-derived filtered stream. Pre-1.0 sessions
-/// that only have `output.log` are rejected (the fallback was removed;
-/// see MIGRATION.md).
-pub fn render_log_session(
-    session_dir: &Path,
-    tail: usize,
-    keep_color: bool,
-    term_cols: u16,
-    viewport: Option<ViewportSize>,
-) -> Result<(Vec<u8>, Vec<LogResize>)> {
+/// The maximum number of journal *lines* the resume-hint fallback pass
+/// scans when the engine-based render produces no match. The engine walks
+/// rows in paint order, so a row that is painted and then overwritten by a
+/// later redraw disappears from the rendered grid even though the
+/// bytes survive in the journal. The fallback skips rendering and
+/// regex-matches the filtered-stream bytes directly, which is cheap and
+/// often recovers hints the engine has wiped.
+///
+/// The window is intentionally generous: a single resume hint is far
+/// shorter than a typical TUI repaint, and a chat scrollback that buries
+/// the hint can still hold it for thousands of lines below the visible
+/// area. Anchor-anchored replay caps the journal walk to the latest
+/// checkpoint anchor (~32 MiB cadence) plus at most one further anchor,
+/// so the wall-clock cost is bounded by `REPLAY_BATCH_BYTES` per call.
+pub const RESUME_FALLBACK_TAIL_LINES: usize = 8192;
+
+/// Filtered-stream tail bytes plus the journal offsets they cover. Used
+/// by the engine-based renderer and by resume-hint extraction, which
+/// scans the raw bytes directly when the rendered output holds no hint.
+pub struct FilteredTail {
+    /// Tail bytes covering approximately the most recent
+    /// `desired_tail_lines`. May be the entire filtered stream for
+    /// short sessions.
+    pub bytes: Vec<u8>,
+    /// Filtered-stream offset where `bytes` begins.
+    pub start_offset: u64,
+    /// Filtered-stream end offset (== current `filtered_stream_len`).
+    pub end_offset: u64,
+    /// Resize events inside `[start_offset, end_offset)` (already bounded
+    /// to the resize window relevant to the tail).
+    pub resizes: Vec<LogResize>,
+}
+
+pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Result<FilteredTail> {
     if !session_dir
         .join(crate::session::journal::JOURNAL_DIR_NAME)
         .is_dir()
@@ -61,7 +84,7 @@ pub fn render_log_session(
     let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
     let mut starts: Vec<_> = anchors.iter().rev().map(Some).collect();
     starts.push(None);
-    let mut rendered: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
+    let mut candidate: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
     for anchor in starts {
         let requested_start = anchor.map(|anchor| anchor.filtered_offset).unwrap_or(0);
         let (bytes, end, resizes, start) =
@@ -70,7 +93,7 @@ pub fn render_log_session(
                 requested_start,
                 anchor,
             )?;
-        let tail_bytes = super::index::tail_window_bytes(&bytes, tail);
+        let tail_bytes = super::index::tail_window_bytes(&bytes, desired_tail_lines);
         debug_assert_eq!(tail_bytes.end_offset + start, end);
         // start_offset > 0 means the window found enough lines inside the
         // suffix; otherwise widen the replay at an older anchor.
@@ -92,13 +115,47 @@ pub fn render_log_session(
                 .into_iter()
                 .filter(|resize| resize.offset >= resize_start && resize.offset <= resize_end)
                 .collect();
-            rendered = Some((tail_bytes.bytes, start_offset, end, resizes));
+            candidate = Some((tail_bytes.bytes, start_offset, end, resizes));
             break;
         }
     }
-    let Some((bytes, start_offset, end_offset, resizes)) = rendered else {
-        return Ok((Vec::new(), Vec::new()));
+
+    let Some((bytes, start_offset, end_offset, resizes)) = candidate else {
+        return Ok(FilteredTail {
+            bytes: Vec::new(),
+            start_offset: 0,
+            end_offset: 0,
+            resizes: Vec::new(),
+        });
     };
+    Ok(FilteredTail {
+        bytes,
+        start_offset,
+        end_offset,
+        resizes,
+    })
+}
+
+/// Render a session's persisted output for `oly logs` / the HTTP tail
+/// endpoint from the journal-derived filtered stream. Pre-1.0 sessions
+/// that only have `output.log` are rejected (the fallback was removed;
+/// see MIGRATION.md).
+pub fn render_log_session(
+    session_dir: &Path,
+    tail: usize,
+    keep_color: bool,
+    term_cols: u16,
+    viewport: Option<ViewportSize>,
+) -> Result<(Vec<u8>, Vec<LogResize>)> {
+    let FilteredTail {
+        bytes,
+        start_offset,
+        end_offset,
+        resizes,
+    } = replay_filtered_tail(session_dir, tail)?;
+    if bytes.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let viewport_plan = if viewport.is_some() {
         ViewportReplayPlan::default()
     } else {

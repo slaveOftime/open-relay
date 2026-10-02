@@ -19,7 +19,10 @@ mod tests;
 use crate::protocol::LogResize;
 
 pub use index::{read_persisted_log_page, split_rendered_log_output};
-pub use render::{engine_content_rows, finish_render, format_history_rows, render_log_session};
+pub use render::{
+    RESUME_FALLBACK_TAIL_LINES, engine_content_rows, finish_render, format_history_rows,
+    render_log_session, replay_filtered_tail,
+};
 
 /// Terminal dimensions a caller wants the log replayed at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
