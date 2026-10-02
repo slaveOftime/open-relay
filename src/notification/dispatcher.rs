@@ -1,7 +1,4 @@
-use super::{
-    channel::NotificationChannel,
-    event::NotificationEvent,
-};
+use super::{channel::NotificationChannel, event::NotificationEvent};
 
 /// Shareable, hot-swappable notifier handle.
 ///

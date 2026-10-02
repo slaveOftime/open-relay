@@ -241,9 +241,15 @@ mod tests {
     #[test]
     fn roles_parse_the_wire_tokens() {
         assert_eq!(AttachRole::parse(None), Ok(AttachRole::Controller));
-        assert_eq!(AttachRole::parse(Some("controller")), Ok(AttachRole::Controller));
+        assert_eq!(
+            AttachRole::parse(Some("controller")),
+            Ok(AttachRole::Controller)
+        );
         assert_eq!(AttachRole::parse(Some("observe")), Ok(AttachRole::Observer));
-        assert_eq!(AttachRole::parse(Some("observer")), Ok(AttachRole::Observer));
+        assert_eq!(
+            AttachRole::parse(Some("observer")),
+            Ok(AttachRole::Observer)
+        );
         assert!(AttachRole::parse(Some("takeover")).is_err());
     }
 }

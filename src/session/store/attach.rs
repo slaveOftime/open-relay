@@ -54,11 +54,11 @@ impl SessionStore {
         }
     }
 
-    /// Register an identified attachment (fenced: per-session incarnation
-    /// + token). The role is chosen here and never changes: controllers
-    /// drive, observers
-    /// (`oly attach --observe`) watch. When a controller declares a
-    /// viewport, the initial geometry is applied through the session
+    /// Register an identified attachment. The fencing is per-session
+    /// incarnation plus a token. The role is chosen here and never
+    /// changes: controllers drive the session snapshot, observers
+    /// launched with `--observe` only watch. When a controller declares
+    /// a viewport, the initial geometry is applied through the session
     /// sequencer before any snapshot is taken.
     pub async fn attach_register(
         &self,

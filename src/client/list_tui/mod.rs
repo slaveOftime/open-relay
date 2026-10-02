@@ -81,9 +81,13 @@ pub(super) use refresh::{
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use spawn::{
-    WindowRect, arrange_window, powershell_encoded_command, session_command, shell_command,
-    shell_quote, spawn_session_terminal, terminal_marker, windows_screen_geometry,
+    WindowRect, arrange_window, session_command, shell_command, shell_quote,
+    spawn_session_terminal, terminal_marker,
 };
+#[cfg(test)]
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub(super) use spawn::{powershell_encoded_command, windows_screen_geometry};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(super) use table::{

@@ -737,10 +737,7 @@ async fn apply_client_message_local(
                 )
                 .await;
             if let Err(err) = outcome {
-                let gated = matches!(
-                    err,
-                    SessionError::ViewOnly | SessionError::StaleAttachment
-                );
+                let gated = matches!(err, SessionError::ViewOnly | SessionError::StaleAttachment);
                 if !send_server_message(
                     socket,
                     &ServerMessage::Error {

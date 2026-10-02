@@ -395,8 +395,7 @@ async fn run_attach_inner(
                 if can_drive {
                     renderer.resize(now_rows, now_cols);
                 }
-                send_attach_resize(&mut write_half, &id_owned, now_rows, now_cols)
-                    .await?;
+                send_attach_resize(&mut write_half, &id_owned, now_rows, now_cols).await?;
             }
         }
 
