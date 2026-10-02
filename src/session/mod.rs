@@ -110,9 +110,9 @@ pub enum SessionError {
         requested: Option<u64>,
         current: Option<u64>,
     },
-    /// An attached client tried to drive geometry/input without holding
-    /// the session's control lease (I6; PLAN §8.1).
-    NotController,
+    /// A view-only attach (`oly attach --observe`) tried to drive
+    /// geometry/input (I6; PLAN §8.1).
+    ViewOnly,
     /// The attachment id is unknown to the session (stale fencing token).
     StaleAttachment,
     /// A background worker join/sync failed. Surfaces only when a
@@ -132,9 +132,9 @@ impl SessionError {
                 "stale resume cursor for {id}: cursor names incarnation {requested:?}, \
                  session incarnation is {current:?}; resnapshot instead of resuming"
             ),
-            Self::NotController => format!(
-                "not the controller of session {id}: attached as observer; \
-                 take over control to send input or resize"
+            Self::ViewOnly => format!(
+                "session {id} is attached in view-only mode (observe): \
+                 re-attach without --observe to send input or resize"
             ),
             Self::StaleAttachment => {
                 format!("attachment is no longer registered for session {id}; re-attach")

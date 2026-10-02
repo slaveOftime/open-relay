@@ -249,7 +249,7 @@ pub async fn read_response_from_reader(
 //   [u32 LE payload_len][u8 tag][payload]
 //   tag 1 = output:  payload = [u64 LE offset][raw bytes]
 //   tag 2 = control: payload = bare JSON `RpcResponse` (modes / done /
-//                    control-changed / resize-broadcast / error notices)
+//                    resize-broadcast / error notices)
 
 pub const ATTACH_FRAME_OUTPUT: u8 = 1;
 pub const ATTACH_FRAME_CONTROL: u8 = 2;

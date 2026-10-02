@@ -8,7 +8,7 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
     session::{
         AttachEvent, AttachPump,
-        registry::{AttachKind, AttachRole, ControlRequest},
+        registry::{AttachKind, AttachRole},
         resize::ResizeSubscriber,
     },
 };
@@ -42,11 +42,11 @@ pub(super) async fn handle_attach_subscribe(
         "starting IPC streaming session relay"
     );
 
-    // M3-4: register the attachment (control lease + viewport) *before*
-    // taking the snapshot, so a controller's authorized initial geometry is
-    // applied through the sequencer and is already reflected in the init.
-    let request = match ControlRequest::parse(role.as_deref()) {
-        Ok(request) => request,
+    // M3-4: register the attachment (role + viewport) *before* taking
+    // the snapshot, so a controller's initial geometry is applied through
+    // the sequencer and is already reflected in the init.
+    let role = match AttachRole::parse(role.as_deref()) {
+        Ok(role) => role,
         Err(message) => {
             return ipc::write_response_to_writer(&mut writer, RpcResponse::Error { message })
                 .await;
@@ -57,7 +57,7 @@ pub(super) async fn handle_attach_subscribe(
         _ => None,
     };
     let registration = match session_store
-        .attach_register(&id, AttachKind::Cli, request, viewport)
+        .attach_register(&id, AttachKind::Cli, role, viewport)
         .await
     {
         Ok(registration) => registration,
@@ -69,7 +69,7 @@ pub(super) async fn handle_attach_subscribe(
         }
     };
     let attachment_id = registration.attachment_id;
-    let mut current_role = registration.role;
+    let current_role = registration.role;
 
     // M5-1: local IPC clients ack applied cursors, so their stream is
     // credit-gated; node-relayed subscriptions arrive with `credited:
@@ -142,8 +142,6 @@ pub(super) async fn handle_attach_subscribe(
     )
     .await?;
 
-    // Control-handoff notices: every send carries the current controller id.
-    let mut control_rx = session_store.subscribe_control(&id);
     debug!(session_id = %id, attachment_id, role = current_role.as_str(), "IPC stream client registered");
 
     // Subscribe to resize broadcasts so we can notify this client when
@@ -182,9 +180,10 @@ pub(super) async fn handle_attach_subscribe(
                         Some(Ok(RpcRequest::AttachInput { id: req_id, data, wait_for_change, .. })) if req_id == id => {
                             trace!(session_id = %id, bytes = data.len(), "IPC client input received");
                             if let Err(err) = session_store.attach_input(&req_id, Some(attachment_id), &data, wait_for_change).await {
-                                // Control-gate violations are client-visible,
-                                // transport failures end the stream.
-                                if matches!(err, crate::session::SessionError::NotController | crate::session::SessionError::StaleAttachment) {
+                                // Observe-mode violations are
+                                // client-visible; transport failures end
+                                // the stream.
+                                if matches!(err, crate::session::SessionError::ViewOnly | crate::session::SessionError::StaleAttachment) {
                                     let message = err.message(&id);
                                     if ipc::write_attach_control_frame(&mut writer, &RpcResponse::Error { message }).await.is_err() {
                                         break;
@@ -201,19 +200,12 @@ pub(super) async fn handle_attach_subscribe(
                             if let Err(err) = session_store.attach_resize(&req_id, Some(attachment_id), rows, cols).await {
                                 // Observers never resize the shared PTY; their
                                 // declared size is recorded as a viewport only.
-                                if matches!(err, crate::session::SessionError::NotController | crate::session::SessionError::StaleAttachment) {
+                                if matches!(err, crate::session::SessionError::ViewOnly | crate::session::SessionError::StaleAttachment) {
                                     resize_sub.mark_sent(0, 0);
                                     continue;
                                 }
                                 warn!(session_id = %id, rows, cols, "IPC client resize forwarding failed");
                                 break;
-                            }
-                        }
-                        Some(Ok(RpcRequest::AttachAcquireControl { id: req_id })) if req_id == id => {
-                            debug!(session_id = %id, attachment_id, "IPC client requested control takeover");
-                            match session_store.attach_acquire_control(&req_id, attachment_id).await {
-                                Ok(outcome) => current_role = outcome.role,
-                                Err(err) => warn!(session_id = %id, error = err.message(&id), "control takeover failed"),
                             }
                         }
                         Some(Ok(RpcRequest::AttachAppliedCursor { id: req_id, cursor })) if req_id == id => {
@@ -270,33 +262,6 @@ pub(super) async fn handle_attach_subscribe(
                     }
                 }
 
-                // Control handoffs: every notice carries the current
-                // controller id; derive this attachment's role from it.
-                notice = async {
-                    match control_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match notice {
-                        Ok(controller) => {
-                            current_role = if controller == Some(attachment_id) {
-                                AttachRole::Controller
-                            } else {
-                                AttachRole::Observer
-                            };
-                            let resp = RpcResponse::AttachControlChanged {
-                                role: current_role.as_str().to_owned(),
-                            };
-                            if ipc::write_attach_control_frame(&mut writer, &resp).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
-                    }
-                }
-
                 // Resize notifications from other attached clients.
                 Some((rows, cols)) = resize_sub.recv_foreign() => {
                     debug!(
@@ -332,7 +297,8 @@ pub(super) async fn handle_attach_input(
 ) -> RpcResponse {
     debug!(session_id = %id, bytes = data.len(), "handling one-shot IPC input request");
     // `attachment_id = None` is the ungated operator one-shot (`oly send`);
-    // `Some(lease)` is an agent send gated on a held control lease.
+    // `Some(attachment)` is an agent send gated on its attach role: an
+    // observer (view-only) cannot drive input.
     match session_store
         .attach_input(&id, attachment_id, &data, wait_for_change)
         .await

@@ -1011,7 +1011,7 @@ fn e2e_attach_ctrl_d_detaches() {
 }
 
 /// Helper for attach-under-PTY tests: spawn `oly attach` (extra args
-/// allowed, e.g. `--observer`) at the given size and return the pieces a
+/// allowed, e.g. `--observe`) at the given size and return the pieces a
 /// resize/detach scenario needs. Output is pumped on a thread so every
 /// wait in the caller has a real timeout.
 #[cfg(not(target_os = "windows"))]
@@ -1145,9 +1145,9 @@ fn wait_for_session_size(tmp: &Path, id: &str, rows: u16, cols: u16, timeout: Du
 }
 
 /// Resizing the outer terminal while attached must reach the daemon and
-/// resize the session PTY (the controller has geometry authority).
-/// Regression test: a native-window resize previously went nowhere
-/// whenever the client was not the controller.
+/// resize the session PTY (a controller has geometry authority). An
+/// observe-mode attach must NOT get that authority: its window resizes
+/// are gated out and the session keeps the controller's geometry.
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn e2e_attach_terminal_resize_reaches_the_daemon() {
@@ -1161,13 +1161,20 @@ fn e2e_attach_terminal_resize_reaches_the_daemon() {
     controller.resize(40, 100);
     wait_for_session_size(&tmp, &id, 40, 100, Duration::from_secs(15));
 
-    // A second, explicitly read-only attach starts as an observer.
-    let observer = PtyAttach::spawn(&tmp, &id, &["--observer"], 24, 80);
+    // A second, explicitly read-only attach starts in observe mode.
+    let observer = PtyAttach::spawn(&tmp, &id, &["--observe"], 24, 80);
 
-    // Resizing the observer's window takes control (same last-active-wins
-    // rule as attach) and resizes the session to the observer's geometry.
+    // Resizing the observer's window is gated: the session stays at the
+    // controller's geometry for the rest of this check window.
     observer.resize(50, 120);
-    wait_for_session_size(&tmp, &id, 50, 120, Duration::from_secs(15));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        wait_for_session_size(&tmp, &id, 40, 100, Duration::from_secs(5));
+    }
+
+    // The controller still drives geometry afterwards.
+    controller.resize(30, 90);
+    wait_for_session_size(&tmp, &id, 30, 90, Duration::from_secs(15));
 
     observer.detach();
     controller.detach();

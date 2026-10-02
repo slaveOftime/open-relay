@@ -188,7 +188,6 @@ async fn dispatch_request(
             .await
         }
         RpcRequest::AttachSubscribe { .. }
-        | RpcRequest::AttachAcquireControl { .. }
         | RpcRequest::AttachAppliedCursor { .. } => {
             // Handled before dispatch in handle_client; should not reach here.
             RpcResponse::Error {
@@ -1021,7 +1020,7 @@ mod tests {
     // Post-review protocol evidence (corrective increment, W4): the
     // complete IPC attach path over a REAL local socket — production
     // framed codec, `handle_client` dispatch, streaming state machine,
-    // incarnation fencing, and control-lease gating — served from the
+    // incarnation fencing, and observe-mode gating — served from the
     // canonical journal.
     // ---------------------------------------------------------------
 
@@ -1156,8 +1155,8 @@ mod tests {
             assert_eq!(role, "controller");
             assert!(attachment_id >= 1);
 
-            // The control lease gates input over the wire: the lease token
-            // writes; a foreign token is rejected with a visible error.
+            // Input gating over the wire: the connection's registered
+            // attachment drives; observe-mode attachments are rejected.
             ipc::write_request_to_writer(
                 &mut writer_a,
                 RpcRequest::AttachInput {
@@ -1285,7 +1284,7 @@ mod tests {
             assert_eq!(data, b"world");
             assert_eq!(end_offset, 11);
 
-            // --- Connection D: observers are input-gated until takeover ---
+            // --- Connection D: observe attaches are input-gated ---
             let (read_d, mut writer_d) =
                 tokio::io::split(ipc::connect(&config).await.expect("connect D"));
             let mut reader_d = BufReader::new(read_d);
@@ -1297,7 +1296,7 @@ mod tests {
                     incarnation: None,
                     rows: None,
                     cols: None,
-                    role: Some("observer".into()),
+                    role: Some("observe".into()),
                     credited: true,
                 },
             )
@@ -1338,46 +1337,6 @@ mod tests {
                 matches!(&rejected, ipc::AttachFrame::Control(resp) if matches!(&**resp, RpcResponse::Error { .. })),
                 "observer input must be rejected, got {rejected:?}"
             );
-
-            // Takeover publishes the handoff and unlocks input.
-            ipc::write_request_to_writer(
-                &mut writer_d,
-                RpcRequest::AttachAcquireControl {
-                    id: "ipcconf1".into(),
-                },
-            )
-            .await
-            .expect("acquire control");
-            let handoff = tokio::time::timeout(
-                Duration::from_secs(5),
-                ipc::read_attach_frame(&mut reader_d),
-            )
-            .await
-            .expect("handoff notice timeout")
-            .expect("handoff notice");
-            let ipc::AttachFrame::Control(resp) = handoff else {
-                panic!("expected AttachControlChanged, got {handoff:?}");
-            };
-            let RpcResponse::AttachControlChanged { role } = *resp else {
-                panic!("expected AttachControlChanged, got {resp:?}");
-            };
-            assert_eq!(role, "controller");
-            ipc::write_request_to_writer(
-                &mut writer_d,
-                RpcRequest::AttachInput {
-                    id: "ipcconf1".into(),
-                    data: b"go".to_vec(),
-                    wait_for_change: false,
-                    attachment_id: None,
-                },
-            )
-            .await
-            .expect("write post-takeover input");
-            let typed = tokio::time::timeout(Duration::from_secs(5), writer_rx.recv())
-                .await
-                .expect("post-takeover input delivered")
-                .expect("writer open");
-            assert_eq!(&typed[..], b"go");
 
             server.abort();
             std::fs::remove_dir_all(&dir).ok();

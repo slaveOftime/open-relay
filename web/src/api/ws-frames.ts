@@ -7,7 +7,7 @@
 // drift apart without one side failing.
 //
 //   INIT:   [tag=1][flags:u8][endOffset:u64be][incarnation:u64be][running:u8]
-//           [attachmentId:u64be][role:u8][data]
+//           [attachmentId:u64be][data]
 //   DATA:   [tag=2][offset:u64be][data]
 //   ENDED:  [tag=5][hasExitCode:u8][exitCode:i32be][finalOffset:u64be]
 // MODECHG:  [tag=3][flags:u8]
@@ -21,19 +21,16 @@ const WS_FRAME_RESIZED = 4
 const WS_FRAME_SESSION_ENDED = 5
 const WS_FRAME_ERROR = 6
 const WS_FRAME_PONG = 7
-const WS_FRAME_CONTROL = 8
 const WS_FLAG_APP_CURSOR_KEYS = 1 << 0
 const WS_FLAG_BRACKETED_PASTE_MODE = 1 << 1
 const WS_FLAG_MOUSE_REPORT = 1 << 2
 const WS_FLAG_SGR_MOUSE = 1 << 3
 const WS_FLAG_FOCUS_EVENTS = 1 << 4
-export const WS_INIT_HEADER_LEN = 28
+export const WS_INIT_HEADER_LEN = 27
 const WS_DATA_HEADER_LEN = 9
 const WS_ENDED_LEN = 14
 
 const textDecoder = new TextDecoder()
-
-export type ControlRole = 'controller' | 'observer'
 
 /**
  * Input-affecting terminal modes carried by init/modeChanged frames.
@@ -87,7 +84,6 @@ export type ServerFrame =
       incarnation: number
       running: boolean
       attachmentId: number
-      role: ControlRole
       data: Uint8Array
     }
   | { type: 'data'; offset: number; data: Uint8Array }
@@ -102,7 +98,6 @@ export type ServerFrame =
   | { type: 'resized'; rows: number; cols: number }
   | { type: 'sessionEnded'; exitCode: number | null; finalOffset: number }
   | { type: 'error'; message: string }
-  | { type: 'control'; role: ControlRole }
   | { type: 'pong' }
 
 /**
@@ -133,7 +128,6 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
         incarnation: Number(view.getBigUint64(10, false)),
         running: bytes[18] === 1,
         attachmentId: Number(view.getBigUint64(19, false)),
-        role: bytes[27] === 1 ? 'controller' : 'observer',
         data: bytes.subarray(WS_INIT_HEADER_LEN),
       }
     }
@@ -173,9 +167,6 @@ export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
     }
     case WS_FRAME_ERROR:
       return { type: 'error', message: textDecoder.decode(bytes.subarray(1)) }
-    case WS_FRAME_CONTROL:
-      if (bytes.length < 2) throw new Error('truncated control frame')
-      return { type: 'control', role: bytes[1] === 1 ? 'controller' : 'observer' }
     case WS_FRAME_PONG:
       return { type: 'pong' }
     default:

@@ -3,8 +3,8 @@
   "description": "Shared WS server-frame conformance vectors (ADR-0004). The Rust encoder test (src/http/ws.rs) builds each ServerMessage from `expect` and asserts the encoded bytes equal `hex`; the web decoder test (web/src/api/ws-frames.test.ts) parses `hex` and asserts the decoded fields equal `expect`. Update both sides together; never edit `hex` without regenerating from the Rust encoder.",
   "frames": [
     {
-      "name": "init_controller_with_data",
-      "hex": "01030000000000001000000000000000000901000000000000002a0168656c6c6f",
+      "name": "init_with_data",
+      "hex": "01030000000000001000000000000000000901000000000000002a68656c6c6f",
       "expect": {
         "type": "init",
         "app_cursor_keys": true,
@@ -16,13 +16,12 @@
         "incarnation": 9,
         "running": true,
         "attachment_id": 42,
-        "role": "controller",
         "data_hex": "68656c6c6f"
       }
     },
     {
-      "name": "init_observer_empty",
-      "hex": "01000000000000000000000000000000000100000000000000000700",
+      "name": "init_empty",
+      "hex": "010000000000000000000000000000000001000000000000000007",
       "expect": {
         "type": "init",
         "app_cursor_keys": false,
@@ -34,13 +33,12 @@
         "incarnation": 1,
         "running": false,
         "attachment_id": 7,
-        "role": "observer",
         "data_hex": ""
       }
     },
     {
       "name": "init_mouse_sgr_focus",
-      "hex": "011c0000000000000000000000000000000101000000000000000700",
+      "hex": "011c00000000000000000000000000000001010000000000000007",
       "expect": {
         "type": "init",
         "app_cursor_keys": false,
@@ -52,7 +50,6 @@
         "incarnation": 1,
         "running": true,
         "attachment_id": 7,
-        "role": "observer",
         "data_hex": ""
       }
     },
@@ -104,16 +101,6 @@
       "name": "error",
       "hex": "06626f6f6d",
       "expect": { "type": "error", "message": "boom" }
-    },
-    {
-      "name": "control_controller",
-      "hex": "0801",
-      "expect": { "type": "control", "role": "controller" }
-    },
-    {
-      "name": "control_observer",
-      "hex": "0800",
-      "expect": { "type": "control", "role": "observer" }
     },
     {
       "name": "pong",

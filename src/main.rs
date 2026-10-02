@@ -258,11 +258,11 @@ async fn run() -> Result<()> {
                         println!("{session_id}");
                         return Ok(());
                     }
-                    // Interactive attach takes control by default (see
-                    // AttachArgs::role): the just-started session is driven
-                    // by the terminal that launched it.
+                    // Interactive attach controls the session by default
+                    // (see AttachArgs::role): the just-started session is
+                    // driven by the terminal that launched it.
                     if let Err(err) =
-                        client::run_attach(&config, &session_id, Some("takeover")).await
+                        client::run_attach(&config, &session_id, Some("controller")).await
                     {
                         eprintln!();
                         eprintln!(

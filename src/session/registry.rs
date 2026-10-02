@@ -1,14 +1,15 @@
-//! Attachment registry and controller lease (M3-4; PLAN §8.1, invariant I6).
+//! Attachment registry (M3-4; PLAN §8.1, invariant I6).
 //!
 //! Replaces anonymous attach counters with identified attachment records:
 //! every attached client gets a per-session attachment id (a fencing token:
 //! stale or unknown ids cannot act on the session), a role, and liveness.
 //!
-//! Policy: **many observers, one controller**. A controller request is
-//! granted when the lease is free; otherwise the client joins as an observer
-//! and must explicitly take over. Only the controller may drive geometry
-//! (resize) and attached input; observers watch. Control changes are
-//! published so every client can see who drives (I6 visibility).
+//! Policy: **observe is the only restricted role**. Every attach is a
+//! `Controller` by default — it may send input and resize the PTY, and
+//! several controllers may drive at once (the last successful resize wins
+//! on geometry). A CLI attach that explicitly asks for view-only mode
+//! (`oly attach --observe`) registers as an `Observer`: it watches, reports
+//! its viewport, but input and resize are rejected with a clear error.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,41 +25,29 @@ pub enum AttachKind {
     Web,
 }
 
-/// Control role requested at attach time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlRequest {
-    /// Watch only; never takes the lease implicitly.
-    Observer,
-    /// Drive if the lease is free; otherwise join as observer.
-    Controller,
-    /// Take the lease even if another attachment holds it (the previous
-    /// controller is demoted to observer and can see the handoff).
-    Takeover,
-}
-
-impl ControlRequest {
-    /// Parse the wire/CLI role token (`None` defaults to `Controller`).
-    pub fn parse(role: Option<&str>) -> Result<Self, String> {
-        match role {
-            None => Ok(Self::Controller),
-            Some("controller") => Ok(Self::Controller),
-            Some("observer") => Ok(Self::Observer),
-            Some("takeover") => Ok(Self::Takeover),
-            Some(other) => Err(format!(
-                "invalid control role {other:?}: expected observer|controller|takeover"
-            )),
-        }
-    }
-}
-
-/// The role an attachment actually holds.
+/// The role an attachment holds for its whole lifetime. It is chosen at
+/// register time and never changes: there is no lease, no takeover, and no
+/// demotion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachRole {
+    /// View-only (`oly attach --observe`): input and resize are rejected.
     Observer,
+    /// Full control: input and geometry. The default for every attach.
     Controller,
 }
 
 impl AttachRole {
+    /// Parse the wire/CLI role token (`None` defaults to `Controller`).
+    pub fn parse(role: Option<&str>) -> Result<Self, String> {
+        match role {
+            None | Some("controller") | Some("control") => Ok(Self::Controller),
+            Some("observe") | Some("observer") => Ok(Self::Observer),
+            Some(other) => Err(format!(
+                "invalid attach mode {other:?}: expected observe|controller"
+            )),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Observer => "observer",
@@ -68,8 +57,7 @@ impl AttachRole {
 }
 
 /// One identified attachment. Some fields are consumed by later M3 surfaces
-/// (applied-cursor ACKs in M3-5, attached-client status listings), hence the
-/// allow.
+/// (attached-client status listings), hence the allow.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Attachment {
@@ -92,42 +80,18 @@ pub struct Attachment {
 pub struct AttachmentRegistry {
     next_id: u64,
     attachments: HashMap<u64, Attachment>,
-    controller: Option<u64>,
-}
-
-/// Outcome of a registration or control operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControlOutcome {
-    pub role: AttachRole,
-    /// The previous controller's attachment id when a takeover demoted it.
-    pub demoted: Option<u64>,
 }
 
 impl AttachmentRegistry {
-    /// Register a new attachment, granting control per policy.
+    /// Register a new attachment with the role chosen at attach time.
     pub fn register(
         &mut self,
         kind: AttachKind,
-        request: ControlRequest,
+        role: AttachRole,
         viewport: Option<(u16, u16)>,
-    ) -> (u64, ControlOutcome) {
+    ) -> (u64, AttachRole) {
         self.next_id += 1;
         let id = self.next_id;
-        let (role, demoted) = match request {
-            ControlRequest::Observer => (AttachRole::Observer, None),
-            ControlRequest::Controller => match self.controller {
-                None => {
-                    self.controller = Some(id);
-                    (AttachRole::Controller, None)
-                }
-                // Lease held: join visibly as observer (PLAN §8.1).
-                Some(_) => (AttachRole::Observer, None),
-            },
-            ControlRequest::Takeover => {
-                let demoted = self.controller.replace(id);
-                (AttachRole::Controller, demoted)
-            }
-        };
         self.attachments.insert(
             id,
             Attachment {
@@ -139,43 +103,21 @@ impl AttachmentRegistry {
                 applied_cursor: Arc::new(AtomicU64::new(0)),
             },
         );
-        (id, ControlOutcome { role, demoted })
+        (id, role)
     }
 
-    /// Remove an attachment, releasing the lease if it held it. Returns the
-    /// removed record; unknown ids (stale fencing tokens) are a no-op.
+    /// Remove an attachment. Returns the removed record; unknown ids
+    /// (stale fencing tokens) are a no-op.
     pub fn unregister(&mut self, id: u64) -> Option<Attachment> {
-        let removed = self.attachments.remove(&id)?;
-        if self.controller == Some(id) {
-            self.controller = None;
-        }
-        Some(removed)
+        self.attachments.remove(&id)
     }
 
-    /// Explicitly acquire the lease (takeover by an attached observer).
-    pub fn acquire_control(&mut self, id: u64) -> Option<ControlOutcome> {
-        let attachment = self.attachments.get_mut(&id)?;
-        let demoted = self.controller.replace(id).filter(|old| *old != id);
-        attachment.role = AttachRole::Controller;
-        if let Some(old) = demoted
-            && let Some(previous) = self.attachments.get_mut(&old)
-        {
-            previous.role = AttachRole::Observer;
-        }
-        Some(ControlOutcome {
-            role: AttachRole::Controller,
-            demoted,
-        })
-    }
-
-    /// Is this attachment the current controller?
-    pub fn is_controller(&self, id: u64) -> bool {
-        self.controller == Some(id)
-    }
-
-    /// The current controller's attachment id.
-    pub fn controller_id(&self) -> Option<u64> {
-        self.controller
+    /// May this attachment drive input/geometry (I6)? Controllers can;
+    /// observers (view-only attaches) cannot; stale tokens cannot.
+    pub fn can_control(&self, id: u64) -> bool {
+        self.attachments
+            .get(&id)
+            .is_some_and(|a| a.role == AttachRole::Controller)
     }
 
     /// Is this id a live attachment (fencing check)?
@@ -210,11 +152,6 @@ impl AttachmentRegistry {
         }
     }
 
-    /// An attachment's last declared viewport, if any.
-    pub fn viewport(&self, id: u64) -> Option<(u16, u16)> {
-        self.attachments.get(&id).and_then(|a| a.viewport)
-    }
-
     /// Number of live attachments (replaces the anonymous attach counter).
     pub fn len(&self) -> usize {
         self.attachments.len()
@@ -240,7 +177,7 @@ mod tests {
     #[test]
     fn report_applied_advances_the_shared_credit_cell_monotonically() {
         let mut registry = AttachmentRegistry::default();
-        let (id, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
+        let (id, _) = registry.register(AttachKind::Cli, AttachRole::Controller, None);
         let cell = registry.credit_cell(id).expect("credit cell");
         assert_eq!(cell.load(Ordering::Relaxed), 0);
 
@@ -256,67 +193,53 @@ mod tests {
     }
 
     #[test]
-    fn first_controller_request_wins_second_joins_as_observer() {
+    fn every_controller_request_is_granted_observers_are_gated() {
         let mut registry = AttachmentRegistry::default();
-        let (a, outcome) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
-        assert_eq!(outcome.role, AttachRole::Controller);
-        assert_eq!(outcome.demoted, None);
+        let (a, role) = registry.register(AttachKind::Cli, AttachRole::Controller, None);
+        assert_eq!(role, AttachRole::Controller);
+        // A second controller is granted control too — no lease to fight over.
+        let (b, role) = registry.register(AttachKind::Web, AttachRole::Controller, None);
+        assert_eq!(role, AttachRole::Controller);
+        assert!(registry.can_control(a));
+        assert!(registry.can_control(b));
 
-        let (b, outcome) = registry.register(AttachKind::Web, ControlRequest::Controller, None);
-        assert_eq!(outcome.role, AttachRole::Observer);
-        assert!(registry.is_controller(a));
-        assert!(!registry.is_controller(b));
+        // An explicit observe attach is view-only for its whole lifetime.
+        let (c, role) = registry.register(AttachKind::Cli, AttachRole::Observer, None);
+        assert_eq!(role, AttachRole::Observer);
+        assert!(!registry.can_control(c));
+        // ...and it changes nothing for the existing controllers.
+        assert!(registry.can_control(a));
+        assert!(registry.can_control(b));
     }
 
     #[test]
-    fn takeover_demotes_the_previous_controller() {
+    fn unregister_leaves_the_other_attachments_alone() {
         let mut registry = AttachmentRegistry::default();
-        let (a, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
-        let (b, outcome) = registry.register(AttachKind::Web, ControlRequest::Takeover, None);
-        assert_eq!(outcome.role, AttachRole::Controller);
-        assert_eq!(outcome.demoted, Some(a));
-        assert!(registry.is_controller(b));
-        assert!(!registry.is_controller(a));
-        // The demoted controller stays attached as an observer.
-        assert_eq!(registry.len(), 2);
-    }
-
-    #[test]
-    fn observer_unregister_does_not_release_the_lease() {
-        let mut registry = AttachmentRegistry::default();
-        let (a, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
-        let (b, _) = registry.register(AttachKind::Web, ControlRequest::Observer, None);
+        let (a, _) = registry.register(AttachKind::Cli, AttachRole::Controller, None);
+        let (b, _) = registry.register(AttachKind::Web, AttachRole::Observer, None);
         registry.unregister(b);
-        assert!(registry.is_controller(a));
+        assert!(registry.can_control(a));
+        assert!(!registry.can_control(b));
         registry.unregister(a);
-        assert_eq!(registry.controller_id(), None);
-        // The lease is free again for the next attachment.
-        let (c, outcome) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
-        assert_eq!(outcome.role, AttachRole::Controller);
-        assert!(registry.is_controller(c));
+        assert!(registry.is_empty());
     }
 
     #[test]
     fn stale_ids_cannot_act() {
         let mut registry = AttachmentRegistry::default();
-        let (a, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
+        let (a, _) = registry.register(AttachKind::Cli, AttachRole::Controller, None);
         registry.unregister(a);
         assert!(!registry.contains(a));
-        assert!(registry.acquire_control(a).is_none());
+        assert!(!registry.can_control(a));
         assert!(registry.unregister(a).is_none());
-        assert!(!registry.is_controller(a));
     }
 
     #[test]
-    fn observer_can_take_over_explicitly() {
-        let mut registry = AttachmentRegistry::default();
-        let (a, _) = registry.register(AttachKind::Cli, ControlRequest::Controller, None);
-        let (b, _) = registry.register(AttachKind::Web, ControlRequest::Observer, None);
-        let outcome = registry.acquire_control(b).expect("attached observer");
-        assert_eq!(outcome.demoted, Some(a));
-        assert!(registry.is_controller(b));
-        // Re-acquiring while holding the lease demotes nobody.
-        let outcome = registry.acquire_control(b).expect("still attached");
-        assert_eq!(outcome.demoted, None);
+    fn roles_parse_the_wire_tokens() {
+        assert_eq!(AttachRole::parse(None), Ok(AttachRole::Controller));
+        assert_eq!(AttachRole::parse(Some("controller")), Ok(AttachRole::Controller));
+        assert_eq!(AttachRole::parse(Some("observe")), Ok(AttachRole::Observer));
+        assert_eq!(AttachRole::parse(Some("observer")), Ok(AttachRole::Observer));
+        assert!(AttachRole::parse(Some("takeover")).is_err());
     }
 }

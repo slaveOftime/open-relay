@@ -206,7 +206,7 @@ impl NodeRegistry {
 
     /// Send one mid-stream client message to an open streaming RPC on the
     /// named secondary (M5-2): attach input, resize, applied-cursor
-    /// credits, control takeover, and detach all travel this way so the
+    /// credits, and detach all travel this way so the
     /// owning node's stream task applies its attachment-scoped fencing
     /// and credit gate to remote clients exactly as to local ones.
     pub async fn proxy_rpc_stream_message(

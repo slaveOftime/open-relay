@@ -113,7 +113,6 @@ pub(crate) fn make_runtime(
         last_input_at: None,
         last_attach_activity_at: None,
         attachments: Default::default(),
-        control_tx: broadcast::channel(8).0,
         last_notified_at: None,
         notified_output_epoch: None,
         engine,
@@ -261,7 +260,6 @@ pub(crate) fn make_runtime_writable_with_capacity(
         last_input_at: None,
         last_attach_activity_at: None,
         attachments: Default::default(),
-        control_tx: broadcast::channel(8).0,
         last_notified_at: None,
         notified_output_epoch: None,
         engine: crate::terminal::Terminal::new(

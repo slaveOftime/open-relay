@@ -210,12 +210,9 @@ pub struct SessionRuntime {
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
-    /// Identified attachments and the control lease (M3-4); the attachment
-    /// count is `attachments.len()`.
+    /// Identified attachments (M3-4); the attachment count is
+    /// `attachments.len()`.
     pub attachments: super::registry::AttachmentRegistry,
-    /// Publishes the current controller's attachment id on every handoff
-    /// (`None` = lease free). Receivers compare with their own id.
-    pub control_tx: broadcast::Sender<Option<u64>>,
     /// Timestamp of the last *successful* notification delivery for this session.
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
@@ -603,42 +600,38 @@ impl SessionRuntime {
         super::logs::engine_content_rows(&self.engine, keep_color, term_cols)
     }
 
-    /// Register an identified attachment and grant control per the registry
-    /// policy (M3-4). When control is granted and the attachment declared a
-    /// viewport, the authorized initial geometry is applied here, through
-    /// the same sequencer path as any later resize (PLAN §7.2.1). Returns
-    /// the attachment id (fencing token), the granted role, and whether the
-    /// initial geometry was applied.
+    /// Register an identified attachment (M3-4). When the attachment is a
+    /// controller and declared a viewport, the initial geometry is applied
+    /// here, through the same sequencer path as any later resize
+    /// (PLAN §7.2.1). Returns the attachment id (fencing token), the
+    /// granted role, and whether the initial geometry was applied.
     pub fn register_attachment(
         &mut self,
         kind: super::registry::AttachKind,
-        request: super::registry::ControlRequest,
+        role: super::registry::AttachRole,
         viewport: Option<(u16, u16)>,
-    ) -> (u64, super::registry::ControlOutcome, bool) {
+    ) -> (u64, super::registry::AttachRole, bool) {
         use super::registry::AttachRole;
         // Attaching is itself user activity: someone just opened this
         // session and saw its current state.
         self.last_attach_activity_at = Some(Instant::now());
-        let (id, outcome) = self.attachments.register(kind, request, viewport);
+        let (id, role) = self.attachments.register(kind, role, viewport);
         let mut resized = false;
-        if outcome.role == AttachRole::Controller
+        if role == AttachRole::Controller
             && let Some((rows, cols)) = viewport
             && rows > 0
             && cols > 0
         {
             resized = self.resize_pty(rows, cols);
         }
-        if outcome.demoted.is_some() || outcome.role == AttachRole::Controller {
-            let _ = self.control_tx.send(self.attachments.controller_id());
-        }
         trace!(
             session_id = %self.meta.id,
             attachment_id = id,
-            role = outcome.role.as_str(),
+            role = role.as_str(),
             attach_count = self.attachments.len(),
             "attach client registered"
         );
-        (id, outcome, resized)
+        (id, role, resized)
     }
 
     pub fn mark_attach_activity(&mut self) {
@@ -650,8 +643,8 @@ impl SessionRuntime {
         self.last_attach_activity_at = Some(Instant::now());
     }
 
-    /// Remove an attachment by its fencing token; releases the control lease
-    /// if it held it. Unknown (stale) ids are a no-op.
+    /// Remove an attachment by its fencing token. Unknown (stale) ids are
+    /// a no-op.
     pub fn unregister_attachment(&mut self, attachment_id: u64) {
         let removed = self.attachments.unregister(attachment_id);
         debug!(
@@ -661,36 +654,9 @@ impl SessionRuntime {
             attach_count = self.attachments.len(),
             "attach client detached"
         );
-        if removed
-            .as_ref()
-            .is_some_and(|attachment| attachment.role == super::registry::AttachRole::Controller)
-        {
-            let _ = self.control_tx.send(None);
-        }
         if self.attachments.is_empty() {
             self.clear_attach_state();
         }
-    }
-
-    /// Explicit control takeover by an attached observer.
-    pub fn acquire_control(
-        &mut self,
-        attachment_id: u64,
-    ) -> Option<super::registry::ControlOutcome> {
-        let outcome = self.attachments.acquire_control(attachment_id)?;
-        self.last_attach_activity_at = Some(Instant::now());
-        // The controller owns session geometry: adopt the new controller's
-        // declared viewport immediately so a takeover resizes the session to
-        // the now-active client instead of leaving the previous controller's
-        // size in place until the next resize event.
-        if let Some((rows, cols)) = self.attachments.viewport(attachment_id)
-            && rows > 0
-            && cols > 0
-        {
-            self.resize_pty(rows, cols);
-        }
-        let _ = self.control_tx.send(self.attachments.controller_id());
-        Some(outcome)
     }
 
     pub fn clear_attach_state(&mut self) {
@@ -1296,7 +1262,6 @@ pub fn spawn_session(
         last_input_at: None,
         last_attach_activity_at: None,
         attachments: Default::default(),
-        control_tx: broadcast::channel(8).0,
         notified_output_epoch: None,
         last_notified_at: None,
         engine: {
@@ -1774,7 +1739,6 @@ mod tests {
             last_input_at: None,
             last_attach_activity_at: None,
             attachments: Default::default(),
-            control_tx: broadcast::channel(8).0,
             last_notified_at: None,
             notified_output_epoch: None,
             engine: Terminal::new(24, 80, 1000),
@@ -2665,7 +2629,7 @@ mod tests {
         let mut rt = new_runtime();
         rt.register_attachment(
             crate::session::registry::AttachKind::Cli,
-            crate::session::registry::ControlRequest::Controller,
+            crate::session::registry::AttachRole::Controller,
             None,
         );
         assert!(
@@ -2755,7 +2719,6 @@ mod tests {
             last_input_at: None,
             last_attach_activity_at: None,
             attachments: Default::default(),
-            control_tx: broadcast::channel(8).0,
             last_notified_at: None,
             notified_output_epoch: None,
             engine: Terminal::new(24, 80, 1000),

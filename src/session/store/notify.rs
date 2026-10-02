@@ -930,7 +930,7 @@ mod tests {
             .attach_register(
                 "abc1234",
                 crate::session::registry::AttachKind::Cli,
-                crate::session::registry::ControlRequest::Controller,
+                crate::session::registry::AttachRole::Controller,
                 None,
             )
             .await
@@ -964,7 +964,7 @@ mod tests {
             .attach_register(
                 "abc1234",
                 crate::session::registry::AttachKind::Cli,
-                crate::session::registry::ControlRequest::Controller,
+                crate::session::registry::AttachRole::Controller,
                 None,
             )
             .await

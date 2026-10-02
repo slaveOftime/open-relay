@@ -50,7 +50,6 @@ function describeFrame(frame: ServerFrame): Record<string, unknown> {
         incarnation: frame.incarnation,
         running: frame.running,
         attachment_id: frame.attachmentId,
-        role: frame.role,
         data_hex: toHex(frame.data),
       }
     case 'data':
@@ -70,8 +69,6 @@ function describeFrame(frame: ServerFrame): Record<string, unknown> {
       return { type: 'session_ended', exit_code: frame.exitCode, final_offset: frame.finalOffset }
     case 'error':
       return { type: 'error', message: frame.message }
-    case 'control':
-      return { type: 'control', role: frame.role }
     case 'pong':
       return { type: 'pong' }
   }
@@ -81,7 +78,7 @@ describe('ws frame fixture conformance', () => {
   const vectors = loadVectors()
 
   it('covers every server frame kind', () => {
-    expect(vectors.length).toBeGreaterThanOrEqual(10)
+    expect(vectors.length).toBeGreaterThanOrEqual(8)
     const kinds = new Set(vectors.map((v) => v.expect.type))
     for (const kind of [
       'init',
@@ -90,7 +87,6 @@ describe('ws frame fixture conformance', () => {
       'resized',
       'session_ended',
       'error',
-      'control',
       'pong',
     ]) {
       expect(kinds.has(kind), `fixture covers ${kind}`).toBe(true)
@@ -131,8 +127,8 @@ describe('ws frame fixture conformance', () => {
     expect(parseServerFrame(new Uint8Array(0))).toBeNull()
     // Unknown tag: throwing beats silently dropping stream bytes (I2).
     expect(() => parseServerFrame(new Uint8Array([255, 1, 2]))).toThrow(/unknown server frame tag/)
-    // INIT header is 28 bytes; 27 must not decode.
-    expect(() => parseServerFrame(fromHex(vectors[0].hex).subarray(0, 27))).toThrow(
+    // INIT header is 27 bytes; 26 must not decode.
+    expect(() => parseServerFrame(fromHex(vectors[0].hex).subarray(0, 26))).toThrow(
       /truncated init frame/
     )
     // DATA header is 9 bytes; 8 must not decode.

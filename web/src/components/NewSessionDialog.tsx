@@ -210,6 +210,7 @@ export default function NewSessionDialog({
           </FormField>
           {resumeCommand ? (
             <button
+              type="button"
               className="w-full rounded-md p-1 outline-dashed outline-1 outline-neutral-500 opacity-60 hover:opacity-80 focus:opacity-80 -mt-1 whitespace-normal max-h-12 align-top overflow-y-auto"
               onClick={handleToggleResumeCommand}
               disabled={loading || startedSessionId !== null || creationUncertain}

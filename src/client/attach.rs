@@ -289,12 +289,13 @@ async fn run_attach_inner(
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
 
-    // I6 (PLAN §8.1): observers never drive input or geometry. The server
-    // enforces the lease; this mirrors it client-side so an observer's
-    // keystrokes don't bounce off the gate.
-    let mut is_controller = granted_role != "observer";
-    if interactive && !is_controller {
-        eprintln!("Attached as observer (view-only). Ctrl-T takes control, Ctrl-D detaches.");
+    // I6 (PLAN §8.1): an observe-mode attach (`--observe`) never drives
+    // input or geometry. The server enforces the gate; this mirrors it
+    // client-side so an observer's keystrokes don't bounce off it. Every
+    // other attach controls the session by default.
+    let can_drive = granted_role != "observer";
+    if interactive && !can_drive {
+        eprintln!("Attached in observe mode (view-only). Ctrl-D detaches.");
     }
 
     // Every chunk must continue exactly at the cursor the init frame left
@@ -325,7 +326,6 @@ async fn run_attach_inner(
                 }
                 ipc::AttachFrame::Control(resp) => match *resp {
                     RpcResponse::AttachModeChanged { .. } => {}
-                    RpcResponse::AttachControlChanged { .. } => {}
                     RpcResponse::AttachStreamDone { final_offset, .. } => {
                         stream_cursor.finish(final_offset)?;
                         running = false;
@@ -391,17 +391,11 @@ async fn run_attach_inner(
             if (now_cols, now_rows) != last_sent_size {
                 last_sent_size = (now_cols, now_rows);
                 #[cfg(windows)]
-                if is_controller {
+                if can_drive {
                     renderer.resize(now_rows, now_cols);
                 }
-                send_attach_resize(
-                    &mut write_half,
-                    &id_owned,
-                    now_rows,
-                    now_cols,
-                    !is_controller,
-                )
-                .await?;
+                send_attach_resize(&mut write_half, &id_owned, now_rows, now_cols)
+                    .await?;
             }
         }
 
@@ -470,7 +464,7 @@ async fn run_attach_inner(
                                 // paste as one bounded transaction, bytes
                                 // exactly as the terminal delivered them
                                 // (PLAN §5.1: no CRLF rewriting).
-                                if is_controller {
+                                if can_drive {
                                     send_attach_input(
                                         &mut write_half,
                                         &id_owned,
@@ -483,7 +477,7 @@ async fn run_attach_inner(
                             Event::FocusGained => {
                                 // DECSET 1004: forward focus events only when
                                 // the child asked for them.
-                                if is_controller && child_focus_events {
+                                if can_drive && child_focus_events {
                                     send_attach_input(
                                         &mut write_half,
                                         &id_owned,
@@ -494,7 +488,7 @@ async fn run_attach_inner(
                                 }
                             }
                             Event::FocusLost => {
-                                if is_controller && child_focus_events {
+                                if can_drive && child_focus_events {
                                     send_attach_input(
                                         &mut write_half,
                                         &id_owned,
@@ -513,21 +507,15 @@ async fn run_attach_inner(
                                     last_sent_size = (actual_cols, actual_rows);
 
                                     #[cfg(windows)]
-                                    if is_controller {
+                                    if can_drive {
                                         renderer.resize(actual_rows, actual_cols);
                                     }
 
-                                    // Observers take control first: the
-                                    // daemon rejects observer resizes with
-                                    // NotController, so without the takeover
-                                    // an observer's window resize never
-                                    // reached the session.
                                     send_attach_resize(
                                         &mut write_half,
                                         &id_owned,
                                         actual_rows,
                                         actual_cols,
-                                        !is_controller,
                                     )
                                     .await?
                                 }
@@ -561,17 +549,7 @@ async fn run_attach_inner(
                                 } else if is_ctrl_d(key) {
                                     detached = true;
                                     running = false;
-                                } else if !is_controller && is_ctrl_t(key) {
-                                    // Observer takeover: the server answers
-                                    // with an AttachControlChanged frame.
-                                    ipc::write_request_to_writer(
-                                        &mut write_half,
-                                        RpcRequest::AttachAcquireControl {
-                                            id: id_owned.clone(),
-                                        },
-                                    )
-                                    .await?;
-                                } else if !is_controller {
+                                } else if !can_drive {
                                     // Observer: keys do not reach the session.
                                 } else if let Some(data) =
                                     map_key_to_input(key, child_app_cursor_keys)
@@ -592,7 +570,7 @@ async fn run_attach_inner(
                                 // application asked for it (any of
                                 // 1000/1002/1003); otherwise the local
                                 // terminal keeps selection semantics.
-                                if !is_controller || !child_mouse_report {
+                                if !can_drive || !child_mouse_report {
                                     continue;
                                 }
                                 if let Some(data) = map_mouse_input(mouse, child_sgr_mouse) {
@@ -679,34 +657,6 @@ async fn run_attach_inner(
                                         let (actual_cols, actual_rows) =
                                             terminal::size().unwrap_or((80, 24));
                                         last_sent_size = (actual_cols, actual_rows);
-                                    }
-                                    RpcResponse::AttachControlChanged { role } => {
-                                        is_controller = role == "controller";
-                                        if is_controller {
-                                            // The controller owns session
-                                            // geometry: push our actual
-                                            // terminal size immediately so a
-                                            // takeover (Ctrl-T, or a demoted
-                                            // client becoming active again)
-                                            // resizes the session to the now
-                                            // -active client instead of
-                                            // leaving stale geometry until
-                                            // the next window resize.
-                                            let (actual_cols, actual_rows) =
-                                                terminal::size().unwrap_or((80, 24));
-                                            last_sent_size = (actual_cols, actual_rows);
-                                            #[cfg(windows)]
-                                            renderer.resize(actual_rows, actual_cols);
-                                            ipc::write_request_to_writer(
-                                                &mut write_half,
-                                                RpcRequest::AttachResize {
-                                                    id: id_owned.clone(),
-                                                    rows: actual_rows,
-                                                    cols: actual_cols,
-                                                },
-                                            )
-                                            .await?;
-                                        }
                                     }
                                     RpcResponse::AttachStreamDone { final_offset, .. } => {
                                         if let Err(err) = stream_cursor.finish(final_offset) {
@@ -1255,24 +1205,15 @@ fn is_ctrl_d(key: KeyEvent) -> bool {
 }
 
 /// Push the client's terminal size to the daemon as session geometry.
-/// `take_control` first acquires the control lease: a native window
-/// resize signals intent to drive, and the daemon rejects observer
-/// resizes with NotController, so an observer's resize must take control
-/// (last-active-client-wins, same rule as attach) to reach the session.
+/// Only controllers get through: the daemon rejects an observer's resize
+/// with ViewOnly, and controllers follow a last-successful-resize-wins
+/// rule.
 async fn send_attach_resize(
     writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
     id: &str,
     rows: u16,
     cols: u16,
-    take_control: bool,
 ) -> Result<()> {
-    if take_control {
-        ipc::write_request_to_writer(
-            writer,
-            RpcRequest::AttachAcquireControl { id: id.to_string() },
-        )
-        .await?;
-    }
     ipc::write_request_to_writer(
         writer,
         RpcRequest::AttachResize {
@@ -1308,11 +1249,6 @@ async fn maybe_send_ack(
         .await;
         *last_acked = cursor;
     }
-}
-
-fn is_ctrl_t(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
 }
 
 #[cfg(test)]

@@ -645,7 +645,7 @@ mod tests {
             .attach_register(
                 "credit1",
                 crate::session::registry::AttachKind::Cli,
-                crate::session::registry::ControlRequest::Controller,
+                crate::session::registry::AttachRole::Controller,
                 None,
             )
             .await
@@ -716,7 +716,7 @@ mod tests {
             .attach_register(
                 "credit2",
                 crate::session::registry::AttachKind::Web,
-                crate::session::registry::ControlRequest::Observer,
+                crate::session::registry::AttachRole::Observer,
                 None,
             )
             .await
@@ -974,15 +974,15 @@ mod tests {
     }
 
     /// M3 exit stress (I2/I6/I7): ten mixed attachments — CLI and web,
-    /// controller and observers — streaming through output bursts, ring
-    /// overflows, resizes, a control takeover, and a detach/re-attach, then
-    /// a clean session end. Every pump must observe exactly the same
-    /// contiguous byte stream (its own suffix of the total), control
-    /// gating must hold throughout, and every completion reports the same
-    /// final cursor.
+    /// controllers and a view-only observer — streaming through output
+    /// bursts, ring overflows, resizes, an observe-gating check, and a
+    /// detach/re-attach, then a clean session end. Every pump must observe
+    /// exactly the same contiguous byte stream (its own suffix of the
+    /// total), observe gating must hold throughout, and every completion
+    /// reports the same final cursor.
     #[tokio::test]
     async fn pump_stress_ten_mixed_clients_stay_consistent() {
-        use crate::session::registry::{AttachKind, AttachRole, ControlRequest};
+        use crate::session::registry::{AttachKind, AttachRole};
 
         struct Client {
             pump: AttachPump,
@@ -1044,10 +1044,11 @@ mod tests {
             .expect("open fixture journal");
         let mut journal_seq = 0u64;
 
-        // Ten attachments, alternating kinds: the first takes the control
-        // lease, the rest join as observers (many observers, one
-        // controller).
+        // Ten attachments, alternating kinds. Nine are controllers (every
+        // attach drives by default); attachment 3 joins as a view-only
+        // observer.
         let mut attachment_ids = Vec::new();
+        let mut observer_id = 0u64;
         for i in 0..10u8 {
             let reg = store
                 .attach_register(
@@ -1057,11 +1058,18 @@ mod tests {
                     } else {
                         AttachKind::Web
                     },
-                    ControlRequest::Controller,
+                    if i == 3 {
+                        AttachRole::Observer
+                    } else {
+                        AttachRole::Controller
+                    },
                     None,
                 )
                 .await
                 .expect("register attachment");
+            if i == 3 {
+                observer_id = reg.attachment_id;
+            }
             attachment_ids.push(reg.attachment_id);
         }
 
@@ -1095,7 +1103,7 @@ mod tests {
             });
         }
 
-        let mut controller = attachment_ids[0];
+        let controller = attachment_ids[0];
         for step in 0..120u32 {
             let mut chunk = format!(
                 "line{step:03}
@@ -1120,27 +1128,21 @@ mod tests {
             }
 
             match step {
-                // Resize driven only by the controller.
+                // Resize driven by a controller.
                 10 | 50 => {
                     store
                         .attach_resize("stress1", Some(controller), 30 + (step as u16 % 5), 100)
                         .await
                         .expect("controller resize");
                 }
-                // Takeover: attachment 3 seizes control mid-stream.
+                // The observer stays gated (I6) while any number of
+                // controllers can drive.
                 40 => {
-                    let outcome = store
-                        .attach_acquire_control("stress1", attachment_ids[3])
-                        .await
-                        .expect("takeover");
-                    assert_eq!(outcome.role, AttachRole::Controller);
-                    controller = attachment_ids[3];
-                    // The demoted controller is now gated (I6).
                     let err = store
-                        .attach_input("stress1", Some(attachment_ids[0]), b"x", false)
+                        .attach_input("stress1", Some(observer_id), b"x", false)
                         .await
-                        .expect_err("demoted controller must be gated");
-                    assert!(matches!(err, SessionError::NotController));
+                        .expect_err("observer input must be gated");
+                    assert!(matches!(err, SessionError::ViewOnly));
                 }
                 // Controller input still lands.
                 41 => {
@@ -1159,7 +1161,7 @@ mod tests {
                         .expect("detach");
                     drop(leaving);
                     let reg = store
-                        .attach_register("stress1", AttachKind::Web, ControlRequest::Observer, None)
+                        .attach_register("stress1", AttachKind::Web, AttachRole::Observer, None)
                         .await
                         .expect("late observer");
                     let (pump, init) = AttachPump::subscribe(
@@ -1203,7 +1205,7 @@ mod tests {
         );
 
         // Every client applied exactly its own suffix of the one true
-        // stream — no gaps, no duplication, across lag/takeover/reconnect.
+        // stream — no gaps, no duplication, across lag/reconnect.
         for client in &clients {
             assert_eq!(
                 client.received,

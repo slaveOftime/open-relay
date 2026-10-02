@@ -175,7 +175,6 @@ function SessionDetailPageContent() {
 
   const termRef = useRef<XTermHandle>(null)
   const socketRef = useRef<AttachSocket | null>(null)
-  const [controlRole, setControlRole] = useState<'controller' | 'observer'>('controller')
   const wsConnectedRef = useRef(false)
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
@@ -833,17 +832,6 @@ function SessionDetailPageContent() {
             // even after a reconnect or stale replay bytes.
             enqueueTerminalOutput([modesEncoder.encode(terminalModeSequences(modes))])
           },
-          onControl: (role) => {
-            lastWsFrameAtRef.current = Date.now()
-            if (isMounted.current) setControlRole(role)
-            // The controller owns session geometry: the moment we hold the
-            // lease, push our actual viewport so the session resizes to the
-            // active browser instead of keeping a previous controller's size.
-            if (role === 'controller') {
-              const size = termRef.current?.getSize()
-              if (size) sock.sendResize(size.rows, size.cols)
-            }
-          },
           onResized: (rows, cols) => {
             lastWsFrameAtRef.current = Date.now()
             // If the PTY was resized to dimensions that don't match our
@@ -890,10 +878,7 @@ function SessionDetailPageContent() {
           },
         },
         node ?? undefined,
-        initialSize ?? undefined,
-        // Browser attach always takes control (and with it geometry
-        // authority): the active browser tab drives the session.
-        'takeover'
+        initialSize ?? undefined
       )
       pushConnectTrace('websocket created')
       socketRef.current = sock
@@ -1443,12 +1428,6 @@ function SessionDetailPageContent() {
                 <span className="hidden sm:inline">Offline</span>
               </Badge>
             )}
-            {mode === 'attach' && controlRole === 'observer' && (
-              <Badge variant="secondary" className="inline-flex font-light">
-                <span className="hidden sm:inline">Observer (view-only)</span>
-                <span className="sm:hidden">Observer</span>
-              </Badge>
-            )}
           </div>
 
           {/* Desktop actions */}
@@ -1457,15 +1436,6 @@ function SessionDetailPageContent() {
               <ReloadIcon className="h-4 w-4" />
               Refresh
             </Button>
-            {mode === 'attach' && controlRole === 'observer' && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => socketRef.current?.sendAcquireControl()}
-              >
-                Take control
-              </Button>
-            )}
             {mode === 'attach' && (
               <Button
                 size="sm"

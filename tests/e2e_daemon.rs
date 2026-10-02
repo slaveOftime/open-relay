@@ -1432,7 +1432,7 @@ fn e2e_list_empty_shows_no_sessions_hint() {
 }
 
 /// W4 protocol evidence: a real WS attach against a live daemon — INIT frame
-/// layout, controller role, gated input, contiguously offset DATA frames
+/// layout, input flowing, contiguously offset DATA frames
 /// (I2), ping/pong, graceful detach — with the canonical journal staying
 /// doctor-clean throughout.
 #[test]
@@ -1453,7 +1453,7 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
             .expect("connect attach websocket");
 
         // INIT: [1][flags][endOffset u64be][incarnation u64be][running u8]
-        //       [attachmentId u64be][role u8][data]
+        //       [attachmentId u64be][data]
         let init = timeout(Duration::from_secs(5), ws.next())
             .await
             .expect("init frame timeout")
@@ -1463,7 +1463,7 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
             panic!("expected binary INIT frame, got: {init:?}")
         };
         assert_eq!(init[0], 1, "first frame must be INIT");
-        assert!(init.len() >= 28, "INIT header is 28 bytes");
+        assert!(init.len() >= 27, "INIT header is 27 bytes");
         let mut expected_offset = u64::from_be_bytes(init[2..10].try_into().unwrap());
         let incarnation = u64::from_be_bytes(init[10..18].try_into().unwrap());
         assert!(
@@ -1473,9 +1473,8 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
         assert_eq!(init[18], 1, "session is running");
         let attachment_id = u64::from_be_bytes(init[19..27].try_into().unwrap());
         assert!(attachment_id >= 1, "attachment fencing token is assigned");
-        assert_eq!(init[27], 1, "the sole attacher is the controller");
 
-        // Controller input flows; the echoed bytes arrive in DATA frames
+        // Input flows; the echoed bytes arrive in DATA frames
         // whose offsets continue the init cursor exactly (I2).
         ws.send(WsMessage::Text(
             r#"{"type":"input","data":"hello-ws\n","waitForChange":false}"#.into(),
@@ -1508,8 +1507,8 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
                     expected_offset += (bytes.len() - 9) as u64;
                     echoed.extend_from_slice(&bytes[9..]);
                 }
-                // mode/resize/control notices are legitimate interleavings.
-                3 | 4 | 8 => {}
+                // mode/resize notices are legitimate interleavings.
+                3 | 4 => {}
                 other => panic!("unexpected frame tag {other}"),
             }
         }

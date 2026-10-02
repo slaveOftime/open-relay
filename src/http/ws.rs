@@ -12,7 +12,6 @@ use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::protocol::RpcRequest;
-use crate::session::registry::ControlRequest;
 
 use crate::session::{ModeSnapshot, SessionError};
 
@@ -29,8 +28,6 @@ pub struct AttachParams {
     pub cols: Option<u16>,
     /// Initial terminal height (rows) reported by the browser xterm instance.
     pub rows: Option<u16>,
-    /// Requested control role: observer | controller (default) | takeover.
-    pub role: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -57,9 +54,8 @@ pub(crate) enum ServerMessage {
         /// this, a fresh page load into an already-mouse-enabled program
         /// (vim, htop, …) leaves xterm.js capturing nothing.
         modes: WsModes,
-        /// This attachment's fencing token and granted role (M3-4).
+        /// This attachment's fencing token (M3-4).
         attachment_id: u64,
-        role: &'static str,
     },
     /// Incremental PTY output chunk; `offset` is the stream offset of the
     /// first byte so clients can verify contiguity (I2).
@@ -85,10 +81,6 @@ pub(crate) enum ServerMessage {
     Error {
         message: String,
     },
-    /// Control handoff notice: this attachment's role after the change.
-    Control {
-        role: &'static str,
-    },
     Pong,
 }
 
@@ -105,8 +97,6 @@ pub(crate) enum ClientMessage {
         rows: u16,
         cols: u16,
     },
-    /// Take over the control lease from an observer position.
-    AcquireControl,
     /// Applied-cursor credit (M3-5, I7): highest stream offset the client
     /// has rendered.
     Ack {
@@ -123,7 +113,6 @@ const WS_FRAME_RESIZED: u8 = 4;
 const WS_FRAME_SESSION_ENDED: u8 = 5;
 const WS_FRAME_ERROR: u8 = 6;
 const WS_FRAME_PONG: u8 = 7;
-const WS_FRAME_CONTROL: u8 = 8;
 const WS_FLAG_APP_CURSOR_KEYS: u8 = 1 << 0;
 const WS_FLAG_BRACKETED_PASTE_MODE: u8 = 1 << 1;
 const WS_FLAG_MOUSE_REPORT: u8 = 1 << 2;
@@ -195,7 +184,6 @@ pub async fn attach_handler(
             AttachConnectionParams {
                 initial_rows: params.rows,
                 initial_cols: params.cols,
-                role: params.role,
                 headers,
             },
         ))
@@ -257,16 +245,14 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
             running,
             modes,
             attachment_id,
-            role,
         } => {
-            let mut payload = Vec::with_capacity(28 + data.len());
+            let mut payload = Vec::with_capacity(27 + data.len());
             payload.push(WS_FRAME_INIT);
             payload.push(mode_flags(modes));
             payload.extend_from_slice(&end_offset.to_be_bytes());
             payload.extend_from_slice(&incarnation.to_be_bytes());
             payload.push(u8::from(*running));
             payload.extend_from_slice(&attachment_id.to_be_bytes());
-            payload.push(u8::from(*role == "controller"));
             payload.extend_from_slice(data);
             payload
         }
@@ -309,7 +295,6 @@ fn encode_server_message(msg: &ServerMessage) -> Vec<u8> {
             payload.extend_from_slice(message.as_bytes());
             payload
         }
-        ServerMessage::Control { role } => vec![WS_FRAME_CONTROL, u8::from(*role == "controller")],
         ServerMessage::Pong => vec![WS_FRAME_PONG],
     }
 }
@@ -326,7 +311,6 @@ async fn send_server_message(socket: &mut WebSocket, msg: &ServerMessage) -> boo
 struct AttachConnectionParams {
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
-    role: Option<String>,
     /// Upgrade-time headers retained so a future revision can incorporate
     /// per-connection surfaces (CSRF cookies, Auth-Bearer tokens,
     /// per-message auth evidence) without changing the upgrade plumbing.
@@ -343,16 +327,6 @@ async fn handle_ws(
 ) {
     debug!(session_id = %id, node = ?node, "WebSocket connected");
 
-    // Parse the role before opening either source so the dispatch error
-    // path can wrap a clean ServerMessage::Error without side effects.
-    let request = match ControlRequest::parse(params.role.as_deref()) {
-        Ok(request) => request,
-        Err(message) => {
-            let _ = send_server_message(&mut socket, &ServerMessage::Error { message }).await;
-            return;
-        }
-    };
-
     // ADR-0007 (M5-4): logout/revocation closes live control streams not
     // just future requests — watch the revocation epoch and re-validate the
     // connection's token before tearing the stream down.
@@ -366,7 +340,6 @@ async fn handle_ws(
             node_name.clone(),
             params.initial_rows,
             params.initial_cols,
-            params.role.clone(),
         )
         .await
         {
@@ -405,7 +378,6 @@ async fn handle_ws(
         id.clone(),
         params.initial_rows,
         params.initial_cols,
-        request,
     )
     .await
     {
@@ -449,7 +421,7 @@ async fn handle_ws(
 /// and dispatches client messages back into the source.
 ///
 /// The `init_metrics_label` must be exactly one of `"local"` or
-/// `"proxied"` -- the same labels pre-S2 observers expect.
+/// `"proxied"` -- the same labels pre-S2 metrics dashboards expect.
 ///
 /// S2 unifies the local and relayed paths, so this handler deliberately
 /// threads both shapes' bags of context (`AttachSource`, sender pair,
@@ -527,12 +499,6 @@ async fn serve_attach(
                     }
                     Some(AttachStreamEvent::Resized { rows, cols }) => {
                         if !send_server_message(&mut socket, &ServerMessage::Resized { rows, cols }).await {
-                            cleanup_source(&state, &id, &node, &source).await;
-                            return;
-                        }
-                    }
-                    Some(AttachStreamEvent::Control { role }) => {
-                        if !send_server_message(&mut socket, &ServerMessage::Control { role }).await {
                             cleanup_source(&state, &id, &node, &source).await;
                             return;
                         }
@@ -769,7 +735,7 @@ async fn apply_client_message_local(
             if let Err(err) = outcome {
                 let gated = matches!(
                     err,
-                    SessionError::NotController | SessionError::StaleAttachment
+                    SessionError::ViewOnly | SessionError::StaleAttachment
                 );
                 if !send_server_message(
                     socket,
@@ -821,7 +787,7 @@ async fn apply_client_message_local(
                 .await
             {
                 Ok(()) => true,
-                Err(SessionError::NotController | SessionError::StaleAttachment) => {
+                Err(SessionError::ViewOnly | SessionError::StaleAttachment) => {
                     source.resize_sub.mark_sent(0, 0);
                     true
                 }
@@ -836,27 +802,6 @@ async fn apply_client_message_local(
                     false
                 }
             }
-        }
-        ClientMessage::AcquireControl => {
-            debug!(
-                session_id = %id,
-                attach_path = init_metrics_label,
-                attachment_id = source.attachment_id,
-                "WS control takeover requested"
-            );
-            if let Err(err) = state
-                .store
-                .attach_acquire_control(id, source.attachment_id)
-                .await
-            {
-                warn!(
-                    session_id = %id,
-                    attach_path = init_metrics_label,
-                    error = err.message(id),
-                    "control takeover failed"
-                );
-            }
-            true
         }
         ClientMessage::Ack { offset } => {
             state
@@ -974,29 +919,6 @@ async fn apply_client_message_relayed(
             }
             true
         }
-        ClientMessage::AcquireControl => {
-            debug!(
-                session_id = %id,
-                node = %node,
-                attach_path = init_metrics_label,
-                "relayed WS control takeover requested"
-            );
-            let rpc = RpcRequest::AttachAcquireControl { id: id.to_string() };
-            if let Err(err) = state
-                .node_registry
-                .proxy_rpc_stream_message(node, &source.stream_rpc_id, &rpc)
-                .await
-            {
-                warn!(
-                    session_id = %id,
-                    node = %node,
-                    attach_path = init_metrics_label,
-                    %err,
-                    "failed to proxy WebSocket control takeover"
-                );
-            }
-            true
-        }
         ClientMessage::Ack { offset } => {
             let rpc = RpcRequest::AttachAppliedCursor {
                 id: id.to_string(),
@@ -1101,8 +1023,8 @@ pub(crate) fn seed_web_init_data(
 mod tests {
     use super::{
         ServerMessage, WS_FLAG_FOCUS_EVENTS, WS_FLAG_MOUSE_REPORT, WS_FLAG_SGR_MOUSE,
-        WS_FRAME_CONTROL, WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED, WsModes,
-        encode_server_message, panic_payload_message, seed_web_init_data,
+        WS_FRAME_DATA, WS_FRAME_INIT, WS_FRAME_SESSION_ENDED, WsModes, encode_server_message,
+        panic_payload_message, seed_web_init_data,
     };
 
     #[test]
@@ -1160,17 +1082,13 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).expect("read ws_frames.json"))
                 .expect("parse ws_frames.json");
         let frames = fixture["frames"].as_array().expect("frames array");
-        assert!(frames.len() >= 10, "the fixture covers every frame kind");
+        assert!(frames.len() >= 8, "the fixture covers every frame kind");
 
         for frame in frames {
             let name = frame["name"].as_str().expect("name");
             let pinned = frame["hex"].as_str().expect("hex");
             let expect = &frame["expect"];
             let kind = expect["type"].as_str().expect("expect.type");
-            let role = match expect["role"].as_str() {
-                Some("controller") => "controller",
-                _ => "observer",
-            };
             let message = match kind {
                 "init" => ServerMessage::Init {
                     data: decode_hex(expect["data_hex"].as_str().unwrap_or("")),
@@ -1187,7 +1105,6 @@ mod tests {
                         focus_events: expect["focus_events"].as_bool().expect("focus_events"),
                     },
                     attachment_id: expect["attachment_id"].as_u64().expect("attachment_id"),
-                    role,
                 },
                 "data" => ServerMessage::Data {
                     offset: expect["offset"].as_u64().expect("offset"),
@@ -1215,7 +1132,6 @@ mod tests {
                 "error" => ServerMessage::Error {
                     message: expect["message"].as_str().expect("message").to_string(),
                 },
-                "control" => ServerMessage::Control { role },
                 "pong" => ServerMessage::Pong,
                 other => panic!("{name}: unknown frame type {other}"),
             };
@@ -1238,7 +1154,6 @@ mod tests {
                 ..WsModes::default()
             },
             attachment_id: 42,
-            role: "controller",
         });
         assert_eq!(payload[0], WS_FRAME_INIT);
         assert_eq!(payload[1], 1); // app-cursor-keys flag only
@@ -1246,8 +1161,7 @@ mod tests {
         assert_eq!(payload[10..18], 9_u64.to_be_bytes());
         assert_eq!(payload[18], 1); // running
         assert_eq!(payload[19..27], 42_u64.to_be_bytes()); // attachment id
-        assert_eq!(payload[27], 1); // role: controller
-        assert_eq!(&payload[28..], b"hi");
+        assert_eq!(&payload[27..], b"hi");
     }
 
     /// Mouse/focus mode bits must reach the browser: xterm.js only
@@ -1273,23 +1187,10 @@ mod tests {
             running: false,
             modes,
             attachment_id: 0,
-            role: "observer",
         });
         assert_eq!(
             payload[1],
             WS_FLAG_MOUSE_REPORT | WS_FLAG_SGR_MOUSE | WS_FLAG_FOCUS_EVENTS
-        );
-    }
-
-    #[test]
-    fn encode_control_frame_layout() {
-        assert_eq!(
-            encode_server_message(&ServerMessage::Control { role: "controller" }),
-            vec![WS_FRAME_CONTROL, 1]
-        );
-        assert_eq!(
-            encode_server_message(&ServerMessage::Control { role: "observer" }),
-            vec![WS_FRAME_CONTROL, 0]
         );
     }
 

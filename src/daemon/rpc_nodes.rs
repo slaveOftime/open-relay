@@ -637,7 +637,6 @@ fn is_stream_message_relayable(request: &RpcRequest) -> bool {
         request,
         RpcRequest::AttachInput { .. }
             | RpcRequest::AttachResize { .. }
-            | RpcRequest::AttachAcquireControl { .. }
             | RpcRequest::AttachAppliedCursor { .. }
             | RpcRequest::AttachDetach { .. }
     )
@@ -647,7 +646,7 @@ fn is_stream_message_relayable(request: &RpcRequest) -> bool {
 /// IPC connection to this daemon (single implementation — the same
 /// streaming handler local clients use), forward its frames to the
 /// primary, and write mid-stream client messages from the primary onto
-/// the connection so attachment-scoped fencing, control leases, and
+/// the connection so attachment-scoped fencing, observe-mode gating, and
 /// applied-cursor credits apply to remote clients (M5-2).
 async fn relay_streaming_rpc(
     config: &AppConfig,
@@ -792,7 +791,7 @@ pub(super) async fn handle_node_accept(
 
 /// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the
 /// secondary node and relay all streaming frames back to the CLI via IPC.
-/// Client messages (input/resize/credits/control/detach) read from the IPC
+/// Client messages (input/resize/credits/detach) read from the IPC
 /// reader are forwarded as mid-stream messages on the same stream (M5-2),
 /// so the owning node's attachment-scoped fencing and credit gate apply to
 /// remote clients exactly as to local ones.
@@ -957,7 +956,6 @@ mod tests {
                 rows: 24,
                 cols: 80,
             },
-            RpcRequest::AttachAcquireControl { id: "s".into() },
             RpcRequest::AttachAppliedCursor {
                 id: "s".into(),
                 cursor: 7,

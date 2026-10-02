@@ -49,7 +49,7 @@ core concern:
 | Journal | `src/session/journal.rs` | Segmented, incarnation-fenced append-only log with durability cursors and checkpoint-gated retention. Integrity is verifiable through manifest validation. |
 | Replay | `src/session/replay.rs`, `src/session/logs/` | Derives the filtered display stream, resize history, and rendered logs from the journal. |
 | Attach pump | `src/session/store/pump.rs` | The single state machine that serves every attach: snapshot from the journal, then gapless live chunks with enforced credits and bounded per-client queues. |
-| Attachments | `src/session/store/attach.rs` | Registry, control lease (one controller, many observers), fenced handoff, geometry authority. |
+| Attachments | `src/session/store/attach.rs` | Registry with roles fixed at registration (controller, or view-only observer); geometry authority gated by role. |
 | Web UI | `web/` | React + xterm.js; consumes the same binary frame protocol over WebSocket. |
 | Federation | `src/node/`, `src/daemon/rpc_nodes.rs` | A primary supervises sessions on secondary nodes; remote attach relays the same stream with fencing, deadlines, and keepalives. See “Node federation”. |
 
@@ -87,10 +87,10 @@ Input (one gate):
 
 ```
 CLI keys / xterm onData ──► AttachClientMessage
-  { input | resize | acquire-control | applied-cursor | detach }
+  { input | resize | applied-cursor | detach }
               │
-  attachment registry (store/attach.rs): control-lease check —
-  observers are rejected, handoff is explicit and fenced
+  attachment registry (store/attach.rs): role gate —
+  observe-mode attachments are rejected; controllers drive directly
               │
   PTY writer (runtime.rs) ──► child stdin
 ```
@@ -177,17 +177,17 @@ browser / CLI ──WS──► primary ws.rs ── NodeRegistry::proxy_rpc_str
                                          connection to its OWN daemon
                                            │  full local attach runs:
                                            │  journal → AttachPump →
-                                           │  control lease → credits
+                                           │  role gate → credits
                                            ▼
    RpcStreamFrame{id, chunk, done} ◄───────┤  binary attach frames ride
    RpcStreamMessage{id, input|resize|      │  back as stream frames;
-   acquire-control|applied-cursor|detach} ─►┤  client messages are
+   applied-cursor|detach} ─►┤  client messages are
                                             │  forwarded verbatim
 ```
 
    Because the secondary serves the relay through its own local IPC,
-   the *authoritative* implementation — pump cursors, one-controller
-   lease, credit enforcement, gapless resume — runs unchanged on the
+   the *authoritative* implementation — pump cursors, the role gate,
+   credit enforcement, gapless resume — runs unchanged on the
    owning node. A federated attach is a local attach plus one transport
    hop, which is why fencing and flow control are identical for remote
    clients. Mid-stream messages are allowlisted to attach-scoped ones;
@@ -226,8 +226,10 @@ test suite enforces (the full list with rationale is in `PLAN.md` §4):
   resume continues exactly, cross-incarnation cursors are fenced, and
   gaps/duplicates are protocol errors — for local, browser, and relayed
   clients alike.
-- **One controller.** Input is gated by a control lease; observers cannot
-  inject; handoff is explicit and fenced.
+- **Roles fixed at attach.** Input is gated by attachment role: an
+  observe-mode attach cannot inject; every other attach is a
+  controller, and controllers drive concurrently (last successful
+  resize wins geometry).
 - **Bounded memory.** Slow clients backpressure via stream credits and
   bounded queues; a stuck client is resynced or dropped, never buffered
   forever.

@@ -243,8 +243,8 @@ async fn send_data(config: &AppConfig, id: &str, data: Vec<u8>, node: Option<&st
         id: id.to_string(),
         data,
         wait_for_change: true,
-        // Ungated operator one-shot: no attachment token (PLAN §5.1 —
-        // `oly send` works regardless of who holds the control lease).
+        // Ungated operator one-shot: no attachment token, so `oly send`
+        // reaches the session regardless of attach role (PLAN §5.1).
         attachment_id: None,
     };
     let req = match node {

@@ -108,9 +108,9 @@ Useful behavior to know:
 
 - `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
 - To detach from an attached session, press `Ctrl-D`.
-- Attaching (CLI or browser) takes control of the session by default and resizes it to the attaching client's viewport — the most recently active client always drives. Use `oly attach --observer` for a view-only attach that never drives input or geometry.
-- Resizing an attached terminal window reports the new size to the daemon and resizes the session; if that client was an observer, the resize takes control first (same last-active-wins rule), so the session always follows the window you are actively shaping.
-- The control lease is coordination, not a security boundary: it records who is driving and demotes the previous controller, but operator commands like `oly send` reach the session regardless by design — no lease ceremony is needed (or available) for scripted input.
+- Attaching (CLI or browser) controls the session by default and resizes it to the attaching client's viewport. Any number of attached clients can drive input at the same time; geometry follows the most recent successful resize. Use `oly attach --observe` for a view-only attach that never drives input or geometry.
+- Resizing an attached terminal window reports the new size to the daemon and resizes the session (controllers only — an observer's resize is gated out). When several controllers resize, the last successful resize wins.
+- Input gating is coordination, not a security boundary: operator commands like `oly send` reach the session regardless of attach mode — no ceremony is needed (or available) for scripted input.
 
 ---
 
@@ -204,7 +204,7 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
 | `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
-| `oly attach [id] [--observer] [--node <name>]` | Reattach to a session (takes control by default) |
+| `oly attach [id] [--observe] [--node <name>]` | Reattach to a session (controls it by default; `--observe` is view-only) |
 | `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching (also `--screen`, `--from`, and wait modes — see below) |
 | `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session. Use `--` to send arbitrary text verbatim without per-token dispatch (see "Let humans stay in the loop"). |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
@@ -509,8 +509,7 @@ raw bytes with `oly logs --raw <id>`.
 ## Learn more
 
 - [MIGRATION.md](./MIGRATION.md) for the 0.3.x → 0.5.0 transition
-- [SPEC.md](./SPEC.md) for the implementation-aligned product spec
-- [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview
-- [ARCHITECTURE.md](./ARCHITECTURE.md) for the architecture decision records
+- [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview and architecture decision records
+- [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow
 
 If you are building agent workflows and want durable, inspectable terminal sessions, `oly` is for you.

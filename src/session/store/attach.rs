@@ -54,59 +54,35 @@ impl SessionStore {
         }
     }
 
-    /// Register an identified attachment and grant control per the registry
-    /// policy (M3-4, PLAN §8.1). When control is granted and a viewport is
-    /// declared, the initial geometry is applied through the session
+    /// Register an identified attachment (M3-4, PLAN §8.1). The role is
+    /// chosen here and never changes: controllers drive, observers
+    /// (`oly attach --observe`) watch. When a controller declares a
+    /// viewport, the initial geometry is applied through the session
     /// sequencer before any snapshot is taken.
     pub async fn attach_register(
         &self,
         id: &str,
         kind: crate::session::registry::AttachKind,
-        request: crate::session::registry::ControlRequest,
+        role: crate::session::registry::AttachRole,
         viewport: Option<(u16, u16)>,
     ) -> std::result::Result<AttachRegistration, SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        let (attachment_id, outcome, _resized) = {
+        let (attachment_id, role, _resized) = {
             let mut rt = handle.write();
-            rt.register_attachment(kind, request, viewport)
+            rt.register_attachment(kind, role, viewport)
         };
         // M6-2: resize geometry is journaled by resize_pty itself; no
         // separate events.log record.
         debug!(
             session_id = id,
             attachment_id,
-            role = outcome.role.as_str(),
+            role = role.as_str(),
             "attach client registered"
         );
         Ok(AttachRegistration {
             attachment_id,
-            role: outcome.role,
+            role,
         })
-    }
-
-    /// Explicit control takeover by an attached observer.
-    pub async fn attach_acquire_control(
-        &self,
-        id: &str,
-        attachment_id: u64,
-    ) -> std::result::Result<crate::session::registry::ControlOutcome, SessionError> {
-        let handle = self.lookup_runtime(id).await?;
-        handle
-            .write()
-            .acquire_control(attachment_id)
-            .ok_or(SessionError::StaleAttachment)
-    }
-
-    /// Subscribe to control handoffs for a session: every send carries the
-    /// current controller's attachment id (`None` = lease free).
-    pub fn subscribe_control(
-        &self,
-        id: &str,
-    ) -> Option<tokio::sync::broadcast::Receiver<ControlNotice>> {
-        let sessions = self.sessions.load();
-        sessions
-            .get(id)
-            .map(|handle| handle.read().control_tx.subscribe())
     }
 
     /// Initialise a streaming subscription: return persisted canonical output
@@ -374,9 +350,10 @@ impl SessionStore {
     ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
 
-        // I6: attached clients drive input only while holding the control
-        // lease. `None` is the operator control plane (`oly send`, HTTP
-        // input), which is not an attachment and stays ungated.
+        // I6: attached clients drive input directly; view-only attaches
+        // (observers) do not. `None` is the operator control plane
+        // (`oly send`, HTTP input), which is not an attachment and stays
+        // ungated.
         if let Some(attachment_id) = attachment_id {
             let rt = handle.read();
             check_control(&rt, attachment_id)?;
@@ -487,7 +464,8 @@ impl SessionStore {
         let resized = {
             let mut rt = handle.write();
             // I6: observers never resize the PTY; their declared size is a
-            // viewport, recorded for status surfaces only.
+            // viewport, recorded for status surfaces only. Controllers
+            // resize freely — the last successful resize wins.
             if let Some(attachment_id) = attachment_id {
                 check_control(&rt, attachment_id)?;
                 rt.attachments.set_viewport(attachment_id, rows, cols);
@@ -558,15 +536,12 @@ fn read_filtered_window(
 pub struct AttachRegistration {
     /// Fencing token identifying this attachment for its lifetime.
     pub attachment_id: u64,
-    /// The role actually granted (a controller request may join as observer).
+    /// The role granted at register time (fixed for the attachment's life).
     pub role: crate::session::registry::AttachRole,
 }
 
-/// Control-handoff notice element: the current controller's attachment id
-/// (`None` = lease free).
-pub type ControlNotice = Option<u64>;
-
-/// Geometry/input gate for attached clients: only the controller drives.
+/// Input/geometry gate for attached clients: observers (view-only
+/// attaches) cannot drive; stale fencing tokens cannot do anything.
 fn check_control(
     rt: &super::super::runtime::SessionRuntime,
     attachment_id: u64,
@@ -574,10 +549,10 @@ fn check_control(
     if !rt.attachments.contains(attachment_id) {
         return Err(SessionError::StaleAttachment);
     }
-    if rt.attachments.is_controller(attachment_id) {
+    if rt.attachments.can_control(attachment_id) {
         Ok(())
     } else {
-        Err(SessionError::NotController)
+        Err(SessionError::ViewOnly)
     }
 }
 
@@ -833,7 +808,7 @@ mod tests {
             .attach_register(
                 "detach001",
                 crate::session::registry::AttachKind::Cli,
-                crate::session::registry::ControlRequest::Controller,
+                crate::session::registry::AttachRole::Controller,
                 None,
             )
             .await
@@ -865,7 +840,7 @@ mod tests {
             .attach_register(
                 "detach002",
                 crate::session::registry::AttachKind::Cli,
-                crate::session::registry::ControlRequest::Controller,
+                crate::session::registry::AttachRole::Controller,
                 None,
             )
             .await
@@ -874,7 +849,7 @@ mod tests {
             .attach_register(
                 "detach002",
                 crate::session::registry::AttachKind::Cli,
-                crate::session::registry::ControlRequest::Controller,
+                crate::session::registry::AttachRole::Controller,
                 None,
             )
             .await
@@ -921,17 +896,17 @@ mod tests {
 
     #[tokio::test]
     async fn attach_applied_cursor_credits_register_per_attachment() {
-        use crate::session::registry::{AttachKind, ControlRequest};
+        use crate::session::registry::{AttachKind, AttachRole};
 
         let (rt, _writer_rx) = make_runtime_writable("ack0001", SessionStatus::Running);
         let store = store_with(vec![rt], make_test_db().await);
 
         let reg_a = store
-            .attach_register("ack0001", AttachKind::Cli, ControlRequest::Controller, None)
+            .attach_register("ack0001", AttachKind::Cli, AttachRole::Controller, None)
             .await
             .expect("attach A");
         let reg_b = store
-            .attach_register("ack0001", AttachKind::Web, ControlRequest::Observer, None)
+            .attach_register("ack0001", AttachKind::Web, AttachRole::Observer, None)
             .await
             .expect("attach B");
 
@@ -959,38 +934,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attach_control_lease_gates_input_and_resize() {
+    async fn attach_observe_mode_gates_input_and_resize() {
         use crate::session::SessionError;
-        use crate::session::registry::{AttachKind, ControlRequest};
+        use crate::session::registry::{AttachKind, AttachRole};
 
         let (rt, _writer_rx) = make_runtime_writable("ctl0001", SessionStatus::Running);
         let store = store_with(vec![rt], make_test_db().await);
 
-        // First controller takes the lease.
+        // Every attach is a controller by default — several at once is fine.
         let first = store
-            .attach_register("ctl0001", AttachKind::Cli, ControlRequest::Controller, None)
+            .attach_register("ctl0001", AttachKind::Cli, AttachRole::Controller, None)
             .await
             .expect("first attach");
-        assert_eq!(first.role, crate::session::registry::AttachRole::Controller);
-
-        // A second controller request joins as observer.
+        assert_eq!(first.role, AttachRole::Controller);
         let second = store
-            .attach_register("ctl0001", AttachKind::Web, ControlRequest::Controller, None)
+            .attach_register("ctl0001", AttachKind::Web, AttachRole::Controller, None)
             .await
             .expect("second attach");
-        assert_eq!(second.role, crate::session::registry::AttachRole::Observer);
+        assert_eq!(second.role, AttachRole::Controller);
+        store
+            .attach_input("ctl0001", Some(first.attachment_id), b"a", false)
+            .await
+            .expect("first controller input");
+        store
+            .attach_input("ctl0001", Some(second.attachment_id), b"b", false)
+            .await
+            .expect("second controller input");
 
-        // Observer input and resize are rejected with NotController.
+        // An explicit observe attach is view-only for its whole lifetime.
+        let observer = store
+            .attach_register("ctl0001", AttachKind::Cli, AttachRole::Observer, None)
+            .await
+            .expect("observe attach");
+        assert_eq!(observer.role, AttachRole::Observer);
         let err = store
-            .attach_input("ctl0001", Some(second.attachment_id), b"x", false)
+            .attach_input("ctl0001", Some(observer.attachment_id), b"x", false)
             .await
             .expect_err("observer input must be gated");
-        assert!(matches!(err, SessionError::NotController));
+        assert!(matches!(err, SessionError::ViewOnly));
         let err = store
-            .attach_resize("ctl0001", Some(second.attachment_id), 24, 80)
+            .attach_resize("ctl0001", Some(observer.attachment_id), 24, 80)
             .await
             .expect_err("observer resize must be gated");
-        assert!(matches!(err, SessionError::NotController));
+        assert!(matches!(err, SessionError::ViewOnly));
 
         // The operator control plane (no attachment) stays ungated.
         store
@@ -998,62 +984,26 @@ mod tests {
             .await
             .expect("operator input must not be gated");
 
-        // Takeover flips the lease: second drives, first is rejected.
-        let outcome = store
-            .attach_acquire_control("ctl0001", second.attachment_id)
-            .await
-            .expect("takeover should succeed");
-        assert_eq!(
-            outcome.role,
-            crate::session::registry::AttachRole::Controller
-        );
-        assert_eq!(outcome.demoted, Some(first.attachment_id));
+        // Detaching leaves a precise stale-token error, and other
+        // attachments keep driving.
         store
-            .attach_input("ctl0001", Some(second.attachment_id), b"x", false)
+            .attach_detach("ctl0001", observer.attachment_id)
             .await
-            .expect("new controller input");
+            .expect("detach observer");
         let err = store
-            .attach_input("ctl0001", Some(first.attachment_id), b"x", false)
-            .await
-            .expect_err("demoted controller input must be gated");
-        assert!(matches!(err, SessionError::NotController));
-
-        // Detaching the controller frees the lease; a stale token is a
-        // no-op, and further control ops on it fail precisely.
-        store
-            .attach_detach("ctl0001", second.attachment_id)
-            .await
-            .expect("detach controller");
-        let err = store
-            .attach_input("ctl0001", Some(second.attachment_id), b"x", false)
+            .attach_input("ctl0001", Some(observer.attachment_id), b"x", false)
             .await
             .expect_err("stale attachment must fail precisely");
         assert!(matches!(err, SessionError::StaleAttachment));
-        // The demoted first attachment stays an observer (no implicit
-        // promotion), but can take the now-free lease explicitly.
-        let err = store
-            .attach_input("ctl0001", Some(first.attachment_id), b"x", false)
-            .await
-            .expect_err("demoted attachment stays observer after lease frees");
-        assert!(matches!(err, SessionError::NotController));
-        let outcome = store
-            .attach_acquire_control("ctl0001", first.attachment_id)
-            .await
-            .expect("takeover of the free lease should succeed");
-        assert_eq!(
-            outcome.role,
-            crate::session::registry::AttachRole::Controller
-        );
-        assert_eq!(outcome.demoted, None);
         store
             .attach_input("ctl0001", Some(first.attachment_id), b"x", false)
             .await
-            .expect("re-acquired controller input");
+            .expect("remaining controller input");
     }
 
     #[tokio::test]
-    async fn attach_takeover_resizes_session_to_the_new_controllers_viewport() {
-        use crate::session::registry::{AttachKind, ControlRequest};
+    async fn observe_viewport_never_resizes_but_controllers_win_last_writer() {
+        use crate::session::registry::{AttachKind, AttachRole};
 
         let (rt, _writer_rx) = make_runtime_writable("ctl0002", SessionStatus::Running);
         let store = store_with(vec![rt], make_test_db().await);
@@ -1063,7 +1013,7 @@ mod tests {
             .attach_register(
                 "ctl0002",
                 AttachKind::Cli,
-                ControlRequest::Controller,
+                AttachRole::Controller,
                 Some((24, 80)),
             )
             .await
@@ -1071,32 +1021,43 @@ mod tests {
         let initial = store.subscribe_resize("ctl0002").and_then(|(_, size)| size);
         assert_eq!(initial, Some((24, 80)));
 
-        // B joins as an observer (lease held) with a different viewport;
-        // session geometry is unchanged.
-        let second = store
+        // An observer joins with a different viewport; session geometry
+        // is unchanged.
+        let observer = store
             .attach_register(
                 "ctl0002",
                 AttachKind::Web,
-                ControlRequest::Controller,
+                AttachRole::Observer,
                 Some((40, 120)),
             )
             .await
-            .expect("second attach");
-        assert_eq!(second.role, crate::session::registry::AttachRole::Observer);
+            .expect("observe attach");
+        assert_eq!(observer.role, AttachRole::Observer);
         let before = store.subscribe_resize("ctl0002").and_then(|(_, size)| size);
         assert_eq!(before, Some((24, 80)), "observer viewport must not resize");
-
-        // B takes control: the session adopts B's viewport immediately,
-        // not on the next resize event.
-        store
-            .attach_acquire_control("ctl0002", second.attachment_id)
+        // Even an explicit resize from the observer changes nothing.
+        let err = store
+            .attach_resize("ctl0002", Some(observer.attachment_id), 50, 200)
             .await
-            .expect("takeover should succeed");
+            .expect_err("observer resize must be gated");
+        assert!(matches!(err, crate::session::SessionError::ViewOnly));
+
+        // A new controller's declared viewport applies immediately
+        // (last-writer-wins).
+        let _third = store
+            .attach_register(
+                "ctl0002",
+                AttachKind::Cli,
+                AttachRole::Controller,
+                Some((40, 120)),
+            )
+            .await
+            .expect("third attach");
         let after = store.subscribe_resize("ctl0002").and_then(|(_, size)| size);
         assert_eq!(
             after,
             Some((40, 120)),
-            "takeover must resize the session to the new controller's viewport"
+            "a controller's attach resizes the session to its viewport"
         );
     }
 

@@ -48,7 +48,6 @@ honest migration instead.
 | API keys | one all-powerful daemon key | scoped keys (M5-4) | Old keys stop working; create new scoped keys with `oly api-key`. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
 | Input handling | timing heuristics for paste/keys | event-driven; paste boundaries come from bracketed-paste markers only (ADR-0003) | No action; apps that enable bracketed paste get exact paste boundaries. |
-| Attach control | first attach holds control; later attaches observe | attaching (CLI or browser) **takes control by default** and resizes the session to the new controller's viewport; the previous controller is demoted to observer | Use `oly attach --observer` for view-only attaches. Scripts that relied on attach-as-observer should add `--observer`. |
 | Detach keys | `Ctrl-]` then `d` (broken in some terminals) | `Ctrl-D` (EOT), matching the historic key contract; Ctrl-V and Shift+Insert are clipboard paste shortcuts. | No action. |
 | Daemon status | reported the client's config values | reports the running daemon's effective flags and HTTP endpoint (from the daemon's own record) | No action; `oly daemon start` against a running daemon now prints the running config and the remedy. |
 
@@ -122,7 +121,7 @@ There is **no automatic import**, on purpose. A faithful 0.5.0 journal needs
 ordered raw bytes, resize offsets, and checkpoints; reconstructing those from
 `output.log`/`events.log` would fabricate provenance we cannot guarantee
 (ambiguous resize offsets, unknown timing, truncated tails). The project rule
-is: never present a guess as a faithful recording (PLAN §14.4).
+is: never present a guess as a faithful recording.
 
 Your old bytes are still useful:
 
@@ -138,13 +137,13 @@ Your old bytes are still useful:
   attaching produces an explicit `uses the pre-0.5 log format (output.log) …
   see MIGRATION.md` error rather than empty output.
 
-## New retention knobs (PLAN2 §P2.5, §P2.6)
+## New retention knobs
 
 0.5.0 introduces two **independent, hot-reloadable** caps on persisted
 session state. They default to `0` (= disabled) so a stock install keeps
 the pre-0.5 behavior exactly; opt in only when you need them.
 
-### `limits.max_journal_bytes_per_session` (PLAN2 §P2.5)
+### `limits.max_journal_bytes_per_session`
 
 A byte cap on a **running** session's on-disk journal. When a checkpoint
 is sealed, the daemon computes how many pre-checkpoint incarnations it
@@ -186,7 +185,7 @@ You can fetch the live numbers via `oly list`:
 SESS…  echo hello  stopped  2024-01-15  1.2 MiB / 256 MiB cap  (3 sweeps, dropped 2 incs)
 ```
 
-### `limits.journal_retention_days` (PLAN2 §P2.6)
+### `limits.journal_retention_days`
 
 A wall-clock cap on **stopped** sessions only. A background sweeper
 (runs hourly) deletes the journal directory + DB row of any session whose

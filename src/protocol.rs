@@ -234,8 +234,9 @@ pub enum RpcRequest {
         /// `from_byte_offset` is set.
         #[serde(default)]
         incarnation: Option<u64>,
-        /// Requested control role: "observer" | "controller" (default) |
-        /// "takeover" (PLAN §8.1). Unknown values are rejected.
+        /// Requested attach mode: "observe" (view-only) or absent /
+        /// "controller" (default: drives input and geometry).
+        /// Unknown values are rejected.
         #[serde(default)]
         role: Option<String>,
         #[serde(default)]
@@ -285,11 +286,6 @@ pub enum RpcRequest {
         cols: u16,
     },
     AttachDetach {
-        id: String,
-    },
-    /// Take over the session's control lease from an attached observer
-    /// position (streaming attach connections only).
-    AttachAcquireControl {
         id: String,
     },
     /// Report the applied-cursor credit for this attach connection (M3-5,
@@ -411,7 +407,6 @@ impl RpcRequest {
             RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
-            RpcRequest::AttachAcquireControl { .. } => "attach_acquire_control",
             RpcRequest::AttachAppliedCursor { .. } => "attach_applied_cursor",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Restart { .. } => "restart",
@@ -512,13 +507,9 @@ pub enum RpcResponse {
         /// This attachment's fencing token (M3-4).
         #[serde(default)]
         attachment_id: u64,
-        /// Granted control role: "controller" or "observer".
+        /// This attachment's role, fixed at register time:
+        /// "controller" (default) or "observer" (view-only attach).
         #[serde(default)]
-        role: String,
-    },
-    /// Control handoff notice pushed mid-stream: this attachment's role
-    /// after the change ("controller" or "observer").
-    AttachControlChanged {
         role: String,
     },
     /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
@@ -703,7 +694,7 @@ pub enum NodeWsMessage {
     },
     /// Primary → Secondary: one mid-stream client message for an open
     /// streaming RPC (M5-2). Carries attach input, resize,
-    /// applied-cursor credits, control takeover, and detach to the owning
+    /// applied-cursor credits, and detach to the owning
     /// node's stream task, so remote attachments get the same
     /// attachment-scoped fencing and enforced credits as local ones.
     RpcStreamMessage {

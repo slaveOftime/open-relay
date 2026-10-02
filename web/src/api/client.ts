@@ -540,8 +540,6 @@ export interface AttachOptions {
   onModeChanged: (modes: WsModes) => void
   /** Called when the PTY was resized by another attached client. */
   onResized?: (rows: number, cols: number) => void
-  /** Called on control handoffs with this attachment's new role. */
-  onControl?: (role: 'controller' | 'observer') => void
   /** Called when the session ends. */
   onSessionEnded: (exitCode: number | null) => void
   onError: (message: string) => void
@@ -555,15 +553,12 @@ export class AttachSocket {
   /** Next expected stream offset (from the init frame's snapshot boundary). */
   private expectedOffset: number | null = null
   private lastAckedOffset = 0
-  /** Granted control role; observers never send input or resize (I6). */
-  role: 'controller' | 'observer' = 'controller'
 
   constructor(
     sessionId: string,
     opts: AttachOptions,
     node?: string,
-    initialSize?: { rows: number; cols: number },
-    controlRole?: 'observer' | 'controller' | 'takeover'
+    initialSize?: { rows: number; cols: number }
   ) {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = location.host
@@ -573,7 +568,6 @@ export class AttachSocket {
       params.set('rows', String(initialSize.rows))
       params.set('cols', String(initialSize.cols))
     }
-    if (controlRole) params.set('role', controlRole)
     const tok = getToken()
     if (tok) params.set('token', tok)
     const qs = params.toString()
@@ -596,8 +590,6 @@ export class AttachSocket {
         switch (frame.type) {
           case 'init': {
             this.expectedOffset = frame.endOffset
-            this.role = frame.role
-            opts.onControl?.(this.role)
             opts.onInit(frame.data, {
               appCursorKeys: frame.appCursorKeys,
               bracketedPasteMode: frame.bracketedPasteMode,
@@ -655,11 +647,6 @@ export class AttachSocket {
           case 'error':
             opts.onError(frame.message)
             return
-          case 'control':
-            // Control handoff notice for this attachment.
-            this.role = frame.role
-            opts.onControl?.(this.role)
-            return
           case 'pong':
             return
         }
@@ -678,12 +665,7 @@ export class AttachSocket {
   }
 
   sendInput(data: string, waitForChange: boolean) {
-    if (this.role !== 'controller') return
     this.send({ type: 'input', data, waitForChange })
-  }
-  /** Request the control lease (observer → controller takeover). */
-  sendAcquireControl() {
-    this.send({ type: 'acquire_control' })
   }
 
   /** Send an applied-cursor credit (M3-5, I7); throttled by the caller. */
@@ -694,7 +676,6 @@ export class AttachSocket {
     this.send({ type: 'busy' })
   }
   sendResize(rows: number, cols: number) {
-    if (this.role !== 'controller') return
     this.send({ type: 'resize', rows, cols })
   }
 

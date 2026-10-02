@@ -243,7 +243,6 @@ export type WsClientMessage =
   | { type: 'input'; data: string; waitForChange: boolean }
   | { type: 'busy' }
   | { type: 'resize'; rows: number; cols: number }
-  | { type: 'acquire_control' }
   | { type: 'ack'; offset: number }
   | { type: 'detach' }
 
