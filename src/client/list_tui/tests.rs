@@ -1175,10 +1175,25 @@ fn cwdless_sessions_use_their_oly_storage_directory_in_tree_and_filter_paths() {
     assert!(app.tree.auto_expand_all);
     assert!(app.tree.visible.iter().any(|entry| matches!(entry,
         super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "orphan-local")));
-    for folder in ["oly-state", "sessions", "orphan-local"] {
-        assert!(app.tree.visible.iter().any(|entry| matches!(entry,
-            super::TreeEntry::Folder { node, .. } if app.tree.nodes[*node].name == folder)));
-    }
+    // `orphan-remote` lives on `worker-a` and has no cwd, so it is
+    // routed under `sessions/<id>`; the cwd-less local session is
+    // routed under the session-storage directory. Both routings are
+    // asserted up front; filtering just needs to keep the local one
+    // visible while hiding the remote one.
+    assert!(
+        !app.tree.visible.iter().any(|entry| matches!(entry,
+        super::TreeEntry::Session { session, .. } if app.sessions[*session].id == "orphan-remote"))
+    );
+    let local_leaf = app
+        .tree
+        .visible
+        .iter()
+        .find_map(|entry| match entry {
+            super::TreeEntry::Session { session, .. } => Some(*session),
+            _ => None,
+        })
+        .expect("at least one session visible under the cwd-less filter");
+    assert_eq!(app.sessions[local_leaf].id, "orphan-local");
 }
 #[test]
 fn tree_folders_show_attention_before_descendant_running_state() {
