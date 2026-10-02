@@ -3,8 +3,8 @@ export type SparklinePoint = { x: number; y: number }
 export function easeOutCubic(progress: number): number {
   return 1 - (1 - progress) ** 3
 }
-export const SPARKLINE_HOLD_MS = 2_000
-export const SPARKLINE_FADE_MS = 350
+export const SPARKLINE_HOLD_MS = 400
+export const SPARKLINE_FADE_MS = 200
 
 export function animatedHeadY(
   now: number,

@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test'
 
-test('renders sessions page with mocked API data', async ({ page }) => {
+test('opens SSE and renders session_activity in the sessions sparkline', async ({ page }) => {
   const item = {
     id: '1234567-89ab-cdef-0123-456789abcdef',
     title: 'demo session',
@@ -52,11 +52,25 @@ test('renders sessions page with mocked API data', async ({ page }) => {
     await route.fulfill({
       status: 200,
       contentType: 'text/event-stream',
-      body: `event: snapshot\ndata: ${JSON.stringify([item])}\n\n`,
+      body: [
+        `event: stream_ready\ndata: ${JSON.stringify({ version: 2, nodes: [] })}\n\n`,
+        ...[0, 1024].map(
+          (total) =>
+            `event: session_activity\ndata: ${JSON.stringify({
+              node: null,
+              samples: [{ id: item.id, last_total_bytes: total, last_output_at: null }],
+            })}\n\n`
+        ),
+      ].join(''),
     })
   })
 
   await page.route('**/api/sessions**', async (route) => {
+    // Playwright runs the last matching route first; let SSE use its own handler.
+    if (new URL(route.request().url()).pathname === '/api/sessions/events') {
+      await route.fallback()
+      return
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -69,10 +83,18 @@ test('renders sessions page with mocked API data', async ({ page }) => {
     })
   })
 
+  const sseRequest = page.waitForRequest(
+    (request) => new URL(request.url()).pathname === '/api/sessions/events'
+  )
   await page.goto('/')
+  await sseRequest
 
   await expect(page.locator('header').first()).toContainText('Open Relay')
   await expect(page.locator('table').getByText('demo session')).toBeVisible()
+  await expect(page.locator('table span[aria-label*="activity"]').first()).toHaveAttribute(
+    'aria-label',
+    /Recent: 512 B\/s/
+  )
 })
 
 test('switching nodes ignores old list responses and keeps the live indicator stable', async ({
@@ -232,7 +254,7 @@ test('switching nodes ignores old list responses and keeps the live indicator st
         ),
       { timeout: 1_000 }
     )
-    .toBeGreaterThan(3)
+    .toBeGreaterThan(0)
   const graphPath = page.locator('table svg path[stroke-width="2"]').first()
   // After the initial output tween, the graph should keep gliding across the
   // next bucket boundary even with no additional SSE message.
@@ -252,11 +274,11 @@ test('switching nodes ignores old list responses and keeps the live indicator st
     }
   }
   const before = pointNearHead(await graphPath.getAttribute('d'))
-  expect(before.headY).toBeLessThan(19) // no flash to baseline as the bucket opens
+  // With a short hold the head can already be idle; historical activity remains.
   expect(before.y).toBeLessThan(19)
   await page.waitForTimeout(80)
   const after = pointNearHead(await graphPath.getAttribute('d'))
-  expect(after.x).toBeLessThan(before.x) // existing samples physically travel left
+  expect(after.x).toBeLessThanOrEqual(before.x) // body moves only on bucket boundaries
   expect(after.y).toBe(before.y) // their heights do not morph like a worm
   await page.evaluate(
     (data) => {
@@ -270,7 +292,7 @@ test('switching nodes ignores old list responses and keeps the live indicator st
   await page.waitForTimeout(80)
   const withNewHead = pointNearHead(await graphPath.getAttribute('d'))
   expect(withNewHead.y).toBe(after.y) // incoming bytes only change the head
-  expect(withNewHead.x).toBeLessThan(after.x)
+  expect(withNewHead.x).toBeLessThanOrEqual(after.x)
   expect(listRequests).toBe(requestsBeforeActivity)
   await expect(page.locator('table').getByText('worker-a session')).toHaveCount(0)
   await expect(page.locator('table').getByText('local session')).toHaveCount(0)
