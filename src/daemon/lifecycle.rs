@@ -590,8 +590,12 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         Arc::new(Database::open(&config.paths.db_file, config.paths.sessions_dir.clone()).await?);
     info!(db_file = ?config.paths.db_file, "database opened");
 
-    let node_registry = Arc::new(NodeRegistry::new());
+    let node_registry = NodeRegistry::new();
     let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
+    // Wrap in Arc now so every consumer (HTTP, IPC, federation, activity
+    // sampler) shares the same pool. `bind_event_tx` is interior-mutating
+    // (OnceLock) and can be called through the Arc.
+    let node_registry = Arc::new(node_registry);
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
@@ -617,6 +621,10 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     };
     let session_store = Arc::new(store);
     let event_tx = session_store.event_tx();
+    // CR-4 (node_state fan-out): wire the registry to event_tx so
+    // connect/disconnect publish `SessionEvent::NodeState {…}` for any
+    // active SSE listener to consume without polling.
+    node_registry.bind_event_tx(event_tx.clone());
     for join in client::join::load_join_configs(&config) {
         // Lifecycle replay runs at daemon startup before any IPC
         // client is around; there's no caller to surface the first
@@ -624,7 +632,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
             join.clone(),
             Arc::clone(&config),
-            event_tx.subscribe(),
+            event_tx.clone(),
             None,
         );
         join_handles
@@ -660,20 +668,38 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         )
         .unwrap_or_else(|_| http::NodeIdentity::disabled());
     if !no_http {
+        let (event_bytes_tx, _) = tokio::sync::broadcast::channel::<http::EncodedSessionEvent>(
+            http::sse::SSE_BROADCAST_CAPACITY,
+        );
         let http_state = http::AppState {
             store: session_store.clone(),
             config: live_config.clone(),
             db: db.clone(),
             notifier: notifier.clone(),
             event_tx: event_tx.clone(),
+            event_bytes_tx: event_bytes_tx.clone(),
             auth: auth_state,
             node_registry: node_registry.clone(),
             node_identity: node_identity.clone(),
         };
+        // CR-3: one dedicated task that drains `event_tx` and re-broadcasts
+        // the encoded frames. Every SSE handler that subscribes afterward
+        // does NOT re-serialize events, so a busy relay does not multiply
+        // CPU per reminder count.
+        http::run_event_encoder(event_tx.clone(), event_bytes_tx);
         tokio::spawn(http::serve(http_state));
         info!("http server task spawned");
     } else {
-        info!("http server disabled by --no-web");
+        info!("http server disabled by --no-http");
+    }
+
+    {
+        let activity_store = session_store.clone();
+        let activity_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            activity_store.run_activity_sampler(activity_event_tx).await;
+        });
+        info!("session activity sampler task spawned");
     }
 
     let notify_store = session_store.clone();

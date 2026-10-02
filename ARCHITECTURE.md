@@ -248,6 +248,27 @@ Tests are the executable specification: unit tests live next to the code,
 protocol conformance in `src/daemon/rpc.rs` (`ipc_conformance`) and
 `tests/fixtures/`, end-to-end coverage in `tests/e2e_*.rs`.
 
+## Frontend update pipeline (`/api/sessions/events`)
+
+See PERFORMANCE.md §Update pipeline for the sampling and recovery budget.
+The SSE endpoint keeps the view current rather than mirroring the database:
+
+- **`stream_ready` opens each connection** with a version and connected node names,
+  not a session inventory. Views reconcile their inventory through REST.
+- **Structural changes use lifecycle events** (`session_created`, `session_updated`,
+  `session_deleted`, notifications and `node_state`). Secondaries forward their
+  local events; the primary applies the secondary name on delivery.
+- **Activity uses compact `session_activity` batches**. Each owning daemon samples
+  in-memory runtimes every 500 ms and emits changed counters or output timestamps.
+  Sparklines consume counters directly without reloading the list.
+- **Gaps require reconciliation**. `resync_required` identifies an affected node;
+  a null scope means the shared stream may have lost events for any node. Clients
+  preserve history, invalidate counter baselines and reconcile through REST.
+  The first post-gap total establishes a baseline without plotting missing bytes.
+- **Lagged SSE receivers get a resync marker and EOF**. Persistent clients reconnect
+  with backoff and receive a fresh `stream_ready`. Missing events never imply a
+  session deletion.
+
 ## Documents
 
 - `README.md` — what oly is and how to use it.

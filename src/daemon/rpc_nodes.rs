@@ -61,7 +61,7 @@ impl AttemptReporter {
 pub(super) fn spawn_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
-    session_event_rx: broadcast::Receiver<SessionEvent>,
+    session_event_tx: broadcast::Sender<SessionEvent>,
     on_attempt: Option<tokio::sync::oneshot::Sender<JoinAttempt>>,
 ) -> (tokio::task::AbortHandle, watch::Sender<bool>) {
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -69,8 +69,17 @@ pub(super) fn spawn_join_connector(
         Some(tx) => AttemptReporter::new(tx),
         None => AttemptReporter::empty(),
     };
+    let session_event_rx = session_event_tx.subscribe();
     let task = tokio::spawn(async move {
-        run_join_connector(join, local_config, session_event_rx, stop_rx, reporter).await;
+        run_join_connector(
+            join,
+            local_config,
+            session_event_tx,
+            session_event_rx,
+            stop_rx,
+            reporter,
+        )
+        .await;
     });
     (task.abort_handle(), stop_tx)
 }
@@ -78,6 +87,7 @@ pub(super) fn spawn_join_connector(
 async fn run_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
+    session_event_tx: broadcast::Sender<SessionEvent>,
     mut session_event_rx: broadcast::Receiver<SessionEvent>,
     mut stop_rx: watch::Receiver<bool>,
     mut attempt_report: AttemptReporter,
@@ -89,6 +99,7 @@ async fn run_join_connector(
         match connect_and_relay(
             &join,
             &local_config,
+            &session_event_tx,
             &mut session_event_rx,
             &mut stop_rx,
             &mut attempt_report,
@@ -132,6 +143,7 @@ async fn run_join_connector(
 async fn connect_and_relay(
     join: &JoinConfig,
     local_config: &Arc<AppConfig>,
+    session_event_tx: &broadcast::Sender<SessionEvent>,
     session_event_rx: &mut broadcast::Receiver<SessionEvent>,
     stop_rx: &mut watch::Receiver<bool>,
     attempt_report: &mut AttemptReporter,
@@ -529,6 +541,18 @@ async fn connect_and_relay(
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(node = %join.name, skipped, "session event relay lagged");
+                        // CR-4: surface `resync_required` so the primary's
+                        // SSE listener knows the relay's view diverged and
+                        // that any subsequent activity byte counters lost
+                        // their basis. Continue this loop on lag; the
+                        // encoding pipeline below will resume on the
+                        // next delivered frame.
+                        let _ = session_event_tx.send(SessionEvent::ResyncRequired {
+                            // This daemon owns the dropped events. The primary
+                            // applies our registered secondary name on delivery.
+                            node: None,
+                            reason: Some("relay_lagged".to_string()),
+                        });
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }

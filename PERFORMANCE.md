@@ -109,6 +109,33 @@ state to consult.
 
 **Numbers.** 110–147 ms → p50 1.9 ms daemon-side (table above).
 
+## Update pipeline (added 2026-10-02)
+
+Activity is produced by **one** `ActivitySampler` per daemon, ticked at
+500 ms. The sampler owns the only path that emits `SessionEvent::SessionActivity`;
+the per-output-reader fast publish path was retired at the same time, so a busy
+session no longer races the sampler through `SessionUpdated`. Concrete shape:
+
+- **In-memory only**: the sampler walks `SessionStore::sessions` under
+  `try_read`, skipping any runtime a PTY reader is currently writing to. No
+  SQL, no journal decode, no terminal engine snapshot.
+- **Batched**: only sessions whose `last_total_bytes` advanced are
+  included, so an idle daemon publishes zero frames between bursts of
+  output. The frontend renders sparse sparkline buckets exactly once.
+- **Federated**: secondary nodes forward the batch through the existing
+  node channel; the primary rebroadcasts it through its SSE encoder.
+- **Lag safety**: relay-side `Lagged(n)` surfaces a
+  `ResyncRequired { node, reason: "relay_lagged" }` event into the same
+  broadcast so any active SSE listener knows to refetch REST. SSE clients
+  that lag the bounded ring close the stream; the broker auto-reconnects
+  and the next `stream_ready` carries a fresh node list.
+
+Measurement target (not yet benchmarked): one primary + up to five
+secondaries, 50 sessions/node and 10 SSE clients. Aim for sampler CPU/frame
+below 50 µs at idle and no DB or journal reads per tick. Idle sessions should
+produce no activity frames. Lag and activity batches currently have tracing
+logs; dedicated metric counters and latency histograms are not implemented.
+
 ## Backlog (measure before optimizing)
 
 - **Daemon-down fallback list** (`client/list.rs` → `db.list_summaries`)

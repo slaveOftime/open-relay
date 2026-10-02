@@ -14,7 +14,5 @@ node_modules
 test-results
 .tli.claude/
 
-
-**/???????/
 scripts/
 target-tests/

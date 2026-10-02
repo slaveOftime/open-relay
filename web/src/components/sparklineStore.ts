@@ -18,6 +18,7 @@ type Entry = {
   snapshot: number[]
   lastBucket: number
   lastTotalBytes: number | null
+  baselineUnknown?: boolean
   lastOutputAt: number | null
   activitySnapshot: SparklineActivitySnapshot
 }
@@ -155,11 +156,34 @@ export class SparklineStore {
     if (advanced || value > 0) this.emitChange(id)
   }
 
-  /** Record absolute byte totals and add only new bytes to the current bucket. */
+  /** Record absolute byte totals and add only new bytes to the current bucket.
+   *
+   * CR-5 anti-cliff: callers must opt into a counter reset via
+   * `resetBaseline(id, value)`. A bare counter that goes backwards here is
+   * treated as an out-of-order observation (older REST response reached us
+   * after a fresher one already moved the baseline) and ignored, so the
+   * visible window doesn't plot manufactured bytes for stale data.
+   */
   recordTotal(id: string, totalBytes: number, previousTotalBytes?: number): void {
     if (!Number.isFinite(totalBytes) || totalBytes < 0) return
     const entry = this.getOrCreate(id)
     const advanced = this.advance(entry)
+    // Out-of-order observations must not manufacture bytes.
+    if (entry.lastTotalBytes !== null && totalBytes < entry.lastTotalBytes) {
+      if (advanced) this.emitChange(id)
+      return
+    }
+    // Consume the first post-gap observation only as a baseline, even when
+    // a caller supplies its own previous (pre-gap) total.
+    if (
+      entry.baselineUnknown ||
+      (entry.lastTotalBytes === null && previousTotalBytes === undefined)
+    ) {
+      entry.baselineUnknown = false
+      entry.lastTotalBytes = totalBytes
+      if (advanced) this.emitChange(id)
+      return
+    }
     // An older REST response or SSE event must not roll the baseline back and
     // manufacture a spike when the next current total arrives.
     const baseline = Math.max(
@@ -198,7 +222,21 @@ export class SparklineStore {
     return this.data.get(id)?.snapshot ?? this.emptySeries
   }
 
+  /** Iterate over the currently tracked ids. Test/admin only. */
+  keys(): IterableIterator<string> {
+    return this.data.keys()
+  }
+
   remove(id: string): void {
     if (this.data.delete(id)) this.emitChange(id)
+  }
+
+  /** Mark the counter unknown after a gap without erasing visible history. */
+  resetBaseline(id: string, baseline: number | null = null): void {
+    const entry = this.data.get(id)
+    if (entry) {
+      entry.lastTotalBytes = baseline
+      entry.baselineUnknown = baseline === null
+    }
   }
 }

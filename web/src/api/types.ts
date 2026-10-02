@@ -145,11 +145,51 @@ export interface PushSubscriptionInput {
 // SSE event types
 // ---------------------------------------------------------------------------
 
+export interface SessionActivitySample {
+  id: string
+  last_total_bytes: number
+  last_output_at?: string | null
+}
+
+export interface SessionActivityBatch {
+  node?: string | null
+  samples: SessionActivitySample[]
+}
+
+export interface StreamReadyData {
+  /** Wire format version; bumped when the SSE contract changes. */
+  version: number
+  /** Names of currently connected secondary nodes. */
+  nodes: string[]
+}
+
+export interface ResyncRequiredData {
+  /** Affected node name; absent when the local receiver is the cause. */
+  node?: string | null
+  /** Diagnostic tag for telemetry only. */
+  reason?: string
+}
+
+export interface NodeStateData {
+  /** Affected node name. */
+  node: string
+  /** True on connect, false on disconnect. */
+  connected: boolean
+  /** Seconds since the UNIX epoch when the secondary was last reachable; null on disconnect. */
+  last_seen?: number | null
+}
+
+export type SessionActivityData = SessionActivityBatch
+
 export type SessionEvent =
   | { event: 'snapshot'; data: SessionSummary[] }
+  | { event: 'stream_ready'; data: StreamReadyData }
   | { event: 'session_created'; data: SessionSummary }
   | { event: 'session_updated'; data: SessionSummary }
   | { event: 'session_deleted'; data: { id: string; node?: string | null } }
+  | { event: 'resync_required'; data: ResyncRequiredData }
+  | { event: 'node_state'; data: NodeStateData }
+  | { event: 'session_activity'; data: SessionActivityData }
   | {
       event: 'session_notification'
       data: SessionNotificationData
@@ -176,9 +216,24 @@ export type SessionNotificationData = {
 // The live binary protocol lives in ./ws-frames.ts; input-affecting modes
 // (DECCKM, bracketed paste, mouse report/SGR, focus) ride the frame flags.
 export type WsServerMessage =
-  | { type: 'init'; data: string; appCursorKeys: boolean; bracketedPasteMode: boolean; mouseReport: boolean; sgrMouse: boolean; focusEvents: boolean }
+  | {
+      type: 'init'
+      data: string
+      appCursorKeys: boolean
+      bracketedPasteMode: boolean
+      mouseReport: boolean
+      sgrMouse: boolean
+      focusEvents: boolean
+    }
   | { type: 'data'; data: string }
-  | { type: 'mode_changed'; appCursorKeys: boolean; bracketedPasteMode: boolean; mouseReport: boolean; sgrMouse: boolean; focusEvents: boolean }
+  | {
+      type: 'mode_changed'
+      appCursorKeys: boolean
+      bracketedPasteMode: boolean
+      mouseReport: boolean
+      sgrMouse: boolean
+      focusEvents: boolean
+    }
   | { type: 'resized'; rows: number; cols: number }
   | { type: 'session_ended'; exit_code: number | null }
   | { type: 'error'; message: string }

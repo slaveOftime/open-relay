@@ -1206,10 +1206,10 @@ export default function SessionsPage() {
   )
 
   // The primary's SSE carries session_updated events for every connected
-  // node through the join-WS forwarder, but in practice the per-byte churn
-  // on a secondary doesn't always reach the forwarder. Re-pull summaries for
-  // the currently-selected remote node so the sparklines refresh without
-  // requiring the user to tap the reload button.
+  // node. Re-pull summaries for the currently-selected remote node on demand:
+  // a) when the page mounts, b) when stream_ready lands, and c) when the
+  // user-visible filter changes. Activity now arrives via session_activity
+  // SSE events, so a polling interval is no longer necessary.
   useEffect(() => {
     if (!selectedNode) return
     let stopped = false
@@ -1227,17 +1227,14 @@ export default function SessionsPage() {
         }
         const res = await fetchSessions(params)
         if (stopped || !isMounted.current || selectedNodeRef.current !== selectedNode) return
-        // Pipe straight into the activity store; the SessionsPage rows are
-        // already accurate, so we don't want to overwrite their state.
         ingestSessionSummaries(res.items)
       } catch {
-        /* swallow — the next tick retries */
+        /* swallow */
       }
     }
-    const id = window.setInterval(tick, 2500)
+    void tick()
     return () => {
       stopped = true
-      window.clearInterval(id)
     }
   }, [page, search, selectedNode, sortField, sortOrder, statusFilter])
 
@@ -1404,16 +1401,6 @@ export default function SessionsPage() {
       if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
     }
   }, [])
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      void reloadSessions({ background: true })
-    }, 30_000)
-
-    return () => {
-      clearInterval(interval)
-    }
-  }, [reloadSessions])
 
   // Display order: pinned live sessions first (most recently pinned topmost),
   // then — for the default Created At sort — active sessions before finished

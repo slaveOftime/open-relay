@@ -4,6 +4,7 @@
 //! by concern into private submodules that each add an `impl SessionStore`
 //! block. The shared state and helpers live here.
 
+mod activity;
 mod attach;
 mod lifecycle;
 
@@ -29,11 +30,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, trace, warn};
 
-use crate::{
-    config::ResumePattern,
-    db::Database,
-    session::SessionEventTx,
-};
+use crate::{config::ResumePattern, db::Database, session::SessionEventTx};
 
 use super::{SessionError, SessionMeta, SessionStatus, runtime::SessionRuntime};
 
@@ -86,6 +83,13 @@ impl SessionHandle {
 
     pub(super) fn read(&self) -> parking_lot::RwLockReadGuard<'_, SessionRuntime> {
         self.runtime.read()
+    }
+
+    /// Non-blocking read: returns `None` when a writer currently owns
+    /// the runtime. Used by the activity sampler so it can skip
+    /// mid-write sessions without stalling the reader thread.
+    pub(super) fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, SessionRuntime>> {
+        self.runtime.try_read()
     }
 
     pub(super) fn write(&self) -> parking_lot::RwLockWriteGuard<'_, SessionRuntime> {

@@ -102,5 +102,28 @@ export function handleSessionPageEvent(
       handlers.showNotification(event.data)
       return
     }
+    case 'node_state': {
+      if (matchesSelectedNode(context.selectedNode, event.data.node)) {
+        handlers.reloadSessions({ background: true })
+      }
+      return
+    }
+    case 'stream_ready': {
+      // Always reconcile on (re)connect, regardless of selected node.
+      handlers.reloadSessions({ background: true })
+      return
+    }
+    case 'resync_required': {
+      // The lag was on the bridge (or one specific node); reconcile the
+      // active view. We do NOT delete cached rows or fabricate deletions,
+      // and we do not toggle the session status from the missing event.
+      const resyncNode = event.data.node ?? null
+      if (resyncNode == null || matchesSelectedNode(context.selectedNode, resyncNode)) {
+        handlers.reloadSessions({ background: true })
+      }
+      return
+    }
+    default:
+      return
   }
 }

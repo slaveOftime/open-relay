@@ -36,6 +36,8 @@ use crate::{
     utils::format_http_url,
 };
 
+pub use sse::{EncodedSessionEvent, run_event_encoder};
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<SessionStore>,
@@ -45,6 +47,11 @@ pub struct AppState {
     pub db: Arc<Database>,
     pub notifier: SharedNotifier,
     pub event_tx: broadcast::Sender<SessionEvent>,
+    /// Pre-encoded SSE frame broadcast. Producers run
+    /// [`run_event_encoder`] once at startup; each connected SSE handler
+    /// subscribes to this and forwards bytes verbatim. Bounded; on lag the
+    /// encoder publishes a `resync_required` frame and continues.
+    pub event_bytes_tx: broadcast::Sender<EncodedSessionEvent>,
     /// None when `--no-auth` was specified; Some when password auth is active.
     pub auth: Option<Arc<AuthState>>,
     /// Registry of connected secondary nodes (only populated on a primary daemon).
@@ -223,10 +230,7 @@ pub async fn serve(state: AppState) {
         "serving custom HTTP static files from wwwroot"
     );
 
-    tokio::spawn(sse::run_session_poller(
-        state.store.clone(),
-        state.event_tx.clone(),
-    ));
+    // Daemon lifecycle owns the activity sampler, including on HTTP-disabled nodes.
 
     let protected_router = Router::new()
         .route("/api/auth/status", get(auth::status))

@@ -23,6 +23,23 @@ describe('SparklineStore', () => {
     expect(series.every((value) => value === 0)).toBe(true)
   })
 
+  it('preserves history and consumes the first post-gap total without plotting', () => {
+    const store = new SparklineStore()
+    store.recordTotal('session-1', 100)
+    store.recordTotal('session-1', 180)
+    const history = store.getSeries('session-1')
+    store.resetBaseline('session-1')
+    expect(store.getSeries('session-1')).toBe(history)
+    store.recordTotal('session-1', 5000, 180)
+    expect(store.getSeries('session-1')).toBe(history)
+    store.recordTotal('session-1', 5010)
+    expect(store.getSeries('session-1').at(-1)).toBe(90)
+    store.resetBaseline('session-1')
+    store.recordTotal('session-1', 10)
+    store.recordTotal('session-1', 20)
+    expect(store.getSeries('session-1').at(-1)).toBe(100)
+  })
+
   it('records positive byte deltas into the active bucket', () => {
     const store = new SparklineStore()
 

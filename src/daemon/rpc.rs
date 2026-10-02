@@ -555,18 +555,18 @@ async fn handle_logs_tail(
     })
     .await
     {
-            Ok(Ok((output, resizes))) => (output, resizes),
-            Ok(Err(err)) => {
-                return RpcResponse::Error {
-                    message: err.to_string(),
-                };
-            }
-            Err(join_err) => {
-                return RpcResponse::Error {
-                    message: format!("log render worker join failed: {join_err}"),
-                };
-            }
-        };
+        Ok(Ok((output, resizes))) => (output, resizes),
+        Ok(Err(err)) => {
+            return RpcResponse::Error {
+                message: err.to_string(),
+            };
+        }
+        Err(join_err) => {
+            return RpcResponse::Error {
+                message: format!("log render worker join failed: {join_err}"),
+            };
+        }
+    };
 
     let status = db
         .get_session(&id)
@@ -762,12 +762,8 @@ async fn handle_join_start(
     // the CLI synchronously instead of the user finding out about a
     // rejected join only by absence in `oly join ls`.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let (abort, stop_tx) = spawn_join_connector(
-        join,
-        Arc::clone(config),
-        session_event_tx.subscribe(),
-        Some(tx),
-    );
+    let (abort, stop_tx) =
+        spawn_join_connector(join, Arc::clone(config), session_event_tx.clone(), Some(tx));
     join_handles.lock().await.insert(name, (abort, stop_tx));
     let outcome = match tokio::time::timeout(FIRST_JOIN_ATTEMPT_DEADLINE, rx).await {
         Ok(Ok(super::rpc_nodes::JoinAttempt::Connected)) => ("connected", String::new()),

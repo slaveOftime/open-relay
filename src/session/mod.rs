@@ -30,7 +30,6 @@ pub(crate) use store::scrollback_seed_bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::time::Instant;
 use tokio::sync::broadcast;
 
 use crate::error::{AppError, Result};
@@ -147,11 +146,6 @@ impl SessionError {
     }
 }
 
-pub struct SessionLiveSummary {
-    pub summary: SessionSummary,
-    pub last_output_at: Option<Instant>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 #[allow(clippy::enum_variant_names)] // Session-prefix is the protocol contract; renaming diverges from wire docs.
@@ -180,9 +174,64 @@ pub enum SessionEvent {
         last_total_bytes: u64,
         enabled_for_channels: bool,
     },
+
+    /// Compact activity batch produced by the daemon-wide sampler. Rebroadcast
+    /// by the primary with `batch.node` populated so a single SSE consumer
+    /// sees the global activity stream. Frontends apply these in place to
+    /// already-known summaries; activity never creates or deletes rows.
+    SessionActivity(SessionActivityBatch),
+
+    /// Emitted when a session-event stream diverged past its bounded ring
+    /// (local SSE receiver, federation relay, or any fold over `event_tx`)
+    /// so the frontend can request a fresh inventory via REST instead of
+    /// painting a partially-stale UI.
+    ResyncRequired {
+        /// Affected node name; absent when the local receiver is the cause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
+        /// Diagnostic tag for telemetry only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Emitted when the local pool of connected secondary nodes changes,
+    /// or a known secondary toggles online/offline. Frontends add or remove
+    /// bare rows in the list view without re-fetching the full inventory.
+    NodeState {
+        /// Affected node name.
+        node: String,
+        /// `true` when the node joined; `false` when it left.
+        connected: bool,
+        /// Wall-clock seconds since the UNIX epoch of the last received
+        /// heartbeat; only set for `connected: true`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_seen: Option<i64>,
+    },
 }
 
 pub type SessionEventTx = broadcast::Sender<SessionEvent>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionActivitySample {
+    pub id: String,
+    /// Cumulative `last_total_bytes` for the session's filtered stream as
+    /// observed by the local activity sampler on the **owning** daemon.
+    pub last_total_bytes: u64,
+    /// Calendar timestamp of the last meaningful PTY chunk observed by the
+    /// sampler. `None` only when the session has not produced meaningful
+    /// output yet (in which case the byte counter stays `0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionActivityBatch {
+    /// Owning daemon's node name. `None` when emitted by the daemon that
+    /// owns the session; populated by the primary as it rebroadcasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub samples: Vec<SessionActivitySample>,
+}
 
 pub const MAX_SESSION_TITLE_LEN: usize = 256;
 

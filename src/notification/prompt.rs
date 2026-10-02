@@ -132,6 +132,27 @@ impl SessionEvent {
                 last_total_bytes: *last_total_bytes,
                 enabled_for_channels: *enabled_for_channels,
             },
+            SessionEvent::SessionActivity(batch_ref) => {
+                let mut batch = batch_ref.clone();
+                batch.node = merge_node(&batch.node, node);
+                SessionEvent::SessionActivity(batch)
+            }
+            SessionEvent::ResyncRequired {
+                node: existing,
+                reason,
+            } => SessionEvent::ResyncRequired {
+                node: merge_node(existing, node),
+                reason: reason.clone(),
+            },
+            SessionEvent::NodeState {
+                node: name,
+                connected,
+                last_seen,
+            } => SessionEvent::NodeState {
+                node: name.clone(),
+                connected: *connected,
+                last_seen: *last_seen,
+            },
         }
     }
 }
@@ -174,6 +195,33 @@ impl NodeWsMessage {
                 trigger_detail: trigger_detail.clone(),
                 last_total_bytes: *last_total_bytes,
                 enabled_for_channels: *enabled_for_channels,
+            },
+            SessionEvent::SessionActivity(batch_ref) => {
+                let mut batch = batch_ref.clone();
+                batch.node = merge_node(&batch.node, node);
+                NodeWsMessage::SessionEvent {
+                    payload: SessionEvent::SessionActivity(batch),
+                }
+            }
+            SessionEvent::ResyncRequired {
+                node: existing,
+                reason,
+            } => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::ResyncRequired {
+                    node: merge_node(existing, node),
+                    reason: reason.clone(),
+                },
+            },
+            SessionEvent::NodeState {
+                node: name,
+                connected,
+                last_seen,
+            } => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::NodeState {
+                    node: name.clone(),
+                    connected: *connected,
+                    last_seen: *last_seen,
+                },
             },
         }
     }

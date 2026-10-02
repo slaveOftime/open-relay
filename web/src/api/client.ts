@@ -145,9 +145,13 @@ export function fetchSessions(params: ListParams = {}): Promise<ListPage<Session
   return req<ListPage<SessionSummary>>(`${BASE}/sessions${qs ? `?${qs}` : ''}`)
 }
 
-export function fetchSession(id: string, node?: string): Promise<SessionSummary> {
+export function fetchSession(
+  id: string,
+  node?: string,
+  signal?: AbortSignal
+): Promise<SessionSummary> {
   const q = node ? `?node=${encodeURIComponent(node)}` : ''
-  return req<SessionSummary>(`${BASE}/sessions/${id}${q}`)
+  return req<SessionSummary>(`${BASE}/sessions/${id}${q}`, { signal })
 }
 
 export function startSession(spec: CreateSessionSpec): Promise<{ session_id: string }> {
@@ -396,6 +400,39 @@ export function subscribeEvents(
         /* ignore */
       }
     })
+    source.addEventListener('stream_ready', (e: MessageEvent) => {
+      if (stopped || es !== source) return
+      try {
+        cb({ event: 'stream_ready', data: JSON.parse(e.data) })
+      } catch {
+        /* ignore */
+      }
+    })
+    source.addEventListener('resync_required', (e: MessageEvent) => {
+      if (stopped || es !== source) return
+      try {
+        cb({ event: 'resync_required', data: JSON.parse(e.data) })
+      } catch {
+        /* ignore */
+      }
+    })
+    source.addEventListener('node_state', (e: MessageEvent) => {
+      if (stopped || es !== source) return
+      try {
+        cb({ event: 'node_state', data: JSON.parse(e.data) })
+      } catch {
+        /* ignore */
+      }
+    })
+    source.addEventListener('session_activity', (e: MessageEvent) => {
+      if (stopped || es !== source) return
+      try {
+        cb({ event: 'session_activity', data: JSON.parse(e.data) })
+      } catch {
+        /* ignore */
+      }
+    })
+
     source.addEventListener('session_created', (e: MessageEvent) => {
       if (stopped || es !== source) return
       try {

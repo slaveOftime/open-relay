@@ -1,4 +1,4 @@
-import { useSyncExternalStore } from 'react'
+import { useEffect, useSyncExternalStore } from 'react'
 
 import { subscribeEvents, type SseConnectionState } from '@/api/client'
 import type { SessionEvent, SessionSummary } from '@/api/types'
@@ -21,25 +21,32 @@ function sameStringArray(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
-function sameSessionSummary(left: SessionSummary, right: SessionSummary): boolean {
-  return (
-    left.id === right.id &&
-    left.title === right.title &&
-    sameStringArray(left.tags, right.tags) &&
-    left.command === right.command &&
-    sameStringArray(left.args, right.args) &&
-    left.pid === right.pid &&
-    left.status === right.status &&
-    left.created_at === right.created_at &&
-    left.started_at === right.started_at &&
-    left.ended_at === right.ended_at &&
-    left.cwd === right.cwd &&
-    left.input_needed === right.input_needed &&
-    left.notifications_enabled === right.notifications_enabled &&
-    normalizeNode(left.node) === normalizeNode(right.node) &&
-    left.last_total_bytes === right.last_total_bytes &&
-    left.last_output_epoch === right.last_output_epoch
-  )
+function sameOptionalString(a: string | null | undefined, b: string | null | undefined): boolean {
+  return (a ?? null) === (b ?? null)
+}
+
+function sameSessionSummary(a: SessionSummary, b: SessionSummary): boolean {
+  if (a === b) return true
+  if (a.id !== b.id) return false
+  if (!sameOptionalString(a.title, b.title)) return false
+  if (!sameStringArray(a.tags, b.tags)) return false
+  if (a.command !== b.command) return false
+  if (!sameStringArray(a.args, b.args)) return false
+  if ((a.pid ?? null) !== (b.pid ?? null)) return false
+  if (a.status !== b.status) return false
+  if (a.created_at !== b.created_at) return false
+  if (!sameOptionalString(a.started_at, b.started_at)) return false
+  if (!sameOptionalString(a.ended_at, b.ended_at)) return false
+  if (!sameOptionalString(a.resume_command ?? null, b.resume_command ?? null)) return false
+  if (!sameOptionalString(a.cwd, b.cwd)) return false
+  if (a.input_needed !== b.input_needed) return false
+  if (a.notifications_enabled !== b.notifications_enabled) return false
+  if (normalizeNode(a.node) !== normalizeNode(b.node)) return false
+  if (a.last_total_bytes !== b.last_total_bytes) return false
+  if (!sameOptionalString(a.last_output_epoch ?? null, b.last_output_epoch ?? null)) return false
+  if (!sameOptionalString(a.foreground_color ?? null, b.foreground_color ?? null)) return false
+  if (!sameOptionalString(a.background_color ?? null, b.background_color ?? null)) return false
+  return true
 }
 
 class SessionEventsStore {
@@ -153,13 +160,22 @@ class SessionEventsStore {
       case 'session_deleted':
         changed = this.sessions.delete(sessionKey(event.data.id, event.data.node))
         break
+      case 'stream_ready':
+        // No payload to record yet; reconciliation happens separately.
+        break
       case 'session_notification':
         break
     }
 
-    // Snapshot/update/created summaries already record bytes in upsertSession.
-    // Only deletion and notifications need separate activity-store handling.
-    if (event.event === 'session_deleted' || event.event === 'session_notification') {
+    // Activity and reconciliation are the responsibility of the activity store.
+    if (
+      event.event === 'session_deleted' ||
+      event.event === 'session_notification' ||
+      event.event === 'session_activity' ||
+      event.event === 'resync_required' ||
+      event.event === 'stream_ready' ||
+      event.event === 'node_state'
+    ) {
       ingestSessionActivityEvent(event)
     }
     this.eventListeners.forEach((listener) => listener(event))
@@ -236,4 +252,28 @@ export function useLiveSessionSummary(
     () => sessionEventsStore.getSession(id, node),
     () => null
   )
+}
+
+/**
+ * Reconcile handler. Fires once per matching SSE event for the duration
+ * of the consumer's mount; consumers (e.g. SessionDetailPage) use this to
+ * re-fetch the canonical session summary when the local store diverges
+ * from the server's REST view.
+ */
+export function useReconcileTrigger(
+  id?: string | null,
+  node?: string | null,
+  reconcile: ((reason: 'stream_ready' | 'resync_required') => void) | null = null
+): void {
+  useEffect(() => {
+    if (!id || !reconcile) return
+    return sessionEventsStore.subscribeEvents((event) => {
+      if (event.event !== 'stream_ready' && event.event !== 'resync_required') return
+      if (event.event === 'resync_required') {
+        const target = normalizeNode(event.data.node)
+        if (target !== null && target !== normalizeNode(node)) return
+      }
+      reconcile(event.event)
+    })
+  }, [id, node, reconcile])
 }

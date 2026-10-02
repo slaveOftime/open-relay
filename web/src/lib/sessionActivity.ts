@@ -63,6 +63,23 @@ export function removeSessionActivity(sessionId: string, node?: string | null): 
   sparklineStore.remove(sessionActivityKey(sessionId, node))
 }
 
+export function resetSessionActivityBaseline(
+  sessionId: string,
+  node: string | null | undefined,
+  baseline: number
+): void {
+  sparklineStore.resetBaseline(sessionActivityKey(sessionId, node), baseline)
+}
+
+/** Reset every cached sparkline whose key belongs to this node. */
+export function resetAllSessionActivityForNode(node: string | null): void {
+  const prefix = (node?.trim() ?? '') + '\0'
+  for (const key of sparklineStore.keys()) {
+    // A null resync scope means the shared stream lost events for any node.
+    if (node === null || key.startsWith(prefix)) sparklineStore.resetBaseline(key)
+  }
+}
+
 export function ingestSessionActivityEvent(event: SessionEvent): void {
   switch (event.event) {
     case 'snapshot':
@@ -77,6 +94,29 @@ export function ingestSessionActivityEvent(event: SessionEvent): void {
       return
     case 'session_notification':
       recordSessionNotificationActivity(event.data)
+      return
+    case 'session_activity':
+      // Apply the owning node's byte counters to each listed session.
+      // SparklineStore.recordTotal is monotonic per-id, so this cannot
+      // produce an artificial spike on a counter that just decreased.
+      for (const sample of event.data.samples) {
+        recordSessionActivity({
+          id: sample.id,
+          node: event.data.node ?? null,
+          last_total_bytes: sample.last_total_bytes,
+        })
+      }
+      return
+    case 'stream_ready':
+      resetAllSessionActivityForNode(null)
+      return
+    case 'node_state':
+      if (!event.data.connected) resetAllSessionActivityForNode(event.data.node)
+      return
+    case 'resync_required':
+      // Re-baseline sparklines so bytes that accumulated during the gap
+      // don't get plotted as one large bucket.
+      resetAllSessionActivityForNode(event.data.node ?? null)
       return
   }
 }

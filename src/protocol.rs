@@ -657,6 +657,7 @@ pub struct JoinSummary {
 /// Messages exchanged over the `/api/nodes/join` WebSocket connection.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Wire-format dict; C/C+1 invariant depends on this exact shape.
 pub enum NodeWsMessage {
     /// Secondary → Primary: authentication handshake.
     /// Authentication can be via API key or SSH key signature.

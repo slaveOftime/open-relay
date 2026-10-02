@@ -70,7 +70,11 @@ import {
 } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
 import AttachPanel from '@/components/AttachPanel'
-import { ingestSessionSummary, useLiveSessionSummary } from '@/lib/sessionEvents'
+import {
+  ingestSessionSummary,
+  useLiveSessionSummary,
+  useReconcileTrigger,
+} from '@/lib/sessionEvents'
 
 function isSessionRunning(session: SessionSummary | null): boolean {
   return session
@@ -645,26 +649,58 @@ function SessionDetailPageContent() {
     return () => window.removeEventListener('keyup', handleKeyUp)
   }, [mode])
 
+  const requestDetailReconcile = useRef<(() => void) | null>(null)
   useEffect(() => {
     if (!id) return
     isMounted.current = true
     let cancelled = false
-    // Defer to avoid StrictMode double-fetch
-    const raf = requestAnimationFrame(() => {
+    let version = 0
+    let inflight = false
+    let pending = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const controller = new AbortController()
+    const schedule = () => {
+      version += 1
+      pending = true
+      if (inflight || timer !== null) return
+      timer = setTimeout(() => {
+        timer = null
+        void load()
+      }, 250)
+    }
+    const load = async () => {
       if (cancelled) return
-      fetchSession(id, node ?? undefined)
-        .then((s) => {
+      const requestedVersion = version
+      pending = false
+      inflight = true
+      try {
+        const s = await fetchSession(id, node ?? undefined, controller.signal)
+        if (!cancelled && requestedVersion === version) {
           ingestSessionSummary(s)
-          if (!cancelled && isMounted.current) setSession(s)
-        })
-        .catch(() => {})
-    })
+          setSession(s)
+        }
+      } catch {
+        /* A later reconnect or manual reload retries. */
+      } finally {
+        inflight = false
+        if (!cancelled && pending) schedule()
+      }
+    }
+    requestDetailReconcile.current = schedule
+    schedule()
     return () => {
       cancelled = true
-      cancelAnimationFrame(raf)
+      controller.abort()
+      if (timer !== null) clearTimeout(timer)
+      requestDetailReconcile.current = null
       isMounted.current = false
     }
   }, [id, node, reloadTick])
+
+  const reconcileSessionDetail = useCallback(() => {
+    requestDetailReconcile.current?.()
+  }, [])
+  useReconcileTrigger(id, node, reconcileSessionDetail)
 
   // Only connect after session metadata is loaded so the info bar has
   // rendered and the terminal container has its final dimensions.  This

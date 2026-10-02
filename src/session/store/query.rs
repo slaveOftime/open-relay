@@ -12,7 +12,7 @@ use crate::{
     error::AppError,
     error::Result,
     protocol::{ListQuery, SessionSummary},
-    session::{SessionEvent, SessionLiveSummary, validate_session_metadata_update},
+    session::{SessionEvent, validate_session_metadata_update},
 };
 
 use super::super::SessionError;
@@ -45,23 +45,6 @@ impl SessionStore {
     pub fn get_summary(&self, id: &str) -> Option<SessionSummary> {
         let sessions = self.sessions.load();
         sessions.get(id).map(|handle| handle.read().to_summary())
-    }
-
-    /// Returns summaries for all sessions that are currently held in memory
-    /// (live or recently evicted), without touching the database.
-    /// Used by the SSE session poller to avoid a DB query every 500 ms.
-    pub fn list_live_summaries(&self) -> Vec<SessionLiveSummary> {
-        let sessions = self.sessions.load();
-        sessions
-            .values()
-            .map(|handle| {
-                let rt = handle.read();
-                SessionLiveSummary {
-                    last_output_at: rt.last_output_epoch,
-                    summary: rt.to_summary(),
-                }
-            })
-            .collect()
     }
 
     pub fn get_exit_code(&self, id: &str) -> Option<i32> {

@@ -2,11 +2,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use crate::{
     error::{AppError, Result},
     protocol::{NodeWsMessage, RpcRequest, RpcResponse},
+    session::SessionEvent,
 };
 
 /// Default deadline for one-shot proxied RPCs (M5-3): a hung secondary
@@ -49,6 +50,11 @@ pub struct NodeRegistry {
     nodes: Mutex<HashMap<String, NodeHandle>>,
     /// Deadline applied to one-shot proxied RPCs (test-overridable).
     rpc_timeout: Duration,
+    /// Session-event broadcaster used to publish `node_state` when the
+    /// pool changes. Stored behind a `OnceLock` so the bind is idempotent
+    /// and the `bind_event_tx` call can land after the registry has already
+    /// been wrapped in `Arc::<NodeRegistry>`.
+    event_tx: std::sync::OnceLock<broadcast::Sender<SessionEvent>>,
 }
 
 impl NodeRegistry {
@@ -56,6 +62,7 @@ impl NodeRegistry {
         Self {
             nodes: Mutex::new(HashMap::new()),
             rpc_timeout: NODE_RPC_TIMEOUT,
+            event_tx: std::sync::OnceLock::new(),
         }
     }
 
@@ -64,19 +71,46 @@ impl NodeRegistry {
         Self {
             nodes: Mutex::new(HashMap::new()),
             rpc_timeout,
+            event_tx: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Wire `event_tx` so future `connect`/`disconnect` calls publish a
+    /// [`SessionEvent::NodeState`] on the broadcast. The relay path then
+    /// fans it out to subscribers without double-counting the source.
+    /// Idempotent: only the first call sticks.
+    pub fn bind_event_tx(&self, event_tx: broadcast::Sender<SessionEvent>) {
+        let _ = self.event_tx.set(event_tx);
+    }
+
+    fn event_tx(&self) -> Option<&broadcast::Sender<SessionEvent>> {
+        self.event_tx.get()
     }
 
     /// Register a newly-connected secondary node.
     pub async fn connect(&self, name: String, handle: NodeHandle) {
         let mut nodes = self.nodes.lock().await;
-        nodes.insert(name, handle);
+        nodes.insert(name.clone(), handle);
+        if let Some(tx) = self.event_tx() {
+            let _ = tx.send(SessionEvent::NodeState {
+                node: name,
+                connected: true,
+                last_seen: Some(chrono::Utc::now().timestamp()),
+            });
+        }
     }
 
     /// Remove a secondary node (called on WS disconnect).
     pub async fn disconnect(&self, name: &str) {
         let mut nodes = self.nodes.lock().await;
         nodes.remove(name);
+        if let Some(tx) = self.event_tx() {
+            let _ = tx.send(SessionEvent::NodeState {
+                node: name.to_string(),
+                connected: false,
+                last_seen: None,
+            });
+        }
     }
 
     /// Forward `request` to the named secondary and await a single response.

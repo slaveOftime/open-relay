@@ -297,19 +297,6 @@ const PTY_WRITER_QUEUE_CAPACITY: usize = 4096;
 /// therefore as few downstream chunks, broadcasts and IPC frames — as possible.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 
-// Report the first meaningful PTY chunk immediately. Bound subsequent full
-// summaries to four per second per session rather than one per read syscall;
-// the HTTP poller still catches the final total and any status changes.
-const ACTIVITY_SUMMARY_MIN_INTERVAL: Duration = Duration::from_millis(250);
-
-fn activity_summary_due(last_sent: &mut Option<Instant>, now: Instant) -> bool {
-    if last_sent.is_some_and(|last| now.duration_since(last) < ACTIVITY_SUMMARY_MIN_INTERVAL) {
-        return false;
-    }
-    *last_sent = Some(now);
-    true
-}
-
 /// PLAN2 §P2.5: run one byte-budgeted journal retention sweep.
 ///
 /// Convenience wrapper around `journal::min_incarnation_for_byte_budget` +
@@ -1359,7 +1346,6 @@ pub fn spawn_session(
         let mut reader = reader;
         let mut scanner = PtyScanner::new();
         let mut scan_out = ScanOut::default();
-        let mut last_activity_summary_at = None;
         // Every exit path funnels into one close-out so the runtime
         // observes — and the shadow journal records — exactly one
         // `OutputClosed` fact, regardless of how the stream ended (I10).
@@ -1405,13 +1391,8 @@ pub fn spawn_session(
                         };
                         rt.push_output(&filtered, meaningful_len);
                         let chunk_offset = rt.filtered_stream_len() - filtered.len() as u64;
-                        // The existing SSE broadcast is already a streaming HTTP
-                        // response. Publish the first changed total from the
-                        // reader instead of waiting for the 500 ms poller.
-                        let activity_changed = !filtered.is_empty()
-                            && meaningful_len > 0
-                            && reader_event_tx.receiver_count() > 0
-                            && activity_summary_due(&mut last_activity_summary_at, Instant::now());
+                        // Byte-only updates belong to the daemon-wide activity
+                        // sampler; full summaries are reserved for metadata changes.
                         // A mode flip lands immediately after the output
                         // that caused it, in the same order a replay sees.
                         rt.journal_modes_if_changed();
@@ -1425,8 +1406,7 @@ pub fn spawn_session(
                             let _ = rt.pty.kill();
                             "journal failed; stopping session (ADR-0006)".to_string()
                         });
-                        let update_summary =
-                            (meta_changed || activity_changed).then(|| rt.to_summary());
+                        let update_summary = meta_changed.then(|| rt.to_summary());
                         (query_responses, update_summary, chunk_offset, journal_stop)
                     };
 
@@ -1642,26 +1622,6 @@ fn format_command_for_display(command: &str, args: &[String]) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-
-    #[test]
-    fn activity_summary_is_immediate_then_bounded_per_session() {
-        let start = Instant::now();
-        let mut last_sent = None;
-        assert!(activity_summary_due(&mut last_sent, start));
-        assert!(!activity_summary_due(
-            &mut last_sent,
-            start + Duration::from_millis(249)
-        ));
-        assert_eq!(last_sent, Some(start));
-        assert!(activity_summary_due(
-            &mut last_sent,
-            start + ACTIVITY_SUMMARY_MIN_INTERVAL
-        ));
-        assert!(activity_summary_due(
-            &mut last_sent,
-            start + Duration::from_secs(2)
-        ));
-    }
 
     #[test]
     fn refreshed_environment_overrides_inherited_values() {
