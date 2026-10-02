@@ -21,9 +21,18 @@ describe('nodeAfterSwipe', () => {
     expect(nodeAfterSwipe('worker-b', nodes, 100, 10)).toBe('worker-a')
   })
 
-  it('ignores short and vertical or diagonal drags', () => {
+  it('commits mostly-horizontal drags even with noticeable vertical drift', () => {
+    // 100px left with 80px drift is still well within "felt horizontal" range.
+    expect(nodeAfterSwipe(null, nodes, -100, 80)).toBe('worker-a')
+    expect(nodeAfterSwipe(null, nodes, 100, 99)).toBe('worker-b')
+  })
+
+  it('ignores short, vertical, or pull-dominant drags', () => {
     expect(nodeAfterSwipe(null, nodes, -50, 0)).toBeUndefined()
+    // equal components are too ambiguous to commit a swipe.
     expect(nodeAfterSwipe(null, nodes, -100, 100)).toBeUndefined()
+    // any drag where the vertical component strictly exceeds the horizontal one
+    // belongs to pull territory, not to node switching.
     expect(nodeAfterSwipe(null, nodes, -100, 150)).toBeUndefined()
   })
 
@@ -44,8 +53,15 @@ describe('swipeDragOffset', () => {
 
   it('leaves taps, vertical scrolling and single-node views alone', () => {
     expect(swipeDragOffset(9, 0, true)).toBe(0)
-    expect(swipeDragOffset(100, 90, true)).toBe(0)
+    expect(swipeDragOffset(100, 101, true)).toBe(0)
     expect(swipeDragOffset(100, 0, false)).toBe(0)
+  })
+
+  it('follows through on mostly-horizontal drags so users see feedback', () => {
+    // 100px right with 90px down is closer to horizontal than vertical, so the
+    // user should see the content follow the finger even though a pure
+    // pull-to-refresh would still need a clearly vertical drag to fire.
+    expect(swipeDragOffset(100, 90, true)).toBe(30)
   })
 })
 

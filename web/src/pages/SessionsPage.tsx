@@ -1629,14 +1629,20 @@ export default function SessionsPage() {
     }
     const wasPulling = pendingPullOffsetRef.current > 0
     resetMobileGesture()
-    if (wasPulling) {
-      lastNodeSwipeAtRef.current = Date.now() // don't open a card on a canceled pull
+    // Decide the navigation outcome first: a clean horizontal swipe should
+    // always win over a stray vertical drift, even if the pull visual
+    // flickered briefly mid-gesture.
+    const next = nodeAfterSwipe(selectedNode, nodes, deltaX, deltaY)
+    if (next !== undefined) {
+      lastNodeSwipeAtRef.current = Date.now()
+      handleNodeChange(next)
       return
     }
-    const next = nodeAfterSwipe(selectedNode, nodes, deltaX, deltaY)
-    if (next === undefined) return
-    lastNodeSwipeAtRef.current = Date.now()
-    handleNodeChange(next)
+    // No node change. If the user pulled at all, suppress the click on the
+    // card below so a slightly-stale finger-drag doesn't open a session.
+    if (wasPulling) {
+      lastNodeSwipeAtRef.current = Date.now()
+    }
   }
 
   function handleDeleted(id: string) {
