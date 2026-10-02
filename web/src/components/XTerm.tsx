@@ -145,7 +145,7 @@ interface Props {
   /** Called when the terminal is resized by FitAddon (cols, rows) */
   onResize?: (cols: number, rows: number) => void
   /**
-   * Called when the user's pinned-to-bottom state changes (M4-2): live
+   * Called when the user's pinned-to-bottom state changes: live
    * output may only auto-scroll while the user is already at the bottom —
    * scrolling up to read history must never be stolen by new output.
    */

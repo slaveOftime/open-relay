@@ -15,7 +15,7 @@ use super::{SessionStore, SilentCandidate, USER_ACTIVITY_WINDOW};
 
 /// Per-session data needed to evaluate silence/notification state, captured
 /// under the runtime's read lock with no rendering performed. Render → excerpt
-/// is CPU-only and runs on `spawn_blocking` (PLAN2 §P1.2).
+/// is CPU-only and runs on `spawn_blocking`.
 struct CandidateSnapshot {
     session_id: String,
     session_title: Option<String>,
@@ -38,7 +38,7 @@ impl SessionStore {
         // silence-detection metadata and a flat byte payload of the
         // engine rows we want to render. The read lock is held only
         // long enough to copy plain data — no CPU-bound format pass
-        // runs under the lock (PLAN2 §P1.2).
+        // runs under the lock.
         let snapshots: Vec<CandidateSnapshot> = {
             let now = Instant::now();
             let sessions = self.sessions.load();

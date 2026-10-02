@@ -1,5 +1,4 @@
-//! Reader / torn-tail recovery, segment scan internals, and ScanResult types
-//! (PLAN2 S1.5 step 3 + S1.6 step 1 + P2.2).
+//! Reader / torn-tail recovery, segment scan internals, and ScanResult types.
 //!
 //! Two contiguous `mod.rs` blocks were carved verbatim:
 //!   1. The 105-line on-the-wire scan API (`ScanStop`, `ScanOutcome`,
@@ -9,7 +8,9 @@
 //!      `ScanStart`, `scan_impl`, `outcome`, `ReadPiece`,
 //!      `read_exact_or_partial`).
 //!
-//! No body code was rewritten in S1.5/S1.6. P2.2 rewrote the
+//! No body code was rewritten when these modules were extracted;
+//! the scan-API rewrite that produced the slice-torn-tail recovery
+//! landed as part of
 //! payload-validation path inside `scan_impl` to stream-check large
 //! payloads over a 1 MiB scratch buffer before allocating the retained
 //! payload Vec, so corrupt-but-valid headers do not force a 64 MiB allocation.
@@ -107,9 +108,9 @@ impl ScanOutcome {
 
 /// Scan a segment from the start, stopping at the first invalid byte.
 ///
-/// Recovery contract (PLAN.md §6.2): a crash can tear the *tail* of the
-/// active segment; recovery rewinds to `valid_len`
-/// (`ScanStop::PartialTail`). Anything else is corruption, not a tear — the
+/// Recovery contract: a crash can tear the *tail* of the active segment;
+/// recovery rewinds to `valid_len` (`ScanStop::PartialTail`). Anything
+/// else is corruption, not a tear — the
 /// caller quarantines and reports it instead of silently continuing.
 #[cfg(test)]
 pub fn scan_segment(path: &Path) -> io::Result<ScanOutcome> {
@@ -154,7 +155,7 @@ pub fn scan_segment_stats_from(
 }
 
 // =========================================================================
-// Scan internals (carved from mod.rs at S1.6 step 1).
+// Scan internals (carved from `mod.rs` as a verbatim split).
 // Body byte-identical; visibility widened as documented inline.
 // =========================================================================
 

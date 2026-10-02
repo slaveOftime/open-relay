@@ -1,6 +1,5 @@
 //! Open-with-recovery: validates the journal dir, rewinds torn tails,
-//! and hands out the [`OpenedJournal`] / [`RecoveryReport`] handle
-//! (PLAN2 S1.5 step 6).
+//! and hands out the [`OpenedJournal`] / [`RecoveryReport`] handle.
 //!
 //! Lifted from `session/journal/mod.rs`. The open-path (`RecoveryReport`,
 //! `OpenedJournal`, `open`, `complete_retired_retention`,
@@ -243,7 +242,7 @@ pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Ordered events and the in-memory sequencing core (M1)
+// Ordered events and the in-memory sequencing core
 // ---------------------------------------------------------------------------
 
 /// Durable cursor for one journal record: `{session_id, incarnation, seq}`
@@ -255,7 +254,7 @@ pub struct JournalCursor {
 }
 
 /// One immutable, already-sequenced session event. Sequence and timing are
-/// assigned **before** publication (PLAN.md §4.1 item 3); the payload is
+/// assigned **before** publication; the payload is
 /// reference-counted so live delivery, the recent replay cache and the
 /// journal queue share one allocation.
 #[derive(Debug, Clone)]

@@ -65,8 +65,8 @@ pub(super) struct StoreMutableState {
     pub(super) evicted_sessions: HashMap<String, Instant>,
     /// Persisted filtered-stream lengths for sessions without a live
     /// runtime, keyed by session id: `(incarnation, len)`. The incarnation
-    /// component invalidates the entry when the journal advances (M4
-    /// corrective increment: keeps `oly wait` polling cheap against
+    /// component invalidates the entry when the journal advances
+    /// (keeps `oly wait` polling cheap against
     /// completed sessions with large journals).
     pub(super) persisted_stream_len_cache: HashMap<String, (u64, u64)>,
 }
@@ -102,9 +102,9 @@ pub struct SessionStore {
     /// TTL for evicting completed sessions, in seconds. Atomic so the
     /// daemon's config hot-reload can adjust it without a restart.
     pub(super) eviction_ttl_secs: std::sync::atomic::AtomicU64,
-    /// PLAN2 §P2.5: byte-budget cap on a session's persisted journal,
-    /// shared with `SessionRuntime` so every retention sweep across the
-    /// process sees the same value (0 = unlimited). Updated on the
+    /// Byte-budget cap on a session's persisted journal, shared with
+    /// `SessionRuntime` so every retention sweep across the process sees
+    /// the same value (0 = unlimited). Updated on the
     /// daemon's config hot-reload pass.
     pub(super) journal_byte_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Reloadable rules applied when a completed journal is scanned.
@@ -172,9 +172,9 @@ impl SessionStore {
             .store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// PLAN2 §P2.5: handle to the shared journal byte cap so a retention
-    /// sweep scheduled by one session can read it through the runtime's
-    /// `Arc` clone. The handle stays valid for the daemon's lifetime
+    /// Handle to the shared journal byte cap so a retention sweep
+    /// scheduled by one session can read it through the runtime's `Arc`
+    /// clone. The handle stays valid for the daemon's lifetime
     /// (the `SessionStore` itself is `Arc`-shared, so this is just a
     /// borrow-of-`Arc` from `Arc::clone`).
     pub(super) fn journal_byte_cap(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {

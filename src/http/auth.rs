@@ -31,7 +31,7 @@ const AUTH_COOKIE_NAME: &str = "oly_auth_token";
 /// within this window.
 const API_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 
-// ── Authorization scopes (ADR-0007, M5-4) ────────────────────────────────────
+// ── Authorization scopes (ADR-0007) ─────────────────────────────────────
 
 /// Read-only access: lists, session details, logs, SSE events, node list.
 pub const SCOPE_OBSERVE: &str = "observe";
@@ -225,14 +225,14 @@ impl AuthState {
     /// returning the granted scopes. Results are cached briefly so the hot
     /// path does not pay Argon2 verification per request.
     ///
-    /// PLAN2 P2.3a (interim): the `entries.to_vec()` clone below is the
+    /// Interim: the `entries.to_vec()` clone below is the
     /// acknowledged cost of feeding the O(N)·O(argon2) verify loop to a
     /// blocking-pool task. The clone stays cheap in absolute terms
     /// (entries already came from `db.list_api_key_entries` as an owned
     /// `Vec<(String, String)>` — this just re-borrows it for `'static`)
     /// but the budget grows linearly with the number of registered keys.
-    /// The real fix is X2.2's O(1) key-id lookup; this comment marks the
-    /// spot so the next reader knows why we don't reach for
+    /// A future O(1) key-id lookup would be the proper fix; this comment
+    /// marks the spot so the next reader knows why we don't reach for
     /// `Arc<Vec<...>>` here.
     pub async fn verify_api_key_scopes(
         &self,

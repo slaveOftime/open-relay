@@ -146,8 +146,7 @@ pub fn write_pid(lock_file: &PathBuf, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Reserved for M3 notification engine.
-#[allow(dead_code)]
+/// Read the daemon PID from the lock file, if any.
 pub fn read_pid(lock_file: &PathBuf) -> Result<Option<u32>> {
     let mut file = match OpenOptions::new().read(true).open(lock_file) {
         Ok(file) => file,

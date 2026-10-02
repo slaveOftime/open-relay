@@ -1,4 +1,4 @@
-//! App-manifest parsing and definition construction. PLAN2 S1.2.
+//! App-manifest parsing and definition construction.
 use reqwest::Url;
 use serde::Deserialize;
 use std::{

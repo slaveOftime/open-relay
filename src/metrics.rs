@@ -1,11 +1,10 @@
 //! A minimal always-on metrics registry for the critical data paths.
 //!
-//! Design constraints (PLAN "bounded everything" applies to observability
-//! too): no new dependencies, no dynamic label cardinality (names and
-//! labels are `&'static str` or small closed sets from code), lock held
-//! only for the map update after the measured work — never around it.
-//! Metric names are lowercase with underscores and get an `oly_` prefix
-//! plus a Prometheus suffix (`_seconds`, `_total`) at render time.
+//! Design constraints: no new dependencies; metrics/labels are
+//! `&'static str` from closed sets; the registry lock is held only for
+//! the map update after the measurement, never around it. Names are
+//! lowercase with underscores; render prepends `oly_` and adds the
+//! Prometheus suffix (`_seconds`, `_total`).
 //!
 //! Everything is exported as Prometheus text format at `GET /api/metrics`
 //! (behind the normal auth layer). Numbers are recorded from the first

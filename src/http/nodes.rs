@@ -287,7 +287,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
     }
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
-    // Keepalive (M5-3): protocol-level pings detect a silently dead
+    // Keepalive: protocol-level pings detect a silently dead
     // connection; any inbound frame (tungstenite auto-pongs included)
     // resets the liveness clock. Without this a half-open TCP connection
     // would leave proxied callers hanging until the next write fails.

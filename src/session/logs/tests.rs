@@ -44,7 +44,7 @@ fn assert_fixture_or_update(name: &str, output: &[u8]) {
 }
 
 fn fixture_name(name: &str) -> &str {
-    // M6-1: the engine renders identically on every platform, so there is
+    // The engine renders identically on every platform, so there is
     // one fixture per transcript (the retired parser needed a Windows
     // variant for its platform-specific erase-sequence choices).
     name
@@ -85,7 +85,7 @@ fn temp_session_dir(prefix: &str) -> PathBuf {
 
 #[test]
 fn journal_backed_session_logs_render_and_paginate() {
-    // M3-1c: with a journal present, `oly logs` and the HTTP logs endpoint
+    // With a journal present, `oly logs` and the HTTP logs endpoint
     // read the derived filtered stream — never output.log (which is absent).
     let dir = std::env::temp_dir().join(format!("oly-logs-journal-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
@@ -408,7 +408,7 @@ fn splits_persisted_logs_by_fallback_size_when_no_boundaries_exist() {
 
 #[test]
 fn persisted_log_page_rejects_pre_0_5_output_log_sessions() {
-    // M6-2: sessions with only a legacy `output.log` (no journal) fail
+    // Sessions with only a legacy `output.log` (no journal) fail
     // loudly instead of silently serving the retired format.
     let temp_dir = temp_session_dir("oly-log-legacy");
     fs::create_dir_all(&temp_dir).expect("create temp dir");

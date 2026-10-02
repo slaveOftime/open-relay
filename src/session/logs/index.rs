@@ -2,8 +2,8 @@
 //!
 //! Raw PTY logs have no line framing, so records are cut on terminal-aware
 //! boundaries. Journal-backed sessions paginate the derived filtered stream
-//! via the streaming replay reader (M6-2); the legacy `output.log` sidecar
-//! index is retired.
+//! via the streaming replay reader; the legacy `output.log` sidecar index
+//! is retired.
 
 #[cfg(test)]
 use std::fs::File;
@@ -42,7 +42,7 @@ pub(super) struct TailBytes {
 /// chunks when the stream contains no `\n`.
 ///
 /// Journal-backed sessions paginate the derived filtered stream via the
-/// streaming replay reader (bounded memory; M6-2). A session with only a
+/// streaming replay reader (bounded memory). A session with only a
 /// pre-0.5 `output.log` is an explicit error — the legacy fallback is
 /// retired (see MIGRATION.md).
 pub fn read_persisted_log_page(
@@ -441,7 +441,7 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
 }
 
 /// In-memory equivalent of [`read_tail_bytes`] for journal-derived
-/// streams (M3-1c): same tail-window and partial-line-drop semantics.
+/// streams: same tail-window and partial-line-drop semantics.
 pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
     if bytes.is_empty() {
         return TailBytes {
@@ -482,7 +482,7 @@ pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
 /// Pick the resize records relevant to replaying the stream window
 /// `[start_offset, end_offset)`: the geometry in effect at `start_offset`
 /// plus every resize inside the window, rebased to window-relative
-/// offsets. Pure derivation over journal-sourced resize events (M6-2).
+/// offsets. Pure derivation over journal-sourced resize events.
 pub(super) fn viewport_resize_plan(
     events: &[LogResize],
     start_offset: u64,

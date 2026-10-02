@@ -1,7 +1,8 @@
 //! Windows-only unhandled-exception filter that restores the TUI before the
 //! process dies from a genuine unhandled exception.
 //!
-//! Carved out of `list_tui.rs` by PLAN2 S1.3. The crash-handling `unsafe`
+//! Carved out of `list_tui.rs` to fence the Win32 unsafe behind a
+//! `#[cfg(windows)]` boundary. The crash-handling `unsafe`
 //! runs exclusively from this module (Win32 calls into
 //! `SetUnhandledExceptionFilter`, `WriteFile`, and the `EXCEPTION_POINTERS`
 //! read). Other Win32 pointer dances in `list_tui.rs`

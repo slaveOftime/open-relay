@@ -526,7 +526,7 @@ impl App {
     /// drives `tree.cursor`, so the focused session is the one sitting
     /// under that cursor — *without* any visibility pre-check, because
     /// `visible` is the filtered list and the tree view deliberately
-    /// ignores filters (see P3.2 TODO).
+    /// ignores filters.
     ///
     /// Keeping this in one helper means every dial action (Enter,
     /// Ctrl+D duplicate, Ctrl+U update, inline open) reads the same

@@ -1,4 +1,4 @@
-//! Typed payload codecs for non-output records (PLAN2 S1.5 step 1).
+//! Typed payload codecs for non-output records.
 //!
 //! Lifted from `session/journal/mod.rs`. The actual codec helpers
 //! (`encode_resize_payload`, `policy_payload`, `parse_policy`,
@@ -58,8 +58,8 @@ pub enum LifecycleCode {
     Killed = 3,
     Failed = 4,
     /// The PTY output stream reached its end (EOF, read error or writer
-    /// teardown). Process exit and PTY EOF are separate facts (PLAN.md
-    /// I10): completion is only journaled after this record.
+    /// teardown). Process exit and PTY EOF are separate facts:
+    /// completion is only journaled after this record.
     OutputClosed = 5,
 }
 

@@ -54,8 +54,9 @@ impl SessionStore {
         }
     }
 
-    /// Register an identified attachment (M3-4, PLAN §8.1). The role is
-    /// chosen here and never changes: controllers drive, observers
+    /// Register an identified attachment (fenced: per-session incarnation
+    /// + token). The role is chosen here and never changes: controllers
+    /// drive, observers
     /// (`oly attach --observe`) watch. When a controller declares a
     /// viewport, the initial geometry is applied through the session
     /// sequencer before any snapshot is taken.
@@ -71,8 +72,8 @@ impl SessionStore {
             let mut rt = handle.write();
             rt.register_attachment(kind, role, viewport)
         };
-        // M6-2: resize geometry is journaled by resize_pty itself; no
-        // separate events.log record.
+        // Migration note: resize geometry is journaled by resize_pty itself;
+        // no separate events.log record.
         debug!(
             session_id = id,
             attachment_id,
@@ -112,9 +113,9 @@ impl SessionStore {
             )
         };
         let offset = from_byte_offset.unwrap_or(0);
-        // The filtered display stream is derived from the raw journal
-        // (M3-1b); sessions without a journal are pre-0.5 and unsupported
-        // (M6-2 removed the output.log fallback; see MIGRATION.md).
+        // The filtered display stream is derived from the raw journal;
+        // sessions without a journal are pre-0.5 and unsupported
+        // (the output.log fallback was removed; see MIGRATION.md).
         if !dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
             warn!(
                 session_id = id,
@@ -144,8 +145,8 @@ impl SessionStore {
 
     /// Initialise an attach stream from the current rendered terminal state
     /// instead of replaying persisted PTY history from byte offset 0.
-    /// Read one bounded window of the persisted filtered stream starting at
-    /// `from` (I7): at most `max_bytes`, so a lagged attachment resyncs in
+    /// Read one bounded window of the persisted filtered stream starting
+    /// at `from`: at most `max_bytes`, so a lagged attachment resyncs in
     /// slices instead of one unbounded allocation.
     pub async fn attach_resync_window(
         &self,
@@ -168,10 +169,10 @@ impl SessionStore {
         })
     }
 
-    /// Record a client's applied-cursor credit (I7). Stale attachment
+    /// Record a client's applied-cursor credit. Stale attachment
     /// tokens and non-advancing cursors are ignored. The report lands in
-    /// the attachment's shared cell, which its output pump gates on (M5-1:
-    /// credits are enforced, not advisory).
+    /// the attachment's shared cell, which its output pump gates on
+    /// (credits are enforced, not advisory).
     pub async fn attach_report_applied(&self, id: &str, attachment_id: u64, cursor: u64) {
         if let Ok(handle) = self.lookup_runtime(id).await {
             let mut rt = handle.write();
@@ -180,7 +181,7 @@ impl SessionStore {
     }
 
     /// The shared applied-cursor cell for one registered attachment, used
-    /// by the output pump's credit gate (M5-1). `None` for stale/unknown
+    /// by the output pump's credit gate. `None` for stale/unknown
     /// attachment tokens.
     pub(crate) async fn attachment_credit_cell(
         &self,
@@ -205,7 +206,7 @@ impl SessionStore {
             .min()
     }
 
-    /// Filtered-stream length (M3-5): the in-memory count for live
+    /// Filtered-stream length: the in-memory count for live
     /// sessions (it counts bytes the journal appender may not have flushed
     /// yet, so the pump's completion drain knows when the persisted tail
     /// has caught up); the persisted, incarnation-cached derivation for
@@ -335,9 +336,9 @@ impl SessionStore {
 
     /// Forward raw input bytes to the session PTY.
     ///
-    /// Byte-exact (PLAN §5.1): the bytes the client sent reach the PTY
-    /// unchanged. Key-to-sequence encoding (DECCKM application cursor
-    /// keys, modifier parameters, bracketed-paste wrapping) happens at
+    /// Byte-exact: the bytes the client sent reach the PTY unchanged.
+    /// Key-to-sequence encoding (DECCKM application cursor keys, modifier
+    /// parameters, bracketed-paste wrapping) happens at
     /// the *client* that owns the key event; the daemon never rewrites
     /// input, so pasted or scripted bytes containing `ESC [ A`-style
     /// sequences are not corrupted.
@@ -350,8 +351,8 @@ impl SessionStore {
     ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
 
-        // I6: attached clients drive input directly; view-only attaches
-        // (observers) do not. `None` is the operator control plane
+        // Observe-mode enforcement: an attached observer never drives input
+        // directly. `None` is the operator control plane
         // (`oly send`, HTTP input), which is not an attachment and stays
         // ungated.
         if let Some(attachment_id) = attachment_id {
@@ -463,8 +464,8 @@ impl SessionStore {
         let handle = self.lookup_runtime(id).await?;
         let resized = {
             let mut rt = handle.write();
-            // I6: observers never resize the PTY; their declared size is a
-            // viewport, recorded for status surfaces only. Controllers
+            // Observe-mode enforcement: an observer's declared size is a
+            // viewport, recorded for status surfaces only; controllers
             // resize freely — the last successful resize wins.
             if let Some(attachment_id) = attachment_id {
                 check_control(&rt, attachment_id)?;
@@ -479,7 +480,7 @@ impl SessionStore {
             rows, cols, resized, "attach resize requested"
         );
         if resized {
-            // Geometry is journaled by resize_pty (M6-2: no events.log).
+            // Geometry is journaled by resize_pty (no events.log).
             Ok(())
         } else {
             Err(SessionError::Evicted)
@@ -520,9 +521,9 @@ pub fn scrollback_seed_bytes(seed: &[u8], rows: u16) -> Vec<u8> {
     out
 }
 
-/// One bounded window of the persisted filtered display stream (I7),
-/// derived from the journal. Shared by the live-runtime and persisted
-/// fallback paths so both read the same canonical bytes.
+/// One bounded window of the persisted filtered display stream, derived
+/// from the journal. Shared by live-runtime and persisted fallback paths
+/// so both read the same canonical bytes.
 fn read_filtered_window(
     dir: &Path,
     from: u64,
@@ -531,7 +532,7 @@ fn read_filtered_window(
     replay::filtered_stream_window(dir, from, max_bytes).map_err(|err| err.to_string())
 }
 
-/// The result of registering an attachment (M3-4).
+/// The result of registering an attachment.
 #[derive(Debug, Clone, Copy)]
 pub struct AttachRegistration {
     /// Fencing token identifying this attachment for its lifetime.
@@ -656,8 +657,8 @@ mod tests {
         );
     }
 
-    /// PLAN §5.1 byte-exactness: the daemon NEVER rewrites input, even
-    /// when the child has DECCKM application cursor keys enabled — the
+    /// Byte-exactness: the daemon NEVER rewrites input, even when the
+    /// child has DECCKM application cursor keys enabled — the
     /// key-to-sequence mapping is the sending client's job, and a pasted
     /// or scripted stream containing `ESC [ A` must survive unchanged.
     #[tokio::test]
@@ -910,7 +911,8 @@ mod tests {
             .await
             .expect("attach B");
 
-        // Credits advance monotonically per attachment (M3-5, I7).
+        // Credits advance monotonically per attachment (the cell's
+        // `fetch_max` lets stale reports no-op instead of regressing).
         store
             .attach_report_applied("ack0001", reg_a.attachment_id, 4096)
             .await;

@@ -26,18 +26,18 @@ use super::cursor::StreamCursor;
 const MAX_BATCHED_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Daemon-frame queue depth between the socket reader task and the render
-/// loop (M5-1). Frames are coalesced server-side to at most 512 KiB raw
+/// loop. Frames are coalesced server-side to at most 512 KiB raw
 /// (~700 KiB base64 on the wire), so 16 frames bound the queue at ~11 MiB
 /// worst case; backpressure flows to the socket, never to a dropped byte.
 const ATTACH_FRAME_QUEUE_DEPTH: usize = 16;
 
 /// Terminal-event queue depth between the blocking crossterm reader thread
-/// and the async event loop (M5-1). Full means the thread blocks — input
+/// and the async event loop. Full means the thread blocks — input
 /// is backpressured, never dropped. Paste bursts arrive as one
 /// `Event::Paste`, so this only needs to absorb key-burst jitter.
 const TERMINAL_EVENT_QUEUE_DEPTH: usize = 4096;
 
-/// Windows-only attach renderer (M6-1: terminal-engine based; the second
+/// Windows-only attach renderer (terminal-engine based; the second
 /// `vt100` parser is retired). The struct and its tests compile on every
 /// platform so the logic is type-checked and unit-tested on Linux; only the
 /// *construction* in the attach flow is `cfg(windows)`.
@@ -46,7 +46,7 @@ const TERMINAL_EVENT_QUEUE_DEPTH: usize = 4096;
 /// daemon bytes raw: it maintains a canonical engine screen and emits
 /// row-diffs (or a full snapshot after a resize) wrapped in synchronized
 /// updates. This is the same [`crate::terminal::Terminal`] engine the
-/// daemon runs — one supported terminal policy (PLAN §16).
+/// daemon runs — one supported terminal policy.
 #[cfg(any(windows, test))]
 struct AttachRenderer {
     engine: crate::terminal::Terminal,
@@ -289,17 +289,18 @@ async fn run_attach_inner(
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
 
-    // I6 (PLAN §8.1): an observe-mode attach (`--observe`) never drives
-    // input or geometry. The server enforces the gate; this mirrors it
-    // client-side so an observer's keystrokes don't bounce off it. Every
-    // other attach controls the session by default.
+    // Observe-mode attach never drives input or geometry. The server
+    // enforces the gate; this mirrors it client-side so an observer's
+    // keystrokes don't bounce. Every other attach controls the session.
     let can_drive = granted_role != "observer";
     if interactive && !can_drive {
         eprintln!("Attached in observe mode (view-only). Ctrl-D detaches.");
     }
 
     // Every chunk must continue exactly at the cursor the init frame left
-    // us at; gaps/duplicates abort the attach loudly (I2, M3-3).
+    // us at; gaps/duplicates abort the attach loudly and surface the
+    // failure so retry logic can re-anchor instead of silently applying
+    // duplicate bytes.
     let mut stream_cursor = StreamCursor::new(stream_end_offset);
     let mut last_acked: u64 = 0;
 
@@ -310,8 +311,8 @@ async fn run_attach_inner(
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         while running {
-            // M6-3: after the init line the stream is binary framed
-            // (ADR-0004); output arrives as raw bytes.
+            // After the init line the stream is binary framed (ADR-0004);
+            // output arrives as raw bytes.
             match ipc::read_checked_attach_frame(&mut reader).await? {
                 ipc::AttachFrame::Output { offset, data } => {
                     stream_cursor.accept(offset, data.len())?;
@@ -399,13 +400,11 @@ async fn run_attach_inner(
             }
         }
 
-        // Frame reads are not safe to keep cancelling with timeouts. Read
-        // daemon frames in a dedicated task and receive them over a channel
-        // instead. The channel is bounded (M5-1): when the render loop falls
-        // behind, the reader task's send awaits, which backpressures the
-        // socket and — via the daemon's credit gate and broadcast-ring
-        // resync — never grows memory without bound. Worst case: 16 frames
-        // x at most ~1 MiB binary frames (M6-3).
+        // Read daemon frames in a dedicated task and channel them in:
+        // cancelling reads with timeouts was not safe, and a bounded
+        // channel backpressures the socket all the way to the daemon's
+        // credit gate, so a slow renderer never bloats memory. Worst
+        // case: 16 frames at ≈ 1 MiB each.
         let (frame_tx, mut frame_rx) = mpsc::channel(ATTACH_FRAME_QUEUE_DEPTH);
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
@@ -423,17 +422,13 @@ async fn run_attach_inner(
 
         let mut shutdown_rx = spawn_attach_shutdown_listener();
 
-        // Terminal events are produced by a dedicated blocking thread
-        // (crossterm's `event::read` blocks); the async loop selects over
-        // terminal events, daemon frames, and the shutdown signal. Input is
-        // fully event-driven: no polling timeouts, no key-burst deadlines,
-        // no paste-detection windows (PLAN.md §5.1/§5.2 — paste boundaries
-        // come from bracketed-paste markers or the explicit clipboard
-        // shortcut, never from typing speed).
-        // Bounded (M5-1): the blocking reader thread applies backpressure
-        // via `blocking_send` — input events are NEVER dropped to relieve
-        // pressure (silent input loss is a release blocker), the producer
-        // simply waits until the event loop catches up.
+        // Terminal events come from a blocking reader thread (crossterm's
+        // `event::read`); the async loop selects over them alongside
+        // daemon frames and shutdown. Input is fully event-driven — no
+        // polling timeouts, no paste-detection windows. Backpressure via
+        // `blocking_send`: input events are never dropped (silent input
+        // loss would corrupt the session); the producer waits until the
+        // event loop catches up.
         let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_DEPTH);
         let event_reader = std::thread::spawn(move || {
             // stdin closed or unreadable ends the stream.
@@ -463,7 +458,7 @@ async fn run_attach_inner(
                                 // Explicit bracketed-paste boundaries: send the
                                 // paste as one bounded transaction, bytes
                                 // exactly as the terminal delivered them
-                                // (PLAN §5.1: no CRLF rewriting).
+                                // (no CRLF rewriting).
                                 if can_drive {
                                     send_attach_input(
                                         &mut write_half,
@@ -746,7 +741,7 @@ fn attach_proxy(node: Option<&str>, req: RpcRequest) -> RpcRequest {
 }
 
 fn spawn_attach_shutdown_listener() -> mpsc::Receiver<()> {
-    // One-shot signal: a single-slot channel is enough (M5-1).
+    // One-shot signal: a single-slot channel is enough.
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
     {
@@ -839,7 +834,7 @@ fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
 
 /// Wrap pasted text in bracketed-paste markers when the child enabled
 /// DECSET 2004. The pasted bytes themselves are preserved exactly — no
-/// CRLF rewriting, no key substitution (PLAN §5.1).
+/// CRLF rewriting, no key substitution.
 fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> Vec<u8> {
     if bracketed_paste_mode {
         let mut out = b"\x1b[200~".to_vec();
@@ -1225,7 +1220,7 @@ async fn send_attach_resize(
     .await
 }
 
-/// Applied-cursor credit cadence (M3-5, I7): credits are backpressure
+/// Applied-cursor credit cadence: credits are backpressure
 /// signals, not per-chunk chatter, so they go out at most once per MiB of
 /// newly applied output.
 const ACK_STRIDE_BYTES: u64 = 1024 * 1024;
@@ -1300,7 +1295,7 @@ mod tests {
             .to_string()
     }
 
-    /// vt100 is the test-only oracle renderer (M6-1: dev-dependency).
+    /// vt100 is the test-only oracle renderer (dev-dependency).
     fn oracle_contents(rows: u16, cols: u16, stream: &[u8]) -> String {
         let mut oracle = vt100::Parser::new(rows, cols, 0);
         oracle.process(stream);
@@ -1463,7 +1458,7 @@ mod tests {
 
     #[test]
     fn test_wrap_paste_input_preserves_crlf_bytes() {
-        // Terminal paste events are forwarded byte-exact (PLAN §5.1).
+        // Terminal paste events are forwarded byte-exact.
         assert_eq!(
             wrap_paste_input("line1\r\nline2".to_string(), false),
             b"line1\r\nline2".to_vec()
@@ -1806,9 +1801,9 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // M0 input-codec evidence (PLAN.md §8, ADR-0003). Passing tests pin
-    // the incumbent baseline; ignored repros pin the complete, standard
-    // encoding the 1.0 raw/semantic codec must provide.
+    // Input-codec evidence (ADR-0003). Passing tests pin the incumbent
+    // baseline; ignored repros pin the complete, standard encoding the
+    // 1.0 raw/semantic codec must provide.
     // -------------------------------------------------------------------
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

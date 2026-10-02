@@ -1,6 +1,6 @@
 //! Local-asset resolution, request-path candidates, and FS existence helpers.
 //!
-//! Sibling to `manifest.rs`, `html.rs`, `proxy_targets.rs`. PLAN2 S1.2.
+//! Sibling to `manifest.rs`, `html.rs`, `proxy_targets.rs`.
 use std::{
     io,
     path::{Component, Path, PathBuf},

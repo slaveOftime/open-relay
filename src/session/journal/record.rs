@@ -1,10 +1,10 @@
-//! On-disk record format, primary types and CRC-32 (PLAN2 S1.1 + P2.1).
+//! On-disk record format, primary types and CRC-32.
 //!
 //! Owns the wire format: header layout, sequence + elapsed_ms framing,
 //! CRC-32 (IEEE 802.3 reflected) and the streaming [`Crc32`] state used
 //! to checksum sealed-part manifests without re-reading the part.
 //!
-//! ## CRC-32 implementation (PLAN2 P2.1)
+//! ## CRC-32 implementation
 //!
 //! The hot path (every record append) and the cold path (recovery/verify
 //! scans) used to go through a hand-rolled byte-at-a-time table walk.
@@ -25,13 +25,15 @@ pub(crate) const RECORD_MAGIC: &[u8; 4] = b"OJRN";
 pub(crate) const RECORD_VERSION: u16 = 1;
 /// magic + version + kind + flags + seq + elapsed_ms + payload_len + crc32.
 pub(crate) const HEADER_LEN: usize = 4 + 2 + 2 + 4 + 8 + 8 + 4 + 4;
-/// Refuse absurd length fields before allocating (PLAN.md §7.4: limits are
-/// checked before allocation).
+/// Refuse absurd length fields before allocating (limits are checked
+/// before allocation).
 pub(crate) const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
 
 /// Typed journal record kinds. Unknown kinds are unrecoverable corruption for
 /// this format version: a torn or aliased tail must stop the scan, never be
-/// silently skipped (I3 — missing history is explicit, not empty success).
+/// silently skipped (partial replay is not honest reporting: a torn or
+/// aliased tail must surface as an explicit error rather than be
+/// reported as empty success).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum RecordKind {
@@ -119,16 +121,16 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// CRC-32 (production: crc32fast, PLAN2 P2.1)
+// CRC-32 (production: crc32fast)
 // ---------------------------------------------------------------------------
 
 /// Resumable CRC-32 (IEEE 802.3 reflected, same polynomial as [`crc32`]):
 /// sealed-part manifests checksum a segment incrementally as records are
-/// appended, so sealing never re-reads the part (M3-6).
+/// appended, so sealing never re-reads the part.
 ///
 /// Thin wrapper around [`crc32fast::Hasher`]. `finish(&self)` clones the
 /// inner hasher rather than consuming it so the caller can keep using
-/// the value after extracting a digest — that matches the pre-P2.1 API
+/// the value after extracting a digest — that matches the legacy API
 /// (`Copy` + `finish(&self)`) and the lone caller resets the hasher in
 /// the very next statement anyway.
 #[derive(Clone)]

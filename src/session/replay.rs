@@ -1,4 +1,4 @@
-//! Journal-served reads (M3-1b): derive the canonical **filtered display
+//! Journal-served reads: derive the canonical **filtered display
 //! stream** from the raw journal.
 //!
 //! The journal stores pre-filter PTY bytes (ADR-0002: replay and
@@ -7,12 +7,12 @@
 //! raw bytes — the same `PtyScanner` the reader loop runs, which buffers
 //! escape sequences split across records so the concatenated result is
 //! chunk-boundary independent. `output.log` therefore duplicates state the
-//! journal already owns and is retired in M3-1c; this module is the read
-//! path that replaces it.
+//! journal already owns and is retired; this module is the read path that
+//! replaces it.
 //!
-//! Cost note: replay is checkpoint-anchored (PLAN §5.3): deriving from an
-//! arbitrary filtered offset starts at the newest anchored checkpoint at
-//! or before that offset, so cost is bounded by the checkpoint cadence
+//! Cost note: replay is checkpoint-anchored: deriving from an arbitrary
+//! filtered offset starts at the newest anchored checkpoint at or before
+//! that offset, so cost is bounded by the checkpoint cadence
 //! (~32 MiB), never by total recording size. Sessions without anchors
 //! (pre-checkpoint journals, or a scanner that was mid-escape at every
 //! cadence boundary) fall back to a full-prefix scan in bounded batches.
@@ -30,7 +30,7 @@ use crate::protocol::LogResize;
 const REPLAY_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum filtered-stream lookahead included in resize history for a tail.
-/// Resizes further ahead cannot affect a bounded render window (PLAN §5.3).
+/// Resizes further ahead cannot affect a bounded render window.
 pub(crate) const MAX_RESIZE_EVENTS_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolve the replay anchor for a target filtered offset: the newest
@@ -68,7 +68,7 @@ fn replay_stream(
 
 /// Anchors of the latest incarnation, ascending by filtered offset.
 /// `oly logs` reuses these records to avoid rescanning the journal for each
-/// candidate tail start (PLAN §5.3).
+/// candidate tail start.
 pub(crate) fn replay_anchors(session_dir: &Path) -> io::Result<Vec<CheckpointAnchor>> {
     let Some(incarnation) = latest_incarnation(session_dir)? else {
         return Ok(Vec::new());
@@ -308,7 +308,7 @@ fn derive_stream_and_resizes(
 /// Derive the resize history of the latest incarnation by walking the
 /// journal: one [`LogResize`] per resize record, where `offset` is the
 /// filtered-stream length at the moment the resize was recorded. This is
-/// the canonical resize source since M6-2 retired `events.log`; the
+/// the canonical resize source since `events.log` was retired; the
 /// journal is append-ordered with the output stream, so the offsets are
 /// derived, never stored, and cannot disagree with the stream.
 pub fn resize_events(session_dir: &Path) -> io::Result<Vec<LogResize>> {
@@ -316,8 +316,8 @@ pub fn resize_events(session_dir: &Path) -> io::Result<Vec<LogResize>> {
 }
 
 /// Bounded variant of [`resize_events`]: only resizes at or after
-/// `from_offset`, anchored at a checkpoint (PLAN §5.3). Offsets in the
-/// result are absolute filtered-stream offsets.
+/// `from_offset`, anchored at a checkpoint. Offsets in the result are
+/// absolute filtered-stream offsets.
 pub fn resize_events_from(session_dir: &Path, from_offset: u64) -> io::Result<Vec<LogResize>> {
     let Some(incarnation) = latest_incarnation(session_dir)? else {
         return Ok(Vec::new());
@@ -360,7 +360,7 @@ pub fn resize_events_from(session_dir: &Path, from_offset: u64) -> io::Result<Ve
     Ok(events)
 }
 
-/// Bounded variant of [`filtered_stream_from`] (M3-5, I7): returns at most
+/// Bounded variant of [`filtered_stream_from`]: returns at most
 /// `max_bytes` of the filtered display stream starting at `from_offset`.
 /// Attach pumps use this to resync a lagged client in bounded windows
 /// instead of materializing the whole lag in memory at once; a short
@@ -842,7 +842,7 @@ mod tests {
         );
 
         // Corrupt a pre-anchor record's payload in place: anchored replay
-        // from a covered offset never reads it (PLAN §5.3 bound), while a
+        // from a covered offset never reads it (anchored bound), while a
         // full-prefix replay must fail integrity validation.
         let journal_dir = dir.join(journal::JOURNAL_DIR_NAME);
         let segment = std::fs::read_dir(&journal_dir)
@@ -860,7 +860,8 @@ mod tests {
         assert_eq!(tail, b"dddd");
         assert!(
             filtered_stream_from(&dir, 0).is_err(),
-            "a corrupted prefix must fail a full replay (I3)"
+            "a corrupted prefix must fail a full replay — partial replay
+             is not honest reporting"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

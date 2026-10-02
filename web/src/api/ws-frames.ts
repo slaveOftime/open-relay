@@ -105,7 +105,8 @@ export type ServerFrame =
  * the only ignorable result: truncated headers and unknown tags throw,
  * because silently dropping a frame desynchronizes the attach stream —
  * the client must surface the corruption instead of rendering on
- * (fail-loud, I2).
+ * (fail-loud: the next chunk's offset check would abort the whole
+ * attach anyway, so surface the corruption eagerly).
  */
 export function parseServerFrame(bytes: Uint8Array): ServerFrame | null {
   if (bytes.length === 0) return null

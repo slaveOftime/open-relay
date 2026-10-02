@@ -904,8 +904,8 @@ fn e2e_input_to_nonexistent_session_fails_gracefully() {
 }
 
 /// `oly attach` runs under a real PTY; pressing Ctrl-D (EOT, 0x04)
-/// must detach the client (README/SPEC key contract). This exercises the
-/// full terminal input path end-to-end.
+/// must detach the client. This exercises the full terminal input path
+/// end-to-end.
 #[cfg(not(target_os = "windows"))]
 #[test]
 fn e2e_attach_ctrl_d_detaches() {

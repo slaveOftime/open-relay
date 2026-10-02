@@ -2,7 +2,7 @@
 //! metadata types the rest of the daemon speaks in.
 
 pub(crate) mod file;
-// The single canonical per-session recording (PLAN.md §6.1, ADR-0002):
+// The single canonical per-session recording (ADR-0002):
 // record format, segment writer/reader, torn-tail recovery, the bounded
 // journal appender, ordered resize/lifecycle records, fixed-range/tail/
 // history reads and checkpoint-gated retention. Always on; if it fails,
@@ -13,15 +13,15 @@ pub mod pty;
 pub mod registry;
 pub(crate) mod replay;
 pub(crate) mod resize;
-// `pub(crate)` (PLAN2 S1.4) so test code outside this submodule tree can
+// `pub(crate)` so test code outside this submodule tree can
 // reach types such as `runtime::SequencedChunk` directly, without a
 // `#[cfg(test)]` re-export flip mirroring the production module graph.
 pub(crate) mod runtime;
 pub(crate) mod scan;
 // `pub(crate)` (not `mod`) is required unconditionally so test code outside
 // this submodule tree can reach `crate::session::store::testsupport`
-// without a `#[cfg(test)]` visibility flip. PLAN2 S1.4 removes cfg-dependent
-// module visibility from the shipping module graph.
+// without a `#[cfg(test)]` visibility flip — the shipping module graph
+// has no `cfg(test)`-gated `pub(crate)` modifiers.
 pub(crate) mod store;
 pub use runtime::ModeSnapshot;
 pub use store::pump::{AttachEvent, AttachPump, PumpCredit};
@@ -111,13 +111,13 @@ pub enum SessionError {
         current: Option<u64>,
     },
     /// A view-only attach (`oly attach --observe`) tried to drive
-    /// geometry/input (I6; PLAN §8.1).
+    /// geometry/input (observe-mode invariant).
     ViewOnly,
     /// The attachment id is unknown to the session (stale fencing token).
     StaleAttachment,
     /// A background worker join/sync failed. Surfaces only when a
     /// `spawn_blocking` task panics or is cancelled mid-flight; it
-    /// indicates an internal invariant was violated (PLAN2 §P1.2).
+    /// indicates an internal invariant was violated.
     Internal(String),
 }
 

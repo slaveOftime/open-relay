@@ -33,11 +33,10 @@ impl SessionStore {
     /// Maintenance sweep: prune evicted completed sessions past the
     /// retention window.
     ///
-    /// The 0.x `output.log` size-cap truncation is gone (M3-1c2):
-    /// truncating the canonical stream silently renumbered cursors and
-    /// destroyed history (PLAN I3). Growth is bounded instead by
-    /// checkpoint-gated journal retention (ADR-0002), which runs at
-    /// checkpoint cadence in the runtime.
+    /// The 0.x `output.log` size-cap truncation is gone: truncating the
+    /// canonical stream silently renumbered cursors and destroyed history.
+    /// Growth is bounded instead by checkpoint-gated journal retention
+    /// (ADR-0002), which runs at checkpoint cadence in the runtime.
     pub async fn run_maintenance(&self) {
         self.prune_evicted_sessions().await;
     }
@@ -94,9 +93,9 @@ impl SessionStore {
         } = prepared;
         let session_id = meta.id.clone();
         // `spawn_session` performs mkdir + ShadowJournal recovery scan
-        // + fsyncs + PATH walks + PTY spawn, all of which block workers
-        // (PLAN2 §P1.1). Run it on the blocking pool so a dirty, large
-        // journal can't stall live attach pumps on a 4-worker runtime.
+        // + fsyncs + PATH walks + PTY spawn, all of which block workers.
+        // Run it on the blocking pool so a dirty, large journal can't
+        // stall live attach pumps on a 4-worker runtime.
         // The `SessionMeta` is shared by `Arc<Mutex<_>>` because
         // `spawn_session` records the assigned pid back onto the meta;
         // we unwrap the mutex once the join completes.
@@ -511,7 +510,7 @@ impl SessionStore {
         let deadline = start + grace;
         let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
         let mut next_soft_stop_index = 0usize;
-        // M5-5 graceful drain escalation: the app interrupt (soft-stop
+        // Graceful-drain escalation contract: the app interrupt (soft-stop
         // input) owns the first half of the grace window; at the midpoint we
         // ask the whole process group to exit (POSIX SIGTERM — injected
         // Ctrl-C is not one), and at the deadline the tree is killed.
@@ -1005,9 +1004,10 @@ mod tests {
         }
     }
 
-    /// PLAN2 §P1.1 regression guard. Three concurrent
-    /// `start_session_via_handle` calls under a single-thread runtime
-    /// must finish in roughly the wall-clock time of a single call,
+    /// Regression guard: three concurrent `start_session_via_handle`
+    /// calls under a
+    /// single-thread runtime must finish in roughly the wall-clock time
+    /// of a single call,
     /// because the per-call blocking work runs on `spawn_blocking`
     /// and so the three calls overlap on the blocking pool.  Without
     /// that wrapper, the only worker would process them sequentially
@@ -1070,7 +1070,7 @@ mod tests {
 
         assert!(
             triple_ms <= 3 * single_ms / 2,
-            "3 concurrent start_session calls took {triple_ms}ms (single baseline {single_ms}ms);              expected roughly the single-call time, not 3x sequential.              Did something drop the spawn_blocking wrapper?               (PLAN2 §P1.1)"
+            "3 concurrent start_session calls took {triple_ms}ms (single baseline {single_ms}ms);              expected roughly the single-call time, not 3x sequential.              Did something drop the spawn_blocking wrapper?"
         );
     }
 
@@ -1412,7 +1412,7 @@ mod tests {
             writes.push(bytes);
         }
 
-        // M5-5 escalation semantics: the dummy child is a real `sleep` that
+        // Escalation semantics: the dummy child is a real `sleep` that
         // never sees the soft-stop input bytes (they land in the test's
         // channel, not the PTY). Stages due before the grace midpoint are
         // sent; the midpoint process-group SIGTERM then ends the session

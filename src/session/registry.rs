@@ -1,4 +1,4 @@
-//! Attachment registry (M3-4; PLAN §8.1, invariant I6).
+//! Attachment registry (fenced attachments with role + liveness).
 //!
 //! Replaces anonymous attach counters with identified attachment records:
 //! every attached client gets a per-session attachment id (a fencing token:
@@ -56,8 +56,9 @@ impl AttachRole {
     }
 }
 
-/// One identified attachment. Some fields are consumed by later M3 surfaces
-/// (attached-client status listings), hence the allow.
+/// One identified attachment. Some fields feed status-list surfaces; the
+/// binary crate flags the rest as `#[allow(dead_code)]` until those
+/// surfaces land.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Attachment {
@@ -69,8 +70,9 @@ pub struct Attachment {
     /// Last geometry this attachment declared (its terminal size).
     pub viewport: Option<(u16, u16)>,
     /// Last stream cursor the client reported as fully applied. Shared
-    /// with the attachment's output pump, which gates sends on it (M5-1:
-    /// credits are enforced, not advisory — I7).
+    /// with the attachment's output pump, which gates sends on it
+    /// (credits are enforced, not advisory, so a slow client cannot
+    /// unbounded-buffer the daemon).
     pub applied_cursor: Arc<AtomicU64>,
 }
 
@@ -112,7 +114,7 @@ impl AttachmentRegistry {
         self.attachments.remove(&id)
     }
 
-    /// May this attachment drive input/geometry (I6)? Controllers can;
+    /// May this attachment drive input/geometry? Controllers can;
     /// observers (view-only attaches) cannot; stale tokens cannot.
     pub fn can_control(&self, id: u64) -> bool {
         self.attachments
@@ -126,11 +128,12 @@ impl AttachmentRegistry {
     }
 
     /// Record a client-reported applied cursor (drives the pump's credit
-    /// gate, M5-1).
+    /// gate).
     pub fn report_applied(&mut self, id: u64, cursor: u64) {
         if let Some(attachment) = self.attachments.get_mut(&id) {
             // Credits are monotonic: a stale or duplicated report never
-            // moves the cursor backwards (I7 bookkeeping stays conservative).
+            // moves the cursor backwards (a stale report never regresses
+            // the headroom the credit-gate relies on).
             attachment
                 .applied_cursor
                 .fetch_max(cursor, Ordering::Relaxed);
@@ -138,7 +141,8 @@ impl AttachmentRegistry {
     }
 
     /// The shared applied-cursor cell for one attachment, so its output
-    /// pump can gate sends on applied + budget (M5-1, I7).
+    /// pump can gate sends on applied + budget (apply-vs-budget headroom
+    /// is the contract the credit-gate enforces).
     pub fn credit_cell(&self, id: u64) -> Option<Arc<AtomicU64>> {
         self.attachments
             .get(&id)
@@ -161,7 +165,7 @@ impl AttachmentRegistry {
         self.attachments.is_empty()
     }
 
-    /// M3 status surface: enumerate live attachments.
+    /// Status surface: enumerate live attachments.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn attachments(&self) -> impl Iterator<Item = &Attachment> {
         self.attachments.values()
@@ -172,7 +176,7 @@ impl AttachmentRegistry {
 mod tests {
     use super::*;
 
-    /// M5-1: applied-cursor reports land in the attachment's shared cell
+    /// Applied-cursor reports land in the attachment's shared cell
     /// (which the output pump gates on) and never move it backwards.
     #[test]
     fn report_applied_advances_the_shared_credit_cell_monotonically() {

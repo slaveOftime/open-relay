@@ -65,7 +65,7 @@ pub async fn run_send(
 
     // Piped stdin (only when no explicit chunks AND `--` was not used).
     // Bytes are forwarded exactly as read — no UTF-8 validation or
-    // lossy conversion — so binary input survives (PLAN §5.1).
+    // lossy conversion — so binary input survives.
     if !has_chunks && !had_separator && !stdin_is_terminal {
         let mut bytes = Vec::new();
         std::io::stdin().read_to_end(&mut bytes)?;
@@ -244,7 +244,7 @@ async fn send_data(config: &AppConfig, id: &str, data: Vec<u8>, node: Option<&st
         data,
         wait_for_change: true,
         // Ungated operator one-shot: no attachment token, so `oly send`
-        // reaches the session regardless of attach role (PLAN §5.1).
+        // reaches the session regardless of attach role.
         attachment_id: None,
     };
     let req = match node {
@@ -355,7 +355,7 @@ fn parse_ctrl_key(normalized: &str) -> Option<char> {
 
 /// Parse `hex:<hex-bytes>` notation, e.g. `hex:1b` or `hex:1b5b41`.
 /// Returns the exact decoded bytes — never lossy UTF-8 — so arbitrary
-/// binary input is representable (PLAN §5.1).
+/// binary input is representable.
 fn parse_hex_bytes(normalized: &str) -> Option<Vec<u8>> {
     let payload = normalized.strip_prefix("hex:")?;
 

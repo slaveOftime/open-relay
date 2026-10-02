@@ -1,6 +1,6 @@
-//! M4 agent surfaces: machine-readable cursor/history/wait/control commands
+//! Agent surfaces: machine-readable cursor/history/wait/control commands
 //! over the cursor-checked IPC protocol. Text output goes to stdout as data
-//! only; diagnostics stay on stderr (PLAN §9.3).
+//! only; diagnostics stay on stderr.
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
@@ -259,7 +259,8 @@ pub async fn wait_for_condition(
             {
                 search_buf.extend_from_slice(&data);
                 search_from = next_offset;
-                // Bound the search buffer (I7): keep the tail.
+                // Bound the search buffer (the tail-first search must
+                // never retain more than ~1 MiB of pre-head patterns).
                 if search_buf.len() > 1024 * 1024 {
                     let keep = search_buf.split_off(search_buf.len() - 256 * 1024);
                     search_buf = keep;

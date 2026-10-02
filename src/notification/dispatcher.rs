@@ -1,5 +1,5 @@
 use super::{
-    channel::{LocalOsNotificationChannel, NotificationChannel},
+    channel::NotificationChannel,
     event::NotificationEvent,
 };
 
@@ -28,13 +28,6 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    #[allow(dead_code)]
-    pub fn default_local(hook: Option<String>) -> Self {
-        Self {
-            channels: vec![Box::new(LocalOsNotificationChannel { hook })],
-        }
-    }
-
     pub fn with_channels(channels: Vec<Box<dyn NotificationChannel + Send + Sync>>) -> Self {
         Self { channels }
     }

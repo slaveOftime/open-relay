@@ -18,7 +18,8 @@ use crate::session::{SessionMeta, SessionStatus};
 use super::{SessionHandle, SessionStore};
 
 /// Seed a fresh session dir with a journal holding `data` as one output
-/// record — the M6-2 replacement for legacy `output.log` fixtures. For
+/// record — the replacement for legacy `output.log` fixtures (the
+/// legacy format was retired). For
 /// repeated appends keep one journal open and use [`sync_journal`]
 /// instead; each `ShadowJournal::open` starts a new incarnation.
 pub(crate) fn seed_journal_output(dir: &std::path::Path, data: &[u8]) {

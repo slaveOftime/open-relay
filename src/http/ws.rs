@@ -54,11 +54,12 @@ pub(crate) enum ServerMessage {
         /// this, a fresh page load into an already-mouse-enabled program
         /// (vim, htop, …) leaves xterm.js capturing nothing.
         modes: WsModes,
-        /// This attachment's fencing token (M3-4).
+        /// This attachment's fencing token.
         attachment_id: u64,
     },
     /// Incremental PTY output chunk; `offset` is the stream offset of the
-    /// first byte so clients can verify contiguity (I2).
+    /// first byte so clients can verify contiguity (next chunk's offset
+    /// must equal this chunk's offset plus its byte length).
     Data {
         offset: u64,
         data: Vec<u8>,
@@ -72,8 +73,10 @@ pub(crate) enum ServerMessage {
         rows: u16,
         cols: u16,
     },
-    /// Session ended. `final_offset` is the end-of-stream cursor (I2
-    /// completion check); 0 when unknown (proxy errors).
+    /// Session ended. `final_offset` is the inclusive end-of-stream
+    /// cursor: a client able to apply a partial frame at that offset
+    /// has caught up to the moment the daemon signalled end-of-stream.
+    /// `0` when unknown (proxy errors).
     SessionEnded {
         exit_code: Option<i32>,
         final_offset: u64,
@@ -97,8 +100,8 @@ pub(crate) enum ClientMessage {
         rows: u16,
         cols: u16,
     },
-    /// Applied-cursor credit (M3-5, I7): highest stream offset the client
-    /// has rendered.
+    /// Applied-cursor credit: highest stream offset the client has
+    /// rendered.
     Ack {
         offset: u64,
     },
@@ -163,8 +166,8 @@ pub async fn attach_handler(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // ADR-0007 (M5-4): browser cross-site WebSockets must not ride the
-    // ambient auth cookie — Origin host must match the request Host.
+    // ADR-0007: browser cross-site WebSockets must not ride the ambient
+    // auth cookie — Origin host must match the request Host.
     if !crate::http::auth::ws_origin_allowed(&headers) {
         return (
             axum::http::StatusCode::FORBIDDEN,
@@ -314,7 +317,6 @@ struct AttachConnectionParams {
     /// Upgrade-time headers retained so a future revision can incorporate
     /// per-connection surfaces (CSRF cookies, Auth-Bearer tokens,
     /// per-message auth evidence) without changing the upgrade plumbing.
-    #[allow(dead_code)]
     headers: axum::http::HeaderMap,
 }
 
@@ -327,8 +329,8 @@ async fn handle_ws(
 ) {
     debug!(session_id = %id, node = ?node, "WebSocket connected");
 
-    // ADR-0007 (M5-4): logout/revocation closes live control streams not
-    // just future requests — watch the revocation epoch and re-validate the
+    // ADR-0007: logout/revocation closes live control streams not just
+    // future requests — watch the revocation epoch and re-validate the
     // connection's token before tearing the stream down.
     let reconnect_token =
         crate::http::auth::extract_request_token_parts(&params.headers, None).unwrap_or_default();
@@ -411,7 +413,7 @@ async fn handle_ws(
 }
 
 // ---------------------------------------------------------------------------
-// Shared serve loop — local + relayed attach via `AttachSource` (PLAN2 S2)
+// Shared serve loop — local + relayed attach via `AttachSource`
 // ---------------------------------------------------------------------------
 
 /// Single canonical WebSocket attach loop for both arms. The init frame
@@ -421,10 +423,12 @@ async fn handle_ws(
 /// and dispatches client messages back into the source.
 ///
 /// The `init_metrics_label` must be exactly one of `"local"` or
-/// `"proxied"` -- the same labels pre-S2 metrics dashboards expect.
+/// `"proxied"` -- the dashboard-facing labels for the two metrics
+/// sources the unified handler aggregates.
 ///
-/// S2 unifies the local and relayed paths, so this handler deliberately
-/// threads both shapes' bags of context (`AttachSource`, sender pair,
+/// The unified handler merges the local and relayed paths, so it
+/// deliberately threads both shapes' bags of context (`AttachSource`,
+/// sender pair,
 /// metrics tag, etc.) instead of inventing yet another intermediate
 /// wrapper struct.
 #[allow(clippy::too_many_arguments)]

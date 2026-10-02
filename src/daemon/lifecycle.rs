@@ -777,7 +777,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         let _ = event_tx.send(event.into_session_event(0, true));
     }
 
-    // M5-5: service managers stop daemons with SIGTERM; give it the same
+    // Service managers stop daemons with SIGTERM; give it the same
     // graceful drain as ctrl-c and the RPC stop path. (cfg'd out on Windows:
     // select! arms can't carry cfg attributes, so the future pends forever.)
     #[cfg(unix)]
@@ -859,7 +859,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 /// `oly daemon stop` default so both shutdown paths behave identically.
 const DAEMON_SHUTDOWN_GRACE_SECONDS: u64 = 15;
 
-/// M5-5: signal-driven shutdown must not orphan managed children — drain
+/// Signal-driven shutdown must not orphan managed children — drain
 /// every session (soft stop, process-group SIGTERM, tree kill) before the
 /// daemon exits. `oly daemon stop` drains in the RPC handler before the
 /// shutdown signal even arrives, so both paths converge here.

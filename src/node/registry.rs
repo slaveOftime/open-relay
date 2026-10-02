@@ -10,7 +10,7 @@ use crate::{
     session::SessionEvent,
 };
 
-/// Default deadline for one-shot proxied RPCs (M5-3): a hung secondary
+/// Default deadline for one-shot proxied RPCs: a hung secondary
 /// must never stall a gateway caller forever. `LogsWait` overrides this
 /// with its own client-specified timeout plus margin.
 pub const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -204,11 +204,10 @@ impl NodeRegistry {
         Ok((id, rx))
     }
 
-    /// Send one mid-stream client message to an open streaming RPC on the
-    /// named secondary (M5-2): attach input, resize, applied-cursor
-    /// credits, and detach all travel this way so the
-    /// owning node's stream task applies its attachment-scoped fencing
-    /// and credit gate to remote clients exactly as to local ones.
+    /// Send one mid-stream client message to an open streaming RPC on
+    /// the named secondary. Attach input, resize, applied-cursor credits
+    /// and detach travel this way so remote clients get the same
+    /// fencing and credit gate as local ones.
     pub async fn proxy_rpc_stream_message(
         &self,
         node: &str,
@@ -273,7 +272,7 @@ mod tests {
         )
     }
 
-    /// M5-3: a hung secondary must fail the caller loudly at the deadline,
+    /// A hung secondary must fail the caller loudly at the deadline,
     /// not stall it forever; the pending entry is removed so a late
     /// response has nowhere to land.
     #[tokio::test]
@@ -295,7 +294,7 @@ mod tests {
         );
     }
 
-    /// M5-3: disconnecting a node fails every waiter (one-shot and stream)
+    /// Disconnecting a node fails every waiter (one-shot and stream)
     /// loudly — no caller hangs on a dead generation.
     #[tokio::test]
     async fn disconnect_fences_pending_waiters_and_streams() {
@@ -347,7 +346,7 @@ mod tests {
         );
     }
 
-    /// M5-3: reconnecting under the same name replaces the handle — new
+    /// Reconnecting under the same name replaces the handle — new
     /// RPCs route to the new generation, never to the stale one.
     #[tokio::test]
     async fn reconnect_routes_to_the_new_generation() {

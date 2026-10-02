@@ -179,12 +179,12 @@ function SessionDetailPageContent() {
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
   const replayTimerRef = useRef<number | null>(null)
-  // History paging/anchoring lives in the extracted HistoryController (M4-2);
+  // History paging/anchoring lives in the extracted HistoryController;
   // the page only keeps the xterm-facing replay state.
   const historyRef = useRef<HistoryController | null>(null)
   const historyKeyRef = useRef('')
   // Live output may only auto-scroll while the user is pinned to the
-  // bottom (M4-2): scrolling up to read history must never be stolen.
+  // bottom: scrolling up to read history must never be stolen.
   const userAtBottomRef = useRef(true)
   const replaySpeedRef = useRef(0.5)
   const isPausedRef = useRef(false)
@@ -569,7 +569,7 @@ function SessionDetailPageContent() {
       return loaded > 0
     } catch (err) {
       // Anchor mismatches must be loud: retained history is never silently
-      // duplicated or truncated (M4 exit criterion).
+      // duplicated or truncated (anchor-mismatch must be loud).
       if (err instanceof HistoryAnchorError) console.error(err)
       return false
     }

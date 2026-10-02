@@ -1,8 +1,8 @@
 //! Replaying raw log bytes through the terminal engine into displayable rows.
 //!
 //! The log is a raw PTY byte stream, so the only way to know what the user saw
-//! is to feed it to a terminal emulator and read the resulting grid. M6-1
-//! retired the second (`vt100`) parser: rendering uses the same
+//! is to feed it to a terminal emulator and read the resulting grid. The
+//! second (`vt100`) parser was retired: rendering uses the same
 //! [`crate::terminal::Terminal`] engine as live sessions, so what `oly logs`
 //! shows is exactly what the attached renderer saw.
 
@@ -32,7 +32,7 @@ const MAX_LOG_RESIZE_EVENTS: usize = 64;
 
 /// Render a session's persisted output for `oly logs` / the HTTP tail
 /// endpoint from the journal-derived filtered stream. Pre-1.0 sessions
-/// that only have `output.log` are rejected (M6-2 removed the fallback;
+/// that only have `output.log` are rejected (the fallback was removed;
 /// see MIGRATION.md).
 pub fn render_log_session(
     session_dir: &Path,
@@ -52,8 +52,8 @@ pub fn render_log_session(
         )));
     }
 
-    // Checkpoint-anchored tail replay (PLAN §5.3): start at the newest
-    // anchored checkpoint and walk older anchors only until the replayed
+    // Checkpoint-anchored tail replay: start at the newest anchored
+    // checkpoint and walk older anchors only until the replayed
     // suffix covers the requested tail. Cost is bounded by the checkpoint
     // cadence, not by total recording size. Bytes and resize history are
     // derived in the SAME pass — a tail render never scans the journal
@@ -181,9 +181,9 @@ pub fn render_log_file(
 ///
 /// Production live-tail callers should use [`engine_content_rows`] +
 /// [`crate::session::logs::finish_render`] on `spawn_blocking` so the
-/// render doesn't hold the runtime read lock (PLAN2 §P1.2). This
-/// helper glues those two free functions back together for tests and
-/// single-step invocations; it lives here so the live-tail regression
+/// render doesn't hold the runtime read lock. This helper glues those
+/// two free functions back together for tests and single-step
+/// invocations; it lives here so the live-tail regression
 /// tests can validate the decomposition without re-implementing it.
 #[allow(dead_code)] // exercised by `src/session/logs/tests.rs`; not pulled into the main binary.
 pub fn render_engine_screen(
@@ -218,7 +218,7 @@ pub fn engine_content_rows(
 
 /// Pure CPU step applied to a snapshot of engine rows. Lives outside
 /// the runtime lock so callers can drop the lock and run this on
-/// `tokio::task::spawn_blocking` (PLAN2 §P1.2).
+/// `tokio::task::spawn_blocking`.
 pub fn finish_render(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: bool) -> Vec<u8> {
     let rows = if let Some((first, last)) = content_bounds(&content_rows) {
         let visible_rows = &content_rows[first..=last];
@@ -643,7 +643,7 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
 /// sequences between them are dropped, so log rows don't carry full-width
 /// background-color padding to the replay width. Trailing cells revert to
 /// the terminal's default background — the same display behavior the
-/// pre-M6 renderer had. Non-ASCII (UTF-8 continuation) bytes always count
+/// legacy renderer had. Non-ASCII (UTF-8 continuation) bytes always count
 /// as content; only CSI sequences (`\x1b[` … final byte) are skipped as
 /// styling, which is all the engine's styled rows emit.
 fn trim_styled_row_end(row: &[u8]) -> &[u8] {

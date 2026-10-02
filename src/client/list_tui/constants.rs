@@ -20,8 +20,7 @@ pub(crate) const INACTIVE_LOG_TAIL_LINES: usize = 1000;
 pub(crate) const STOP_GRACE_SECONDS: u64 = 15;
 pub(crate) const SPARK_BLOCKS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 // `pub(crate)` so the Windows crash handler in `crate::client::crash` can
-// restore the terminal on unhandled exceptions. Visibility is the minimum
-// needed by the cross-module references introduced in PLAN2 S1.3.
+// restore the terminal on unhandled exceptions.
 pub(crate) const TUI_RESTORE_BYTES: &[u8] = b"\x1b[?1049l\x1b[?2026l\x1b[0m\x1b[?25h\x1b[0 q\
     \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
 /// Window title shown while the interactive session list owns the terminal.
@@ -32,8 +31,7 @@ pub(crate) const LIST_WINDOW_TITLE: &str = "oly sessions";
 pub(crate) const TITLE_SAVE_BYTES: &[u8] = b"\x1b[22;0t";
 /// XTWINOPS 23;0 pops the title saved by `TITLE_SAVE_BYTES`.
 // `pub(crate)` so the Windows crash handler in `crate::client::crash` can
-// restore the terminal on unhandled exceptions. Visibility is the minimum
-// needed by the cross-module references introduced in PLAN2 S1.3.
+// restore the terminal on unhandled exceptions.
 pub(crate) const TITLE_RESTORE_BYTES: &[u8] = b"\x1b[23;0t";
 pub(crate) const CLONE_DIALOG_HELP: &str =
     " Quotes group words · ←/→ cursor · Tab/Shift+Tab · Space toggle · Enter create · Esc cancel";

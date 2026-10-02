@@ -639,7 +639,8 @@ async fn security_headers(request: Request, next: axum::middleware::Next) -> Res
 
 /// Resolve an HTTP `MatchedPath` template to the closed histogram label.
 /// Anything not in `METRIC_ROUTES` collapses to `"other"` to bound label
-/// cardinality. S3.3 made this a free function so a debug-only assertion
+/// cardinality. The route-label normaliser was made a free function
+/// so a debug-only assertion
 /// can confirm every METRIC_ROUTES entry round-trips and that the drift
 /// the original `/api/push/subscribe` typo introduced cannot recur.
 fn resolve_route_label(matched: Option<&str>) -> &'static str {
@@ -664,7 +665,7 @@ mod tests {
         response::IntoResponse,
     };
 
-    /// S3.3 regression guard: a previous version of `METRIC_ROUTES` had
+    /// Regression guard: a previous version of `METRIC_ROUTES` had
     /// `/api/push/subscribe` while the router served `/api/push/subscriptions`,
     /// so every push subscription silently fell into the `"other"` bucket.
     /// This test ensures the captured closure is reflected verbatim in the

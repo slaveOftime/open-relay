@@ -1,5 +1,5 @@
 //! App discovery, manifest parsing, and request resolution for the
-//! `/apps/<slug>/*` HTTP surface. PLAN2 S1.2 split.
+//! `/apps/<slug>/*` HTTP surface.
 use axum::{
     Json,
     extract::State,
@@ -24,8 +24,8 @@ mod proxy_targets;
 mod resolve;
 
 // Production code uses unqualified call-sites because the moves from
-// `apps.rs` were carried out verbatim (PLAN2 S1.2). Items tests need by
-// short name are re-exported below under `#[cfg(test)]`.
+// `apps.rs` were carried out verbatim. Items tests need by short name
+// are re-exported below under `#[cfg(test)]`.
 #[cfg(test)]
 use html::extract_meta_content;
 #[cfg(test)]
@@ -45,8 +45,9 @@ use resolve::{
 };
 
 // `include_str!` paths resolve relative to this file, not the source-root,
-// so the embedded asset is referenced as `../apps-index.html` — the same
-// blob as before the S1.2 split, just with a deeper file location.
+// so the embedded asset is referenced as `../apps-index.html` — the
+// same blob as before the apps/ directory was split out, just with a
+// deeper file location.
 const DEFAULT_WWWROOT_INDEX: &str = include_str!("../apps-index.html");
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +302,7 @@ mod tests {
 
     /// Test helper: drives the sync `discover_static_apps` through a
     /// blocking-pool worker so the unit tests exercise the same path
-    /// the production handler does (PLAN2 §P1.3).
+    /// the production handler does.
     async fn discover_static_apps_async_for_tests(
         wwwroot: PathBuf,
     ) -> std::io::Result<Vec<StaticApp>> {

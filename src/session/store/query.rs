@@ -180,9 +180,9 @@ impl SessionStore {
     /// Live-tail render of the engine screen, off the runtime read
     /// lock. Snapshots the engine's content rows under the guard,
     /// drops it, then runs the CPU-only `finish_render` on
-    /// `spawn_blocking`.  Holding the runtime read lock across a
-    /// full tabular render was starving the PTY reader's write lock
-    /// when the visible region grew (PLAN2 §P1.2).
+    /// `spawn_blocking`. Holding the runtime read lock across a full
+    /// tabular render was starving the PTY reader's write lock when the
+    /// visible region grew.
     pub async fn render_live_logs(
         &self,
         id: &str,

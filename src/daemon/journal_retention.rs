@@ -1,18 +1,17 @@
-//! PLAN2 §P2.6: wall-clock retention sweeper.
+//! Wall-clock retention sweeper for stopped sessions.
 //!
 //! Companion to the live-session byte-budget retention in
-//! `crate::session::runtime` (PLAN2 §P2.5). That one deletes the
-//! newest-of-the-old incarnations of a running session's journal on
-//! every checkpoint; this one deletes the entire journal directory
-//! plus DB row of a stopped session after a configurable number of
-//! days.
+//! `crate::session::runtime` — that one trims the oldest incarnations
+//! of a running session's journal at every checkpoint; this one
+//! deletes the whole journal + DB row of a stopped session after a
+//! configurable number of days.
 //!
 //! Two orthogonal levers for two different problems:
 //!
-//! - **P2.5**: "stop my long-running dev session from filling the
-//!   disk while I work on it" → cap on bytes.
-//! - **P2.6**: "stop accumulating killed/failed sessions from CI runs
-//!   ten weeks after the fact" → cap on wall-clock age.
+//! - **byte budget**: cap on persisted journal size, checked at each
+//!   checkpoint, so a long-running session cannot fill the disk while running.
+//! - **wall-clock retention**: cap on stopped-session age, so killed/failed
+//!   CI runs do not accumulate indefinitely.
 //!
 //! The sweeper runs every [`JOURNAL_RETENTION_SWEEP_INTERVAL`]
 //! (one hour by default) and is intentionally synchronous against

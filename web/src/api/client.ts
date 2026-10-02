@@ -521,14 +521,15 @@ export function subscribeEvents(
 // WebSocket PTY attach
 // ---------------------------------------------------------------------------
 
-// Binary attach frames (M3-3): every data-carrying frame names its stream
+// Binary attach frames: every data-carrying frame names its stream
 // cursor so the client can verify the C/C+1 boundary — contiguous,
-// gap-free application of the canonical stream (PLAN §7.2, invariant I2).
+// gap-free application of the canonical stream — every chunk's offset
+// must equal the previous chunk's offset plus its byte length.
 // Decoding lives in ./ws-frames.ts so the wire format is pinned against the
 // shared fixture tests/fixtures/ws_frames.json (encoder and decoder can
 // never drift apart without a test failing).
 
-/** Applied-cursor credit cadence (M3-5): at most one ack per MiB. */
+/** Applied-cursor credit cadence: at most one ack per MiB. */
 const WS_ACK_STRIDE_BYTES = 1024 * 1024
 
 export interface AttachOptions {
@@ -601,8 +602,9 @@ export class AttachSocket {
           }
           case 'data': {
             if (this.expectedOffset !== null && frame.offset !== this.expectedOffset) {
-              // A gap or overlap means the rendered screen would be corrupt;
-              // abort loudly instead of applying out-of-order bytes (I2).
+              // A gap or overlap corrupts the rendered screen, so abort
+              // loudly rather than apply out-of-order bytes — rejecting
+              // is strictly better than papering over.
               opts.onError(
                 `attach stream cursor mismatch: expected offset ${this.expectedOffset}, chunk starts at ${frame.offset}`
               )
@@ -611,7 +613,7 @@ export class AttachSocket {
             }
             this.expectedOffset = frame.offset + frame.data.length
             opts.onData(frame.data)
-            // Applied-cursor credit (M3-5): bytes handed to the renderer
+            // Applied-cursor credit: bytes handed to the renderer
             // count as applied; credit at most once per MiB.
             if (this.expectedOffset >= this.lastAckedOffset + WS_ACK_STRIDE_BYTES) {
               this.lastAckedOffset = this.expectedOffset
@@ -652,7 +654,7 @@ export class AttachSocket {
         }
       } catch (err) {
         // Truncated/unknown frames are corruption or a version mismatch:
-        // surface them instead of silently dropping stream bytes (I2).
+        // surface them instead of silently dropping stream bytes.
         opts.onError(`unreadable server frame: ${err instanceof Error ? err.message : String(err)}`)
       }
     }
@@ -668,7 +670,7 @@ export class AttachSocket {
     this.send({ type: 'input', data, waitForChange })
   }
 
-  /** Send an applied-cursor credit (M3-5, I7); throttled by the caller. */
+  /** Send an applied-cursor credit; throttled by the caller. */
   sendAck(offset: number) {
     this.send({ type: 'ack', offset })
   }

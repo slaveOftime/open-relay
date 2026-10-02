@@ -1115,7 +1115,7 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
 
     // Drive the primary's streaming IPC directly: subscribe (controller,
     // credited), then send input and applied-cursor credits mid-stream.
-    // Without the M5-2 relay channel these messages could not reach the
+    // Without the relay channel, mid-stream credits could not reach the
     // owning node's stream task at all.
     rt.block_on(async {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -1146,7 +1146,7 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
 
         // IPC control messages are versioned envelopes:
         // {"version":13,"payload":{...}} (v13: attach streams carry output
-        // as binary frames after the JSON init line, M6-3).
+        // as binary frames after the JSON init line).
         let envelope = |payload: serde_json::Value| json!({"version": 13, "payload": payload});
         let subscribe = envelope(json!({
             "type": "node_proxy",
@@ -1433,7 +1433,8 @@ fn e2e_list_empty_shows_no_sessions_hint() {
 
 /// W4 protocol evidence: a real WS attach against a live daemon — INIT frame
 /// layout, input flowing, contiguously offset DATA frames
-/// (I2), ping/pong, graceful detach — with the canonical journal staying
+/// with contiguous stream cursors, ping/pong, graceful detach — and the
+/// canonical journal staying
 /// doctor-clean throughout.
 #[test]
 fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
@@ -1475,7 +1476,7 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
         assert!(attachment_id >= 1, "attachment fencing token is assigned");
 
         // Input flows; the echoed bytes arrive in DATA frames
-        // whose offsets continue the init cursor exactly (I2).
+        // whose offsets continue the init cursor exactly (contiguous,
         ws.send(WsMessage::Text(
             r#"{"type":"input","data":"hello-ws\n","waitForChange":false}"#.into(),
         ))
@@ -1502,7 +1503,7 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
                     let offset = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
                     assert_eq!(
                         offset, expected_offset,
-                        "DATA offsets must continue the stream cursor exactly (I2)"
+                        "DATA offsets must continue the stream cursor exactly"
                     );
                     expected_offset += (bytes.len() - 9) as u64;
                     echoed.extend_from_slice(&bytes[9..]);
@@ -1557,7 +1558,7 @@ fn http_post_kill(port: u16, id: &str) -> u16 {
         .unwrap_or_else(|| panic!("malformed HTTP response: {response:?}"))
 }
 
-/// M5-5: killing a session must terminate the whole process tree, not just
+/// Killing a session must terminate the whole process tree, not just
 /// the direct child — a backgrounded grandchild must not leak.
 #[cfg(not(target_os = "windows"))]
 #[test]
@@ -1607,7 +1608,7 @@ fn e2e_kill_terminates_the_whole_process_tree() {
     );
 }
 
-/// M5-5: `oly daemon stop` drains sessions with the same process-tree
+/// `oly daemon stop` drains sessions with the same process-tree
 /// semantics — a backgrounded grandchild must not survive the shutdown.
 #[cfg(not(target_os = "windows"))]
 #[test]
@@ -1656,7 +1657,7 @@ fn e2e_daemon_stop_kills_process_trees() {
     let _ = id;
 }
 
-/// M5-6 safe export: `--raw` returns the exact child bytes (explicit
+/// Safe export: `--raw` returns the exact child bytes (explicit
 /// opt-in), while the default rendered view never re-emits raw control
 /// sequences.
 #[cfg(not(target_os = "windows"))]

@@ -1,6 +1,6 @@
 //! Proxy-target URL construction + SSRF guard.
 //!
-//! PLAN2 S1.2. Lifted from `src/http/apps.rs`.
+//! Lifted from `src/http/apps.rs`.
 use reqwest::Url;
 use std::io;
 

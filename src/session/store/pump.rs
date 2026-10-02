@@ -1,4 +1,4 @@
-//! The transport-agnostic attach output pump (M3-2).
+//! The transport-agnostic attach output pump.
 //!
 //! Every live attach — CLI-over-IPC and WebSocket alike — used to carry its
 //! own copy of the streaming state machine: follow the broadcast, coalesce
@@ -33,7 +33,7 @@ const MAX_COALESCED_CHUNK_BYTES: usize = 512 * 1024;
 /// 100 ms and the WebSocket pump 200 ms; unified on the tighter value.
 const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Bounded resync window (M3-5, I7): a lagged attachment replays the
+/// Bounded resync window: a lagged attachment replays the
 /// persisted stream in slices of this size instead of materializing the
 /// whole lag in memory at once.
 const RESYNC_WINDOW_BYTES: usize = 8 * 1024 * 1024;
@@ -41,11 +41,11 @@ const RESYNC_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 /// The journal appender persists asynchronously, so a chunk can reach the
 /// broadcast ring slightly before it is readable from disk. When a resync
 /// gap or the completion tail is waiting on that flush, retry briefly
-/// before giving up — loudly, never by skipping bytes (I2).
+/// before giving up — loudly, never by skipping bytes.
 const FLUSH_RETRY_MAX: u8 = 50;
 const FLUSH_RETRY_DELAY: Duration = Duration::from_millis(10);
 
-/// Credit-gating policy for one attached client (M5-1, I7; PLAN §7.4).
+/// Credit-gating policy for one attached client.
 /// Credits are enforced, not advisory: the pump may run at most
 /// `budget_bytes` ahead of the cursor the client reports as applied, and a
 /// client that stops applying is disconnected loudly after
@@ -74,13 +74,13 @@ impl CreditPolicy {
     }
 }
 
-/// Whether an attachment's stream is credit-gated (M5-1).
+/// Whether an attachment's stream is credit-gated.
 ///
 /// Local IPC and WebSocket clients report applied-cursor acks, so their
 /// streams are gated. Node-relayed subscriptions are the documented
 /// exception: the relay carries one request per stream and cannot forward
-/// mid-stream credits, so those pumps run uncredited (fail-open, same as
-/// pre-M5-1) until direct remote attachment streams land (M5-2).
+/// mid-stream credits, so those pumps run uncredited (fail-open) until
+/// direct remote attachment streams land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PumpCredit {
     Uncredited,
@@ -98,7 +98,8 @@ pub enum AttachEvent {
     /// The session ended. `exit_code` is `Some` when the child exited on its
     /// own, `None` when it was killed/stopped externally. `final_offset` is
     /// the exact end-of-stream cursor so clients can verify they applied
-    /// every byte (I2 at the completion boundary).
+    /// every byte — clients re-anchor against `final_offset` to recover
+    /// from a missed acknowledgement window.
     Done {
         exit_code: Option<i32>,
         final_offset: u64,
@@ -150,7 +151,7 @@ pub struct AttachPump {
     completing: Option<Option<i32>>,
     /// Bounded waits for the async journal flush (see FLUSH_RETRY_MAX).
     flush_retries: u8,
-    /// Credit gate (M5-1): the client's shared applied-cursor cell plus the
+    /// Credit gate: the client's shared applied-cursor cell plus the
     /// enforcement policy. `None` for uncredited (node-relayed) streams.
     credit: Option<(Arc<AtomicU64>, CreditPolicy)>,
 }
@@ -189,7 +190,7 @@ impl AttachPump {
         credit: PumpCredit,
         credit_policy: CreditPolicy,
     ) -> Result<(Self, AttachInit), SessionError> {
-        // Incarnation fencing (PLAN §7.3): a resume cursor is only valid for
+        // Incarnation fencing: a resume cursor is only valid for
         // the incarnation that issued it. Anything else is rejected up front
         // with a precise error instead of streaming from an inferred offset.
         if from_offset.is_some() {
@@ -239,7 +240,7 @@ impl AttachPump {
         let last_modes = init.modes;
         let mut completion = tokio::time::interval(COMPLETION_POLL_INTERVAL);
         completion.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // M5-1: arm the credit gate. The cell starts at the init boundary:
+        // Arm the credit gate. The cell starts at the init boundary:
         // the client is deemed to have applied everything up to
         // `end_offset` once it processes INIT (whose payload is separately
         // bounded), so only bytes streamed after attach count as in-flight.
@@ -279,7 +280,7 @@ impl AttachPump {
         ))
     }
 
-    /// Credit gate (M5-1, I7): wait until the client's applied cursor is
+    /// Credit gate: wait until the client's applied cursor is
     /// within `budget_bytes` of the pump cursor. Bounded: a client that
     /// stops applying is ended loudly with [`AttachEvent::Closed`] after
     /// the stall timeout, never buffered without bound. Cancel-safe: no
@@ -315,7 +316,7 @@ impl AttachPump {
     /// [`AttachEvent::Done`] or [`AttachEvent::Closed`].
     pub async fn next(&mut self) -> AttachEvent {
         loop {
-            // Credit gate first (M5-1, I7): before consuming any broadcast
+            // Credit gate first: before consuming any broadcast
             // chunk or advancing any offset. Placing the wait here — never
             // after `forward_chunk` — keeps `next()` cancel-safe: a
             // cancelled wait has consumed nothing, so no byte is lost.
@@ -410,7 +411,7 @@ impl AttachPump {
         self.current_offset
     }
 
-    /// Replay one bounded persisted window (I7); `None` means keep pumping
+    /// Replay one bounded persisted window; `None` means keep pumping
     /// (resync finished or a bounded flush-wait elapsed). Emits `Done` when
     /// the completion drain catches up to the in-memory stream length, and
     /// `Closed` — loudly, never skipping bytes — when a gap stays
@@ -503,7 +504,7 @@ impl AttachPump {
         None
     }
 
-    /// Offset-checked forwarding (I2): trims prefixes already covered by
+    /// Offset-checked forwarding: trims prefixes already covered by
     /// the pump cursor, holds chunks that start past it (the resync loop
     /// fills the gap), and coalesces contiguous bursts into one frame. A
     /// large paste echoes back as a burst of 64 KiB reads; forwarding them
@@ -636,7 +637,7 @@ mod tests {
         });
     }
 
-    /// M5-1: a credited pump may run at most `budget_bytes` ahead of the
+    /// A credited pump may run at most `budget_bytes` ahead of the
     /// client's applied cursor; output resumes the moment credits arrive.
     #[tokio::test]
     async fn credit_gate_holds_output_until_the_client_applies() {
@@ -707,7 +708,7 @@ mod tests {
         }
     }
 
-    /// M5-1: a client that never applies is disconnected loudly after the
+    /// A client that never applies is disconnected loudly after the
     /// stall timeout — never buffered into an unbounded queue.
     #[tokio::test]
     async fn credit_gate_disconnects_a_stalled_client_loudly() {
@@ -753,7 +754,7 @@ mod tests {
         }
     }
 
-    /// M5-1: a credited subscription names its attachment fencing token; a
+    /// A credited subscription names its attachment fencing token; a
     /// stale token fails loudly instead of degrading to ungated streaming.
     #[tokio::test]
     async fn credited_subscribe_rejects_a_stale_attachment_token() {
@@ -883,7 +884,8 @@ mod tests {
         }
 
         // A duplicate of already-forwarded bytes (offset fully covered by
-        // the cursor) must be skipped, never double-sent (I2).
+        // the cursor) must be skipped — never double-sent — and must surface
+        // its detection so retries do not silently corrupt the stream.
         let _ = rt.read().broadcast_tx.send(SequencedChunk {
             offset: 0,
             bytes: Bytes::from_static(b"abc"),
@@ -973,7 +975,9 @@ mod tests {
         }
     }
 
-    /// M3 exit stress (I2/I6/I7): ten mixed attachments — CLI and web,
+    /// Stress test of the streaming/contiguity, observe-mode, and credit-
+    /// gate invariants: ten mixed attachments —
+    /// CLI and web,
     /// controllers and a view-only observer — streaming through output
     /// bursts, ring overflows, resizes, an observe-gating check, and a
     /// detach/re-attach, then a clean session end. Every pump must observe
@@ -1001,7 +1005,7 @@ mod tests {
                 AttachEvent::Chunk { offset, data } => {
                     assert_eq!(
                         offset, client.expect,
-                        "chunk must continue exactly at the client cursor (I2)"
+                        "chunk must continue exactly at the client cursor (no gaps)"
                     );
                     client.received.extend_from_slice(&data);
                     client.expect += data.len() as u64;
@@ -1014,7 +1018,7 @@ mod tests {
                     assert_eq!(exit_code, Some(0));
                     assert_eq!(
                         final_offset, client.expect,
-                        "final cursor matches everything the client applied (I2)"
+                        "final cursor matches everything the client applied"
                     );
                     client.done = true;
                 }
@@ -1118,7 +1122,9 @@ mod tests {
 
             // Group A (0..5) keeps up every step; group B (5..10) polls
             // only every 7 steps so its ring overflows and it resyncs from
-            // the persisted stream in bounded windows (I7).
+            // the persisted stream in bounded windows (a 7-step ring
+            // keeps resync windows small even if the consumer's progress
+            // stalls).
             let group_b_due = step % 7 == 0;
             for (i, client) in clients.iter_mut().enumerate() {
                 if client.done || (i >= 5 && !group_b_due) {
@@ -1135,8 +1141,8 @@ mod tests {
                         .await
                         .expect("controller resize");
                 }
-                // The observer stays gated (I6) while any number of
-                // controllers can drive.
+                // Observe-mode enforcement: an observer stays gated while
+                // any number of controllers can drive.
                 40 => {
                     let err = store
                         .attach_input("stress1", Some(observer_id), b"x", false)

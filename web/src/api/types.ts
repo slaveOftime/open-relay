@@ -212,7 +212,7 @@ export type SessionNotificationData = {
 // WebSocket protocol
 // ---------------------------------------------------------------------------
 
-// Legacy JSON attach protocol types (pre-M3-3 wire format, kept for docs).
+// Legacy JSON attach protocol types (pre-binary wire format, kept for docs).
 // The live binary protocol lives in ./ws-frames.ts; input-affecting modes
 // (DECCKM, bracketed paste, mouse report/SGR, focus) ride the frame flags.
 export type WsServerMessage =

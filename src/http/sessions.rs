@@ -433,8 +433,8 @@ pub async fn get_session(
 
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
-            // M3-1c: journal-backed sessions report the derived filtered
-            // stream length; pre-0.5 sessions report 0 (M6-2). The store
+            // Journal-backed sessions report the derived filtered stream
+            // length; pre-0.5 sessions report 0. The store
             // answers live sessions from O(1) runtime counters and caches
             // the per-incarnation journal decode for persisted ones, so
             // this stays off the O(journal) path.
@@ -1292,7 +1292,7 @@ pub async fn get_logs(
 
     match read_persisted_log_page(&session_dir, offset, limit) {
         Err(message) => {
-            // Pre-1.0 log format: explicit, actionable error (M6-2).
+            // Pre-1.0 log format: explicit, actionable error.
             debug!(session_id = %id, error = %message, "session log unreadable");
             (
                 StatusCode::GONE,
@@ -1402,7 +1402,7 @@ pub async fn get_logs_tail(
         return logs_tail_binary_response(output.0, &output.1);
     }
 
-    // Fall back to the persisted stream (journal-derived since M3-1c).
+    // Fall back to the persisted stream (journal-derived).
     match render_log_session(&session_dir, tail, true, term_cols, None) {
         Ok((output, resizes)) => logs_tail_binary_response(output, &resizes),
         Err(err) => {

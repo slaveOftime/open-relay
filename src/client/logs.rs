@@ -89,7 +89,7 @@ pub async fn run_logs(
     run_logs_local(config, id, tail, keep_color, term_cols, from_file).await
 }
 
-/// M5-6 safe export: the original output byte stream, exported only on
+/// Safe export: the original output byte stream, exported only on
 /// explicit request. Rendered `oly logs` (plain or `--keep-color`) is
 /// sanitized by the engine round-trip — control sequences are interpreted,
 /// never re-emitted, and hyperlink escape codes are dropped — while `--raw`

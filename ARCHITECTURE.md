@@ -26,7 +26,8 @@ core concern:
    (`src/session/replay.rs`), so derived state can never silently disagree
    with the recording. Replay is checkpoint-anchored: anchored v2
    checkpoints carry their filtered-stream offset, so deriving a window
-   costs O(checkpoint cadence), never O(total recording) (PLAN §5.3).
+   costs O(checkpoint cadence), never O(total recording) (the checkpoint-
+   anchored replay design).
    The journal is always on; if it fails, the session
    fails loudly rather than recording nothing (ADR-0002, ADR-0006).
    Sessions left over from pre-0.5 builds (only `output.log`) are rejected
@@ -217,7 +218,8 @@ helpers), `src/client/join.rs` (join config + CLI).
 ## The invariants that matter
 
 When you change session, streaming, or storage code, these are the rules the
-test suite enforces (the full list with rationale is in `PLAN.md` §4):
+test suite enforces (the full list with rationale is captured in the
+invariant descriptions throughout this document):
 
 - **Ordered, durable recording.** Every byte the PTY emits reaches the
   journal exactly once, in order; durability is asserted via sync
@@ -275,9 +277,8 @@ The SSE endpoint keeps the view current rather than mirroring the database:
 
 - `README.md` — what oly is and how to use it.
 - `MIGRATION.md` — 0.3.x → 0.5.0 breaking changes and upgrade steps.
-- `SPEC.md` — the product surface (commands, behaviors) as implemented.
 - `ARCHITECTURE.md` — the architecture decision records (engine, journal,
   input, streaming, history UX, crash boundary, authz), consolidated here.
-- `PLAN.md` — the design plan behind 0.5.0: invariants, architecture rules,
-  and the release checklist the code and tests cite.
-- `docs/` — the security audit report and the 0.5.0 release evidence.
+- `MIGRATION.md` — 0.3.x → 0.5.0 breaking changes and upgrade steps.
+- `PERFORMANCE.md` — critical data-path tracking with before/after numbers.
+- `CONTRIBUTING.md` — development workflow.

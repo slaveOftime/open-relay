@@ -1,5 +1,6 @@
 //! Shadow journal: bundles the sequencing core with the appender for
-//! the M1 shadow wiring (PLAN2 S1.5 step 8).
+//! the shadow wiring (single wiring chosen when the journal module was
+//! extracted).
 //!
 //! Lifted from `session/journal/mod.rs`. The `ShadowJournal` type, its
 //! four impl blocks (drain/test, open/options, shutdown/test, public
@@ -13,7 +14,7 @@ use super::{
     encode_checkpoint, encode_lifecycle_payload, encode_resize_payload, policy_payload,
 };
 
-/// M1 shadow journal: bundles the sequencing core with the appender for
+/// Shadow journal: bundles the sequencing core with the appender for
 /// the shadow wiring behind [`shadow_enabled`].
 pub struct ShadowJournal {
     pub core: SequencerCore,
@@ -23,7 +24,7 @@ pub struct ShadowJournal {
 
 impl ShadowJournal {
     /// Drain queued records and stop the appender (sealing the tail part
-    /// into the manifest, M3-6).
+    /// into the manifest).
     #[cfg(test)]
     pub fn shutdown(&self) {
         self.appender.shutdown();
@@ -74,7 +75,9 @@ impl ShadowJournal {
         // Once persistence has failed, stop publishing: caching further
         // events that can never be journaled would let a disk stall grow
         // memory indefinitely. The degrade point is the explicit
-        // incomplete-capture boundary (I8/I10).
+        // incomplete-capture boundary: durable records must be acked or the
+        // upstream never declared them written, and the OutputClosed fact
+        // happens exactly once regardless of how the stream ended.
         if self.core.is_degraded() {
             return Err(JournalSubmitError::PersistenceDegraded);
         }
@@ -106,7 +109,7 @@ impl ShadowJournal {
     }
 
     /// Record a checkpoint anchoring this stream position: restore and
-    /// retention may both start from it (PLAN §5.3).
+    /// retention may both start from it.
     pub fn record_checkpoint(
         &mut self,
         checkpoint: &Checkpoint,
@@ -155,7 +158,7 @@ impl ShadowJournal {
         }
     }
 
-    /// Request a group sync (durability cadence; see PLAN.md §4.2).
+    /// Request a group sync (durability cadence).
     pub fn request_sync(&self) {
         self.appender.request_sync();
     }

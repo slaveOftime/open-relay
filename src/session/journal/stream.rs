@@ -1,4 +1,4 @@
-//! Stream / range / history / tail read APIs (PLAN2 S1.5 step 4).
+//! Stream / range / history / tail read APIs.
 //!
 //! Lifted from `session/journal/mod.rs`. The reader-path APIs
 //! (`RangeRead`, `read_range`, `SegmentStream`, `incarnation_parts`,
@@ -40,8 +40,8 @@ pub struct RangeRead {
 /// Read the records of one incarnation whose sequences fall inside
 /// `from_seq..=to_seq`, buffering at most `max_bytes` of payload (the
 /// first in-window record is always included, even if it alone exceeds
-/// the budget). Continuity and integrity of the whole consumed prefix are
-/// still validated — a range read never presents a silent hole (I3).
+/// the budget). A corrupted prefix must fail visibly — never silently
+/// truncated to "empty success".
 #[cfg(test)]
 pub fn read_range(
     session_dir: &Path,
@@ -105,13 +105,11 @@ pub fn read_range(
 }
 
 /// All parts of one incarnation as `(part, path)`, ascending; `NotFound`
-/// when the incarnation is not retained. Part numbering must be
-/// contiguous from 1 — a hole means retention deleted the wrong thing or
-/// the directory is corrupt, and reads must fail rather than silently
-/// skip a range (I3). (Retention deletes newest-part-first, so a
-/// concurrent reader can observe a *prefix* of a being-deleted
-/// incarnation — cursors stay truthful — but never a hole. The M3
-/// manifest will make retention/reader coordination exact.)
+/// when the incarnation is not retained. Part numbering is contiguous
+/// from 1 — a hole is a corrupt directory or a retention bug, and
+/// reads must fail rather than silently skip. The sealed-part manifest
+/// is the proof: an entry is written only after its part is durable, so
+/// a reader that needs part K either proves K exists or fails loudly.
 pub(crate) fn incarnation_parts(
     journal_dir: &Path,
     incarnation: u64,
@@ -141,7 +139,7 @@ pub(crate) fn incarnation_parts(
 }
 
 /// Streaming reader over one incarnation, pulling bounded batches from a
-/// resume position (PLAN §5.3 anchored replay). The resume position is
+/// resume position (anchored replay). The resume position is
 /// either the journal start (prefix fully validated) or the record
 /// following a [`CheckpointAnchor`] — the skipped prefix is then trusted
 /// as of the anchor, the same trust model the sparse tail index uses for
@@ -440,12 +438,12 @@ pub struct HistoryRead {
     pub truncated: bool,
 }
 
-/// The one internal read API for live and completed history (PLAN.md §6.1
-/// M1 exit): reads events with cursor >= `from` across incarnation
+/// The one internal read API for live and completed history: reads
+/// events with cursor >= `from` across incarnation
 /// segments, oldest first, buffering at most `max_bytes` of payload (the
 /// first event is always included).
 ///
-/// Cursors never alias (I3): a restart opens a new incarnation, so a
+/// Cursors never alias: a restart opens a new incarnation, so a
 /// pre-restart cursor keeps addressing the pre-restart bytes. If `from`
 /// names an incarnation that retention has removed, the read fails loudly
 /// with `NotFound` instead of returning empty or aliased data.

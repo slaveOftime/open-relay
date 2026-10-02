@@ -547,8 +547,8 @@ async fn handle_logs_tail(
     };
 
     // Journal replay + engine render is a multi-hundred-millisecond CPU
-    // burst for long recordings; keep it off the async workers (PLAN2
-    // §P1.2 — same rule the live-tail path follows).
+    // burst for long recordings; keep it off the async workers (the same
+    // rule the live-tail path follows).
     let (lines, resizes) = match tokio::task::spawn_blocking(move || {
         render_log_session(&session_dir, tail, keep_color, term_cols, None)
     })
@@ -604,7 +604,7 @@ async fn handle_logs_pagination(
     };
 
     let page = match read_persisted_log_page(&session_dir, offset.unwrap_or(0), limit) {
-        // Pre-1.0 log format: explicit, actionable error (M6-2).
+        // Pre-1.0 log format: explicit, actionable error.
         Err(message) => return RpcResponse::Error { message },
         Ok(page) => page.map(|(lines, total)| (lines, total, offset.unwrap_or(0))),
     };
@@ -893,7 +893,7 @@ mod tests {
 
         let session_dir = sessions_dir.join(&meta.id);
         std::fs::create_dir_all(&session_dir).expect("create session dir");
-        // M6-2: the persisted stream lives only in the journal.
+        // The persisted stream lives only in the journal.
         crate::session::store::testsupport::seed_journal_output(
             &session_dir,
             b"\x1b[1;1Hpersisted one\x1b[2;1Hpersisted two",
@@ -972,7 +972,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // M4-1 agent surface handlers
+    // Agent surface handlers
     // ---------------------------------------------------------------
 
     mod agent_surfaces {
@@ -1195,7 +1195,8 @@ mod tests {
             assert_eq!(&typed[..], b"x");
 
             // Live output arrives as an offset-sequenced chunk continuing the
-            // init cursor exactly (I2: no gaps, no duplication).
+            // init cursor exactly (stream cursor must remain contiguous
+            // and gap-free across every chunk the daemon forwards).
             {
                 let mut rt = rt.write();
                 rt.feed_engine(b"\n");
@@ -1206,7 +1207,7 @@ mod tests {
                     bytes: Bytes::from_static(b"\n"),
                 });
             }
-            // M6-3: after the init line the stream is binary framed.
+            // After the init line the stream is binary framed.
             let chunk = tokio::time::timeout(
                 Duration::from_secs(5),
                 ipc::read_attach_frame(&mut reader_a),
@@ -1314,7 +1315,9 @@ mod tests {
             };
             assert_eq!(role, "observer");
 
-            // Observer input is rejected with a client-visible error (I6).
+            // Observer input is rejected with a client-visible error
+            // (observe-mode enforcement: an observer may never drive the
+            // session's terminal).
             ipc::write_request_to_writer(
                 &mut writer_d,
                 RpcRequest::AttachInput {

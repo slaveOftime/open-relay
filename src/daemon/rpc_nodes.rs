@@ -385,7 +385,7 @@ async fn connect_and_relay(
     }
 
     let (stream_frame_tx, mut stream_frame_rx) = mpsc::channel::<(String, RpcResponse, bool)>(256);
-    // Open streaming RPCs: rpc_id -> inbound client-message channel (M5-2).
+    // Open streaming RPCs: rpc_id -> inbound client-message channel.
     // Mid-stream messages from the primary (input/resize/credits/detach)
     // are routed into the stream's task, which writes them onto the
     // nested local IPC connection so the owning daemon's attachment-scoped
@@ -630,7 +630,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
 }
 
 /// Mid-stream client messages the relay forwards into an open attach
-/// stream (M5-2). Everything else is rejected: the stream channel is not
+/// stream. Everything else is rejected: the stream channel is not
 /// a general RPC tunnel.
 fn is_stream_message_relayable(request: &RpcRequest) -> bool {
     matches!(
@@ -647,7 +647,7 @@ fn is_stream_message_relayable(request: &RpcRequest) -> bool {
 /// streaming handler local clients use), forward its frames to the
 /// primary, and write mid-stream client messages from the primary onto
 /// the connection so attachment-scoped fencing, observe-mode gating, and
-/// applied-cursor credits apply to remote clients (M5-2).
+/// applied-cursor credits apply to remote clients.
 async fn relay_streaming_rpc(
     config: &AppConfig,
     request: RpcRequest,
@@ -665,7 +665,7 @@ async fn relay_streaming_rpc(
     // closes or the client detaches; afterwards we only drain frames until
     // the stream handler ends the stream.
     let mut msgs_open = true;
-    // M6-3: the nested IPC attach stream sends its init (or an error) as a
+    // The nested IPC attach stream sends its init (or an error) as a
     // JSON line, then switches to binary frames (ADR-0004). The relay
     // re-encodes them into the node-WS `RpcResponse` shape.
     let mut stream_binary = false;
@@ -792,8 +792,8 @@ pub(super) async fn handle_node_accept(
 /// Handle a node-proxied streaming attach: open `proxy_rpc_stream()` to the
 /// secondary node and relay all streaming frames back to the CLI via IPC.
 /// Client messages (input/resize/credits/detach) read from the IPC
-/// reader are forwarded as mid-stream messages on the same stream (M5-2),
-/// so the owning node's attachment-scoped fencing and credit gate apply to
+/// reader are forwarded as mid-stream messages on the same stream, so
+/// the owning node's attachment-scoped fencing and credit gate apply to
 /// remote clients exactly as to local ones.
 pub(super) async fn handle_node_proxy_streaming(
     node: String,
@@ -839,8 +839,8 @@ pub(super) async fn handle_node_proxy_streaming(
         _ => String::new(),
     };
 
-    // M6-3: local IPC attach streams switch to binary frames after the
-    // init line (ADR-0004) — this relay is no exception.
+    // Local IPC attach streams switch to binary frames after the init
+    // line (ADR-0004) — this relay is no exception.
     let mut stream_binary = false;
 
     loop {
@@ -940,8 +940,8 @@ mod tests {
     use super::{is_stream_message_relayable, is_supported_proxied_rpc};
     use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
 
-    /// M5-2: only attach stream messages may ride the mid-stream channel
-    /// — it is not a general RPC tunnel.
+    /// Only attach stream messages may ride the mid-stream channel —
+    /// it is not a general RPC tunnel.
     #[test]
     fn only_attach_messages_are_relayable_mid_stream() {
         for req in [

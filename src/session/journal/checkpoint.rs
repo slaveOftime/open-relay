@@ -1,5 +1,4 @@
-//! Checkpoint payload codec + retention bookkeeping (PLAN §5.3,
-//! PLAN2 S1.6 step 2).
+//! Checkpoint payload codec + retention bookkeeping.
 //!
 //! Lifted verbatim from `session/journal/mod.rs`. The `Checkpoint`
 //! struct, `encode_checkpoint`/`decode_checkpoint` codec, anchor
@@ -27,8 +26,8 @@ use super::{
 // ---------------------------------------------------------------------------
 // Checkpoints (RecordKind::CheckpointRef)
 //
-// A checkpoint payload is a versioned, self-describing restore anchor
-// (PLAN §5.3): it carries the terminal geometry, cursor, modes, and a
+// A checkpoint payload is a versioned, self-describing restore anchor:
+// it carries the terminal geometry, cursor, modes, and a
 // side-effect-free *restore program* (styled scrollback + clear + styled
 // screen + cursor report) that repaints equivalent state into a fresh
 // engine. Retention is gated on checkpoints: everything older than the
@@ -51,8 +50,8 @@ pub struct Checkpoint {
     pub bracketed_paste: bool,
     /// Filtered display-stream offset covered by this checkpoint (v2):
     /// replay may start at the checkpoint's journal position and treat the
-    /// derived stream as beginning at this offset (PLAN §5.3). `0` means
-    /// unknown — records written by checkpoint format v1 carry no offset.
+    /// derived stream as beginning at this offset. `0` means unknown —
+    /// records written by checkpoint format v1 carry no offset.
     pub filtered_offset: u64,
     /// Side-effect-free restore program (repaint escape stream).
     pub program: bytes::Bytes,
@@ -134,7 +133,7 @@ pub fn decode_checkpoint(payload: &[u8]) -> io::Result<Checkpoint> {
 }
 
 /// One replay anchor: a checkpoint's filtered-stream offset and its
-/// journal position (PLAN §5.3). Sorted by filtered offset ascending.
+/// journal position. Sorted by filtered offset ascending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointAnchor {
     pub filtered_offset: u64,
@@ -360,7 +359,7 @@ pub fn retain_before_unchecked(session_dir: &Path, min_incarnation: u64) -> io::
     Ok(deleted)
 }
 
-/// PLAN2 §P2.5: byte-budget retention horizon.
+/// Byte-budget retention horizon.
 ///
 /// Returns the highest incarnation number such that the bytes of *all*
 /// sealed incarnations in `[incarnation, latest]` fit under `byte_cap`.

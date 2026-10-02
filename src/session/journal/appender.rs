@@ -1,5 +1,5 @@
 //! Daemon-side record pipeline: sequencer core, appender loop and
-//! rolling-segment writer (PLAN2 S1.5 step 7).
+//! rolling-segment writer.
 //!
 //! Lifted from `session/journal/mod.rs`. The appender path
 //! (`DEFAULT_CACHE_BUDGET_BYTES`, `DEFAULT_QUEUE_CAPACITY`,
@@ -27,16 +27,16 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
 /// Default byte bound for one session's journal queue. A stalled appender
 /// can therefore hold at most this many bytes of session output before
 /// submission is rejected and the session degrades explicitly — memory
-/// cannot grow indefinitely (PLAN.md §4.2).
+/// cannot grow indefinitely.
 pub const DEFAULT_QUEUE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// Default group-sync cadence: the appender syncs at most this long after
 /// the last unsynced append, bounding the crash-loss window without
 /// per-record `fsync` latency on the ingest path (ADR-0002).
 pub const DEFAULT_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The in-memory sequencing authority (PLAN.md §4.1/§4.2, invariants
-/// I1/I8). Allocates monotonic `seq` and monotonic `elapsed_ms` **before**
-/// an event is published, retains recent events in a byte-bounded cache
+/// The in-memory sequencing authority. Allocates monotonic `seq` and
+/// monotonic `elapsed_ms` **before** an event is published, retains
+/// recent events in a byte-bounded cache
 /// until the journal makes them replayable, and tracks the
 /// `head_seq`/`journal_seq`/`durable_seq` cursors separately. It performs
 /// no I/O; persistence is the [`JournalAppender`]'s job.
@@ -126,9 +126,9 @@ impl SequencerCore {
         self.durable_seq = self.durable_seq.max(seq);
     }
 
-    /// Persistence failed; the session is explicitly degraded (PLAN.md
-    /// §4.2). Subsequent `publish` calls still sequence — publication must
-    /// not silently continue pretending durability is on track.
+    /// Persistence failed; the session is explicitly degraded. Subsequent
+    /// `publish` calls still sequence — publication must not silently
+    /// continue pretending durability is on track.
     pub fn degrade(&mut self, reason: impl Into<String>) {
         if self.degraded.is_none() {
             self.degraded = Some(reason.into());
@@ -206,8 +206,8 @@ pub(crate) enum AppenderMsg {
 
 /// The journal appender: sole owner of the active [`SegmentWriter`],
 /// running on its own thread so sequencing and live publication never
-/// perform disk I/O (PLAN.md §4.2). It validates contiguity, appends in
-/// assigned order, group-syncs on request, and reports progress through
+/// perform disk I/O. It validates contiguity, appends in assigned order,
+/// group-syncs on request, and reports progress through
 /// [`JournalAck`]s. The queue is bounded in both messages and bytes.
 pub struct JournalAppender {
     pub tx: std::sync::mpsc::SyncSender<AppenderMsg>,
@@ -348,7 +348,7 @@ pub enum JournalSubmitError {
     /// Persistence already failed for this incarnation. New events are
     /// refused (not cached) so a dead or stalled journal cannot grow
     /// memory indefinitely; the incomplete-capture boundary is the
-    /// degrade point recorded in the core (PLAN.md §6.1 exit).
+    /// degrade point recorded in the core.
     PersistenceDegraded,
 }
 
@@ -379,7 +379,7 @@ pub(crate) struct RollingSegmentWriter {
     part_first_seq: Option<u64>,
     /// Last sequence appended to the active part.
     part_last_seq: u64,
-    /// Running CRC-32 of the active part's exact bytes (M3-6 manifest).
+    /// Running CRC-32 of the active part's exact bytes (manifest).
     part_crc: Crc32,
 }
 
@@ -441,7 +441,7 @@ impl RollingSegmentWriter {
     }
 
     /// Seal the active part: sync it durable, then append its entry to the
-    /// incarnation manifest (M3-6). The manifest entry lands after the part
+    /// incarnation manifest. The manifest entry lands after the part
     /// itself is durable, so a manifest line always names a complete part;
     /// a crash between part sync and manifest append leaves a sealed part
     /// without an entry, which verification reports instead of guessing.
@@ -611,8 +611,9 @@ pub(crate) fn appender_loop(
         }
     }
 
-    // Final barrier: a graceful shutdown (or the last sender going away)
-    // must not strand acknowledged-but-unsynced records (PLAN I8/I10).
+    // Final barrier on graceful shutdown: an ack means the record is
+    // durable on disk; stopping short of that would re-emit records
+    // on the next replay.
     if dead.is_none() && last_written > last_durable {
         do_sync(
             &mut writer,
@@ -623,7 +624,7 @@ pub(crate) fn appender_loop(
             &mut sync_deadline,
         );
     }
-    // Seal the tail part into the manifest (M3-6): a clean shutdown leaves
+    // Seal the tail part into the manifest: a clean shutdown leaves
     // every part checksummed; only a crash leaves an unsealed tail.
     if dead.is_none()
         && let Err(err) = writer.seal_part()

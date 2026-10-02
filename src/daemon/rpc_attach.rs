@@ -17,7 +17,7 @@ use super::SessionStoreHandle;
 
 /// Stream one session's output to an IPC client.
 ///
-/// M3-2: the output state machine (follow, coalesce, lag resync, completion
+/// The output state machine (follow, coalesce, lag resync, completion
 /// flush, mode tracking) lives in [`AttachPump`]; this handler is the thin
 /// IPC adapter that frames pump events as [`RpcResponse`]s and forwards
 /// client input/resize/detach requests.
@@ -42,9 +42,9 @@ pub(super) async fn handle_attach_subscribe(
         "starting IPC streaming session relay"
     );
 
-    // M3-4: register the attachment (role + viewport) *before* taking
-    // the snapshot, so a controller's initial geometry is applied through
-    // the sequencer and is already reflected in the init.
+    // Register the attachment (role + viewport) *before* taking the
+    // snapshot, so a controller's initial geometry is applied through the
+    // sequencer and is already reflected in the init.
     let role = match AttachRole::parse(role.as_deref()) {
         Ok(role) => role,
         Err(message) => {
@@ -71,10 +71,10 @@ pub(super) async fn handle_attach_subscribe(
     let attachment_id = registration.attachment_id;
     let current_role = registration.role;
 
-    // M5-1: local IPC clients ack applied cursors, so their stream is
+    // Local IPC clients ack applied cursors, so their stream is
     // credit-gated; node-relayed subscriptions arrive with `credited:
     // false` and run ungated (the relay cannot forward mid-stream credits
-    // — documented limitation until direct remote streams, M5-2).
+    // — documented limitation until direct remote streams).
     let credit = if credited {
         crate::session::PumpCredit::Credited { attachment_id }
     } else {
@@ -226,7 +226,7 @@ pub(super) async fn handle_attach_subscribe(
                 event = pump.next() => {
                     match event {
                         AttachEvent::Chunk { offset, data } => {
-                            // M6-3: raw binary frame, no base64 (ADR-0004).
+                            // Raw binary frame, no base64 (ADR-0004).
                             ipc::write_attach_output_frame(&mut writer, offset, &data).await?;
                         }
                         AttachEvent::Modes(modes) => {
@@ -351,7 +351,7 @@ pub(super) async fn handle_attach_detach(
 }
 
 // ---------------------------------------------------------------------------
-// M4 agent surfaces: cursor, bounded observe windows
+// Agent surfaces: cursor, bounded observe windows
 // ---------------------------------------------------------------------------
 
 /// Machine-readable session cursor: liveness + canonical filtered offset.
@@ -387,7 +387,7 @@ pub(super) async fn handle_observe_window(
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     // Hard cap regardless of what the client asked for: reads stay
-    // memory-bounded (I7).
+    // memory-bounded even when the client requested a multi-GiB window.
     let max_bytes = (max_bytes as usize).clamp(1, 8 * 1024 * 1024);
     let data = match session_store
         .attach_resync_window(&id, from, max_bytes)

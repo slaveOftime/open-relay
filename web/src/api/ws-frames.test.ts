@@ -125,7 +125,9 @@ describe('ws frame fixture conformance', () => {
   it('fails loudly on truncated and unknown frames instead of misparsing them', () => {
     // Empty payload is the only ignorable result ("no frame").
     expect(parseServerFrame(new Uint8Array(0))).toBeNull()
-    // Unknown tag: throwing beats silently dropping stream bytes (I2).
+    // Unknown tag: throwing beats silently dropping stream bytes.
+    // The next chunk's offset check would abort the whole attach
+    // anyway, so surface the corruption eagerly.
     expect(() => parseServerFrame(new Uint8Array([255, 1, 2]))).toThrow(/unknown server frame tag/)
     // INIT header is 27 bytes; 26 must not decode.
     expect(() => parseServerFrame(fromHex(vectors[0].hex).subarray(0, 26))).toThrow(

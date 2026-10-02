@@ -1,5 +1,5 @@
 //! Segmented session journal: typed, checksummed records with stable
-//! sequence numbers (PLAN.md §6.1, invariants I1/I3/I8/I10).
+//! sequence numbers.
 //!
 //! Every raw PTY chunk, resize, mode revision (Policy) and lifecycle fact
 //! is sequenced under the session write lock and appended by a dedicated
@@ -43,9 +43,7 @@ use std::{
     path::Path,
 };
 
-// `record` holds the on-disk record format, primary types and CRC-32
-// (PLAN2 S1.1). Re-exported here so existing callers
-// (`crate::session::journal::*`) keep the same paths after the split.
+// On-disk record format, primary types and CRC-32.
 pub(crate) mod record;
 #[cfg(test)]
 pub(crate) use record::crc32;
@@ -54,7 +52,7 @@ pub(crate) use record::{
     HEADER_LEN, MAX_PAYLOAD_LEN, RECORD_MAGIC, RECORD_VERSION, encode_record_header,
 };
 
-// Typed payload codecs for non-output records (PLAN2 S1.5 step 1).
+// Typed payload codecs for non-output records.
 pub(crate) mod codec;
 pub use codec::{
     LifecycleCode, decode_resize_payload, encode_lifecycle_payload, encode_resize_payload,
@@ -63,7 +61,7 @@ pub use codec::{
 #[cfg(test)]
 pub use codec::{decode_lifecycle_payload, parse_policy};
 
-// Sealed-part manifest (M3-6) (PLAN2 S1.5 step 2).
+// Sealed-part manifest.
 pub(crate) mod manifest;
 #[cfg(test)]
 pub(crate) use manifest::{ManifestLine, read_manifest_lines, verify_manifest};
@@ -71,7 +69,7 @@ pub(crate) use manifest::{
     RetiredIncarnation, SegmentManifestEntry, read_manifest, retired_incarnations,
 };
 
-// Reader / torn-tail recovery (PLAN2 S1.5 step 3 + S1.6 step 1 internals).
+// Reader / torn-tail recovery.
 pub(crate) mod scan;
 #[allow(unused_imports)]
 // re-exported for sibling modules; consumed via short name by `stream.rs`.
@@ -82,13 +80,13 @@ pub(crate) use scan::{
 #[cfg(test)]
 pub(crate) use scan::{scan_segment, scan_segment_stats};
 
-// Stream / range / history / tail read APIs (PLAN2 S1.5 step 4).
+// Stream / range / history / tail read APIs.
 pub(crate) mod stream;
 pub(crate) use stream::{CollectWindow, IndexEntry, SegmentStream, incarnation_parts};
 #[cfg(test)]
 pub(crate) use stream::{read_history, read_range, read_tail};
 
-// Checkpoints (RecordKind::CheckpointRef) + retention (PLAN2 S1.6 step 2).
+// Checkpoints (RecordKind::CheckpointRef) + retention.
 pub(crate) mod checkpoint;
 pub(crate) use checkpoint::{
     Checkpoint, CheckpointAnchor, checkpoint_anchors, encode_checkpoint,
@@ -102,7 +100,7 @@ pub(crate) use checkpoint::{
     decode_checkpoint, latest_checkpoint_incarnation, retain_before_unchecked,
 };
 
-// On-disk segment writer and segment-file helpers (PLAN2 S1.5 step 5).
+// On-disk segment writer and segment-file helpers.
 pub(crate) mod segment;
 pub(crate) use segment::{
     DEFAULT_SEGMENT_MAX_BYTES, JOURNAL_DIR_NAME, MANIFEST_FILE_NAME, SegmentWriter,
@@ -110,12 +108,12 @@ pub(crate) use segment::{
 };
 
 // Open-with-recovery: validates the journal dir, rewinds torn tails,
-// returns `OpenedJournal` plus the recovery report (PLAN2 S1.5 step 6).
+// returns `OpenedJournal` plus the recovery report.
 pub(crate) mod open;
 pub(crate) use open::{JournalCursor, OrderedEvent, RecoveryReport, open, sync_dir};
 
 // Daemon-side record pipeline: sequencer core, appender loop and
-// rolling-segment writer (PLAN2 S1.5 step 7).
+// rolling-segment writer.
 pub(crate) mod appender;
 #[cfg(test)]
 pub(crate) use appender::{
@@ -126,7 +124,7 @@ pub(crate) use appender::{
 };
 
 // Shadow journal: bundles the sequencing core with the appender for
-// the M1 shadow wiring (PLAN2 S1.5 step 8).
+// the shadow wiring.
 pub(crate) mod shadow;
 pub(crate) use shadow::ShadowJournal;
 
@@ -320,7 +318,7 @@ mod tests {
 
     #[test]
     fn open_fails_loudly_when_the_journal_dir_is_not_a_directory() {
-        // M3-1 (ADR-0006): sessions fail to start when their journal cannot
+        // ADR-0006: sessions fail to start when their journal cannot
         // be opened. Pin the open-level error the runtime propagates.
         let dir = std::env::temp_dir().join(format!("oly-jopen-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
@@ -590,7 +588,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // -- Appender boundary tests (PLAN.md §4.2) --
+    // -- Appender boundary tests (group-sync cadence, ADR-0002) --
 
     fn event(seq: u64, payload: &'static [u8]) -> OrderedEvent {
         OrderedEvent {
@@ -872,7 +870,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // -- Fixed-range reads (I3) --
+    // -- Fixed-range reads --
 
     fn write_ten_record_segment(dir: &Path) {
         let mut opened = open(dir).unwrap();
@@ -972,7 +970,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // -- Bounded tail, cross-incarnation history, retention (I3/I8) --
+    // -- Bounded tail, cross-incarnation history, retention --
 
     #[test]
     fn read_tail_returns_the_newest_records_within_budget() {
@@ -1215,7 +1213,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // -- Checkpoints and checkpoint-gated retention (PLAN §5.3, ADR-0002) --
+    // -- Checkpoints and checkpoint-gated retention (ADR-0002) --
 
     fn test_checkpoint(program: &[u8]) -> Checkpoint {
         Checkpoint {
@@ -1430,9 +1428,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// PLAN2 §P2.5: byte-budget retention computes the highest
-    /// `min_incarnation` such that the surviving sealed bytes fit under
-    /// the cap. It honours three invariants:
+    /// Byte-budget retention computes the highest `min_incarnation` such
+    /// that the surviving sealed bytes fit under the cap. It honours
+    /// three invariants:
     ///
     /// - never crosses the checkpoint gate (live + checkpoint-bearing
     ///   incarnations stay),
@@ -1578,9 +1576,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// PLAN2 §P2.5: when no checkpoint has ever been emitted
-    /// (`latest_checkpoint_incarnation == None`), the byte-budget
-    /// horizon must default to the latest incarnation, matching the
+    /// When no checkpoint has ever been emitted
+    /// (`latest_checkpoint_incarnation == None`), the byte-budget horizon
+    /// must default to the latest incarnation, matching the
     /// gate semantics used by [`retain_before`].
     #[test]
     fn min_incarnation_for_byte_budget_without_a_checkpoint_uses_latest_as_gate() {
@@ -1617,7 +1615,7 @@ mod tests {
 
     /// A cursor beyond the recovered valid tail must fail loudly — never
     /// silently return the next incarnation's bytes or empty success
-    /// (incomplete capture, PLAN.md §6.2).
+    /// (incomplete capture invariant: the reader never invents data).
     #[test]
     fn cursor_beyond_recovered_tail_fails_loudly() {
         let dir = test_session_dir("cursor_tail");
@@ -1706,7 +1704,8 @@ mod tests {
 
     /// Retention racing readers: readers observe either the complete
     /// incarnation or a truthful prefix of it, but never a hole; once
-    /// deletion finishes, cursors into it fail loudly (I3).
+    /// deletion finishes, cursors into it fail loudly
+    /// (silent "truncated successfully" would misrepresent the user data).
     #[test]
     fn retention_concurrent_with_readers_never_shows_a_hole() {
         let dir = test_session_dir("retention_race");
@@ -1826,9 +1825,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Disk-full degradation (PLAN.md §6.1 M1 exit: "disk stall cannot
-    /// grow memory indefinitely" + explicit failure state): an appender
-    /// whose writes fail must surface `Failed`, reject further records
+    /// Disk-full degradation: a disk stall must not grow memory
+    /// indefinitely, and a failing appender must surface an explicit
+    /// failure state and reject further records
     /// without writing past a hole, and leave the segment untouched.
     #[cfg(target_os = "linux")]
     #[test]
@@ -1897,7 +1896,9 @@ mod tests {
 
     /// A graceful shutdown must sync whatever it already acknowledged as
     /// journaled — otherwise "written" records can be lost without any
-    /// failed ack (I8).
+    /// failed ack (a record whose journal write fails must leave the
+    /// reader unaware that there was ever a record to begin with —
+    /// ack-equivalent records cannot silently disappear).
     #[test]
     fn shutdown_syncs_unsynced_records() {
         let dir = test_session_dir("shutdown_sync");
@@ -1967,9 +1968,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The M1 exit requirement "disk stall cannot grow memory
-    /// indefinitely": once persistence degrades, further records are
-    /// refused before they are cached, and the cache size freezes.
+    /// "Disk-stall cannot grow memory indefinitely": once persistence
+    /// degrades, further records are refused before they are cached, and
+    /// the cache size freezes.
     #[test]
     fn degraded_journal_stops_growing() {
         let (_ack_tx, acks) = std::sync::mpsc::channel();

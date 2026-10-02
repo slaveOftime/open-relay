@@ -1,10 +1,10 @@
-//! Client-side attach-stream cursor verification (M3-3, ADR-0004).
+//! Client-side attach-stream cursor verification (ADR-0004).
 //!
 //! The server guarantees contiguous, in-order stream cursors: the init frame
 //! names the snapshot boundary C and every chunk names the offset of its
 //! first byte. The client must never apply out-of-order or gapped data
 //! silently — a mismatch means the stream is corrupt and the attach aborts
-//! loudly instead of rendering a wrong screen (PLAN §7.2, invariant I2).
+//! loudly instead of rendering a wrong screen.
 
 use crate::error::AppError;
 

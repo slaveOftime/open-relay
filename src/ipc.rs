@@ -239,7 +239,7 @@ pub async fn read_response_from_reader(
     Ok(envelope.payload)
 }
 
-// ── Binary attach-stream frames (M6-3, ADR-0004) ─────────────────────────
+// ── Binary attach-stream frames (ADR-0004) ──────────────────────────────
 //
 // After the `AttachStreamInit` JSON line, the server→client direction of an
 // attach stream switches to binary length-delimited frames: PTY output is
@@ -254,8 +254,8 @@ pub async fn read_response_from_reader(
 pub const ATTACH_FRAME_OUTPUT: u8 = 1;
 pub const ATTACH_FRAME_CONTROL: u8 = 2;
 
-/// Hard caps checked before any allocation (PLAN §7.4). Output frames carry
-/// one canonical chunk (at most 512 KiB by runtime batching); control frames
+/// Hard caps checked before any allocation. Output frames carry one
+/// canonical chunk (at most 512 KiB by runtime batching); control frames
 /// carry small JSON notices only.
 const MAX_ATTACH_OUTPUT_FRAME_BYTES: u32 = 1024 * 1024 + 8;
 const MAX_ATTACH_CONTROL_FRAME_BYTES: u32 = 64 * 1024;
@@ -558,7 +558,7 @@ mod tests {
     }
 
     /// Oversize or unknown-tag frames are rejected from the header alone —
-    /// no payload-sized allocation happens first (PLAN §7.4).
+    /// no payload-sized allocation happens first.
     #[tokio::test]
     async fn attach_frame_caps_are_enforced_before_allocation() {
         let (mut tx, rx) = tokio::io::duplex(1024);

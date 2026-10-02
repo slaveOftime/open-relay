@@ -75,7 +75,8 @@ pub struct ResumeConfig {
     pub patterns: Vec<ResumePattern>,
 }
 
-// ── Hot-reload diff helper (S3.4) ──────────────────────────────────────────
+// ── Hot-reload diff helper ─────────────────────────────────────────────────
+
 //
 // `AppConfig::hot_reload_changes` and `restart_required_changes` used to be
 // two open-coded `if x != y { push("x") }` loops that grew with every new
@@ -144,22 +145,16 @@ pub struct LimitsConfig {
     pub screen_scrollback_rows: usize,
     pub silence_seconds: u64,
     pub stop_grace_seconds: u64,
-    /// PLAN2 §P2.5: byte-budget cap on a session's persisted journal.
-    /// 0 means unlimited (the historical behaviour). When non-zero, the
-    /// daemon's checkpoint-gated retention will delete the oldest sealed
-    /// journal incarnations so the surviving bytes never exceed this cap;
-    /// the live incarnation and the latest checkpoint-bearing incarnation
-    /// are never touched, so live cursors stay valid and the next
-    /// reattach can still replay from the latest checkpoint.
+    /// Byte-budget cap on a session's persisted journal. 0 = unlimited.
+    /// When non-zero, checkpoint-gated retention deletes the oldest
+    /// sealed incarnations so surviving bytes stay under the cap. The
+    /// live and the latest checkpoint-bearing incarnation are never
+    /// touched, so live cursors stay valid.
     pub max_journal_bytes_per_session: u64,
-    /// PLAN2 §P2.6: wall-clock retention for **stopped** sessions, in
-    /// days. The daemon's periodic sweeper deletes the journal directory
-    /// **and** the database row for any session whose `ended_at` is
-    /// older than this cap and whose status is no longer running.
-    /// 0 means disabled (the historical behaviour: stopped-session
-    /// metadata lives forever; the operator decides what to keep).
-    /// Running sessions are NEVER auto-deleted by this knob — wall-clock
-    /// termination of running work is orthogonal and a separate setting.
+    /// Wall-clock retention for **stopped** sessions, in days. The
+    /// sweeper deletes the journal directory and DB row for stopped
+    /// sessions older than this cap. 0 = disabled; running sessions
+    /// are unaffected by this knob.
     pub journal_retention_days: u32,
 }
 
@@ -267,8 +262,10 @@ impl LiveConfig {
 struct AppConfigOverrides {
     /// On-disk JSON shape stays flat and backward-compatible: each
     /// sub-struct is `#[serde(flatten)]`-ed so the wire format ("bind",
-    /// "http_port", "web_push_*", …) is byte-identical to the pre-S3.4
-    /// layout. New config files land in a sub-struct automatically.
+    /// "http_port", "web_push_*", …) is byte-identical to the
+    /// pre-flatten layout: existing `config.json` files deserialize
+    /// without `unknown field` errors, and new keys land in a
+    /// sub-struct automatically.
     #[serde(flatten)]
     http: HttpOverrides,
     #[serde(flatten)]
@@ -285,9 +282,9 @@ struct AppConfigOverrides {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct HttpOverrides {
-    /// Listener bind address. S3.4: canonical key is `http_bind` (matching
-    /// `http_port`); the pre-S3.4 single-word `bind` is still accepted as
-    /// an alias for backward compat with existing `config.json` files.
+    /// Listener bind address. Canonical key is `http_bind` (matching
+    /// `http_port`); the legacy single-word `bind` is still accepted as
+    /// an alias so existing `config.json` files deserialize cleanly.
     #[serde(alias = "bind")]
     http_bind: Option<String>,
     http_port: Option<u16>,
@@ -324,20 +321,20 @@ struct LimitsOverrides {
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
     screen_scrollback_rows: Option<usize>,
-    /// PLAN2 §P2.5: defaults to 0 (unlimited) to preserve the
-    /// pre-P2.5 behaviour exactly. `max_journal_bytes_per_session` is
-    /// the canonical key; the legacy `max_output_log_bytes` (0.3.x) is
-    /// re-mapped to it for migration ergonomics — see MIGRATION.md.
+    /// Defaults to 0 (unlimited) so the pre-cap behaviour is preserved.
+    /// `max_journal_bytes_per_session` is the canonical key; the legacy
+    /// `max_output_log_bytes` (0.3.x) is re-mapped to it — see
+    /// MIGRATION.md.
     max_journal_bytes_per_session: Option<u64>,
     /// Legacy alias for [`LimitsOverrides::max_journal_bytes_per_session`]:
     /// the 0.3.x cap on `output.log` size. The 0.x sweep that truncated
-    /// `output.log` mid-stream was retired (M3-1c2 / PLAN I3), but the
-    /// number is morally the same one, so we accept it and apply it as
-    /// the new journal cap. Same semantics: 0 = unlimited.
+    /// `output.log` mid-stream no longer runs, but the number is morally
+    /// the same one, so we accept it and apply it as the new journal cap.
+    /// Same semantics: 0 = unlimited.
     #[serde(default, alias = "max_output_log_bytes")]
     max_journal_bytes_per_session_legacy: Option<u64>,
-    /// PLAN2 §P2.6: wall-clock retention for stopped sessions. 0 =
-    /// disabled (keep everything, pre-P2.6 behaviour).
+    /// Wall-clock retention for stopped sessions. 0 = disabled (keep
+    /// everything, the pre-cap behaviour).
     journal_retention_days: Option<u32>,
 }
 
@@ -489,7 +486,7 @@ impl AppConfig {
     /// Everything listed here is picked up by the running daemon without a
     /// restart; keep this in sync with the reload task in
     /// `daemon::reload` and the live readers (notification monitor, session
-    /// start paths, HTTP handlers). S3.4 makes this a fixed composition of
+    /// start paths, HTTP handlers). The diff is a fixed composition of
     /// per-sub-struct diffs: any future field added to the relevant
     /// sub-structs gets its diff arm automatically.
     pub fn hot_reload_changes(&self, other: &Self) -> Vec<&'static str> {
@@ -783,7 +780,7 @@ mod tests {
 
     #[test]
     fn screen_scrollback_rows_override_deserializes() {
-        // Sanity: S3.4 wraps the per-axis fields in sub-structs; the JSON
+        // Sanity: the per-axis fields are wrapped in sub-structs; the JSON
         // shape is preserved via `#[serde(flatten)]`, so the wire-level
         // override name is unchanged.
         let overrides: super::AppConfigOverrides =
@@ -847,9 +844,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_dir);
     }
 
-    /// S3.4 follow-up: legacy single-word `bind` JSON key must keep
-    /// loading alongside the canonical `http_bind`. Errors with
-    /// `unknown field` otherwise on every pre-S3.4 config.json.
+    /// Legacy single-word `bind` JSON key must keep loading alongside
+    /// the canonical `http_bind`; otherwise every pre-flatten
+    /// `config.json` would fail with `unknown field`.
     #[test]
     fn http_bind_alias_accepts_legacy_bind_key() {
         let overrides: super::AppConfigOverrides =

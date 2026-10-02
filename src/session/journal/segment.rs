@@ -1,4 +1,4 @@
-//! On-disk segment writer and segment-file helpers (PLAN2 S1.5 step 5).
+//! On-disk segment writer and segment-file helpers.
 //!
 //! Lifted from `session/journal/mod.rs`. The active-tail writer
 //! (`SegmentWriter`) and segment-path / list-segment helpers
@@ -94,8 +94,8 @@ impl SegmentWriter {
     }
 
     /// Push appended records to the storage device. Callers decide the
-    /// group-sync cadence (PLAN.md §4.2): live publication does not wait for
-    /// this, but `durable_seq` may not advance past the last synced record.
+    /// group-sync cadence: live publication does not wait for this, but
+    /// `durable_seq` may not advance past the last synced record.
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.sync_data()
     }
@@ -108,14 +108,15 @@ impl SegmentWriter {
 }
 
 // ---------------------------------------------------------------------------
-// Per-session sequencer (M1)
+// Per-session sequencer
 // ---------------------------------------------------------------------------
 
 /// Directory inside `sessions/<id>/` holding the journal segments.
 pub const JOURNAL_DIR_NAME: &str = "journal";
 const SEGMENT_PREFIX: &str = "seg-";
-/// Append-only manifest of sealed segment parts (M3-6): one JSON line per
-/// sealed part, written after the part itself is durable. Compaction (M4)
+/// Append-only manifest of sealed segment parts: one JSON line per
+/// sealed part, written after the part itself is durable. Compaction and
+/// integrity tooling verify parts against these entries
 /// and integrity tooling verify parts against these entries; the active
 /// tail part never has one.
 pub const MANIFEST_FILE_NAME: &str = "manifest.log";

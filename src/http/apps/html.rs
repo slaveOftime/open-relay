@@ -1,5 +1,5 @@
 //! HTML introspection: title/description/kind/icon extraction and asset-href
-//! resolution. PLAN2 S1.2.
+//! resolution.
 
 use std::path::Path;
 

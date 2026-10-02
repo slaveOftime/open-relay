@@ -100,28 +100,25 @@ impl SharedModes {
 
 /// One broadcast unit of the canonical filtered stream. Sent inside the
 /// same write-lock section that sequenced the journal record, so
-/// journal order and broadcast order agree (PLAN.md §4.1).
+/// journal order and broadcast order agree.
 #[derive(Debug, Clone)]
 pub struct SequencedChunk {
-    /// Filtered-stream offset of the first byte (I2): the attach pump
-    /// trims overlaps and detects gaps against this instead of trusting
+    /// Filtered-stream offset of the first byte. The attach pump trims
+    /// overlaps and detects gaps against this instead of trusting
     /// broadcast delivery order blindly.
     pub offset: u64,
     pub bytes: Bytes,
 }
 
 /// Raw-output interval between journal checkpoints. Bounds the bytes a
-/// replay must re-consume after the newest checkpoint (PLAN §5.3); sized
-/// so a checkpoint is taken roughly every other journal part.
+/// replay must re-consume after the newest checkpoint; sized so a
+/// checkpoint is taken roughly every other journal part.
 pub(crate) const JOURNAL_CHECKPOINT_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
 
-/// PLAN2 §P2.5: the runtime's lock-free publication of the last
-/// retention sweep's outcome. The retention thread runs after every
-/// journal checkpoint; the runtime summary mirrors the bytes it kept and
-/// the sealing-pass count so users can see whether the cap is actually
-/// firing. The values are atomic-monotonic except `bytes_retained`,
-/// which an external observer can read at use time to draw the live
-/// picture on the session list.
+/// Atomic-monotonic publication of the last retention sweep's outcome:
+/// `sealing_passes` and the dropped/swept counters are surfaced on the
+/// session list; `bytes_retained` is read on demand. Together they show
+/// whether the byte-budget cap is actually firing.
 #[derive(Debug)]
 struct RetentionStats {
     bytes_retained: std::sync::atomic::AtomicU64,
@@ -139,10 +136,9 @@ impl Default for RetentionStats {
     }
 }
 
-/// PLAN2 §P2.5: holder type for the retention stats + the shared byte
-/// cap. Both ends of the runtime's lifetime share these atomics (the
-/// `Arc` clone into the retention thread lets the daemon hot-reload the
-/// cap without touching every session in place).
+/// Retention-stats handle + shared byte cap, cloned into the retention
+/// thread so the daemon can hot-reload the cap without touching every
+/// session in place.
 #[derive(Debug, Default, Clone)]
 pub struct RetentionHandle {
     stats: Arc<RetentionStats>,
@@ -194,7 +190,7 @@ pub struct SessionRuntime {
     pub requested_final_status: Option<SessionStatus>,
     /// Total length of the canonical filtered PTY output stream for persistence and replay.
     /// Total bytes of the canonical FILTERED display stream (what
-    /// `output.log` held before M3; attach offsets index this stream).
+    /// `output.log` previously held; attach offsets index this stream).
     /// Raw pre-filter bytes live in the journal.
     pub filtered_total_bytes: u64,
     /// Total length of meaningful PTY output bytes that changed the terminal state.
@@ -210,7 +206,7 @@ pub struct SessionRuntime {
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
-    /// Identified attachments (M3-4); the attachment count is
+    /// Identified attachments; the attachment count is
     /// `attachments.len()`.
     pub attachments: super::registry::AttachmentRegistry,
     /// Timestamp of the last *successful* notification delivery for this session.
@@ -243,8 +239,8 @@ pub struct SessionRuntime {
     pub resume_scanned: bool,
     /// Terminal completion fact waiting for the output stream to drain
     /// before it may be journaled. Process exit and PTY EOF are separate
-    /// facts (PLAN.md I10): completion must be sequenced after the final
-    /// retained output, never at the moment `try_wait` noticed the exit.
+    /// facts: completion must be sequenced after the final retained
+    /// output, never at the moment `try_wait` noticed the exit.
     pub(crate) pending_journal_completion: Option<(LifecycleCode, Option<i32>, String)>,
     /// Raw-output counter value at the last journal checkpoint.
     pub(crate) last_journal_checkpoint_at: u64,
@@ -252,29 +248,26 @@ pub struct SessionRuntime {
     /// incarnation; `None` until the baseline revision is recorded.
     pub(crate) journaled_modes: Option<ModeSnapshot>,
     pub notifications_enabled: bool,
-    /// The session's canonical journal (ADR-0002): the per-session
-    /// sequencing point for output, resize and lifecycle facts. Always on
-    /// since M6-2; `None` only for runtimes constructed without a session
-    /// directory (tests). The mutex only covers in-memory sequencing plus
-    /// a bounded, non-blocking queue submit — never disk I/O — so it is
-    /// safe to take while the runtime write lock is held (that lock is
-    /// what orders mutation, sequencing and publication against each
-    /// other; PLAN.md §4.1 item 4).
+    /// Per-session sequencing point for output, resize, and lifecycle
+    /// facts (ADR-0002). `None` only for runtimes with no session
+    /// directory (tests). The mutex covers in-memory sequencing and a
+    /// bounded, non-blocking queue submit — no disk I/O — and is safe
+    /// to take under the runtime write lock.
     pub journal: Option<parking_lot::Mutex<ShadowJournal>>,
     /// Set the first time a journal record fails (ADR-0006): a session
     /// whose history can no longer be recorded is stopped (marked
     /// `Failed`) instead of continuing to run unrecorded. Atomic because
     /// `journal_event` only holds `&self`.
     pub journal_failed: std::sync::atomic::AtomicBool,
-    /// PLAN2 §P2.5: pointer into the daemon's shared journal byte cap.
-    /// The retention thread re-loads it on every sweep, so a daemon hot
-    /// reload (`store.set_journal_byte_cap`) is visible to every live
+    /// Pointer into the daemon's shared journal byte cap. The retention
+    /// thread re-loads it on every sweep, so a daemon hot reload
+    /// (`store.set_journal_byte_cap`) is visible to every live
     /// session without a restart. 0 = unlimited (the historical,
-    /// pre-P2.5 behaviour).
+    /// historical behaviour: 0 = no cap).
     pub journal_byte_cap: Arc<std::sync::atomic::AtomicU64>,
-    /// PLAN2 §P2.5: handle to the journal byte cap + lock-free
-    /// retention stats. Populated by `spawn_session` and shared (via the
-    /// inner `Arc`) with the retention thread so a hot-reloaded cap is
+    /// Handle to the journal byte cap + lock-free retention stats.
+    /// Populated by `spawn_session` and shared (via the inner `Arc`)
+    /// with the retention thread so a hot-reloaded cap is
     /// visible without re-spawning the runtime.
     pub retention: RetentionHandle,
 }
@@ -294,7 +287,7 @@ const PTY_WRITER_QUEUE_CAPACITY: usize = 4096;
 /// therefore as few downstream chunks, broadcasts and IPC frames — as possible.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 
-/// PLAN2 §P2.5: run one byte-budgeted journal retention sweep.
+/// Run one byte-budgeted journal retention sweep.
 ///
 /// Convenience wrapper around `journal::min_incarnation_for_byte_budget` +
 /// `journal::retain_before`. The function never panics on journal I/O:
@@ -310,7 +303,9 @@ fn run_retention_sweep(
     let cap = byte_cap.load(std::sync::atomic::Ordering::Relaxed);
     let effective_horizon = if cap == 0 {
         // Unlimited cap: nothing is deleted — `retain_before` clamps any
-        // horizon to the checkpoint gate, preserving pre-P2.5 behaviour
+        // horizon to the checkpoint gate, preserving the pre-byte-budget
+        // behaviour (no deletion happens unless the byte-budget cap is also
+        // exceeded)
         // exactly. Horizon 1 keeps ALL manifest entries for the
         // `bytes_retained` stat (retain_before(dir, 1) clamps to the
         // gate and deletes nothing).
@@ -378,7 +373,7 @@ impl SessionRuntime {
 
     /// Feed one raw PTY chunk to the terminal engine and return the query
     /// responses it generated — each produced at the query's exact stream
-    /// position while the chunk advanced (PLAN.md I5). Title/bell events
+    /// position while the chunk advanced. Title/bell events
     /// stay on the scanner's signal path; the engine's duplicates are
     /// drained and ignored there.
     ///
@@ -418,8 +413,7 @@ impl SessionRuntime {
         }
     }
 
-    /// Current filtered-stream end offset (M3-1b: replaces stating
-    /// `output.log` for live sessions).
+    /// Current filtered-stream end offset.
     pub fn filtered_stream_len(&self) -> u64 {
         self.filtered_total_bytes
     }
@@ -450,9 +444,9 @@ impl SessionRuntime {
 
     /// Build a `SessionSummary` snapshot from the current runtime state.
     ///
-    /// PLAN2 P2.3b (noted, not fixed): this clones ~15 strings per call
-    /// and is invoked per-broadcast (attach pump) and per-list
-    /// (`GET /api/sessions`). At `max_running_sessions = 50` that is
+    /// Known cost: this clones ~15 strings per call and is invoked
+    /// per-broadcast (attach pump) and per-list (`GET /api/sessions`).
+    /// At `max_running_sessions = 50` that is
     /// under 1 KiB of garbage per fan-out — well below noise. Revisit
     /// the per-call allocation budget if `/api/metrics` shows the
     /// `attach` chunk inter-arrival histogram tail creeping up under a
@@ -593,17 +587,17 @@ impl SessionRuntime {
     /// Lets async callers snapshot the rows under the read lock, drop
     /// the guard, and finish the render on
     /// `tokio::task::spawn_blocking` so the PTY reader's write lock is
-    /// never starved by a long render (PLAN2 §P1.2). Pairs with
+    /// never starved by a long render. Pairs with
     /// [`super::logs::finish_render`] which performs the
     /// CPU-bound tail/skip pass off the lock.
     pub fn snapshot_engine_rows(&self, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
         super::logs::engine_content_rows(&self.engine, keep_color, term_cols)
     }
 
-    /// Register an identified attachment (M3-4). When the attachment is a
+    /// Register an identified attachment. When the attachment is a
     /// controller and declared a viewport, the initial geometry is applied
-    /// here, through the same sequencer path as any later resize
-    /// (PLAN §7.2.1). Returns the attachment id (fencing token), the
+    /// here, through the same sequencer path as any later resize.
+    /// Returns the attachment id (fencing token), the
     /// granted role, and whether the initial geometry was applied.
     pub fn register_attachment(
         &mut self,
@@ -769,8 +763,8 @@ impl SessionRuntime {
             ),
             other => format!("session ended status={}", other.as_str()),
         };
-        // M6-2: the completion fact lives only in the journal (events.log
-        // is retired); `event` remains the human-readable detail below.
+        // The completion fact lives only in the journal (events.log was
+        // retired); `event` remains the human-readable detail below.
         // The end fact is a stream-positioned event too: journal it once,
         // after the final state is set.
         if newly_ended {
@@ -786,11 +780,10 @@ impl SessionRuntime {
         }
     }
 
-    /// Journal the terminal end-of-life fact, but only once the output
-    /// stream has fully drained (I10's "ordered ending"). If the PTY
-    /// reader has not reported EOF yet, the fact is parked and flushed by
-    /// [`Self::close_output_stream`] so completion is never sequenced
-    /// before the final retained output.
+    /// Park the terminal end-of-life fact until the output stream has
+    /// fully drained. PTY EOF must precede the closure fact in the
+    /// journal so replay sees both — [`Self::close_output_stream`]
+    /// flushes the parked fact once the reader has caught up.
     fn queue_journal_completion(
         &mut self,
         code: LifecycleCode,
@@ -804,9 +797,9 @@ impl SessionRuntime {
         }
     }
 
-    /// Record a terminal end-of-life fact and request the persistence
-    /// barrier: completion must be durable before the session is treated
-    /// as fully captured (I10's "persistence barrier").
+    /// Record the terminal end-of-life fact under the journal's
+    /// persistence barrier, so a reader that sees the captured marker
+    /// is guaranteed to see every preceding PTY byte.
     fn journal_terminal_end(&mut self, code: LifecycleCode, exit_code: Option<i32>, detail: &str) {
         self.journal_event(|journal| {
             journal
@@ -834,8 +827,8 @@ impl SessionRuntime {
         self.output_closed = true;
         self.journal_lifecycle(LifecycleCode::OutputClosed, None, &detail);
         // Anchor the final state so retention and replay can start from
-        // the checkpoint instead of the raw prefix (PLAN §5.3); a trailing
-        // partial escape at EOF makes this retention-only.
+        // the checkpoint instead of the raw prefix; a trailing partial
+        // escape at EOF makes this retention-only.
         self.journal_checkpoint(scanner_idle);
         if let Some((code, exit_code, completion_detail)) = self.pending_journal_completion.take() {
             self.journal_terminal_end(code, exit_code, &completion_detail);
@@ -847,8 +840,8 @@ impl SessionRuntime {
     /// runtime has no journal (tests without a session directory).
     /// `anchored` is true only when the reader thread's scanner is idle at
     /// this boundary (no partial escape buffered); anchored checkpoints
-    /// carry the filtered-stream offset and double as replay anchors
-    /// (PLAN §5.3), unanchored ones still gate retention.
+    /// carry the filtered-stream offset and double as replay anchors,
+    /// unanchored ones still gate retention.
     fn journal_checkpoint(&mut self, anchored: bool) {
         if self.journal.is_none() {
             return;
@@ -871,7 +864,7 @@ impl SessionRuntime {
             alt_screen: modes.alt_screen,
             app_cursor_keys: modes.app_cursor_keys,
             bracketed_paste: modes.bracketed_paste,
-            // Anchor (PLAN §5.3): replay may start at this record and treat
+            // Anchor: replay may start at this record and treat
             // the derived filtered stream as beginning at this offset. 0 =
             // unanchored (scanner mid-escape): retention-only.
             filtered_offset: if anchored {
@@ -901,7 +894,7 @@ impl SessionRuntime {
     /// Emit a checkpoint once the session has produced another
     /// `JOURNAL_CHECKPOINT_INTERVAL_BYTES` of filtered output (a
     /// conservative proxy for raw journaled bytes: filtered <= raw) —
-    /// this bounds replay-from-checkpoint work (PLAN §5.3 cadence).
+    /// this bounds replay-from-checkpoint work.
     fn journal_checkpoint_if_due(&mut self, scanner_idle: bool) {
         if self
             .filtered_total_bytes
@@ -1019,8 +1012,8 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
-            // Native reflow: logical lines survive shrink/widen cycles
-            // (PLAN.md §5.3); no trimmed-row rebuild anymore.
+            // Native reflow: logical lines survive shrink/widen cycles;
+            // no trimmed-row rebuild anymore.
             self.engine.resize(rows, cols);
             self.resize_history.push(LogResize {
                 offset: self.filtered_total_bytes,
@@ -1066,7 +1059,7 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 /// the command, and PTY-spawns. All of those are blocking syscalls, so
 /// callers running inside an async fn must wrap this call in
 /// `tokio::task::spawn_blocking` to keep that worker free for attach
-/// pumps and SSE/WS multiplexing (PLAN2 §P1.1).
+/// pumps and SSE/WS multiplexing.
 ///
 /// `meta` is mutated to record the assigned `pid` once the PTY child
 /// is live; wrap the caller's `SessionMeta` in a `Mutex` and unwrap
@@ -1096,9 +1089,9 @@ pub fn spawn_session(
     );
     std::fs::create_dir_all(&full_dir)?;
 
-    // M3-1 (ADR-0002/ADR-0006): the journal is becoming the canonical
-    // stream, so it must exist before the child starts — a session whose
-    // history cannot be recorded must fail loudly, not run unrecorded.
+    // The journal is the canonical persisted stream (ADR-0002 / ADR-0006)
+    // and must exist before the child starts — a session whose history
+    // cannot be recorded must fail loudly, not run unrecorded.
     // One sequencing point per session, owned by the runtime: the runtime
     // write lock orders mutation, sequencing and publication; the appender
     // thread owns disk.
@@ -1190,13 +1183,13 @@ pub fn spawn_session(
     meta.pid = runtime_child.process_id();
 
     // The journal (opened above) is the canonical persisted stream
-    // (M3-1c2 retired output.log; M6-2 retired events.log).
+    // (events.log and output.log fallback were retired).
     let started_pid = meta
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "?".to_string());
 
-    // M3-1: the journal is becoming the canonical stream (ADR-0002), so it
+    // The journal is the canonical stream (ADR-0002), so it
     // was opened — loudly — before the PTY spawn above; here we only record
     // the first ordered facts: initial geometry, then start.
     if let Some(journal) = &shadow_journal {
@@ -1313,7 +1306,9 @@ pub fn spawn_session(
         let mut scan_out = ScanOut::default();
         // Every exit path funnels into one close-out so the runtime
         // observes — and the shadow journal records — exactly one
-        // `OutputClosed` fact, regardless of how the stream ended (I10).
+        // `OutputClosed` fact, regardless of how the stream ended (a
+        // crash, a graceful detach, EOF, or a write error all collapse
+        // to the same single fact so replay cannot double-close).
         let close_detail = loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
@@ -1345,8 +1340,8 @@ pub fn spawn_session(
                         let mut rt = runtime_reader.write();
                         // Journal the exact bytes read from the PTY —
                         // pre-filter — so replay and post-mortems never lose
-                        // data the scan pipeline dropped (PLAN.md I4). This
-                        // happens even when the filtered chunk is empty.
+                        // data the scan pipeline dropped. This happens even
+                        // when the filtered chunk is empty.
                         rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
                         let query_responses = rt.feed_engine(&buf[..n]);
                         let meta_changed = if let Some(signals) = changed_signals {
@@ -1387,7 +1382,7 @@ pub fn spawn_session(
 
                     // The raw chunk is already journaled (canonical); the
                     // filtered stream is derived from the journal on read
-                    // (M3-1b) — output.log is no longer written.
+                    // (output.log is no longer written).
 
                     // Broadcast canonical filtered output to all live
                     // subscribers (non-blocking; lagged receivers re-sync from
@@ -1805,7 +1800,8 @@ mod tests {
 
         // Wait for the appender to drain, then verify the journal holds
         // exactly the close, the final-state checkpoint, and the
-        // completion record — in that order (I10 + PLAN §5.3).
+        // completion record — in that order (output-before-completion
+        // and the final-state checkpoint is the last record before it).
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             {
@@ -1944,7 +1940,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// I4/§4.1: terminal-mode revisions are journaled as Policy records
+    /// Terminal-mode revisions are journaled as Policy records
     /// immediately after the output that caused them, in one ordered
     /// stream; unchanged modes never re-record.
     #[test]
@@ -2003,7 +1999,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// I10: a completion observed before the PTY output stream has
+    /// Completion-vs-output ordering: a completion observed before the
+    /// PTY output stream has
     /// drained must be parked and journaled only after the OutputClosed
     /// fact — completion never precedes the final retained output.
     #[test]
@@ -2182,18 +2179,13 @@ mod tests {
         );
     }
 
-    /// M0 reproduction (PLAN.md invariant I5): the reader thread collects
-    /// the probes in a chunk, pushes the whole filtered chunk into the
-    /// screen, and only then answers every probe with the *final* cursor
-    /// position. A child that writes `A`, asks for the cursor, writes `B`
-    /// and asks again — all coalesced into one PTY read — gets the same
-    /// answer twice. The 1.0 query broker must answer each probe at its own
-    /// position in the stream; this test pins that behaviour and stays
-    /// ignored until the broker lands.
+    /// Every probe is answered at its own position in the stream: a chunk
+    /// containing `A`, CPR, `B`, CPR yields two CPR replies at the cursor
+    /// after `B`.
     #[test]
     fn repro_queries_are_answered_at_their_own_stream_position() {
-        // Fixed by the M2 engine integration: the engine answers each query
-        // while advancing the raw chunk, i.e. at its own stream position.
+        // The engine answers each query while advancing the raw chunk,
+        // i.e. at its own stream position.
         let stream = b"A\x1b[6nB\x1b[6n";
         let mut rt = new_runtime();
         let responses = rt.feed_engine(stream);
@@ -2221,23 +2213,15 @@ mod tests {
         assert_eq!(out.filtered, b"AB");
     }
 
-    /// M0 reproduction (PLAN.md invariant I2): the reader thread runs
-    /// `push_output` (screen + counters), file append and broadcast as three
-    /// separate steps, and `attach_snapshot_init` reads the screen snapshot
-    /// and the file length in a different lock scope. A chunk caught between
-    /// "pushed" and "appended" is inside the snapshot but *outside* the
-    /// returned resume offset — a client that then replays the file from
-    /// that offset receives the chunk a second time. The M1 sequencer plus
-    /// the M3 C/C+1 attach boundary must make snapshot content and resume
-    /// cursor agree exactly; this test pins that and stays ignored until
-    /// they land.
+    /// Pins the snapshot/resume invariant: the snapshot content and the
+    /// returned resume offset must describe the same boundary so replay
+    /// from that offset re-delivers exactly the bytes the snapshot
+    /// covered.
     #[test]
     fn snapshot_boundary_matches_the_live_stream_cursor() {
-        // Fixed in M3-1 (was M0 repro PLAN I2): the snapshot and the resume
-        // cursor now come from the SAME in-memory state under the runtime
-        // lock — no file offset can lag the screen. Snapshot coverage and
-        // resume cursor describe the same boundary, so replay-from-cursor
-        // can neither lose nor duplicate a chunk.
+        // Snapshot and resume cursor come from the same in-memory state
+        // under the runtime lock, so replay-from-cursor can neither lose
+        // nor duplicate a chunk.
         let dir = std::env::temp_dir().join(format!("oly_repro_snapshot_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 

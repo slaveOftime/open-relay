@@ -185,8 +185,8 @@ impl Database {
 
     pub fn session_output_offset(&self, id: &str) -> u64 {
         let session_dir = self.sessions_dir.join(id);
-        // M6-2: only journal-backed sessions have a stream; pre-0.5
-        // sessions report 0 (see MIGRATION.md).
+        // Only journal-backed sessions have a stream; pre-0.5 sessions
+        // report 0 (see MIGRATION.md).
         if session_dir
             .join(crate::session::journal::JOURNAL_DIR_NAME)
             .is_dir()
@@ -340,9 +340,9 @@ impl Database {
             .collect())
     }
 
-    /// PLAN2 §P2.6: list stopped sessions whose `ended_at` is strictly
-    /// older than `cutoff`. Used by the daemon's periodic sweeper to
-    /// decide which rows to delete alongside their journal directories.
+    /// List stopped sessions whose `ended_at` is strictly older than
+    /// `cutoff`. Used by the daemon's periodic sweeper to decide which
+    /// rows to delete alongside their journal directories.
     ///
     /// Live sessions (`status IN ('created', 'running', 'stopping')`)
     /// are filtered out by SQL: the sweeper must never see them. That
@@ -374,9 +374,9 @@ impl Database {
             .collect())
     }
 
-    /// PLAN2 §P2.6: delete a single session row by id. Returns the
-    /// number of rows removed (0 means the row was already gone — the
-    /// sweeper treats this as success because it implies a concurrent
+    /// Delete a single session row by id. Returns the number of rows
+    /// removed (0 means the row was already gone — the sweeper treats
+    /// this as success because it implies a concurrent
     /// removal has already cleaned up).
     pub async fn delete_session_by_id(&self, id: &str) -> Result<u64> {
         let res = sqlx::query("DELETE FROM sessions WHERE id=?1")
@@ -386,7 +386,6 @@ impl Database {
         Ok(res.rows_affected())
     }
 
-    #[allow(dead_code)]
     pub async fn list_push_subscriptions(&self) -> Result<Vec<PushSubscriptionRecord>> {
         let rows = sqlx::query(
             "SELECT endpoint, p256dh, auth FROM push_subscriptions ORDER BY updated_at DESC",

@@ -1,4 +1,4 @@
-//! Attach-source abstraction for the WebSocket attach path (PLAN2 S2).
+//! Attach-source abstraction for the WebSocket attach path.
 //!
 //! ARCHITECTURE.md says a federated attach is a local attach plus one
 //! transport hop. `http/ws.rs` used to spell that out as two structurally
@@ -151,7 +151,6 @@ impl AttachSource {
                 pump,
                 resize_sub,
                 attachment_id,
-                session_id: id,
             },
             init_frame,
             tti_start: Instant::now(),
@@ -236,7 +235,6 @@ impl AttachSource {
 
         Ok(RelayedSourceOutput {
             source: RelayedSource {
-                registry,
                 node,
                 stream_rpc_id,
                 stream_rx,
@@ -252,12 +250,10 @@ impl AttachSource {
 // Local arm
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub(crate) struct LocalSource {
     pub(crate) pump: AttachPump,
     pub(crate) resize_sub: ResizeSubscriber,
     pub(crate) attachment_id: u64,
-    pub(crate) session_id: String,
 }
 
 pub(crate) struct LocalSourceOutput {
@@ -287,9 +283,7 @@ impl LocalSource {
 // Relayed arm
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub(crate) struct RelayedSource {
-    pub(crate) registry: Arc<NodeRegistry>,
     pub(crate) node: String,
     pub(crate) stream_rpc_id: String,
     pub(crate) stream_rx: mpsc::Receiver<StdResult<RpcResponse, crate::error::AppError>>,

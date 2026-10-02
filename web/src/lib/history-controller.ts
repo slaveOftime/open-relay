@@ -1,6 +1,6 @@
 /**
  * HistoryController — the browser-side owner of paginated session history
- * (M4-2, PLAN §9.2).
+ * (browser-side owner of paginated history).
  *
  * Extracted from SessionDetailPage so the paging/anchoring policy is a pure,
  * testable state machine instead of a web of refs. The xterm-facing replay

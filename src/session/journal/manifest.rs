@@ -1,4 +1,4 @@
-//! Sealed-part manifest (M3-6). PLAN2 S1.5 step 2.
+//! Sealed-part manifest.
 //!
 //! Lifted from `session/journal/mod.rs`. The on-disk format
 //! (`SegmentManifestEntry`, `RetiredIncarnation`, `ManifestLine`,
@@ -10,12 +10,14 @@ use std::{fs, io, io::Write, path::Path};
 use super::{Crc32, MANIFEST_FILE_NAME, list_segments, segment_path};
 
 // ---------------------------------------------------------------------------
-// Sealed-part manifest (M3-6)
+// Sealed-part manifest
 // ---------------------------------------------------------------------------
 
 /// One sealed segment part, checksummed at seal time. JSON-line in
 /// `journal/manifest.log`; readers/compaction verify a part against its
-/// entry before trusting or dropping it (I3/I8).
+/// entry before trusting or dropping it — a corrupted part must fail
+/// visibly, and "already recorded as sealed" must hold for every byte a
+/// reader can observe in the filtered stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SegmentManifestEntry {
     pub incarnation: u64,

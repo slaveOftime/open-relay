@@ -8,7 +8,7 @@ use tracing::debug;
 use crate::session::SessionEvent;
 
 // 12: attach streams carry PTY output as binary length-delimited frames
-// after the JSON init line (M6-3, ADR-0004); pre-12 peers expect base64
+// after the JSON init line (ADR-0004); pre-12 peers expect base64
 // JSON chunks and are rejected.
 // 13: `AttachInput.data` is raw bytes (base64 in JSON) instead of a JSON
 // string — PTY input is byte-exact end to end, so invalid UTF-8 (binary
@@ -221,17 +221,18 @@ pub enum RpcRequest {
         id: String,
         from_byte_offset: Option<u64>,
         /// Whether this stream reports applied-cursor credits and is
-        /// therefore gated on them (M5-1, I7). Local interactive clients
-        /// set `true` and ack; node-relayed subscriptions must set `false`
+        /// therefore gated on them (credit-gated). Local interactive
+        /// clients set
+        /// `true` and ack; node-relayed subscriptions must set `false`
         /// because the relay cannot forward mid-stream credits (fail-open
-        /// until direct remote streams land in M5-2). Defaults to `false`
+        /// until direct remote streams land). Defaults to `false`
         /// (safe: no enforcement) when absent.
         #[serde(default)]
         credited: bool,
         /// Incarnation the `from_byte_offset` cursor was issued by. Resume is
         /// only valid within the same incarnation; a mismatch is rejected with
-        /// a precise stale-cursor error (PLAN §7.3). Required when
-        /// `from_byte_offset` is set.
+        /// a precise stale-cursor error. Required when `from_byte_offset` is
+        /// set.
         #[serde(default)]
         incarnation: Option<u64>,
         /// Requested attach mode: "observe" (view-only) or absent /
@@ -248,7 +249,7 @@ pub enum RpcRequest {
         id: String,
         /// Raw PTY input bytes (base64 on the JSON wire): input is
         /// byte-exact end to end — no UTF-8 validation or lossy
-        /// conversion anywhere on the path (PLAN §5.1).
+        /// conversion anywhere on the path.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
         wait_for_change: bool,
@@ -257,12 +258,12 @@ pub enum RpcRequest {
         #[serde(default)]
         attachment_id: Option<u64>,
     },
-    /// Machine-readable session cursor (M4 agent surface): incarnation,
+    /// Machine-readable session cursor (agent surface): incarnation,
     /// current filtered-stream offset, and liveness in one cheap call.
     SessionCursor {
         id: String,
     },
-    /// Bounded window read of the filtered stream (M4): never unbounded,
+    /// Bounded window read of the filtered stream: never unbounded,
     /// resumable via the returned `next_offset`.
     ObserveWindow {
         id: String,
@@ -288,9 +289,9 @@ pub enum RpcRequest {
     AttachDetach {
         id: String,
     },
-    /// Report the applied-cursor credit for this attach connection (M3-5,
-    /// I7): the highest stream offset the client has rendered. Handled on
-    /// the streaming path only.
+    /// Report the applied-cursor credit for this attach connection:
+    /// the highest stream offset the client has rendered. Handled on the
+    /// streaming path only.
     AttachAppliedCursor {
         id: String,
         cursor: u64,
@@ -435,7 +436,7 @@ impl RpcRequest {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
-    /// Machine-readable session cursor answer (M4).
+    /// Machine-readable session cursor answer.
     SessionCursor {
         running: bool,
         exit_code: Option<i32>,
@@ -443,7 +444,7 @@ pub enum RpcResponse {
         offset: u64,
         incarnation: Option<u64>,
     },
-    /// One bounded filtered-stream window (M4).
+    /// One bounded filtered-stream window.
     ObserveWindow {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
@@ -504,7 +505,7 @@ pub enum RpcResponse {
         /// present the same incarnation (ADR-0004).
         #[serde(default)]
         incarnation: u64,
-        /// This attachment's fencing token (M3-4).
+        /// This attachment's fencing token.
         #[serde(default)]
         attachment_id: u64,
         /// This attachment's role, fixed at register time:
@@ -546,8 +547,10 @@ pub enum RpcResponse {
     /// Session ended; attach stream is done.
     AttachStreamDone {
         exit_code: Option<i32>,
-        /// Canonical filtered-stream offset of the end of the stream; the
-        /// client must have applied exactly up to here (I2 completion).
+        /// Inclusive end-of-stream cursor: a client able to apply a
+        /// partial frame at offset `final_offset` has applied everything
+        /// the daemon signalled — by induction on contiguous
+        /// application, no later chunk exists to wait for.
         #[serde(default)]
         final_offset: u64,
     },
@@ -693,10 +696,10 @@ pub enum NodeWsMessage {
         done: bool,
     },
     /// Primary → Secondary: one mid-stream client message for an open
-    /// streaming RPC (M5-2). Carries attach input, resize,
-    /// applied-cursor credits, and detach to the owning
-    /// node's stream task, so remote attachments get the same
-    /// attachment-scoped fencing and enforced credits as local ones.
+    /// streaming RPC. Carries attach input, resize, applied-cursor
+    /// credits, and detach to the owning node's stream task so remote
+    /// attachments get the same fencing and credit-gate enforcement as
+    /// local ones.
     RpcStreamMessage {
         id: String,
         request: serde_json::Value,
@@ -910,26 +913,24 @@ pub struct SessionSummary {
     /// spec).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_color: Option<String>,
-    /// PLAN2 §P2.5: bytes currently retained on disk for this session's
-    /// journal (sealed parts only). `None` for runtimes that never went
-    /// through a checkpointed retention sweep yet (sessions in their
-    /// pre-P2.5 lifetime). Lets the UI distinguish "cap is happily off"
+    /// Bytes currently retained on disk for this session's journal
+    /// (sealed parts only). `None` until the first checkpoint-gated
+    /// sweep has run, so the UI can distinguish "cap is happily off"
     /// from "cap is firing".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_bytes_retained: Option<u64>,
-    /// PLAN2 §P2.5: cumulative count of journal retention sweeps run for
-    /// this session. Increments on every checkpoint (≈ 32 MiB of
-    /// filtered output). 0 means the session is pre-P2.5 / no sweeps
-    /// have occurred yet.
+    /// Cumulative count of journal retention sweeps run for this session.
+    /// Increments on every checkpoint (≈ 32 MiB of filtered output). 0
+    /// means no sweeps have occurred yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_retention_sweeps: Option<u64>,
-    /// PLAN2 §P2.5: cumulative count of sealed incarnations dropped from
-    /// this session's journal across all retention sweeps. Sums over
-    /// retention cycles; does not need to be ≤ `journal_retention_sweeps`
-    /// because pre-checkpoint-bound bursts may drop several at once.
+    /// Cumulative count of sealed incarnations dropped from this
+    /// session's journal across all retention sweeps. May exceed
+    /// `journal_retention_sweeps` when a single sweep drops several
+    /// incarnations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_incarnations_dropped: Option<u64>,
-    /// PLAN2 §P2.5: snapshot of the cap currently in effect (0 = unlimited).
+    /// Snapshot of the cap currently in effect (0 = unlimited).
     /// Mirrors `LimitsConfig::max_journal_bytes_per_session`, atomic-loaded
     /// from the shared `Arc<AtomicU64>` inside the runtime; useful so the
     /// UI can show "capped at X MiB" without reaching back to the config
@@ -1010,7 +1011,6 @@ pub struct PushSubscriptionInput {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PushSubscriptionRecord {
     pub endpoint: String,
     pub p256dh: String,

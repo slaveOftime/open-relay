@@ -16,6 +16,7 @@ pub(super) mod view;
 
 #[allow(unused_imports)] // Preserve the documented client::list_tui API.
 pub(super) use constants::LIST_WINDOW_TITLE;
+#[allow(unused_imports)] // Used by `client::crash` (windows-only); inert on other targets.
 pub(crate) use constants::{TITLE_RESTORE_BYTES, TUI_RESTORE_BYTES};
 pub(super) use runner::run;
 
