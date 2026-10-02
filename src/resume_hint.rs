@@ -187,10 +187,13 @@ mod tests {
         };
         let tail = "agent --resume first\ncodex resume 0199e6e2-b60e-715d-851f-b8713b7064df\nagent --resume second\n";
         assert_eq!(
-            super::detect("agent", tail, &[custom.clone()]).as_deref(),
+            super::detect("agent", tail, std::slice::from_ref(&custom)).as_deref(),
             Some("agent --restore second")
         );
-        assert_eq!(super::detect("codex", tail, &[custom.clone()]), None);
+        assert_eq!(
+            super::detect("codex", tail, std::slice::from_ref(&custom)),
+            None
+        );
         assert_eq!(
             super::detect("codex", tail, &configured_patterns()).as_deref(),
             Some("codex resume 0199e6e2-b60e-715d-851f-b8713b7064df")

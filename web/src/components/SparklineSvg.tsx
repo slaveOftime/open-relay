@@ -283,7 +283,11 @@ export default function SparklineSvg({
       frameRef.current = null
       // Reset above always rebuilds visualStateRef for static modes, so the
       // head helpers can draw the committed snapshot with no scroll offset.
-      drawBody(model.points.map((point) => point.y), model.baselineY, renderWidth)
+      drawBody(
+        model.points.map((point) => point.y),
+        model.baselineY,
+        renderWidth
+      )
       const staticState = visualStateRef.current
       if (staticState) drawHead(staticState, model.lastPoint.y, 0)
       return
@@ -342,10 +346,7 @@ export default function SparklineSvg({
         // now instead of waiting for the next animation-frame bucket check.
         redrawBodyRef.current?.()
         state.headFrom = before
-        state.headTarget = calculateSparklineLastY(
-          carryOpenBucket(next.series),
-          state.height
-        )
+        state.headTarget = calculateSparklineLastY(carryOpenBucket(next.series), state.height)
         state.headChangedAt = now
         state.lastOutputAt = next.lastOutputAt
       }

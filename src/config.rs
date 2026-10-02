@@ -827,8 +827,11 @@ mod tests {
             std::env::temp_dir().join(format!("oly_config_resume_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let config_path = state_dir.join("config.json");
-        std::fs::write(&config_path, r#"{"resume_patterns":[{"program":"agent","pattern":"(","command":"agent $1"}]}"#)
-            .expect("write config");
+        std::fs::write(
+            &config_path,
+            r#"{"resume_patterns":[{"program":"agent","pattern":"(","command":"agent $1"}]}"#,
+        )
+        .expect("write config");
         let mut config = test_config();
         config.paths.state_dir = state_dir.clone();
         assert!(config.try_reload().unwrap_err().contains("invalid regex"));

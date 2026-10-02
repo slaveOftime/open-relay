@@ -1441,8 +1441,9 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
     let tmp = make_tmp_dir("e2e_ws_attach_frames");
     let port = pick_free_port();
     let _daemon = start_daemon_http(&tmp, port);
-    // `cat` echoes input back: send bytes, expect them back in DATA frames.
-    let id = start_session(&tmp, &["cat"]);
+    // Use the platform's stdin-to-stdout utility.
+    let echo_command = if cfg!(windows) { "more" } else { "cat" };
+    let id = start_session(&tmp, &[echo_command]);
 
     let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
     rt.block_on(async {
@@ -1825,7 +1826,17 @@ fn e2e_logs_gates_compose_with_reads_and_json_wait_results() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_logs_ergonomics");
     let _daemon = start_daemon(&tmp);
-    let id = start_session(&tmp, &["sh", "-i"]);
+    // Interactive shell: on Linux/macOS we use `sh -i`, on Windows we
+    // substitute the interactive `cmd /Q` which likewise accepts stdin
+    // lines and echoes command output. The test only relies on the
+    // marker string reaching the journal; the exact interpreter is
+    // irrelevant to its gating assertions.
+    let interactive = if cfg!(target_os = "windows") {
+        vec!["cmd", "/Q"]
+    } else {
+        vec!["sh", "-i"]
+    };
+    let id = start_session(&tmp, &interactive);
     send_line(&tmp, &id, "echo ERGO-MARKER");
     assert!(
         wait_for_log(

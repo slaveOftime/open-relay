@@ -70,11 +70,11 @@ pub fn resolve_state_dir() -> PathBuf {
         if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
             return PathBuf::from(local_app_data).join("oly");
         }
-        return dirs::home_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AppData")
             .join("Local")
-            .join("oly");
+            .join("oly")
     }
 
     #[cfg(target_os = "linux")]

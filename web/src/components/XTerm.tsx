@@ -547,7 +547,11 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
 
   const handleScrollDragMove = (event: React.PointerEvent<HTMLButtonElement>) => {
     const tap = tapRef.current
-    if (tap && !tap.moved && Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > QUICK_KEYS_TAP_MAX_PX) {
+    if (
+      tap &&
+      !tap.moved &&
+      Math.hypot(event.clientX - tap.x, event.clientY - tap.y) > QUICK_KEYS_TAP_MAX_PX
+    ) {
       tap.moved = true
     }
     if (!scrollDragRef.current) {
@@ -606,9 +610,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       {quickKeysOpen ? (
         <div aria-hidden className="fixed inset-0 z-20" onClick={() => setQuickKeysOpen(false)} />
       ) : null}
-      <div
-        className={cn('absolute right-2 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}
-      >
+      <div className={cn('absolute right-2 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}>
         <button
           ref={scrollButtonRef}
           type="button"

@@ -1020,15 +1020,35 @@ mod tests {
         let store = Arc::new(store_with(vec![], make_test_db().await));
         let config = make_test_config(8);
 
-        let make_spec = || StartSpec {
-            title: None,
-            tags: vec![],
-            cmd: "echo".into(),
-            args: vec!["hi".into()],
-            cwd: None,
-            rows: None,
-            cols: None,
-            notifications_enabled: false,
+        // Cross-platform dispatcher: on Linux/macOS `echo` is its own
+        // binary, on Windows it is `cmd.exe`'s built-in. The two paths
+        // exercise identical spawn-blocking timing characteristics,
+        // so we pick whichever matches the host without changing the
+        // intent of the budget assertion below.
+        let make_spec = || {
+            #[cfg(target_os = "windows")]
+            let spec = StartSpec {
+                title: None,
+                tags: vec![],
+                cmd: "cmd".into(),
+                args: vec!["/C".into(), "echo".into(), "hi".into()],
+                cwd: None,
+                rows: None,
+                cols: None,
+                notifications_enabled: false,
+            };
+            #[cfg(not(target_os = "windows"))]
+            let spec = StartSpec {
+                title: None,
+                tags: vec![],
+                cmd: "echo".into(),
+                args: vec!["hi".into()],
+                cwd: None,
+                rows: None,
+                cols: None,
+                notifications_enabled: false,
+            };
+            spec
         };
 
         let single = std::time::Instant::now();
@@ -1398,8 +1418,19 @@ mod tests {
         // sent; the midpoint process-group SIGTERM then ends the session
         // before the final stage comes due. Poll slack: stage 3 is due at
         // 1333ms, midpoint at 1000ms, poll interval 100ms — no race.
+        //
+        // Windows caveat: there is no POSIX SIGTERM equivalent in the
+        // `cfg(unix)` escalation path, so the dummy child keeps running
+        // until the deadline at 2000ms and all three stages get written.
+        // We gate the count assertion to honour the actual platform
+        // behaviour rather than skip the test entirely; the cross-
+        // platform aspect of "every stage is delivered in order" is
+        // still exercised by collecting `writes` first.
         let all = expected_soft_stop_inputs();
+        #[cfg(unix)]
         assert_eq!(writes, all[..all.len() - 1]);
+        #[cfg(not(unix))]
+        assert_eq!(writes, all);
     }
 
     #[tokio::test]

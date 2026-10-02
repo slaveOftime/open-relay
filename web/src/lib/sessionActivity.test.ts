@@ -7,6 +7,8 @@ describe('sessionActivityKey', () => {
       sessionActivityKey('same-id', 'worker-b')
     )
     expect(sessionActivityKey('same-id', null)).toBe(sessionActivityKey('same-id'))
-    expect(sessionActivityKey('same-id', ' worker-a ')).toBe(sessionActivityKey('same-id', 'worker-a'))
+    expect(sessionActivityKey('same-id', ' worker-a ')).toBe(
+      sessionActivityKey('same-id', 'worker-a')
+    )
   })
 })

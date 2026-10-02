@@ -144,7 +144,7 @@ export function agentName(command: string): string {
     python3: 'Python',
     copilot: 'GitHub Copilot',
     pi: 'Pi',
-  wsl: 'WSL',
+    wsl: 'WSL',
   }
   return known[base.toLowerCase()] ?? base
 }

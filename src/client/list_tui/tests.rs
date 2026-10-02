@@ -633,29 +633,6 @@ fn absolute_tree_paths_do_not_create_empty_root_folders() {
     );
 }
 
-fn tree_groups_sessions_under_a_shared_ancestor() {
-    let mut app = App::default();
-    app.replace_sessions(vec![
-        session_at("ls", Some("/work/proj")),
-        session_at("vim", Some("/work/proj/sub")),
-        session_at("build", Some("/home/alice")),
-    ]);
-    let ids = tree_visible_ids(&app);
-    // Top-level folders are the children of the shared ancestor: home
-    // and work. (After stripping the leading `/`, the constructed paths
-    // are relative.)
-    assert!(ids.iter().any(|id| id == "folder:home"), "ids = {ids:?}");
-    assert!(ids.iter().any(|id| id == "folder:work"), "ids = {ids:?}");
-    // Sessions render after their enclosing folder chain.
-    assert!(ids.contains(&"ls".to_string()), "ids = {ids:?}");
-    assert!(ids.contains(&"build".to_string()), "ids = {ids:?}");
-    // `vim` lives under work/proj/sub, past the depth-2 horizon.
-    assert!(
-        !ids.contains(&"vim".to_string()),
-        "vim should sit past auto-depth: {ids:?}"
-    );
-}
-
 #[test]
 fn tree_arrow_keys_move_tree_cursor_only() {
     let mut app = App::default();

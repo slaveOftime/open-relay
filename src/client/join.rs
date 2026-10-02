@@ -126,7 +126,7 @@ pub fn build_join_config(
             ))
         })?;
     }
-    let api_key = key.and_then(|k| if k.is_empty() { None } else { Some(k) });
+    let api_key = key.and_then(|k| (!k.is_empty()).then_some(k));
     Ok(JoinConfig {
         name,
         primary_url: url,
