@@ -69,7 +69,7 @@ export default function SessionActionConfirmDialog({
               Cancel
             </AlertDialogCancel>
             <AlertDialogAction
-              className={cn(buttonVariants({ variant: action, size: 'sm' }))}
+              className={`${cn(buttonVariants({ variant: action, size: 'sm' }))} bg-amber-600 !text-white`}
               onClick={() => {
                 if (action) onConfirm(action)
               }}

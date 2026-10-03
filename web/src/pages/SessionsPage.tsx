@@ -338,7 +338,7 @@ function SessionNotificationButton({
     <Tooltip>
       <TooltipTrigger asChild>
         <Button
-          variant={enabled ? 'link' : 'ghost'}
+          variant="ghost"
           size="icon"
           aria-label={label}
           disabled={disabled || pending}
@@ -877,8 +877,7 @@ const SessionCard = memo(function SessionCard({
 
         {/* Action bar */}
         <CardFooter
-          data-node-swipe-ignore
-          className="flex items-center gap-1 px-2 py-1 overflow-x-auto"
+          className={`flex items-center ${isRunning ? 'flex-row-reverse' : ''} gap-1 px-2 py-1 overflow-x-auto`}
           onClick={(e) => e.stopPropagation()}
         >
           {isRunning && (
