@@ -537,9 +537,27 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     }
   }
 
+  /**
+   * Release the soft keyboard before a control-cluster gesture.
+   *
+   * `handleScrollDragStart` calls `preventDefault()`, so the handle never takes
+   * focus itself and xterm's textarea keeps `document.activeElement` after the
+   * keyboard is dismissed. Mobile browsers then re-show the IME for that
+   * still-focused field on the very next tap — including taps meant for the
+   * scroll handle. Blurring up front keeps the drag keyboard-free; tapping the
+   * terminal again restores focus.
+   */
+  const blurTerminalKeyboard = () => {
+    const term = termRef.current
+    if (term?.textarea && document.activeElement === term.textarea) {
+      term.blur()
+    }
+  }
+
   const handleScrollDragStart = (event: React.PointerEvent<HTMLButtonElement>) => {
     event.preventDefault()
     event.stopPropagation()
+    blurTerminalKeyboard()
     event.currentTarget.setPointerCapture(event.pointerId)
     tapRef.current = { x: event.clientX, y: event.clientY, startedAt: Date.now(), moved: false }
     beginScrollDrag(event.clientY)
@@ -631,6 +649,8 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         onPointerMove={(event) => event.stopPropagation()}
         onPointerUp={(event) => event.stopPropagation()}
         onPointerCancel={(event) => event.stopPropagation()}
+        onTouchStart={(event) => event.stopPropagation()}
+        onTouchEnd={(event) => event.stopPropagation()}
       >
         <button
           ref={scrollButtonRef}
