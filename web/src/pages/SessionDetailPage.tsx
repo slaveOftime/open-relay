@@ -75,6 +75,11 @@ import {
   useLiveSessionSummary,
   useReconcileTrigger,
 } from '@/lib/sessionEvents'
+import {
+  PENDING_TERMINATION_STATUS,
+  withPendingTermination,
+  type SessionTermination,
+} from './session-termination'
 
 function isSessionRunning(session: SessionSummary | null): boolean {
   return session
@@ -152,6 +157,7 @@ function SessionDetailPageContent() {
   const [wsEverConnected, setWsEverConnected] = useState(false)
   const [wsReconnectKey, setWsReconnectKey] = useState(0)
   const [wsError, setWsError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [connectTraceOpen, setConnectTraceOpen] = useState(false)
   const [connectTrace, setConnectTrace] = useState<string[]>([])
   const [exitCode, setExitCode] = useState<number | null | undefined>(undefined)
@@ -513,6 +519,11 @@ function SessionDetailPageContent() {
     setPrevLiveSession(liveSession)
     if (liveSession) {
       setSession((current) => (current === liveSession ? current : liveSession))
+      // A terminate error only stays truthful while the session is alive: if
+      // the daemon finished it anyway, the lost response was not a lost stop.
+      if (actionError !== null && !isSessionRunning(liveSession)) {
+        setActionError(null)
+      }
     }
   }
 
@@ -1325,19 +1336,48 @@ function SessionDetailPageContent() {
     setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
   }
 
-  async function handleStop() {
-    if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => {})
-    fetchSession(id, node ?? undefined)
-      .then((s) => {
-        ingestSessionSummary(s)
-        if (isMounted.current) setSession(s)
-      })
-      .catch(() => {})
-  }
-  async function handleKill() {
-    if (!id) return
-    await killSession(id, node ?? undefined).catch(() => {})
+  // Stop/Kill paint their result optimistically. The daemon moves the runtime to
+  // `stopping` immediately but only publishes a summary once the whole grace
+  // window has elapsed, so waiting for the request to answer would leave the
+  // header reading `running` for up to `stop_grace_seconds`.
+  async function runTermination(action: SessionTermination) {
+    if (!id || !session) return
+    const pending = withPendingTermination(session)
+    // Already stopping or finished: re-sending would restart the daemon's
+    // escalation schedule and push the kill deadline further out.
+    if (!pending) return
+
+    const previous = session
+    setActionError(null)
+    setSession(pending)
+
+    try {
+      if (action === 'stop') {
+        await stopSession(id, undefined, node ?? undefined)
+      } else {
+        await killSession(id, node ?? undefined)
+      }
+    } catch (error) {
+      // Only revert if nothing authoritative landed in the meantime: the
+      // `session_updated` mirror would otherwise immediately overwrite it.
+      if (isMounted.current) {
+        setSession((current) =>
+          current?.status === PENDING_TERMINATION_STATUS ? previous : current
+        )
+        setActionError(
+          `Failed to ${action} session: ${
+            error instanceof Error && error.message.trim() !== ''
+              ? error.message.trim()
+              : 'the request did not reach the daemon.'
+          }`
+        )
+      }
+      return
+    }
+
+    if (!isMounted.current) return
+    // A failed refresh must not undo a stop that already succeeded; the next
+    // `session_updated` still carries the authoritative status.
     fetchSession(id, node ?? undefined)
       .then((s) => {
         ingestSessionSummary(s)
@@ -1630,6 +1670,14 @@ function SessionDetailPageContent() {
         )}
 
         {wsError && <div className="text-sm text-[hsl(var(--destructive))]">{wsError}</div>}
+        {actionError && (
+          <div className="flex items-center gap-2 text-sm text-[hsl(var(--destructive))]">
+            <span className="min-w-0 flex-1">{actionError}</span>
+            <Button size="sm" variant="ghost" onClick={() => setActionError(null)}>
+              Dismiss
+            </Button>
+          </div>
+        )}
 
         {/* ── Main body ── */}
         <ScrollArea type={isAttachPanelOpen ? 'always' : 'auto'} className="min-h-0 flex-1">
@@ -1827,8 +1875,8 @@ function SessionDetailPageContent() {
           action={pendingAction}
           sessionId={id ?? ''}
           onConfirm={(action) => {
-            if (action === 'stop') void handleStop()
-            else void handleKill()
+            if (action === 'stop') void runTermination('stop')
+            else void runTermination('kill')
           }}
           onClose={() => setPendingAction(null)}
         />

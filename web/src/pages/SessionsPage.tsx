@@ -8,6 +8,7 @@ import {
   isSessionSortField,
   isSortOrder,
   type SessionSummary,
+  type SessionStatus,
   type SessionStatusFilter,
   type NodeSummary,
 } from '@/api/types'
@@ -48,6 +49,12 @@ import {
   shouldRefreshOnPull,
   swipeDragOffset,
 } from './sessions-node-swipe'
+import {
+  revertSessionStatus,
+  withPendingTermination,
+  withSessionStatus,
+  type SessionTermination,
+} from './session-termination'
 import { NodeSelector } from '@/components/NodeSelector'
 import { agentName, formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
 import {
@@ -475,8 +482,8 @@ const SessionRow = memo(function SessionRow({
   session: SessionSummary
   animateIn?: boolean
   pinned?: boolean
-  onStop: (id: string) => void
-  onKill: (id: string) => void
+  onStop: (session: SessionSummary) => void
+  onKill: (session: SessionSummary) => void
   onToggleNotifications: (session: SessionSummary) => void
   onTogglePin: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
@@ -724,8 +731,8 @@ const SessionRow = memo(function SessionRow({
         action={pendingAction}
         sessionId={session.id}
         onConfirm={(action) => {
-          if (action === 'stop') onStop(session.id)
-          else onKill(session.id)
+          if (action === 'stop') onStop(session)
+          else onKill(session)
         }}
         onClose={() => setPendingAction(null)}
       />
@@ -753,8 +760,8 @@ const SessionCard = memo(function SessionCard({
   session: SessionSummary
   animateIn?: boolean
   pinned?: boolean
-  onStop: (id: string) => void
-  onKill: (id: string) => void
+  onStop: (session: SessionSummary) => void
+  onKill: (session: SessionSummary) => void
   onToggleNotifications: (session: SessionSummary) => void
   onTogglePin: (session: SessionSummary) => void
   onRunAgain: (session: SessionSummary) => void
@@ -941,8 +948,8 @@ const SessionCard = memo(function SessionCard({
         action={pendingAction}
         sessionId={session.id}
         onConfirm={(action) => {
-          if (action === 'stop') onStop(session.id)
-          else onKill(session.id)
+          if (action === 'stop') onStop(session)
+          else onKill(session)
         }}
         onClose={() => setPendingAction(null)}
       />
@@ -1109,6 +1116,10 @@ export default function SessionsPage() {
       next[index] = { ...next[index], notifications_enabled: enabled }
       return next
     })
+  }, [])
+
+  const setLoadedSessionStatus = useCallback((sessionId: string, status: SessionStatus) => {
+    setSessions((prev) => withSessionStatus(prev, sessionId, status))
   }, [])
 
   const loadLocal = useCallback(
@@ -1650,20 +1661,55 @@ export default function SessionsPage() {
     void reloadSessions({ background: true })
   }
 
-  const handleStop = useCallback(
-    async (id: string) => {
-      await stopSession(id, undefined, selectedNode ?? undefined).catch(() => {})
+  // Stop/Kill paint their result optimistically. The daemon moves the runtime
+  // to `stopping` immediately but only publishes a summary once the whole
+  // grace window has elapsed, so an authoritative-only row would keep reading
+  // `running` for up to `stop_grace_seconds` after the user confirmed.
+  const runTermination = useCallback(
+    async (action: SessionTermination, session: SessionSummary) => {
+      const pending = withPendingTermination(session)
+      // Already stopping or finished: re-sending would restart the daemon's
+      // escalation schedule and push the kill deadline further out.
+      if (!pending) return
+
+      const previousStatus = session.status
+      setLoadedSessionStatus(session.id, pending.status)
+
+      try {
+        if (action === 'stop') {
+          await stopSession(session.id, undefined, selectedNode ?? undefined)
+        } else {
+          await killSession(session.id, selectedNode ?? undefined)
+        }
+      } catch (error) {
+        // Roll back only while the row still shows the status we claimed; a
+        // `session_updated` that arrived meanwhile stays authoritative.
+        setSessions((prev) =>
+          revertSessionStatus(prev, session.id, pending.status, previousStatus)
+        )
+        setLoadError({
+          title: action === 'stop' ? 'Failed to stop session' : 'Failed to kill session',
+          message: getErrorMessage(error, `Failed to ${action} session.`),
+        })
+        return
+      }
+
+      // A remote node does not stream its own summaries here, so re-pull the
+      // page once the request settles. Local rows reconcile through the shared
+      // `session_updated` event.
       if (selectedNode) void loadRemote()
     },
-    [loadRemote, selectedNode]
+    [loadRemote, selectedNode, setLoadedSessionStatus]
+  )
+
+  const handleStop = useCallback(
+    (session: SessionSummary) => runTermination('stop', session),
+    [runTermination]
   )
 
   const handleKill = useCallback(
-    async (id: string) => {
-      await killSession(id, selectedNode ?? undefined).catch(() => {})
-      if (selectedNode) void loadRemote()
-    },
-    [loadRemote, selectedNode]
+    (session: SessionSummary) => runTermination('kill', session),
+    [runTermination]
   )
 
   const handleToggleNotifications = useCallback(
