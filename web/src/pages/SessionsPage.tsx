@@ -620,7 +620,7 @@ const SessionRow = memo(function SessionRow({
       case 'actions':
         return (
           <TableCell key={columnKey} className="px-3 py-1" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-1">
+            <div className="flex items-center gap-1 overflow-x-auto">
               {isRunning && (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -700,7 +700,7 @@ const SessionRow = memo(function SessionRow({
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
-                    variant="destructive"
+                    variant="stop"
                     size="icon"
                     className="shrink-0"
                     onClick={() => onRequestDelete(session)}
@@ -791,7 +791,7 @@ const SessionCard = memo(function SessionCard({
     <Tooltip>
       <TooltipTrigger asChild>
         <Button
-          variant="kill"
+          variant="stop"
           size="icon"
           className="shrink-0"
           onClick={() => onRequestDelete(session)}
@@ -1949,15 +1949,6 @@ export default function SessionsPage() {
               />
             )}
             <div className="flex-1 min-w-0" />
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={() => void reloadSessions({ background: false })}
-              disabled={loading || refreshing}
-              aria-label="Refresh sessions"
-            >
-              <ReloadIcon className="h-4 w-4" />
-            </Button>
             <Button
               variant="ghost"
               size="icon"
