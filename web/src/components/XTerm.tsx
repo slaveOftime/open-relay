@@ -6,6 +6,7 @@ import { hasTransferredFiles } from './ui/file-transfer'
 import { cn } from '@/lib/utils'
 import QuickKeysMenu from './terminal/QuickKeysMenu'
 import QuickKeysDialog from './terminal/QuickKeysDialog'
+import { markOwnedTerminalWheel } from './terminal/scroll-wheel'
 import type { QuickKey } from './terminal/quick-keys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
@@ -110,16 +111,18 @@ function emitTerminalWheel(
     element.querySelector('.xterm-screen') ??
     element
   const rect = target.getBoundingClientRect()
-  target.dispatchEvent(
-    new WheelEvent('wheel', {
-      deltaY,
-      deltaMode,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-      bubbles: true,
-      cancelable: true,
-    })
-  )
+  const event = new WheelEvent('wheel', {
+    deltaY,
+    deltaMode,
+    clientX: rect.left + rect.width / 2,
+    clientY: rect.top + rect.height / 2,
+    bubbles: true,
+    cancelable: true,
+  })
+  // Flag it so listeners on the terminal container (e.g. the logs replay
+  // scrubber, which runs in the capture phase) ignore our own scrolling.
+  markOwnedTerminalWheel(event)
+  target.dispatchEvent(event)
 }
 
 export interface XTermHandle {
@@ -538,26 +541,28 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   }
 
   /**
-   * Release the soft keyboard before a control-cluster gesture.
+   * Park DOM focus on the scroll handle instead of xterm's textarea.
    *
-   * `handleScrollDragStart` calls `preventDefault()`, so the handle never takes
-   * focus itself and xterm's textarea keeps `document.activeElement` after the
-   * keyboard is dismissed. Mobile browsers then re-show the IME for that
-   * still-focused field on the very next tap — including taps meant for the
-   * scroll handle. Blurring up front keeps the drag keyboard-free; tapping the
-   * terminal again restores focus.
+   * Touching the handle must not raise the soft keyboard. xterm keeps its
+   * hidden textarea focused, and mobile browsers re-show the IME for that
+   * still-focused field on the next tap — even one aimed at our own controls.
+   * The handle is a plain button, so focusing it releases the textarea (and the
+   * keyboard with it) without any viewport guessing.
+   *
+   * Returns whether the handle actually took focus. It is `md:hidden`, so on
+   * desktop the call is a no-op and callers fall back to the terminal.
    */
-  const blurTerminalKeyboard = () => {
-    const term = termRef.current
-    if (term?.textarea && document.activeElement === term.textarea) {
-      term.blur()
-    }
+  const focusScrollButton = () => {
+    const button = scrollButtonRef.current
+    if (!button) return false
+    button.focus({ preventScroll: true })
+    return document.activeElement === button
   }
 
   const handleScrollDragStart = (event: React.PointerEvent<HTMLButtonElement>) => {
     event.preventDefault()
     event.stopPropagation()
-    blurTerminalKeyboard()
+    focusScrollButton()
     event.currentTarget.setPointerCapture(event.pointerId)
     tapRef.current = { x: event.clientX, y: event.clientY, startedAt: Date.now(), moved: false }
     beginScrollDrag(event.clientY)
@@ -615,7 +620,10 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     if (!term) return
     // input() routes through term.onData — the same path as typed keys.
     term.input(key.data)
-    if (onDataRef.current) term.focus()
+    // Park focus on the handle: the command is already sent, and re-raising
+    // the keyboard for every tap is not what the ring is for. The handle is
+    // md:hidden, so desktop falls back to focusing the terminal.
+    if (!focusScrollButton() && onDataRef.current) term.focus()
   }
 
   return (
@@ -636,21 +644,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
           }}
         />
       ) : null}
-      {/*
-        Guard for the whole control cluster: the scroll handle and every
-        quick-keys ring button live here, so swallow click/pointer events
-        after they finish locally — taps must not bubble into the terminal
-        area, page handlers, or document-level dismiss layers above us.
-      */}
       <div
+        data-terminal-scroll-controls
         className={cn('absolute right-5 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}
-        onClick={(event) => event.stopPropagation()}
-        onPointerDown={(event) => event.stopPropagation()}
-        onPointerMove={(event) => event.stopPropagation()}
-        onPointerUp={(event) => event.stopPropagation()}
-        onPointerCancel={(event) => event.stopPropagation()}
-        onTouchStart={(event) => event.stopPropagation()}
-        onTouchEnd={(event) => event.stopPropagation()}
       >
         <button
           ref={scrollButtonRef}
@@ -677,7 +673,17 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
           onCustomize={() => setQuickKeysDialogOpen(true)}
         />
       </div>
-      <QuickKeysDialog open={quickKeysDialogOpen} onOpenChange={setQuickKeysDialogOpen} />
+      <QuickKeysDialog
+        open={quickKeysDialogOpen}
+        onOpenChange={(open) => {
+          setQuickKeysDialogOpen(open)
+          if (open) return
+          // Radix restores focus to whatever opened the dialog on close; the
+          // scroll handle is the only sensible target and keeps the keyboard
+          // down. Defer a frame so this wins over that restore.
+          requestAnimationFrame(() => focusScrollButton())
+        }}
+      />
     </div>
   )
 })

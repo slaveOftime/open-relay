@@ -25,6 +25,7 @@ import StatusBadge from '@/components/StatusBadge'
 import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/SessionActivitySparkline'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
+import { isOwnedTerminalWheel } from '@/components/terminal/scroll-wheel'
 import Logo from '@/components/Logo'
 import NewSessionDialog from '@/components/NewSessionDialog'
 import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
@@ -628,6 +629,11 @@ function SessionDetailPageContent() {
     const el = termContainerRef.current
     if (!el || mode !== 'logs') return
     const handleWheel = (e: WheelEvent) => {
+      // The mobile scroll handle owns its gestures: the real wheel is captured
+      // here before the handle can stop it, and the synthetic wheels it emits
+      // scroll the terminal directly. Either way this scrubber must not also
+      // step — that would jump the replay while the log is being scrolled.
+      if (isOwnedTerminalWheel(e)) return
       if (e.deltaY < 0 && replayIdxRef.current > 0) {
         const step = e.shiftKey ? 50 : 10
         void stepReplayRef.current?.(-step)
