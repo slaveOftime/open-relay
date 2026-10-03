@@ -601,7 +601,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   }
 
   return (
-    <div className={cn('relative', className)}>
+    <div className={`${cn('relative', className)}`}>
       <div
         ref={containerRef}
         className="h-full w-full"
@@ -610,7 +610,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       {quickKeysOpen ? (
         <div aria-hidden className="fixed inset-0 z-20" onClick={() => setQuickKeysOpen(false)} />
       ) : null}
-      <div className={cn('absolute right-2 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}>
+      <div className={cn('absolute right-5 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}>
         <button
           ref={scrollButtonRef}
           type="button"

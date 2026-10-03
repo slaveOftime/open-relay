@@ -1633,10 +1633,15 @@ function SessionDetailPageContent() {
 
         {/* ── Main body ── */}
         <ScrollArea type={isAttachPanelOpen ? 'always' : 'auto'} className="min-h-0 flex-1">
-          <div
-            id="main-container"
-            className={`h-full ${isAttachPanelOpen ? 'overflow-y-visible' : 'overflow-y-hidden'} sm:flex sm:overflow-y-hidden`}
-          >
+          {/*
+            The ScrollArea viewport owns vertical scrolling here. Keep both
+            axes `visible` on mobile so the open drawer's overflow propagates up
+            to the Radix viewport; setting only one axis to `hidden` would make
+            the other compute `auto` and turn this element into a second,
+            redundant scroll container. On sm+ the panel is a fixed sidebar, so
+            clip instead of scroll.
+          */}
+          <div id="main-container" className="h-full sm:flex sm:overflow-hidden">
             {/* Terminal area */}
             <div
               className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
@@ -1647,7 +1652,7 @@ function SessionDetailPageContent() {
               />
               <div
                 ref={termContainerRef}
-                className="flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full overflow-x-auto"
+                className={`flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full ${mode === 'attach' ? "overflow-clip" : "overflow-x-auto"}`}
               >
                 <XTerm
                   key={mode === 'logs' ? `logs-${logsView}` : mode}
@@ -1663,7 +1668,7 @@ function SessionDetailPageContent() {
                         }
                       : undefined
                   }
-                  className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
+                  className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full -mr-3.5 md:mr-0' : 'w-500'}`}
                 />
               </div>
 
