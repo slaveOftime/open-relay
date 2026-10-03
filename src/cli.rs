@@ -195,7 +195,9 @@ impl ListStatus {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Filter by title or ID substring (case-insensitive).
+    /// Filter sessions: a bare substring matches id, title, tags, command,
+    /// args, or cwd (case-insensitive). `id:`, `title:`, `tag:`, `cmd:`,
+    /// `args:`, and `cwd:` scope a term to one field. Terms are ANDed.
     #[arg(long)]
     pub search: Option<String>,
     /// Only show sessions containing these tags (repeatable).

@@ -1955,7 +1955,8 @@ export default function SessionsPage() {
               <div className="relative">
                 <Input
                   className={search ? 'pr-8' : undefined}
-                  placeholder="Search sessions…"
+                  placeholder="Search cmd, cwd, title…"
+                  aria-label="Search sessions by id, title, command, or working directory"
                   value={search}
                   onChange={(e) => {
                     setSearch(e.target.value)
@@ -2059,7 +2060,8 @@ export default function SessionsPage() {
             <div className="relative w-48">
               <Input
                 className={search ? 'h-8 w-full pr-8 text-sm' : 'h-8 w-full text-sm'}
-                placeholder="Search sessions…"
+                placeholder="Search cmd, cwd, title…"
+                aria-label="Search sessions by id, title, command, or working directory"
                 value={search}
                 onChange={(e) => {
                   setSearch(e.target.value)

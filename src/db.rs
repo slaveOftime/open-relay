@@ -19,6 +19,40 @@ pub struct Database {
     sessions_dir: PathBuf,
 }
 
+/// Fields a `field:value` search term can scope to (see
+/// [`Database::push_search_filter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchField {
+    Id,
+    Title,
+    Tags,
+    Command,
+    Args,
+    Cwd,
+}
+
+impl SearchField {
+    /// Resolve a `field:` prefix (case-insensitive). Returns `None` for
+    /// unknown prefixes or bare terms so Windows paths such as `C:\src`
+    /// stay broad rather than being read as a scope.
+    fn from_prefix(prefix: &str) -> Option<Self> {
+        match prefix.trim().to_ascii_lowercase().as_str() {
+            "id" => Some(Self::Id),
+            "title" => Some(Self::Title),
+            "tag" | "tags" => Some(Self::Tags),
+            "cmd" | "command" => Some(Self::Command),
+            "arg" | "args" => Some(Self::Args),
+            "cwd" => Some(Self::Cwd),
+            _ => None,
+        }
+    }
+}
+
+/// SQL `LIKE` needle for a case-insensitive substring match.
+fn like_needle(value: &str) -> String {
+    format!("%{}%", value.trim().to_ascii_lowercase())
+}
+
 impl Database {
     fn push_list_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, query: &ListQuery) {
         for tag in &query.tags {
@@ -47,18 +81,91 @@ impl Database {
         }
 
         if let Some(search) = query.search.as_deref() {
-            let needle = format!("%{}%", search.to_ascii_lowercase());
-            qb.push(" AND (LOWER(id) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(COALESCE(title,'')) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(COALESCE(tags,'')) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(command) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(args) LIKE ");
-            qb.push_bind(needle);
-            qb.push(")");
+            Self::push_search_filter(qb, search);
+        }
+    }
+
+    /// Apply the `search` box as whitespace-separated, ANDed terms.
+    ///
+    /// A term of the form `field:value` scopes the match to one column
+    /// (`cmd:python`, `cwd:api`); any other term matches the broad field set
+    /// — id, title, tags, command, args and cwd — so a plain query finds a
+    /// session by its command or its working directory. Prefixes are
+    /// case-insensitive; an unknown prefix (or a Windows path such as
+    /// `C:\src`) is treated as a bare term. A scoped term with an empty value
+    /// (`cmd:`) is ignored so typing a prefix mid-edit never blanks the list.
+    fn push_search_filter(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, search: &str) {
+        for term in search.split_whitespace() {
+            if let Some((prefix, value)) = term.split_once(':') {
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                if let Some(field) = SearchField::from_prefix(prefix) {
+                    Self::push_scoped_search(qb, field, value);
+                    continue;
+                }
+            }
+            Self::push_broad_search(qb, term);
+        }
+    }
+
+    /// The union of columns a bare search term matches. Mirrors the fields
+    /// the CLI list view indexes client-side (`session_search_text`), so the
+    /// server-filtered and client-filtered results stay in step.
+    fn push_broad_search(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, term: &str) {
+        let needle = like_needle(term);
+        qb.push(" AND (LOWER(id) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(COALESCE(title,'')) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(COALESCE(tags,'')) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(command) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(args) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(COALESCE(cwd,'')) LIKE ");
+        qb.push_bind(needle);
+        qb.push(")");
+    }
+
+    fn push_scoped_search(
+        qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+        field: SearchField,
+        value: &str,
+    ) {
+        let needle = like_needle(value);
+        match field {
+            SearchField::Id => {
+                qb.push(" AND LOWER(id) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Title => {
+                qb.push(" AND LOWER(COALESCE(title,'')) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Tags => {
+                qb.push(" AND LOWER(COALESCE(tags,'')) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Cwd => {
+                qb.push(" AND LOWER(COALESCE(cwd,'')) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Args => {
+                qb.push(" AND LOWER(args) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Command => {
+                // `cmd:` covers the program and its arguments, matching the
+                // command cell the web table renders.
+                qb.push(" AND (LOWER(command) LIKE ");
+                qb.push_bind(needle.clone());
+                qb.push(" OR LOWER(args) LIKE ");
+                qb.push_bind(needle);
+                qb.push(")");
+            }
         }
     }
 
@@ -701,6 +808,101 @@ mod tests {
             foreground_color: None,
             background_color: None,
         }
+    }
+    async fn insert_search_fixture(db: &Database) {
+        let mut python = meta("sess-python", SessionStatus::Stopped, Some(Utc::now()));
+        python.command = "python".to_string();
+        python.args = vec!["-m".to_string(), "http.server".to_string()];
+        python.cwd = Some("C:/work/api-server".to_string());
+        python.title = Some("API dev".to_string());
+        python.tags = vec!["backend".to_string()];
+        db.insert_session(&python).await.expect("insert python");
+
+        let mut node = meta("sess-node", SessionStatus::Running, None);
+        node.command = "node".to_string();
+        node.args = vec!["server.js".to_string()];
+        node.cwd = Some("C:/work/web-ui".to_string());
+        node.title = Some("Web dev".to_string());
+        node.tags = vec!["frontend".to_string()];
+        db.insert_session(&node).await.expect("insert node");
+    }
+
+    async fn search_ids(db: &Database, search: &str) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .list_summaries(&ListQuery {
+                search: Some(search.to_string()),
+                tags: vec![],
+                statuses: vec![],
+                since: None,
+                until: None,
+                limit: 50,
+                offset: 0,
+                sort: crate::protocol::ListSortField::CreatedAt,
+                order: crate::protocol::SortOrder::Asc,
+            })
+            .await
+            .expect("list summaries")
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn search_matches_command_and_cwd() {
+        let db = open_test_db().await;
+        insert_search_fixture(&db).await;
+
+        // Command substring (the program, and separately its arguments).
+        assert_eq!(search_ids(&db, "python").await, vec!["sess-python"]);
+        assert_eq!(search_ids(&db, "server.js").await, vec!["sess-node"]);
+        // Working-directory substring, the field the search box previously
+        // could not reach.
+        assert_eq!(search_ids(&db, "web-ui").await, vec!["sess-node"]);
+        assert_eq!(search_ids(&db, "work/api").await, vec!["sess-python"]);
+        // A bare term still spans every indexed column.
+        assert_eq!(
+            search_ids(&db, "work").await,
+            vec!["sess-node", "sess-python"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_search_restricts_to_one_field() {
+        let db = open_test_db().await;
+        insert_search_fixture(&db).await;
+
+        // `dev` only appears in titles.
+        assert_eq!(
+            search_ids(&db, "title:dev").await,
+            vec!["sess-node", "sess-python"]
+        );
+        assert_eq!(search_ids(&db, "title:web").await, vec!["sess-node"]);
+        // `cmd:` covers command + args, not cwd.
+        assert_eq!(search_ids(&db, "cmd:python").await, vec!["sess-python"]);
+        assert_eq!(search_ids(&db, "cmd:http.server").await, vec!["sess-python"]);
+        // `cwd:` scopes to the working directory only.
+        assert_eq!(search_ids(&db, "cwd:web").await, vec!["sess-node"]);
+        assert_eq!(search_ids(&db, "cwd:C:/work").await.len(), 2);
+        // Terms are ANDed.
+        assert_eq!(search_ids(&db, "cwd:work cmd:node").await, vec!["sess-node"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_search_falls_back_for_unknown_prefixes_and_empty_values() {
+        let db = open_test_db().await;
+        insert_search_fixture(&db).await;
+
+        // An unknown prefix is a plain substring, not a scope.
+        assert!(search_ids(&db, "nope:python").await.is_empty());
+        // An empty scoped value is ignored rather than matching nothing.
+        assert_eq!(
+            search_ids(&db, "cmd:").await,
+            vec!["sess-node", "sess-python"]
+        );
+        // Windows drive paths are not mistaken for a scope.
+        assert_eq!(search_ids(&db, "C:/work/web-ui").await, vec!["sess-node"]);
     }
 
     #[tokio::test]

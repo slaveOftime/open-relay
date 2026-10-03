@@ -273,6 +273,31 @@ The SSE endpoint keeps the view current rather than mirroring the database:
   with backoff and receive a fresh `stream_ready`. Missing events never imply a
   session deletion.
 
+## Session listing and search
+
+`GET /api/sessions` (and the `oly ls` / TUI baseline query) share one filter
+implementation — `Database::push_list_filters` in `src/db.rs` — so the web
+list, the CLI's server-side query, and the TUI's follow-mode baseline agree on
+what "matches". The web search box and `oly ls --search` send the same
+`ListQuery.search` string.
+
+- The query is whitespace-split into ANDed terms.
+- A **bare** term matches the union of `id`, `title`, `tags`, `command`,
+  `args`, and `cwd`, so a session is findable by the command it runs *and* the
+  directory it runs in. (The web placeholder surfaces `cmd`/`cwd`.)
+- A `field:value` term scopes to one column: `id`, `title`, `tag`/`tags`,
+  `cmd`/`command` (command **or** args, matching the rendered command cell),
+  `args`, and `cwd`. Prefixes are case-insensitive; an unknown prefix — and a
+  Windows drive path such as `C:\src` — stays a bare term so a colon never
+  surprises the user. A scoped term with an empty value (`cmd:`) is ignored so
+  typing a prefix mid-edit never blanks the list.
+- Remote lists proxy the same filter to the owning node; the primary only adds
+  the `node` tag on the way back (`tag_sessions_with_node`).
+
+The CLI list view keeps a parallel client-side index
+(`session_search_text`, `src/client/list_tui/app.rs`) over the same field set,
+so follow-mode filtering stays in step with the server-side query.
+
 ## Documents
 
 - `README.md` — what oly is and how to use it.
