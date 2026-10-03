@@ -29,3 +29,33 @@
   font-style: italic;
   font-display: swap;
 }
+
+/*
+ * Monospaced symbol fallback for the terminal.
+ *
+ * Stock JetBrains Mono (above) covers Latin, box drawing and a few symbols but
+ * not the ranges tools actually print: Misc Technical (U+23F5 ⏵, U+23F8 ⏸),
+ * Braille spinners (U+2819 ⠙), dingbats (U+2713 ✓, U+273B ✻) and geometric
+ * shapes (U+25CB ○, U+25D0 ◐). Nerd Fonts' builds do not add those either - it
+ * patches icons, not these blocks - so left alone they fall through to whatever
+ * the OS happens to have: Windows font-links Segoe UI Symbol and renders them
+ * (proportionally), while phones have nothing and draw tofu.
+ *
+ * This is Noto Sans Symbols 2 (OFL, see NotoSansSymbols2-OFL.txt) subset to
+ * exactly those blocks, with every glyph scaled to the JetBrains Mono cell
+ * (600/1000 em) and given that advance. One symbol per cell, same on every
+ * platform. No `unicode-range` is declared on purpose: the subset physically
+ * contains nothing else, and CSS fallback already gives a character to the
+ * first family in the stack that has a glyph - so JetBrains Mono keeps winning
+ * every character it owns. (It also dodges a minifier that corrupts
+ * `unicode-range` values, turning U+23FF into U+23??.)
+ */
+@font-face {
+  font-family: 'Open Relay Terminal Symbols';
+  src: url('../assets/fonts/OpenRelayTerminalSymbols.woff2') format('woff2');
+  /* One static face covers all four styles; the browser synthesises bold and
+     italic, which suits symbols and halves the payload. */
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
