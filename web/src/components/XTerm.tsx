@@ -608,9 +608,30 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         style={{ overflow: 'hidden', touchAction: 'none' }}
       />
       {quickKeysOpen ? (
-        <div aria-hidden className="fixed inset-0 z-20" onClick={() => setQuickKeysOpen(false)} />
+        <div
+          aria-hidden
+          className="fixed inset-0 z-20"
+          onClick={(event) => {
+            // Dismiss layer: only close the ring, never reach page handlers.
+            event.stopPropagation()
+            setQuickKeysOpen(false)
+          }}
+        />
       ) : null}
-      <div className={cn('absolute right-5 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}>
+      {/*
+        Guard for the whole control cluster: the scroll handle and every
+        quick-keys ring button live here, so swallow click/pointer events
+        after they finish locally — taps must not bubble into the terminal
+        area, page handlers, or document-level dismiss layers above us.
+      */}
+      <div
+        className={cn('absolute right-5 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}
+        onClick={(event) => event.stopPropagation()}
+        onPointerDown={(event) => event.stopPropagation()}
+        onPointerMove={(event) => event.stopPropagation()}
+        onPointerUp={(event) => event.stopPropagation()}
+        onPointerCancel={(event) => event.stopPropagation()}
+      >
         <button
           ref={scrollButtonRef}
           type="button"
@@ -620,6 +641,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
           onPointerMove={handleScrollDragMove}
           onPointerUp={handleScrollDragEnd}
           onPointerCancel={handleScrollDragEnd}
+          onClick={(event) => event.stopPropagation()}
           onContextMenu={(event) => event.preventDefault()}
           className={cn(
             'relative flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] shadow-lg transition-opacity md:hidden',
