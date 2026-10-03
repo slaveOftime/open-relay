@@ -1401,14 +1401,14 @@ function SessionDetailPageContent() {
     <TooltipProvider>
       <div className="flex h-screen w-full min-w-0 flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] supports-[height:100dvh]:h-dvh">
         {/* ── Header ── */}
-        <header className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
+        <header className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
               <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
-          <div className="flex items-center gap-3 min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <button
               className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold truncate hover:text-[hsl(var(--primary))] transition-colors"
               onClick={() => setShowMetadataDialog(true)}
