@@ -125,7 +125,8 @@ import {
 } from '@/lib/sessionEvents'
 const PREFS_KEY = 'open-relay.webv2.sessions.preferences.v1'
 const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
-const PAGE_SIZE = 15
+const DEFAULT_PAGE_SIZE = 15
+const PAGE_SIZE_OPTIONS = [10, 15, 25, 50, 100] as const
 
 const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
 
@@ -138,6 +139,7 @@ type SessionPrefs = {
   node: string | null
   sortField: SessionSortField
   sortOrder: SortOrder
+  pageSize: number
 }
 
 type LoadErrorState = {
@@ -181,6 +183,7 @@ function loadSessionPrefs(): SessionPrefs {
     node: null,
     sortField: SessionSortField.CreatedAt,
     sortOrder: SortOrder.Desc,
+    pageSize: DEFAULT_PAGE_SIZE,
   }
   if (typeof window === 'undefined') return defaults
   try {
@@ -202,6 +205,13 @@ function loadSessionPrefs(): SessionPrefs {
       node: normalizeStoredNode(node) ?? defaults.node,
       sortField: isSessionSortField(sortField) ? sortField : defaults.sortField,
       sortOrder: isSortOrder(sortOrder) ? sortOrder : defaults.sortOrder,
+      pageSize:
+        typeof parsed.pageSize === 'number' &&
+        Number.isInteger(parsed.pageSize) &&
+        parsed.pageSize > 0 &&
+        parsed.pageSize <= 500
+          ? parsed.pageSize
+          : defaults.pageSize,
     }
   } catch {
     return defaults
@@ -1017,6 +1027,7 @@ export default function SessionsPage() {
   const [groupBy, setGroupBy] = useState<GroupBy>(initialPrefs.groupBy)
   const [sortField, setSortField] = useState<SessionSortField>(initialPrefs.sortField)
   const [sortOrder, setSortOrder] = useState<SortOrder>(initialPrefs.sortOrder)
+  const [pageSize, setPageSize] = useState<number>(initialPrefs.pageSize)
   const [page, setPage] = useState(0)
   const [showNewSession, setShowNewSession] = useState(false)
   const [rerunSession, setRerunSession] = useState<SessionSummary | null>(null)
@@ -1140,8 +1151,8 @@ export default function SessionsPage() {
         const params: ListParams = {
           search: search || undefined,
           status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: PAGE_SIZE,
-          offset: page * PAGE_SIZE,
+          limit: pageSize,
+          offset: page * pageSize,
           sort: sortField,
           order: sortOrder,
         }
@@ -1165,7 +1176,7 @@ export default function SessionsPage() {
         }
       }
     },
-    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
+    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter, pageSize]
   )
 
   const loadRemote = useCallback(
@@ -1186,8 +1197,8 @@ export default function SessionsPage() {
         const params: ListParams = {
           search: search || undefined,
           status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: PAGE_SIZE,
-          offset: page * PAGE_SIZE,
+          limit: pageSize,
+          offset: page * pageSize,
           sort: sortField,
           order: sortOrder,
           node: selectedNode,
@@ -1212,7 +1223,7 @@ export default function SessionsPage() {
         }
       }
     },
-    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter]
+    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter, pageSize]
   )
 
   // The primary's SSE carries session_updated events for every connected
@@ -1229,8 +1240,8 @@ export default function SessionsPage() {
         const params: ListParams = {
           search: search || undefined,
           status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: PAGE_SIZE,
-          offset: page * PAGE_SIZE,
+          limit: pageSize,
+          offset: page * pageSize,
           sort: sortField,
           order: sortOrder,
           node: selectedNode,
@@ -1246,7 +1257,7 @@ export default function SessionsPage() {
     return () => {
       stopped = true
     }
-  }, [page, search, selectedNode, sortField, sortOrder, statusFilter])
+  }, [page, search, selectedNode, sortField, sortOrder, statusFilter, pageSize])
 
   const reloadSessions = useCallback(
     async (opts?: LoadOptions) => {
@@ -1309,8 +1320,16 @@ export default function SessionsPage() {
   }, [])
 
   useEffect(() => {
-    saveSessionPrefs({ search, statusFilter, groupBy, node: selectedNode, sortField, sortOrder })
-  }, [search, selectedNode, statusFilter, groupBy, sortField, sortOrder])
+    saveSessionPrefs({
+      search,
+      statusFilter,
+      groupBy,
+      node: selectedNode,
+      sortField,
+      sortOrder,
+      pageSize,
+    })
+  }, [search, selectedNode, statusFilter, groupBy, sortField, sortOrder, pageSize])
 
   useEffect(() => {
     saveSessionTableColumnSettings(tableColumnSettings)
@@ -1428,8 +1447,6 @@ export default function SessionsPage() {
   )
 
   const total = remoteTotal
-  const pageStart = total === 0 ? 0 : page * PAGE_SIZE + 1
-  const pageEnd = Math.min(page * PAGE_SIZE + pagedSessions.length, total)
 
   // Clamp the page when the filtered total shrinks (e.g. after a search).
   // Render-time adjustment is the React-recommended alternative to a
@@ -1437,7 +1454,7 @@ export default function SessionsPage() {
   const [prevTotal, setPrevTotal] = useState(total)
   if (prevTotal !== total) {
     setPrevTotal(total)
-    const lastPage = Math.max(Math.ceil(total / PAGE_SIZE) - 1, 0)
+    const lastPage = Math.max(Math.ceil(total / pageSize) - 1, 0)
     setPage((prev) => Math.min(prev, lastPage))
   }
 
@@ -1684,9 +1701,7 @@ export default function SessionsPage() {
       } catch (error) {
         // Roll back only while the row still shows the status we claimed; a
         // `session_updated` that arrived meanwhile stays authoritative.
-        setSessions((prev) =>
-          revertSessionStatus(prev, session.id, pending.status, previousStatus)
-        )
+        setSessions((prev) => revertSessionStatus(prev, session.id, pending.status, previousStatus))
         setLoadError({
           title: action === 'stop' ? 'Failed to stop session' : 'Failed to kill session',
           message: getErrorMessage(error, `Failed to ${action} session.`),
@@ -1743,7 +1758,8 @@ export default function SessionsPage() {
     [selectedNode, setLoadedSessionNotifications]
   )
 
-  const totalPages = Math.ceil(total / PAGE_SIZE)
+  const totalPages = Math.ceil(total / pageSize)
+
   const pageTitle = sessionPageTitle(selectedNode)
 
   function handleSort(field: SessionSortField) {
@@ -1765,6 +1781,7 @@ export default function SessionsPage() {
       node: selectedNode,
       sortField: nextSortField,
       sortOrder: nextSortOrder,
+      pageSize,
     })
     setPage(0)
   }
@@ -2015,14 +2032,14 @@ export default function SessionsPage() {
               </div>
               <div className="flex gap-2">
                 <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
-                  <SelectTrigger className="flex-1 h-8 text-xs">
+                  <SelectTrigger className="min-w-0 flex-1 h-8 text-xs">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="none">No grouping</SelectItem>
                     <SelectItem value="tag">Tag</SelectItem>
+                    <SelectItem value="cwd">CWD</SelectItem>
                     <SelectItem value="command">Command</SelectItem>
-                    <SelectItem value="cwd">Current working directory</SelectItem>
                   </SelectContent>
                 </Select>
                 {statusFilterView}
@@ -2040,6 +2057,7 @@ export default function SessionsPage() {
                       node: selectedNode,
                       sortField: nextSortField,
                       sortOrder,
+                      pageSize,
                     })
                     setPage(0)
                   }}
@@ -2067,6 +2085,7 @@ export default function SessionsPage() {
                       node: selectedNode,
                       sortField,
                       sortOrder: nextSortOrder,
+                      pageSize,
                     })
                     setPage(0)
                   }}
@@ -2126,8 +2145,8 @@ export default function SessionsPage() {
               <SelectContent>
                 <SelectItem value="none">No grouping</SelectItem>
                 <SelectItem value="tag">Tag</SelectItem>
+                <SelectItem value="cwd">CWD</SelectItem>
                 <SelectItem value="command">Command</SelectItem>
-                <SelectItem value="cwd">Current working directory</SelectItem>
               </SelectContent>
             </Select>
 
@@ -2172,7 +2191,7 @@ export default function SessionsPage() {
 
         {/* ── Mobile list ── */}
         <div
-          className="flex-1 overflow-x-clip md:hidden"
+          className="flex-1 overflow-y-auto overflow-x-clip md:hidden"
           data-testid="mobile-session-list"
           onPointerDownCapture={(event) => {
             if (event.pointerType !== 'touch') lastNodeSwipeAtRef.current = 0
@@ -2383,33 +2402,57 @@ export default function SessionsPage() {
         </div>
 
         {/* ── Meta bar ── */}
-        <div className="flex items-center gap-2 px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--background))]/80 text-sm text-[hsl(var(--muted-foreground))]">
+        <div className="flex items-center overflow-x-auto gap-2 px-2 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--background))]/80 text-sm text-[hsl(var(--muted-foreground))]">
           <SseStatusDot status={sseStatus} />
           {refreshing && !loading && (
             <span className="text-[hsl(var(--muted-foreground))]">Refreshing…</span>
           )}
           <div className="flex-1"></div>
-          <span className="text-sm">
-            {pageStart}-{pageEnd} / {total}
+          <Select
+            value={String(pageSize)}
+            onValueChange={(value) => {
+              const next = Number(value)
+              if (!Number.isInteger(next) || next <= 0 || next === pageSize) return
+              setPageSize(next)
+              setPage(0)
+            }}
+          >
+            <SelectTrigger
+              aria-label="Sessions per page"
+              className="h-7 w-auto shrink-0 min-w-0 px-2 text-xs text-[hsl(var(--muted-foreground))]"
+            >
+              {pageSize}
+            </SelectTrigger>
+            <SelectContent>
+              {PAGE_SIZE_OPTIONS.map((size) => (
+                <SelectItem key={size} value={String(size)}>
+                  {size}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <span className="whitespace-nowrap text-sm tabular-nums">
+            / {total}
           </span>
-          <div />
           {totalPages > 1 && (
             <div className="flex items-center gap-0.5">
               <Button
                 variant="ghost"
                 size="icon"
                 disabled={page === 0}
+                aria-label="Previous page"
                 onClick={() => setPage((p) => p - 1)}
               >
                 <ChevronLeftIcon className="h-4 w-4" />
               </Button>
-              <span className="px-2 text-sm">
+              <span className="whitespace-nowrap px-1 sm:px-2 text-sm tabular-nums">
                 {page + 1} / {totalPages}
               </span>
               <Button
                 variant="ghost"
                 size="icon"
                 disabled={page >= totalPages - 1}
+                aria-label="Next page"
                 onClick={() => setPage((p) => p + 1)}
               >
                 <ChevronRightIcon className="h-4 w-4" />
