@@ -226,6 +226,7 @@ export default function AttachPanel({
   const [drawerOpen, setDrawerOpen] = useState(() => loadSessionDrawerOpen(sessionId))
   const [customInput, setCustomInput] = useState(() => loadSessionInputDraft(sessionId))
   const [customKeys, setCustomKeys] = useState('')
+  const customKeysValueRef = useRef(customKeys)
   const [imagePreviews, setImagePreviews] = useState<SessionImagePreviews>(() =>
     loadSessionImagePreviews(sessionId)
   )
@@ -241,7 +242,14 @@ export default function AttachPanel({
   const busyIntervalRef = useRef<number | null>(null)
   const drawerScrollTimeoutsRef = useRef<number[]>([])
   const pendingCustomInputSelectionRef = useRef<{ start: number; end: number } | null>(null)
-  const { startRepeat, stopRepeat } = useRepeatWhilePressed()
+  const repeat = useRepeatWhilePressed()
+
+  // Mirrored alongside the textarea draft so a held key always reads the queue
+  // as it is now, not as it was when the press started.
+  const updateCustomKeys = useCallback((nextValue: string) => {
+    customKeysValueRef.current = nextValue
+    setCustomKeys(nextValue)
+  }, [])
 
   const updateCustomInput = useCallback((nextValue: string) => {
     customInputValueRef.current = nextValue
@@ -397,7 +405,7 @@ export default function AttachPanel({
       for (const data of parsed) {
         sendInput(data)
       }
-      setCustomKeys('')
+      updateCustomKeys('')
     } catch (error) {
       showKeyError(error instanceof Error ? error.message : 'invalid key spec')
     }
@@ -666,20 +674,23 @@ export default function AttachPanel({
                       type="button"
                       variant="secondary"
                       size="sm"
-                      className={`select-none touch-none font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
+                      className={`select-none font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
                       {...(instant
-                        ? holdRepeatProps(startRepeat, stopRepeat, () => {
-                            if (customKeys.trim()) {
+                        ? holdRepeatProps(repeat, () => {
+                            const queued = customKeysValueRef.current
+                            if (queued.trim()) {
                               // compose with any pending modifier already in the queue
-                              handleSendCustomKeys(`${customKeys.trim()} ${key}`)
+                              handleSendCustomKeys(`${queued.trim()} ${key}`)
                             } else {
                               handleSendKeySpec(key)
                             }
                           })
                         : {
                             onClick: () => {
-                              setCustomKeys((prev) =>
-                                prev.trim() ? `${prev.trim()} ${key} ` : key + ' '
+                              updateCustomKeys(
+                                customKeysValueRef.current.trim()
+                                  ? `${customKeysValueRef.current.trim()} ${key} `
+                                  : key + ' '
                               )
                               document.getElementById('custom-keys')?.focus()
                             },
@@ -701,7 +712,7 @@ export default function AttachPanel({
                 className="text-sm"
                 placeholder="Keys separated by whitespace. Press enter to send."
                 value={customKeys}
-                onChange={(e) => setCustomKeys(e.target.value)}
+                onChange={(e) => updateCustomKeys(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
                     e.preventDefault()
@@ -757,8 +768,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('left'))}
+            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('left'))}
             aria-label="Left"
           >
             <ChevronLeftIcon className="w-6 h-6" />
@@ -766,8 +777,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('up'))}
+            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('up'))}
             aria-label="Up"
           >
             <ChevronUpIcon className="w-6 h-6" />
@@ -775,8 +786,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('down'))}
+            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('down'))}
             aria-label="Down"
           >
             <ChevronDownIcon className="w-6 h-6" />
@@ -784,8 +795,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('right'))}
+            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('right'))}
             aria-label="Right"
           >
             <ChevronRightIcon className="w-6 h-6" />
@@ -793,8 +804,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('tab'))}
+            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('tab'))}
             aria-label="Tab"
           >
             Tab
@@ -802,8 +813,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-amber-600 px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('esc'))}
+            className="shrink-0 select-none text-amber-600 px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('esc'))}
             aria-label="Esc"
           >
             Esc
@@ -811,8 +822,8 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none touch-none text-amber-600 px-2.5"
-            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('enter'))}
+            className="shrink-0 select-none text-amber-600 px-2.5"
+            {...holdRepeatProps(repeat, () => handleSendKeySpec('enter'))}
             aria-label="Enter"
           >
             Enter
