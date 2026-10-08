@@ -1,5 +1,5 @@
 import { useRef, useState, useSyncExternalStore } from 'react'
-import { GripVertical, Plus, RotateCcw, X } from 'lucide-react'
+import { GripVertical, Pencil, Plus, RotateCcw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -76,16 +76,50 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
   const keys = useSyncExternalStore(subscribeQuickKeys, getQuickKeys)
   const [combo, setCombo] = useState('')
   const [label, setLabel] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [paletteFor, setPaletteFor] = useState<string | null>(null)
   const dragRef = useRef<DragState | null>(null)
   const [dragView, setDragView] = useState<{ id: string; delta: number } | null>(null)
+  const comboInputRef = useRef<HTMLInputElement | null>(null)
 
   const preview = combo.trim() ? (encodeQuickKeyCombo(combo.trim()) ?? combo.trim()) : ''
+
+  function resetEditor() {
+    setCombo('')
+    setLabel('')
+    setEditingId(null)
+  }
+
+  function handleEdit(key: QuickKey) {
+    setCombo(key.combo)
+    setLabel(key.label)
+    setEditingId(key.id)
+    setPaletteFor(null)
+    comboInputRef.current?.focus()
+  }
 
   function handleAdd() {
     const trimmed = combo.trim()
     if (!trimmed) return
     const data = encodeQuickKeyCombo(trimmed) ?? trimmed
+
+    if (editingId) {
+      setQuickKeys(
+        getQuickKeys().map((key) =>
+          key.id === editingId
+            ? {
+                ...key,
+                label: (label.trim() || formatCombo(trimmed)).slice(0, 4),
+                data,
+                combo: trimmed.toLowerCase(),
+              }
+            : key
+        )
+      )
+      resetEditor()
+      return
+    }
+
     const key: QuickKey = {
       id: `${trimmed.toLowerCase()}::${Date.now()}`,
       label: (label.trim() || formatCombo(trimmed)).slice(0, 4),
@@ -93,8 +127,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
       combo: trimmed.toLowerCase(),
     }
     setQuickKeys([...getQuickKeys(), key])
-    setCombo('')
-    setLabel('')
+    resetEditor()
   }
 
   function handleColorSet(id: string, color: string | undefined) {
@@ -112,6 +145,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
 
   function handleRemove(id: string) {
     setQuickKeys(getQuickKeys().filter((key) => key.id !== id))
+    if (editingId === id) resetEditor()
   }
 
   function handleDragStart(event: React.PointerEvent<HTMLElement>, index: number, id: string) {
@@ -150,8 +184,8 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
         <DialogHeader>
           <DialogTitle>Quick Keys</DialogTitle>
           <DialogDescription>
-            Tap to send · drag the handle to reorder · tap a label to recolor it. Keys are sent to
-            the terminal as soon as the round button is tapped.
+            Tap to send · drag the handle to reorder · tap a label to recolor · tap the pencil to
+            edit. Keys are sent to the terminal as soon as the round button is tapped.
           </DialogDescription>
         </DialogHeader>
 
@@ -211,9 +245,17 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
                   </span>
                   <button
                     type="button"
+                    aria-label={`Edit ${key.label}`}
+                    onClick={() => handleEdit(key)}
+                    className="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--foreground))]"
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
                     aria-label={`Remove ${key.label}`}
                     onClick={() => handleRemove(key.id)}
-                    className="ml-auto flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--destructive))]"
+                    className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:bg-[hsl(var(--muted))] hover:text-[hsl(var(--destructive))]"
                   >
                     <X className="h-4 w-4" />
                   </button>
@@ -255,6 +297,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
         >
           <div className="flex gap-2">
             <Input
+              ref={comboInputRef}
               value={combo}
               onChange={(event) => setCombo(event.target.value)}
               placeholder="Combo, e.g. ctrl+c or enter space"
@@ -278,8 +321,13 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
             </span>
             <Button type="submit" size="sm" variant="outline" disabled={!combo.trim()}>
               <Plus className="h-4 w-4" />
-              Add
+              {editingId ? 'Save' : 'Add'}
             </Button>
+            {editingId ? (
+              <Button type="button" size="sm" variant="ghost" onClick={resetEditor}>
+                Cancel
+              </Button>
+            ) : null}
           </div>
         </form>
 
