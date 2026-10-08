@@ -57,6 +57,20 @@ export function useRepeatWhilePressed(): RepeatControls {
 }
 
 /**
+ * Park DOM focus on a hold-repeat button.
+ *
+ * Suppressing the press's default is not enough on its own: it leaves focus
+ * wherever it was, and in attach mode that is xterm's hidden textarea. The
+ * soft keyboard then stays up over the panel, and the tap/keyboard-driven
+ * viewport churn drags the page out from under the finger — cancelling the
+ * pointer and cutting the repeat short. A `<button>` never raises a keyboard,
+ * so focusing it both answers the tap and drops the IME.
+ */
+function parkFocus(button: HTMLButtonElement): void {
+  button.focus({ preventScroll: true })
+}
+
+/**
  * Shared button handlers for hold-to-repeat keys.
  *
  * A hold sends on pointerdown/keydown and repeats while it is held; a click
@@ -71,12 +85,16 @@ export function holdRepeatProps(
     onPointerDown: (event) => {
       if (event.button !== 0) return
       event.preventDefault()
+      parkFocus(event.currentTarget)
       controls.startRepeat(action, { pointerId: event.pointerId, at: event.timeStamp })
     },
     // Belt and braces over the pointerdown above on browsers where that does
-    // not suppress the compatibility mouse events: keeping the button from
-    // taking focus stops xterm from losing it on every tap.
-    onMouseDown: (event) => event.preventDefault(),
+    // not suppress the compatibility mouse events: keeping focus on the button
+    // is what stops xterm from reclaiming it on every tap.
+    onMouseDown: (event) => {
+      event.preventDefault()
+      parkFocus(event.currentTarget)
+    },
     onKeyDown: (event) => {
       if (event.key !== 'Enter' && event.key !== ' ') return
       event.preventDefault()
