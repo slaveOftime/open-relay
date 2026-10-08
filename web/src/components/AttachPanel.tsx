@@ -170,6 +170,15 @@ function readFileAsDataUrl(file: File): Promise<string> {
 }
 
 // ── AttachPanel ───────────────────────────────────────────────────────────────
+/**
+ * Hold-repeat keys park DOM focus on the pressed button (that is what keeps the
+ * soft keyboard down), so that focus is a side effect, not something to
+ * highlight: WebKit carries `:focus-visible` over from a focused text field and
+ * would paint the ring on a key the user merely tapped.
+ */
+const HOLD_KEY_FOCUS_NONE =
+  'focus:outline-none focus:ring-0 focus:ring-offset-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
+
 interface AttachPanelProps {
   sessionId: string
   sendInput: (data: string) => void
@@ -674,7 +683,7 @@ export default function AttachPanel({
                       type="button"
                       variant="secondary"
                       size="sm"
-                      className={`select-none font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
+                      className={`${HOLD_KEY_FOCUS_NONE} select-none font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
                       {...(instant
                         ? holdRepeatProps(repeat, () => {
                             const queued = customKeysValueRef.current
@@ -768,7 +777,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('left'))}
             aria-label="Left"
           >
@@ -777,7 +786,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('up'))}
             aria-label="Up"
           >
@@ -786,7 +795,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('down'))}
             aria-label="Down"
           >
@@ -795,7 +804,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('right'))}
             aria-label="Right"
           >
@@ -804,7 +813,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-[hsl(var(--primary))] px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('tab'))}
             aria-label="Tab"
           >
@@ -813,7 +822,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-amber-600 px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-amber-600 px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('esc'))}
             aria-label="Esc"
           >
@@ -822,7 +831,7 @@ export default function AttachPanel({
           <Button
             type="button"
             variant={'ghost'}
-            className="shrink-0 select-none text-amber-600 px-2.5"
+            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-amber-600 px-2.5`}
             {...holdRepeatProps(repeat, () => handleSendKeySpec('enter'))}
             aria-label="Enter"
           >
