@@ -11,7 +11,7 @@ import {
   AttachSocket,
 } from '@/api/client'
 import { terminalModeSequences } from '@/api/ws-frames'
-import { formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
+import { formatByteSize, formatTimestamp, normalizeCwdPath, sessionDisplayName } from '@/utils/format'
 import { HistoryAnchorError, HistoryController } from '@/lib/history-controller'
 import {
   encodeLogChunks,
@@ -1644,7 +1644,7 @@ function SessionDetailPageContent() {
                 )}
                 <span className="break-all">{sessionDisplayName(session)}</span>
                 {session.cwd && (
-                  <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
+                  <span className="text-[hsl(var(--foreground))] break-all">{normalizeCwdPath(session.cwd)}</span>
                 )}
                 <span className="text-[hsl(var(--foreground))]">
                   {formatTimestamp(session.created_at)}

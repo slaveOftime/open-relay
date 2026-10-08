@@ -56,7 +56,7 @@ import {
   type SessionTermination,
 } from './session-termination'
 import { NodeSelector } from '@/components/NodeSelector'
-import { agentName, formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
+import { agentName, formatByteSize, formatTimestamp, normalizeCwdPath, sessionDisplayName } from '@/utils/format'
 import {
   loadPinnedSessionKeys,
   orderSessionPage,
@@ -585,9 +585,9 @@ const SessionRow = memo(function SessionRow({
             {session.cwd ? (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span>{session.cwd}</span>
+                  <span>{normalizeCwdPath(session.cwd)}</span>
                 </TooltipTrigger>
-                <TooltipContent>{session.cwd}</TooltipContent>
+                <TooltipContent>{normalizeCwdPath(session.cwd)}</TooltipContent>
               </Tooltip>
             ) : null}
           </TableCell>
@@ -863,7 +863,7 @@ const SessionCard = memo(function SessionCard({
           {/* Row 3: cwd */}
           {showCwd && session.cwd && (
             <div className="z-10 text-sm leading-4 text-[hsl(var(--muted-foreground))] font-mono break-all">
-              {session.cwd}
+              {normalizeCwdPath(session.cwd)}
             </div>
           )}
 
@@ -1461,13 +1461,15 @@ export default function SessionsPage() {
   const grouped = useMemo<Array<{ key: string; items: SessionSummary[] }>>(() => {
     if (groupBy === 'none') return [{ key: '', items: pagedSessions }]
     if (groupBy === 'cwd') {
-      const map = new Map<string, SessionSummary[]>()
+      const map = new Map<string, { label: string; items: SessionSummary[] }>()
       for (const s of pagedSessions) {
-        const k = s.cwd || '(no cwd)'
-        if (!map.has(k)) map.set(k, [])
-        map.get(k)!.push(s)
+        const trimmed = s.cwd?.trim() ?? ''
+        const label = trimmed ? normalizeCwdPath(trimmed) : '(no cwd)'
+        const k = label.toLowerCase()
+        if (!map.has(k)) map.set(k, { label, items: [] })
+        map.get(k)!.items.push(s)
       }
-      return Array.from(map.entries()).map(([key, items]) => ({ key, items }))
+      return Array.from(map.values()).map(({ label, items }) => ({ key: label, items }))
     }
     if (groupBy === 'tag') {
       const map = new Map<string, SessionSummary[]>()

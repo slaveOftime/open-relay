@@ -149,9 +149,14 @@ export function agentName(command: string): string {
   return known[base.toLowerCase()] ?? base
 }
 
+export function normalizeCwdPath(cwd: string | null): string {
+  if (!cwd) return ''
+  return cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
 export function cwdBasename(cwd: string | null): string {
   if (!cwd) return ''
-  return cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? cwd
+  return normalizeCwdPath(cwd).split('/').filter(Boolean).pop() ?? cwd
 }
 
 // ── Shell arg parser ─────────────────────────────────────────────────────────
