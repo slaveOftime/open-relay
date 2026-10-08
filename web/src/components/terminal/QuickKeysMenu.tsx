@@ -89,7 +89,6 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
               ...key,
               data: encodeQuickKeyCombo(key.combo) ?? key.data,
             })
-            onClose()
           }}
           style={{
             ...popStyle(positions[index].dx, positions[index].dy, index),
@@ -113,6 +112,7 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
         onClick={(event) => {
           event.stopPropagation()
           onCustomize()
+          onClose()
         }}
         style={popStyle(customize.dx, customize.dy, keys.length)}
         className={cn(
