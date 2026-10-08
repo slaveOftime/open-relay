@@ -658,7 +658,7 @@ export default function AttachPanel({
             <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
               Quick Keys
             </p>
-            <div className="grid grid-cols-4 gap-1.5 max-h-27 sm:max-h-fit overflow-y-auto">
+            <div className="grid grid-cols-4 gap-1.5 max-h-27 sm:max-h-fit overflow-y-auto select-none">
               {popularKeys.map(({ key, label, instant }) => (
                 <Tooltip key={key}>
                   <TooltipTrigger asChild>
@@ -666,7 +666,7 @@ export default function AttachPanel({
                       type="button"
                       variant="secondary"
                       size="sm"
-                      className={`font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
+                      className={`select-none touch-none font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
                       {...(instant
                         ? holdRepeatProps(startRepeat, stopRepeat, () => {
                             if (customKeys.trim()) {
@@ -753,58 +753,65 @@ export default function AttachPanel({
         </div>
       </div>
       <div className="sm:hidden w-full h-10 flex items-center gap-1 justify-between overflow-hidden">
-        <div className="sm:hidden w-full h-10 flex items-center overflow-y-hidden overflow-x-auto">
+        <div className="sm:hidden w-full h-10 flex items-center overflow-y-hidden overflow-x-auto select-none">
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('left'))}
             aria-label="Left"
           >
             <ChevronLeftIcon className="w-6 h-6" />
           </Button>
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('up'))}
             aria-label="Up"
           >
             <ChevronUpIcon className="w-6 h-6" />
           </Button>
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('down'))}
             aria-label="Down"
           >
             <ChevronDownIcon className="w-6 h-6" />
           </Button>
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('right'))}
             aria-label="Right"
           >
             <ChevronRightIcon className="w-6 h-6" />
           </Button>
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-[hsl(var(--primary))] px-2.5"
+            className="shrink-0 select-none touch-none text-[hsl(var(--primary))] px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('tab'))}
             aria-label="Tab"
           >
             Tab
           </Button>
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-amber-600 px-2.5"
+            className="shrink-0 select-none touch-none text-amber-600 px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('esc'))}
             aria-label="Esc"
           >
             Esc
           </Button>
           <Button
+            type="button"
             variant={'ghost'}
-            className="shrink-0 text-amber-600 px-2.5"
+            className="shrink-0 select-none touch-none text-amber-600 px-2.5"
             {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('enter'))}
             aria-label="Enter"
           >

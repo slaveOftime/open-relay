@@ -1839,7 +1839,7 @@ function SessionDetailPageContent() {
                 <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
                   <AttachPanel
                     sessionId={id ?? ''}
-                    sendInput={(x) => sendInput(x, true)}
+                    sendInput={(x) => sendInput(x, false)}
                     sendBusy={sendBusy}
                     showKeyError={showKeyError}
                     uploadFile={handleUploadFile}

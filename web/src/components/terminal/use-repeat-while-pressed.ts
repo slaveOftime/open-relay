@@ -70,6 +70,7 @@ export function holdRepeatProps(
       event.preventDefault()
       startRepeat(action)
     },
+    onMouseDown: (event) => event.preventDefault(),
     onPointerUp: stopRepeat,
     onPointerLeave: stopRepeat,
     onPointerCancel: stopRepeat,
