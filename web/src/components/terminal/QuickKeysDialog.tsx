@@ -18,7 +18,7 @@ import {
 } from '@/lib/quickKeysStorage'
 import {
   describeData,
-  encodeCombo,
+  encodeQuickKeyCombo,
   formatCombo,
   moveQuickKey,
   QUICK_KEY_COLORS,
@@ -80,12 +80,12 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
   const dragRef = useRef<DragState | null>(null)
   const [dragView, setDragView] = useState<{ id: string; delta: number } | null>(null)
 
-  const preview = combo.trim() ? (encodeCombo(combo.trim()) ?? combo.trim()) : ''
+  const preview = combo.trim() ? (encodeQuickKeyCombo(combo.trim()) ?? combo.trim()) : ''
 
   function handleAdd() {
     const trimmed = combo.trim()
     if (!trimmed) return
-    const data = encodeCombo(trimmed) ?? trimmed
+    const data = encodeQuickKeyCombo(trimmed) ?? trimmed
     const key: QuickKey = {
       id: `${trimmed.toLowerCase()}::${Date.now()}`,
       label: (label.trim() || formatCombo(trimmed)).slice(0, 4),
@@ -257,7 +257,7 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
             <Input
               value={combo}
               onChange={(event) => setCombo(event.target.value)}
-              placeholder="Combo, e.g. ctrl+c or up"
+              placeholder="Combo, e.g. ctrl+c or enter space"
               className="h-11 flex-1"
               aria-label="Key combo"
             />
@@ -273,8 +273,8 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate font-mono text-[11px] text-[hsl(var(--muted-foreground))]">
               {preview
-                ? `Sends: ${describeData(preview)}`
-                : 'e.g. ctrl+c, shift+tab, alt+f, or any text'}
+                ? `Sends: ${describeData(preview).replaceAll(' ', '␣')}`
+                : 'e.g. ctrl+c, shift+tab, alt+f, text, enter, or space'}
             </span>
             <Button type="submit" size="sm" variant="outline" disabled={!combo.trim()}>
               <Plus className="h-4 w-4" />

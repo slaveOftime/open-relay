@@ -6,6 +6,7 @@ import {
   RING_MIN_SPACING_PX,
   describeData,
   encodeCombo,
+  encodeQuickKeyCombo,
   formatCombo,
   layoutRing,
   moveQuickKey,
@@ -48,6 +49,22 @@ describe('encodeCombo', () => {
     expect(encodeCombo('hyper+x')).toBeNull()
     expect(encodeCombo('ctrl+')).toBeNull()
     expect(encodeCombo('')).toBeNull()
+  })
+})
+
+describe('encodeQuickKeyCombo', () => {
+  it('encodes AttachPanel key specs', () => {
+    expect(encodeQuickKeyCombo('ctrl+c')).toBe('\x03')
+    expect(encodeQuickKeyCombo('ctrl c')).toBe('ctrlc')
+    expect(encodeQuickKeyCombo('enter')).toBe('\r')
+    expect(encodeQuickKeyCombo('space')).toBe(' ')
+    expect(encodeQuickKeyCombo('ctrl+space')).toBe('\x00')
+  })
+
+  it('splits plain words into characters', () => {
+    expect(encodeQuickKeyCombo('hello')).toBe('hello')
+    expect(encodeQuickKeyCombo('ls -al enter')).toBe('ls-al\r')
+    expect(encodeQuickKeyCombo('hello space world')).toBe('hello world')
   })
 })
 

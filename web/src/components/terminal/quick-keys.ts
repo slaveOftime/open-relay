@@ -7,6 +7,8 @@
  * encoded fall back to being sent as literal text.
  */
 
+import { parseKeyInputSpecs, parseKeySpec, splitKeyInput } from '@/utils/keyInput'
+
 export interface QuickKey {
   id: string
   /** Short text shown on the radial button, e.g. "^C". */
@@ -134,6 +136,38 @@ export function encodeCombo(raw: string): string | null {
   if (named !== undefined) return alt ? `\x1b${named}` : named
   if (key.length === 1) return alt ? `\x1b${key}` : key
   return null
+}
+
+/**
+ * Encode a full quick-key editor value. A whitespace-separated word is kept
+ * as one AttachPanel-style key spec when it parses (`ctrl+c`, `enter`,
+ * `space`, `tab`, ...); otherwise it is expanded into its individual
+ * characters, mirroring AttachPanel's custom-keys input. Unknown words
+ * therefore send their letters rather than being rejected.
+ */
+export function encodeQuickKeyCombo(raw: string): string | null {
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+
+  // Preserve legacy single-combo aliases such as `ctrl+space` / `return`.
+  const legacy = encodeCombo(trimmed)
+  if (legacy !== null) return legacy
+
+  const specs: string[] = []
+  for (const word of splitKeyInput(trimmed)) {
+    try {
+      parseKeySpec(word)
+      specs.push(word)
+    } catch {
+      specs.push(...Array.from(word))
+    }
+  }
+
+  try {
+    return parseKeyInputSpecs(specs).join('')
+  } catch {
+    return null
+  }
 }
 
 /** "ctrl+c" -> "Ctrl+C", "shift+tab" -> "Shift+Tab", "!" -> "!" */

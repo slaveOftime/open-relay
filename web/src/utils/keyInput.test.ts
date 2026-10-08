@@ -27,6 +27,7 @@ describe('namedKeySequence', () => {
   it('esc / escape', () => {
     expect(namedKeySequence('esc')).toBe('\x1b')
     expect(namedKeySequence('escape')).toBe('\x1b')
+    expect(namedKeySequence('space')).toBe(' ')
   })
 
   it('arrow keys', () => {

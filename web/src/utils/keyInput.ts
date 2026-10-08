@@ -152,6 +152,8 @@ export function namedKeySequence(normalized: string): string | null {
     case 'esc':
     case 'escape':
       return '\x1b'
+    case 'space':
+      return ' '
     case 'up':
       return '\x1b[A'
     case 'down':

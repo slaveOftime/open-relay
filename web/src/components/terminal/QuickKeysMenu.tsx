@@ -10,7 +10,7 @@ import { SlidersHorizontal } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
 import { useReducedMotion } from './use-reduced-motion'
-import { layoutRing, type QuickKey } from './quick-keys'
+import { encodeQuickKeyCombo, layoutRing, type QuickKey } from './quick-keys'
 
 /** Keep this much clearance between popped keys and the screen edges. */
 const EDGE_MARGIN_PX = 10
@@ -85,7 +85,10 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
           aria-label={`Send ${key.label}`}
           onClick={(event) => {
             event.stopPropagation()
-            onSend(key)
+            onSend({
+              ...key,
+              data: encodeQuickKeyCombo(key.combo) ?? key.data,
+            })
             onClose()
           }}
           style={{
