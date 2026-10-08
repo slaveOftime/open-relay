@@ -11,6 +11,7 @@ import { cn } from '@/lib/utils'
 import { getQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
 import { useReducedMotion } from './use-reduced-motion'
 import { encodeQuickKeyCombo, layoutRing, type QuickKey } from './quick-keys'
+import { holdRepeatProps, useRepeatWhilePressed } from './use-repeat-while-pressed'
 
 /** Keep this much clearance between popped keys and the screen edges. */
 const EDGE_MARGIN_PX = 10
@@ -31,6 +32,7 @@ interface Props {
 export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Props) {
   const keys = useSyncExternalStore(subscribeQuickKeys, getQuickKeys)
   const reducedMotion = useReducedMotion()
+  const { startRepeat, stopRepeat } = useRepeatWhilePressed()
   // Items mount collapsed at the pad center and slide out on the next
   // frame so the CSS transform transition actually runs.
   const [armed, setArmed] = useState(false)
@@ -83,13 +85,12 @@ export default function QuickKeysMenu({ open, onSend, onClose, onCustomize }: Pr
           key={key.id}
           type="button"
           aria-label={`Send ${key.label}`}
-          onClick={(event) => {
-            event.stopPropagation()
+          {...holdRepeatProps(startRepeat, stopRepeat, () =>
             onSend({
               ...key,
               data: encodeQuickKeyCombo(key.combo) ?? key.data,
             })
-          }}
+          )}
           style={{
             ...popStyle(positions[index].dx, positions[index].dy, index),
             ...labelStyle(key.color),

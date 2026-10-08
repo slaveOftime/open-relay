@@ -23,6 +23,7 @@ import {
   DoubleArrowDownIcon,
   DoubleArrowUpIcon,
 } from '@radix-ui/react-icons'
+import { holdRepeatProps, useRepeatWhilePressed } from './terminal/use-repeat-while-pressed'
 import type { UploadSessionFileResponse } from '@/api/client'
 
 // ── Input history ─────────────────────────────────────────────────────────────
@@ -240,6 +241,7 @@ export default function AttachPanel({
   const busyIntervalRef = useRef<number | null>(null)
   const drawerScrollTimeoutsRef = useRef<number[]>([])
   const pendingCustomInputSelectionRef = useRef<{ start: number; end: number } | null>(null)
+  const { startRepeat, stopRepeat } = useRepeatWhilePressed()
 
   const updateCustomInput = useCallback((nextValue: string) => {
     customInputValueRef.current = nextValue
@@ -665,21 +667,23 @@ export default function AttachPanel({
                       variant="secondary"
                       size="sm"
                       className={`font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
-                      onClick={() => {
-                        if (instant) {
-                          if (customKeys.trim()) {
-                            // compose with any pending modifier already in the queue
-                            handleSendCustomKeys(`${customKeys.trim()} ${key}`)
-                          } else {
-                            handleSendKeySpec(key)
-                          }
-                          return
-                        }
-                        setCustomKeys((prev) =>
-                          prev.trim() ? `${prev.trim()} ${key} ` : key + ' '
-                        )
-                        document.getElementById('custom-keys')?.focus()
-                      }}
+                      {...(instant
+                        ? holdRepeatProps(startRepeat, stopRepeat, () => {
+                            if (customKeys.trim()) {
+                              // compose with any pending modifier already in the queue
+                              handleSendCustomKeys(`${customKeys.trim()} ${key}`)
+                            } else {
+                              handleSendKeySpec(key)
+                            }
+                          })
+                        : {
+                            onClick: () => {
+                              setCustomKeys((prev) =>
+                                prev.trim() ? `${prev.trim()} ${key} ` : key + ' '
+                              )
+                              document.getElementById('custom-keys')?.focus()
+                            },
+                          })}
                     >
                       {label}
                     </Button>
@@ -753,7 +757,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
-            onClick={() => handleSendKeySpec('left')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('left'))}
             aria-label="Left"
           >
             <ChevronLeftIcon className="w-6 h-6" />
@@ -761,7 +765,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
-            onClick={() => handleSendKeySpec('up')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('up'))}
             aria-label="Up"
           >
             <ChevronUpIcon className="w-6 h-6" />
@@ -769,7 +773,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
-            onClick={() => handleSendKeySpec('down')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('down'))}
             aria-label="Down"
           >
             <ChevronDownIcon className="w-6 h-6" />
@@ -777,7 +781,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
-            onClick={() => handleSendKeySpec('right')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('right'))}
             aria-label="Right"
           >
             <ChevronRightIcon className="w-6 h-6" />
@@ -785,7 +789,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-[hsl(var(--primary))] px-2.5"
-            onClick={() => handleSendKeySpec('tab')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('tab'))}
             aria-label="Tab"
           >
             Tab
@@ -793,7 +797,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-amber-600 px-2.5"
-            onClick={() => handleSendKeySpec('esc')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('esc'))}
             aria-label="Esc"
           >
             Esc
@@ -801,7 +805,7 @@ export default function AttachPanel({
           <Button
             variant={'ghost'}
             className="shrink-0 text-amber-600 px-2.5"
-            onClick={() => handleSendKeySpec('enter')}
+            {...holdRepeatProps(startRepeat, stopRepeat, () => handleSendKeySpec('enter'))}
             aria-label="Enter"
           >
             Enter
