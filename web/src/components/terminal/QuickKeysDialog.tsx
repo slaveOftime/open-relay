@@ -88,6 +88,16 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
     setCombo('')
     setLabel('')
     setEditingId(null)
+    setPaletteFor(null)
+  }
+
+  // Radix keeps this component mounted while the dialog is closed, so an edit
+  // abandoned mid-way would otherwise still be sitting in the form the next
+  // time it opens.
+  const [wasOpen, setWasOpen] = useState(open)
+  if (wasOpen !== open) {
+    setWasOpen(open)
+    if (!open) resetEditor()
   }
 
   function handleEdit(key: QuickKey) {
