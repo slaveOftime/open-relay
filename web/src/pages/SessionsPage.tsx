@@ -50,6 +50,8 @@ import {
   swipeDragOffset,
 } from './sessions-node-swipe'
 import {
+  applyPendingTermination,
+  applyPendingTerminations,
   revertSessionStatus,
   withPendingTermination,
   withSessionStatus,
@@ -1067,6 +1069,9 @@ export default function SessionsPage() {
   } | null>(null)
   const tableColumnDragRef = useRef<SessionTableColumnKey | null>(null)
   const isMounted = useRef(true)
+  // Optimistic `stopping` claims keyed by session id, re-applied whenever a
+  // server refresh would otherwise wipe them with a stale `running`.
+  const pendingTerminationRef = useRef(new Map<string, SessionStatus>())
   const prevIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
   const requestVersionRef = useRef(0)
@@ -1078,12 +1083,15 @@ export default function SessionsPage() {
 
   const applySessionItems = useCallback((items: SessionSummary[]) => {
     ingestSessionSummaries(items)
-    setSessions(items)
+    setSessions(applyPendingTerminations(items, pendingTerminationRef.current))
   }, [])
 
   const applyLoadedSessionSnapshot = useCallback(
     (items: SessionSummary[]) => {
-      const filteredItems = filterSessionsByStatus(items, statusFilter)
+      const filteredItems = applyPendingTerminations(
+        filterSessionsByStatus(items, statusFilter),
+        pendingTerminationRef.current
+      )
       const itemsById = new Map(filteredItems.map((session) => [session.id, session]))
       setSessions((prev) => {
         const next = prev
@@ -1102,16 +1110,18 @@ export default function SessionsPage() {
   )
 
   const replaceLoadedSession = useCallback((session: SessionSummary) => {
+    const effective = applyPendingTermination(session, pendingTerminationRef.current)
     setSessions((prev) => {
-      const index = prev.findIndex((item) => item.id === session.id)
+      const index = prev.findIndex((item) => item.id === effective.id)
       if (index === -1) return prev
       const next = prev.slice()
-      next[index] = session
+      next[index] = effective
       return next
     })
   }, [])
 
   const removeLoadedSession = useCallback((sessionId: string) => {
+    pendingTerminationRef.current.delete(sessionId)
     setSessions((prev) => {
       const index = prev.findIndex((item) => item.id === sessionId)
       if (index === -1) return prev
@@ -1523,6 +1533,7 @@ export default function SessionsPage() {
     delayedReloadTimerRef.current = null
     hasLoadedRef.current = false
     prevIdsRef.current = new Set()
+    pendingTerminationRef.current.clear()
     setSessions([])
     setRemoteTotal(0)
     setLoading(true)
@@ -1692,6 +1703,7 @@ export default function SessionsPage() {
       if (!pending) return
 
       const previousStatus = session.status
+      pendingTerminationRef.current.set(session.id, pending.status)
       setLoadedSessionStatus(session.id, pending.status)
 
       try {
@@ -1703,6 +1715,7 @@ export default function SessionsPage() {
       } catch (error) {
         // Roll back only while the row still shows the status we claimed; a
         // `session_updated` that arrived meanwhile stays authoritative.
+        pendingTerminationRef.current.delete(session.id)
         setSessions((prev) => revertSessionStatus(prev, session.id, pending.status, previousStatus))
         setLoadError({
           title: action === 'stop' ? 'Failed to stop session' : 'Failed to kill session',

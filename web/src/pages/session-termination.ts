@@ -68,3 +68,48 @@ export function revertSessionStatus(
   if (index === -1 || items[index].status !== pendingStatus) return items
   return withSessionStatus(items, sessionId, previousStatus)
 }
+
+/**
+ * Re-applies in-flight optimistic statuses over a fresh authoritative list.
+ *
+ * A remote node's own summaries may still report `running` long after the
+ * terminate request was confirmed (the daemon publishes only after the drain
+ * finishes), and every background `loadRemote` would otherwise wipe the
+ * optimistic `stopping` row. While the server keeps saying the session is
+ * `running`/`created`, the pending status wins; once the server reports any
+ * progressed status it becomes authoritative again and the pending entry is
+ * dropped.
+ */
+export function applyPendingTerminations(
+  items: SessionSummary[],
+  pending: Map<string, SessionStatus>
+): SessionSummary[] {
+  if (pending.size === 0) return items
+  let changed = false
+  const next = items.map((item) => {
+    const forced = pending.get(item.id)
+    if (forced === undefined) return item
+    if (item.status === 'running' || item.status === 'created') {
+      if (item.status === forced) return item
+      changed = true
+      return { ...item, status: forced }
+    }
+    pending.delete(item.id)
+    return item
+  })
+  return changed ? next : items
+}
+
+/** Single-session variant of {@link applyPendingTerminations}. */
+export function applyPendingTermination(
+  session: SessionSummary,
+  pending: Map<string, SessionStatus>
+): SessionSummary {
+  const forced = pending.get(session.id)
+  if (forced === undefined) return session
+  if (session.status === 'running' || session.status === 'created') {
+    return session.status === forced ? session : { ...session, status: forced }
+  }
+  pending.delete(session.id)
+  return session
+}

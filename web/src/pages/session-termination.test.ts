@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionStatus, SessionSummary } from '@/api/types'
 import {
+  applyPendingTermination,
+  applyPendingTerminations,
   isTerminationSettled,
   PENDING_TERMINATION_STATUS,
   revertSessionStatus,
@@ -91,5 +93,51 @@ describe('revertSessionStatus', () => {
   it('never rolls back a server update that beat the failed request', () => {
     const items = withSessionStatus([session({ id: 'a' })], 'a', 'stopped')
     expect(revertSessionStatus(items, 'a', 'stopping', 'running')).toBe(items)
+  })
+})
+
+describe('applyPendingTerminations', () => {
+  it('keeps the optimistic status over a stale running snapshot', () => {
+    const pending = new Map([['a', 'stopping' as SessionStatus]])
+    const items = [session({ id: 'a', status: 'running' }), session({ id: 'b' })]
+
+    const next = applyPendingTerminations(items, pending)
+
+    expect(next[0].status).toBe('stopping')
+    expect(next[1]).toBe(items[1])
+    expect(pending.get('a')).toBe('stopping')
+  })
+
+  it('lets a progressed server status win and drops the pending entry', () => {
+    const pending = new Map([['a', 'stopping' as SessionStatus]])
+    const next = applyPendingTerminations([session({ id: 'a', status: 'stopped' })], pending)
+
+    expect(next[0].status).toBe('stopped')
+    expect(pending.has('a')).toBe(false)
+  })
+
+  it('returns the same array when nothing needs overriding', () => {
+    const pending = new Map([['a', 'stopping' as SessionStatus]])
+    const items = [session({ id: 'a', status: 'stopping' })]
+    expect(applyPendingTerminations(items, pending)).toBe(items)
+    expect(applyPendingTerminations([session()], new Map())).toHaveLength(1)
+  })
+})
+
+describe('applyPendingTermination', () => {
+  it('overrides a stale single-session event payload', () => {
+    const pending = new Map([['a', 'stopping' as SessionStatus]])
+    expect(applyPendingTermination(session({ id: 'a', status: 'running' }), pending).status).toBe(
+      'stopping'
+    )
+    expect(applyPendingTermination(session({ id: 'b' }), pending).status).toBe('running')
+  })
+
+  it('accepts the authoritative status once it progressed', () => {
+    const pending = new Map([['a', 'stopping' as SessionStatus]])
+    expect(applyPendingTermination(session({ id: 'a', status: 'killed' }), pending).status).toBe(
+      'killed'
+    )
+    expect(pending.has('a')).toBe(false)
   })
 })
