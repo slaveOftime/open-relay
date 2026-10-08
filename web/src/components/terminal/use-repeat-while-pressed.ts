@@ -1,86 +1,101 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { ButtonHTMLAttributes } from 'react'
+import { RepeatController, type RepeatSource } from './repeat-controller'
 
-const REPEAT_DELAY_MS = 400
-const REPEAT_INTERVAL_MS = 100
-
-/**
- * Start an action immediately, then again after a short hold delay, then on a
- * fixed interval. `stopRepeat` clears whichever timer is currently pending.
- */
-export function useRepeatWhilePressed() {
-  const timeoutRef = useRef<number | null>(null)
-  const intervalRef = useRef<number | null>(null)
-  const actionRef = useRef<(() => void) | null>(null)
-
-  const stopRepeat = useCallback(() => {
-    if (timeoutRef.current !== null) {
-      window.clearTimeout(timeoutRef.current)
-      timeoutRef.current = null
-    }
-    if (intervalRef.current !== null) {
-      window.clearInterval(intervalRef.current)
-      intervalRef.current = null
-    }
-    actionRef.current = null
-  }, [])
-
-  const startRepeat = useCallback(
-    (action: () => void) => {
-      stopRepeat()
-      actionRef.current = action
-      action()
-      timeoutRef.current = window.setTimeout(() => {
-        actionRef.current?.()
-        intervalRef.current = window.setInterval(() => {
-          actionRef.current?.()
-        }, REPEAT_INTERVAL_MS)
-      }, REPEAT_DELAY_MS)
-    },
-    [stopRepeat]
-  )
-
-  useEffect(() => {
-    const stop = () => stopRepeat()
-    window.addEventListener('pointerup', stop)
-    window.addEventListener('pointercancel', stop)
-    window.addEventListener('blur', stop)
-    window.addEventListener('keyup', stop)
-    return () => {
-      window.removeEventListener('pointerup', stop)
-      window.removeEventListener('pointercancel', stop)
-      window.removeEventListener('blur', stop)
-      window.removeEventListener('keyup', stop)
-      stopRepeat()
-    }
-  }, [stopRepeat])
-
-  return { startRepeat, stopRepeat }
+export interface RepeatControls {
+  startRepeat: (action: () => void, source: RepeatSource) => void
+  /** `at` is the `timeStamp` of the event that is ending the gesture. */
+  stopRepeat: (at?: number) => void
+  /** True when this pointer ending should end the hold. */
+  endsOnPointer: (pointerId: number) => boolean
+  /** True when this key release should end the hold. */
+  endsOnKey: (key: string) => boolean
+  /** True when a click at `event.timeStamp` repeats an activation we handled. */
+  isFollowUpClick: (at: number) => boolean
 }
 
-/** Shared button handlers for hold-to-repeat keys. */
+/**
+ * Owns one RepeatController for the caller's lifetime and forwards the window
+ * events that must end a hold even when the pointer or focus moved away.
+ */
+export function useRepeatWhilePressed(): RepeatControls {
+  const [controller] = useState(() => new RepeatController(window))
+
+  useEffect(() => {
+    const onPointerEnd = (event: PointerEvent) => {
+      if (controller.endsOnPointer(event.pointerId)) controller.stop(event.timeStamp)
+    }
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (controller.endsOnKey(event.key)) controller.stop(event.timeStamp)
+    }
+    const onBlur = () => controller.stop()
+    window.addEventListener('pointerup', onPointerEnd)
+    window.addEventListener('pointercancel', onPointerEnd)
+    window.addEventListener('keyup', onKeyUp)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('pointerup', onPointerEnd)
+      window.removeEventListener('pointercancel', onPointerEnd)
+      window.removeEventListener('keyup', onKeyUp)
+      window.removeEventListener('blur', onBlur)
+    }
+  }, [controller])
+
+  // Unmounting the owner mid-hold must not leave a timer firing.
+  useEffect(() => () => controller.stop(), [controller])
+
+  return useMemo<RepeatControls>(
+    () => ({
+      startRepeat: (action, source) => controller.start(action, source),
+      stopRepeat: (at) => controller.stop(at),
+      endsOnPointer: (pointerId) => controller.endsOnPointer(pointerId),
+      endsOnKey: (key) => controller.endsOnKey(key),
+      isFollowUpClick: (at) => controller.isFollowUpClick(at),
+    }),
+    [controller]
+  )
+}
+
+/**
+ * Shared button handlers for hold-to-repeat keys.
+ *
+ * A hold sends on pointerdown/keydown and repeats while it is held; a click
+ * only sends when no pointer/key activation preceded it, which is how assistive
+ * technology (and `element.click()`) activates a button.
+ */
 export function holdRepeatProps(
-  startRepeat: (action: () => void) => void,
-  stopRepeat: () => void,
+  controls: RepeatControls,
   action: () => void
 ): ButtonHTMLAttributes<HTMLButtonElement> {
   return {
     onPointerDown: (event) => {
       if (event.button !== 0) return
       event.preventDefault()
-      startRepeat(action)
+      controls.startRepeat(action, { pointerId: event.pointerId, at: event.timeStamp })
     },
+    // Belt and braces over the pointerdown above on browsers where that does
+    // not suppress the compatibility mouse events: keeping the button from
+    // taking focus stops xterm from losing it on every tap.
     onMouseDown: (event) => event.preventDefault(),
-    onPointerUp: stopRepeat,
-    onPointerLeave: stopRepeat,
-    onPointerCancel: stopRepeat,
-    onContextMenu: (event) => event.preventDefault(),
     onKeyDown: (event) => {
       if (event.key !== 'Enter' && event.key !== ' ') return
       event.preventDefault()
-      if (!event.repeat) startRepeat(action)
+      // Auto-repeat keydowns are already covered by the interval.
+      if (!event.repeat) controls.startRepeat(action, { key: event.key, at: event.timeStamp })
     },
-    onKeyUp: stopRepeat,
-    onBlur: stopRepeat,
+    onClick: (event) => {
+      // The browser's own follow-up click for a tap or key press we already
+      // handled: sending again would double the key. Everything else (assistive
+      // tech, programmatic activation) is a first activation.
+      if (controls.isFollowUpClick(event.timeStamp)) return
+      controls.stopRepeat()
+      action()
+    },
+    onPointerUp: (event) => controls.stopRepeat(event.timeStamp),
+    onPointerLeave: () => controls.stopRepeat(),
+    onPointerCancel: (event) => controls.stopRepeat(event.timeStamp),
+    onKeyUp: (event) => controls.stopRepeat(event.timeStamp),
+    onBlur: () => controls.stopRepeat(),
+    onContextMenu: (event) => event.preventDefault(),
   }
 }
