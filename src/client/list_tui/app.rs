@@ -153,7 +153,7 @@ pub fn session_search_text(session: &SessionSummary) -> String {
     }
     if let Some(cwd) = &session.cwd {
         text.push('\n');
-        text.push_str(cwd);
+        text.push_str(&normalize_tree_cwd(cwd));
     }
     if let Some(node) = &session.node {
         text.push('\n');
@@ -214,7 +214,8 @@ use super::spawn::{session_command, spawn_session_terminal, terminal_marker};
 use super::terminal::{TuiTerminal, wait_for_ctrl_d};
 use super::tree::{
     TREE_AUTO_DEPTH, TreeEntry, TreeNode, TreeView, ViewMode, append_tree_node, common_path_prefix,
-    ensure_tree_path, walk_tree_branch,
+    ensure_tree_path, normalize_tree_cwd, path_ends_with_ci, path_starts_with_ci,
+    path_strip_prefix_ci, walk_tree_branch,
 };
 
 #[derive(Default)]
@@ -480,7 +481,7 @@ impl App {
             return Vec::new();
         };
         let folder_node = folder.node.as_deref().or(list_node);
-        let folder_path = folder.cwd.as_deref().map(PathBuf::from);
+        let folder_path = folder.cwd.as_deref().map(|cwd| PathBuf::from(normalize_tree_cwd(cwd)));
         let mut targets = Vec::new();
         for session in &self.sessions {
             let session_node = session.node.as_deref().or(list_node);
@@ -493,8 +494,8 @@ impl App {
                 let session_path = self.session_tree_cwd(session);
                 folder_path
                     .as_ref()
-                    .is_some_and(|path| session_path.starts_with(path))
-                    || session_path.ends_with(&folder.path)
+                    .is_some_and(|path| path_starts_with_ci(&session_path, path))
+                    || path_ends_with_ci(&session_path, &folder.path)
             };
             if belongs {
                 let target = SessionTarget {
@@ -650,8 +651,8 @@ impl App {
     /// from `self.sessions`. Sessions without a `cwd` (or whose cwd matches
     /// the shared prefix) are bucketed onto the synthetic root.
     fn session_tree_cwd(&self, session: &SessionSummary) -> PathBuf {
-        if let Some(cwd) = session.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
-            return PathBuf::from(cwd);
+        if let Some(cwd) = session.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
+            return PathBuf::from(normalize_tree_cwd(cwd));
         }
         // A secondary node's storage root is opaque to this client. Use a
         // logical sessions/<id> path under that node's tree branch.
@@ -760,8 +761,7 @@ impl App {
                 let effective = if self.tree.auto_expand_all {
                     cwd.clone()
                 } else {
-                    cwd.strip_prefix(&common)
-                        .map_or_else(|_| cwd.clone(), |stripped| stripped.to_path_buf())
+                    path_strip_prefix_ci(&cwd, &common).unwrap_or_else(|| cwd.clone())
                 };
                 let leaf_idx = ensure_tree_path(
                     &mut self.tree,
@@ -942,8 +942,7 @@ impl App {
         let effective = if self.tree.auto_expand_all {
             cwd.clone()
         } else {
-            cwd.strip_prefix(&common)
-                .map_or_else(|_| cwd.clone(), |stripped| stripped.to_path_buf())
+            path_strip_prefix_ci(&cwd, &common).unwrap_or_else(|| cwd.clone())
         };
         if let Some((_, position)) = self
             .tree
@@ -955,7 +954,7 @@ impl App {
                     let folder = &self.tree.nodes[*node];
                     (folder.node.as_deref() == session_node
                         && (folder.is_node && folder.path.as_os_str().is_empty()
-                            || effective.starts_with(&folder.path)))
+                            || path_starts_with_ci(&effective, &folder.path)))
                     .then_some((folder.path.components().count(), position))
                 }
                 TreeEntry::Session { .. } => None,

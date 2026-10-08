@@ -100,6 +100,70 @@ impl TreeView {
 /// Number of path-folder levels expanded by default under each tree root.
 pub const TREE_AUTO_DEPTH: usize = 1;
 
+/// Canonical separator form for a stored cwd: remote sessions on a different
+/// OS report paths with the other platform's slashes, and the host `PathBuf`
+/// is not guaranteed to parse those. Folding `\` to `/` makes the tree the
+/// same regardless of which side produced the path.
+pub fn normalize_tree_cwd(cwd: &str) -> String {
+    cwd.trim().replace('\\', "/")
+}
+
+fn component_key(component: std::path::Component<'_>) -> String {
+    component
+        .as_os_str()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
+fn components_lower(path: &Path) -> Vec<String> {
+    path.components().map(component_key).collect()
+}
+
+/// Component-wise equality that ignores case, so `C:/Foo` and `c:/foo`
+/// bucket into one folder. The first spelling seen keeps the display name.
+pub fn path_eq_ci(a: &Path, b: &Path) -> bool {
+    components_lower(a) == components_lower(b)
+}
+
+pub fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
+    let mut components = path.components();
+    for prefix_component in prefix.components() {
+        match components.next() {
+            Some(component) if component_key(component) == component_key(prefix_component) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub fn path_ends_with_ci(path: &Path, suffix: &Path) -> bool {
+    let components = components_lower(path);
+    let suffix_components = components_lower(suffix);
+    suffix_components.len() <= components.len()
+        && components[components.len() - suffix_components.len()..] == suffix_components[..]
+}
+
+/// Case-insensitive `Path::strip_prefix`; the remainder keeps the original
+/// spelling of `path`'s components.
+pub fn path_strip_prefix_ci(path: &Path, prefix: &Path) -> Option<PathBuf> {
+    let path_components: Vec<_> = path.components().collect();
+    let prefix_components: Vec<_> = prefix.components().collect();
+    if prefix_components.len() > path_components.len() {
+        return None;
+    }
+    for (path_component, prefix_component) in path_components.iter().zip(&prefix_components) {
+        if component_key(*path_component) != component_key(*prefix_component) {
+            return None;
+        }
+    }
+    let mut rest = PathBuf::new();
+    for component in &path_components[prefix_components.len()..] {
+        rest.push(component.as_os_str());
+    }
+    Some(rest)
+}
+
 /// Stable expansion key distinguishes a grouped node root from the synthetic
 /// root, which share the same empty path.
 pub type TreeFolderKey = (Option<String>, PathBuf, bool);
@@ -118,7 +182,7 @@ pub fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
     let first = iter.next().expect("non-empty").clone();
     let mut prefix = first.clone();
     for candidate in iter {
-        while !candidate.starts_with(&prefix) {
+        while !path_starts_with_ci(candidate, &prefix) {
             if !prefix.pop() {
                 return Path::new("/").to_path_buf();
             }
@@ -161,13 +225,13 @@ pub fn ensure_tree_path(
             .subfolders
             .iter()
             .copied()
-            .find(|&idx| tree.nodes[idx].path == accumulated);
+            .find(|&idx| path_eq_ci(&tree.nodes[idx].path, &accumulated));
         current = match next {
             Some(idx) => idx,
             None => {
                 // Pop components from the original spelling of the cwd.
                 // A remote Unix path viewed on Windows must keep its slashes.
-                let mut absolute = PathBuf::from(cwd);
+                let mut absolute = PathBuf::from(normalize_tree_cwd(cwd));
                 for _ in 0..path
                     .components()
                     .filter(|c| !matches!(c, std::path::Component::RootDir))
