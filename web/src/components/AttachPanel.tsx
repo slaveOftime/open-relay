@@ -23,7 +23,7 @@ import {
   DoubleArrowDownIcon,
   DoubleArrowUpIcon,
 } from '@radix-ui/react-icons'
-import { holdRepeatProps, useRepeatWhilePressed } from './terminal/use-repeat-while-pressed'
+import { holdRepeatProps, useRepeatWhilePressed } from '@/hooks/use-repeat-while-pressed'
 import type { UploadSessionFileResponse } from '@/api/client'
 
 // ── Input history ─────────────────────────────────────────────────────────────

@@ -1,53 +1,10 @@
-import { useEffect, useSyncExternalStore } from 'react'
-
 import { subscribeEvents, type SseConnectionState } from '@/api/client'
 import type { SessionEvent, SessionSummary } from '@/api/types'
 import { ingestSessionActivityEvent, recordSessionActivity } from '@/lib/sessionActivity'
+import { sameSessionSummary, sessionKey } from '@/lib/sessionSummary'
 
 type StoreListener = () => void
 type EventListener = (event: SessionEvent) => void
-
-function normalizeNode(node?: string | null): string | null {
-  if (typeof node !== 'string') return null
-  const trimmed = node.trim()
-  return trimmed === '' ? null : trimmed
-}
-
-function sessionKey(id: string, node?: string | null): string {
-  return `${normalizeNode(node) ?? ''}\0${id}`
-}
-
-function sameStringArray(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index])
-}
-
-function sameOptionalString(a: string | null | undefined, b: string | null | undefined): boolean {
-  return (a ?? null) === (b ?? null)
-}
-
-function sameSessionSummary(a: SessionSummary, b: SessionSummary): boolean {
-  if (a === b) return true
-  if (a.id !== b.id) return false
-  if (!sameOptionalString(a.title, b.title)) return false
-  if (!sameStringArray(a.tags, b.tags)) return false
-  if (a.command !== b.command) return false
-  if (!sameStringArray(a.args, b.args)) return false
-  if ((a.pid ?? null) !== (b.pid ?? null)) return false
-  if (a.status !== b.status) return false
-  if (a.created_at !== b.created_at) return false
-  if (!sameOptionalString(a.started_at, b.started_at)) return false
-  if (!sameOptionalString(a.ended_at, b.ended_at)) return false
-  if (!sameOptionalString(a.resume_command ?? null, b.resume_command ?? null)) return false
-  if (!sameOptionalString(a.cwd, b.cwd)) return false
-  if (a.input_needed !== b.input_needed) return false
-  if (a.notifications_enabled !== b.notifications_enabled) return false
-  if (normalizeNode(a.node) !== normalizeNode(b.node)) return false
-  if (a.last_total_bytes !== b.last_total_bytes) return false
-  if (!sameOptionalString(a.last_output_epoch ?? null, b.last_output_epoch ?? null)) return false
-  if (!sameOptionalString(a.foreground_color ?? null, b.foreground_color ?? null)) return false
-  if (!sameOptionalString(a.background_color ?? null, b.background_color ?? null)) return false
-  return true
-}
 
 class SessionEventsStore {
   private readonly storeListeners = new Set<StoreListener>()
@@ -208,7 +165,7 @@ class SessionEventsStore {
   }
 }
 
-const sessionEventsStore = new SessionEventsStore()
+export const sessionEventsStore = new SessionEventsStore()
 
 export function startSessionEvents(): void {
   sessionEventsStore.retain()
@@ -228,52 +185,4 @@ export function ingestSessionSummary(session: SessionSummary): void {
 
 export function ingestSessionSummaries(items: SessionSummary[]): void {
   sessionEventsStore.seedSessions(items)
-}
-
-// A stable subscribe function avoids tearing down and re-adding the store
-// listener on every table render (e.g. when activity sparklines update).
-const subscribeConnectionStore = (listener: StoreListener) =>
-  sessionEventsStore.subscribeStore(listener)
-
-export function useSseConnectionState(): SseConnectionState {
-  return useSyncExternalStore(
-    subscribeConnectionStore,
-    () => sessionEventsStore.getConnectionState(),
-    () => 'connecting'
-  )
-}
-
-export function useLiveSessionSummary(
-  id?: string | null,
-  node?: string | null
-): SessionSummary | null {
-  return useSyncExternalStore(
-    subscribeConnectionStore,
-    () => sessionEventsStore.getSession(id, node),
-    () => null
-  )
-}
-
-/**
- * Reconcile handler. Fires once per matching SSE event for the duration
- * of the consumer's mount; consumers (e.g. SessionDetailPage) use this to
- * re-fetch the canonical session summary when the local store diverges
- * from the server's REST view.
- */
-export function useReconcileTrigger(
-  id?: string | null,
-  node?: string | null,
-  reconcile: ((reason: 'stream_ready' | 'resync_required') => void) | null = null
-): void {
-  useEffect(() => {
-    if (!id || !reconcile) return
-    return sessionEventsStore.subscribeEvents((event) => {
-      if (event.event !== 'stream_ready' && event.event !== 'resync_required') return
-      if (event.event === 'resync_required') {
-        const target = normalizeNode(event.data.node)
-        if (target !== null && target !== normalizeNode(node)) return
-      }
-      reconcile(event.event)
-    })
-  }, [id, node, reconcile])
 }

@@ -126,11 +126,8 @@ import {
   syncPushSubscription,
   type PushSetupState,
 } from '@/lib/push'
-import {
-  ingestSessionSummaries,
-  subscribeSessionEvents,
-  useSseConnectionState,
-} from '@/lib/sessionEvents'
+import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/sessionEvents'
+import { useSseConnectionState } from '@/hooks/use-session-events'
 const PREFS_KEY = 'open-relay.webv2.sessions.preferences.v1'
 const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
 const DEFAULT_PAGE_SIZE = 15

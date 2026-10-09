@@ -69,11 +69,8 @@ import {
 } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
 import AttachPanel from '@/components/AttachPanel'
-import {
-  ingestSessionSummary,
-  useLiveSessionSummary,
-  useReconcileTrigger,
-} from '@/lib/sessionEvents'
+import { ingestSessionSummary } from '@/lib/sessionEvents'
+import { useLiveSessionSummary, useReconcileTrigger } from '@/hooks/use-session-events'
 import {
   PENDING_TERMINATION_STATUS,
   withPendingTermination,
