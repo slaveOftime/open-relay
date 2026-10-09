@@ -20,11 +20,9 @@ Format: `area — finding — why it matters — suggested next step`.
    `eslint-disable` warnings. CI only passes because `dev-dist` doesn't exist there.
    _Next step:_ add `dev-dist` to `globalIgnores`.
 
-3. **OPEN, and it now blocks work** — Playwright has no trace/screenshot/retry setup: `retries: 0`, `reporter: 'list'`,
-   no `use.trace`, no projects (so no WebKit/iOS run). The mobile focus-ring bug fixed
-   in `59c473e` only reproduces on WebKit, which the suite never runs — that is why it
-   shipped. _Next step:_ add `trace: 'on-first-retry'`, `screenshot: 'only-on-failure'`,
-   and a `webkit` (or `Mobile Safari`) project in CI.
+3. **FIXED** (bb8507f) — Playwright had no trace/screenshot/retry setup and no
+   mobile-Safari project. Traces and screenshots are kept on failure, CI retries
+   twice, and an iPhone 13 project covers the iOS attach paths. See item 32.
 
 4. **`vitest` runs with `environment: 'node'` and no `jsdom`/`happy-dom` installed,
    so component/DOM tests cannot be added without new dependencies. All current tests
