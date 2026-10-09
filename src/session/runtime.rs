@@ -1123,7 +1123,12 @@ pub fn spawn_session(
         }
     };
 
-    let spawn_env = load_spawn_environment();
+    // Seed the child environment from the daemon's own (Windows refreshes
+    // it from the user environment block) and inject this session's id as
+    // `OLY_SESSION_ID`, so a program running under oly can discover which
+    // session it is — e.g. an agent CLI that reports its id back to a
+    // supervising agent (see `skills/oly-subagent/SKILL.md`).
+    let spawn_env = session_spawn_environment(&meta.id);
     let command_cwd = meta
         .cwd
         .as_deref()
@@ -1478,6 +1483,40 @@ fn load_spawn_environment() -> Vec<(OsString, OsString)> {
     inherited
 }
 
+/// Environment variable carrying a session's own id into its PTY child.
+///
+/// Injected for every spawned session (see [`session_spawn_environment`]), so
+/// a program running under oly can discover which session it is. The primary
+/// consumer is an agent CLI that reports its session id back to a supervising
+/// agent (`skills/oly-subagent/SKILL.md`), but any child may read it.
+pub const OLY_SESSION_ID_ENV: &str = "OLY_SESSION_ID";
+
+/// Build the environment for a PTY child of session `session_id`.
+///
+/// Starts from [`load_spawn_environment`] (the daemon's own environment, with
+/// the Windows user block refreshed) and injects [`OLY_SESSION_ID_ENV`] set to
+/// this session's id.
+fn session_spawn_environment(session_id: &str) -> Vec<(OsString, OsString)> {
+    inject_session_id(load_spawn_environment(), session_id)
+}
+
+/// Inject [`OLY_SESSION_ID_ENV`] into `env`, replacing any inherited entry.
+///
+/// Pure and independent of the process environment so it is unit-tested
+/// directly. Any pre-existing `OLY_SESSION_ID` is dropped first (matched with
+/// [`env_key_eq`], which is case-insensitive on Windows) so the child always
+/// sees its own id exactly once — even when the daemon itself runs inside an
+/// oly session and inherited a parent `OLY_SESSION_ID`.
+fn inject_session_id(
+    mut env: Vec<(OsString, OsString)>,
+    session_id: &str,
+) -> Vec<(OsString, OsString)> {
+    let key = OsStr::new(OLY_SESSION_ID_ENV);
+    env.retain(|(existing, _)| !env_key_eq(existing, key));
+    env.push((OsString::from(key), OsString::from(session_id)));
+    env
+}
+
 // Only Windows merges a refreshed user environment, but the merge logic is
 // platform-agnostic and unit-tested on every platform.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -1609,6 +1648,82 @@ mod tests {
         assert!(merged.iter().any(|(key, value)| {
             key == OsStr::new("NEW_VALUE") && value == OsStr::new("added")
         }));
+    }
+
+    #[test]
+    fn inject_session_id_adds_the_session_id_alongside_inherited_env() {
+        let env = inject_session_id(
+            vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+                (OsString::from("HOME"), OsString::from("/home/dev")),
+            ],
+            "abc1234",
+        );
+
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| env_key_eq(key, OsStr::new(OLY_SESSION_ID_ENV)))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("abc1234")),
+            "the session id must be injected as OLY_SESSION_ID"
+        );
+        // The rest of the inherited environment is preserved untouched.
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == OsStr::new("PATH"))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("/usr/bin"))
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == OsStr::new("HOME"))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("/home/dev"))
+        );
+    }
+
+    #[test]
+    fn inject_session_id_replaces_an_inherited_value_exactly_once() {
+        // A daemon that itself runs inside an oly session inherits the
+        // parent's OLY_SESSION_ID; every spawned child must instead see its
+        // OWN id — and exactly one entry, never two.
+        let env = inject_session_id(
+            vec![
+                (OsString::from("OLY_SESSION_ID"), OsString::from("parent1")),
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+            ],
+            "child42",
+        );
+
+        let matches: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| env_key_eq(key, OsStr::new(OLY_SESSION_ID_ENV)))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "OLY_SESSION_ID must appear exactly once, got: {:?}",
+            matches
+        );
+        assert_eq!(matches[0].1, OsStr::new("child42"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_session_id_is_case_insensitive_on_windows() {
+        // Windows env names are case-insensitive; a differently-cased
+        // inherited entry must still be replaced, not duplicated.
+        let env = inject_session_id(
+            vec![(OsString::from("oly_session_id"), OsString::from("stale"))],
+            "win0001",
+        );
+
+        let matches: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| env_key_eq(key, OsStr::new(OLY_SESSION_ID_ENV)))
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1, OsStr::new("win0001"));
     }
 
     #[cfg(windows)]

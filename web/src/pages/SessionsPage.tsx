@@ -271,7 +271,7 @@ export default function SessionsPage() {
     return () => {
       stopped = true
     }
-  }, [page, search, selectedNode, sortField, sortOrder, statusFilter, pageSize])
+  }, [page, search, selectedNode, selectedNodeRef, sortField, sortOrder, statusFilter, pageSize])
 
   const reloadSessions = useCallback(
     async (opts?: LoadOptions) => {
@@ -365,7 +365,7 @@ export default function SessionsPage() {
         requestVersionRef.current += 1
       }
     }
-  }, [loadLocal, selectedNode])
+  }, [loadLocal, selectedNode, requestVersionRef])
 
   useEffect(() => {
     if (selectedNode) {
@@ -378,7 +378,7 @@ export default function SessionsPage() {
         requestVersionRef.current += 1
       }
     }
-  }, [loadRemote, selectedNode])
+  }, [loadRemote, selectedNode, requestVersionRef])
 
   useEffect(() => {
     void syncPushSubscription(false)

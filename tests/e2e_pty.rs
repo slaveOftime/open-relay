@@ -486,6 +486,35 @@ fn e2e_logs_available_after_session_exits() {
     );
 }
 
+/// Every PTY child receives its own session id as `OLY_SESSION_ID`, so a
+/// program running under oly can discover which session it is and report it
+/// back to a supervising agent (see `skills/oly-subagent/SKILL.md`). The
+/// child prints a marker immediately followed by the variable's value; the
+/// marker keeps the assertion honest — the daemon's own `--- Session <id>
+/// is <status> ---` trailer also contains the id and would satisfy a bare
+/// `.contains(id)` even if the variable were never set.
+#[test]
+fn e2e_session_id_is_injected_into_the_child_environment() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_session_id_env");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", "echo", "SID=%OLY_SESSION_ID%"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "printf SID=%s \"$OLY_SESSION_ID\""];
+
+    let id = start_session(&tmp, cmd);
+
+    let needle = format!("SID={id}");
+    let seen = wait_for_log(&tmp, &id, |log| log.contains(&needle), native_shell_timeout());
+    assert!(
+        seen.is_some(),
+        "child did not print its own OLY_SESSION_ID (expected '{needle}').\nLogs:\n{}",
+        fetch_logs(&tmp, &id)
+    );
+}
+
 #[test]
 fn e2e_local_attach_reports_session_end_on_child_exit() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());

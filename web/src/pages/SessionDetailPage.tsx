@@ -264,6 +264,28 @@ function SessionDetailPageContent() {
     setConnectTrace((prev) => [`${ts} ${step}`, ...prev].slice(0, 200))
   }, [])
 
+  // Reconnect backoff, attempt counting and deferred-while-hidden state.
+  // The two closures are memoized so the hook's returned callbacks are stable:
+  // a fresh `triggerReconnect` each render would make `scheduleReconnect` a new
+  // function every render, which is the same trap that broke the session loaders.
+  const triggerReconnect = useCallback(() => setWsReconnectKey((k) => k + 1), [])
+  const isReconnectCurrent = useCallback(
+    () => isMounted.current && modeRef.current === 'attach',
+    []
+  )
+  const reconnect = useAttachReconnect({
+    pushTrace: pushConnectTrace,
+    setError: setWsError,
+    setConnecting: setWsConnecting,
+    triggerReconnect,
+    isCurrent: isReconnectCurrent,
+  })
+  const reconnectTimerRef = reconnect.timerRef
+  const pendingReconnectRef = reconnect.pendingRef
+  const resetReconnectAttempts = reconnect.resetAttempts
+  const cancelReconnect = reconnect.cancelReconnect
+  const scheduleReconnect = reconnect.scheduleReconnect
+
   const requestReconnect = useCallback(
     (source: string, force = false) => {
       if (document.visibilityState !== 'visible') return false
@@ -288,7 +310,7 @@ function SessionDetailPageContent() {
       setWsReconnectKey((k) => k + 1)
       return true
     },
-    [pushConnectTrace]
+    [pushConnectTrace, pendingReconnectRef]
   )
 
   const sendInput = useCallback((data: string, waitForChange: boolean) => {
@@ -632,28 +654,6 @@ function SessionDetailPageContent() {
   // Python REPL) to redraw its prompt, producing a duplicate cursor line.
   const sessionReady = session !== null
 
-  // Reconnect backoff, attempt counting and deferred-while-hidden state.
-  // The two closures are memoized so the hook's returned callbacks are stable:
-  // a fresh `triggerReconnect` each render would make `scheduleReconnect` a new
-  // function every render, which is the same trap that broke the session loaders.
-  const triggerReconnect = useCallback(() => setWsReconnectKey((k) => k + 1), [])
-  const isReconnectCurrent = useCallback(
-    () => isMounted.current && modeRef.current === 'attach',
-    []
-  )
-  const reconnect = useAttachReconnect({
-    pushTrace: pushConnectTrace,
-    setError: setWsError,
-    setConnecting: setWsConnecting,
-    triggerReconnect,
-    isCurrent: isReconnectCurrent,
-  })
-  const reconnectTimerRef = reconnect.timerRef
-  const pendingReconnectRef = reconnect.pendingRef
-  const resetReconnectAttempts = reconnect.resetAttempts
-  const cancelReconnect = reconnect.cancelReconnect
-  const scheduleReconnect = reconnect.scheduleReconnect
-
   useEffect(() => {
     if (mode !== 'attach' || !id || !sessionReady) return
 
@@ -758,6 +758,9 @@ function SessionDetailPageContent() {
     wsReconnectKey,
     enqueueTerminalOutput,
     noteAttachUserActivity,
+    cancelReconnect,
+    resetReconnectAttempts,
+    scheduleReconnect,
   ])
 
   useEffect(() => {
@@ -838,7 +841,7 @@ function SessionDetailPageContent() {
       window.removeEventListener('pageshow', handlePageShow)
       window.removeEventListener('online', handleOnline)
     }
-  }, [mode, requestReconnect])
+  }, [mode, requestReconnect, pendingReconnectRef, reconnectTimerRef])
 
   // Reconnect watchdog: if attach view is visible+online but remains disconnected
   // without a scheduled retry, force a fresh socket attempt. This covers stale
@@ -861,7 +864,7 @@ function SessionDetailPageContent() {
     }, 1600)
 
     return () => window.clearInterval(tick)
-  }, [mode, requestReconnect])
+  }, [mode, requestReconnect, pendingReconnectRef, reconnectTimerRef])
 
   useEffect(() => {
     if (mode !== 'logs' || !id) return
