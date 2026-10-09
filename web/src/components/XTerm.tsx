@@ -7,7 +7,7 @@ import { cn } from '@/utils/cn'
 import QuickKeysMenu from './terminal/QuickKeysMenu'
 import QuickKeysDialog from './terminal/QuickKeysDialog'
 import { markOwnedTerminalWheel } from './terminal/scroll-wheel'
-import type { QuickKey } from './terminal/quick-keys'
+import type { QuickKey } from '@/lib/quickKeys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 import './XTerm.css'

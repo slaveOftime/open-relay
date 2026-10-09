@@ -1,5 +1,5 @@
 import type { SessionEvent, SessionNotificationData, SessionSummary } from '@/api/types'
-import { SparklineStore, type SparklineActivitySnapshot } from '@/components/sparklineStore'
+import { SparklineStore, type SparklineActivitySnapshot } from '@/lib/sparklineStore'
 
 // Pin the singleton on globalThis so Vite HMR (or any future module-system
 // replacement) keeps the same instance instead of rebuilding a fresh one and

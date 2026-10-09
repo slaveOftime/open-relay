@@ -7,7 +7,7 @@ import {
   seedHeldBuckets,
   type SparklinePoint,
 } from './sparklineGeometry'
-import { SPARKLINE_BUCKET_MS, type SparklineActivitySnapshot } from './sparklineStore'
+import { SPARKLINE_BUCKET_MS, type SparklineActivitySnapshot } from '@/lib/sparklineStore'
 import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,

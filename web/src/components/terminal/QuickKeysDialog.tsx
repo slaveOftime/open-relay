@@ -23,7 +23,7 @@ import {
   moveQuickKey,
   QUICK_KEY_COLORS,
   type QuickKey,
-} from './quick-keys'
+} from '@/lib/quickKeys'
 
 /** Fixed row height (h-14) + vertical margin (mb-2) used for drag math. */
 const ROW_STRIDE_PX = 64

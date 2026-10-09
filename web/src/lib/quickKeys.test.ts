@@ -11,7 +11,7 @@ import {
   layoutRing,
   moveQuickKey,
   parseCombo,
-} from './quick-keys'
+} from './quickKeys'
 import { loadQuickKeys, normalizeQuickKeys, saveQuickKeys } from '@/lib/quickKeysStorage'
 
 function fakeStorage(initial: Record<string, string> = {}) {
