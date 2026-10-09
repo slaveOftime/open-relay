@@ -76,12 +76,12 @@ pub enum Commands {
     Remove(RemoveArgs),
     /// Attach to a running session.
     Attach(AttachArgs),
-    /// Show session output: rendered log tail (default), the visible screen
-    /// (`--screen`), a raw byte window from a cursor (`--from`), or block
-    /// until a condition is met (`--after`/`--exit`/`--idle-ms`/`--pattern`).
-    /// Uses live screen state when running, otherwise replays the journal;
-    /// `--from-file` forces the journal replay.
+    /// Read rendered views (default tail 40), sampled screen history, or
+    /// exact bounded byte pages (`--since`), optionally after a wait.
     Logs(LogsArgs),
+    /// Stream a fixed prefix of canonical filtered bytes (not raw PTY),
+    /// including terminal controls, for files and pipes.
+    Export(ExportArgs),
     /// Send text or keys to a session. Example: `oly send <id> "hello" key:enter`.
     Send(SendArgs),
     /// Manage API keys on this (primary) daemon.
@@ -406,116 +406,104 @@ impl AttachArgs {
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    /// Session ID to show logs for. If omitted, uses the most recently created session.
+    /// Session ID to read. If omitted, uses the most recently created session.
     pub id: Option<String>,
 
-    // ── What to read (at most one; default: the rendered log tail) ──────
-    /// Print the visible screen instead of the log tail.
-    #[arg(long, conflicts_with_all = ["from", "raw"])]
+    // ── What to print (default: last 40 text lines) ──
+    /// Print the last N rendered text lines (0..65535; default 40).
+    #[arg(long, value_name = "N", conflicts_with_all = ["screen", "tail_frames"])]
+    pub tail: Option<usize>,
+    /// Print the current screen: what a viewer would see if they attached
+    /// now, or the final visible grid after exit (including blank states).
+    #[arg(long, conflicts_with_all = ["tail", "tail_frames"])]
     pub screen: bool,
-    /// Read a raw byte window of the canonical filtered stream starting at
-    /// OFFSET (pair with `logs --from` for the cursor; page with the
-    /// returned `next` offset).
-    #[arg(long, value_name = "OFFSET", conflicts_with = "raw")]
-    pub from: Option<u64>,
-    /// Export the whole raw output byte stream (journal-derived, unfiltered
-    /// by rendering). May contain terminal control sequences — meant for
-    /// pipes and files; a warning is printed when stdout is a terminal.
-    /// Local sessions only.
-    #[arg(
-        long = "raw",
-        conflicts_with_all = [
-            "tail", "keep_color", "from_file", "no_truncate", "cols",
-            "wait_for_prompt", "after", "exit", "idle_ms", "pattern", "json"
-        ]
-    )]
-    pub raw: bool,
+    /// Print the last N distinct output-event screen observations,
+    /// oldest first, including blanks (0..1024). Not application frames.
+    #[arg(long = "tail-frames", value_name = "N", conflicts_with_all = ["tail", "screen"])]
+    pub tail_frames: Option<usize>,
 
-    // ── When to read it (optional gate; with nothing to read selected,
-    //    prints the condition result and the new cursor instead) ─────────
-    /// Block until the session needs input (or exits) before reading.
-    #[arg(
-        long = "wait-for-prompt",
-        short = 'w',
-        conflicts_with_all = ["after", "exit", "idle_ms", "pattern"]
-    )]
-    pub wait_for_prompt: bool,
-    /// Block until output appears after this filtered-stream offset (or
-    /// another gate condition below is met) before reading.
-    #[arg(long, value_name = "OFFSET")]
-    pub after: Option<u64>,
-    /// Gate condition: the session exited.
-    #[arg(long)]
-    pub exit: bool,
-    /// Gate condition: no output for this many milliseconds (heuristic:
-    /// likely idle or waiting for input, never proof).
-    #[arg(long)]
-    pub idle_ms: Option<u64>,
-    /// Gate condition: regex matches output produced after --after.
-    #[arg(long)]
-    pub pattern: Option<String>,
-    /// Timeout for --wait-for-prompt and the gate conditions. Accepts plain
-    /// milliseconds or units like 10s, 5m, or 1h; 0 waits forever.
-    /// Defaults: 5m with --wait-for-prompt, 30s for gate conditions.
+    // ── When to print it (optional gate; it never changes what is printed) ──
+    /// Block until this condition holds, then print.
+    #[arg(long, value_enum, value_name = "CONDITION")]
+    pub wait: Option<WaitCondition>,
+    /// Quiet period for `--wait idle`: 500ms, 2s, 1m. Default 800ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
+    pub idle_for: Option<u64>,
+    /// Regex for `--wait match`, searched per logical line of canonical
+    /// output after the start point, including partial prompts. No cross-line
+    /// matches; lines over 1 MiB fail explicitly. Page boundaries are transparent.
+    #[arg(long = "match", value_name = "REGEX")]
+    pub match_: Option<String>,
+    /// Timeout for `--wait`: 500ms, 30s, 2m, 1h; 0 waits forever. Default 30s.
     #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
     pub timeout: Option<u64>,
 
-    // ── How to format it ─────────────────────────────────────────────────
-    /// Number of recent lines to display (rendered tail). Defaults to the
-    /// terminal height - 1, or 40 if it cannot be determined.
-    #[arg(long, conflicts_with_all = ["screen", "from", "raw"])]
-    pub tail: Option<usize>,
-    /// Keep ANSI color codes (rendered modes: log tail, --screen).
-    #[arg(long = "keep-color", conflicts_with_all = ["from", "raw"])]
-    pub keep_color: bool,
-    /// Render width in columns (default: local terminal width, fallback 80).
-    #[arg(long, conflicts_with_all = ["from", "raw", "no_truncate"])]
-    pub cols: Option<u32>,
-    /// Do not truncate columns (rendered tail).
-    #[arg(long = "no-truncate", conflicts_with_all = ["screen", "from", "raw"])]
-    pub no_truncate: bool,
-    /// Force rendering from the persisted journal instead of live screen
-    /// state (rendered modes: log tail, --screen).
-    #[arg(long = "from-file", conflicts_with_all = ["from", "raw"])]
-    pub from_file: bool,
-    /// Maximum bytes for a --from window (bounded; larger spans need
-    /// multiple calls).
-    #[arg(long, requires = "from")]
-    pub limit: Option<u32>,
-    /// Emit machine-readable JSON (with --from, or with a wait condition
-    /// and no read selected).
-    #[arg(
-        long,
-        conflicts_with_all = [
-            "screen", "raw", "tail", "keep_color", "cols", "no_truncate", "from_file"
-        ]
-    )]
-    pub json: bool,
+    // ── Where to start reading ─────────────────────────────────────────
+    /// Opaque cursor token from an earlier `oly logs` run: print only what
+    /// came after it, as an exact canonical-byte page (not a rendered view).
+    /// JSON encodes bytes as base64. Fails if the session restarted.
+    #[arg(long, value_name = "TOKEN", conflicts_with_all = ["tail", "screen", "tail_frames"])]
+    pub since: Option<String>,
+    /// Maximum bytes in a continuation page (default 256 KiB, max 8 MiB).
+    #[arg(long, value_name = "N", requires = "since")]
+    pub limit_bytes: Option<usize>,
+    /// Print only the current cursor token — the start point for a
+    /// follow-up `--since` — and exit.
+    #[arg(long, conflicts_with_all = ["tail", "screen", "tail_frames", "wait", "since", "timeout", "idle_for", "match_", "limit_bytes"])]
+    pub cursor: bool,
 
+    // ── Formatting and routing ─────────────────────────────────────────
+    /// Colorize rendered ANSI output.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub color: ColorMode,
+    /// Emit one machine-readable JSON object on stdout (diagnostics and
+    /// status lines move to stderr); includes the next cursor.
+    #[arg(long)]
+    pub json: bool,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
 }
 
-impl LogsArgs {
-    /// A wait gate is configured when any wait condition flag is present.
-    pub fn wait_mode(&self) -> bool {
-        self.after.is_some() || self.exit || self.idle_ms.is_some() || self.pattern.is_some()
-    }
+/// When `oly logs --wait` stops blocking and prints.
+/// When to emit ANSI styling in rendered output.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Colorize when stdout is a terminal (default).
+    Auto,
+    /// Always emit styles, even into a pipe.
+    Always,
+    /// Never emit styles.
+    Never,
+}
 
-    /// Wait-only mode: gate flags but nothing to read selected (nor any
-    /// render modifier that would imply the default tail read). Prints the
-    /// condition result and the new cursor.
-    pub fn wait_only(&self) -> bool {
-        self.wait_mode()
-            && !self.screen
-            && self.from.is_none()
-            && self.tail.is_none()
-            && !self.keep_color
-            && !self.no_truncate
-            && !self.from_file
-            && self.cols.is_none()
-    }
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitCondition {
+    /// New output arrived, or the session ended.
+    #[value(alias = "new")]
+    Output,
+    /// The session is waiting for input — or has ended, so a caller never
+    /// blocks on a prompt that will never arrive.
+    Prompt,
+    /// Output stayed quiet for `--idle-for`.
+    Idle,
+    /// The session ended. The child's exit code is reported on stderr; the
+    /// command itself exits 0 once the lifecycle has reached a terminal state.
+    Exit,
+    /// The `--match` regex appeared in output produced after the start point.
+    Match,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Session ID to export. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Stream a JSON object containing base64 canonical filtered bytes and size.
+    #[arg(long)]
+    pub json: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -809,84 +797,74 @@ mod tests {
         assert_eq!(args.timeout, Some(10_000));
     }
 
+    /// The logs surface is three axes: what to print (default tail,
+    /// `--screen`, `--tail-frames`), an optional `--wait` gate, and format
+    /// modifiers. Meaningful combinations parse; meaningless ones are usage
+    /// errors rather than silently ignored flags.
     #[test]
-    fn logs_screen_accepts_keep_color_but_not_tail() {
-        // --screen renders through the same engine as the default mode, so
-        // --keep-color is meaningful there; --tail is not (the screen is
-        // always the whole visible viewport).
-        let cli = Cli::try_parse_from(["oly", "logs", "s1", "--screen", "--keep-color"]).unwrap();
-        let Commands::Logs(args) = cli.command else {
-            panic!("expected logs command");
-        };
-        assert!(args.screen && args.keep_color);
-        assert!(Cli::try_parse_from(["oly", "logs", "s1", "--screen", "--tail", "5"]).is_err());
-    }
-
-    /// The logs surface is three orthogonal axes: what to read (default
-    /// tail / --screen / --from / --raw), an optional gate (-w or
-    /// --after/--exit/--idle-ms/--pattern), and format modifiers. Any
-    /// meaningful combination parses; meaningless ones are usage errors
-    /// instead of being silently ignored.
-    #[test]
-    fn logs_ergonomic_axis_combinations_parse() {
+    fn logs_surfaces_are_mutually_exclusive() {
         let ok: &[&[&str]] = &[
-            // Gates compose with every read selector (block, then read).
-            &["oly", "logs", "s1", "--after", "10", "--screen"],
-            &["oly", "logs", "s1", "--exit", "--tail", "40"],
+            &["oly", "logs", "s1"],
+            &["oly", "logs", "s1", "--tail", "5"],
+            &["oly", "logs", "s1", "--screen"],
+            &["oly", "logs", "s1", "--tail-frames", "3"],
             &[
-                "oly", "logs", "s1", "--from", "10", "--after", "10", "--json",
+                "oly",
+                "logs",
+                "s1",
+                "--tail-frames",
+                "3",
+                "--color",
+                "always",
+            ],
+            &["oly", "logs", "s1", "--wait", "exit", "--screen"],
+            &[
+                "oly", "logs", "s1", "--wait", "output", "--since", "tok", "--json",
             ],
             &[
                 "oly",
                 "logs",
                 "s1",
-                "--idle-ms",
-                "800",
-                "--screen",
-                "--keep-color",
+                "--wait",
+                "idle",
+                "--idle-for",
+                "1500ms",
             ],
-            &["oly", "logs", "s1", "-w", "--screen"],
-            &["oly", "logs", "s1", "-w", "--from", "0", "--json"],
-            &["oly", "logs", "s1", "--pattern", "DONE", "--after", "0"],
-            // Format modifiers across the rendered modes.
             &[
                 "oly",
                 "logs",
                 "s1",
-                "--screen",
-                "--from-file",
-                "--keep-color",
+                "--wait",
+                "match",
+                "--match",
+                "DONE",
+                "--timeout",
+                "0",
             ],
-            &["oly", "logs", "s1", "--cols", "120"],
-            &["oly", "logs", "s1", "--cols", "120", "--screen"],
-            &["oly", "logs", "s1", "--tail", "10", "--keep-color", "-w"],
-            // Wait-only with JSON.
-            &["oly", "logs", "s1", "--after", "0", "--json"],
+            &["oly", "logs", "s1", "--cursor"],
+            &["oly", "logs", "s1", "--cursor", "--json"],
+            &["oly", "logs", "s1", "--node", "worker", "--screen"],
         ];
         for argv in ok {
             assert!(Cli::try_parse_from(*argv).is_ok(), "should parse: {argv:?}");
         }
 
         let err: &[&[&str]] = &[
-            // Two read selectors.
-            &["oly", "logs", "s1", "--screen", "--from", "0"],
-            &["oly", "logs", "s1", "--raw", "--screen"],
-            // Two gates.
-            &["oly", "logs", "s1", "-w", "--after", "0"],
-            // Render modifiers that do not apply to the selected read.
-            &["oly", "logs", "s1", "--from", "0", "--keep-color"],
-            &["oly", "logs", "s1", "--from", "0", "--cols", "80"],
-            &["oly", "logs", "s1", "--screen", "--no-truncate"],
-            &["oly", "logs", "s1", "--cols", "80", "--no-truncate"],
-            &["oly", "logs", "s1", "--raw", "--keep-color"],
-            // Raw export and gates do not compose.
-            &["oly", "logs", "s1", "--raw", "--exit"],
-            &["oly", "logs", "s1", "--raw", "--after", "0"],
-            // JSON only shapes --from windows and wait-only results.
-            &["oly", "logs", "s1", "--screen", "--json"],
-            &["oly", "logs", "s1", "--tail", "5", "--json"],
-            // --limit / --cols need their selector.
-            &["oly", "logs", "s1", "--limit", "100"],
+            // Two print surfaces.
+            &["oly", "logs", "s1", "--screen", "--tail", "5"],
+            &["oly", "logs", "s1", "--screen", "--tail-frames", "2"],
+            &["oly", "logs", "s1", "--tail", "5", "--tail-frames", "2"],
+            // --cursor prints only a token.
+            &["oly", "logs", "s1", "--cursor", "--tail", "5"],
+            &["oly", "logs", "s1", "--cursor", "--wait", "exit"],
+            // Removed flags are gone, not silently accepted.
+            &["oly", "logs", "s1", "--raw"],
+            &["oly", "logs", "s1", "--from", "10"],
+            &["oly", "logs", "s1", "--from-file"],
+            &["oly", "logs", "s1", "--cols", "120"],
+            &["oly", "logs", "s1", "--keep-color"],
+            &["oly", "logs", "s1", "--exit"],
+            &["oly", "logs", "s1", "--wait-for-prompt"],
         ];
         for argv in err {
             assert!(Cli::try_parse_from(*argv).is_err(), "should fail: {argv:?}");
@@ -894,14 +872,19 @@ mod tests {
     }
 
     #[test]
-    fn logs_timeout_defaults_to_none_for_mode_defaults() {
-        // No explicit --timeout: run_logs applies the per-mode defaults
-        // (5m with --wait-for-prompt, 30s in wait mode).
+    fn logs_timeout_defaults_to_none_so_the_client_picks_it() {
+        // No explicit --timeout: the client applies the default (30s), and
+        // `0` means "wait as long as it takes".
         let cli = Cli::try_parse_from(["oly", "logs", "session-1"]).unwrap();
         let Commands::Logs(args) = cli.command else {
             panic!("expected logs command");
         };
         assert_eq!(args.timeout, None);
+        let cli = Cli::try_parse_from(["oly", "logs", "session-1", "--timeout", "0"]).unwrap();
+        let Commands::Logs(args) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(args.timeout, Some(0));
     }
 
     #[test]

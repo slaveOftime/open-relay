@@ -258,7 +258,7 @@ pub(crate) fn filtered_stream_and_resizes_from_anchor(
         None => (SegmentStream::open(session_dir, incarnation)?, 0),
     };
     let (bytes, end, resizes) = derive_stream_and_resizes(stream, filtered_pos, from_offset)?;
-    Ok((bytes, end, resizes, from_offset))
+    Ok((bytes, end, resizes, from_offset.max(filtered_pos)))
 }
 
 fn derive_stream_and_resizes(
@@ -443,6 +443,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn thousands_of_lines_page_exactly_across_utf8_and_controls() {
+        let dir = journal_dir("many-pages");
+        let canonical = (1..=2100)
+            .map(|n| format!("\x1b[31m{n}:你好\x1b[0m\r\n"))
+            .collect::<String>()
+            .into_bytes();
+        let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+        for part in canonical.chunks(2048) {
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(part))
+                .unwrap();
+        }
+        journal.shutdown();
+        let mut delivered = Vec::new();
+        while delivered.len() < canonical.len() {
+            let page = filtered_stream_window(&dir, delivered.len() as u64, 257).unwrap();
+            assert!(!page.is_empty());
+            assert!(page.len() <= 257);
+            delivered.extend_from_slice(&page);
+        }
+        assert_eq!(delivered, canonical);
+        assert!(
+            filtered_stream_window(&dir, canonical.len() as u64, 257)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -19,7 +19,77 @@ use super::super::SessionError;
 use super::super::logs::{finish_render, split_rendered_log_output};
 use super::SessionStore;
 
+/// Atomic result of a live screen render: the rendered bytes, the resize
+/// history the render was generated against, and the filtered-stream end
+/// offset captured under the same runtime read lock. Callers MUST use
+/// `captured_offset` as the cursor they hand back to a follow-up `--since`
+/// call to avoid leaking bytes the render never saw.
+pub struct LiveRenderSnapshot {
+    pub output: Vec<u8>,
+    pub resize_history: Vec<crate::protocol::LogResize>,
+    pub captured_offset: u64,
+    pub incarnation: Option<u64>,
+}
+
 impl SessionStore {
+    /// Liveness, incarnation and byte offset share one runtime lock.
+    pub async fn stream_observation(
+        &self,
+        id: &str,
+    ) -> Option<(bool, Option<i32>, u64, Option<u64>, bool)> {
+        if let Ok(handle) = self.lookup_runtime(id).await {
+            let rt = handle.read();
+            return Some((
+                !rt.is_completed(),
+                rt.meta.exit_code,
+                rt.filtered_stream_len(),
+                rt.journal_incarnation(),
+                rt.input_needed(),
+            ));
+        }
+        let dir = self.persisted_session_dir(id).await?;
+        let incarnation_dir = dir.clone();
+        let incarnation = tokio::task::spawn_blocking(move || {
+            crate::session::journal::list_incarnations(
+                &incarnation_dir.join(crate::session::journal::JOURNAL_DIR_NAME),
+            )
+            .ok()
+            .and_then(|v| v.last().copied())
+        })
+        .await
+        .ok()
+        .flatten();
+        let offset = self.persisted_filtered_len(id).await?;
+        let after = tokio::task::spawn_blocking(move || {
+            crate::session::journal::list_incarnations(
+                &dir.join(crate::session::journal::JOURNAL_DIR_NAME),
+            )
+            .ok()
+            .and_then(|v| v.last().copied())
+        })
+        .await
+        .ok()
+        .flatten();
+        if after != incarnation {
+            return None;
+        }
+        if let Ok(handle) = self.lookup_runtime(id).await {
+            let rt = handle.read();
+            return Some((
+                !rt.is_completed(),
+                rt.meta.exit_code,
+                rt.filtered_stream_len(),
+                rt.journal_incarnation(),
+                rt.input_needed(),
+            ));
+        }
+        let (_, _, exit_code) = self
+            .attach_stream_status(id)
+            .await
+            .unwrap_or((false, true, None));
+        Some((false, exit_code, offset, incarnation, false))
+    }
+
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
         // PERF: the journal-derived byte offset is deliberately not fetched
         // in SQL. A live session's whole summary comes from its runtime
@@ -62,28 +132,12 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub fn is_input_needed(&self, id: &str) -> bool {
-        let sessions = self.sessions.load();
-        sessions
+        self.sessions
+            .load()
             .get(id)
-            .map(|handle| handle.read().input_needed())
-            .unwrap_or(false)
-    }
-
-    pub fn is_silent_for(&self, id: &str, duration: std::time::Duration) -> bool {
-        let sessions = self.sessions.load();
-        sessions
-            .get(id)
-            .map(|handle| {
-                handle
-                    .read()
-                    .last_output_epoch
-                    .map(|last_output| {
-                        std::time::Instant::now().duration_since(last_output) >= duration
-                    })
-                    .unwrap_or(true)
-            })
-            .unwrap_or(true)
+            .is_some_and(|handle| handle.read().input_needed())
     }
 
     pub async fn update_session_metadata(
@@ -190,8 +244,28 @@ impl SessionStore {
         keep_color: bool,
         term_cols: u16,
     ) -> std::result::Result<(Vec<u8>, Vec<crate::protocol::LogResize>), SessionError> {
+        let snapshot = self
+            .snapshot_live_render(id, tail, keep_color, term_cols)
+            .await?;
+        Ok((snapshot.output, snapshot.resize_history))
+    }
+
+    /// Atomic variant of [`Self::render_live_logs`]: returns the rendered
+    /// screen bytes together with the filtered-stream end offset as
+    /// captured under the same runtime read lock that produced them. The
+    /// captured offset is the right cursor to hand back to a subsequent
+    /// `--since` read; using a separately-locked `attach_filtered_len`
+    /// call would race the PTY writer and leak bytes the render never
+    /// saw.
+    pub async fn snapshot_live_render(
+        &self,
+        id: &str,
+        tail: usize,
+        keep_color: bool,
+        term_cols: u16,
+    ) -> std::result::Result<LiveRenderSnapshot, SessionError> {
         let handle = self.lookup_runtime(id).await?;
-        let (rows, resize_history) = {
+        let (rows, resize_history, offset, incarnation) = {
             let rt = handle.read();
             if rt.is_completed() || rt.output_closed {
                 return Err(SessionError::NotRunning);
@@ -199,6 +273,8 @@ impl SessionStore {
             (
                 rt.snapshot_engine_rows(keep_color, term_cols),
                 rt.resize_history.clone(),
+                rt.filtered_stream_len(),
+                rt.journal_incarnation(),
             )
         };
 
@@ -208,7 +284,12 @@ impl SessionStore {
                 SessionError::Internal(format!("log render worker join failed: {join_err}"))
             })?;
 
-        Ok((rendered, resize_history))
+        Ok(LiveRenderSnapshot {
+            output: rendered,
+            resize_history,
+            captured_offset: offset,
+            incarnation,
+        })
     }
 
     /// Same off-lock pattern as [`Self::render_live_logs`], but
@@ -351,6 +432,96 @@ mod tests {
             .expect_err("completed session should not render live logs");
 
         assert!(matches!(err, SessionError::NotRunning));
+    }
+
+    #[tokio::test]
+    async fn snapshot_live_render_captures_rows_and_offset_atomically() {
+        let runtime = make_runtime(
+            "atomic123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"alpha\nbeta\n");
+            // Force filtered_total_bytes to a known value so the snapshot
+            // has a deterministic offset to assert against.
+            const SAMPLE_OFFSET: u64 = 7;
+            rt.filtered_total_bytes = SAMPLE_OFFSET;
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let snapshot = store
+            .snapshot_live_render("atomic123", usize::MAX, false, 80)
+            .await
+            .expect("atomic snapshot");
+
+        // The captured offset must reflect the bytes the engine has seen
+        // at the moment the snapshot was taken; a follow-up `--since`
+        // cursor derived from it must NOT replay any bytes between the
+        // snapshot and a separately-locked `attach_filtered_len`.
+        assert_eq!(
+            snapshot.captured_offset, 7,
+            "snapshot cursor must be paired with the engine rows"
+        );
+        assert!(
+            snapshot.output.starts_with(b"alpha\n"),
+            "rendered output preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_snapshot_cursor_stays_paired_with_concurrent_output() {
+        let runtime = make_runtime(
+            "race123",
+            SessionStatus::Running,
+            "",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"0");
+            rt.filtered_total_bytes = 0;
+        }
+        let store = store_with(vec![runtime.clone()], make_test_db().await);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut generation = 0u64;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                generation += 1;
+                let mut rt = runtime.write();
+                rt.feed_engine(format!("\x1b[H\x1b[2J{generation}").as_bytes());
+                rt.filtered_total_bytes = generation;
+                drop(rt);
+                std::thread::yield_now();
+            }
+        });
+        let mut mismatch = None;
+        for _ in 0..100 {
+            let snapshot = store
+                .snapshot_live_render("race123", usize::MAX, false, 80)
+                .await
+                .unwrap();
+            let visible = String::from_utf8(snapshot.output)
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap();
+            if visible != snapshot.captured_offset {
+                mismatch = Some((visible, snapshot.captured_offset));
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(
+            mismatch, None,
+            "rows and cursor must be from one generation"
+        );
     }
 
     #[tokio::test]

@@ -47,7 +47,7 @@ impl SessionStore {
 
     /// Persisted session dir for a session with no live runtime (evicted
     /// or post-restart); `None` when the id is unknown entirely.
-    async fn persisted_session_dir(&self, id: &str) -> Option<PathBuf> {
+    pub(super) async fn persisted_session_dir(&self, id: &str) -> Option<PathBuf> {
         match self.db.get_session_dir(id).await {
             Ok(Some(dir)) if dir.is_dir() => Some(dir),
             _ => None,
@@ -163,10 +163,13 @@ impl SessionStore {
                 None => return Err(err),
             },
         };
-        read_filtered_window(&dir, from, max_bytes).map_err(|err| {
-            warn!(session_id = id, %err, "attach resync window read failed");
-            SessionError::Evicted
-        })
+        tokio::task::spawn_blocking(move || read_filtered_window(&dir, from, max_bytes))
+            .await
+            .map_err(|err| SessionError::Internal(format!("stream window worker failed: {err}")))?
+            .map_err(|err| {
+                warn!(session_id = id, %err, "attach resync window read failed");
+                SessionError::Evicted
+            })
     }
 
     /// Record a client's applied-cursor credit. Stale attachment
@@ -238,7 +241,11 @@ impl SessionStore {
                     return Some(len);
                 }
             }
-            let len = replay::filtered_stream_len(&dir).ok()?;
+            let scan_dir = dir.clone();
+            let len = tokio::task::spawn_blocking(move || replay::filtered_stream_len(&scan_dir))
+                .await
+                .ok()?
+                .ok()?;
             let mut state = self.mutable.lock().await;
             // Completed sessions accumulate; bound the cache.
             if state.persisted_stream_len_cache.len() >= 1024 {

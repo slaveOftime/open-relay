@@ -11,19 +11,20 @@ use crate::{
 };
 
 /// Default deadline for one-shot proxied RPCs: a hung secondary
-/// must never stall a gateway caller forever. `LogsWait` overrides this
-/// with its own client-specified timeout plus margin.
+/// must never stall a gateway caller forever. `LogsRead` overrides this
+/// because a bounded journal replay on the owning node is disk- and
+/// CPU-bound work whose cost grows with the recording, not with the RPC.
 pub const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Extra margin added to a `LogsWait` request's own timeout so the proxy
-/// deadline never fires before the owning node could answer legitimately.
-pub const NODE_RPC_LOGS_WAIT_MARGIN: Duration = Duration::from_secs(10);
+/// Deadline for a proxied `logs` read: the worst legitimate case is a
+/// cold screen-history replay of a multi-gigabyte recording, which no
+/// interactive caller should wait for, but a 30 s default would fail
+/// long-running sessions that are merely slow to seek.
+pub const NODE_RPC_LOGS_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn rpc_deadline_for(request: &RpcRequest) -> Duration {
     match request {
-        RpcRequest::LogsWait { timeout_ms, .. } => {
-            Duration::from_millis(*timeout_ms) + NODE_RPC_LOGS_WAIT_MARGIN
-        }
+        RpcRequest::LogsRead { .. } => NODE_RPC_LOGS_READ_TIMEOUT,
         _ => NODE_RPC_TIMEOUT,
     }
 }
@@ -163,7 +164,7 @@ impl NodeRegistry {
 
     fn rpc_deadline_for(&self, request: &RpcRequest) -> Duration {
         match request {
-            RpcRequest::LogsWait { .. } => rpc_deadline_for(request),
+            RpcRequest::LogsRead { .. } => rpc_deadline_for(request),
             _ => self.rpc_timeout,
         }
     }
@@ -375,18 +376,19 @@ mod tests {
         assert!(old_rx.try_recv().is_err());
     }
 
-    /// LogsWait carries its own client timeout; the proxy deadline must
-    /// exceed it by the margin, never the other way around.
+    /// Journal-backed reads get the extended deadline; everything else
+    /// keeps the interactive default.
     #[test]
-    fn logs_wait_deadline_tracks_its_own_timeout() {
-        let wait = RpcRequest::LogsWait {
+    fn logs_read_gets_the_replay_deadline() {
+        let read = RpcRequest::LogsRead {
             id: "s".into(),
-            timeout_ms: 5_000,
+            mode: "frames".into(),
+            count: 10,
+            from: None,
+            keep_color: false,
+            term_cols: 80,
         };
-        assert_eq!(
-            rpc_deadline_for(&wait),
-            Duration::from_millis(5_000) + NODE_RPC_LOGS_WAIT_MARGIN
-        );
+        assert_eq!(rpc_deadline_for(&read), NODE_RPC_LOGS_READ_TIMEOUT);
         assert_eq!(rpc_deadline_for(&RpcRequest::Health), NODE_RPC_TIMEOUT);
     }
 }

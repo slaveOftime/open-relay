@@ -110,6 +110,10 @@ impl PtyScanner {
     /// True when no partial escape sequence is buffered: a checkpoint taken
     /// at an idle boundary is a safe replay anchor, because the next output
     /// record begins a fresh sequence (idle boundary = replay anchor).
+    pub(crate) fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.pending.capacity() + self.joined.capacity()
+    }
+
     pub fn is_idle(&self) -> bool {
         self.pending.is_empty()
     }

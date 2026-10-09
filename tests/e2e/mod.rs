@@ -277,7 +277,7 @@ pub fn send_key(tmp: &std::path::Path, id: &str, key: &str) {
 pub fn fetch_logs_with_tail(tmp: &std::path::Path, id: &str, tail: usize) -> String {
     let tail = tail.to_string();
     let output = oly_cmd(tmp)
-        .args(["logs", id, "--tail", &tail, "--no-truncate"])
+        .args(["logs", id, "--tail", &tail])
         .output()
         .expect("`oly logs` failed to execute");
     String::from_utf8_lossy(&output.stdout).to_string()
@@ -397,7 +397,7 @@ pub fn wait_for_exact_log_with_tail_ignoring_status_marker(
 
 pub fn fetch_logs_node(tmp: &std::path::Path, node: &str, id: &str) -> String {
     let output = oly_cmd(tmp)
-        .args(["logs", id, "--node", node, "--tail", "200", "--no-truncate"])
+        .args(["logs", id, "--node", node, "--tail", "200"])
         .output()
         .expect("`oly logs --node` failed to execute");
     String::from_utf8_lossy(&output.stdout).to_string()

@@ -139,25 +139,6 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub struct ColorfulGuard {
-    enabled: bool,
-}
-
-impl ColorfulGuard {
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled }
-    }
-}
-
-impl Drop for ColorfulGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            let _ = std::io::stdout().write_all(b"\x1b[0m\x1b[39m\x1b[49m\x1b[?25h");
-            let _ = std::io::stdout().flush();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
