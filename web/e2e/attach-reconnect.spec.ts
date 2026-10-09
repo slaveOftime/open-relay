@@ -164,7 +164,10 @@ test('an explicit session-end frame closes the socket for good', async ({ page }
   // the 1200ms force-throttle before concluding.
   await page.waitForTimeout(4000)
   expect(ws.connections).toBe(1)
-  // An end frame is terminal: the page switches to the log view rather than\n  // quietly sitting on a dead terminal.\n  await expect(page).toHaveURL(/mode=logs/)\n  await expect(page.getByRole('spinbutton', { name: 'Tail line limit' })).toBeVisible()
+  // An end frame is terminal: the page switches to the log view rather than
+  // quietly sitting on a dead terminal.
+  await expect(page).toHaveURL(/mode=logs/)
+  await expect(page.getByRole('spinbutton', { name: 'Tail line limit' })).toBeVisible()
 })
 
 test('a repeated drop keeps reconnecting rather than giving up', async ({ page }) => {
@@ -175,4 +178,17 @@ test('a repeated drop keeps reconnecting rather than giving up', async ({ page }
     ws.dropConnection()
     await expect.poll(() => ws.connections, { timeout: 6000, intervals: [100] }).toBe(drop + 2)
   }
+})
+
+test('a reconnect reads Reconnecting, not Connecting', async ({ page }) => {
+  const ws = await openAttach(page)
+  await gotoAttach(page)
+
+  ws.dropConnection()
+
+  // Once the socket has opened at least once, a drop is a *re*connect. This is
+  // the only thing `wsEverConnected` decides, and it is the easiest state to
+  // drop when the socket handlers are reworked.
+  await expect(page.locator('#main-container')).toContainText('Reconnecting')
+  await expect.poll(() => ws.connections, { timeout: 6000, intervals: [100] }).toBeGreaterThan(1)
 })

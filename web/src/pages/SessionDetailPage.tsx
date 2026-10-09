@@ -10,7 +10,6 @@ import {
   uploadSessionFile,
   AttachSocket,
 } from '@/api/client'
-import { terminalModeSequences } from '@/api/ws-frames'
 import {
   formatByteSize,
   formatTimestamp,
@@ -29,6 +28,7 @@ import {
 import StatusBadge from '@/components/StatusBadge'
 import { useAttachIdleAnimation } from '@/hooks/use-attach-idle-animation'
 import { useAttachReconnect } from '@/hooks/use-attach-reconnect'
+import { buildAttachSocketOptions } from '@/components/attach/attach-socket-options'
 import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
@@ -88,7 +88,6 @@ const DEFAULT_LOG_TAIL = 200
 
 /** Encodes the authoritative DECSET mode sequences into the terminal's
  * byte output queue (see onInit/onModeChanged). */
-const modesEncoder = new TextEncoder()
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function SessionDetailPage() {
@@ -669,9 +668,7 @@ function SessionDetailPageContent() {
     // ended: server sent an 'end' frame — session finished normally, no reconnect.
     // discarded: this effect run is being cleaned up — prevents stale onClose from
     // scheduling a reconnect after we've already torn down intentionally.
-    let ended = false
     let discarded = false
-    let gotSnapshot = false
 
     connectAttemptStartedAtRef.current = Date.now()
     // Defer WebSocket creation to requestAnimationFrame so that:
@@ -687,96 +684,37 @@ function SessionDetailPageContent() {
       const initialSize = termRef.current?.fit() ?? undefined
       const sock = new AttachSocket(
         id,
-        {
-          onOpen: () => {
-            pushConnectTrace('websocket open')
-            resetReconnectAttempts()
+        buildAttachSocketOptions({
+          sessionId: id,
+          node: node ?? undefined,
+          pushTrace: pushConnectTrace,
+          enqueueOutput: enqueueTerminalOutput,
+          noteFrame: () => {
+            lastWsFrameAtRef.current = Date.now()
+          },
+          noteActivity: noteAttachUserActivity,
+          termRef,
+          isMounted,
+          setError: setWsError,
+          setExitCode: setExitCode,
+          setConnected: setWsConnected,
+          setEverConnected: () => setWsEverConnected(true),
+          openLogsView: () => setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' }),
+          setSession,
+          // Reconnect bookkeeping the effect owns, not the frame table.
+          afterOpen: () => {
             connectAttemptStartedAtRef.current = 0
             lastSentResizeRef.current = null
             pendingResizeRef.current = null
-            lastWsFrameAtRef.current = Date.now()
-            setWsError(null)
-            setWsConnecting(false)
-            setWsEverConnected(true)
-            if (reconnectTimerRef.current !== null) {
-              clearTimeout(reconnectTimerRef.current)
-              reconnectTimerRef.current = null
-            }
-            if (isMounted.current) setWsConnected(true)
-            noteAttachUserActivity()
+            resetReconnectAttempts()
+            cancelReconnect()
           },
-          onInit: (data, modes) => {
-            if (!gotSnapshot) {
-              pushConnectTrace(`init received (${data.length} bytes)`)
-              gotSnapshot = true
-            }
-            lastWsFrameAtRef.current = Date.now()
-            enqueueTerminalOutput([data], { reset: true })
-            // Mirror the child's input modes right after the snapshot — the
-            // web equivalent of the native client's
-            // sync_local_terminal_modes(). The snapshot stream never
-            // replays DECSET mode sequences (and the scrollback seed can
-            // carry stale ones), so without this xterm.js would never
-            // capture mouse clicks/wheel for a program that had them
-            // enabled before the page loaded.
-            enqueueTerminalOutput([modesEncoder.encode(terminalModeSequences(modes))])
+          afterClose: (ended, code, reason) => {
+            if (ended) return
+            setWsConnecting(true)
+            scheduleReconnect(code, reason)
           },
-          onData: (data) => {
-            lastWsFrameAtRef.current = Date.now()
-            enqueueTerminalOutput([data])
-          },
-          onModeChanged: (modes) => {
-            lastWsFrameAtRef.current = Date.now()
-            // Modes are authoritative server-side; re-mirror them so the
-            // terminal's capture state always matches the child's request
-            // even after a reconnect or stale replay bytes.
-            enqueueTerminalOutput([modesEncoder.encode(terminalModeSequences(modes))])
-          },
-          onResized: (rows, cols) => {
-            lastWsFrameAtRef.current = Date.now()
-            // If the PTY was resized to dimensions that don't match our
-            // viewport (e.g. a CLI client resized), push our actual size
-            // back so the PTY adapts to the web client.
-            termRef.current?.resize(cols, rows)
-          },
-          onSessionEnded: (code) => {
-            ended = true
-            lastWsFrameAtRef.current = Date.now()
-            noteAttachUserActivity()
-            pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
-            if (!isMounted.current) return
-            const exitMsg = code != null ? ` (exit code: ${code})` : ''
-            termRef.current?.writeln(`\r\n\x1b[2m[Session ended${exitMsg}]\x1b[0m`)
-            setExitCode(code)
-            setWsConnected(false)
-            setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
-            fetchSession(id!, node ?? undefined)
-              .then((s) => {
-                ingestSessionSummary(s)
-                if (isMounted.current) setSession(s)
-              })
-              .catch(() => {})
-          },
-          onError: (msg) => {
-            lastWsFrameAtRef.current = Date.now()
-            pushConnectTrace(`server error frame: ${msg}`)
-            if (!isMounted.current) return
-            termRef.current?.writeln(`\r\n\x1b[31mError: ${msg}\x1b[0m`)
-            setWsError(`Server error: ${msg}`)
-          },
-          onClose: (code, reason) => {
-            noteAttachUserActivity()
-            pushConnectTrace(`websocket close (code=${code}${reason ? ` reason=${reason}` : ''})`)
-            if (isMounted.current) setWsConnected(false)
-            // iOS PWA kills WebSocket connections when the app goes to background.
-            // Reconnect automatically for unexpected drops (not when the session
-            // ended normally or this effect is being cleaned up).
-            if (!ended && !discarded) {
-              setWsConnecting(true)
-              scheduleReconnect(code, reason)
-            }
-          },
-        },
+        }),
         node ?? undefined,
         initialSize ?? undefined
       )
