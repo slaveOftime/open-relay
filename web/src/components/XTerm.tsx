@@ -8,13 +8,13 @@ import QuickKeysMenu from './terminal/QuickKeysMenu'
 import QuickKeysDialog from './terminal/QuickKeysDialog'
 import { markOwnedTerminalWheel } from './terminal/scroll-wheel'
 import { getTerminalTheme } from './terminal/xterm-theme'
+import { useTerminalKeyboardSync } from '@/hooks/use-terminal-keyboard-sync'
 import {
   TERMINAL_FONT_FAMILY,
   TERMINAL_FONT_SIZE,
   TERMINAL_FONT_VARIANTS,
   TERMINAL_PRELOAD_TEXT,
 } from './terminal/xterm-fonts'
-import { findScrollContainer } from '@/utils/scroll-container'
 import type { QuickKey } from '@/lib/quick-keys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
@@ -106,6 +106,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
 ) {
   const containerRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
+  // Owns the iOS keyboard scroll sync, so the terminal effect below only wires
+  // the event handlers that need `term` itself.
+  const { restart: restartKeyboardSync } = useTerminalKeyboardSync(termRef, containerRef)
   const fitRef = useRef<FitAddon | null>(null)
   const onDataRef = useRef(onData)
   const onPasteRef = useRef(onPaste)
@@ -293,61 +296,17 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     })
     ro.observe(containerRef.current)
 
-    let keyboardSyncRaf = 0
-    let keyboardSyncPasses = 0
-    const maxKeyboardSyncPasses = 8
-    const syncFocusedTerminalIntoView = (): boolean => {
-      const textarea = term.textarea
-      if (!textarea || document.activeElement !== textarea) return false
-
-      const viewport = window.visualViewport
-      const viewportBottom = viewport ? viewport.offsetTop + viewport.height : window.innerHeight
-      const rect = container.getBoundingClientRect()
-      const bottomPadding = 40
-      const overlap = rect.bottom + bottomPadding - viewportBottom
-      if (overlap <= 0) return false
-
-      const scrollContainer = findScrollContainer(container)
-      if (!scrollContainer) return false
-
-      const scrollTop = Math.ceil(overlap)
-
-      if (scrollContainer === document.documentElement || scrollContainer === document.body) {
-        window.scrollBy({ top: scrollTop, behavior: 'auto' })
-        return true
-      }
-
-      scrollContainer.scrollBy({ top: scrollTop, behavior: 'auto' })
-      return true
-    }
-
-    const scheduleKeyboardSync = () => {
-      if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
-      keyboardSyncRaf = requestAnimationFrame(() => {
-        keyboardSyncRaf = 0
-        const didScroll = syncFocusedTerminalIntoView()
-        if (didScroll && keyboardSyncPasses < maxKeyboardSyncPasses) {
-          keyboardSyncPasses += 1
-          scheduleKeyboardSync()
-          return
-        }
-        keyboardSyncPasses = 0
-      })
-    }
-
     // iOS PWA: tapping the terminal canvas doesn't reliably trigger the
     // virtual keyboard in standalone mode. Explicitly focus xterm's internal
     // input element on touchend so the keyboard appears.
     const container = containerRef.current
     const handleTouchEnd = () => {
       if (!onDataRef.current) return
-      keyboardSyncPasses = 0
       term.focus()
-      scheduleKeyboardSync()
+      restartKeyboardSync()
     }
     const handleTerminalFocus = () => {
-      keyboardSyncPasses = 0
-      scheduleKeyboardSync()
+      restartKeyboardSync()
     }
     const handlePaste = (event: ClipboardEvent) => {
       const clipboardData = event.clipboardData
@@ -366,12 +325,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       event.stopPropagation()
       onPasteRef.current(event)
     }
-    const viewport = window.visualViewport
     container.addEventListener('touchend', handleTouchEnd, { passive: true })
     term.textarea?.addEventListener('focus', handleTerminalFocus)
     term.textarea?.addEventListener('paste', handlePaste, true)
-    viewport?.addEventListener('resize', scheduleKeyboardSync)
-    viewport?.addEventListener('scroll', scheduleKeyboardSync)
 
     return () => {
       // Null refs immediately so any in-flight callbacks become no-ops
@@ -382,7 +338,6 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       if (initialRaf) cancelAnimationFrame(initialRaf)
       if (pendingRaf) cancelAnimationFrame(pendingRaf)
       if (fontLoadRaf) cancelAnimationFrame(fontLoadRaf)
-      if (keyboardSyncRaf) cancelAnimationFrame(keyboardSyncRaf)
       dataDisposable.dispose()
       scrollDisposable.dispose()
       writeDisposable.dispose()
@@ -390,13 +345,13 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       container.removeEventListener('touchend', handleTouchEnd)
       term.textarea?.removeEventListener('focus', handleTerminalFocus)
       term.textarea?.removeEventListener('paste', handlePaste)
-      viewport?.removeEventListener('resize', scheduleKeyboardSync)
-      viewport?.removeEventListener('scroll', scheduleKeyboardSync)
       // Defer dispose by TWO frames so xterm's own internally-scheduled
       // RAFs can fully drain before _renderService is torn down.
       requestAnimationFrame(() => requestAnimationFrame(() => term.dispose()))
     }
-  }, [autoFit]) // mount only
+    // `restartKeyboardSync` is a stable callback (refs all the way down), so
+    // listing it keeps this effect running once per mount.
+  }, [autoFit, restartKeyboardSync])
 
   // Update terminal theme when OS color scheme changes
   useEffect(() => {
