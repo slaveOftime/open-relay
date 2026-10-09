@@ -21,13 +21,7 @@ import NewSessionDialog from '@/components/dialogs/NewSessionDialog'
 import { buildNewSessionInitialValues } from '@/components/dialogs/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/dialogs/SessionMetadataDialog'
 import SessionDeleteConfirmDialog from '@/components/dialogs/SessionDeleteConfirmDialog'
-import {
-  clampSessionTableColumnSize,
-  getOrderedSessionTableColumns,
-  getSessionTableWidth,
-  reorderSessionTableColumn,
-  type SessionTableColumnKey,
-} from '@/lib/sessions-table-columns'
+import { getOrderedSessionTableColumns, getSessionTableWidth } from '@/lib/sessions-table-columns'
 import {
   handleSessionPageEvent,
   normalizeStoredNode,
@@ -98,6 +92,7 @@ import {
 } from '@/lib/push'
 import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/session-events'
 import { useSseConnectionState } from '@/hooks/use-session-events'
+import { useSessionTableColumns } from '@/hooks/use-session-table-columns'
 import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
 import type { GroupBy } from '@/components/sessions/group-by'
 import { SessionCard } from '@/components/sessions/SessionCard'
@@ -168,16 +163,10 @@ export default function SessionsPage() {
   const pendingPullOffsetRef = useRef(0)
   const pullRefreshingRef = useRef(false)
   const lastNodeSwipeAtRef = useRef(0)
-  const tableResizeRef = useRef<{
-    columnKey: SessionTableColumnKey
-    startX: number
-    startWidth: number
-  } | null>(null)
-  const tableColumnDragRef = useRef<SessionTableColumnKey | null>(null)
-  const isMounted = useRef(true)
   // Optimistic `stopping` claims keyed by session id, re-applied whenever a
   // server refresh would otherwise wipe them with a stale `running`.
   const pendingTerminationRef = useRef(new Map<string, SessionStatus>())
+  const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
   const hasLoadedRef = useRef(false)
   const requestVersionRef = useRef(0)
@@ -907,74 +896,15 @@ export default function SessionsPage() {
     setPage(0)
   }
 
-  function beginColumnResize(columnKey: SessionTableColumnKey, event: React.PointerEvent) {
-    event.preventDefault()
-    event.stopPropagation()
-    tableResizeRef.current = {
-      columnKey,
-      startX: event.clientX,
-      startWidth: tableColumnSizes[columnKey],
-    }
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-
-  function updateColumnResize(event: React.PointerEvent) {
-    const resize = tableResizeRef.current
-    if (!resize) return
-    event.preventDefault()
-    const nextWidth = clampSessionTableColumnSize(
-      resize.columnKey,
-      resize.startWidth + event.clientX - resize.startX
-    )
-    setTableColumnSettings((previous) => {
-      if (previous.sizes[resize.columnKey] === nextWidth) return previous
-      return {
-        ...previous,
-        sizes: {
-          ...previous.sizes,
-          [resize.columnKey]: nextWidth,
-        },
-      }
-    })
-  }
-
-  function endColumnResize(event: React.PointerEvent) {
-    if (!tableResizeRef.current) return
-    tableResizeRef.current = null
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId)
-    }
-  }
-
-  function beginColumnReorder(columnKey: SessionTableColumnKey, event: React.DragEvent) {
-    tableColumnDragRef.current = columnKey
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('text/plain', columnKey)
-  }
-
-  function moveColumnBefore(columnKey: SessionTableColumnKey, event: React.DragEvent) {
-    const draggedColumn = tableColumnDragRef.current
-    if (!draggedColumn || draggedColumn === columnKey) return
-    event.preventDefault()
-    event.dataTransfer.dropEffect = 'move'
-  }
-
-  function dropColumnBefore(columnKey: SessionTableColumnKey, event: React.DragEvent) {
-    const draggedColumn =
-      tableColumnDragRef.current ||
-      (event.dataTransfer.getData('text/plain') as SessionTableColumnKey)
-    tableColumnDragRef.current = null
-    if (!draggedColumn || draggedColumn === columnKey) return
-    event.preventDefault()
-    setTableColumnSettings((previous) => ({
-      ...previous,
-      order: reorderSessionTableColumn(previous.order, draggedColumn, columnKey),
-    }))
-  }
-
-  function endColumnReorder() {
-    tableColumnDragRef.current = null
-  }
+  const {
+    beginResize: beginColumnResize,
+    updateResize: updateColumnResize,
+    endResize: endColumnResize,
+    beginReorder: beginColumnReorder,
+    moveBefore: moveColumnBefore,
+    dropBefore: dropColumnBefore,
+    endReorder: endColumnReorder,
+  } = useSessionTableColumns(tableColumnSettings, setTableColumnSettings)
 
   const hasActiveFilters =
     search !== '' ||
