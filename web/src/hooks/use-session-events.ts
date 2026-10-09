@@ -2,8 +2,8 @@ import { useEffect, useSyncExternalStore } from 'react'
 
 import type { SseConnectionState } from '@/api/client'
 import type { SessionSummary } from '@/api/types'
-import { sessionEventsStore, subscribeSessionEvents } from '@/lib/sessionEvents'
-import { normalizeNode } from '@/lib/sessionSummary'
+import { sessionEventsStore, subscribeSessionEvents } from '@/lib/session-events'
+import { normalizeNode } from '@/lib/session-summary'
 
 // A stable subscribe function avoids tearing down and re-adding the store
 // listener on every table render (e.g. when activity sparklines update).

@@ -35,8 +35,8 @@ import {
   normalizeCwdPath,
   sessionDisplayName,
 } from '@/utils/format'
-import { isTerminalStatus } from '@/utils/sessionStatus'
-import type { SessionTableColumn, SessionTableColumnKey } from '@/pages/sessions-table-columns'
+import { isTerminalStatus } from '@/utils/session-status'
+import type { SessionTableColumn, SessionTableColumnKey } from '@/lib/sessions-table-columns'
 
 export const SessionRow = memo(function SessionRow({
   session,

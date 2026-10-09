@@ -27,7 +27,7 @@ import {
   normalizeCwdPath,
   sessionDisplayName,
 } from '@/utils/format'
-import { isTerminalStatus } from '@/utils/sessionStatus'
+import { isTerminalStatus } from '@/utils/session-status'
 
 export const SessionCard = memo(function SessionCard({
   session,

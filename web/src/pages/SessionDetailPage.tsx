@@ -25,7 +25,7 @@ import {
   replayLogChunks,
   seekLogChunks,
   type LogReplayState,
-} from '@/utils/logReplay'
+} from '@/utils/log-replay'
 import StatusBadge from '@/components/StatusBadge'
 import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
@@ -69,13 +69,13 @@ import {
 } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
 import AttachPanel from '@/components/attach/AttachPanel'
-import { ingestSessionSummary } from '@/lib/sessionEvents'
+import { ingestSessionSummary } from '@/lib/session-events'
 import { useLiveSessionSummary, useReconcileTrigger } from '@/hooks/use-session-events'
 import {
   PENDING_TERMINATION_STATUS,
   withPendingTermination,
   type SessionTermination,
-} from '@/utils/sessionTermination'
+} from '@/utils/session-termination'
 import {
   didSessionVisibleOutputAdvance,
   isSessionRunning,

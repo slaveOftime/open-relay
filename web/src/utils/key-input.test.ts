@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { namedKeySequence, parseKeySpec, parseKeyInputSpecs, modifierToken } from './keyInput'
+import { namedKeySequence, parseKeySpec, parseKeyInputSpecs, modifierToken } from './key-input'
 
 // ── namedKeySequence ──────────────────────────────────────────────────────────
 

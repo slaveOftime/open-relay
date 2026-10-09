@@ -4,9 +4,9 @@
  * mounting the component.
  */
 
-import type { SparklinePoint } from './sparklineGeometry'
-import { buildAreaPath, buildSmoothLinePath, buildSparklinePoints } from './sparklineGeometry'
-import { sparklinePalette, type SparklinePalette } from './sparklinePalettes'
+import type { SparklinePoint } from './sparkline-geometry'
+import { buildAreaPath, buildSmoothLinePath, buildSparklinePoints } from './sparkline-geometry'
+import { sparklinePalette, type SparklinePalette } from './sparkline-palettes'
 
 export interface SparklineModel {
   areaPath: string

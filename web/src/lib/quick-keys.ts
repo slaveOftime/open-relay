@@ -7,7 +7,7 @@
  * encoded fall back to being sent as literal text.
  */
 
-import { parseKeyInputSpecs, parseKeySpec, splitKeyInput } from '@/utils/keyInput'
+import { parseKeyInputSpecs, parseKeySpec, splitKeyInput } from '@/utils/key-input'
 
 export interface QuickKey {
   id: string

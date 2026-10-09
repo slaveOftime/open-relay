@@ -15,7 +15,7 @@ import {
   TERMINAL_PRELOAD_TEXT,
 } from './terminal/xterm-fonts'
 import { findScrollContainer } from '@/utils/scroll-container'
-import type { QuickKey } from '@/lib/quickKeys'
+import type { QuickKey } from '@/lib/quick-keys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 import './XTerm.css'

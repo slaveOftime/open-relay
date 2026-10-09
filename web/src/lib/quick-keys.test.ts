@@ -11,8 +11,8 @@ import {
   layoutRing,
   moveQuickKey,
   parseCombo,
-} from './quickKeys'
-import { loadQuickKeys, normalizeQuickKeys, saveQuickKeys } from '@/lib/quickKeysStorage'
+} from './quick-keys'
+import { loadQuickKeys, normalizeQuickKeys, saveQuickKeys } from '@/lib/quick-keys-storage'
 
 function fakeStorage(initial: Record<string, string> = {}) {
   const data = new Map(Object.entries(initial))

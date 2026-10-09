@@ -4,7 +4,7 @@ import type {
   SessionStatusFilter,
   SessionSummary,
 } from '@/api/types'
-import { sessionPinKey } from '@/utils/sessionOrdering'
+import { sessionPinKey } from '@/utils/session-ordering'
 
 /**
  * Sessions-page handling of the shared SSE stream.

@@ -8,9 +8,9 @@ import {
   buildSmoothLinePath,
   seedHeldBuckets,
   sparklinePointsFromHeights,
-} from './sparklineGeometry'
-import { buildSparklineModel } from './sparklineModel'
-import { SPARKLINE_BUCKET_MS, type SparklineActivitySnapshot } from '@/lib/sparklineStore'
+} from './sparkline-geometry'
+import { buildSparklineModel } from './sparkline-model'
+import { SPARKLINE_BUCKET_MS, type SparklineActivitySnapshot } from '@/lib/sparkline-store'
 import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,
@@ -18,7 +18,7 @@ import {
   calculateSparklineLastY,
   carryOpenBucket,
   formatBytesPerSecond,
-} from './sparklineMetrics'
+} from './sparkline-metrics'
 interface Props {
   width?: number
   readActivity: () => SparklineActivitySnapshot

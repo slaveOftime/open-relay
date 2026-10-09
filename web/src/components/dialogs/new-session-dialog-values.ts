@@ -1,5 +1,5 @@
 import type { SessionSummary } from '@/api/types'
-import { formatSessionTagInput } from '@/lib/sessionMetadata'
+import { formatSessionTagInput } from '@/lib/session-metadata'
 
 export type NewSessionInitialValues = {
   cmd: string

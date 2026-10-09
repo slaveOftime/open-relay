@@ -1,9 +1,9 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import LoginDialog from '@/components/dialogs/LoginDialog'
-import { proxyLoginDestination } from './lib/proxyLogin'
+import { proxyLoginDestination } from './lib/proxy-login'
 import { getAuthStatus, getToken } from './api/client'
-import { startSessionEvents, stopSessionEvents } from '@/lib/sessionEvents'
+import { startSessionEvents, stopSessionEvents } from '@/lib/session-events'
 import {
   consumePendingNotificationTarget,
   notificationClickMessageTarget,

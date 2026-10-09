@@ -36,8 +36,8 @@ describe('shared session event stream', () => {
     vi.stubGlobal('localStorage', { getItem: () => null })
     vi.stubGlobal('EventSource', MockEventSource)
     const { startSessionEvents, stopSessionEvents, subscribeSessionEvents } =
-      await import('./sessionEvents')
-    const { recordSessionActivity, getSessionActivitySnapshot } = await import('./sessionActivity')
+      await import('./session-events')
+    const { recordSessionActivity, getSessionActivitySnapshot } = await import('./session-activity')
     recordSessionActivity({ id: 'session-1', last_total_bytes: 100 })
     const listener = vi.fn()
 

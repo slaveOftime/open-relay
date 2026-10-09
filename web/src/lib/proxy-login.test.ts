@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { proxyLoginDestination } from './proxyLogin'
+import { proxyLoginDestination } from './proxy-login'
 
 describe('proxyLoginDestination', () => {
   it('restores a proxied app deep link after login', () => {

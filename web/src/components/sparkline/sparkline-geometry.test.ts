@@ -1,13 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildSparklineModel } from './sparklineModel'
-import { RUNNING_PALETTE, sparklinePalette } from './sparklinePalettes'
+import { buildSparklineModel } from './sparkline-model'
+import { RUNNING_PALETTE, sparklinePalette } from './sparkline-palettes'
 import {
   buildAreaPath,
   buildSmoothLinePath,
   buildSparklinePoints,
   sparklinePointsFromHeights,
-} from './sparklineGeometry'
+} from './sparkline-geometry'
 
 describe('buildSparklinePoints', () => {
   it('draws a flat baseline when the series is too short to plot', () => {

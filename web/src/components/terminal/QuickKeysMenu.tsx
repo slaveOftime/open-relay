@@ -8,9 +8,9 @@ import {
 } from 'react'
 import { SlidersHorizontal } from 'lucide-react'
 import { cn } from '@/utils/cn'
-import { getQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
+import { getQuickKeys, subscribeQuickKeys } from '@/lib/quick-keys-storage'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
-import { layoutRing, type QuickKey } from '@/lib/quickKeys'
+import { layoutRing, type QuickKey } from '@/lib/quick-keys'
 import { holdRepeatProps, useRepeatWhilePressed } from '@/hooks/use-repeat-while-pressed'
 
 /** Keep this much clearance between popped keys and the screen edges. */

@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { SPARKLINE_BUCKET_MS, SparklineStore } from '@/lib/sparklineStore'
+import { SPARKLINE_BUCKET_MS, SparklineStore } from '@/lib/sparkline-store'
 import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,
   calculateRecentBytesPerSecond,
   carryOpenBucket,
-} from './sparklineMetrics'
+} from './sparkline-metrics'
 
 afterEach(() => {
   vi.useRealTimers()

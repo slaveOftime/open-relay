@@ -52,7 +52,7 @@ Rules of thumb, and the longer version in `FRONTEND.md`:
 - New primitives only when a pattern repeats, and only in `components/ui/`.
 - Components are `PascalCase.tsx`; every other module is `kebab-case.ts`.
 - Pure logic lives next to its component (`attach-panel-input.ts`,
-  `sparklineGeometry.ts`, `quickKeys.ts`) so it can be unit-tested without a DOM.
+  `sparkline-geometry.ts`, `quick-keys.ts`) so it can be unit-tested without a DOM.
 - `utils/` and `lib/` never import from `components/` or `pages/`.
 
 ## Related docs

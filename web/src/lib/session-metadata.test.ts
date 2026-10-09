@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildSessionMetadataUpdateSpec, normalizeSessionTitleInput } from './sessionMetadata'
+import { buildSessionMetadataUpdateSpec, normalizeSessionTitleInput } from './session-metadata'
 
 describe('session metadata helpers', () => {
   it('omits unchanged metadata fields', () => {

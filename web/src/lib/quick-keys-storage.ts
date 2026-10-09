@@ -5,7 +5,7 @@
  * localStorage shape is validated on read so a corrupted entry silently
  * falls back to the defaults instead of breaking the terminal.
  */
-import { DEFAULT_QUICK_KEYS, type QuickKey } from '@/lib/quickKeys'
+import { DEFAULT_QUICK_KEYS, type QuickKey } from '@/lib/quick-keys'
 
 const STORAGE_KEY = 'oly.terminal.quickKeys.v1'
 

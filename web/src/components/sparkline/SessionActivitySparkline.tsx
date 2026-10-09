@@ -5,7 +5,7 @@ import {
   getSessionActivitySnapshot,
   sessionActivityKey,
   subscribeSessionActivity,
-} from '@/lib/sessionActivity'
+} from '@/lib/session-activity'
 
 function SessionActivitySparkline({
   sessionId,

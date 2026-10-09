@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Button } from '@/components/ui/button'
-import { FileDropZone } from '../ui/file-drop-zone'
-import { getTransferredFiles } from '../ui/file-transfer'
+import { FileDropZone } from '@/components/ui/file-drop-zone'
+import { getTransferredFiles } from '@/components/ui/file-transfer'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react'
-import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
+import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/key-input'
 import { findScrollContainer } from '@/utils/scroll-container'
 import { insertUploadedPathAtSelection, removeUploadedPathFromInput } from './attach-panel-input'
 import {
@@ -24,7 +24,7 @@ import {
   isPreviewableImageFile,
   type SessionImagePreviews,
 } from './attach-panel-image-preview'
-import ImagePreviewDialog from '../dialogs/ImagePreviewDialog'
+import ImagePreviewDialog from '@/components/dialogs/ImagePreviewDialog'
 import {
   ChevronDownIcon,
   ChevronLeftIcon,

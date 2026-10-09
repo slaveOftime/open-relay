@@ -26,11 +26,19 @@ export default defineConfig([
     },
   },
   {
-    // Soft size budget (see web/REFACTOR-PLAN.md): warns, never fails, so it can
-    // sit in the shared config from day one and go quiet as files are split.
-    files: ['src/**/*.{ts,tsx}'],
+    // Soft size budget (see web/REFACTOR-PLAN.md §2): warns, never fails, so it
+    // can sit in the shared config from day one and go quiet as files are
+    // split. Two tiers, because a page or a component can carry markup a module
+    // cannot, so the same line count means something different in each.
+    files: ['src/pages/**/*.tsx', 'src/components/**/*.tsx'],
     rules: {
       'max-lines': ['warn', { max: 500, skipBlankLines: true, skipComments: true }],
+    },
+  },
+  {
+    files: ['src/api/**/*.ts', 'src/lib/**/*.ts', 'src/utils/**/*.ts', 'src/hooks/**/*.ts'],
+    rules: {
+      'max-lines': ['warn', { max: 400, skipBlankLines: true, skipComments: true }],
     },
   },
 ])

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as Form from '@radix-ui/react-form'
 import { forceRemoveSession, startSession } from '@/api/client'
-import { parseSessionTagInput } from '@/lib/sessionMetadata'
+import { parseSessionTagInput } from '@/lib/session-metadata'
 import { cn } from '@/utils/cn'
 import { parseArgString } from '@/utils/format'
 import { Button } from '@/components/ui/button'

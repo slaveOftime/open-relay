@@ -33,7 +33,7 @@ import {
   type SessionTableColumnKey,
   type SessionTableColumnOrder,
   type SessionTableColumnSizes,
-} from './sessions-table-columns'
+} from '@/lib/sessions-table-columns'
 import {
   handleSessionPageEvent,
   matchesStatusFilter,
@@ -54,7 +54,7 @@ import {
   withPendingTermination,
   withSessionStatus,
   type SessionTermination,
-} from '@/utils/sessionTermination'
+} from '@/utils/session-termination'
 import { NodeSelector } from '@/components/NodeSelector'
 import { agentName, normalizeCwdPath } from '@/utils/format'
 import {
@@ -63,7 +63,7 @@ import {
   savePinnedSessionKeys,
   sessionIsPinnable,
   sessionPinKey,
-} from '@/utils/sessionOrdering'
+} from '@/utils/session-ordering'
 import Logo from '@/components/Logo'
 import SseStatusDot from '@/components/SseStatusDot'
 import { Button } from '@/components/ui/button'
@@ -103,13 +103,12 @@ import {
   syncPushSubscription,
   type PushSetupState,
 } from '@/lib/push'
-import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/sessionEvents'
+import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/session-events'
 import { useSseConnectionState } from '@/hooks/use-session-events'
 import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
 import type { GroupBy } from '@/components/sessions/group-by'
 import { SessionCard } from '@/components/sessions/SessionCard'
 import { SessionRow } from '@/components/sessions/SessionRow'
-
 import { SkeletonCard, SkeletonRow } from '@/components/sessions/SessionSkeletons'
 import { SessionsEmptyState } from '@/components/sessions/SessionsEmptyState'
 import { SortIcon } from '@/components/sessions/SortIcon'

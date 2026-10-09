@@ -8,7 +8,7 @@
 
 import type { SessionSummary } from '@/api/types'
 import { Badge } from '@/components/ui/badge'
-import { normalizeSessionTags } from '@/utils/sessionTags'
+import { normalizeSessionTags } from '@/utils/session-tags'
 
 export function SessionTagList({
   tags,

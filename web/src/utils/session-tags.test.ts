@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { normalizeSessionTags } from './sessionTags'
+import { normalizeSessionTags } from './session-tags'
 
 describe('normalizeSessionTags', () => {
   it('trims whitespace and drops empty entries', () => {

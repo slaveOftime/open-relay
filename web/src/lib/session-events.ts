@@ -1,7 +1,7 @@
 import { subscribeEvents, type SseConnectionState } from '@/api/client'
 import type { SessionEvent, SessionSummary } from '@/api/types'
-import { ingestSessionActivityEvent, recordSessionActivity } from '@/lib/sessionActivity'
-import { sameSessionSummary, sessionKey } from '@/lib/sessionSummary'
+import { ingestSessionActivityEvent, recordSessionActivity } from '@/lib/session-activity'
+import { sameSessionSummary, sessionKey } from '@/lib/session-summary'
 
 type StoreListener = () => void
 type EventListener = (event: SessionEvent) => void

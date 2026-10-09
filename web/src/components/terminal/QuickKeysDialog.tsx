@@ -15,7 +15,7 @@ import {
   resetQuickKeys,
   setQuickKeys,
   subscribeQuickKeys,
-} from '@/lib/quickKeysStorage'
+} from '@/lib/quick-keys-storage'
 import {
   describeData,
   encodeQuickKeyCombo,
@@ -23,7 +23,7 @@ import {
   moveQuickKey,
   QUICK_KEY_COLORS,
   type QuickKey,
-} from '@/lib/quickKeys'
+} from '@/lib/quick-keys'
 
 /** Fixed row height (h-14) + vertical margin (mb-2) used for drag math. */
 const ROW_STRIDE_PX = 64

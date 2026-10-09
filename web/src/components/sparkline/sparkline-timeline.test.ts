@@ -7,7 +7,7 @@ import {
   heldHeadY,
   seedHeldBuckets,
   timedSparklinePoints,
-} from './sparklineGeometry'
+} from './sparkline-geometry'
 
 describe('continuous sparkline timeline', () => {
   it('moves existing heights without waiting for a new store snapshot', () => {

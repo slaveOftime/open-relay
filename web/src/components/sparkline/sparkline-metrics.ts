@@ -1,4 +1,4 @@
-import { SPARKLINE_BUCKET_MS } from '@/lib/sparklineStore'
+import { SPARKLINE_BUCKET_MS } from '@/lib/sparkline-store'
 
 const BUCKET_SECONDS = SPARKLINE_BUCKET_MS / 1000
 // Two seconds of output, including silence, so Recent falls back to zero promptly.

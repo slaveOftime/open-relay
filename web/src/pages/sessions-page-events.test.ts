@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { SessionEvent, SessionSummary } from '@/api/types'
-import { sessionPinKey } from '@/utils/sessionOrdering'
+import { sessionPinKey } from '@/utils/session-ordering'
 import {
   handleSessionPageEvent,
   normalizeStoredNode,

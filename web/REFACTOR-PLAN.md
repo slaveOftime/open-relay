@@ -79,7 +79,7 @@ src/
 | Rule                                                                               | Example                                                                     |
 | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | A file whose default export is a component is `PascalCase.tsx`                     | `SessionsPage.tsx`, `SessionRow.tsx`, `Button.tsx`                          |
-| Everything else is `kebab-case.ts`                                                 | `sessions-page-prefs.ts`, `keyInput.ts`, `historyController.ts`             |
+| Everything else is `kebab-case.ts`                                                 | `sessions-page-prefs.ts`, `key-input.ts`, `history-controller.ts`           |
 | Tests are colocated and never separate by type                                     | `quick-keys.test.ts` next to `quick-keys.ts`                                |
 | No file extensions in import specifiers                                            | `@/api/types`, never `@/api/types.ts`                                       |
 | Alias `@/…` when crossing a folder boundary; relative only for siblings            | `./quick-keys` inside `components/terminal/`, `@/lib/utils` everywhere else |

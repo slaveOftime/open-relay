@@ -44,7 +44,7 @@ Format: `area — finding — why it matters — suggested next step`.
    _Next step:_ extract to `utils/scroll-container.ts` (already in the refactor plan).
 
 7. **FIXED** (`6ce694d`) — `SparklineSvg.tsx` re-implemented geometry that exists in
-   `components/sparklineGeometry.ts`. Two sources of truth for the same math.
+   `sparklineGeometry.ts`. Two sources of truth for the same math.
    _Next step:_ dedupe during Phase 4.
 
 8. **FIXED** (`d08f32d`) — commented-out code: the import block in `pages/SessionDetailPage.tsx` (45–51) and
@@ -52,9 +52,9 @@ Format: `area — finding — why it matters — suggested next step`.
 
 ## Structure / layering
 
-9. **FIXED** (`07585b8`) — layer inversion between `lib/` and `components/`: `lib/quickKeysStorage.ts`
-   imports `components/terminal/quick-keys`, and `lib/sessionActivity.ts` imports
-   `components/sparklineStore`, while components import back from `lib`. A data module
+9. **FIXED** (`07585b8`) — layer inversion between `lib/` and `components/`: `lib/quick-keys-storage.ts`
+   imports `components/terminal/quick-keys`, and `lib/session-activity.ts` imports
+   `sparklineStore.ts` (in `lib/`), while components import back from `lib`. A data module
    depending on the view layer blocks reuse and complicates testing.
    _Next step:_ move `DEFAULT_QUICK_KEYS`/encoding into `lib/`, the sparkline store into
    `components/`, or introduce a shared `model/` module.
@@ -75,7 +75,7 @@ Format: `area — finding — why it matters — suggested next step`.
     `utils/cn.ts` (Phase 2).
 
 13. **FIXED** (`c0aeaa8`) — no home for hooks: `use-reduced-motion.ts` and `use-repeat-while-pressed.ts`
-    live in `components/terminal/`, and `lib/sessionEvents.ts` exports both a
+    live in `components/terminal/`, and `lib/session-events.ts` exports both a
     non-hook imperative API and three hooks. _Next step:_ `src/hooks/` (Phase 2).
 
 14. **`api/types.ts` mirrors the Rust protocol by hand** ("mirrors Rust protocol.rs").

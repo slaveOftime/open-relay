@@ -5,7 +5,7 @@ import {
   sessionIsActive,
   sessionIsPinnable,
   sessionPinKey,
-} from './sessionOrdering'
+} from './session-ordering'
 
 function session(partial: Partial<SessionSummary>): SessionSummary {
   return {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { sessionActivityKey } from './sessionActivity'
+import { sessionActivityKey } from './session-activity'
 
 describe('sessionActivityKey', () => {
   it('keeps identical session ids on different nodes separate', () => {

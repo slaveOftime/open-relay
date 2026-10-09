@@ -6,7 +6,7 @@ import {
   encodeLogChunks,
   initialLogReplayState,
   replayLogChunks,
-} from './logReplay'
+} from './log-replay'
 
 const { Terminal } = xtermPkg as typeof import('@xterm/xterm')
 const decoder = new TextDecoder()
