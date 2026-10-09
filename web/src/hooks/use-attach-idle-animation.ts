@@ -86,13 +86,18 @@ export function useAttachIdleAnimation({
       if (!armedRef.current) return
       setIdle(true)
     }, delayMs)
-  }, [clearTimer, connected, delayMs, mode, mounted, setIdle])
+    // `setIdle` and `setIdle`'s own deps are stable (a state setter and a ref),
+    // so listing them adds nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clearTimer, connected, delayMs, mode, mounted])
 
   const noteVisibleActivity = useCallback(() => {
     armedRef.current = true
     setIsIdle(false)
     schedule()
-  }, [schedule, setIdle])
+    // `setIdle` is omitted deliberately: it is a state setter plus one ref, so
+    // it is stable for the lifetime of the component.
+  }, [schedule])
 
   const noteUserActivity = useCallback(() => {
     disarm()

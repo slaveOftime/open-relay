@@ -454,7 +454,13 @@ function SessionDetailPageContent() {
     }
 
     previousLiveSessionRef.current = liveSession
-  }, [clearAttachIdleTimer, noteAttachUserActivity, liveSession, noteVisibleSessionActivity])
+  }, [
+    clearAttachIdleTimer,
+    noteAttachUserActivity,
+    liveSession,
+    noteVisibleSessionActivity,
+    requestIdleBorder,
+  ])
 
   // One HistoryController per (id, node): owns anchored paging state.
   const getHistory = useCallback((): HistoryController | null => {

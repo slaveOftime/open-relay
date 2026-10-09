@@ -119,3 +119,20 @@ Format: `area — finding — why it matters — suggested next step`.
     reports every CRLF file. On Linux CI the checkout is LF and the gate passes.
     _Next step:_ add `"endOfLine": "auto"` to `.prettierrc` — a no-op in CI (files are
     already LF there) and it makes the gate usable on Windows.
+
+22. **`react-hooks/refs` violations that were masked by file size.** The rule
+    reports render-phase ref access, but it stopped analysing
+    `src/components/attach/AttachPanel.tsx` entirely while the file was large
+    enough. Removing three small handlers from it brought it under the rule's
+    analysis threshold and four pre-existing violations appeared at once: two
+    `Ref.current = false` writes in the session-change branch, one reached
+    through a state-setter that also writes a ref, and one in the quick-keys
+    `map` callback. _Why it matters:_ the render-phase ref writes in the
+    "adjust state on prop change" branch are a real React anti-pattern; they
+    are load-bearing here (they must run before the persistence effects that
+    read them, which an effect cannot do), so fixing them means reworking the
+    persistence contract. _Next step:_ first audit the other large components -
+    `SessionDetailPage.tsx`, `SessionsPage.tsx`, `XTerm.tsx`, `SparklineSvg.tsx`
+    - for the same pattern, since the rule is silently skipping them today.
+      The four sites are suppressed with an explanatory comment rather than
+      changed, because changing them would alter persistence timing.

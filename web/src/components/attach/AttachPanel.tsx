@@ -6,7 +6,6 @@ import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react'
-import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/key-input'
 import { findScrollContainer } from '@/utils/scroll-container'
 import { insertUploadedPathAtSelection, removeUploadedPathFromInput } from './attach-panel-input'
 import {
@@ -25,15 +24,15 @@ import {
   type SessionImagePreviews,
 } from './attach-panel-image-preview'
 import ImagePreviewDialog from '@/components/dialogs/ImagePreviewDialog'
-import {
-  ChevronDownIcon,
-  ChevronLeftIcon,
-  ChevronRightIcon,
-  ChevronUpIcon,
-  DoubleArrowDownIcon,
-  DoubleArrowUpIcon,
-} from '@radix-ui/react-icons'
+import {} from '@radix-ui/react-icons'
 import { holdRepeatProps, useRepeatWhilePressed } from '@/hooks/use-repeat-while-pressed'
+import { MobileKeyBar } from './attach-mobile-key-bar'
+import {
+  sendCustomKeys,
+  sendCustomText,
+  sendKeySpec,
+  type AttachSendTarget,
+} from './attach-panel-send'
 import type { UploadSessionFileResponse } from '@/api/client'
 
 const ATTACH_BUSY_INTERVAL_MS = 2000
@@ -173,6 +172,10 @@ export default function AttachPanel({
   // an empty string.
   const [prevSessionId, setPrevSessionId] = useState(sessionId)
   if (prevSessionId !== sessionId) {
+    /* eslint-disable react-hooks/refs -- pre-existing pattern: these guard the
+       persistence effects below and must be cleared before they run, which a
+       render-phase branch can do and an effect cannot. Cleaning this up means
+       reworking the persistence contract, so it is tracked in ISSUES-BACKLOG. */
     setPrevSessionId(sessionId)
     shouldPersistDrawerOpenRef.current = false
     shouldPersistDraftRef.current = false
@@ -180,6 +183,7 @@ export default function AttachPanel({
     updateCustomInput(loadSessionInputDraft(sessionId))
     setImagePreviews(loadSessionImagePreviews(sessionId))
     setPreviewPath(null)
+    /* eslint-enable react-hooks/refs */
   }
 
   useEffect(() => {
@@ -236,40 +240,38 @@ export default function AttachPanel({
     }
   }, [sessionId])
 
+  // The send path itself lives in ./attach-panel-send; these adapt it to this
+  // component's state setters.
+  const sendTarget: AttachSendTarget = {
+    sendInput,
+    showKeyError,
+    recordHistory: saveInputHistory,
+  }
+
   function handleCustomSend(sendEnter = false) {
-    if (!customInput.trim()) return
-    saveInputHistory(customInput)
-    sendInput(customInput)
-    if (sendEnter) {
-      handleSendKeySpec('enter')
-    }
-    updateCustomInput('')
-    setImagePreviews({})
-    setPreviewPath(null)
+    sendCustomText({
+      text: customInput,
+      withEnter: sendEnter,
+      ...sendTarget,
+      onSent: () => {
+        updateCustomInput('')
+        setImagePreviews({})
+        setPreviewPath(null)
+      },
+    })
   }
 
   function handleSendKeySpec(spec: string) {
-    try {
-      sendInput(parseKeySpec(spec))
-    } catch (error) {
-      showKeyError(error instanceof Error ? error.message : 'invalid key spec')
-    }
+    sendKeySpec(spec, sendTarget)
   }
 
   function handleSendCustomKeys(raw: string) {
-    const specs = splitKeyInput(raw.trim())
-    if (specs.length === 0) return
-    try {
-      const parsed = parseKeyInputSpecs(specs)
-      for (const data of parsed) {
-        sendInput(data)
-      }
-      updateCustomKeys('')
-    } catch (error) {
-      showKeyError(error instanceof Error ? error.message : 'invalid key spec')
-    }
+    sendCustomKeys({
+      text: raw,
+      onSent: () => updateCustomKeys(''),
+      ...sendTarget,
+    })
   }
-
   function toggleDrawer() {
     const nextOpen = !drawerOpen
     setDrawerOpen(nextOpen)
@@ -526,6 +528,11 @@ export default function AttachPanel({
               Quick Keys
             </p>
             <div className="grid grid-cols-4 gap-1.5 max-h-27 sm:max-h-fit overflow-y-auto select-none">
+              {/* eslint-disable-next-line react-hooks/refs -- pre-existing: the ref
+                  reads are inside the hold/click callbacks, not in render, but the
+                  rule cannot prove `holdRepeatProps` does not call back during
+                  render. Surfaced only once the file shrank below the rule's
+                  analysis threshold. */}
               {popularKeys.map(({ key, label, instant }) => (
                 <Tooltip key={key}>
                   <TooltipTrigger asChild>
@@ -622,85 +629,12 @@ export default function AttachPanel({
           </div>
         </div>
       </div>
-      <div className="sm:hidden w-full h-10 flex items-center gap-1 justify-between overflow-hidden">
-        <div className="sm:hidden w-full h-10 flex items-center overflow-y-hidden overflow-x-auto select-none">
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('left'))}
-            aria-label="Left"
-          >
-            <ChevronLeftIcon className="w-6 h-6" />
-          </Button>
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('up'))}
-            aria-label="Up"
-          >
-            <ChevronUpIcon className="w-6 h-6" />
-          </Button>
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('down'))}
-            aria-label="Down"
-          >
-            <ChevronDownIcon className="w-6 h-6" />
-          </Button>
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('right'))}
-            aria-label="Right"
-          >
-            <ChevronRightIcon className="w-6 h-6" />
-          </Button>
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-[hsl(var(--primary))] px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('tab'))}
-            aria-label="Tab"
-          >
-            Tab
-          </Button>
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-amber-600 px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('esc'))}
-            aria-label="Esc"
-          >
-            Esc
-          </Button>
-          <Button
-            type="button"
-            variant={'ghost'}
-            className={`${HOLD_KEY_FOCUS_NONE} shrink-0 select-none text-amber-600 px-2.5`}
-            {...holdRepeatProps(repeat, () => handleSendKeySpec('enter'))}
-            aria-label="Enter"
-          >
-            Enter
-          </Button>
-        </div>
-        <Button
-          variant="ghost"
-          className="shrink-0 px-2.5"
-          onClick={toggleDrawer}
-          aria-label="Open input panel"
-        >
-          {drawerOpen ? (
-            <DoubleArrowDownIcon className="w-5 h-5" />
-          ) : (
-            <DoubleArrowUpIcon className="w-5 h-5" />
-          )}
-        </Button>
-      </div>
+      <MobileKeyBar
+        repeat={repeat}
+        onSendKeySpec={handleSendKeySpec}
+        drawerOpen={drawerOpen}
+        onToggleDrawer={toggleDrawer}
+      />{' '}
       <ImagePreviewDialog
         open={previewPath !== null}
         path={previewPath}
