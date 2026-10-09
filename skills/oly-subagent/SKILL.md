@@ -18,6 +18,16 @@ oly start --title "scoped task" --cwd /path/to/repo --detach <agent-cli> [agent-
 
 Save the returned **session ID** and specify it on every subsequent `oly` call. Use `--node <name>` consistently only if the worker was explicitly started on that node. If a sandbox reports `Access is denied`, the daemon may still be running; retry the failed `oly` command with the available approval mechanism instead of stopping or restarting the daemon. If daemon status genuinely confirms it is stopped, `oly daemon start --detach` is appropriate.
 
+Every session knows its own id at runtime: oly injects `OLY_SESSION_ID` into the child's environment, so a worker reads its id with `$OLY_SESSION_ID`, and you can read yours the same way. To give the worker a way to hand results back without you polling its logs, pass your own session id in the task prompt and have it report with `oly send <your-session-id> -- <result>`:
+
+```sh
+# your id (if you run inside an oly session): echo "$OLY_SESSION_ID"
+# hand that literal id to the worker in the task prompt; it then reports back with e.g.:
+#   oly send abc1234 -- changed foo.rs and bar.rs, cargo test passes
+```
+
+Optional — watching the worker's logs below is normally enough — and it recurses: a worker that delegates its own sub worker reads its `$OLY_SESSION_ID` and passes it along the same way, so results can always reach the originating session.
+
 If the CLI supports a documented one-shot prompt option, use it when suitable. Otherwise wait until its input UI is ready (`oly logs <ID> --screen`), then send a bounded task prompt containing the objective, allowed files, constraints, relevant checks, and what to report. Avoid asking the worker to run `oly skill` unless it itself needs oly.
 
 ```sh
@@ -52,4 +62,4 @@ Answer routine, authorized questions using the task context. **Never auto-approv
 
 Check the worker's final output **and** observable artifacts (diffs, tests, files) before reporting completion. A stopped session alone is not success, and a still-running interactive agent may have finished its task but be waiting at a prompt. Report the worker ID, what actually changed, checks and failures, and any unfinished work. Gracefully exit or stop only sessions you started and no longer need; verify their status before assuming a Ctrl+C closed them. Do not stop the shared daemon or `oly rm` sessions just to clean up.
 
-If the supervising agent itself runs in an oly session, prefer watching the worker's durable logs to depending on the worker sending a message back. `oly send <PARENT_ID>` can deliver to a live parent, but delivery/echo is not proof the parent processed it; communicate results in the worker log and in your own final answer as well.
+If you run inside an oly session, the worker can reach you with `oly send <your-session-id> -- <result>`, where your id is your `$OLY_SESSION_ID` handed to the worker in the task prompt. Prefer watching the worker's durable logs to depending on that message back: delivery/echo is never proof the parent processed it, so require the result in the worker's own log and repeat it in your final answer.
