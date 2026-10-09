@@ -233,25 +233,26 @@ SessionsPage data layer remain).
 
 ## 6. Definition of done (checked against the current tree)
 
-- [x] Largest component file is `SessionDetailPage.tsx` at 1,893 lines; every
-      non-page file is under 700 and `api/client.ts` is a facade. Pages are still over
-      400 — see §8 for the two remaining extractions.
-- [x] Naming rules (§2) hold; no import specifier carries a file extension.
-- [ ] Naming rules (§2) hold for every file; import specifiers uniform.
-- [x] `hooks/` holds `use-session-events`, `use-repeat-while-pressed`,
-      `use-reduced-motion`, `repeat-controller`; nothing hook-shaped lives in a
-      component file.
-- [ ] `SessionDetailPage` still owns the 198-line attach-socket effect; that is the
-      last hook to extract (§8).
-- [ ] `utils/` and `lib/` no longer import `components/` (both inversions fixed).
-      Two `pages/` helpers are imported by components — `SessionRow`/`SessionCard` take
-      `SessionTableColumn` from `pages/sessions-table-columns`; move that module to
-      `lib/` in the next pass.
-- [x] Backlog items 1-4 (the `.test.tsx` that never ran, the 3 unused `ui/`
-      primitives, `eslint .` linting `dev-dist`, Playwright traces/retries) are fixed;
-      remaining backlog items are recorded, not acted on.
-- [x] All four gates green; `README.md` rewritten for the real structure and
-      `FRONTEND.md` / `DESIGN.md` still accurate.
+Not yet met, and stated plainly rather than relaxed:
+
+- [ ] **Size.** No page is under 400 lines: `SessionsPage.tsx` is 1,618 and
+      `SessionDetailPage.tsx` is 1,846. Three components are over the 300-line
+      target and two are over the 500-line warning. §8 lists what is left.
+- [x] **Naming.** Every non-component module is `kebab-case.ts`, no import
+      specifier carries an extension, and `@/…` is used whenever an import
+      crosses a folder boundary.
+- [x] **Layering.** `utils/` imports nothing internal; `lib/` and `hooks/` do not
+      import `components/` or `pages/`; `components/` no longer imports
+      `pages/` (the `sessions-table-columns` import moved to `@/lib/`).
+- [x] **Hooks.** `hooks/` holds `use-session-events`, `use-repeat-while-pressed`,
+      `use-reduced-motion`, `repeat-controller`, `use-attach-idle-animation` and
+      `use-terminal-keyboard-sync`; no shared hook lives inside a component.
+- [x] **Tests.** 302 unit tests across 36 files and 13 Playwright specs, all
+      running (`StatusBadge.test.tsx` was silently skipped before this work).
+- [x] **Gates.** `tsc -b`, `eslint src e2e`, `vitest run` and `prettier --check`
+      clean; `playwright test` 13/13.
+- [x] **Docs.** `README.md` describes the structure that exists, and
+      `FRONTEND.md` / `DESIGN.md` are still accurate.
 
 ## 7. Not in scope
 
@@ -262,51 +263,64 @@ in `web/ISSUES-BACKLOG.md`.
 
 ## 8. What landed, and what is left
 
-All of it is `git mv` plus import updates, verified against a `git worktree`
-copy of HEAD before each commit (moved spans compared byte-for-byte). Nothing
-below changed behavior; the two places where a line _had_ to change are called
-out in their commit messages.
+Everything here is a `git mv` plus import updates, verified against a
+`git worktree` copy of HEAD before each commit (moved spans compared
+byte-for-byte). Nothing below changed behavior; the few places where a line
+_had_ to change are called out in their commit messages.
 
 ### Done
 
-| Phase    | Result                                                                                                                                                                                                                                                                                                                | Commit                                  |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
-| 0        | vitest picks up `.test.tsx` again (30 -> 31 files, 243 -> 245 tests), `.prettierrc` gains `endOfLine: auto` so `format:check` works on Windows (105 -> 0 failures), eslint ignores `dev-dist`, `max-lines` warns at 500, 3 unused `ui/` primitives deleted (213 lines), `README.md` replaced                          | `5e0f426`                               |
-| 1        | `NodeSelector` extensions dropped, commented-out code removed from `SessionDetailPage`, `export { Badge }` removed from `SessionsPage`                                                                                                                                                                                | `d08f32d`                               |
-| 2        | `cn` -> `utils/cn.ts`; `quickKeys` + `sparklineStore` moved into `lib/` (both layer inversions gone); `src/hooks/` created; `sessionEvents` split into store + `hooks/use-session-events.ts`                                                                                                                          | `cd81413` `07585b8` `c0aeaa8`           |
-| 3        | `api/client.ts` split into `client-http` / `client-auth` / `client-sessions` / `client-nodes-push` / `client-sse` / `client-socket` behind a re-export facade; every declaration byte-compared                                                                                                                        | `9058ed5`                               |
-| 4        | `findScrollContainer` deduplicated into `utils/scroll-container.ts` (+5 tests); sparkline geometry/palettes/model split out (+12 tests); `xterm-fonts` + `xterm-theme` extracted; attach storage + input history extracted; session-detail pure helpers extracted (+13 tests); tag normalization extracted (+5 tests) | `6ce694d` `80c9ece` `becf576` `2a2902f` |
-| 5 (part) | 7 leaf components + `SessionRow` + `SessionCard` moved to `components/sessions/`; `GroupBy`, `normalizeSessionTags` and `isTerminalStatus` given homes; `session-termination.ts` moved `pages/` -> `utils/`                                                                                                           | `cf88043` `e0148d5`                     |
-| 6        | `components/attach/`, `dialogs/`, `sparkline/` created (26 `git mv`s); `README.md` documents the real structure                                                                                                                                                                                                       | `e1053c9`                               |
+| Phase   | Result                                                                                                                                                                                                                                                                                                               | Commits                                 |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| 0       | vitest picks up `.test.tsx` again (30 -> 31 files, 243 -> 245 tests), `.prettierrc` gains `endOfLine: auto` so `format:check` works on Windows (105 -> 0 failures), eslint ignores `dev-dist`, `max-lines` warns at 500, 3 unused `ui/` primitives deleted (213 lines), `README.md` replaced                         | `5e0f426`                               |
+| 1       | `NodeSelector` extensions dropped, commented-out code removed from `SessionDetailPage`, `export { Badge }` removed from `SessionsPage`                                                                                                                                                                               | `d08f32d`                               |
+| 2       | `cn` -> `utils/cn.ts`; `quick-keys` + `sparkline-store` moved into `lib/` (both layer inversions gone); `src/hooks/` created; `session-events` split into store + `hooks/use-session-events.ts`                                                                                                                      | `cd81413` `07585b8` `c0aeaa8`           |
+| 3       | `api/client.ts` split into `client-http` / `client-auth` / `client-sessions` / `client-nodes-push` / `client-sse` / `client-socket` behind a re-export facade; every declaration byte-compared                                                                                                                       | `9058ed5`                               |
+| 4       | `findScrollContainer` deduplicated into `utils/scrollContainer.ts` (+5 tests); sparkline geometry/palettes/model split out (+12 tests); `xterm-fonts` + `xterm-theme` extracted; attach storage + input history extracted; session-detail pure helpers extracted (+13 tests); tag normalization extracted (+5 tests) | `6ce694d` `80c9ece` `becf576` `2a2902f` |
+| 5       | 7 leaf components + `SessionRow` + `SessionCard` moved to `components/sessions/`; `GroupBy`, `normalizeSessionTags` and `isTerminalStatus` given homes; `session-termination.ts` moved `pages/` -> `utils/`                                                                                                          | `cf88043` `e0148d5`                     |
+| 6       | `components/attach/`, `dialogs/`, `sparkline/` created (26 `git mv`s); `README.md` documents the real structure                                                                                                                                                                                                      | `e1053c9`                               |
+| 7       | the review findings: the `components -> pages` import fixed, every non-component module renamed to kebab-case (33 files), cross-folder relatives made aliases, the second `max-lines` tier added, two orphaned deps dropped                                                                                          | `8a1d8b5`                               |
+| 5 cont. | `pages/sessions-page-prefs.ts` + `sessions-page-data.ts` extracted (+23 tests, first tests either has had); `hooks/use-attach-idle-animation.ts`; `attach/attach-mobile-key-bar.tsx` + `attach-panel-send.ts`; `hooks/use-terminal-keyboard-sync.ts`                                                                 | `0b82bc7` `6d87e15` `714dc67` `d57c478` |
 
-File sizes, before -> after:
+File sizes, before -> now:
 
 ```
-SessionsPage.tsx        2514 -> 1777
-SessionDetailPage.tsx   1973 -> 1893
-AttachPanel.tsx          862 ->  712
-XTerm.tsx                721 ->  616
-SparklineSvg.tsx         603 ->  487
-api/client.ts            694 ->   18 (facade)
+SessionsPage.tsx         2514 -> 1618
+SessionDetailPage.tsx     1973 -> 1846
+api/client.ts             694 ->   18 (facade)
+AttachPanel.tsx           862 ->  646
+XTerm.tsx                 721 ->  571
+SparklineSvg.tsx          603 ->  487
 ```
 
 ### Left, in the order I would take it
 
-1. **The attach-socket effect** �� the 198-line `useEffect` in `SessionDetailPage`
+1. **The attach-socket effect** — the 198-line `useEffect` in `SessionDetailPage`
    that owns `AttachSocket`, reconnect backoff, the trace log and the idle
    animation. It needs ~25 dependencies threaded through a params object, so it is
    a rewrite rather than a move, and it is the one piece of this refactor that can
-   change _when_ a reconnect happens. Extract it to `hooks/use-attach-socket.ts`
-   behind a WebKit e2e test that forces a socket drop: the suite has no
-   mobile-Safari project today (backlog item 3), so nothing would catch a
-   regression on the platform where this logic matters most.
-2. **`pages/sessions-table-columns.ts` -> `lib/`** �� `SessionRow` / `SessionCard`
-   import a type from `pages/`, the one place `components/` still reaches into it.
-3. **SessionsPage's data layer** �� `sessionPageRequests`, `fetchSessionsOnce`,
-   `loadLocal` / `loadRemote` and the prefs + column-settings load/save pair
-   (~150 lines) into `pages/sessions-page-data.ts` / `pages/sessions-page-prefs.ts`.
-4. **The mobile gesture layer** �� pull-to-refresh and swipe drawing (~130 lines of
-   rAF/DOM) into `hooks/use-session-list-gestures.ts`.
+   change _when_ a reconnect happens. Extract it to
+   `hooks/use-attach-socket.ts` behind a WebKit e2e test that forces a socket drop:
+   the suite has no mobile-Safari project today (backlog item 3), so nothing would
+   catch a regression on the platform where this logic matters most.
+2. **SessionsPage's remaining data layer** — `loadLocal`, `loadRemote` and
+   `reloadSessions` (~150 lines) into `pages/sessions-page-data.ts`, which now
+   holds only the request map and `buildSessionListParams`.
+3. **The mobile gesture layer** — pull-to-refresh and swipe drawing (~100 lines of
+   rAF/DOM plus six refs) into `hooks/use-session-list-gestures.ts`.
+4. **`hooks/use-session-table-columns.ts`** — the column resize/reorder handlers
+   (~68 lines).
+5. **`hooks/use-sparkline-animation.ts`** — the rAF draw loop in
+   `SparklineSvg.tsx`. Note this one is _not_ a straightforward move: the loop
+   threads eight refs and the whole draw path, so it is a rewrite like item 1, not
+   a relocation. Do it only behind a browser-level test for the frame budget.
 
-Items 2-4 are mechanical. Item 1 is not, and is the only one where new test
-coverage should come first.
+`session-detail-logs.ts` / `-idle.ts` / `-reconnect.ts` from the §3.2 table are
+deliberately dropped from this list. Those effects compose the page's own
+ref-and-state machine with API calls; moving them to another file relocates them
+without making them reusable or testable, and it multiplies the dependency
+surface. The idle one _was_ moved (it is a genuine timer), which is why
+`use-attach-idle-animation.ts` exists and the rest do not.
+
+Items 2-4 are mechanical. Items 1 and 5 are not, and are the only two where new
+test coverage should come first.

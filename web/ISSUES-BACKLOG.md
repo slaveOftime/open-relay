@@ -136,3 +136,22 @@ Format: `area — finding — why it matters — suggested next step`.
     - for the same pattern, since the rule is silently skipping them today.
       The four sites are suppressed with an explanatory comment rather than
       changed, because changing them would alter persistence timing.
+
+### Findings from the refactor continuation, now closed
+
+23. **FIXED** (`8a1d8b5`) �� `components/sessions/SessionRow.tsx` imported
+    `SessionTableColumn` from `@/pages/sessions-table-columns`, so moving the
+    row out of the page had introduced a `components -> pages` edge that the
+    layer rules do not allow. `sessions-table-columns.ts` is now in `lib/`.
+24. **FIXED** (`8a1d8b5`) �� the naming rule was contradicted by the tree: 33
+    non-component modules were `camelCase.ts` (`sessionEvents.ts`,
+    `keyInput.ts`, `sparklineGeometry.ts`, ��). They are all `kebab-case.ts` now
+    and every specifier was rewritten with them.
+25. **FIXED** (`8a1d8b5`) �� `@radix-ui/react-toggle-group` and
+    `@radix-ui/react-separator` were declared with no importers anywhere, because
+    their only consumers were the deleted `ui/` primitives. Removed from
+    `package.json` and hand-edited out of `package-lock.json` (54 deletions), so
+    the lock's registry URLs and every other entry are untouched.
+26. **FIXED** (`8a1d8b5`) �� cross-folder relative imports: `AttachPanel.tsx` and
+    `LoginDialog.tsx` used `../ui/*` and `../dialogs/*`, while every other file
+    in the tree uses the `@/components/...` alias.
