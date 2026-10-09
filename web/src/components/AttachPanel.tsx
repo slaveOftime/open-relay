@@ -10,7 +10,16 @@ import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInpu
 import { findScrollContainer } from '@/utils/scroll-container'
 import { insertUploadedPathAtSelection, removeUploadedPathFromInput } from './attach-panel-input'
 import {
-  coerceSessionImagePreviews,
+  loadSessionDrawerOpen,
+  loadSessionImagePreviews,
+  loadSessionInputDraft,
+  readFileAsDataUrl,
+  saveSessionDrawerOpen,
+  saveSessionImagePreviews,
+  saveSessionInputDraft,
+} from './attach-panel-storage'
+import { saveInputHistory } from './attach-input-history'
+import {
   getVisibleImagePreviewPaths,
   isPreviewableImageFile,
   type SessionImagePreviews,
@@ -27,148 +36,7 @@ import {
 import { holdRepeatProps, useRepeatWhilePressed } from '@/hooks/use-repeat-while-pressed'
 import type { UploadSessionFileResponse } from '@/api/client'
 
-// ── Input history ─────────────────────────────────────────────────────────────
-const INPUT_HISTORY_KEY = 'open-relay:input-history'
-const SESSION_INPUT_DRAFT_KEY_PREFIX = 'open-relay:session-input-draft:'
-const SESSION_DRAWER_OPEN_KEY_PREFIX = 'open-relay:session-drawer-open:'
-const SESSION_IMAGE_PREVIEW_KEY_PREFIX = 'open-relay:session-image-preview:'
 const ATTACH_BUSY_INTERVAL_MS = 2000
-
-interface InputHistoryEntry {
-  text: string
-  count: number
-}
-
-function loadInputHistory(): InputHistoryEntry[] {
-  try {
-    const raw = localStorage.getItem(INPUT_HISTORY_KEY)
-    if (!raw) return []
-    return JSON.parse(raw) as InputHistoryEntry[]
-  } catch {
-    return []
-  }
-}
-
-function saveInputHistory(text: string): void {
-  const trimmed = text.trim()
-  if (!trimmed) return
-  try {
-    const history = loadInputHistory()
-    const existing = history.find((e) => e.text === trimmed)
-    if (existing) existing.count += 1
-    else history.push({ text: trimmed, count: 1 })
-    history.sort((a, b) => b.count - a.count)
-    localStorage.setItem(INPUT_HISTORY_KEY, JSON.stringify(history.slice(0, 50)))
-  } catch {
-    /* ignore */
-  }
-}
-
-function getSessionInputDraftKey(sessionId: string): string | null {
-  const trimmed = sessionId.trim()
-  return trimmed ? `${SESSION_INPUT_DRAFT_KEY_PREFIX}${trimmed}` : null
-}
-
-function loadSessionInputDraft(sessionId: string): string {
-  const storageKey = getSessionInputDraftKey(sessionId)
-  if (!storageKey) return ''
-  try {
-    return localStorage.getItem(storageKey) ?? ''
-  } catch {
-    return ''
-  }
-}
-
-function saveSessionInputDraft(sessionId: string, text: string): void {
-  const storageKey = getSessionInputDraftKey(sessionId)
-  if (!storageKey) return
-  try {
-    if (text.length === 0) {
-      localStorage.removeItem(storageKey)
-      return
-    }
-    localStorage.setItem(storageKey, text)
-  } catch {
-    /* ignore */
-  }
-}
-
-function getSessionDrawerOpenKey(sessionId: string): string | null {
-  const trimmed = sessionId.trim()
-  return trimmed ? `${SESSION_DRAWER_OPEN_KEY_PREFIX}${trimmed}` : null
-}
-
-function loadSessionDrawerOpen(sessionId: string): boolean {
-  const storageKey = getSessionDrawerOpenKey(sessionId)
-  if (!storageKey) return false
-  try {
-    return localStorage.getItem(storageKey) === '1'
-  } catch {
-    return false
-  }
-}
-
-function saveSessionDrawerOpen(sessionId: string, isOpen: boolean): void {
-  const storageKey = getSessionDrawerOpenKey(sessionId)
-  if (!storageKey) return
-  try {
-    if (!isOpen) {
-      localStorage.removeItem(storageKey)
-      return
-    }
-    localStorage.setItem(storageKey, '1')
-  } catch {
-    /* ignore */
-  }
-}
-
-function getSessionImagePreviewKey(sessionId: string): string | null {
-  const trimmed = sessionId.trim()
-  return trimmed ? `${SESSION_IMAGE_PREVIEW_KEY_PREFIX}${trimmed}` : null
-}
-
-function loadSessionImagePreviews(sessionId: string): SessionImagePreviews {
-  const storageKey = getSessionImagePreviewKey(sessionId)
-  if (!storageKey) return {}
-  try {
-    const raw = sessionStorage.getItem(storageKey)
-    if (!raw) return {}
-    return coerceSessionImagePreviews(JSON.parse(raw))
-  } catch {
-    return {}
-  }
-}
-
-function saveSessionImagePreviews(sessionId: string, previews: SessionImagePreviews): void {
-  const storageKey = getSessionImagePreviewKey(sessionId)
-  if (!storageKey) return
-  try {
-    if (Object.keys(previews).length === 0) {
-      sessionStorage.removeItem(storageKey)
-      return
-    }
-    sessionStorage.setItem(storageKey, JSON.stringify(previews))
-  } catch {
-    /* ignore */
-  }
-}
-
-function readFileAsDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onload = () => {
-      if (typeof reader.result === 'string') {
-        resolve(reader.result)
-        return
-      }
-      reject(new Error('image preview unavailable'))
-    }
-    reader.onerror = () => {
-      reject(reader.error ?? new Error('image preview unavailable'))
-    }
-    reader.readAsDataURL(file)
-  })
-}
 
 // ── AttachPanel ───────────────────────────────────────────────────────────────
 /**
