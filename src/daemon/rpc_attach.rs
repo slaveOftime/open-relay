@@ -359,23 +359,21 @@ pub(super) async fn handle_session_cursor(
     id: String,
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
-    let offset = match session_store.attach_filtered_len(&id).await {
-        Some(offset) => offset,
-        None => {
-            return RpcResponse::Error {
-                message: format!("session not found or no output recorded: {id}"),
-            };
-        }
-    };
-    let (running, _, exit_code) = session_store
-        .attach_stream_status(&id)
-        .await
-        .unwrap_or((false, true, None));
+    let (running, exit_code, offset, incarnation, input_needed) =
+        match session_store.stream_observation(&id).await {
+            Some(observation) => observation,
+            None => {
+                return RpcResponse::Error {
+                    message: format!("session not found or no output recorded: {id}"),
+                };
+            }
+        };
     RpcResponse::SessionCursor {
         running,
         exit_code,
         offset,
-        incarnation: session_store.journal_incarnation(&id),
+        incarnation,
+        input_needed,
     }
 }
 
@@ -389,6 +387,7 @@ pub(super) async fn handle_observe_window(
     // Hard cap regardless of what the client asked for: reads stay
     // memory-bounded even when the client requested a multi-GiB window.
     let max_bytes = (max_bytes as usize).clamp(1, 8 * 1024 * 1024);
+    let before = session_store.stream_observation(&id).await;
     let data = match session_store
         .attach_resync_window(&id, from, max_bytes)
         .await
@@ -405,11 +404,17 @@ pub(super) async fn handle_observe_window(
         .attach_stream_status(&id)
         .await
         .unwrap_or((false, true, None));
+    let after = session_store.stream_observation(&id).await;
+    if before.as_ref().map(|v| v.3) != after.as_ref().map(|v| v.3) {
+        return RpcResponse::Error {
+            message: "session restarted during window read".into(),
+        };
+    }
     RpcResponse::ObserveWindow {
         data,
         next_offset,
         running,
         exit_code,
-        incarnation: session_store.journal_incarnation(&id),
+        incarnation: after.and_then(|v| v.3),
     }
 }

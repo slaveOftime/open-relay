@@ -927,28 +927,38 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         fetch_logs_node(&primary_tmp, "worker1", &session_id)
     );
 
-    // Agent-facing bounded history uses a separate pair of one-shot RPCs.
+    // A machine reader on a remote session: JSON output carries the content
+    // and the cursor the read was taken at, both proxied to the owning node.
     let remote_window = oly_cmd(&primary_tmp)
         .args([
             "logs",
             &session_id,
             "--node",
             "worker1",
-            "--from",
-            "0",
-            "--limit",
-            "4096",
+            "--tail",
+            "200",
+            "--json",
         ])
         .output()
-        .expect("`oly logs --from --node` failed to execute");
+        .expect("`oly logs --tail --json --node` failed to execute");
     assert!(
         remote_window.status.success(),
         "remote history read failed: {}",
         String::from_utf8_lossy(&remote_window.stderr)
     );
+    let window: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&remote_window.stdout).trim())
+            .expect("remote logs --json emits one JSON object");
     assert!(
-        String::from_utf8_lossy(&remote_window.stdout).contains(REMOTE_MARKER),
+        window["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(REMOTE_MARKER),
         "remote history window missing marker"
+    );
+    assert!(
+        window["cursor"].as_str().is_some(),
+        "remote read must hand back a cursor a follow-up --since can use"
     );
     const REMOTE_FILE_MARKER: &str = "oly_federation_remote_file_marker";
     let upload_source = primary_tmp.join("remote-send-source.txt");
@@ -1000,6 +1010,87 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         "`oly stop --node` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
+
+    // Remote delivery must be byte-identical to local canonical export,
+    // including base64 carry and tiny continuation-page boundaries.
+    let local = oly_cmd(&secondary_tmp)
+        .args(["export", &session_id])
+        .output()
+        .unwrap();
+    let remote = oly_cmd(&primary_tmp)
+        .args(["export", &session_id, "--node", "worker1"])
+        .output()
+        .unwrap();
+    assert!(local.status.success() && remote.status.success());
+    assert_eq!(remote.stdout, local.stdout);
+    let encoded = oly_cmd(&primary_tmp)
+        .args(["export", &session_id, "--json", "--node", "worker1"])
+        .output()
+        .unwrap();
+    assert!(encoded.status.success());
+    let encoded: serde_json::Value = serde_json::from_slice(&encoded.stdout).unwrap();
+    assert_eq!(
+        base64::Engine::decode(
+            &base64::prelude::BASE64_STANDARD,
+            encoded["bytes"].as_str().unwrap()
+        )
+        .unwrap(),
+        local.stdout
+    );
+    let cursor = oly_cmd(&primary_tmp)
+        .args(["logs", &session_id, "--cursor", "--node", "worker1"])
+        .output()
+        .unwrap();
+    assert!(cursor.status.success());
+    let fields = base64::Engine::decode(
+        &base64::prelude::BASE64_URL_SAFE_NO_PAD,
+        String::from_utf8_lossy(&cursor.stdout).trim(),
+    )
+    .unwrap();
+    let mut token = base64::Engine::encode(
+        &base64::prelude::BASE64_URL_SAFE_NO_PAD,
+        fields
+            .split(|b| *b == b'|')
+            .take(3)
+            .flat_map(|part| part.iter().copied().chain(*b"|"))
+            .chain(*b"0")
+            .collect::<Vec<_>>(),
+    );
+    let mut delivered = Vec::new();
+    loop {
+        let page = oly_cmd(&primary_tmp)
+            .args([
+                "logs",
+                &session_id,
+                "--since",
+                &token,
+                "--limit-bytes",
+                "257",
+                "--json",
+                "--node",
+                "worker1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            page.status.success(),
+            "{}",
+            String::from_utf8_lossy(&page.stderr)
+        );
+        let page: serde_json::Value = serde_json::from_slice(&page.stdout).unwrap();
+        let bytes = base64::Engine::decode(
+            &base64::prelude::BASE64_STANDARD,
+            page["bytes"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(bytes.len() <= 257);
+        delivered.extend(bytes);
+        token = page["cursor"].as_str().unwrap().into();
+        if page["has_more"] == false {
+            break;
+        }
+    }
+    assert_eq!(delivered, local.stdout);
 
     let attach = oly_cmd(&primary_tmp)
         .args(["attach", &session_id, "--node", "worker1"])
@@ -1519,15 +1610,28 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
         ws.send(WsMessage::Text(r#"{"type":"ping"}"#.into()))
             .await
             .expect("send ping");
-        let pong = timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("pong timeout")
-            .expect("ws open")
-            .expect("ws read");
-        let WsMessage::Binary(pong) = pong else {
-            panic!("expected binary PONG frame, got: {pong:?}")
-        };
-        assert_eq!(pong[0], 7, "ping must be answered with PONG");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = ws.next().await.expect("ws open").expect("ws read");
+                let WsMessage::Binary(frame) = frame else {
+                    panic!("expected binary frame, got: {frame:?}")
+                };
+                match frame[0] {
+                    7 => break,
+                    // PTY output/mode/resize can already be queued when ping
+                    // is sent. They must retain ordering, not be overtaken.
+                    2 => {
+                        let offset = u64::from_be_bytes(frame[1..9].try_into().unwrap());
+                        assert_eq!(offset, expected_offset);
+                        expected_offset += (frame.len() - 9) as u64;
+                    }
+                    3 | 4 => {}
+                    tag => panic!("unexpected frame while waiting for PONG: {tag}"),
+                }
+            }
+        })
+        .await
+        .expect("pong timeout");
 
         ws.send(WsMessage::Text(r#"{"type":"detach"}"#.into()))
             .await
@@ -1658,12 +1762,67 @@ fn e2e_daemon_stop_kills_process_trees() {
     let _ = id;
 }
 
-/// Safe export: `--raw` returns the exact child bytes (explicit
-/// opt-in), while the default rendered view never re-emits raw control
-/// sequences.
+#[cfg(unix)]
+#[test]
+fn e2e_export_pins_a_prefix_while_output_keeps_growing() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_export_prefix");
+    let _daemon = start_daemon(&tmp);
+    let id = start_session(
+        &tmp,
+        &[
+            "sh",
+            "-c",
+            "while :; do printf 'PREFIX-你好\\n'; sleep 0.01; done",
+        ],
+    );
+    assert!(wait_for_log(&tmp, &id, |s| s.contains("PREFIX"), Duration::from_secs(5)).is_some());
+    let output = tmp.join("prefix.json");
+    let mut export = oly_cmd(&tmp)
+        .args(["export", &id, "--json"])
+        .stdout(std::fs::File::create(&output).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = export.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            export.kill().unwrap();
+            panic!("export followed continuous output instead of pinning end");
+        }
+        sleep(Duration::from_millis(10));
+    }
+    sleep(Duration::from_millis(200));
+    assert!(
+        oly_cmd(&tmp)
+            .args(["stop", &id])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let prefix: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+    let prefix_bytes = base64::Engine::decode(
+        &base64::prelude::BASE64_STANDARD,
+        prefix["bytes"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(prefix["size"].as_u64().unwrap(), prefix_bytes.len() as u64);
+    let all = oly_cmd(&tmp).args(["export", &id]).output().unwrap();
+    assert!(all.status.success());
+    assert!(all.stdout.starts_with(&prefix_bytes));
+    assert!(all.stdout.len() > prefix_bytes.len());
+}
+
+/// Safe export: `oly export` returns the exact child bytes, while the
+/// default rendered view never re-emits raw control sequences.
 #[cfg(not(target_os = "windows"))]
 #[test]
-fn e2e_logs_raw_exports_unfiltered_bytes() {
+fn e2e_logs_export_emits_canonical_bytes() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_logs_raw");
     let _daemon = start_daemon(&tmp);
@@ -1680,9 +1839,9 @@ fn e2e_logs_raw_exports_unfiltered_bytes() {
         .expect("session produced no output within 5 s");
 
     let raw = oly_cmd(&tmp)
-        .args(["logs", "--raw", &id])
+        .args(["export", &id])
         .output()
-        .expect("`oly logs --raw` failed to execute");
+        .expect("`oly export` failed to execute");
     assert!(
         raw.status.success(),
         "`oly logs --raw` exited non-zero.\nstderr: {}",
@@ -1818,15 +1977,58 @@ fn e2e_daemon_status_reports_not_running() {
     );
 }
 
-/// The merged `oly logs` surface: gates compose with read selectors
-/// (block, then read), wait-only mode emits real JSON with `--json`, and
-/// meaningless combinations are usage errors instead of being silently
-/// ignored.
+/// The `oly logs` surface: `--wait` gates a read, `--json` shapes any read,
+/// cursors continue a read without repeats, and meaningless combinations
+/// are usage errors instead of silent misreads.
 #[test]
-fn e2e_logs_gates_compose_with_reads_and_json_wait_results() {
+fn e2e_logs_waits_prints_and_hands_back_a_cursor() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let tmp = make_tmp_dir("e2e_logs_ergonomics");
+    let tmp = make_tmp_dir("e2e_logs_surface");
     let _daemon = start_daemon(&tmp);
+
+    // `restart` creates a NEW session ID; the original wait must stay on
+    // the ended source, not migrate to the replacement.
+    if !cfg!(target_os = "windows") {
+        let restarting = start_session(&tmp, &["sh", "-c", "sleep 30"]);
+        let pending = oly_cmd(&tmp)
+            .args([
+                "logs",
+                &restarting,
+                "--wait",
+                "output",
+                "--timeout",
+                "10s",
+                "--json",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        sleep(Duration::from_millis(300));
+        let restart = oly_cmd(&tmp)
+            .args(["restart", &restarting, "--force"])
+            .output()
+            .unwrap();
+        assert!(
+            restart.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restart.stderr)
+        );
+        let pending = pending.wait_with_output().unwrap();
+        assert!(pending.status.success());
+        let read: serde_json::Value = serde_json::from_slice(&pending.stdout).unwrap();
+        assert_eq!(read["session"], restarting);
+        assert_eq!(read["running"], false);
+        let replacement = String::from_utf8(restart.stdout).unwrap();
+        let replacement = replacement
+            .split_whitespace()
+            .last()
+            .unwrap()
+            .trim_end_matches('.');
+        let stop = oly_cmd(&tmp).args(["stop", replacement]).output().unwrap();
+        assert!(stop.status.success());
+    }
+
     // Interactive shell: on Linux/macOS we use `sh -i`, on Windows we
     // substitute the interactive `cmd /Q` which likewise accepts stdin
     // lines and echoes command output. The test only relies on the
@@ -1850,97 +2052,188 @@ fn e2e_logs_gates_compose_with_reads_and_json_wait_results() {
         "marker never appeared in logs"
     );
 
-    // Gate + window read: --from/--after/--json blocks until output exists
-    // after the cursor, then emits the window (the agent loop in one call).
+    // First read: drain everything already in the journal so the cursor
+    // we capture represents the position a real `--wait output` next call
+    // would watch from.
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--tail", "50", "--json"])
+        .output()
+        .expect("`oly logs --tail` failed to execute");
+    assert!(
+        output.status.success(),
+        "baseline read failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("baseline read emits one JSON line");
+    assert_eq!(read["session"].as_str(), Some(id.as_str()));
+    assert!(
+        read["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ERGO-MARKER"),
+        "baseline read lost the marker: {read}"
+    );
+    let cursor = read["cursor"]
+        .as_str()
+        .expect("read reports a cursor")
+        .to_string();
+
+    // A gated read: feed a second line in the background, then block until
+    // the cursor moves past `cursor` and dump everything since.
+    let cursor_for_gate = cursor.clone();
+    let id_for_gate = id.clone();
+    let tmp_for_gate = tmp.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(250));
+        send_line(&tmp_for_gate, &id_for_gate, "echo ERGO-SECOND");
+    });
     let output = oly_cmd(&tmp)
         .args([
             "logs",
             &id,
-            "--from",
-            "0",
-            "--after",
-            "0",
+            "--wait",
+            "output",
+            "--since",
+            &cursor_for_gate,
             "--json",
             "--timeout",
             "10s",
         ])
         .output()
-        .expect("`oly logs --from --after` failed to execute");
+        .expect("`oly logs --wait output` failed to execute");
     assert!(
         output.status.success(),
-        "gated window read failed.\nstderr: {}",
+        "gated read failed.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let window: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("gated window read emits one JSON line");
-    assert_eq!(window["from"], 0);
-    assert!(window["bytes"].as_u64().expect("bytes") > 0);
+    let read: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("gated read emits one JSON line");
+    assert_eq!(read["session"].as_str(), Some(id.as_str()));
+    assert!(
+        String::from_utf8_lossy(
+            &base64::Engine::decode(
+                &base64::prelude::BASE64_STANDARD,
+                read["bytes"].as_str().unwrap()
+            )
+            .unwrap()
+        )
+        .contains("ERGO-SECOND"),
+        "gated read lost the second marker: {read}"
+    );
+    let cursor = read["cursor"]
+        .as_str()
+        .expect("read reports a cursor")
+        .to_string();
 
-    // Gate + screen: blocks, then prints the visible screen.
+    // A cursor read sees only what came after it: send a second marker and
+    // the previous one must be gone from the window.
+    send_line(&tmp, &id, "echo ERGO-SECOND");
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains("ERGO-SECOND"),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "second marker never appeared"
+    );
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--since", &cursor, "--json"])
+        .output()
+        .expect("cursor read failed");
+    assert!(
+        output.status.success(),
+        "cursor read failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let window: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    let bytes = base64::Engine::decode(
+        &base64::prelude::BASE64_STANDARD,
+        window["bytes"].as_str().unwrap(),
+    )
+    .unwrap();
+    let content = String::from_utf8_lossy(&bytes);
+    assert!(
+        content.contains("ERGO-SECOND"),
+        "cursor read must include the newer output: {content}"
+    );
+    assert!(
+        !content.contains("ERGO-MARKER"),
+        "cursor read must not re-print output the caller already saw: {content}"
+    );
+
+    // Gate + screen: wait for a pattern, then print the visible screen.
+    // The match itself is the trigger and must arrive after the gate
+    // starts polling, so emit it on a slight delay from a worker thread.
+    let id_for_match = id.clone();
+    let tmp_for_match = tmp.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        send_line(&tmp_for_match, &id_for_match, "echo ERGO-SECOND-MATCH");
+    });
     let output = oly_cmd(&tmp)
         .args([
             "logs",
             &id,
-            "--pattern",
-            "ERGO-MARKER",
+            "--wait",
+            "match",
+            "--match",
+            "ERGO-SECOND-MATCH",
             "--screen",
             "--timeout",
             "10s",
         ])
         .output()
-        .expect("`oly logs --pattern --screen` failed to execute");
+        .expect("`oly logs --wait match --screen` failed to execute");
     assert!(
         output.status.success(),
         "gated screen failed.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("ERGO-MARKER"),
+        String::from_utf8_lossy(&output.stdout).contains("ERGO-SECOND-MATCH"),
         "gated screen should show the marker"
     );
 
-    // Wait-only + --json: a real JSON object (previously --json was
-    // silently ignored in wait mode).
+    // A gate that cannot be satisfied exits 2 and prints nothing: the
+    // caller can branch on the exit code without parsing prose.
     let output = oly_cmd(&tmp)
         .args([
             "logs",
             &id,
-            "--after",
-            "0",
-            "--pattern",
-            "ERGO-MARKER",
-            "--json",
+            "--wait",
+            "exit",
+            "--tail",
+            "5",
             "--timeout",
-            "10s",
+            "1s",
         ])
         .output()
-        .expect("`oly logs --json` failed to execute");
-    assert!(output.status.success());
-    let result: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim())
-            .expect("wait-only --json emits one JSON object");
-    assert_eq!(result["condition"], "pattern");
-    assert_eq!(result["match"], "ERGO-MARKER");
-    assert!(result["offset"].as_u64().expect("offset") > 0);
-
-    // Gate + default tail read.
-    let output = oly_cmd(&tmp)
-        .args(["logs", &id, "--exit", "--tail", "5", "--timeout", "1s"])
-        .output()
-        .expect("`oly logs --exit --tail` failed to execute");
+        .expect("`oly logs --wait exit` failed to execute");
     assert_eq!(
         output.status.code(),
         Some(2),
-        "gate timeout exits 2 without reading"
+        "an unsatisfiable gate exits 2 without reading"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a timed-out gate must not print output: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 
     // Meaningless combinations are usage errors, not silent misreads.
     for args in [
-        vec!["logs", &id, "--raw", "--exit"],
-        vec!["logs", &id, "--json"],
-        vec!["logs", &id, "--screen", "--from", "0"],
-        vec!["logs", &id, "-w", "--after", "0"],
+        vec!["logs", &id, "--screen", "--tail", "5"],
+        vec!["logs", &id, "--tail-frames", "2", "--tail", "5"],
+        vec!["logs", &id, "--cursor", "--screen"],
+        vec!["logs", &id, "--wait", "match"],
+        vec!["logs", &id, "--raw"],
+        vec!["logs", &id, "--from-file"],
     ] {
         let output = oly_cmd(&tmp).args(&args).output().expect("run oly logs");
         assert!(
@@ -1950,26 +2243,235 @@ fn e2e_logs_gates_compose_with_reads_and_json_wait_results() {
         );
     }
 
+    // `--cursor` alone is a token on stdout, nothing else.
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--cursor"])
+        .output()
+        .expect("`oly logs --cursor` failed to execute");
+    assert!(output.status.success());
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        !token.is_empty() && !token.contains('\n'),
+        "token: {token:?}"
+    );
+
     let output = oly_cmd(&tmp)
         .args(["stop", &id])
         .output()
         .expect("`oly stop` failed to execute");
     assert!(output.status.success());
 
-    // Gate that is already satisfied (session exited) reads immediately.
+    // A gate that is already satisfied (session exited) reads immediately.
     let output = oly_cmd(&tmp)
-        .args(["logs", &id, "--exit", "--screen", "--timeout", "10s"])
+        .args([
+            "logs",
+            &id,
+            "--wait",
+            "exit",
+            "--screen",
+            "--timeout",
+            "10s",
+        ])
         .output()
-        .expect("`oly logs --exit --screen` failed to execute");
+        .expect("`oly logs --wait exit --screen` failed to execute");
     assert!(
         output.status.success(),
-        "--exit --screen on a stopped session failed.\nstderr: {}",
+        "exited gate failed.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("ERGO-MARKER"),
+        String::from_utf8_lossy(&output.stdout).contains("ERGO-SECOND"),
         "screen after exit should render the journal"
     );
+
+    // Exact paging after completion: tiny pages must concatenate to the
+    // canonical export, even when UTF-8/control sequences straddle pages.
+    let exported = oly_cmd(&tmp).args(["export", &id]).output().unwrap();
+    assert!(exported.status.success());
+    let origin = base64::Engine::encode(
+        &base64::prelude::BASE64_URL_SAFE_NO_PAD,
+        base64::Engine::decode(&base64::prelude::BASE64_URL_SAFE_NO_PAD, &token)
+            .unwrap()
+            .split(|b| *b == b'|')
+            .take(3)
+            .flat_map(|part| part.iter().copied().chain(*b"|"))
+            .chain(*b"0")
+            .collect::<Vec<_>>(),
+    );
+    let mut next = origin.clone();
+    let mut delivered = Vec::new();
+    loop {
+        let output = oly_cmd(&tmp)
+            .args([
+                "logs",
+                &id,
+                "--since",
+                &next,
+                "--limit-bytes",
+                "17",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let page: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(page["mode"], "stream");
+        let bytes = base64::Engine::decode(
+            &base64::prelude::BASE64_STANDARD,
+            page["bytes"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert!(bytes.len() <= 17);
+        delivered.extend_from_slice(&bytes);
+        next = page["cursor"].as_str().unwrap().into();
+        if !page["has_more"].as_bool().unwrap() {
+            break;
+        }
+        assert!(!bytes.is_empty(), "completed page must progress");
+    }
+    assert_eq!(delivered, exported.stdout);
+    let empty = oly_cmd(&tmp)
+        .args(["logs", &id, "--since", &next, "--json"])
+        .output()
+        .unwrap();
+    let empty: serde_json::Value = serde_json::from_slice(&empty.stdout).unwrap();
+    assert_eq!(empty["bytes"], "");
+    assert_eq!(empty["cursor"], next);
+    assert_eq!(empty["has_more"], false);
+    let json_export = oly_cmd(&tmp)
+        .args(["export", &id, "--json"])
+        .output()
+        .unwrap();
+    assert!(json_export.status.success());
+    let json_export: serde_json::Value = serde_json::from_slice(&json_export.stdout).unwrap();
+    assert_eq!(
+        base64::Engine::decode(
+            &base64::prelude::BASE64_STANDARD,
+            json_export["bytes"].as_str().unwrap()
+        )
+        .unwrap(),
+        delivered
+    );
+    assert_eq!(
+        json_export["size"].as_u64().unwrap(),
+        delivered.len() as u64
+    );
+    for surface in ["--tail", "--tail-frames"] {
+        let zero = oly_cmd(&tmp)
+            .args(["logs", &id, surface, "0"])
+            .output()
+            .unwrap();
+        assert!(zero.status.success());
+        assert!(zero.stdout.is_empty());
+    }
+
+    // A cursor from another session cannot be borrowed to read this one.
+    let output = oly_cmd(&tmp)
+        .args(["logs", "some-other-session", "--since", &token])
+        .output()
+        .expect("foreign cursor read ran");
+    assert!(
+        !output.status.success(),
+        "a cursor from another session must be rejected, not silently ignored"
+    );
+}
+
+/// A full-screen program leaves a stream of cursor moves, not lines. The
+/// only usable history is the screens it painted: `--tail-frames` rebuilds
+/// them, newest last, at the viewport the program actually had.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_logs_tail_frames_replays_the_screens_a_tui_painted() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_logs_frames");
+    let _daemon = start_daemon(&tmp);
+
+    // Three distinct alt-screen states. A real TUI is not needed to prove
+    // the replay: the alt-screen sequences and the painting are what the
+    // recorder stores, and `printf` produces exactly those.
+    let id = start_session(
+        &tmp,
+        &[
+            "sh",
+            "-c",
+            "printf '\\033[?1049h'; for i in 1 2 3; do printf '\\033[H\\033[JFRAME-%s\\n' $i; sleep 0.3; done; sleep 30",
+        ],
+    );
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains("FRAME-3"),
+            Duration::from_secs(15)
+        )
+        .is_some(),
+        "the painted screen never reached the logs"
+    );
+
+    // Default is predictable even for a full-screen producer.
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--json"])
+        .output()
+        .expect("`oly logs --json` failed to execute");
+    assert!(output.status.success());
+    let read: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(
+        read["mode"].as_str(),
+        Some("tail"),
+        "default must remain tail regardless of producer: {read}"
+    );
+
+    let output = oly_cmd(&tmp)
+        .args(["logs", &id, "--tail-frames", "3", "--json"])
+        .output()
+        .expect("`oly logs --tail-frames` failed to execute");
+    assert!(
+        output.status.success(),
+        "`oly logs --tail-frames` failed.\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let read: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    let frames = read["frames"].as_array().expect("frames array");
+    assert!(
+        !frames.is_empty(),
+        "no frames were replayed from a TUI session: {read}"
+    );
+    let contents: Vec<&str> = frames
+        .iter()
+        .map(|frame| frame["content"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        contents.iter().any(|content| content.contains("FRAME-1")),
+        "the first painted screen should be recoverable: {contents:?}"
+    );
+    assert!(
+        contents
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .contains("FRAME-3"),
+        "the newest frame must be the current screen: {contents:?}"
+    );
+    assert!(
+        read["cursor"].as_str().is_some(),
+        "frame history reports a cursor to continue from"
+    );
+
+    // Frame width follows the recorded PTY, so a frame needs no --cols.
+    let width = read["width"].as_u64().expect("frame width");
+    assert!(width > 0, "frames must carry the recorded viewport width");
+
+    let output = oly_cmd(&tmp)
+        .args(["stop", &id])
+        .output()
+        .expect("`oly stop` failed to execute");
+    assert!(output.status.success());
 }
 
 // Regression guard: a single secondary daemon registering *two* persisted

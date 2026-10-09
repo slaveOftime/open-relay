@@ -267,6 +267,29 @@ impl Terminal {
             .collect()
     }
 
+    /// Digest full visible canonical cells, including styled blanks and rare
+    /// cell metadata that the terminal-text projection can omit.
+    pub fn screen_digest(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        struct Sink(Sha256);
+        impl std::fmt::Write for Sink {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0.update(text.as_bytes());
+                Ok(())
+            }
+        }
+        let mut sink = Sink(Sha256::new());
+        let grid = self.term.grid();
+        let _ = write!(sink, "{:?};", self.size());
+        for line in 0..grid.screen_lines() {
+            for cell in &grid[Line(line as i32)] {
+                let _ = write!(sink, "{cell:?};");
+            }
+        }
+        sink.0.finalize().into()
+    }
+
     /// Styled scrollback rows (oldest first, newest last), limited to the
     /// newest `tail` retained rows. Excludes the visible screen.
     pub fn styled_history_rows(&self, tail: usize) -> Vec<Vec<u8>> {
@@ -360,6 +383,11 @@ fn styled_row(row: &alacritty_terminal::grid::Row<Cell>) -> Vec<u8> {
             current = Some(next);
         }
         out.extend_from_slice(cell.c.encode_utf8(&mut [0u8; 4]).as_bytes());
+        if let Some(chars) = cell.zerowidth() {
+            for character in chars {
+                out.extend_from_slice(character.encode_utf8(&mut [0u8; 4]).as_bytes());
+            }
+        }
         let visible_blank = cell.c == ' '
             && next.bg == Color::Named(NamedColor::Background)
             && next.attrs.is_empty();

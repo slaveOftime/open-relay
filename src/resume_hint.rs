@@ -25,7 +25,7 @@ use crate::{
     error::Result,
     session::{
         journal::JOURNAL_DIR_NAME,
-        logs::{RESUME_FALLBACK_TAIL_LINES, render_log_session, replay_filtered_tail},
+        logs::{RESUME_FALLBACK_TAIL_LINES, render_log_session_tail, replay_filtered_tail},
     },
 };
 
@@ -103,7 +103,7 @@ pub(crate) fn from_journal(
     }
     // Primary pass: replay the tail through the engine (the same path
     // `oly logs` uses) and regex-match the rendered string.
-    let (rendered, _) = render_log_session(dir, RESUME_TAIL_ROWS, false, 2000, None)?;
+    let (rendered, _) = render_log_session_tail(dir, RESUME_TAIL_ROWS, false)?;
     if let Some(hint) = detect(command, &String::from_utf8_lossy(&rendered), patterns) {
         return Ok(Some(hint));
     }
@@ -260,7 +260,7 @@ mod tests {
         // Sanity: the engine pass alone must NOT find it (this is the bug
         // the fallback exists to fix).
         let (rendered, _) =
-            crate::session::logs::render_log_session(&dir, RESUME_TAIL_ROWS, false, 2000, None)
+            crate::session::logs::render_log_session_tail(&dir, RESUME_TAIL_ROWS, false)
                 .expect("engine render");
         let rendered_text = String::from_utf8_lossy(&rendered);
         assert!(
@@ -322,7 +322,7 @@ mod tests {
         output.extend_from_slice(b"\r\n");
         crate::session::store::testsupport::seed_journal_output(&dir, &output);
         let (rendered, _) =
-            crate::session::logs::render_log_session(&dir, RESUME_TAIL_ROWS, false, 2000, None)
+            crate::session::logs::render_log_session_tail(&dir, RESUME_TAIL_ROWS, false)
                 .expect("engine render");
         let rendered_text = String::from_utf8_lossy(&rendered);
         assert!(

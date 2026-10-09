@@ -3636,19 +3636,13 @@ fn inactive_session_uses_logs_command() {
     assert_eq!(
         args,
         [
-            "logs",
-            "abc",
-            "--keep-color",
-            "--tail",
-            "1000",
-            "--node",
-            "worker"
+            "logs", "abc", "--color", "always", "--tail", "1000", "--node", "worker"
         ]
     );
     let (_, local_args) = super::session_command("abc", None, false).unwrap();
     assert_eq!(
         local_args,
-        ["logs", "abc", "--keep-color", "--tail", "1000"]
+        ["logs", "abc", "--color", "always", "--tail", "1000"]
     );
     let (_, args) = super::session_command("abc", None, true).unwrap();
     assert_eq!(args, ["attach", "abc"]);

@@ -709,7 +709,7 @@ fn e2e_high_bandwidth_output_logs_intact() {
     );
 
     let full_log = oly_cmd(&tmp)
-        .args(["logs", &id, "--tail", "600", "--no-truncate"])
+        .args(["logs", &id, "--tail", "600"])
         .output()
         .expect("`oly logs --tail 600` failed");
     let full_text = strip_session_status_marker(&String::from_utf8_lossy(&full_log.stdout), &id);
@@ -750,16 +750,9 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
     );
 
     let colored = oly_cmd(&tmp)
-        .args([
-            "logs",
-            &id,
-            "--tail",
-            "200",
-            "--no-truncate",
-            "--keep-color",
-        ])
+        .args(["logs", &id, "--tail", "200", "--color", "always"])
         .output()
-        .expect("`oly logs --keep-color` failed");
+        .expect("`oly logs --color always` failed");
     let colored_text = String::from_utf8_lossy(&colored.stdout);
     assert!(
         colored_text.contains("COLOR_TEST"),
@@ -789,25 +782,25 @@ fn e2e_logs_wait_for_prompt_returns_after_command_exits() {
         .args([
             "logs",
             &id,
-            "--wait-for-prompt",
+            "--wait",
+            "prompt",
             "--timeout",
             "5000",
             "--tail",
             "100",
-            "--no-truncate",
         ])
         .output()
-        .expect("`oly logs --wait-for-prompt` failed to execute");
+        .expect("`oly logs --wait prompt` failed to execute");
 
     assert!(
         output.status.success(),
-        "`oly logs --wait-for-prompt` exited non-zero.\nstderr: {}",
+        "`oly logs --wait prompt` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("PROMPT_DONE"),
-        "expected PROMPT_DONE in wait-for-prompt output.\nstdout:\n{stdout}"
+        "expected PROMPT_DONE in --wait prompt output.\nstdout:\n{stdout}"
     );
 }
 

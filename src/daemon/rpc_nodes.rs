@@ -623,7 +623,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
             | RpcRequest::Restart { .. }
             | RpcRequest::Kill { .. }
             | RpcRequest::Remove { .. }
-            | RpcRequest::LogsWait { .. }
+            | RpcRequest::LogsRead { .. }
             | RpcRequest::LogsTail { .. }
             | RpcRequest::LogsPagination { .. }
     )

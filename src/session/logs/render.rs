@@ -19,7 +19,7 @@ use super::{OUTPUT_COLOR_RESET_SUFFIX, RenderBytes, ViewportReplayPlan, Viewport
 
 /// Wide parser column count — prevents any line wrapping inside the engine
 /// grid for plain scrollback-style logs.
-const PARSER_COLS: u16 = 2000;
+pub const PARSER_COLS: u16 = 2000;
 
 /// Fallback viewport height for alt-screen TUIs when no absolute row movement
 /// is visible in the retained log tail.
@@ -41,9 +41,8 @@ const MAX_LOG_RESIZE_EVENTS: usize = 64;
 /// The window is intentionally generous: a single resume hint is far
 /// shorter than a typical TUI repaint, and a chat scrollback that buries
 /// the hint can still hold it for thousands of lines below the visible
-/// area. Anchor-anchored replay caps the journal walk to the latest
-/// checkpoint anchor (~32 MiB cadence) plus at most one further anchor,
-/// so the wall-clock cost is bounded by `REPLAY_BATCH_BYTES` per call.
+/// area. Anchors provide seek points, but insufficient suffix context can
+/// require older candidates or an origin scan; this is not a page-size work cap.
 pub const RESUME_FALLBACK_TAIL_LINES: usize = 8192;
 
 /// Filtered-stream tail bytes plus the journal offsets they cover. Used
@@ -63,7 +62,10 @@ pub struct FilteredTail {
     pub resizes: Vec<LogResize>,
 }
 
+/// Checkpoint-anchored filtered-stream tail read used by resume hints
+/// and HTTP fallback renderers. CLI continuation uses byte paging instead.
 pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Result<FilteredTail> {
+    let from_offset = 0;
     if !session_dir
         .join(crate::session::journal::JOURNAL_DIR_NAME)
         .is_dir()
@@ -77,27 +79,69 @@ pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Re
 
     // Checkpoint-anchored tail replay: start at the newest anchored
     // checkpoint and walk older anchors only until the replayed
-    // suffix covers the requested tail. Cost is bounded by the checkpoint
-    // cadence, not by total recording size. Bytes and resize history are
+    // suffix covers the requested tail. Short candidates widen, potentially
+    // to the origin; no constant-cost guarantee applies. Bytes and resize history are
     // derived in the SAME pass — a tail render never scans the journal
     // more than once per candidate start.
     let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
-    let mut starts: Vec<_> = anchors.iter().rev().map(Some).collect();
+    // Walk from newest-to-oldest anchor (newest first) and fall back to
+    // a full scan (`None`) only when no anchor accepts. A `--since` cursor
+    // is a content boundary — anchors past the cursor are not seek points,
+    // because using them would skip the bytes between the cursor and the
+    // anchor's replica of the engine state.
+    // No truncation (`tail == usize::MAX`, e.g. `--screen` on a stopped
+    // session) needs the full prefix; the screen state only rebuilds
+    // once the engine has replayed every style and repaint from the
+    // journal origin.
+    let unbounded = desired_tail_lines == usize::MAX || desired_tail_lines == 0;
+    let mut starts: Vec<Option<&crate::session::journal::CheckpointAnchor>> =
+        if unbounded || from_offset > 0 {
+            // Cursor or full-screen: anchors past the cursor are not seek
+            // points, because using them would skip bytes the cursor bound
+            // semantically claims to span (or trim the prefixes the engine
+            // needs to reach its current screen state).
+            anchors
+                .iter()
+                .rev()
+                .filter(|anchor| anchor.filtered_offset <= from_offset)
+                .map(Some)
+                .collect()
+        } else {
+            // `from_offset == 0` and bounded tail: the newest anchored
+            // checkpoint is the cheapest seek when it covers the requested
+            // tail range.
+            anchors.iter().rev().map(Some).collect()
+        };
     starts.push(None);
     let mut candidate: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
+    let mut fallback: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
     for anchor in starts {
-        let requested_start = anchor.map(|anchor| anchor.filtered_offset).unwrap_or(0);
+        // The anchor is only a seek point; the derived window always starts
+        // at `from_offset`, so a `--since` render never leaks bytes that
+        // precede the cursor.
         let (bytes, end, resizes, start) =
             crate::session::replay::filtered_stream_and_resizes_from_anchor(
                 session_dir,
-                requested_start,
+                from_offset,
                 anchor,
             )?;
         let tail_bytes = super::index::tail_window_bytes(&bytes, desired_tail_lines);
-        debug_assert_eq!(tail_bytes.end_offset + start, end);
-        // start_offset > 0 means the window found enough lines inside the
-        // suffix; otherwise widen the replay at an older anchor.
-        if tail_bytes.start_offset > 0 || start == 0 {
+        // An anchor past the requested cursor was a fine seek point for
+        // the journal side, but if the segment that follows it carries no
+        // payload bytes (typical when the live tip just rolled its
+        // checkpoint) replay at an older anchor instead of returning an
+        // empty window.
+        if bytes.is_empty() && start > 0 && anchor.is_some() {
+            continue;
+        }
+        let accepted = |tail_bytes: &super::index::TailBytes| {
+            tail_bytes.start_offset > 0 || anchor.is_none() || from_offset > 0
+        };
+        // `start_offset > 0` means the window found enough lines inside the
+        // suffix; otherwise widen the replay at an older anchor. With a
+        // `--since` cursor the window is bounded below by the cursor, so
+        // widening cannot add earlier lines and the first pass is final.
+        if accepted(&tail_bytes) {
             let start_offset = start + tail_bytes.start_offset;
             // Match the previous bounded resize lookup: it starts at the
             // newest anchor at/before the rendered window and scans no more
@@ -115,10 +159,15 @@ pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Re
                 .into_iter()
                 .filter(|resize| resize.offset >= resize_start && resize.offset <= resize_end)
                 .collect();
-            candidate = Some((tail_bytes.bytes, start_offset, end, resizes));
-            break;
+            let window = (tail_bytes.bytes, start_offset, end, resizes);
+            if tail_bytes.start_offset > 0 || start == 0 {
+                candidate = Some(window);
+                break;
+            }
+            fallback = Some(window);
         }
     }
+    let candidate = candidate.or(fallback);
 
     let Some((bytes, start_offset, end_offset, resizes)) = candidate else {
         return Ok(FilteredTail {
@@ -136,10 +185,22 @@ pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Re
     })
 }
 
+/// Render a session's persisted output via the shared terminal/scanner
+/// cache and return (rendered_bytes, observation_end_offset). The default
+/// `oly logs --tail` path; reused by every CLI Tail RPC.
+pub fn render_log_session_tail(
+    session_dir: &Path,
+    tail: usize,
+    keep_color: bool,
+) -> Result<(Vec<u8>, u64)> {
+    super::screen_history::tail(session_dir, tail, keep_color).map_err(crate::error::AppError::from)
+}
+
 /// Render a session's persisted output for `oly logs` / the HTTP tail
-/// endpoint from the journal-derived filtered stream. Pre-1.0 sessions
-/// that only have `output.log` are rejected (the fallback was removed;
-/// see MIGRATION.md).
+/// endpoint. Exposed viewport sizing is unused by the live callers
+/// (resume hints and HTTP tails let the journal's recorded geometry
+/// drive replay); kept optional for the byte-fixture test adapter below.
+#[allow(clippy::too_many_arguments)]
 pub fn render_log_session(
     session_dir: &Path,
     tail: usize,
@@ -147,6 +208,12 @@ pub fn render_log_session(
     term_cols: u16,
     viewport: Option<ViewportSize>,
 ) -> Result<(Vec<u8>, Vec<LogResize>)> {
+    if viewport.is_none() && tail != usize::MAX {
+        let (output, _end) = super::screen_history::tail(session_dir, tail, keep_color)?;
+        // Resize metadata flows through the screen-history observation
+        // cursor, not via this function. Existing callers ignore it.
+        return Ok((output, Vec::new()));
+    }
     let FilteredTail {
         bytes,
         start_offset,
@@ -312,6 +379,13 @@ pub fn format_history_rows(rows: Vec<Vec<u8>>) -> Option<Vec<u8>> {
 /// For alternate-screen TUIs, `tail` is not a valid parser height. The parser
 /// must approximate the PTY viewport height, otherwise absolute cursor writes
 /// can leave stale off-screen rows visible in an oversized virtual screen.
+///
+/// How many scrollback rows a replay engine retains for a tail render.
+/// Renderers read only visible rows, so replay keeps no history.
+fn replay_scrollback_rows(_tail: usize) -> usize {
+    0
+}
+
 fn render_rows(
     render_bytes: &RenderBytes<'_>,
     tail: usize,
@@ -334,7 +408,7 @@ fn render_rows(
             viewport,
             viewport_plan,
         ),
-        0,
+        replay_scrollback_rows(tail),
     );
     process_bytes_with_resizes(&mut engine, render_bytes.frame, viewport_plan);
 
@@ -352,8 +426,12 @@ fn render_rows(
     };
 
     // Take the last `tail` rows from the content region.
-    let skip = content_rows.len().saturating_sub(tail);
-    content_rows.into_iter().skip(skip).collect()
+    if let Some((first, last)) = content_bounds(&content_rows) {
+        let first = first.max((last + 1).saturating_sub(tail));
+        content_rows[first..=last].to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 pub(super) fn parser_rows(
@@ -373,7 +451,7 @@ pub(super) fn parser_rows(
             .or_else(|| estimate_alt_screen_rows(bytes))
             .unwrap_or(DEFAULT_ALT_SCREEN_ROWS)
     } else {
-        tail.clamp(1, u16::MAX as usize) as u16
+        tail.saturating_add(1).clamp(1, u16::MAX as usize) as u16
     }
 }
 
@@ -423,7 +501,7 @@ fn process_bytes_with_resizes(
     }
 }
 
-fn contains_alt_screen(bytes: &[u8]) -> bool {
+pub fn contains_alt_screen(bytes: &[u8]) -> bool {
     bytes.windows(8).any(|window| {
         matches!(
             window,
@@ -752,5 +830,141 @@ mod tests {
             MAX_LOG_RESIZE_EVENTS
         ];
         assert!(serde_json::to_vec(&worst_case).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn bounded_tail_replay_is_independent_of_checkpointed_prefix_size() {
+        use crate::session::journal::{Checkpoint, ShadowJournal};
+        let mut evidence = Vec::new();
+        for prefix_lines in [1000, 10000] {
+            let dir =
+                std::env::temp_dir().join(format!("oly-tail-measure-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            let prefix = b"prefix\n".repeat(prefix_lines);
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(&prefix[..prefix.len() / 2]))
+                .unwrap();
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: (prefix.len() / 2) as u64,
+                    program: bytes::Bytes::new(),
+                })
+                .unwrap();
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(&prefix[prefix.len() / 2..]))
+                .unwrap();
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: prefix.len() as u64,
+                    program: bytes::Bytes::new(),
+                })
+                .unwrap();
+            let suffix: String = (1..=150).map(|n| format!("{n}\r\n")).collect();
+            journal
+                .record_output(bytes::Bytes::from(suffix.clone()))
+                .unwrap();
+            journal.shutdown();
+            let (tail, scanned) = crate::session::journal::stream::measure_replay_bytes(|| {
+                replay_filtered_tail(&dir, 40).unwrap()
+            });
+            assert_eq!(scanned, suffix.len());
+            assert_eq!(tail.end_offset, (prefix.len() + suffix.len()) as u64);
+            assert!(tail.start_offset >= prefix.len() as u64);
+            let rendered = render_log_session_tail(&dir, 40, false).unwrap().0;
+            assert_eq!(
+                String::from_utf8(rendered).unwrap(),
+                (111..=150).map(|n| format!("{n}\n")).collect::<String>()
+            );
+            evidence.push(scanned);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        assert_eq!(evidence[0], evidence[1]);
+    }
+
+    #[test]
+    fn short_anchor_suffix_widens_to_preserve_tail_context() {
+        // Build a journal with two checkpoint anchors covering 80 percent of
+        // the stream; replaying the tail should land on the newest anchor
+        // since the suffix alone holds enough lines, instead of falling back
+        // to a full scan across the recording.
+        let dir =
+            std::env::temp_dir().join(format!("oly_render_unanchored_tail_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test session dir");
+        {
+            use crate::session::journal::{Checkpoint, ShadowJournal};
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            for chunk in [
+                b"aaaa\n".as_slice(),
+                b"bbbb\n".as_slice(),
+                b"cccc\n".as_slice(),
+                b"dddd\n".as_slice(),
+                b"eeee\n".as_slice(),
+                b"ffff\n".as_slice(),
+                b"gggg\n".as_slice(),
+            ] {
+                journal
+                    .record_output(bytes::Bytes::copy_from_slice(chunk))
+                    .unwrap();
+            }
+            // Anchor after the first three chunks (~after "cccc\n" — bytes
+            // 0..=15, filtered_offset=16 with the trailing newline bytes).
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: 16,
+                    program: bytes::Bytes::from_static(b"\x1b[2Jrepaint"),
+                })
+                .unwrap();
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: 24,
+                    program: bytes::Bytes::from_static(b"\x1b[2Jrepaint"),
+                })
+                .unwrap();
+            for chunk in [
+                b"hhhh\n".as_slice(),
+                b"iiii\n".as_slice(),
+                b"jjjj\n".as_slice(),
+                b"kkkk\n".as_slice(),
+            ] {
+                journal
+                    .record_output(bytes::Bytes::copy_from_slice(chunk))
+                    .unwrap();
+            }
+            journal.shutdown();
+        }
+
+        let tail = replay_filtered_tail(&dir, 3).expect("tail replay");
+        assert_eq!(
+            tail.bytes, b"aaaa\nbbbb\ncccc\ndddd\neeee\nffff\ngggg\nhhhh\niiii\njjjj\nkkkk\n",
+            "short anchor suffix must widen instead of losing requested context"
+        );
+        assert_eq!(tail.end_offset, 55);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

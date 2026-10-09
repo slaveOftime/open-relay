@@ -92,7 +92,7 @@ oly start copilot
 oly ls
 
 # Check recent output and optionally wait for an input-needed checkpoint
-oly logs <id> --wait-for-prompt --timeout 1m
+oly logs <id> --wait prompt --timeout 1m
 
 # Send input without attaching
 oly send <id> "yes" key:enter
@@ -122,7 +122,7 @@ Run coding agents, REPLs, installers, or approval-heavy workflows in the backgro
 
 ### 2. Detect likely human checkpoints
 
-`oly logs --wait-for-prompt` lets you block until a session likely needs attention, then inspect the output before deciding what to do next.
+`oly logs --wait prompt` lets you block until a session likely needs attention, then inspect the output before deciding what to do next. `--wait output`, `--wait idle`, and `--wait exit` round out the gate.
 
 ### 3. Let humans stay in the loop
 
@@ -173,7 +173,7 @@ By default, `oly daemon start -d` also serves a local web UI and HTTP API on `ht
 
 ```sh
 oly start --title "fix failing tests" --detach copilot
-oly logs --wait-for-prompt
+oly logs --wait prompt
 oly send <id> "approve" key:enter
 ```
 
@@ -181,15 +181,23 @@ oly send <id> "approve" key:enter
 
 ```sh
 oly logs <id> --tail 80
-oly logs <id> --tail 80 --keep-color
-oly logs <id> --tail 120 --no-truncate
+oly logs <id> --tail 80 --color always
+oly logs <id> --screen                # current/last visible grid, including a blank final screen
+```
+
+### Lossless incremental read (agent API)
+
+```sh
+cursor=$(oly logs <id> --cursor)       # observe new bytes from now
+oly logs <id> --since "$cursor" --json # exact base64 byte page; chain .cursor
+# See the complete paging loop below.
 ```
 
 ### Start on a connected node
 
 ```sh
 oly start --node worker-1 --title "nightly task" --detach claude
-oly logs --node worker-1 --wait-for-prompt <id>
+oly logs --node worker-1 --wait prompt <id>
 ```
 
 ---
@@ -205,7 +213,8 @@ oly logs --node worker-1 --wait-for-prompt <id>
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
 | `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
 | `oly attach [id] [--observe] [--node <name>]` | Reattach to a session (controls it by default; `--observe` is view-only) |
-| `oly logs [id] [--tail <n>] [--keep-color] [--no-truncate] [--wait-for-prompt] [--timeout <duration>] [--node <name>]` | Read logs without attaching (also `--screen`, `--from`, and wait modes — see below) |
+| `oly logs [id] [--tail <n>] [--screen] [--tail-frames <n>] [--wait <condition>] [--match <regex>] [--idle-for <duration>] [--since <token>] [--limit-bytes <n>] [--cursor] [--color <auto\|always\|never>] [--json] [--timeout <duration>] [--node <name>]` | Read recorded output, optionally after a gate, and hand back a cursor token for the next read |
+| `oly export [id] [--json] [--node <name>]` | Dump the canonical filtered byte stream, control sequences and all, for files and pipes |
 | `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session. Use `--` to send arbitrary text verbatim without per-token dispatch (see "Let humans stay in the loop"). |
 | `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
 | `oly restart <id> [--force] [--node <name>]` | Start a new session from persisted launch metadata (`--force` first kills a running source) |
@@ -222,53 +231,116 @@ Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `
 
 ### Reading session output: `oly logs`
 
-`oly logs` is the single read surface for session output, organized as three
-independent axes that combine freely:
+`oly logs` separates rendered **views** from exact byte **continuation**.
+The default is always the last 40 rendered text lines, even for TUIs.
+Use `--screen` explicitly for a TUI. A wait only gates the selected output:
 
-1. **What to read** (pick at most one): the rendered log tail (default),
-   `--screen` (visible screen as text), `--from <offset>` (raw byte window of
-   the canonical stream), or `--raw` (the whole original byte stream).
-2. **When to read it** (optional gate): `-w/--wait-for-prompt`, or
-   `--after <offset>` with any of `--exit`, `--idle-ms <ms>`,
-   `--pattern <regex>`. With nothing to read selected, the gate alone prints
-   the condition result and the new cursor; combined with a read, it blocks
-   first and reads after the condition is met.
-3. **How to format it**: `--tail`, `--keep-color`, `--cols`, `--no-truncate`,
-   `--from-file` (rendered modes), `--limit` and `--json` (window reads and
-   wait-only results), `--timeout` (gates).
+| Axis | Options |
+| --- | --- |
+| **Print surface** (pick at most one) | `--tail <n>` (default), `--screen`, `--tail-frames <n>` |
+| **Gate** (never changes what is printed) | `--wait output` (alias `--wait new`), `--wait prompt`, `--wait idle`, `--wait exit`, `--wait match`. The last one needs `--match <regex>`. |
+| **Byte continuation** | `--since <cursor>` with no view flag; `--limit-bytes <n>` defaults to 256 KiB (max 8 MiB). `--cursor` prints the current stream-end token. |
+| **Format / routing** | `--color auto\|always\|never`, `--json`, `--node <name>` |
+
+Views are deliberately lossy: terminal cells can be overwritten and tails
+omit older lines. Their JSON cursors are **observation positions**, not claims
+that every preceding byte was delivered. `--since` cannot combine with
+`--tail`, `--screen`, or `--tail-frames`; it returns exact canonical filtered
+bytes, possibly splitting UTF-8/control sequences. Keep a decoder/parser
+across pages. JSON uses `mode: "stream"`, base64 `bytes`, `encoding`,
+`start_cursor`, next `cursor`, `has_more`, `running`, and `exit_code`.
+Empty pages preserve the cursor. `has_more` describes this read's observed end.
+
+Frame history samples after complete recorded output events, not arbitrary
+I/O chunks or application-defined redraws. It includes blanks, preserves
+main/alternate buffers, and deduplicates only consecutive identical styled
+states (A → B → A remains three observations). Resizes affect the next output
+sample; resize-only changes are visible immediately in `--screen`.
+Counts: tail 0..65535, frames 0..1024. Zero prints nothing without replay.
+Tails render retained scrollback plus the visible grid at recorded geometry,
+with continuous parser/styles/main/alternate state; long lines can wrap at
+that geometry. Cold tail/frame reconstruction is linear in recording size;
+warm reads use a shared byte-budgeted LRU and replay only appended records.
+Rebuilds coalesce per session/mode, not across unrelated sessions. Oversized
+entries are served uncached. Requested frame payload above 64 MiB, recorded
+grids above one million cells, tail grids/history above eight million cells,
+or conservatively charged rare terminal metadata above 64 MiB fail explicitly
+rather than silently dropping observations. For count-related limits, request
+fewer frames/lines; use byte paging or export when rendering is unsuitable.
 
 ```bash
-# Human: rendered log tail (default)
-oly logs <ID> --tail 40 --keep-color
-oly logs <ID> -w                        # block until the session needs input, then print
-oly logs <ID> --raw > dump.bin          # exact child bytes (pipes/files)
+# Human: read rendered output
+oly logs <ID> --tail 40 --color always
+oly logs <ID> --screen                          # current/last visible grid
 
-# Screen snapshots
-oly logs <ID> --screen [--cols 120] [--keep-color]
-oly logs <ID> --pattern 'ERROR' --screen   # block until output matches, then show the screen
+# TUI history: last N distinct screens (oldest first)
+oly logs <ID> --tail-frames 3
 
-# Machine: cursor-based window reads
-oly logs <ID> --from <offset> --limit 65536 --json   # one window, base64
+# Gate, then read
+oly logs <ID> --wait prompt --screen            # block until input needed, then print the live screen
+oly logs <ID> --wait exit  --tail 40            # block until the session ends, then read its tail
 
-# Machine: the cursor loop in one call — block until there is output after
-# the cursor, then read exactly that window
-oly logs <ID> --from <offset> --after <offset> --json
+# Lossless future-byte observation (requires jq and base64)
+id=<ID>
+cursor=$(oly logs "$id" --cursor)
+while :; do
+  page=$(oly logs "$id" --since "$cursor" --wait output --timeout 60s --json)
+  rc=$?
+  [ "$rc" -eq 2 ] && continue                  # timeout: cursor unchanged
+  [ "$rc" -eq 0 ] || break                    # stale cursor/error: inspect
+  printf '%s' "$page" | jq -r .bytes | base64 --decode
+  cursor=$(printf '%s' "$page" | jq -r .cursor)
+  [ "$(printf '%s' "$page" | jq -r .running)" = false ] &&
+    [ "$(printf '%s' "$page" | jq -r .has_more)" = false ] && break
+done
 
-# Machine: gates on their own report the condition and the new cursor
-oly logs <ID> --after <offset>                     # any new output
-oly logs <ID> --after <offset> --idle-ms 800       # quiet for 800ms (heuristic)
-oly logs <ID> --exit --timeout 30s                 # session exited
+# Pattern trigger
+oly logs <ID> --wait match --match 'DONE|FAILED' --tail 40
+
+# Status hint: the only line a quiet stream needs (exit 2 on timeout, 0 on met)
+oly logs <ID> --cursor --json                   # {"cursor": "Aa..", "running": true}
 ```
 
-- Wait exit codes: `0` condition met, `2` timeout, `1` error. `--timeout`
+- **Cursors are opaque.** A token encodes `session | incarnation | offset`;
+  handing it to the wrong session, or to a session that restarted since, is
+  rejected loudly. Pair `--cursor` with `--since` to resume losslessly.
+- **Wait exit codes:** `0` condition met, `2` timeout, `1` error. `--timeout`
   accepts plain milliseconds or `s`/`m`/`h` suffixes; `0` waits forever
-  (defaults: 30s for gates, 5m with `--wait-for-prompt`).
-- `--idle-ms` means "quiet", never "done" — a silent session may be thinking,
-  blocked, or crashed. Confirm with `--screen` or a pattern.
-- Window reads are bounded (`--limit`, hard-capped server-side); page with the
-  returned `next` offset instead of asking for everything.
-- Combinations that would be silently meaningless (e.g. `--screen --tail`,
-  `--raw --exit`, `--json` without `--from` or a gate) are usage errors.
+  (default 30s).
+- **Idle means "quiet", never "done".** A silent session may be thinking,
+  blocked, or crashed. Confirm with `--screen` or a `--wait match` pattern.
+- **Match is line-scoped.** Regex sees canonical bytes decoded with UTF-8
+  replacement, including controls. Page boundaries are transparent; partial
+  prompts can match. No cross-line matches; an unmatched line over 1 MiB is
+  an error rather than a silently missed match. An ended session without a
+  match fails promptly.
+- **Restart fencing:** every wait/read checks incarnation; a restart fails
+  instead of attaching an old cursor to a new stream.
+- **Timeout:** prints no content and advances no cursor. JSON emits one
+  `outcome: "timeout"` object with `cursor: null`, then exits 2.
+- **Modifier validation:** timeout needs a wait; idle-for needs wait idle;
+  match needs wait match. Cursor-only cannot take wait modifiers.
+- **Combinations that would be silently meaningless** (e.g. `--tail --screen`,
+  `--cursor --since`, `--wait exit --match foo`) are usage errors.
+
+### Canonical byte export: `oly export`
+
+`oly export` writes the canonical filtered byte stream straight to stdout for
+pipes and files, using bounded pages locally and remotely. It exports a fixed
+prefix captured at invocation, not an endless live feed. JSON incrementally
+serializes base64 without buffering the recording. It warns on stderr when
+stdout is a terminal. Restart/read failures are nonzero; streaming output
+already written cannot be retracted, so discard partial output on error:
+
+```bash
+oly export <id> > capture.bin     # canonical bytes, control sequences included
+oly export <id> --json            # {"bytes": "...", "size": 12345}
+```
+
+Subtle: `oly export` writes the **filtered** stream, so terminal queries that
+the scanner has already answered are not present. Use the journal directly if
+you need the unfiltered raw PTY bytes; for normal screen captures the
+filtered stream is the one a user actually saw.
 
 ### Federation commands
 
@@ -491,8 +563,8 @@ These keys can be set in `config.json` (runtime overrides win over the file). Se
 
 Session recordings live in a per-session journal (raw bytes, resizes,
 lifecycle, checkpoints); there is no size cap key — retention is
-checkpoint-gated. Inspect a session's journal; export
-raw bytes with `oly logs --raw <id>`.
+checkpoint-gated. Inspect a session's journal; export the filtered stream
+with `oly export <id>`.
 
 ---
 

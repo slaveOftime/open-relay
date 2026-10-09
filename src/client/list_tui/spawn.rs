@@ -102,7 +102,10 @@ pub fn session_command(
         id.to_string(),
     ];
     if !attach {
-        args.push("--keep-color".to_string());
+        // The preview pane interprets ANSI, so it asks for styles
+        // explicitly instead of relying on terminal detection.
+        args.push("--color".to_string());
+        args.push("always".to_string());
         args.extend(["--tail".to_string(), INACTIVE_LOG_TAIL_LINES.to_string()]);
     }
     if let Some(node) = node {

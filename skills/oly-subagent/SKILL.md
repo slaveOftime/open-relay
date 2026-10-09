@@ -30,13 +30,21 @@ oly send <ID> key:enter
 ## Observe, decide, act
 
 ```sh
-oly logs <ID> --tail 40 --no-truncate --wait-for-prompt --timeout 5m
-oly logs <ID> --screen                  # current TUI, not a completion signal, append --keep-color when necessary
+oly logs <ID> --tail 40 --wait prompt --timeout 5m
+oly logs <ID> --screen                  # current TUI, not a completion signal; pass --color always to keep ANSI in pipes
 oly ls --json                           # status, node, attach count
-oly logs <ID> --exit --timeout 30s      # exit 2 means timeout, not success
+oly logs <ID> --wait exit --timeout 30s # exit 2 means timeout, not success
 ```
 
 Read fresh output and the current screen before replying. Startup/builds can leave the screen blank temporarily; idle or `input_needed` is a hint, not proof of completion. `oly send` only confirms bytes reached the PTY: check the next screen/output for the worker's actual response. Avoid rapid key sequences on menus; send a step, observe the redraw, then decide the next step. For long-running work, use bounded waits/cursors from `oly skill` instead of polling a full log repeatedly.
+
+Default logs are always tail 40; TUI inspection needs explicit `--screen`.
+Views are lossy observations, not transcripts. For exact future-byte polling,
+start with `cursor=$(oly logs <ID> --cursor)`, then use `--since "$cursor"
+--wait output --json`, decode base64 `.bytes`, and chain `.cursor`; drain while
+`.has_more`. Never combine `--since` with a view flag. Timeout preserves the
+cursor; a restart fails explicitly. See the general oly skill for page limits,
+line-scoped match waits, and sampled-frame semantics.
 
 Answer routine, authorized questions using the task context. **Never auto-approve** destructive actions, credential requests, unexpected network access, broad permission changes, or ambiguous choices; pause and ask the user when authorization is needed. An agent CLI's own approval prompts remain in force even when controlled through oly. If another person has attached, coordinate before sending input (`oly ls --json` exposes `attach_count`). Do not interpret echoed prompts or a message sent to another session as an acknowledgement.
 

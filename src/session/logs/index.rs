@@ -31,7 +31,6 @@ struct LogRecordScannerState {
 pub(super) struct TailBytes {
     pub(super) bytes: Vec<u8>,
     pub(super) start_offset: u64,
-    pub(super) end_offset: u64,
 }
 
 /// Read a page of lines from a session's persisted output.
@@ -383,7 +382,6 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
         return Ok(TailBytes {
             bytes: Vec::new(),
             start_offset: 0,
-            end_offset: 0,
         });
     }
 
@@ -436,7 +434,6 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
     Ok(TailBytes {
         bytes,
         start_offset: position,
-        end_offset: file_size,
     })
 }
 
@@ -447,7 +444,6 @@ pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
         return TailBytes {
             bytes: Vec::new(),
             start_offset: 0,
-            end_offset: 0,
         };
     }
     let ends_with_newline = bytes.last() == Some(&b'\n');
@@ -475,7 +471,6 @@ pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
     TailBytes {
         bytes: bytes[position..].to_vec(),
         start_offset: position as u64,
-        end_offset: bytes.len() as u64,
     }
 }
 

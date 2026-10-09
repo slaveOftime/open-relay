@@ -154,6 +154,18 @@ pub struct SegmentStream {
     done: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static REPLAY_PAYLOAD_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn measure_replay_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    REPLAY_PAYLOAD_BYTES.with(|counter| counter.set(0));
+    let result = f();
+    (result, REPLAY_PAYLOAD_BYTES.with(|counter| counter.get()))
+}
+
 impl SegmentStream {
     /// Stream from the journal start, validating the whole prefix.
     pub fn open(session_dir: &Path, incarnation: u64) -> io::Result<Self> {
@@ -194,6 +206,14 @@ impl SegmentStream {
         })
     }
 
+    /// Refresh a live reader's segment list without losing its validated
+    /// record position. A torn tail is retried on the next refresh.
+    pub fn refresh(&mut self, session_dir: &Path, incarnation: u64) -> io::Result<()> {
+        self.parts = incarnation_parts(&session_dir.join(JOURNAL_DIR_NAME), incarnation)?;
+        self.done = false;
+        Ok(())
+    }
+
     /// Pull the next batch, buffering at most `max_bytes` of payload (the
     /// first record of a batch is always included). An empty batch means
     /// the validated stream end — or a torn live tail — is reached.
@@ -218,6 +238,18 @@ impl SegmentStream {
                 (self.byte_offset == 0).then_some(self.next_seq),
                 start,
             )?;
+            #[cfg(test)]
+            REPLAY_PAYLOAD_BYTES.with(|counter| {
+                counter.set(
+                    counter.get()
+                        + result
+                            .outcome
+                            .records
+                            .iter()
+                            .map(|r| r.payload.len())
+                            .sum::<usize>(),
+                )
+            });
             if let Some(last) = result.outcome.records.last() {
                 self.next_seq = last.seq + 1;
             }
@@ -228,10 +260,16 @@ impl SegmentStream {
                     records = result.outcome.records;
                 }
                 ScanStop::CleanEof | ScanStop::PartialTail => {
-                    // Part exhausted (or torn live tail): advance.
-                    self.part_index += 1;
-                    self.byte_offset = 0;
+                    self.byte_offset = result.outcome.valid_len;
                     records = result.outcome.records;
+                    if self.part_index + 1 < self.parts.len()
+                        && result.outcome.stop == ScanStop::CleanEof
+                    {
+                        self.part_index += 1;
+                        self.byte_offset = 0;
+                    } else {
+                        self.done = true;
+                    }
                 }
                 stop => {
                     self.done = true;

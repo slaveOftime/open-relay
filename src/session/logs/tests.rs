@@ -109,7 +109,7 @@ fn journal_backed_session_logs_render_and_paginate() {
 
     // Render path (oly logs / RPC GetLogs / HTTP tail).
     let (output, _resizes) =
-        super::render::render_log_session(&dir, 10, false, 80, None).expect("render journal logs");
+        super::render::render_log_session_tail(&dir, 10, false).expect("render journal logs");
     let text = String::from_utf8_lossy(&output);
     assert!(text.contains("line 39"), "{text:?}");
 
@@ -489,7 +489,6 @@ fn tail_window_bytes_saturates_on_usize_max_tail() {
     let window = tail_window_bytes(bytes, usize::MAX);
     assert_eq!(window.bytes, bytes);
     assert_eq!(window.start_offset, 0);
-    assert_eq!(window.end_offset, bytes.len() as u64);
     // No trailing newline hits the saturating_add arm too.
     let window = tail_window_bytes(b"one\ntwo", usize::MAX);
     assert_eq!(window.bytes, b"one\ntwo");

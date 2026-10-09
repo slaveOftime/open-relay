@@ -1,7 +1,7 @@
 use interprocess::local_socket::tokio::Stream;
 use std::sync::Arc;
 use tokio::{io::BufReader, sync::mpsc};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::{
     client,
@@ -14,7 +14,7 @@ use crate::{
     protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
-        logs::{read_persisted_log_page, render_log_session},
+        logs::{read_persisted_log_page, render_log_session_tail},
     },
 };
 
@@ -245,8 +245,25 @@ async fn dispatch_request(
         RpcRequest::LogsPagination { id, offset, limit } => {
             handle_logs_pagination(id, offset, limit, session_store, db).await
         }
-        RpcRequest::LogsWait { id, timeout_ms } => {
-            handle_logs_wait(id, timeout_ms, session_store, notification_tx, db).await
+        RpcRequest::LogsRead {
+            id,
+            mode,
+            count,
+            from,
+            keep_color,
+            term_cols,
+        } => {
+            crate::daemon::rpc_logs::handle_logs_read(
+                id,
+                mode,
+                count,
+                from,
+                keep_color,
+                term_cols,
+                session_store,
+                db,
+            )
+            .await
         }
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
@@ -548,12 +565,12 @@ async fn handle_logs_tail(
     // Journal replay + engine render is a multi-hundred-millisecond CPU
     // burst for long recordings; keep it off the async workers (the same
     // rule the live-tail path follows).
-    let (lines, resizes) = match tokio::task::spawn_blocking(move || {
-        render_log_session(&session_dir, tail, keep_color, term_cols, None)
+    let lines = match tokio::task::spawn_blocking(move || {
+        render_log_session_tail(&session_dir, tail, keep_color)
     })
     .await
     {
-        Ok(Ok((output, resizes))) => (output, resizes),
+        Ok(Ok((output, _consumed))) => output,
         Ok(Err(err)) => {
             return RpcResponse::Error {
                 message: err.to_string(),
@@ -574,7 +591,7 @@ async fn handle_logs_tail(
         .map(|meta| meta.status.as_str().to_string());
     RpcResponse::LogsTail {
         output: lines,
-        resizes,
+        resizes: Vec::new(),
         status,
     }
 }
@@ -625,62 +642,6 @@ async fn handle_logs_pagination(
             message: format!("session not found: {id}"),
         },
     }
-}
-
-async fn handle_logs_wait(
-    id: String,
-    timeout_ms: u64,
-    session_store: &SessionStoreHandle,
-    notification_tx: &NotificationTx,
-    db: &Arc<Database>,
-) -> RpcResponse {
-    if let Err(err) = db.get_session_dir(&id).await {
-        return RpcResponse::Error {
-            message: err.to_string(),
-        };
-    }
-
-    if timeout_ms == 0
-        || !session_store.is_running(&id)
-        || session_store.is_input_needed(&id)
-        || session_store.is_silent_for(&id, std::time::Duration::from_secs(10))
-    {
-        return RpcResponse::Empty;
-    }
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let mut notify_rx = notification_tx.subscribe();
-    let mut state_poll = tokio::time::interval(std::time::Duration::from_millis(100));
-    let deadline_sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(deadline_sleep);
-
-    'wait: loop {
-        tokio::select! {
-            biased;
-            _ = &mut deadline_sleep => break 'wait,
-            _ = state_poll.tick() => {
-                if !session_store.is_running(&id) || session_store.is_silent_for(&id, std::time::Duration::from_secs(5)) {
-                    break 'wait;
-                }
-            }
-            notif = notify_rx.recv() => {
-                match notif {
-                    Ok(event) => {
-                        if matches!(event.kind, crate::notification::event::NotificationKind::InputNeeded)
-                            && event.session_ids.iter().any(|s| s == &id)
-                        {
-                            break 'wait;
-                        }
-                        debug!(event = ?event.kind, "other event or session received");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break 'wait,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break 'wait,
-                }
-            }
-        }
-    }
-
-    RpcResponse::Empty
 }
 
 async fn handle_api_key_add(name: String, scopes: String, db: &Arc<Database>) -> RpcResponse {

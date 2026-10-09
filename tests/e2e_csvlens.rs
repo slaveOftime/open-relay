@@ -190,13 +190,38 @@ fn e2e_csvlens_live_logs_mark_message_and_ctrl_e_keeps_session_running() {
     send_text_only(&tmp, &id, "q");
     wait_for_session_status(&tmp, &id, "stopped", Duration::from_secs(5));
 
-    let final_logs = fetch_logs(&tmp, &id);
+    // Leaving alt restores a blank main screen. Blank observations count;
+    // inspect multiple samples to find the preceding TUI state.
+    let fetch_last_frame = || -> String {
+        let output = oly_cmd(&tmp)
+            .args(["logs", &id, "--tail-frames", "10"])
+            .output()
+            .expect("`oly logs --tail-frames 10` failed to execute");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    let final_frame = oly_cmd(&tmp)
+        .args(["logs", &id, "--tail-frames", "1", "--json"])
+        .output()
+        .unwrap();
+    assert!(final_frame.status.success());
+    let final_frame: serde_json::Value = serde_json::from_slice(&final_frame.stdout).unwrap();
+    assert_eq!(final_frame["frames"].as_array().unwrap().len(), 1);
+    assert_eq!(final_frame["frames"][0]["content"], "");
+    let last_frame = fetch_last_frame();
     assert!(
-        final_logs.contains("Marked line 3"),
-        "expected logs to preserve the last non-empty csvlens frame after alternate-screen teardown.\nLogs:\n{final_logs}"
+        last_frame.contains("Marked line 3"),
+        "expected frame history to preserve a preceding csvlens observation \
+         after alternate-screen teardown.\nFrame:\n{last_frame}"
     );
+    // A live cell from the table proves the frame still carries csvlens content.
     assert!(
-        final_logs.contains("score"),
-        "expected logs to preserve the csvlens table after alternate-screen teardown.\nLogs:\n{final_logs}"
+        last_frame.contains("alice") || last_frame.contains("bob"),
+        "expected frame history to keep the preceding csvlens table after \
+         alternate-screen teardown.\nFrame:\n{last_frame}"
     );
 }

@@ -18,6 +18,33 @@ pub const PROTOCOL_VERSION: u16 = 13;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
+/// A position in a session's canonical output stream, as handed to
+/// `--since`. The incarnation is part of the position: a restarted session
+/// reuses offset numbering for a different stream, so reads carrying a
+/// stale incarnation are rejected instead of silently misaligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPosition {
+    pub incarnation: u64,
+    pub offset: u64,
+}
+
+/// One captured screen snapshot from the screen-snapshot history
+/// (`oly logs --tail-frames`): the visible screen the TUI held at the
+/// capture point, rendered at the recorded viewport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFrame {
+    /// The stream position the snapshot was captured at: every byte at
+    /// or before `position.offset` is guaranteed to have contributed to
+    /// this frame, so hand the token back to `--since` to read the next
+    /// batch of history without skipping paint states.
+    pub position: StreamPosition,
+    pub rows: u16,
+    pub cols: u16,
+    /// Rendered rows (SGR-styled with `keep_color`), newline-joined.
+    #[serde(with = "base64_bytes")]
+    pub content: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LogResize {
     pub offset: u64,
@@ -329,11 +356,19 @@ pub enum RpcRequest {
         offset: Option<usize>,
         limit: usize,
     },
-    /// Block until the session emits an `InputNeeded` notification (or exits /
-    /// times out), then return a snapshot.  Response is `LogsTail`.
-    LogsWait {
+    /// One-shot rendered view with an observation cursor, not byte delivery.
+    LogsRead {
         id: String,
-        timeout_ms: u64,
+        /// `tail` | `screen` | `frames`.
+        mode: String,
+        /// Rows for `tail`, snapshots for `frames`; ignored by the other
+        /// modes. 0 prints nothing (wait-only reads).
+        count: usize,
+        /// Must be None for views. Byte continuation uses ObserveWindow.
+        #[serde(default)]
+        from: Option<StreamPosition>,
+        keep_color: bool,
+        term_cols: u16,
     },
     // ── Node federation ──────────────────────────────────────────────────────
     /// Proxy an inner request to a named secondary node.
@@ -415,7 +450,7 @@ impl RpcRequest {
             RpcRequest::Remove { .. } => "remove",
             RpcRequest::LogsTail { .. } => "logs_tail",
             RpcRequest::LogsPagination { .. } => "logs_pagination",
-            RpcRequest::LogsWait { .. } => "logs_wait",
+            RpcRequest::LogsRead { .. } => "logs_read",
             RpcRequest::NodeProxy { .. } => "node_proxy",
             RpcRequest::ApiKeyAdd { .. } => "api_key_add",
             RpcRequest::ApiKeyList => "api_key_list",
@@ -443,6 +478,10 @@ pub enum RpcResponse {
         /// Canonical filtered-stream length (bytes available to read).
         offset: u64,
         incarnation: Option<u64>,
+        /// The session is running and its last output looked like a prompt
+        /// awaiting input (`--wait prompt`).
+        #[serde(default)]
+        input_needed: bool,
     },
     /// One bounded filtered-stream window.
     ObserveWindow {
@@ -580,6 +619,27 @@ pub enum RpcResponse {
         total: usize,
         #[serde(default)]
         resizes: Vec<LogResize>,
+    },
+    /// Answer to [`RpcRequest::LogsRead`]: the rendered surface plus the
+    /// cursor it was taken at, so a caller can chain `--since` reads.
+    LogsRead {
+        /// The explicit mode served.
+        mode: String,
+        /// Rendered text for `tail` / `screen` modes (empty for `frames`).
+        #[serde(default, with = "base64_bytes")]
+        output: Vec<u8>,
+        /// Screen snapshots for `frames` mode, oldest first.
+        #[serde(default)]
+        frames: Vec<LogFrame>,
+        /// Terminal width the read was rendered at.
+        width: u16,
+        /// Stream position at read time: the cursor a follow-up `--since`
+        /// starts from (`None` while nothing has been journaled yet).
+        cursor: Option<StreamPosition>,
+        running: bool,
+        exit_code: Option<i32>,
+        #[serde(default)]
+        status: Option<String>,
     },
     UploadFile {
         path: String,
