@@ -58,7 +58,13 @@ import {
   type SessionTermination,
 } from './session-termination'
 import { NodeSelector } from '@/components/NodeSelector'
-import { agentName, formatByteSize, formatTimestamp, normalizeCwdPath, sessionDisplayName } from '@/utils/format'
+import {
+  agentName,
+  formatByteSize,
+  formatTimestamp,
+  normalizeCwdPath,
+  sessionDisplayName,
+} from '@/utils/format'
 import {
   loadPinnedSessionKeys,
   orderSessionPage,
@@ -2446,9 +2452,7 @@ export default function SessionsPage() {
               ))}
             </SelectContent>
           </Select>
-          <span className="whitespace-nowrap text-sm tabular-nums">
-            / {total}
-          </span>
+          <span className="whitespace-nowrap text-sm tabular-nums">/ {total}</span>
           {totalPages > 1 && (
             <div className="flex items-center gap-0.5">
               <Button

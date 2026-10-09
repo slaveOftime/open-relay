@@ -1,73 +1,60 @@
-# React + TypeScript + Vite
+# Open Relay web client
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript single-page app for the Open Relay daemon: session list,
+terminal attach, and the mobile-friendly toolbars around them.
 
-Currently, two official plugins are available:
+## Running it
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run dev          # dev server on http://127.0.0.1:8060 (proxies /api to :15443)
+npm run build        # type-check + production build
+npm run preview      # serve the production build
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+The daemon must be running for anything useful to happen; `npm run dev` only
+proxies to it.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Checks
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+| Command                | What it runs                                                                    |
+| ---------------------- | ------------------------------------------------------------------------------- |
+| `npm run typecheck`    | `tsc -b` (strict: `noUnusedLocals`, `noUnusedParameters`, `erasableSyntaxOnly`) |
+| `npm run lint`         | ESLint 9 flat config over `src` + `e2e`                                         |
+| `npm test`             | Vitest unit tests, colocated (`*.test.ts`)                                      |
+| `npm run format:check` | Prettier over the whole repo                                                    |
+| `npm run test:e2e`     | Playwright specs in `e2e/` (Chromium)                                           |
+
+CI (`.github/workflows/ci-web.yml`) runs all of them. Run `npm run format:check`
+after editing — Prettier and ESLint must both agree.
+
+## Layout
+
 ```
+src/
+├── api/          transport: REST client, attach WebSocket, SSE, shared types
+├── components/
+│   ├── ui/       Radix-backed primitives (Button, Dialog, Badge, ...)
+│   ├── terminal/ attach terminal, quick keys, hold-to-repeat, scroll wheel
+│   └── *.tsx     app-level components (dialogs, badges, logo, attach panel)
+├── lib/          domain modules and stateful services
+├── pages/        route-level composition (SessionsPage, SessionDetailPage)
+└── utils/        pure helpers (formatting, key parsing, ANSI, ordering)
+```
+
+Rules of thumb, and the longer version in `FRONTEND.md`:
+
+- Pages compose; `components/` own behavior; `components/ui/` owns primitives.
+  Never put a page-local design system in `pages/`.
+- New primitives only when a pattern repeats, and only in `components/ui/`.
+- Components are `PascalCase.tsx`; every other module is `kebab-case.ts`.
+- Pure logic lives next to its component (`attach-panel-input.ts`,
+  `sparklineGeometry.ts`, `quick-keys.ts`) so it can be unit-tested without a DOM.
+
+## Related docs
+
+| File                | Contents                                                      |
+| ------------------- | ------------------------------------------------------------- |
+| `FRONTEND.md`       | layering, conventions, and how to use the design system       |
+| `DESIGN.md`         | the visual system: tokens, density, color rules               |
+| `REFACTOR-PLAN.md`  | structure/size plan and how the frontend is being reorganized |
+| `ISSUES-BACKLOG.md` | findings recorded for later, not fixed yet                    |

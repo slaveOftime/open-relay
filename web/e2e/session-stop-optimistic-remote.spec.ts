@@ -58,9 +58,7 @@ async function stubApi(page: Page) {
       event,
       data
     ) =>
-      OpenEventSource.latest?.dispatchEvent(
-        new MessageEvent(event, { data: JSON.stringify(data) })
-      )
+      OpenEventSource.latest?.dispatchEvent(new MessageEvent(event, { data: JSON.stringify(data) }))
   })
   await page.route('**/api/auth/status', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: '{"auth_required":false}' })

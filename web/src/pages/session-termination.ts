@@ -18,9 +18,7 @@ export const PENDING_TERMINATION_STATUS: SessionStatus = 'stopping'
 
 /** True once the session is already stopping or finished. */
 export function isTerminationSettled(status: SessionStatus): boolean {
-  return (
-    status === 'stopping' || status === 'stopped' || status === 'killed' || status === 'failed'
-  )
+  return status === 'stopping' || status === 'stopped' || status === 'killed' || status === 'failed'
 }
 
 /**

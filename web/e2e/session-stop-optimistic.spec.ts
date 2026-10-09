@@ -122,7 +122,9 @@ function deferredTerminate(
     await route.fulfill({
       status: outcome?.status ?? 200,
       contentType: 'application/json',
-      body: JSON.stringify(outcome?.body ?? (action === 'stop' ? { stopped: true } : { killed: true })),
+      body: JSON.stringify(
+        outcome?.body ?? (action === 'stop' ? { stopped: true } : { killed: true })
+      ),
     })
   })
   return state

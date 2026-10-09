@@ -17,10 +17,7 @@ export function nodeAfterSwipe(
   deltaX: number,
   deltaY: number
 ): string | null | undefined {
-  if (
-    Math.abs(deltaX) < 72 ||
-    Math.abs(deltaX) <= Math.abs(deltaY) * SWIPE_CROSS_AXIS_RATIO
-  ) {
+  if (Math.abs(deltaX) < 72 || Math.abs(deltaX) <= Math.abs(deltaY) * SWIPE_CROSS_AXIS_RATIO) {
     return undefined
   }
   const choices: (string | null)[] = [null, ...new Set(nodes.map((node) => node.name))]

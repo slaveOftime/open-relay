@@ -99,7 +99,12 @@ async function focusState(page: Page) {
     const id = active.getAttribute('id')
     const cls = active.className?.toString?.() ?? ''
     return `${active.tagName.toLowerCase()}${label ? `[${label}]` : ''}${id ? `#${id}` : ''}${
-      cls.includes('xterm') ? ` xterm(${cls.split(/\s+/).filter((c) => c.includes('xterm')).join('.')})` : ''
+      cls.includes('xterm')
+        ? ` xterm(${cls
+            .split(/\s+/)
+            .filter((c) => c.includes('xterm'))
+            .join('.')})`
+        : ''
     }`
   })
 }

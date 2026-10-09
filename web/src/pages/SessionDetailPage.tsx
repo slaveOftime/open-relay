@@ -11,7 +11,12 @@ import {
   AttachSocket,
 } from '@/api/client'
 import { terminalModeSequences } from '@/api/ws-frames'
-import { formatByteSize, formatTimestamp, normalizeCwdPath, sessionDisplayName } from '@/utils/format'
+import {
+  formatByteSize,
+  formatTimestamp,
+  normalizeCwdPath,
+  sessionDisplayName,
+} from '@/utils/format'
 import { HistoryAnchorError, HistoryController } from '@/lib/history-controller'
 import {
   encodeLogChunks,
@@ -1644,7 +1649,9 @@ function SessionDetailPageContent() {
                 )}
                 <span className="break-all">{sessionDisplayName(session)}</span>
                 {session.cwd && (
-                  <span className="text-[hsl(var(--foreground))] break-all">{normalizeCwdPath(session.cwd)}</span>
+                  <span className="text-[hsl(var(--foreground))] break-all">
+                    {normalizeCwdPath(session.cwd)}
+                  </span>
                 )}
                 <span className="text-[hsl(var(--foreground))]">
                   {formatTimestamp(session.created_at)}
@@ -1706,7 +1713,7 @@ function SessionDetailPageContent() {
               />
               <div
                 ref={termContainerRef}
-                className={`flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full ${mode === 'attach' ? "overflow-clip" : "overflow-x-auto"}`}
+                className={`flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full ${mode === 'attach' ? 'overflow-clip' : 'overflow-x-auto'}`}
               >
                 <XTerm
                   key={mode === 'logs' ? `logs-${logsView}` : mode}

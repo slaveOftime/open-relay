@@ -117,7 +117,9 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // .tsx test files exist (StatusBadge.test.tsx) and were silently skipped by
+    // the old `*.test.ts` glob, so match both extensions now.
+    include: ['src/**/*.test.{ts,tsx}'],
   },
   build: {
     target: 'es2020',
