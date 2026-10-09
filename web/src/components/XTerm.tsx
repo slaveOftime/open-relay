@@ -1,5 +1,5 @@
 import { useRef, useEffect, useImperativeHandle, forwardRef, useState } from 'react'
-import { Terminal, type ITheme } from '@xterm/xterm'
+import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { ChevronsUpDown } from 'lucide-react'
 import { hasTransferredFiles } from './ui/file-transfer'
@@ -7,53 +7,18 @@ import { cn } from '@/utils/cn'
 import QuickKeysMenu from './terminal/QuickKeysMenu'
 import QuickKeysDialog from './terminal/QuickKeysDialog'
 import { markOwnedTerminalWheel } from './terminal/scroll-wheel'
+import { getTerminalTheme } from './terminal/xterm-theme'
+import {
+  TERMINAL_FONT_FAMILY,
+  TERMINAL_FONT_SIZE,
+  TERMINAL_FONT_VARIANTS,
+  TERMINAL_PRELOAD_TEXT,
+} from './terminal/xterm-fonts'
 import { findScrollContainer } from '@/utils/scroll-container'
 import type { QuickKey } from '@/lib/quickKeys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
 import './XTerm.css'
-
-const TERMINAL_FONT_SIZE = 13
-const TERMINAL_FONT_FACE = '"Open Relay Terminal"'
-// JetBrains Mono covers Latin, box drawing and some symbols, but not the
-// ranges tools actually print: Misc Technical (U+23F5 ⏵, U+23F8 ⏸), Braille
-// spinners (U+2819 ⠙), dingbats (U+2713 ✓, U+273B ✻) and geometric shapes
-// (U+25CB ○, U+25D0 ◐). Those are resolved by the platform's symbol fonts:
-// Windows font-links Segoe UI Symbol and renders them, while a phone's
-// monospace chain has no equivalent and drew tofu.
-//
-// `Open Relay Terminal Symbols` (see XTerm.css) is a subset of Noto Sans
-// Symbols 2 with every glyph scaled to this cell, so the missing characters are
-// monospaced and identical everywhere; it only claims the blocks it was built
-// for. The system symbol, emoji and CJK families below stay as a last resort
-// for anything still uncovered - notably U+23BF ⎿, which no bundled font has.
-const TERMINAL_SYMBOL_FACE = 'Open Relay Terminal Symbols'
-const TERMINAL_FONT_FAMILY =
-  `${TERMINAL_FONT_FACE}, "${TERMINAL_SYMBOL_FACE}", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, ` +
-  '"Liberation Mono", "Courier New", monospace, ' +
-  '"Segoe UI Symbol", "Noto Sans Symbols2", "Noto Sans Symbols", "Apple Symbols", ' +
-  '"Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji", ' +
-  '"Noto Sans CJK SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans", sans-serif'
-
-/**
- * Representative text for the preload below.
- *
- * `document.fonts.load(font, text)` only loads faces whose unicode-range
- * intersects `text`, so it must carry both halves: Latin (covered by the
- * bundled face, and its default sample text) *and* the symbols it does not
- * cover, which makes the browser resolve the fallback chain before the first
- * paint instead of swapping glyphs in after it.
- */
-const TERMINAL_PRELOAD_TEXT = 'BESbswy ⏵⏸⠙✓✻○◐▣⎿'
-const TERMINAL_FONT_VARIANTS = [
-  `400 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
-  `700 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
-  `italic 400 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
-  `italic 700 ${TERMINAL_FONT_SIZE}px ${TERMINAL_FONT_FACE}`,
-  // The symbol fallback is small and only shows up on scattered cells;
-  // preloading it avoids a flash of tofu the first time one scrolls past.
-  `${TERMINAL_FONT_SIZE}px "${TERMINAL_SYMBOL_FACE}"`,
-]
 
 // Joystick-style scroll handle tuning: drag offset beyond the deadzone
 // scrolls continuously, with speed proportional to the offset distance.
@@ -72,58 +37,6 @@ function loadEmbeddedTerminalFont(): Promise<void> {
   return Promise.all(
     TERMINAL_FONT_VARIANTS.map((font) => document.fonts.load(font, TERMINAL_PRELOAD_TEXT))
   ).then(() => undefined)
-}
-
-function getTerminalTheme(): ITheme {
-  const dark = window.matchMedia('(prefers-color-scheme: dark)').matches
-  if (dark) {
-    return {
-      background: '#030712',
-      foreground: '#e5e7eb',
-      cursor: '#a5b4fc',
-      cursorAccent: '#030712',
-      selectionBackground: '#4f46e580',
-      black: '#111827',
-      red: '#f87171',
-      green: '#4ade80',
-      yellow: '#fbbf24',
-      blue: '#60a5fa',
-      magenta: '#c084fc',
-      cyan: '#22d3ee',
-      white: '#f9fafb',
-      brightBlack: '#374151',
-      brightRed: '#fca5a5',
-      brightGreen: '#86efac',
-      brightYellow: '#fde68a',
-      brightBlue: '#93c5fd',
-      brightMagenta: '#d8b4fe',
-      brightCyan: '#67e8f9',
-      brightWhite: '#ffffff',
-    }
-  }
-  return {
-    background: '#f1f5f9',
-    foreground: '#0f172a',
-    cursor: '#4338ca',
-    cursorAccent: '#f1f5f9',
-    selectionBackground: '#6366f140',
-    black: '#1e293b',
-    red: '#dc2626',
-    green: '#16a34a',
-    yellow: '#d97706',
-    blue: '#2563eb',
-    magenta: '#9333ea',
-    cyan: '#0891b2',
-    white: '#334155',
-    brightBlack: '#475569',
-    brightRed: '#ef4444',
-    brightGreen: '#22c55e',
-    brightYellow: '#f59e0b',
-    brightBlue: '#3b82f6',
-    brightMagenta: '#a855f7',
-    brightCyan: '#06b6d4',
-    brightWhite: '#0f172a',
-  }
 }
 
 // Dispatch a synthetic wheel event that behaves like a real wheel over the
