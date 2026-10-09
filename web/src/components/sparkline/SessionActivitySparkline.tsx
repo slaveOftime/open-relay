@@ -1,6 +1,6 @@
 import { memo, useCallback } from 'react'
 
-import SparklineSvg from '@/components/SparklineSvg'
+import SparklineSvg from '@/components/sparkline/SparklineSvg'
 import {
   getSessionActivitySnapshot,
   sessionActivityKey,

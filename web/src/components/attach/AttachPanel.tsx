@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Button } from '@/components/ui/button'
-import { FileDropZone } from './ui/file-drop-zone'
-import { getTransferredFiles } from './ui/file-transfer'
+import { FileDropZone } from '../ui/file-drop-zone'
+import { getTransferredFiles } from '../ui/file-transfer'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -24,7 +24,7 @@ import {
   isPreviewableImageFile,
   type SessionImagePreviews,
 } from './attach-panel-image-preview'
-import ImagePreviewDialog from './ImagePreviewDialog'
+import ImagePreviewDialog from '../dialogs/ImagePreviewDialog'
 import {
   ChevronDownIcon,
   ChevronLeftIcon,

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { login, setToken } from '../api/client'
-import { TooManyAttemptsError } from '../api/types'
-import { Button } from './ui/button'
-import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog'
-import { Input } from './ui/input'
+import { login, setToken } from '../../api/client'
+import { TooManyAttemptsError } from '../../api/types'
+import { Button } from '../ui/button'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '../ui/dialog'
+import { Input } from '../ui/input'
 
 interface LoginDialogProps {
   /** When true the dialog is shown; cannot be closed by the user. */

@@ -19,10 +19,10 @@ import {
   setSessionNotifications,
   fetchNodes,
 } from '@/api/client'
-import NewSessionDialog from '@/components/NewSessionDialog'
-import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
-import SessionMetadataDialog from '@/components/SessionMetadataDialog'
-import SessionDeleteConfirmDialog from '@/components/SessionDeleteConfirmDialog'
+import NewSessionDialog from '@/components/dialogs/NewSessionDialog'
+import { buildNewSessionInitialValues } from '@/components/dialogs/new-session-dialog-values'
+import SessionMetadataDialog from '@/components/dialogs/SessionMetadataDialog'
+import SessionDeleteConfirmDialog from '@/components/dialogs/SessionDeleteConfirmDialog'
 import {
   clampSessionTableColumnSize,
   coerceSessionTableColumnSettings,

@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
-import LoginDialog from './components/LoginDialog'
+import LoginDialog from '@/components/dialogs/LoginDialog'
 import { proxyLoginDestination } from './lib/proxyLogin'
 import { getAuthStatus, getToken } from './api/client'
 import { startSessionEvents, stopSessionEvents } from '@/lib/sessionEvents'
