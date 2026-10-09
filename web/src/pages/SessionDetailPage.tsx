@@ -76,48 +76,11 @@ import {
   withPendingTermination,
   type SessionTermination,
 } from './session-termination'
-
-function isSessionRunning(session: SessionSummary | null): boolean {
-  return session
-    ? session.status === 'running' || session.status === 'stopping' || session.status === 'created'
-    : false
-}
-
-function normalizeSnapshotOutputForXterm(output: Uint8Array): Uint8Array {
-  let extra = 0
-  for (let i = 0; i < output.length; i += 1) {
-    if (output[i] === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
-      extra += 1
-    }
-  }
-  if (extra === 0) return output
-
-  const normalized = new Uint8Array(output.length + extra)
-  let writeIndex = 0
-  for (let i = 0; i < output.length; i += 1) {
-    const byte = output[i]
-    if (byte === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
-      normalized[writeIndex] = 0x0d
-      writeIndex += 1
-    }
-    normalized[writeIndex] = byte
-    writeIndex += 1
-  }
-  return normalized
-}
-
-function didSessionVisibleOutputAdvance(
-  previous: SessionSummary | null,
-  next: SessionSummary
-): boolean {
-  if (!previous) {
-    return Boolean(next.last_output_epoch) || next.last_total_bytes > 0
-  }
-  if (next.last_output_epoch && next.last_output_epoch !== previous.last_output_epoch) {
-    return true
-  }
-  return next.last_total_bytes > previous.last_total_bytes
-}
+import {
+  didSessionVisibleOutputAdvance,
+  isSessionRunning,
+  normalizeSnapshotOutputForXterm,
+} from './session-detail-output'
 
 const DEFAULT_LOG_TAIL = 200
 const ATTACH_IDLE_BORDER_DELAY_MS = 10_000
