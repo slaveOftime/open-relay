@@ -31,14 +31,18 @@ after editing — Prettier and ESLint must both agree.
 
 ```
 src/
-├── api/          transport: REST client, attach WebSocket, SSE, shared types
+├── api/          transport: REST, attach WebSocket, SSE, shared types
 ├── components/
-│   ├── ui/       Radix-backed primitives (Button, Dialog, Badge, ...)
-│   ├── terminal/ attach terminal, quick keys, hold-to-repeat, scroll wheel
-│   └── *.tsx     app-level components (dialogs, badges, logo, attach panel)
-├── lib/          domain modules and stateful services
-├── pages/        route-level composition (SessionsPage, SessionDetailPage)
-└── utils/        pure helpers (formatting, key parsing, ANSI, ordering)
+│   ├── ui/         Radix-backed primitives (Button, Dialog, Badge, ...)
+│   ├── attach/     the attach drawer and its storage / history / image cache
+│   ├── dialogs/    every dialog in the app, plus their shared helpers
+│   ├── sessions/   session row, card, tags, pin, notification toggle, skeletons
+│   ├── sparkline/  the activity sparkline and its geometry / metrics / model
+│   └── terminal/   xterm wrapper, quick keys, hold-to-repeat, scroll wheel
+├── hooks/         shared React hooks (repeat-while-pressed, session events)
+├── lib/           domain modules and stateful services
+├── pages/         route composition (SessionsPage, SessionDetailPage)
+└── utils/         pure helpers (formatting, key parsing, ANSI, ordering, colors)
 ```
 
 Rules of thumb, and the longer version in `FRONTEND.md`:
@@ -48,7 +52,8 @@ Rules of thumb, and the longer version in `FRONTEND.md`:
 - New primitives only when a pattern repeats, and only in `components/ui/`.
 - Components are `PascalCase.tsx`; every other module is `kebab-case.ts`.
 - Pure logic lives next to its component (`attach-panel-input.ts`,
-  `sparklineGeometry.ts`, `quick-keys.ts`) so it can be unit-tested without a DOM.
+  `sparklineGeometry.ts`, `quickKeys.ts`) so it can be unit-tested without a DOM.
+- `utils/` and `lib/` never import from `components/` or `pages/`.
 
 ## Related docs
 

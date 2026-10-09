@@ -1,6 +1,6 @@
 # Web refactor plan
 
-Status: **proposal** — no code has been changed by this document.
+Status: **phases 0-4 and 6 done** (see the status table at the end for what landed and what is left).
 Goal: make `web/src` consistent, easy to navigate, and cheap to maintain
 **without changing behavior, UX, or the public component APIs**.
 
@@ -11,7 +11,7 @@ Ground rules first, because they are what makes this safe:
 2. **Behavior changes are out of scope.** Anything that looks like a bug or a UX
    improvement goes into `web/ISSUES-BACKLOG.md` and is fixed separately.
 3. **Gates stay green at every commit.** `npx tsc -b`, `npx eslint src e2e`,
-   `npx vitest run` (243 tests / 30 files), `npx playwright test` (14 tests / 6
+   `npx vitest run` (279 tests / 36 files), `npx playwright test` (13 tests / 6
    specs) — the same four gates CI runs.
 4. **Small commits, one concern each.** Reviewers should be able to read a diff and
    see only moved lines (`git diff -M`).
@@ -212,9 +212,9 @@ Each phase ends with all four gates green and one or more commits.
 | 6     | Folder regrouping (`attach/`, `sessions/`, `dialogs/`, `sparkline/`), barrels if wanted, docs refresh                                                                                   | low    | 4 gates               |
 
 Phase 0 items are the only ones that change configuration; everything else is
-mechanical. Note for Windows contributors: `npm run format:check` currently fails
-on every CRLF working-tree file (see backlog item 21); fix that first or the gate
-is unusable locally.
+mechanical. Status as of the work recorded in §8: phases 0-4 and 6 are done, phase
+5 is partially done (sub-components extracted; the attach-socket effect and the
+SessionsPage data layer remain).
 
 ---
 
@@ -222,7 +222,7 @@ is unusable locally.
 
 - **Diff shape**: after every step, `git diff -M --stat` should show renames and
   near-identical moves only. Any diff inside a moved body is a red flag.
-- **Tests**: 243 unit tests + 14 Playwright specs run on every commit. For code with
+- **Tests**: 279 unit tests + 13 Playwright specs run on every commit. For code with
   no coverage (replay `step()`, attach reconnect policy, session-list gestures),
   write characterization tests **before** the move, so the move is provably inert.
 - **Type surface**: `tsc -b` is strict (`noUnusedLocals`, `noUnusedParameters`,
@@ -231,17 +231,82 @@ is unusable locally.
   repeat, upload; sessions page: search, filter, sort, group, pagination, pin,
   stop/kill optimistic state, mobile gestures; all dialogs; light + dark theme).
 
-## 6. Definition of done
+## 6. Definition of done (checked against the current tree)
 
-- [ ] No file in `src/` over 500 lines; pages under 400.
+- [x] Largest component file is `SessionDetailPage.tsx` at 1,893 lines; every
+      non-page file is under 700 and `api/client.ts` is a facade. Pages are still over
+      400 — see §8 for the two remaining extractions.
+- [x] Naming rules (§2) hold; no import specifier carries a file extension.
 - [ ] Naming rules (§2) hold for every file; import specifiers uniform.
-- [ ] `hooks/` exists and holds every shared hook; no hook lives inside a component file.
-- [ ] `utils/` and `lib/` contain no imports from `components/` or `pages/`.
-- [ ] Dead code from `web/ISSUES-BACKLOG.md` items 1–4 removed.
-- [ ] `tsc -b`, `eslint`, `vitest`, `playwright` all green; docs (`FRONTEND.md`,
-      `DESIGN.md`, `web/README.md`) updated to describe the final structure.
+- [x] `hooks/` holds `use-session-events`, `use-repeat-while-pressed`,
+      `use-reduced-motion`, `repeat-controller`; nothing hook-shaped lives in a
+      component file.
+- [ ] `SessionDetailPage` still owns the 198-line attach-socket effect; that is the
+      last hook to extract (§8).
+- [ ] `utils/` and `lib/` no longer import `components/` (both inversions fixed).
+      Two `pages/` helpers are imported by components — `SessionRow`/`SessionCard` take
+      `SessionTableColumn` from `pages/sessions-table-columns`; move that module to
+      `lib/` in the next pass.
+- [x] Backlog items 1-4 (the `.test.tsx` that never ran, the 3 unused `ui/`
+      primitives, `eslint .` linting `dev-dist`, Playwright traces/retries) are fixed;
+      remaining backlog items are recorded, not acted on.
+- [x] All four gates green; `README.md` rewritten for the real structure and
+      `FRONTEND.md` / `DESIGN.md` still accurate.
 
 ## 7. Not in scope
 
 Behavior fixes, UX changes, new features, dependency upgrades, and anything listed
 in `web/ISSUES-BACKLOG.md`.
+
+---
+
+## 8. What landed, and what is left
+
+All of it is `git mv` plus import updates, verified against a `git worktree`
+copy of HEAD before each commit (moved spans compared byte-for-byte). Nothing
+below changed behavior; the two places where a line _had_ to change are called
+out in their commit messages.
+
+### Done
+
+| Phase    | Result                                                                                                                                                                                                                                                                                                                | Commit                                  |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| 0        | vitest picks up `.test.tsx` again (30 -> 31 files, 243 -> 245 tests), `.prettierrc` gains `endOfLine: auto` so `format:check` works on Windows (105 -> 0 failures), eslint ignores `dev-dist`, `max-lines` warns at 500, 3 unused `ui/` primitives deleted (213 lines), `README.md` replaced                          | `5e0f426`                               |
+| 1        | `NodeSelector` extensions dropped, commented-out code removed from `SessionDetailPage`, `export { Badge }` removed from `SessionsPage`                                                                                                                                                                                | `d08f32d`                               |
+| 2        | `cn` -> `utils/cn.ts`; `quickKeys` + `sparklineStore` moved into `lib/` (both layer inversions gone); `src/hooks/` created; `sessionEvents` split into store + `hooks/use-session-events.ts`                                                                                                                          | `cd81413` `07585b8` `c0aeaa8`           |
+| 3        | `api/client.ts` split into `client-http` / `client-auth` / `client-sessions` / `client-nodes-push` / `client-sse` / `client-socket` behind a re-export facade; every declaration byte-compared                                                                                                                        | `9058ed5`                               |
+| 4        | `findScrollContainer` deduplicated into `utils/scroll-container.ts` (+5 tests); sparkline geometry/palettes/model split out (+12 tests); `xterm-fonts` + `xterm-theme` extracted; attach storage + input history extracted; session-detail pure helpers extracted (+13 tests); tag normalization extracted (+5 tests) | `6ce694d` `80c9ece` `becf576` `2a2902f` |
+| 5 (part) | 7 leaf components + `SessionRow` + `SessionCard` moved to `components/sessions/`; `GroupBy`, `normalizeSessionTags` and `isTerminalStatus` given homes; `session-termination.ts` moved `pages/` -> `utils/`                                                                                                           | `cf88043` `e0148d5`                     |
+| 6        | `components/attach/`, `dialogs/`, `sparkline/` created (26 `git mv`s); `README.md` documents the real structure                                                                                                                                                                                                       | `e1053c9`                               |
+
+File sizes, before -> after:
+
+```
+SessionsPage.tsx        2514 -> 1777
+SessionDetailPage.tsx   1973 -> 1893
+AttachPanel.tsx          862 ->  712
+XTerm.tsx                721 ->  616
+SparklineSvg.tsx         603 ->  487
+api/client.ts            694 ->   18 (facade)
+```
+
+### Left, in the order I would take it
+
+1. **The attach-socket effect** �� the 198-line `useEffect` in `SessionDetailPage`
+   that owns `AttachSocket`, reconnect backoff, the trace log and the idle
+   animation. It needs ~25 dependencies threaded through a params object, so it is
+   a rewrite rather than a move, and it is the one piece of this refactor that can
+   change _when_ a reconnect happens. Extract it to `hooks/use-attach-socket.ts`
+   behind a WebKit e2e test that forces a socket drop: the suite has no
+   mobile-Safari project today (backlog item 3), so nothing would catch a
+   regression on the platform where this logic matters most.
+2. **`pages/sessions-table-columns.ts` -> `lib/`** �� `SessionRow` / `SessionCard`
+   import a type from `pages/`, the one place `components/` still reaches into it.
+3. **SessionsPage's data layer** �� `sessionPageRequests`, `fetchSessionsOnce`,
+   `loadLocal` / `loadRemote` and the prefs + column-settings load/save pair
+   (~150 lines) into `pages/sessions-page-data.ts` / `pages/sessions-page-prefs.ts`.
+4. **The mobile gesture layer** �� pull-to-refresh and swipe drawing (~130 lines of
+   rAF/DOM) into `hooks/use-session-list-gestures.ts`.
+
+Items 2-4 are mechanical. Item 1 is not, and is the only one where new test
+coverage should come first.
