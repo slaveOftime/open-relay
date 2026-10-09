@@ -2,19 +2,19 @@ import { useRef, useEffect, useImperativeHandle, forwardRef, useState } from 're
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { ChevronsUpDown } from 'lucide-react'
-import { hasTransferredFiles } from './ui/file-transfer'
+import { hasTransferredFiles } from '@/components/ui/file-transfer'
 import { cn } from '@/utils/cn'
-import QuickKeysMenu from './terminal/QuickKeysMenu'
-import QuickKeysDialog from './terminal/QuickKeysDialog'
-import { markOwnedTerminalWheel } from './terminal/scroll-wheel'
-import { getTerminalTheme } from './terminal/xterm-theme'
+import QuickKeysMenu from './QuickKeysMenu'
+import QuickKeysDialog from './QuickKeysDialog'
+import { markOwnedTerminalWheel } from './scroll-wheel'
+import { getTerminalTheme } from './xterm-theme'
 import { useTerminalKeyboardSync } from '@/hooks/use-terminal-keyboard-sync'
 import {
   TERMINAL_FONT_FAMILY,
   TERMINAL_FONT_SIZE,
   TERMINAL_FONT_VARIANTS,
   TERMINAL_PRELOAD_TEXT,
-} from './terminal/xterm-fonts'
+} from './xterm-fonts'
 import type { QuickKey } from '@/lib/quick-keys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'

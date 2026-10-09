@@ -37,12 +37,12 @@ src/
 │   ├── attach/     the attach drawer and its storage / history / image cache
 │   ├── dialogs/    every dialog in the app, plus their shared helpers
 │   ├── sessions/   session row, card, tags, pin, notification toggle, skeletons
-│   ├── sparkline/  the activity sparkline and its geometry / metrics / model
-│   └── terminal/   xterm wrapper, quick keys, hold-to-repeat, scroll wheel
-├── hooks/         shared React hooks (repeat-while-pressed, session events)
+│   ├── sparkline/  the sparkline renderer and its pure geometry / model
+│   └── terminal/   xterm wrapper, quick keys, fonts, theme, scroll wheel
+├── hooks/         shared React hooks (repeat-while-pressed, reconnect, gestures…)
 ├── lib/           domain modules and stateful services
 ├── pages/         route composition (SessionsPage, SessionDetailPage)
-└── utils/         pure helpers (formatting, key parsing, ANSI, ordering, colors)
+└── utils/         pure helpers (formatting, key parsing, ordering)
 ```
 
 Rules of thumb, and the longer version in `FRONTEND.md`:

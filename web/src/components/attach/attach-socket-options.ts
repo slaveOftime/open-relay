@@ -18,7 +18,7 @@ import type { SessionSummary } from '@/api/types'
 import { terminalModeSequences } from '@/api/ws-frames'
 import type { AttachOptions, AttachSocket } from '@/api/client'
 import { fetchSession } from '@/api/client'
-import type { XTermHandle } from '@/components/XTerm'
+import type { XTermHandle } from '@/components/terminal/XTerm'
 
 const modesEncoder = new TextEncoder()
 

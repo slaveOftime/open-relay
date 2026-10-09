@@ -1,4 +1,4 @@
-import type { SessionStatus } from '../api/types.ts'
+import type { SessionStatus } from '@/api/types'
 
 // ---------------------------------------------------------------------------
 // Age / time formatting

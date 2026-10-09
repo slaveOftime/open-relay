@@ -18,7 +18,7 @@ import {
   calculateSparklineLastY,
   carryOpenBucket,
   formatBytesPerSecond,
-} from './sparkline-metrics'
+} from '@/lib/sparkline-metrics'
 interface Props {
   width?: number
   readActivity: () => SparklineActivitySnapshot

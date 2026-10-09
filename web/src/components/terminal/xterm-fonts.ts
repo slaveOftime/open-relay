@@ -10,7 +10,7 @@
  * Windows font-links Segoe UI Symbol and renders them, while a phone's
  * monospace chain has no equivalent and drew tofu.
  *
- * `Open Relay Terminal Symbols` (see XTerm.css) is a subset of Noto Sans
+ * `Open Relay Terminal Symbols` (see terminal/XTerm.css) is a subset of Noto Sans
  * Symbols 2 with every glyph scaled to this cell, so the missing characters are
  * monospaced and identical everywhere; it only claims the blocks it was built
  * for. The system symbol, emoji and CJK families below stay as a last resort

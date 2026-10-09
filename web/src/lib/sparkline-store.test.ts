@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { SPARKLINE_BUCKET_MS, SparklineStore } from '@/lib/sparkline-store'
+import { SPARKLINE_BUCKET_MS, SparklineStore } from './sparkline-store'
 import {
   calculateAverageBytesPerSecond,
   calculatePeakBytesPerSecond,
