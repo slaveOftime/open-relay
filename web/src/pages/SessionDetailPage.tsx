@@ -633,12 +633,20 @@ function SessionDetailPageContent() {
   const sessionReady = session !== null
 
   // Reconnect backoff, attempt counting and deferred-while-hidden state.
+  // The two closures are memoized so the hook's returned callbacks are stable:
+  // a fresh `triggerReconnect` each render would make `scheduleReconnect` a new
+  // function every render, which is the same trap that broke the session loaders.
+  const triggerReconnect = useCallback(() => setWsReconnectKey((k) => k + 1), [])
+  const isReconnectCurrent = useCallback(
+    () => isMounted.current && modeRef.current === 'attach',
+    []
+  )
   const reconnect = useAttachReconnect({
     pushTrace: pushConnectTrace,
     setError: setWsError,
     setConnecting: setWsConnecting,
-    triggerReconnect: () => setWsReconnectKey((k) => k + 1),
-    isCurrent: () => isMounted.current && modeRef.current === 'attach',
+    triggerReconnect,
+    isCurrent: isReconnectCurrent,
   })
   const reconnectTimerRef = reconnect.timerRef
   const pendingReconnectRef = reconnect.pendingRef
