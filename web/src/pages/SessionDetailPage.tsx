@@ -27,6 +27,7 @@ import {
   type LogReplayState,
 } from '@/utils/log-replay'
 import StatusBadge from '@/components/StatusBadge'
+import { useAttachIdleAnimation } from '@/hooks/use-attach-idle-animation'
 import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
@@ -83,7 +84,6 @@ import {
 } from './session-detail-output'
 
 const DEFAULT_LOG_TAIL = 200
-const ATTACH_IDLE_BORDER_DELAY_MS = 10_000
 
 /** Encodes the authoritative DECSET mode sequences into the terminal's
  * byte output queue (see onInit/onModeChanged). */
@@ -134,7 +134,6 @@ function SessionDetailPageContent() {
   const [isAttachPanelOpen, setIsAttachPanelOpen] = useState(false)
   const [tailLimit, setTailLimit] = useState<number | null>(null)
   const [tailLimitInput, setTailLimitInput] = useState('40')
-  const [isAttachViewportIdle, setIsAttachViewportIdle] = useState(false)
   const [showNewSessionDialog, setShowNewSessionDialog] = useState(false)
   const [showMetadataDialog, setShowMetadataDialog] = useState(false)
 
@@ -174,67 +173,19 @@ function SessionDetailPageContent() {
   const lastWsFrameAtRef = useRef(0)
   const replayUiLastCommitAtRef = useRef(0)
   const replayCommittedIdxRef = useRef(0)
-  const attachIdleTimerRef = useRef<number | null>(null)
-  const attachIdleCountdownArmedRef = useRef(false)
   const previousLiveSessionRef = useRef<SessionSummary | null>(null)
 
-  const clearAttachIdleTimer = useCallback(() => {
-    if (attachIdleTimerRef.current !== null) {
-      clearTimeout(attachIdleTimerRef.current)
-      attachIdleTimerRef.current = null
-    }
-  }, [])
-
-  const stopAttachIdleAnimation = useCallback(() => {
-    clearAttachIdleTimer()
-    if (isMounted.current) {
-      setIsAttachViewportIdle(false)
-    }
-  }, [clearAttachIdleTimer])
-
-  const disarmAttachIdleAnimation = useCallback(() => {
-    attachIdleCountdownArmedRef.current = false
-    stopAttachIdleAnimation()
-  }, [stopAttachIdleAnimation])
-
-  const scheduleAttachIdleAnimation = useCallback(() => {
-    clearAttachIdleTimer()
-    if (
-      !attachIdleCountdownArmedRef.current ||
-      modeRef.current !== 'attach' ||
-      !wsConnectedRef.current
-    ) {
-      if (isMounted.current) {
-        setIsAttachViewportIdle(false)
-      }
-      return
-    }
-
-    attachIdleTimerRef.current = window.setTimeout(() => {
-      attachIdleTimerRef.current = null
-      if (
-        !isMounted.current ||
-        modeRef.current !== 'attach' ||
-        !wsConnectedRef.current ||
-        !attachIdleCountdownArmedRef.current
-      ) {
-        return
-      }
-      setIsAttachViewportIdle(true)
-    }, ATTACH_IDLE_BORDER_DELAY_MS)
-  }, [clearAttachIdleTimer])
-
-  const noteVisibleSessionActivity = useCallback(() => {
-    if (!isMounted.current) return
-
-    attachIdleCountdownArmedRef.current = true
-    setIsAttachViewportIdle(false)
-    scheduleAttachIdleAnimation()
-  }, [scheduleAttachIdleAnimation])
-
-  const noteAttachUserActivity = useCallback(() => {
-    disarmAttachIdleAnimation()
-  }, [disarmAttachIdleAnimation])
+  const {
+    isIdle: isAttachViewportIdle,
+    noteVisibleActivity: noteVisibleSessionActivity,
+    noteUserActivity: noteAttachUserActivity,
+    requestIdleBorder,
+    clearTimer: clearAttachIdleTimer,
+  } = useAttachIdleAnimation({
+    mode: modeRef,
+    connected: wsConnectedRef,
+    mounted: isMounted,
+  })
 
   // Self-reference for the trailing-frame reflush below: a useCallback
   // cannot reference itself directly, so the recursive call goes through
@@ -438,9 +389,9 @@ function SessionDetailPageContent() {
 
   useEffect(() => {
     if (mode !== 'attach' || !wsConnected) {
-      disarmAttachIdleAnimation()
+      noteAttachUserActivity()
     }
-  }, [disarmAttachIdleAnimation, mode, wsConnected])
+  }, [noteAttachUserActivity, mode, wsConnected])
 
   const commitReplayIdx = useCallback((idx: number, opts?: { force?: boolean }) => {
     replayIdxRef.current = idx
@@ -494,20 +445,16 @@ function SessionDetailPageContent() {
       const becameResponsive = Boolean(previous?.input_needed) && !liveSession.input_needed
 
       if (!isSessionRunning(liveSession)) {
-        disarmAttachIdleAnimation()
+        noteAttachUserActivity()
       } else if (liveSession.input_needed) {
-        attachIdleCountdownArmedRef.current = false
-        clearAttachIdleTimer()
-        if (isMounted.current) {
-          setIsAttachViewportIdle(true)
-        }
+        requestIdleBorder()
       } else if (becameResponsive || didSessionVisibleOutputAdvance(previous, liveSession)) {
         noteVisibleSessionActivity()
       }
     }
 
     previousLiveSessionRef.current = liveSession
-  }, [clearAttachIdleTimer, disarmAttachIdleAnimation, liveSession, noteVisibleSessionActivity])
+  }, [clearAttachIdleTimer, noteAttachUserActivity, liveSession, noteVisibleSessionActivity])
 
   // One HistoryController per (id, node): owns anchored paging state.
   const getHistory = useCallback((): HistoryController | null => {
@@ -778,7 +725,7 @@ function SessionDetailPageContent() {
               reconnectTimerRef.current = null
             }
             if (isMounted.current) setWsConnected(true)
-            disarmAttachIdleAnimation()
+            noteAttachUserActivity()
           },
           onInit: (data, modes) => {
             if (!gotSnapshot) {
@@ -817,7 +764,7 @@ function SessionDetailPageContent() {
           onSessionEnded: (code) => {
             ended = true
             lastWsFrameAtRef.current = Date.now()
-            disarmAttachIdleAnimation()
+            noteAttachUserActivity()
             pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
             if (!isMounted.current) return
             const exitMsg = code != null ? ` (exit code: ${code})` : ''
@@ -840,7 +787,7 @@ function SessionDetailPageContent() {
             setWsError(`Server error: ${msg}`)
           },
           onClose: (code, reason) => {
-            disarmAttachIdleAnimation()
+            noteAttachUserActivity()
             pushConnectTrace(`websocket close (code=${code}${reason ? ` reason=${reason}` : ''})`)
             if (isMounted.current) setWsConnected(false)
             // iOS PWA kills WebSocket connections when the app goes to background.
@@ -873,7 +820,7 @@ function SessionDetailPageContent() {
       outputWriteInFlightRef.current = false
       outputBufferRef.current = []
       pendingResetRef.current = false
-      disarmAttachIdleAnimation()
+      noteAttachUserActivity()
       pushConnectTrace('teardown current websocket')
       socketRef.current?.close()
       socketRef.current = null
@@ -889,7 +836,7 @@ function SessionDetailPageContent() {
     setSearchParams,
     wsReconnectKey,
     enqueueTerminalOutput,
-    disarmAttachIdleAnimation,
+    noteAttachUserActivity,
   ])
 
   useEffect(() => {
