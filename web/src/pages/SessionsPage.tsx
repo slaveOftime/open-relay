@@ -88,6 +88,7 @@ import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/session-ev
 import { useSseConnectionState } from '@/hooks/use-session-events'
 import { useSessionTableColumns } from '@/hooks/use-session-table-columns'
 import { useSessionListGestures } from '@/hooks/use-session-list-gestures'
+import { useSessionLoaders } from './sessions-page-loaders'
 import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
 import type { GroupBy } from '@/components/sessions/group-by'
 import { SessionCard } from '@/components/sessions/SessionCard'
@@ -107,7 +108,7 @@ import {
   type LoadErrorState,
   type LoadOptions,
 } from './sessions-page-prefs'
-import { buildSessionListParams, fetchSessionsOnce } from './sessions-page-data'
+import { buildSessionListParams } from './sessions-page-data'
 import { SortIcon } from '@/components/sessions/SortIcon'
 export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
@@ -154,9 +155,6 @@ export default function SessionsPage() {
   const pendingTerminationRef = useRef(new Map<string, SessionStatus>())
   const isMounted = useRef(true)
   const prevIdsRef = useRef<Set<string>>(new Set())
-  const hasLoadedRef = useRef(false)
-  const requestVersionRef = useRef(0)
-  const selectedNodeRef = useRef(selectedNode)
   const sseStatus = useSseConnectionState()
 
   // Ids currently rendered on the page (the SSE handler must not invent rows).
@@ -224,98 +222,23 @@ export default function SessionsPage() {
     setSessions((prev) => withSessionStatus(prev, sessionId, status))
   }, [])
 
-  const loadLocal = useCallback(
-    async (opts?: LoadOptions) => {
-      if (selectedNode || selectedNodeRef.current !== selectedNode) return
-
-      const requestVersion = ++requestVersionRef.current
-      const isCurrent = () =>
-        isMounted.current &&
-        requestVersionRef.current === requestVersion &&
-        selectedNodeRef.current === selectedNode
-
-      const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
-      if (shouldShowSkeleton || !opts || opts?.background === false) setLoading(true)
-      else setRefreshing(true)
-
-      try {
-        const params: ListParams = buildSessionListParams({
-          search,
-          statusFilter,
-          page,
-          pageSize,
-          sortField,
-          sortOrder,
-        })
-        const res = await fetchSessionsOnce(params)
-        if (!isCurrent()) return
-
-        hasLoadedRef.current = true
-        applySessionItems(res.items)
-        setRemoteTotal(res.total)
-      } catch (error) {
-        if (isCurrent() && (!opts?.background || opts?.reportError)) {
-          setLoadError({
-            title: 'Unable to load sessions',
-            message: getErrorMessage(error, 'Failed to load local sessions.'),
-          })
-        }
-      } finally {
-        if (isCurrent()) {
-          setLoading(false)
-          setRefreshing(false)
-        }
-      }
-    },
-    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter, pageSize]
-  )
-
-  const loadRemote = useCallback(
-    async (opts?: LoadOptions) => {
-      if (!selectedNode || selectedNodeRef.current !== selectedNode) return
-
-      const requestVersion = ++requestVersionRef.current
-      const isCurrent = () =>
-        isMounted.current &&
-        requestVersionRef.current === requestVersion &&
-        selectedNodeRef.current === selectedNode
-
-      const shouldShowSkeleton = !opts?.background && !hasLoadedRef.current
-      if (shouldShowSkeleton) setLoading(true)
-      else setRefreshing(true)
-
-      try {
-        const params: ListParams = buildSessionListParams({
-          search,
-          statusFilter,
-          page,
-          pageSize,
-          sortField,
-          sortOrder,
-          node: selectedNode,
-        })
-        const res = await fetchSessionsOnce(params)
-        if (!isCurrent()) return
-
-        hasLoadedRef.current = true
-        applySessionItems(res.items)
-        setRemoteTotal(res.total)
-      } catch (error) {
-        if (isCurrent() && (!opts?.background || opts?.reportError)) {
-          setLoadError({
-            title: 'Unable to load sessions',
-            message: getErrorMessage(error, 'Failed to load remote sessions.'),
-          })
-        }
-      } finally {
-        if (isCurrent()) {
-          if (shouldShowSkeleton) setLoading(false)
-          setRefreshing(false)
-        }
-      }
-    },
-    [applySessionItems, page, search, selectedNode, sortField, sortOrder, statusFilter, pageSize]
-  )
+  const { selectedNodeRef, requestVersionRef, hasLoadedRef, loadLocal, loadRemote } =
+    useSessionLoaders({
+      search,
+      statusFilter,
+      page,
+      pageSize,
+      sortField,
+      sortOrder,
+      selectedNode,
+      mounted: isMounted,
+      applySessionItems,
+      setRemoteTotal,
+      setLoading,
+      setRefreshing,
+      setLoadError,
+      getErrorMessage,
+    })
 
   // The primary's SSE carries session_updated events for every connected
   // node. Re-pull summaries for the currently-selected remote node on demand:
