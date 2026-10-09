@@ -1,4 +1,4 @@
-import type { NodeSummary } from '@/api/types.ts'
+import type { NodeSummary } from '@/api/types'
 import { cn } from '@/lib/utils'
 import {
   Select,
@@ -6,7 +6,7 @@ import {
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from '@/components/ui/select.tsx'
+} from '@/components/ui/select'
 
 interface NodeSelectorProps {
   nodes: NodeSummary[]

@@ -47,13 +47,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-// import {
-//   Select,
-//   SelectContent,
-//   SelectItem,
-//   SelectTrigger,
-//   SelectValue,
-// } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -1497,12 +1490,6 @@ function SessionDetailPageContent() {
                 View Logs
               </Button>
             )}
-            {/* {mode === 'attach' && (
-              <Button size="sm" variant="ghost" onClick={() => setConnectTraceOpen(true)}>
-                <TrackNextIcon className="h-4 w-4" />
-                Trace
-              </Button>
-            )} */}
             {isRunning && (
               <>
                 <Button size="sm" variant="stop" onClick={() => setPendingAction('stop')}>
@@ -1919,40 +1906,6 @@ function SessionDetailPageContent() {
             setSession(updated)
           }}
         />
-        {/* 
-        <Dialog
-          open={wsError !== null}
-          onOpenChange={(open) => {
-            if (!open) setWsError(null)
-          }}
-        >
-          <DialogContent className="max-w-lg">
-            <DialogHeader>
-              <DialogTitle className="text-red-400">Attach Error</DialogTitle>
-            </DialogHeader>
-            <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">
-              Raw error detail for debugging:
-            </p>
-            <pre className="text-xs text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] rounded p-3 overflow-x-auto whitespace-pre-wrap break-all border border-[hsl(var(--border))]">
-              {wsError}
-            </pre>
-            <div className="flex justify-end gap-2 pt-1">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  if (wsError) navigator.clipboard?.writeText(wsError).catch(() => { })
-                }}
-              >
-                Copy
-              </Button>
-              <Button size="sm" onClick={() => setWsError(null)}>
-                Dismiss
-              </Button>
-            </div>
-          </DialogContent>
-        </Dialog> */}
-
         <Dialog open={connectTraceOpen} onOpenChange={setConnectTraceOpen}>
           <DialogContent className="max-w-2xl">
             <DialogHeader>

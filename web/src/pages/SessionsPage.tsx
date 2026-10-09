@@ -2513,6 +2513,3 @@ export default function SessionsPage() {
     </TooltipProvider>
   )
 }
-
-// Needed for Badge import
-export { Badge }
