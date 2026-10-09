@@ -79,7 +79,6 @@ import SessionActivitySparkline from '@/components/SessionActivitySparkline'
 import StatusBadge from '@/components/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardFooter } from '@/components/ui/card'
 import {
   Table,
@@ -101,15 +100,10 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import {
   BellIcon,
   CaretDownIcon,
-  CaretSortIcon,
-  ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  ChevronUpIcon,
   CopyIcon,
   Cross2Icon,
-  DrawingPinFilledIcon,
-  DrawingPinIcon,
   FileTextIcon,
   GridIcon,
   Link2Icon,
@@ -128,14 +122,20 @@ import {
 } from '@/lib/push'
 import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/sessionEvents'
 import { useSseConnectionState } from '@/hooks/use-session-events'
+import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
+import type { GroupBy } from '@/components/sessions/group-by'
+import { SessionNotificationButton } from '@/components/sessions/SessionNotificationButton'
+import { SessionPinButton } from '@/components/sessions/SessionPinButton'
+import { SessionTagList } from '@/components/sessions/SessionTagList'
+import { SkeletonCard, SkeletonRow } from '@/components/sessions/SessionSkeletons'
+import { SessionsEmptyState } from '@/components/sessions/SessionsEmptyState'
+import { SortIcon } from '@/components/sessions/SortIcon'
 const PREFS_KEY = 'open-relay.webv2.sessions.preferences.v1'
 const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
 const DEFAULT_PAGE_SIZE = 15
 const PAGE_SIZE_OPTIONS = [10, 15, 25, 50, 100] as const
 
 const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
-
-type GroupBy = 'none' | 'cwd' | 'command' | 'tag'
 
 type SessionPrefs = {
   search: string
@@ -299,183 +299,7 @@ function fetchSessionsOnce(params: ListParams) {
   return request
 }
 
-function normalizeSessionTags(tags: string[]): string[] {
-  const seen = new Set<string>()
-  const normalized: string[] = []
-  for (const tag of tags) {
-    const trimmed = tag.trim()
-    if (trimmed === '') continue
-    const key = trimmed.toLowerCase()
-    if (seen.has(key)) continue
-    seen.add(key)
-    normalized.push(trimmed)
-  }
-  return normalized
-}
-
-function SessionTagList({
-  tags,
-  className = '',
-  emptyLabel = null,
-}: {
-  tags: string[]
-  className?: string
-  emptyLabel?: string | null
-}) {
-  const normalizedTags = normalizeSessionTags(tags)
-  if (normalizedTags.length === 0) {
-    if (emptyLabel === null) return null
-    return <span className="text-xs text-[hsl(var(--muted-foreground))]">{emptyLabel}</span>
-  }
-
-  return (
-    <div className={`flex min-w-0 max-w-full items-center ${className}`.trim()}>
-      {normalizedTags.map((tag) => (
-        <Badge key={tag} variant="accent" className="min-w-0 max-w-full text-[10px] font-semibold">
-          <span className="min-w-0 truncate">#{tag}</span>
-        </Badge>
-      ))}
-    </div>
-  )
-}
-
-function SessionNotificationButton({
-  enabled,
-  disabled,
-  pending,
-  onToggle,
-}: {
-  enabled: boolean
-  disabled?: boolean
-  pending?: boolean
-  onToggle: () => void
-}) {
-  const label = disabled
-    ? 'Notifications unavailable after session exit'
-    : enabled
-      ? 'Turn notifications off'
-      : 'Turn notifications on'
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label={label}
-          disabled={disabled || pending}
-          onClick={onToggle}
-          className="shrink-0"
-        >
-          <span className="relative inline-flex h-4 w-4 items-center justify-center">
-            <BellIcon className="h-4 w-4" />
-            {!enabled && (
-              <span className="absolute h-[1.5px] w-5 -rotate-45 rounded-full bg-current" />
-            )}
-          </span>
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{pending ? 'Updating notifications…' : label}</TooltipContent>
-    </Tooltip>
-  )
-}
-
-function SessionPinButton({
-  pinned,
-  pending,
-  onToggle,
-}: {
-  pinned: boolean
-  pending?: boolean
-  onToggle: () => void
-}) {
-  const label = pinned ? 'Unpin session' : 'Pin live session to top'
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant={pinned ? 'link' : 'ghost'}
-          size="icon"
-          aria-label={label}
-          disabled={pending}
-          onClick={onToggle}
-          className="shrink-0"
-        >
-          {pinned ? (
-            <DrawingPinFilledIcon className="h-4 w-4" />
-          ) : (
-            <DrawingPinIcon className="h-4 w-4" />
-          )}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
-  )
-}
-
 // ── Skeleton loading ───────────────────────────────────────────────────────
-
-function SkeletonRow() {
-  return (
-    <tr className="border-b border-[hsl(var(--border))]">
-      {[8, 10, 24, 14, 22, 30, 12, 16, 10, 8, 18].map((w, i) => (
-        <TableCell key={i} className="px-3 py-3">
-          <div
-            className="h-3 rounded animate-shimmer"
-            style={{ width: `${w + ((i * 7) % 10)}%` }}
-          />
-        </TableCell>
-      ))}
-    </tr>
-  )
-}
-
-function SkeletonCard() {
-  return (
-    <div className="mx-3 my-2 rounded-xl border border-[hsl(var(--border))] bg-[hsl(var(--card))] p-4 flex flex-col gap-3">
-      <div className="flex items-center justify-between">
-        <div className="h-4 w-20 rounded-full animate-shimmer" />
-        <div className="h-3 w-10 rounded animate-shimmer" />
-      </div>
-      <div className="h-3.5 rounded animate-shimmer" style={{ width: '60%' }} />
-      <div className="flex gap-2">
-        <div className="h-3 w-14 rounded animate-shimmer" />
-        <div className="h-3 w-12 rounded animate-shimmer" />
-      </div>
-    </div>
-  )
-}
-
-function GroupHeaderLabel({
-  groupBy,
-  keyLabel,
-  items,
-}: {
-  groupBy: GroupBy
-  keyLabel: string
-  items: SessionSummary[]
-}) {
-  if (groupBy === 'tag') {
-    return keyLabel === '(untagged)' ? (
-      <>{keyLabel}</>
-    ) : (
-      <Badge
-        variant="outline"
-        className="border-[hsl(var(--border))] px-2 py-0 text-[10px] font-medium text-[hsl(var(--muted-foreground))]"
-      >
-        {keyLabel}
-      </Badge>
-    )
-  }
-  if (groupBy !== 'command') return <span className="break-all">{keyLabel}</span>
-  const groupCommand = items[0]?.command ?? keyLabel
-  return (
-    <span className="inline-flex items-center gap-2 wrap-break-word">
-      <CommandLogo command={groupCommand} size={24} />
-      <span>{keyLabel}</span>
-    </span>
-  )
-}
 
 // ── Session Row ────────────────────────────────────────────────────────────
 
@@ -974,47 +798,7 @@ const SessionCard = memo(function SessionCard({
 
 // ── Sort indicator ─────────────────────────────────────────────────────────
 
-function SortIcon({
-  field,
-  sortField,
-  sortOrder,
-}: {
-  field: SessionSortField
-  sortField: SessionSortField
-  sortOrder: SortOrder
-}) {
-  if (field !== sortField) return <CaretSortIcon className="w-3 h-3 opacity-40" />
-  return sortOrder === SortOrder.Asc ? (
-    <ChevronUpIcon className="w-3 h-3" />
-  ) : (
-    <ChevronDownIcon className="w-3 h-3" />
-  )
-}
-
 // ── Empty state ────────────────────────────────────────────────────────────
-
-function EmptyState({
-  onNewSession,
-  selectedNode,
-}: {
-  onNewSession: () => void
-  selectedNode: string | null
-}) {
-  return (
-    <div className="flex flex-col items-center justify-center py-24 text-[hsl(var(--muted-foreground))] gap-3">
-      <Logo size={80} />
-      <p className="text-sm text-[hsl(var(--muted-foreground))]">
-        No sessions yet{selectedNode ? ` on ${selectedNode}` : ''}.
-      </p>
-      <Button size="sm" onClick={onNewSession}>
-        <PlusIcon className="w-4 h-4" />
-        New Session
-      </Button>
-    </div>
-  )
-}
-
-// ── Main page ──────────────────────────────────────────────────────────────
 
 export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
@@ -2248,7 +2032,7 @@ export default function SessionsPage() {
                 sessions.length === 0 &&
                 Array.from({ length: 5 }).map((_, i) => <SkeletonCard key={i} />)}
               {!loading && sessions.length === 0 && (
-                <EmptyState
+                <SessionsEmptyState
                   selectedNode={selectedNode}
                   onNewSession={() => setShowNewSession(true)}
                 />
@@ -2301,7 +2085,10 @@ export default function SessionsPage() {
             </Table>
           )}
           {!loading && sessions.length === 0 && (
-            <EmptyState selectedNode={selectedNode} onNewSession={() => setShowNewSession(true)} />
+            <SessionsEmptyState
+              selectedNode={selectedNode}
+              onNewSession={() => setShowNewSession(true)}
+            />
           )}
           {!loading && sessions.length > 0 && (
             <Table
