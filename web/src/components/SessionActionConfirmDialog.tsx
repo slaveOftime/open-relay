@@ -9,7 +9,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { buttonVariants } from '@/components/ui/button-variants'
-import { cn } from '@/lib/utils'
+import { cn } from '@/utils/cn'
 
 type SessionAction = 'stop' | 'kill'
 

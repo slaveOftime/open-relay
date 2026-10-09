@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as SwitchPrimitive from '@radix-ui/react-switch'
 
-import { cn } from '@/lib/utils'
+import { cn } from '@/utils/cn'
 
 type SwitchProps = React.ComponentPropsWithoutRef<typeof SwitchPrimitive.Root> & {
   tone?: 'default' | 'destructive'

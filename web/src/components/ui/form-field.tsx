@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as Form from '@radix-ui/react-form'
 
-import { cn } from '@/lib/utils'
+import { cn } from '@/utils/cn'
 
 type FormFieldProps = {
   name: string

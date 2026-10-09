@@ -7,7 +7,7 @@ import {
   type CSSProperties,
 } from 'react'
 import { SlidersHorizontal } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { cn } from '@/utils/cn'
 import { getQuickKeys, subscribeQuickKeys } from '@/lib/quickKeysStorage'
 import { useReducedMotion } from './use-reduced-motion'
 import { layoutRing, type QuickKey } from './quick-keys'

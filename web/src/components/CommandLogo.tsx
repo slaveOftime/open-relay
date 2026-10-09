@@ -1,4 +1,4 @@
-import { cn } from '@/lib/utils'
+import { cn } from '@/utils/cn'
 import { agentName, commandBaseName } from '@/utils/format'
 
 type CommandBrand =
