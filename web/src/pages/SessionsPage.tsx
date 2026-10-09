@@ -29,12 +29,6 @@ import {
   type SessionPageEventHandlers,
 } from './sessions-page-events'
 import {
-  nodeAfterSwipe,
-  pullDragOffset,
-  shouldRefreshOnPull,
-  swipeDragOffset,
-} from './sessions-node-swipe'
-import {
   applyPendingTermination,
   applyPendingTerminations,
   revertSessionStatus,
@@ -93,6 +87,7 @@ import {
 import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/session-events'
 import { useSseConnectionState } from '@/hooks/use-session-events'
 import { useSessionTableColumns } from '@/hooks/use-session-table-columns'
+import { useSessionListGestures } from '@/hooks/use-session-list-gestures'
 import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
 import type { GroupBy } from '@/components/sessions/group-by'
 import { SessionCard } from '@/components/sessions/SessionCard'
@@ -154,15 +149,6 @@ export default function SessionsPage() {
 
   const enterAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const delayedReloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const mobileTouchStartRef = useRef<{ x: number; y: number; canPull: boolean } | null>(null)
-  const mobileSwipeContentRef = useRef<HTMLDivElement | null>(null)
-  const mobilePullIndicatorRef = useRef<HTMLDivElement | null>(null)
-  const mobilePullLabelRef = useRef<HTMLSpanElement | null>(null)
-  const mobileSwipeFrameRef = useRef<number | null>(null)
-  const pendingMobileOffsetRef = useRef(0)
-  const pendingPullOffsetRef = useRef(0)
-  const pullRefreshingRef = useRef(false)
-  const lastNodeSwipeAtRef = useRef(0)
   // Optimistic `stopping` claims keyed by session id, re-applied whenever a
   // server refresh would otherwise wipe them with a stale `running`.
   const pendingTerminationRef = useRef(new Map<string, SessionStatus>())
@@ -532,7 +518,6 @@ export default function SessionsPage() {
       cleanup()
       if (enterAnimTimerRef.current) clearTimeout(enterAnimTimerRef.current)
       if (delayedReloadTimerRef.current) clearTimeout(delayedReloadTimerRef.current)
-      if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
     }
   }, [])
 
@@ -646,139 +631,26 @@ export default function SessionsPage() {
     )
   }
 
-  function drawMobileGesture(animate: boolean) {
-    const content = mobileSwipeContentRef.current
-    if (!content) return
-    const indicator = mobilePullIndicatorRef.current
-    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-    const x = reducedMotion ? 0 : pendingMobileOffsetRef.current
-    const y = reducedMotion ? 0 : pendingPullOffsetRef.current
-    const pulling = pendingPullOffsetRef.current > 0
-    const transition =
-      animate && !reducedMotion
-        ? 'transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1), opacity 180ms ease-out'
-        : 'none'
-    content.style.transition = transition
-    content.style.transform = `translate3d(${x}px, ${y}px, 0)`
-    content.style.opacity = String(1 - (Math.abs(x) / 48) * 0.12)
-    if (indicator) {
-      indicator.style.transition = transition
-      const indicatorOpacity =
-        pullRefreshingRef.current || (reducedMotion && pulling) ? 1 : Math.min(1, y / 48)
-      indicator.style.opacity = String(indicatorOpacity)
-      indicator.style.transform = reducedMotion ? 'none' : `translateY(${Math.min(y - 48, 0)}px)`
-      indicator.setAttribute(
-        'aria-hidden',
-        !pulling && !pullRefreshingRef.current ? 'true' : 'false'
-      )
-      indicator
-        .querySelector('svg')
-        ?.classList.toggle('animate-spin', pullRefreshingRef.current && !reducedMotion)
-    }
-  }
-
-  function resetMobileGesture(animate = true) {
-    if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
-    mobileSwipeFrameRef.current = null
-    pendingMobileOffsetRef.current = 0
-    pendingPullOffsetRef.current = 0
-    drawMobileGesture(animate)
-  }
-
-  function handleMobileTouchMove(event: React.TouchEvent<HTMLDivElement>) {
-    const start = mobileTouchStartRef.current
-    if (!start || event.touches.length !== 1) return
-    const touch = event.touches[0]
-    const deltaX = touch.clientX - start.x
-    const deltaY = touch.clientY - start.y
-    const canSwitch = nodeAfterSwipe(selectedNode, nodes, deltaX < 0 ? -80 : 80, 0) !== undefined
-    const nextX = swipeDragOffset(deltaX, deltaY, canSwitch)
-    const nextY = pullDragOffset(deltaX, deltaY, start.canPull)
-    if (nextX === pendingMobileOffsetRef.current && nextY === pendingPullOffsetRef.current) return
-    const previousX = pendingMobileOffsetRef.current
-    const previousY = pendingPullOffsetRef.current
-    pendingMobileOffsetRef.current = nextX
-    pendingPullOffsetRef.current = nextY
-    if (nextY > 0 && mobilePullLabelRef.current) {
-      mobilePullLabelRef.current.textContent = shouldRefreshOnPull(deltaX, deltaY, start.canPull)
-        ? 'Release to refresh'
-        : 'Pull to refresh'
-    }
-    if (nextX === 0 && nextY === 0 && (previousX !== 0 || previousY !== 0)) {
-      resetMobileGesture()
-      return
-    }
-    if (mobileSwipeFrameRef.current !== null) return
-    mobileSwipeFrameRef.current = requestAnimationFrame(() => {
-      mobileSwipeFrameRef.current = null
-      drawMobileGesture(false)
-    })
-  }
-  function handleMobileTouchStart(event: React.TouchEvent<HTMLDivElement>) {
-    mobileTouchStartRef.current = null
-    if (pullRefreshingRef.current) return
-    resetMobileGesture(false)
-    lastNodeSwipeAtRef.current = 0
-    if (event.touches.length !== 1) return
-    const target = event.target
-    const x = event.touches[0].clientX
-    const interactive =
-      target instanceof Element &&
-      target.closest(
-        '[data-node-swipe-ignore], button, a, input, textarea, select, [role="button"]'
-      )
-    if (x < 24 || x > window.innerWidth - 24 || interactive) return
-    const canPull =
-      !loading &&
-      !refreshing &&
-      event.currentTarget.scrollTop <= 0 &&
-      (document.scrollingElement?.scrollTop ?? window.scrollY) <= 0
-    mobileTouchStartRef.current = { x, y: event.touches[0].clientY, canPull }
-  }
-
-  function handleMobileTouchEnd(event: React.TouchEvent<HTMLDivElement>) {
-    const start = mobileTouchStartRef.current
-    mobileTouchStartRef.current = null
-    if (!start || event.changedTouches.length !== 1) {
-      if (!pullRefreshingRef.current) resetMobileGesture()
-      return
-    }
-    const touch = event.changedTouches[0]
-    const deltaX = touch.clientX - start.x
-    const deltaY = touch.clientY - start.y
-    if (shouldRefreshOnPull(deltaX, deltaY, start.canPull) && !loading && !refreshing) {
-      if (mobileSwipeFrameRef.current !== null) cancelAnimationFrame(mobileSwipeFrameRef.current)
-      mobileSwipeFrameRef.current = null
-      pendingMobileOffsetRef.current = 0
-      pendingPullOffsetRef.current = 56
-      pullRefreshingRef.current = true
-      if (mobilePullLabelRef.current) mobilePullLabelRef.current.textContent = 'Refreshing…'
-      drawMobileGesture(true)
-      lastNodeSwipeAtRef.current = Date.now()
-      void reloadSessions({ background: true, reportError: true }).finally(() => {
-        pullRefreshingRef.current = false
-        resetMobileGesture()
-        if (mobilePullLabelRef.current) mobilePullLabelRef.current.textContent = 'Pull to refresh'
-      })
-      return
-    }
-    const wasPulling = pendingPullOffsetRef.current > 0
-    resetMobileGesture()
-    // Decide the navigation outcome first: a clean horizontal swipe should
-    // always win over a stray vertical drift, even if the pull visual
-    // flickered briefly mid-gesture.
-    const next = nodeAfterSwipe(selectedNode, nodes, deltaX, deltaY)
-    if (next !== undefined) {
-      lastNodeSwipeAtRef.current = Date.now()
-      handleNodeChange(next)
-      return
-    }
-    // No node change. If the user pulled at all, suppress the click on the
-    // card below so a slightly-stale finger-drag doesn't open a session.
-    if (wasPulling) {
-      lastNodeSwipeAtRef.current = Date.now()
-    }
-  }
+  // Pull-to-refresh and node swipe: one continuous touch, drawn by writing
+  // styles directly rather than re-rendering the list on every move.
+  const {
+    onTouchStart: handleMobileTouchStart,
+    onTouchMove: handleMobileTouchMove,
+    onTouchEnd: handleMobileTouchEnd,
+    onTouchCancel: handleMobileTouchCancel,
+    noteNonTouchPointer: noteNonTouchGesture,
+    shouldSuppressClick: gestureSwallowsClick,
+    contentRef: mobileSwipeContentRef,
+    indicatorRef: mobilePullIndicatorRef,
+    labelRef: mobilePullLabelRef,
+  } = useSessionListGestures({
+    selectedNode,
+    nodes,
+    loading,
+    refreshing,
+    onNodeChange: handleNodeChange,
+    onRefresh: () => reloadSessions({ background: true, reportError: true }),
+  })
 
   function handleDeleted(id: string) {
     removeLoadedSession(id)
@@ -1245,20 +1117,16 @@ export default function SessionsPage() {
           className="flex-1 overflow-y-auto overflow-x-clip md:hidden"
           data-testid="mobile-session-list"
           onPointerDownCapture={(event) => {
-            if (event.pointerType !== 'touch') lastNodeSwipeAtRef.current = 0
+            if (event.pointerType !== 'touch') noteNonTouchGesture()
           }}
           onTouchStart={handleMobileTouchStart}
           onTouchMove={handleMobileTouchMove}
           onTouchEnd={handleMobileTouchEnd}
-          onTouchCancel={() => {
-            mobileTouchStartRef.current = null
-            if (!pullRefreshingRef.current) resetMobileGesture()
-          }}
+          onTouchCancel={handleMobileTouchCancel}
           onClickCapture={(event) => {
-            if (lastNodeSwipeAtRef.current && Date.now() - lastNodeSwipeAtRef.current < 350) {
+            if (gestureSwallowsClick()) {
               event.preventDefault()
               event.stopPropagation()
-              lastNodeSwipeAtRef.current = 0
             }
           }}
         >
