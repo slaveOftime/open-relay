@@ -155,3 +155,35 @@ Format: `area — finding — why it matters — suggested next step`.
 26. **FIXED** (`8a1d8b5`) �� cross-folder relative imports: `AttachPanel.tsx` and
     `LoginDialog.tsx` used `../ui/*` and `../dialogs/*`, while every other file
     in the tree uses the `@/components/...` alias.
+
+### Findings from the continued refactor, now closed
+
+27. **FIXED** (`2c9f4fb`) �� the mobile gesture layer lived inline in
+    `SessionsPage`: nine refs, a `drawMobileGesture` that wrote styles directly,
+    three touch handlers, and the click-suppression window. Now
+    `hooks/use-session-list-gestures.ts`.
+28. **FIXED** (`fdd8270`) �� the sessions-table column resize/reorder handlers
+    (seven functions, two gesture refs) were inline in the page. Now
+    `hooks/use-session-table-columns.ts`.
+29. **FIXED** (`c9eff33`) �� `e2e/` had no mobile-Safari project, so nothing
+    covered the iOS PWA behaviour the reconnect policy exists for. Added an
+    `iPhone 13` project scoped to the attach specs, plus a reconnect spec that
+    pins the drop-and-retry policy from outside the app.
+30. **FIXED** (`c9eff33`) �� the reconnect backoff, the transient-close codes
+    and the defer-while-hidden decision were arithmetic buried in an effect.
+    Now `lib/attach-reconnect-policy.ts` with 9 tests.
+31. **FIXED** (`ba465a8`) �� the 95-line `AttachSocket` options table was inline
+    in `SessionDetailPage`, including the `ended` / `gotSnapshot` flags it
+    needs. Now `components/attach/attach-socket-options.ts`.
+
+Two things these commits changed on purpose, because they were load-bearing
+rather than accidental:
+
+- **Click suppression is a 350 ms window, not a flag.** Extracting the gesture
+  hook surfaced that the original suppresses clicks for 350 ms after a gesture
+  and disarms on any non-touch pointer. A flag-shaped extraction would have
+  swallowed every click on the list after the first swipe; the e2e swipe spec
+  passes because the real rule is preserved.
+- **`pullOffsetRef.current = 56` is its own constant.** It is not
+  `PULL_FULL + 8`; the held offset and the threshold are unrelated numbers that
+  happen to differ by 8.
