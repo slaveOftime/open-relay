@@ -75,7 +75,7 @@ import {
   PENDING_TERMINATION_STATUS,
   withPendingTermination,
   type SessionTermination,
-} from './session-termination'
+} from '@/utils/sessionTermination'
 import {
   didSessionVisibleOutputAdvance,
   isSessionRunning,

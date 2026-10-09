@@ -1,5 +1,5 @@
-import { memo, useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import type { ListParams } from '@/api/client'
 import {
   SessionSortField,
@@ -22,7 +22,6 @@ import {
 import NewSessionDialog from '@/components/NewSessionDialog'
 import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
 import SessionMetadataDialog from '@/components/SessionMetadataDialog'
-import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
 import SessionDeleteConfirmDialog from '@/components/SessionDeleteConfirmDialog'
 import {
   clampSessionTableColumnSize,
@@ -31,7 +30,6 @@ import {
   getSessionTableWidth,
   reorderSessionTableColumn,
   SESSION_TABLE_COLUMN_STORAGE_KEY,
-  type SessionTableColumn,
   type SessionTableColumnKey,
   type SessionTableColumnOrder,
   type SessionTableColumnSizes,
@@ -56,15 +54,9 @@ import {
   withPendingTermination,
   withSessionStatus,
   type SessionTermination,
-} from './session-termination'
+} from '@/utils/sessionTermination'
 import { NodeSelector } from '@/components/NodeSelector'
-import {
-  agentName,
-  formatByteSize,
-  formatTimestamp,
-  normalizeCwdPath,
-  sessionDisplayName,
-} from '@/utils/format'
+import { agentName, normalizeCwdPath } from '@/utils/format'
 import {
   loadPinnedSessionKeys,
   orderSessionPage,
@@ -73,13 +65,9 @@ import {
   sessionPinKey,
 } from '@/utils/sessionOrdering'
 import Logo from '@/components/Logo'
-import CommandLogo from '@/components/CommandLogo'
 import SseStatusDot from '@/components/SseStatusDot'
-import SessionActivitySparkline from '@/components/SessionActivitySparkline'
-import StatusBadge from '@/components/StatusBadge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Card, CardContent, CardFooter } from '@/components/ui/card'
 import {
   Table,
   TableBody,
@@ -96,23 +84,18 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import {
   BellIcon,
   CaretDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  CopyIcon,
   Cross2Icon,
-  FileTextIcon,
   GridIcon,
-  Link2Icon,
   MixerHorizontalIcon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
-  StopIcon,
-  TrashIcon,
 } from '@radix-ui/react-icons'
 import {
   disablePushNotifications,
@@ -124,9 +107,9 @@ import { ingestSessionSummaries, subscribeSessionEvents } from '@/lib/sessionEve
 import { useSseConnectionState } from '@/hooks/use-session-events'
 import { GroupHeaderLabel } from '@/components/sessions/GroupHeaderLabel'
 import type { GroupBy } from '@/components/sessions/group-by'
-import { SessionNotificationButton } from '@/components/sessions/SessionNotificationButton'
-import { SessionPinButton } from '@/components/sessions/SessionPinButton'
-import { SessionTagList } from '@/components/sessions/SessionTagList'
+import { SessionCard } from '@/components/sessions/SessionCard'
+import { SessionRow } from '@/components/sessions/SessionRow'
+
 import { SkeletonCard, SkeletonRow } from '@/components/sessions/SessionSkeletons'
 import { SessionsEmptyState } from '@/components/sessions/SessionsEmptyState'
 import { SortIcon } from '@/components/sessions/SortIcon'
@@ -164,10 +147,6 @@ function filterSessionsByStatus(
 ): SessionSummary[] {
   if (statusFilter === 'all') return items
   return items.filter((item) => matchesStatusFilter(statusFilter, item.status))
-}
-
-function isTerminalStatus(status: SessionSummary['status']): boolean {
-  return status === 'stopped' || status === 'killed' || status === 'failed'
 }
 
 const SORT_OPTIONS: Array<{ label: string; value: SessionSortField }> = [
@@ -261,10 +240,6 @@ function sessionPageTitle(selectedNode: string | null): string {
   return normalized
 }
 
-function buildSessionHref(sessionId: string, mode: 'attach' | 'logs', node?: string) {
-  return `/session/${sessionId}?mode=${mode}${node ? `&node=${encodeURIComponent(node)}` : ''}`
-}
-
 function getErrorMessage(error: unknown, fallback: string): string {
   if (error instanceof Error) {
     const message = error.message.trim()
@@ -302,503 +277,6 @@ function fetchSessionsOnce(params: ListParams) {
 // ── Skeleton loading ───────────────────────────────────────────────────────
 
 // ── Session Row ────────────────────────────────────────────────────────────
-
-const SessionRow = memo(function SessionRow({
-  session,
-  animateIn,
-  pinned,
-  onStop,
-  onKill,
-  onToggleNotifications,
-  onTogglePin,
-  onRunAgain,
-  onEditSession,
-  onRequestDelete,
-  notificationsPending,
-  node,
-  columns,
-}: {
-  session: SessionSummary
-  animateIn?: boolean
-  pinned?: boolean
-  onStop: (session: SessionSummary) => void
-  onKill: (session: SessionSummary) => void
-  onToggleNotifications: (session: SessionSummary) => void
-  onTogglePin: (session: SessionSummary) => void
-  onRunAgain: (session: SessionSummary) => void
-  onEditSession: (session: SessionSummary) => void
-  onRequestDelete: (session: SessionSummary) => void
-  notificationsPending?: boolean
-  node?: string
-  columns: SessionTableColumn[]
-}) {
-  const navigate = useNavigate()
-  const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
-  const isRunning =
-    session.status === 'running' || session.status === 'stopping' || session.status === 'created'
-  const attachHref = buildSessionHref(session.id, 'attach', node)
-  const logsHref = buildSessionHref(session.id, 'logs', node)
-
-  const accentClass = session.input_needed
-    ? '[box-shadow:inset_2px_0_0_0_rgb(245_158_11/0.8)] bg-amber-50 dark:bg-amber-950/10'
-    : session.status === 'running'
-      ? '[box-shadow:inset_2px_0_0_0_rgb(22_163_74/0.5)]'
-      : ''
-
-  const rowOpacity = isTerminalStatus(session.status) ? 'opacity-60' : ''
-  const animateClass = animateIn ? 'animate-row-slide-in' : ''
-
-  function openSession(mode: 'attach' | 'logs') {
-    navigate(buildSessionHref(session.id, mode, node))
-  }
-
-  function renderCell(columnKey: SessionTableColumnKey) {
-    switch (columnKey) {
-      case 'id':
-        return (
-          <TableCell
-            key={columnKey}
-            className={`px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0 ${accentClass}`}
-            onClick={(e) => {
-              e.stopPropagation()
-              onEditSession(session)
-            }}
-          >
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button className="truncate text-left hover:text-[hsl(var(--primary))] transition-colors">
-                  {session.id.slice(0, 7)}
-                </button>
-              </TooltipTrigger>
-              <TooltipContent>{`${session.id} — click to edit`}</TooltipContent>
-            </Tooltip>
-          </TableCell>
-        )
-      case 'output':
-        return (
-          <TableCell key={columnKey} className="px-3 py-1 truncate max-w-0">
-            <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-              {formatByteSize(session.last_total_bytes)}
-            </span>
-          </TableCell>
-        )
-      case 'title':
-        return (
-          <TableCell key={columnKey} className="px-3 py-1 truncate max-w-0">
-            <span className="block truncate text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-              {session.title?.trim() || '—'}
-            </span>
-          </TableCell>
-        )
-      case 'tags':
-        return (
-          <TableCell key={columnKey} className="px-3 py-2 align-middle">
-            <SessionTagList tags={session.tags} emptyLabel="—" className="flex-wrap gap-1" />
-          </TableCell>
-        )
-      case 'command':
-        return (
-          <TableCell key={columnKey} className="px-3 py-1 truncate max-w-0">
-            <span className="flex min-w-0 items-center gap-2 text-[hsl(var(--foreground))] text-sm group-hover:text-[hsl(var(--primary))] transition-colors">
-              <CommandLogo command={session.command} size={24} />
-              <span className="truncate">{sessionDisplayName(session)}</span>
-            </span>
-          </TableCell>
-        )
-      case 'cwd':
-        return (
-          <TableCell
-            key={columnKey}
-            className="px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs font-mono truncate max-w-0"
-          >
-            {session.cwd ? (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span>{normalizeCwdPath(session.cwd)}</span>
-                </TooltipTrigger>
-                <TooltipContent>{normalizeCwdPath(session.cwd)}</TooltipContent>
-              </Tooltip>
-            ) : null}
-          </TableCell>
-        )
-      case 'status':
-        return (
-          <TableCell key={columnKey} className="px-3 py-1 whitespace-nowrap">
-            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
-          </TableCell>
-        )
-      case 'created_at':
-        return (
-          <TableCell
-            key={columnKey}
-            className="px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs whitespace-nowrap"
-          >
-            {formatTimestamp(session.created_at)}
-          </TableCell>
-        )
-      case 'activity':
-        return (
-          <TableCell key={columnKey} className="px-3 py-1">
-            <SessionActivitySparkline
-              sessionId={session.id}
-              node={node}
-              isRunning={isRunning}
-              fullWidth
-            />
-          </TableCell>
-        )
-      case 'pid':
-        return (
-          <TableCell
-            key={columnKey}
-            className="px-3 py-1 text-[hsl(var(--muted-foreground))] text-xs font-mono"
-          >
-            {session.pid != null && session.pid}
-          </TableCell>
-        )
-      case 'actions':
-        return (
-          <TableCell key={columnKey} className="px-3 py-1" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-1 overflow-x-auto">
-              {isRunning && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button asChild variant="link" size="icon" className="shrink-0">
-                      <Link to={attachHref} aria-label="Attach">
-                        <Link2Icon className="h-4 w-4" />
-                      </Link>
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Attach</TooltipContent>
-                </Tooltip>
-              )}
-              {isRunning && (
-                <>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="stop"
-                        size="icon"
-                        className="shrink-0"
-                        onClick={() => setPendingAction('stop')}
-                      >
-                        <StopIcon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Stop</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="kill"
-                        size="icon"
-                        className="shrink-0"
-                        onClick={() => setPendingAction('kill')}
-                      >
-                        <Cross2Icon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Kill</TooltipContent>
-                  </Tooltip>
-                  <SessionNotificationButton
-                    enabled={session.notifications_enabled}
-                    disabled={!isRunning}
-                    pending={notificationsPending}
-                    onToggle={() => onToggleNotifications(session)}
-                  />
-                  <SessionPinButton
-                    pinned={pinned ?? false}
-                    onToggle={() => onTogglePin(session)}
-                  />
-                </>
-              )}
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button asChild variant="ghost" size="icon" className="shrink-0">
-                    <Link to={logsHref} aria-label="Logs">
-                      <FileTextIcon className="h-4 w-4" />
-                    </Link>
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Logs</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="shrink-0"
-                    onClick={() => onRunAgain(session)}
-                    aria-label="Run Again"
-                  >
-                    <CopyIcon className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Run Again</TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="stop"
-                    size="icon"
-                    className="shrink-0"
-                    onClick={() => onRequestDelete(session)}
-                    aria-label="Delete session"
-                  >
-                    <TrashIcon className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Delete session</TooltipContent>
-              </Tooltip>
-            </div>
-          </TableCell>
-        )
-    }
-  }
-
-  return (
-    <>
-      <TableRow
-        className={`group border-b border-[hsl(var(--border))] transition-colors duration-150 hover:bg-[hsl(var(--accent))] cursor-pointer ${rowOpacity} ${animateClass}`}
-        onClick={() => openSession(isRunning ? 'attach' : 'logs')}
-      >
-        {columns.map((column) => renderCell(column.key))}
-      </TableRow>
-
-      {/* Confirm dialog */}
-      <SessionActionConfirmDialog
-        action={pendingAction}
-        sessionId={session.id}
-        onConfirm={(action) => {
-          if (action === 'stop') onStop(session)
-          else onKill(session)
-        }}
-        onClose={() => setPendingAction(null)}
-      />
-    </>
-  )
-})
-
-// ── Session Card (mobile) ──────────────────────────────────────────────────
-
-const SessionCard = memo(function SessionCard({
-  session,
-  animateIn,
-  pinned,
-  onStop,
-  onKill,
-  onToggleNotifications,
-  onTogglePin,
-  onRunAgain,
-  onEditSession,
-  onRequestDelete,
-  notificationsPending,
-  node,
-  showCwd,
-}: {
-  session: SessionSummary
-  animateIn?: boolean
-  pinned?: boolean
-  onStop: (session: SessionSummary) => void
-  onKill: (session: SessionSummary) => void
-  onToggleNotifications: (session: SessionSummary) => void
-  onTogglePin: (session: SessionSummary) => void
-  onRunAgain: (session: SessionSummary) => void
-  onEditSession: (session: SessionSummary) => void
-  onRequestDelete: (session: SessionSummary) => void
-  notificationsPending?: boolean
-  node?: string
-  showCwd?: boolean
-}) {
-  const navigate = useNavigate()
-  const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
-  const isRunning =
-    session.status === 'running' || session.status === 'stopping' || session.status === 'created'
-  const attachHref = buildSessionHref(session.id, 'attach', node)
-  const logsHref = buildSessionHref(session.id, 'logs', node)
-
-  const titleTone = isTerminalStatus(session.status)
-    ? 'text-[hsl(var(--foreground))]/70'
-    : 'text-[hsl(var(--foreground))]'
-  const animateClass = animateIn ? 'animate-row-slide-in' : ''
-  const opacityClass =
-    session.status === 'stopped' || session.status === 'killed' || session.status === 'failed'
-      ? 'opacity-60'
-      : ''
-
-  const deleteButton = (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="stop"
-          size="icon"
-          className="shrink-0"
-          onClick={() => onRequestDelete(session)}
-          aria-label="Delete session"
-        >
-          <TrashIcon className="h-4 w-4" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>Delete session</TooltipContent>
-    </Tooltip>
-  )
-
-  function openSession(mode: 'attach' | 'logs') {
-    navigate(buildSessionHref(session.id, mode, node))
-  }
-
-  return (
-    <>
-      <Card
-        className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass} ${opacityClass}`}
-      >
-        <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1 relative">
-          {/* Row 1: id, status, pid, created at */}
-          <div
-            data-node-swipe-ignore
-            className="z-10 flex items-center gap-2 overflow-x-auto whitespace-nowrap"
-          >
-            <button
-              className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold hover:text-[hsl(var(--primary))] transition-colors"
-              onClick={() => onEditSession(session)}
-            >
-              {session.id.slice(0, 7)}
-            </button>
-            <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
-              {formatTimestamp(session.created_at)}
-            </span>
-            <div className="text-[hsl(var(--muted-foreground))] text-xs font-mono tabular-nums">
-              {formatByteSize(session.last_total_bytes)}
-            </div>
-            <div className="flex-1" />
-            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
-          </div>
-
-          {/* Row 2: command + title */}
-          <div className="z-10" onClick={() => openSession(isRunning ? 'attach' : 'logs')}>
-            <div className={`flex min-w-0 items-center gap-2 ${titleTone}`}>
-              <CommandLogo command={session.command} size={36} />
-              <div className="min-w-0 flex-1 line-clamp-5 break-all">
-                {session.title?.trim() && (
-                  <span className="block leading-4 text-[hsl(var(--primary))]">
-                    {session.title.trim()}
-                  </span>
-                )}
-                <span className="block leading-4">{sessionDisplayName(session)}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Row 3: cwd */}
-          {showCwd && session.cwd && (
-            <div className="z-10 text-sm leading-4 text-[hsl(var(--muted-foreground))] font-mono break-all">
-              {normalizeCwdPath(session.cwd)}
-            </div>
-          )}
-
-          <div className="z-10 flex flex-wrap items-center gap-2">
-            {session.tags.length > 0 && (
-              <div className="min-w-0 flex-1">
-                <SessionTagList tags={session.tags} className="flex-1 flex-wrap gap-1.5" />
-              </div>
-            )}
-          </div>
-
-          {/* Row 4: activity sparkline */}
-          {session.status === 'running' && (
-            <div className="pt-1 w-full opacity-20 absolute pointer-events-none z-0 left-0 right-0 -bottom-1">
-              <SessionActivitySparkline
-                sessionId={session.id}
-                node={node}
-                isRunning={isRunning}
-                fullWidth
-                height={60}
-                className="w-full"
-              />
-            </div>
-          )}
-        </CardContent>
-
-        <div className="border-t border-[hsl(var(--border))]" />
-
-        {/* Action bar */}
-        <CardFooter
-          className={`flex items-center ${isRunning ? 'flex-row-reverse' : ''} gap-1 px-2 py-1 overflow-x-auto`}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {isRunning && (
-            <Button
-              asChild
-              variant="outline"
-              className="border-[hsl(var(--primary))] text-[hsl(var(--primary))]"
-              size="sm"
-            >
-              <Link to={attachHref}>
-                <Link2Icon className="h-4 w-4" />
-                Attach
-              </Link>
-            </Button>
-          )}
-          {isRunning && (
-            <>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="stop" size="icon" onClick={() => setPendingAction('stop')}>
-                    <StopIcon className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>Stop</TooltipContent>
-              </Tooltip>
-              {deleteButton}
-              <SessionNotificationButton
-                enabled={session.notifications_enabled}
-                disabled={!isRunning}
-                pending={notificationsPending}
-                onToggle={() => onToggleNotifications(session)}
-              />
-              <SessionPinButton pinned={pinned ?? false} onToggle={() => onTogglePin(session)} />
-            </>
-          )}
-          <div className="flex-1"></div>
-          {!isRunning && deleteButton}
-          <Button asChild variant="ghost" size="icon">
-            <Link to={logsHref} aria-label="Logs">
-              <FileTextIcon className="h-4 w-4" />
-            </Link>
-          </Button>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="shrink-0"
-                onClick={() => onRunAgain(session)}
-                aria-label="Run Again"
-              >
-                <CopyIcon className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Run Again</TooltipContent>
-          </Tooltip>
-        </CardFooter>
-      </Card>
-
-      <SessionActionConfirmDialog
-        action={pendingAction}
-        sessionId={session.id}
-        onConfirm={(action) => {
-          if (action === 'stop') onStop(session)
-          else onKill(session)
-        }}
-        onClose={() => setPendingAction(null)}
-      />
-    </>
-  )
-})
-
-// ── Sort indicator ─────────────────────────────────────────────────────────
-
-// ── Empty state ────────────────────────────────────────────────────────────
 
 export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])

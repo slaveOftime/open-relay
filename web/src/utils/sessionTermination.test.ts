@@ -8,7 +8,7 @@ import {
   revertSessionStatus,
   withPendingTermination,
   withSessionStatus,
-} from './session-termination'
+} from './sessionTermination'
 
 function session(partial: Partial<SessionSummary> = {}): SessionSummary {
   return {
