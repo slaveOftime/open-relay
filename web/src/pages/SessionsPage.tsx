@@ -5,8 +5,6 @@ import {
   SessionSortField,
   SortOrder,
   isSessionStatusFilter,
-  isSessionSortField,
-  isSortOrder,
   type SessionSummary,
   type SessionStatus,
   type SessionStatusFilter,
@@ -25,18 +23,13 @@ import SessionMetadataDialog from '@/components/dialogs/SessionMetadataDialog'
 import SessionDeleteConfirmDialog from '@/components/dialogs/SessionDeleteConfirmDialog'
 import {
   clampSessionTableColumnSize,
-  coerceSessionTableColumnSettings,
   getOrderedSessionTableColumns,
   getSessionTableWidth,
   reorderSessionTableColumn,
-  SESSION_TABLE_COLUMN_STORAGE_KEY,
   type SessionTableColumnKey,
-  type SessionTableColumnOrder,
-  type SessionTableColumnSizes,
 } from '@/lib/sessions-table-columns'
 import {
   handleSessionPageEvent,
-  matchesStatusFilter,
   normalizeStoredNode,
   type SessionPageEventContext,
   type SessionPageEventHandlers,
@@ -111,172 +104,21 @@ import { SessionCard } from '@/components/sessions/SessionCard'
 import { SessionRow } from '@/components/sessions/SessionRow'
 import { SkeletonCard, SkeletonRow } from '@/components/sessions/SessionSkeletons'
 import { SessionsEmptyState } from '@/components/sessions/SessionsEmptyState'
+import {
+  PAGE_SIZE_OPTIONS,
+  SORT_OPTIONS,
+  filterSessionsByStatus,
+  getErrorMessage,
+  loadSessionPrefs,
+  loadSessionTableColumnSettings,
+  saveSessionPrefs,
+  saveSessionTableColumnSettings,
+  sessionPageTitle,
+  type LoadErrorState,
+  type LoadOptions,
+} from './sessions-page-prefs'
+import { buildSessionListParams, fetchSessionsOnce } from './sessions-page-data'
 import { SortIcon } from '@/components/sessions/SortIcon'
-const PREFS_KEY = 'open-relay.webv2.sessions.preferences.v1'
-const LEGACY_PREFS_KEY = 'open-relay.sessions.preferences.v1'
-const DEFAULT_PAGE_SIZE = 15
-const PAGE_SIZE_OPTIONS = [10, 15, 25, 50, 100] as const
-
-const sessionPageRequests = new Map<string, Promise<{ items: SessionSummary[]; total: number }>>()
-
-type SessionPrefs = {
-  search: string
-  statusFilter: SessionStatusFilter
-  groupBy: GroupBy
-  node: string | null
-  sortField: SessionSortField
-  sortOrder: SortOrder
-  pageSize: number
-}
-
-type LoadErrorState = {
-  title: string
-  message: string
-}
-
-type LoadOptions = { background?: boolean; reportError?: boolean }
-
-function normalizeStatusFilter(value: unknown): SessionStatusFilter {
-  return isSessionStatusFilter(value) ? value : 'all'
-}
-
-function filterSessionsByStatus(
-  items: SessionSummary[],
-  statusFilter: SessionStatusFilter
-): SessionSummary[] {
-  if (statusFilter === 'all') return items
-  return items.filter((item) => matchesStatusFilter(statusFilter, item.status))
-}
-
-const SORT_OPTIONS: Array<{ label: string; value: SessionSortField }> = [
-  { label: 'Created At', value: SessionSortField.CreatedAt },
-  { label: 'Status', value: SessionSortField.Status },
-  { label: 'Title', value: SessionSortField.Title },
-  { label: 'ID', value: SessionSortField.Id },
-  { label: 'Command', value: SessionSortField.Command },
-  { label: 'CWD', value: SessionSortField.Cwd },
-  { label: 'PID', value: SessionSortField.Pid },
-]
-
-function loadSessionPrefs(): SessionPrefs {
-  const defaults: SessionPrefs = {
-    search: '',
-    statusFilter: 'all',
-    groupBy: 'none',
-    node: null,
-    sortField: SessionSortField.CreatedAt,
-    sortOrder: SortOrder.Desc,
-    pageSize: DEFAULT_PAGE_SIZE,
-  }
-  if (typeof window === 'undefined') return defaults
-  try {
-    const raw =
-      window.localStorage.getItem(PREFS_KEY) ?? window.localStorage.getItem(LEGACY_PREFS_KEY)
-    if (!raw) return defaults
-    const parsed = JSON.parse(raw) as Partial<SessionPrefs>
-    const groupBy = parsed.groupBy
-    const node = parsed.node
-    const sortField = parsed.sortField
-    const sortOrder = parsed.sortOrder
-    return {
-      search: typeof parsed.search === 'string' ? parsed.search : defaults.search,
-      statusFilter: normalizeStatusFilter(parsed.statusFilter),
-      groupBy:
-        groupBy === 'none' || groupBy === 'cwd' || groupBy === 'command' || groupBy === 'tag'
-          ? groupBy
-          : defaults.groupBy,
-      node: normalizeStoredNode(node) ?? defaults.node,
-      sortField: isSessionSortField(sortField) ? sortField : defaults.sortField,
-      sortOrder: isSortOrder(sortOrder) ? sortOrder : defaults.sortOrder,
-      pageSize:
-        typeof parsed.pageSize === 'number' &&
-        Number.isInteger(parsed.pageSize) &&
-        parsed.pageSize > 0 &&
-        parsed.pageSize <= 500
-          ? parsed.pageSize
-          : defaults.pageSize,
-    }
-  } catch {
-    return defaults
-  }
-}
-
-function saveSessionPrefs(prefs: SessionPrefs) {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs))
-  } catch {
-    /* ignore */
-  }
-}
-
-function loadSessionTableColumnSettings() {
-  if (typeof window === 'undefined') return coerceSessionTableColumnSettings(null)
-  try {
-    const raw = window.localStorage.getItem(SESSION_TABLE_COLUMN_STORAGE_KEY)
-    if (!raw) return coerceSessionTableColumnSettings(null)
-    return coerceSessionTableColumnSettings(JSON.parse(raw))
-  } catch {
-    return coerceSessionTableColumnSettings(null)
-  }
-}
-
-function saveSessionTableColumnSettings(settings: {
-  sizes: SessionTableColumnSizes
-  order: SessionTableColumnOrder
-}) {
-  if (typeof window === 'undefined') return
-  try {
-    window.localStorage.setItem(SESSION_TABLE_COLUMN_STORAGE_KEY, JSON.stringify(settings))
-  } catch {
-    /* ignore */
-  }
-}
-
-function sessionPageTitle(selectedNode: string | null): string {
-  const normalized = normalizeStoredNode(selectedNode)
-  if (!normalized || normalized.toLowerCase() === 'local') return ''
-  return normalized
-}
-
-function getErrorMessage(error: unknown, fallback: string): string {
-  if (error instanceof Error) {
-    const message = error.message.trim()
-    return message === '' ? fallback : message
-  }
-  return fallback
-}
-
-function getSessionListRequestKey(params: ListParams): string {
-  return JSON.stringify({
-    search: params.search ?? '',
-    status: params.status ?? '',
-    limit: params.limit ?? null,
-    offset: params.offset ?? null,
-    sort: params.sort ?? '',
-    order: params.order ?? '',
-    node: params.node ?? '',
-  })
-}
-
-function fetchSessionsOnce(params: ListParams) {
-  const key = getSessionListRequestKey(params)
-  const existing = sessionPageRequests.get(key)
-  if (existing) return existing
-
-  const request = fetchSessions(params).finally(() => {
-    if (sessionPageRequests.get(key) === request) {
-      sessionPageRequests.delete(key)
-    }
-  })
-  sessionPageRequests.set(key, request)
-  return request
-}
-
-// ── Skeleton loading ───────────────────────────────────────────────────────
-
-// ── Session Row ────────────────────────────────────────────────────────────
-
 export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
   const [searchParams, setSearchParams] = useSearchParams()
@@ -422,14 +264,14 @@ export default function SessionsPage() {
       else setRefreshing(true)
 
       try {
-        const params: ListParams = {
-          search: search || undefined,
-          status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: pageSize,
-          offset: page * pageSize,
-          sort: sortField,
-          order: sortOrder,
-        }
+        const params: ListParams = buildSessionListParams({
+          search,
+          statusFilter,
+          page,
+          pageSize,
+          sortField,
+          sortOrder,
+        })
         const res = await fetchSessionsOnce(params)
         if (!isCurrent()) return
 
@@ -468,15 +310,15 @@ export default function SessionsPage() {
       else setRefreshing(true)
 
       try {
-        const params: ListParams = {
-          search: search || undefined,
-          status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: pageSize,
-          offset: page * pageSize,
-          sort: sortField,
-          order: sortOrder,
+        const params: ListParams = buildSessionListParams({
+          search,
+          statusFilter,
+          page,
+          pageSize,
+          sortField,
+          sortOrder,
           node: selectedNode,
-        }
+        })
         const res = await fetchSessionsOnce(params)
         if (!isCurrent()) return
 
@@ -511,15 +353,15 @@ export default function SessionsPage() {
     const tick = async () => {
       if (stopped || !isMounted.current || selectedNodeRef.current !== selectedNode) return
       try {
-        const params: ListParams = {
-          search: search || undefined,
-          status: statusFilter === 'all' ? undefined : statusFilter,
-          limit: pageSize,
-          offset: page * pageSize,
-          sort: sortField,
-          order: sortOrder,
+        const params: ListParams = buildSessionListParams({
+          search,
+          statusFilter,
+          page,
+          pageSize,
+          sortField,
+          sortOrder,
           node: selectedNode,
-        }
+        })
         const res = await fetchSessions(params)
         if (stopped || !isMounted.current || selectedNodeRef.current !== selectedNode) return
         ingestSessionSummaries(res.items)
