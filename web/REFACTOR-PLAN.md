@@ -233,7 +233,7 @@ SessionsPage data layer remain).
 
 ## 6. Definition of done (checked against the current tree)
 
-- [ ] **Size.** `SessionsPage.tsx` is 1,416 lines (was 1,777 before this pass) and
+- [ ] **Size.** `SessionsPage.tsx` is 1,339 lines (was 1,777 before this pass) and
       `SessionDetailPage.tsx` is 1,753 (was 1,893). Both are still far over the
       400-line page target; four components are over the 300-line target.
 - [x] **Naming.** Every non-component module is `kebab-case.ts`, no import
@@ -244,11 +244,13 @@ SessionsPage data layer remain).
 - [x] **Hooks.** `hooks/` holds `use-session-events`, `use-repeat-while-pressed`,
       `use-reduced-motion`, `repeat-controller`, `use-attach-idle-animation`,
       `use-attach-reconnect`, `use-terminal-keyboard-sync`,
-      `use-session-table-columns` and `use-session-list-gestures`.
-- [x] **Tests.** 311 unit tests across 37 files and 23 Playwright specs
-      (13 Chromium + 10 mobile Safari) — the iOS project is new.
+      `use-session-table-columns`, `use-session-list-gestures`.
+- [x] **Tests.** 325 unit tests across 38 files and 23 Playwright specs
+      (13 Chromium + 10 mobile Safari), with the staleness contract, the
+      reconnect policy and the gesture helpers all covered directly.
 - [x] **Gates.** `tsc -b`, `eslint src e2e`, `vitest run`, `prettier --check` and
-      `playwright test` all clean.
+      `playwright test` all clean; the e2e suite keeps a trace and a screenshot
+      on failure.
 
 ## 7. Not in scope
 
@@ -283,7 +285,7 @@ _had_ to change are called out in their commit messages.
 File sizes, before -> now:
 
 ```
-SessionsPage.tsx         2514 -> 1416
+SessionsPage.tsx         2514 -> 1339
 pages/session-detail..   1973 -> 1753
 api/client.ts             694 ->   18 (facade)
 AttachPanel.tsx           862 ->  646
@@ -295,28 +297,21 @@ Test counts: 243 -> 311 unit (30 -> 37 files), 13 -> 23 Playwright specs.
 
 ### Left, in the order I would take it
 
-1. **`loadLocal` / `loadRemote` / `reloadSessions`** (~150 lines) into
-   `pages/sessions-page-data.ts`. Deliberately not merged even though they look
-   like duplicates: their `isCurrent()` guards, their `finally` arms, and their
-   error messages differ in load-bearing ways. A shared implementation would be
-   a rewrite, not a move — worth doing only with a test that pins the
-   stale-response contract.
-2. **`use-sparkline-animation.ts`** — the rAF draw loop in `SparklineSvg.tsx`.
-   Threads eight refs and the entire draw path, so a rewrite like item 3 rather
-   than a relocation. Needs a browser-level test for the frame budget first.
-3. **The rest of the attach-socket effect** — what remains in
+1. **`use-sparkline-animation.ts`** — the rAF draw loop in `SparklineSvg.tsx`.
+   Threads eight refs and the entire draw path, so a rewrite rather than a
+   relocation. Needs a browser-level test for the frame budget first.
+2. **The rest of the attach-socket effect** — what remains in
    `SessionDetailPage` is the `AttachSocket` construction, the rAF deferral and
    the cleanup. Closing that up means threading ~25 dependencies through a
    params object. The reconnect policy, the scheduler and the frame table are
-   already out, and the three reconnect specs plus the header-label spec now
-   cover the parts that were moved; a browser test for socket-drop-while-hidden
-   is the missing piece before the rest.
-4. **`session-detail-logs.ts` and `-reconnect.ts`'s trace helpers** — the logs
-   effect composes the page's ref-and-state machine with API calls, so moving it
-   relocates it without making it reusable or testable. Same judgement as the
-   earlier round; recorded here so it is a decision rather than an omission.
+   already out, and the reconnect specs plus the header-label spec cover the
+   moved parts; a browser test for socket-drop-while-hidden is the missing
+   piece before the rest.
+3. **`session-detail-logs.ts`** — the logs effect composes the page's
+   ref-and-state machine with API calls, so moving it relocates it without
+   making it reusable or testable. Recorded as a decision rather than an
+   omission.
 
-Items 1-4 are all rewrites with a shared shape: each needs a test that pins the
+All three are rewrites with a shared shape: each needs a test that pins the
 behaviour before the code moves, because the seams are wide and the bug classes
-they expose (stale responses, frame budgeting, reconnect timing) are invisible
-to a type check.
+they expose (frame budgeting, reconnect timing) are invisible to a type check.

@@ -187,3 +187,31 @@ rather than accidental:
 - **`pullOffsetRef.current = 56` is its own constant.** It is not
   `PULL_FULL + 8`; the held offset and the threshold are unrelated numbers that
   happen to differ by 8.
+
+32. **FIXED** (`bb8507f`) �� the e2e suite had no trace, screenshot or retry
+    setup, so a failure named a test and nothing else. This suite is the only
+    thing that catches the browser-level regressions the other gates pass, and
+    four of the last five bugs found in this refactor were found by it. Traces
+    and screenshots are now kept on failure; CI retries twice, locally not at
+    all, so a local flake still fails loudly. `test-results/` and
+    `playwright-report/` are also added to `.gitignore`, which the Prettier
+    ignore already had.
+
+33. **FIXED** (`2981dfc`) �� `loadLocal` and `loadRemote` were two near-identical
+    44-line copies of the stale-response contract, with only one of them
+    guarding `setLoading` in its `finally`. Unified behind
+    `runSessionLoad`, with 14 tests covering the guard, the discard path, the
+    error wording and the skeleton/spinner matrix.
+
+### A defect class worth remembering
+
+34. **Unstable hook dependencies.** Passing an object literal into a hook, then
+    listing that object in a `useCallback` dependency array, gives you a new
+    function every render - and any effect keyed on it re-runs forever. It
+    happened twice in this refactor: `useSessionLoaders` (caught by two e2e
+    failures: a lost sparkline path and a lost row) and `useAttachReconnect`
+    (caught by auditing for it, before it could matter). `tsc`, `eslint` and 325
+    unit tests were green both times. **Mitigation:** flat input signatures, and
+    `useRef` for objects a hook builds itself. **Not yet mitigated:** there is
+    no lint rule for this - `react-hooks/exhaustive-deps` catches a _missing_
+    dep, not a _fresh_ one, so the guard is the signature and a review.
