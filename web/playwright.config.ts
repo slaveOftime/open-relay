@@ -19,7 +19,17 @@ export default defineConfig({
   use: {
     baseURL: 'http://127.0.0.1:4173',
     serviceWorkers: 'block',
+    // A failure without a trace is a failure you cannot act on, and this suite
+    // is the only thing that catches the browser-level regressions tsc and the
+    // unit tests happily pass (a second terminal mount, a missing header label,
+    // a list that applied a stale response).
+    trace: 'retain-on-failure',
+    screenshot: 'only-on-failure',
   },
+  // Locally a flake fails loudly and stays fast; CI gets the retry so one
+  // slow worker does not turn a green build red. The traces above are what make
+  // the retry honest rather than a way to hide a real bug.
+  retries: process.env.CI ? 2 : 0,
   projects: [
     {
       name: 'chromium',
