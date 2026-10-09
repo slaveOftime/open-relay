@@ -28,6 +28,7 @@ import {
 } from '@/utils/log-replay'
 import StatusBadge from '@/components/StatusBadge'
 import { useAttachIdleAnimation } from '@/hooks/use-attach-idle-animation'
+import { useAttachReconnect } from '@/hooks/use-attach-reconnect'
 import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
 import XTerm, { type XTermHandle } from '@/components/XTerm'
@@ -158,9 +159,6 @@ function SessionDetailPageContent() {
   const termContainerRef = useRef<HTMLDivElement>(null)
   const isMounted = useRef(true)
   const replayIdxRef = useRef(0)
-  const reconnectAttemptRef = useRef(0)
-  const reconnectTimerRef = useRef<number | null>(null)
-  const pendingReconnectRef = useRef(false)
   const connectAttemptStartedAtRef = useRef(0)
   const outputBufferRef = useRef<Uint8Array[]>([])
   const outputFlushRafRef = useRef<number | null>(null)
@@ -635,6 +633,20 @@ function SessionDetailPageContent() {
   // Python REPL) to redraw its prompt, producing a duplicate cursor line.
   const sessionReady = session !== null
 
+  // Reconnect backoff, attempt counting and deferred-while-hidden state.
+  const reconnect = useAttachReconnect({
+    pushTrace: pushConnectTrace,
+    setError: setWsError,
+    setConnecting: setWsConnecting,
+    triggerReconnect: () => setWsReconnectKey((k) => k + 1),
+    isCurrent: () => isMounted.current && modeRef.current === 'attach',
+  })
+  const reconnectTimerRef = reconnect.timerRef
+  const pendingReconnectRef = reconnect.pendingRef
+  const resetReconnectAttempts = reconnect.resetAttempts
+  const cancelReconnect = reconnect.cancelReconnect
+  const scheduleReconnect = reconnect.scheduleReconnect
+
   useEffect(() => {
     if (mode !== 'attach' || !id || !sessionReady) return
 
@@ -661,45 +673,6 @@ function SessionDetailPageContent() {
     let discarded = false
     let gotSnapshot = false
 
-    const scheduleReconnect = (code: number, reason: string) => {
-      setWsConnecting(true)
-      const attempt = reconnectAttemptRef.current + 1
-      reconnectAttemptRef.current = attempt
-      const delay = Math.min(2000, 120 * 2 ** Math.min(6, attempt - 1))
-      const hidden = document.visibilityState !== 'visible'
-      const offline = typeof navigator !== 'undefined' && !navigator.onLine
-
-      if (reconnectTimerRef.current !== null) {
-        clearTimeout(reconnectTimerRef.current)
-        reconnectTimerRef.current = null
-      }
-
-      if (hidden || offline) {
-        pendingReconnectRef.current = true
-        pushConnectTrace(
-          `reconnect deferred (${hidden ? 'hidden' : ''}${hidden && offline ? '+' : ''}${offline ? 'offline' : ''}) attempt=${attempt}`
-        )
-        setWsError(null)
-        return
-      }
-
-      pendingReconnectRef.current = false
-      const transientClose = code === 1006 || code === 1001 || code === 1005 || code === 0
-      if (!transientClose) {
-        pushConnectTrace(
-          `non-transient close treated as retryable (code=${code}${reason ? ` reason=${reason}` : ''}) attempt=${attempt}`
-        )
-      }
-      setWsError(null)
-
-      reconnectTimerRef.current = window.setTimeout(() => {
-        if (!discarded && isMounted.current && modeRef.current === 'attach') {
-          pushConnectTrace(`retry timer fired (attempt=${attempt}) -> reconnect`)
-          setWsReconnectKey((k) => k + 1)
-        }
-      }, delay)
-    }
-
     connectAttemptStartedAtRef.current = Date.now()
     // Defer WebSocket creation to requestAnimationFrame so that:
     // 1) StrictMode's synchronous mount→unmount→mount sets `discarded = true`
@@ -717,8 +690,7 @@ function SessionDetailPageContent() {
         {
           onOpen: () => {
             pushConnectTrace('websocket open')
-            reconnectAttemptRef.current = 0
-            pendingReconnectRef.current = false
+            resetReconnectAttempts()
             connectAttemptStartedAtRef.current = 0
             lastSentResizeRef.current = null
             pendingResizeRef.current = null
@@ -815,10 +787,7 @@ function SessionDetailPageContent() {
     return () => {
       discarded = true
       cancelAnimationFrame(connectRaf)
-      if (reconnectTimerRef.current !== null) {
-        clearTimeout(reconnectTimerRef.current)
-        reconnectTimerRef.current = null
-      }
+      cancelReconnect()
       if (outputFlushRafRef.current !== null) {
         cancelAnimationFrame(outputFlushRafRef.current)
         outputFlushRafRef.current = null
