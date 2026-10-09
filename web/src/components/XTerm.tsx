@@ -7,6 +7,7 @@ import { cn } from '@/utils/cn'
 import QuickKeysMenu from './terminal/QuickKeysMenu'
 import QuickKeysDialog from './terminal/QuickKeysDialog'
 import { markOwnedTerminalWheel } from './terminal/scroll-wheel'
+import { findScrollContainer } from '@/utils/scroll-container'
 import type { QuickKey } from '@/lib/quickKeys'
 // import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css'
@@ -378,25 +379,6 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
       })
     })
     ro.observe(containerRef.current)
-
-    const findScrollContainer = (node: HTMLElement | null): HTMLElement | null => {
-      let current = node?.parentElement ?? null
-      while (current) {
-        const style = window.getComputedStyle(current)
-        const overflowY = style.overflowY
-        const canScroll =
-          (overflowY === 'auto' || overflowY === 'scroll') &&
-          current.scrollHeight > current.clientHeight
-        if (canScroll) {
-          return current
-        }
-        current = current.parentElement
-      }
-
-      return document.scrollingElement instanceof HTMLElement
-        ? document.scrollingElement
-        : document.documentElement
-    }
 
     let keyboardSyncRaf = 0
     let keyboardSyncPasses = 0

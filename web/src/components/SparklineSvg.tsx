@@ -4,9 +4,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import {
   advanceTimedBuckets,
   animatedHeadY,
+  buildAreaPath,
+  buildSmoothLinePath,
   seedHeldBuckets,
-  type SparklinePoint,
+  sparklinePointsFromHeights,
 } from './sparklineGeometry'
+import { buildSparklineModel } from './sparklineModel'
 import { SPARKLINE_BUCKET_MS, type SparklineActivitySnapshot } from '@/lib/sparklineStore'
 import {
   calculateAverageBytesPerSecond,
@@ -26,40 +29,12 @@ interface Props {
   enableAnimation: boolean
 }
 
-type SparklinePalette = {
-  stroke: string
-  strokeHighlight: string
-  glow: string
-  fillTop: string
-  fillBottom: string
-  dot: string
-  baseline: string
-}
-
-const RUNNING_PALETTE: SparklinePalette = {
-  stroke: '#34C85B',
-  strokeHighlight: '#8EF5AB',
-  glow: '#2BC851A6',
-  fillTop: '#34C85B',
-  fillBottom: '#34c85b86',
-  dot: '#34C85B',
-  baseline: '#34c85b86',
-}
-
+/** Head transition and the frame budget the animation loop spends per tick. */
 const HEAD_TRANSITION_MS = 220
 const FRAME_MS = 1000 / 60
 
 function activityTooltipLabel(series: number[], isRunning: boolean): string {
   return `${isRunning ? 'Running' : 'Stopped'} activity\nRecent: ${formatBytesPerSecond(calculateRecentBytesPerSecond(series))}\nPeak: ${formatBytesPerSecond(calculatePeakBytesPerSecond(series))}\nAverage: ${formatBytesPerSecond(calculateAverageBytesPerSecond(series))}`
-}
-const IDLE_PALETTE: SparklinePalette = {
-  stroke: '#7D8B97',
-  strokeHighlight: '#C5D0D8',
-  glow: '#32404B66',
-  fillTop: '#7D8B9724',
-  fillBottom: '#11181D00',
-  dot: '#D6DEE4',
-  baseline: '#24303A',
 }
 
 type SparklineVisualState = {
@@ -509,95 +484,4 @@ export default function SparklineSvg({
       </TooltipContent>
     </Tooltip>
   )
-}
-
-function buildSparklineModel(
-  series: number[],
-  width: number,
-  height: number,
-  isRunning: boolean
-): {
-  areaPath: string
-  linePath: string
-  lastPoint: SparklinePoint
-  points: SparklinePoint[]
-  baselineY: number
-  palette: SparklinePalette
-} {
-  const baselineY = Math.max(2, height - 3)
-  const palette = isRunning ? RUNNING_PALETTE : IDLE_PALETTE
-  const points = buildSparklinePoints(series, width, height)
-  const linePath = buildSmoothLinePath(points)
-  const areaPath = buildAreaPath(points, baselineY)
-
-  return {
-    areaPath,
-    linePath,
-    lastPoint: points[points.length - 1] ?? { x: width, y: baselineY },
-    points,
-    baselineY,
-    palette,
-  }
-}
-
-function buildSparklinePoints(series: number[], width: number, height: number): SparklinePoint[] {
-  if (series.length < 2) {
-    const baselineY = Math.max(2, height - 3)
-    return [
-      { x: 0, y: baselineY },
-      { x: width, y: baselineY },
-    ]
-  }
-
-  const maxValue = Math.max(...series, 0)
-  const topPadding = 2
-  const bottomPadding = 3
-  const range = Math.max(height - topPadding - bottomPadding, 1)
-  const step = width / (series.length - 1)
-
-  return series.map((value, index) => {
-    const x = index * step
-    const normalized = maxValue <= 0 ? 0 : Math.log10(value + 1) / Math.log10(maxValue + 1)
-    const emphasis = normalized <= 0 ? 0 : Math.pow(normalized, 0.86)
-    const y = height - bottomPadding - emphasis * range
-    return { x, y }
-  })
-}
-
-function sparklinePointsFromHeights(heights: number[], width: number): SparklinePoint[] {
-  if (heights.length < 2) {
-    const y = heights[0] ?? 0
-    return [
-      { x: 0, y },
-      { x: width, y },
-    ]
-  }
-  const step = width / (heights.length - 1)
-  return heights.map((y, index) => ({ x: index * step, y }))
-}
-
-function buildSmoothLinePath(points: SparklinePoint[]): string {
-  if (points.length === 0) return ''
-  const [first, ...rest] = points
-  return [
-    `M ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
-    ...rest.map((point) => `L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`),
-  ].join(' ')
-}
-
-function buildAreaPath(
-  points: SparklinePoint[],
-  baselineY: number,
-  linePath = buildSmoothLinePath(points)
-): string {
-  if (points.length === 0) return ''
-  const first = points[0]
-  const last = points[points.length - 1]
-  return [
-    `M ${first.x.toFixed(2)} ${baselineY.toFixed(2)}`,
-    `L ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
-    linePath.slice(1),
-    `L ${last.x.toFixed(2)} ${baselineY.toFixed(2)}`,
-    'Z',
-  ].join(' ')
 }

@@ -7,6 +7,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react'
 import { parseKeySpec, parseKeyInputSpecs, splitKeyInput } from '@/utils/keyInput'
+import { findScrollContainer } from '@/utils/scroll-container'
 import { insertUploadedPathAtSelection, removeUploadedPathFromInput } from './attach-panel-input'
 import {
   coerceSessionImagePreviews,
@@ -265,30 +266,11 @@ export default function AttachPanel({
     setCustomInput(nextValue)
   }, [])
 
-  const findScrollContainer = useCallback((node: HTMLElement | null): HTMLElement | null => {
-    let current = node?.parentElement ?? null
-    while (current) {
-      const style = window.getComputedStyle(current)
-      const overflowY = style.overflowY
-      const canScroll =
-        (overflowY === 'auto' || overflowY === 'scroll') &&
-        current.scrollHeight > current.clientHeight
-      if (canScroll) {
-        return current
-      }
-      current = current.parentElement
-    }
-
-    return document.scrollingElement instanceof HTMLElement
-      ? document.scrollingElement
-      : document.documentElement
-  }, [])
-
   const scrollDrawerIntoView = useCallback(() => {
     const target = findScrollContainer(rootRef.current)
     if (!target) return
     target.scrollTo({ top: target.scrollHeight, behavior: 'auto' })
-  }, [findScrollContainer])
+  }, [])
 
   function resizeCustomInput() {
     const textarea = customInputRef.current

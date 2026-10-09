@@ -94,3 +94,69 @@ export function timedSparklinePoints(
     { x: width, y: headY },
   ]
 }
+
+export function sparklinePointsFromHeights(heights: number[], width: number): SparklinePoint[] {
+  if (heights.length < 2) {
+    const y = heights[0] ?? 0
+    return [
+      { x: 0, y },
+      { x: width, y },
+    ]
+  }
+  const step = width / (heights.length - 1)
+  return heights.map((y, index) => ({ x: index * step, y }))
+}
+
+export function buildSmoothLinePath(points: SparklinePoint[]): string {
+  if (points.length === 0) return ''
+  const [first, ...rest] = points
+  return [
+    `M ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
+    ...rest.map((point) => `L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`),
+  ].join(' ')
+}
+
+export function buildAreaPath(
+  points: SparklinePoint[],
+  baselineY: number,
+  linePath = buildSmoothLinePath(points)
+): string {
+  if (points.length === 0) return ''
+  const first = points[0]
+  const last = points[points.length - 1]
+  return [
+    `M ${first.x.toFixed(2)} ${baselineY.toFixed(2)}`,
+    `L ${first.x.toFixed(2)} ${first.y.toFixed(2)}`,
+    linePath.slice(1),
+    `L ${last.x.toFixed(2)} ${baselineY.toFixed(2)}`,
+    'Z',
+  ].join(' ')
+}
+
+export function buildSparklinePoints(
+  series: number[],
+  width: number,
+  height: number
+): SparklinePoint[] {
+  if (series.length < 2) {
+    const baselineY = Math.max(2, height - 3)
+    return [
+      { x: 0, y: baselineY },
+      { x: width, y: baselineY },
+    ]
+  }
+
+  const maxValue = Math.max(...series, 0)
+  const topPadding = 2
+  const bottomPadding = 3
+  const range = Math.max(height - topPadding - bottomPadding, 1)
+  const step = width / (series.length - 1)
+
+  return series.map((value, index) => {
+    const x = index * step
+    const normalized = maxValue <= 0 ? 0 : Math.log10(value + 1) / Math.log10(maxValue + 1)
+    const emphasis = normalized <= 0 ? 0 : Math.pow(normalized, 0.86)
+    const y = height - bottomPadding - emphasis * range
+    return { x, y }
+  })
+}
