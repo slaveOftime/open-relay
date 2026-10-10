@@ -48,7 +48,7 @@ import {
 import Logo from '@/components/Logo'
 import SseStatusDot from '@/components/SseStatusDot'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
+import { ClearableInput } from '@/components/ui/clearable-input'
 import {
   Table,
   TableBody,
@@ -71,7 +71,6 @@ import {
   CaretDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  Cross2Icon,
   GridIcon,
   PlayIcon,
   PlusIcon,
@@ -951,30 +950,18 @@ export default function SessionsPage() {
               <span>Open Relay</span>
             </div>
 
-            <div className="relative w-48">
-              <Input
-                className={search ? 'h-8 w-full pr-8 text-sm' : 'h-8 w-full text-sm'}
+            <div className="w-48">
+              <ClearableInput
+                className="h-8 w-full text-sm"
                 placeholder="Search cmd: cwd: title: tag:"
                 aria-label="Search sessions by id, title, command, or working directory"
+                clearLabel="Clear search"
                 value={search}
                 onChange={(e) => {
                   setSearch(e.target.value)
                   setPage(0)
                 }}
               />
-              {search && (
-                <button
-                  type="button"
-                  aria-label="Clear search"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
-                  onClick={() => {
-                    setSearch('')
-                    setPage(0)
-                  }}
-                >
-                  <Cross2Icon className="h-3.5 w-3.5" />
-                </button>
-              )}
             </div>
 
             <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>

@@ -465,3 +465,71 @@ test('duplicate force-removes the source only after create and retries removal w
   expect(removeCount).toBe(2)
   await page.locator('form').getByRole('button', { name: 'Close' }).click()
 })
+
+test('the search box clear button is a phone-sized target, not an icon', async ({ page }) => {
+  await page.route('**/api/auth/status', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ auth_required: false }),
+    })
+  )
+  await page.route('**/api/nodes', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
+  )
+  await page.route('**/api/push/public-key', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ public_key: null }),
+    })
+  )
+  await page.route('**/api/push/subscriptions', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, deleted: false }),
+    })
+  )
+  await page.route('**/api/sessions/events**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `event: stream_ready\ndata: ${JSON.stringify({ version: 2, nodes: [] })}\n\n`,
+    })
+  )
+  await page.route('**/api/sessions**', (route) => {
+    if (new URL(route.request().url()).pathname === '/api/sessions/events') {
+      void route.fallback()
+      return
+    }
+    void route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ items: [], total: 0, offset: 0, limit: 15 }),
+    })
+  })
+
+  await page.goto('/')
+  const search = page.getByRole('textbox', {
+    name: 'Search sessions by id, title, command, or working directory',
+  })
+  const clear = page.getByRole('button', { name: 'Clear search' })
+
+  // No clear button until there is something to clear.
+  await expect(clear).toHaveCount(0)
+  await search.fill('bash')
+  await expect(clear).toBeVisible()
+
+  // The button never appears without a value, and the input keeps its text out
+  // from under it (pr-9), so a long query cannot hide behind the icon.
+  const box = (await clear.boundingBox())!
+  expect(box.width).toBe(32)
+  expect(box.height).toBe(32)
+
+  // The touch area is stretched past the icon: a tap 20px from centre �� six
+  // pixels beyond the 32px button �� still lands on it.
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2 - 20)
+  await expect(search).toHaveValue('')
+  await expect(clear).toHaveCount(0)
+})

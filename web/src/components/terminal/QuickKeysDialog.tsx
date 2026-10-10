@@ -2,6 +2,7 @@ import { useRef, useState, useSyncExternalStore } from 'react'
 import { GripVertical, Pencil, Plus, RotateCcw, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { ClearableInput } from '@/components/ui/clearable-input'
 import {
   Dialog,
   DialogContent,
@@ -306,12 +307,14 @@ export default function QuickKeysDialog({ open, onOpenChange }: Props) {
           }}
         >
           <div className="flex gap-2">
-            <Input
+            <ClearableInput
               ref={comboInputRef}
+              containerClassName="flex-1 min-w-0"
               value={combo}
               onChange={(event) => setCombo(event.target.value)}
               placeholder="Combo, e.g. ctrl+c or enter space"
-              className="h-11 flex-1"
+              clearLabel="Clear combo"
+              className="h-11 w-full"
               aria-label="Key combo"
             />
             <Input

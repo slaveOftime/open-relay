@@ -4,7 +4,7 @@ import { updateSessionMetadata } from '@/api/client'
 import type { SessionSummary } from '@/api/types'
 import { buildSessionMetadataUpdateSpec, formatSessionTagInput } from '@/lib/session-metadata'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
+import { ClearableInput } from '@/components/ui/clearable-input'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { FormActions, FormError, FormField } from '@/components/ui/form-field'
 import NotificationToggle from '@/components/NotificationToggle'
@@ -115,10 +115,11 @@ function SessionMetadataDialogForm({
           </div>
         </div>
         <FormField name="title" label="Title" description="Leave blank to clear the title.">
-          <Input
+          <ClearableInput
             value={title}
             onChange={(event) => setTitle(event.target.value)}
             placeholder="Optional display name"
+            clearLabel="Clear title"
             autoFocus
           />
         </FormField>
@@ -127,10 +128,11 @@ function SessionMetadataDialogForm({
           label="Tags"
           description="Separate tags with commas. Leave blank to clear all tags."
         >
-          <Input
+          <ClearableInput
             value={tags}
             onChange={(event) => setTags(event.target.value)}
             placeholder="prod, release"
+            clearLabel="Clear tags"
           />
         </FormField>
         <NotificationToggle

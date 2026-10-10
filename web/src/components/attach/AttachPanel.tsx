@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'reac
 import { Button } from '@/components/ui/button'
 import { FileDropZone } from '@/components/ui/file-drop-zone'
 import { getTransferredFiles } from '@/components/ui/file-transfer'
-import { Input } from '@/components/ui/input'
+import { ClearableInput } from '@/components/ui/clearable-input'
 import { Textarea } from '@/components/ui/textarea'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react'
@@ -573,10 +573,11 @@ export default function AttachPanel({
               ⚡colorful key will be sent immediately
             </p>
             <div className="mt-2 flex items-center gap-1">
-              <Input
+              <ClearableInput
                 id="custom-keys"
                 className="text-sm"
                 placeholder="Keys separated by whitespace. Press enter to send."
+                clearLabel="Clear keys"
                 value={customKeys}
                 onChange={(e) => updateCustomKeys(e.target.value)}
                 onKeyDown={(e) => {

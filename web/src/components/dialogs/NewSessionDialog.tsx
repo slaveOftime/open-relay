@@ -5,7 +5,7 @@ import { parseSessionTagInput } from '@/lib/session-metadata'
 import { cn } from '@/utils/cn'
 import { parseArgString } from '@/utils/format'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
+import { ClearableInput } from '@/components/ui/clearable-input'
 import { Switch } from '@/components/ui/switch'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { FormActions, FormError, FormField } from '@/components/ui/form-field'
@@ -191,20 +191,22 @@ export default function NewSessionDialog({
             required
             error={error === 'Command is required' ? error : undefined}
           >
-            <Input
+            <ClearableInput
               value={cmd}
               onChange={(event) => setCmd(event.target.value)}
               placeholder="claude, bash, python…"
+              clearLabel="Clear command"
               required
               autoFocus
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="arguments" label="Arguments">
-            <Input
+            <ClearableInput
               value={args}
               onChange={(event) => setArgs(event.target.value)}
               placeholder="--model sonnet-3.7 (space-separated)"
+              clearLabel="Clear arguments"
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
@@ -220,26 +222,29 @@ export default function NewSessionDialog({
             </button>
           ) : null}
           <FormField name="title" label="Title">
-            <Input
+            <ClearableInput
               value={title}
               onChange={(event) => setTitle(event.target.value)}
               placeholder="Optional display name"
+              clearLabel="Clear title"
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="tags" label="Tags">
-            <Input
+            <ClearableInput
               value={tags}
               onChange={(event) => setTags(event.target.value)}
               placeholder="prod, release (Separate tags with commas)"
+              clearLabel="Clear tags"
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
           <FormField name="cwd" label="Working Directory">
-            <Input
+            <ClearableInput
               value={cwd}
               onChange={(event) => setCwd(event.target.value)}
               placeholder="/path/to/project"
+              clearLabel="Clear working directory"
               disabled={loading || startedSessionId !== null || creationUncertain}
             />
           </FormField>
