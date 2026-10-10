@@ -7,6 +7,30 @@ import { test, expect, type Page } from '@playwright/test'
  */
 test.use({ viewport: { width: 375, height: 812 } })
 
+// A real touch tap is a different code path from a synthetic mouse click: no
+// mousedown focus, and a click that arrives after the press already focused the
+// search input. The suite's mouse-driven tests cannot see this, so the gesture
+// runs under touch input here.
+test.describe('with touch input', () => {
+  test.use({ hasTouch: true })
+
+  test('a tap expands the bar and hands focus to the input', async ({ page }) => {
+    const icon = page.getByRole('button', { name: SEARCH_ICON })
+    const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+
+    await icon.tap()
+
+    await expect(input).toBeVisible()
+    // The bar must keep the input focused: the tap's own click moves focus to
+    // the trigger as its default action, which would blur the input and close
+    // the bar it just opened.
+    await expect(input).toBeFocused()
+    await page.waitForTimeout(400)
+    await expect(input).toBeVisible()
+    await expect(input).toBeFocused()
+  })
+})
+
 function makeSession(id: string, title: string, status: string) {
   return {
     id,

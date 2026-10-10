@@ -17,7 +17,7 @@ import { useLongPress } from '@/hooks/use-long-press'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
 import { Input } from '@/components/ui/input'
 
-/** QuickKeysMenu's pop ease: a slight overshoot so the menu feels springy. */
+/** QuickKeysMenu's pop ease: a slight overshoot so the popups feel springy. */
 const SPRING_EASE = 'cubic-bezier(0.34, 1.56, 0.64, 1)'
 const ENTER_DURATION_MS = 200
 /** h-12, the scroll handle's size. The bar is the trigger plus its input zone. */
@@ -166,7 +166,13 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
             aria-label="Search sessions by id, title, command, or working directory"
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
-            onBlur={collapseBar}
+            onBlur={(event) => {
+              // The tap that just opened this bar moves focus to the trigger
+              // as the gesture's default action, which blurs the input right
+              // after it was focused. That move is not a dismissal.
+              if (event.relatedTarget === iconRef.current) return
+              collapseBar()
+            }}
             onKeyDown={(event) => {
               if (event.key === 'Escape') collapseBar()
             }}
@@ -195,11 +201,13 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         aria-label="Search sessions"
         aria-haspopup="true"
         aria-expanded={menuOpen}
-        {...hold}
-        // Keyboard activation only. Pointer taps are handled on pointerup by
-        // the hold, and the click a held press synthesizes must not fire.
+        {...hold.handlers}
+        // Only a click with no gesture behind it: the keyboard, assistive
+        // tech, a programmatic click. The browser's follow-up click for a tap
+        // or hold is swallowed by the window check — a tap activates twice
+        // without it.
         onClick={(event) => {
-          if (event.detail !== 0) return
+          if (hold.isFollowUpClick(event.timeStamp)) return
           handlePress()
         }}
         className={cn(
@@ -220,7 +228,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
           ref={menuRef}
           style={popStyle}
           className={cn(
-            'absolute bottom-full right-0 z-40 mb-2 w-60 origin-bottom-right rounded-lg',
+            'absolute bottom-full right-0 z-40 mb-2 origin-bottom-right rounded-lg',
             'border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 p-3',
             'shadow-xl backdrop-blur-sm transition-[transform,opacity]',
             armed ? 'pointer-events-auto' : 'pointer-events-none'

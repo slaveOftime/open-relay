@@ -37,15 +37,19 @@ export default defineConfig({
     },
     {
       name: 'mobile-safari',
-      // Only the attach specs, deliberately. The others either assume the
-      // desktop table (`sessions.spec.ts` uses `locator('table')`, which does
-      // not exist at 390px where the card list renders instead) or synthesize
-      // `Touch` objects (`sessions-delete-swipe.spec.ts`), which WebKit rejects
-      // with "Illegal constructor". Both would need the specs themselves
-      // reworked for an iOS viewport, which is a separate job from adding the
-      // engine to the matrix - what iOS adds here is coverage of the iOS-only
-      // attach and keyboard paths.
-      testMatch: /(attach|quick-keys)[^/]*\.spec\.ts/,
+      // Only the mobile-first specs, deliberately. The others either assume
+      // the desktop table (`sessions.spec.ts` uses `locator('table')`, which
+      // does not exist at 390px where the card list renders instead) or
+      // synthesize `Touch` objects (`sessions-delete-swipe.spec.ts`), which
+      // WebKit rejects with "Illegal constructor". Both would need the specs
+      // themselves reworked for an iOS viewport, which is a separate job from
+      // adding the engine to the matrix - what iOS adds here is coverage of
+      // the iOS-only attach and keyboard paths.
+      // `sessions-search-control` is phone-viewport by construction, and the
+      // gesture it drives (tap vs press-and-hold, and the focus a tap that
+      // opens a search bar must keep) is exactly the class of thing that
+      // differs on WebKit.
+      testMatch: /(attach|quick-keys|sessions-search)[^/]*\.spec\.ts/,
       use: { ...MOBILE_SAFARI },
     },
   ],
