@@ -83,12 +83,12 @@ export default defineConfig({
     },
   },
   server: {
-    port: 8060,
+    port: 8061,
     host: '127.0.0.1',
     allowedHosts: ['host.docker.internal'],
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:15443',
+        target: 'http://127.0.0.1:8060',
         changeOrigin: true,
         ws: true,
         // The backend validates the WebSocket handshake Origin against the
