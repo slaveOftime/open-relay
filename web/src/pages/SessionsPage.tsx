@@ -73,7 +73,6 @@ import {
   ChevronRightIcon,
   Cross2Icon,
   GridIcon,
-  MixerHorizontalIcon,
   PlayIcon,
   PlusIcon,
   ReloadIcon,
@@ -110,6 +109,7 @@ import {
 } from './sessions-page-prefs'
 import { buildSessionListParams } from './sessions-page-data'
 import { SortIcon } from '@/components/sessions/SortIcon'
+import SessionSearchControl from '@/components/sessions/SessionSearchControl'
 export default function SessionsPage() {
   const initialPrefs = useMemo(() => loadSessionPrefs(), [])
   const [searchParams, setSearchParams] = useSearchParams()
@@ -134,7 +134,6 @@ export default function SessionsPage() {
   const [deletingSession, setDeletingSession] = useState<SessionSummary | null>(null)
   const [enteringIds, setEnteringIds] = useState<Set<string>>(new Set())
   const [notificationRequestIds, setNotificationRequestIds] = useState<Set<string>>(new Set())
-  const [showFilters, setShowFilters] = useState(false)
   const [pushState, setPushState] = useState<PushSetupState>('idle')
   const [loadError, setLoadError] = useState<LoadErrorState | null>(null)
   // Pinned live sessions (browser-local only, most recently pinned first).
@@ -717,6 +716,21 @@ export default function SessionsPage() {
     { label: 'Stopping', value: 'stopping' },
   ]
 
+  const handleSearchChange = useCallback((value: string) => {
+    setSearch(value)
+    setPage(0)
+  }, [])
+
+  // The inverse of hasActiveFilters.
+  const handleClearFilters = useCallback(() => {
+    setSearch('')
+    setStatusFilter('all')
+    setGroupBy('none')
+    setSortField(SessionSortField.CreatedAt)
+    setSortOrder(SortOrder.Desc)
+    setPage(0)
+  }, [])
+
   const pushEnabled = pushState === 'subscribed'
   const pushButtonLabel = pushEnabled
     ? 'Push On'
@@ -766,6 +780,103 @@ export default function SessionsPage() {
       </SelectContent>
     </Select>
   )
+
+  // The quick menu the search icon opens on a long press: the filter dropdowns
+  // that used to live behind the mobile filter toggle. Selects keep the drawer's
+  // handler bodies verbatim.
+  const filterMenu = (
+    <div className="flex flex-col gap-2">
+      <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
+        <SelectTrigger aria-label="Group sessions by" className="min-w-0 w-full h-8 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="none">No grouping</SelectItem>
+          <SelectItem value="tag">Tag</SelectItem>
+          <SelectItem value="cwd">CWD</SelectItem>
+          <SelectItem value="command">Command</SelectItem>
+        </SelectContent>
+      </Select>
+      <Select
+        value={statusFilter}
+        onValueChange={(v) => {
+          if (isSessionStatusFilter(v)) {
+            setStatusFilter(v)
+            setPage(0)
+          }
+        }}
+      >
+        <SelectTrigger aria-label="Filter by status" className="min-w-0 w-full h-8 text-xs">
+          <SelectValue placeholder="All statuses" />
+        </SelectTrigger>
+        <SelectContent>
+          {statusChips.map((chip) => (
+            <SelectItem key={chip.value} value={chip.value}>
+              {chip.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Select
+        value={sortField}
+        onValueChange={(v) => {
+          const nextSortField = v as SessionSortField
+          setSortField(nextSortField)
+          saveSessionPrefs({
+            search,
+            statusFilter,
+            groupBy,
+            node: selectedNode,
+            sortField: nextSortField,
+            sortOrder,
+            pageSize,
+          })
+          setPage(0)
+        }}
+      >
+        <SelectTrigger aria-label="Sort sessions by" className="min-w-0 w-full h-8 text-xs">
+          <SelectValue placeholder="Sort by" />
+        </SelectTrigger>
+        <SelectContent>
+          {SORT_OPTIONS.map((option) => (
+            <SelectItem key={option.value} value={option.value}>
+              {`Sort by ${option.label}`}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Select
+        value={sortOrder}
+        onValueChange={(v) => {
+          const nextSortOrder = v as SortOrder
+          setSortOrder(nextSortOrder)
+          saveSessionPrefs({
+            search,
+            statusFilter,
+            groupBy,
+            node: selectedNode,
+            sortField,
+            sortOrder: nextSortOrder,
+            pageSize,
+          })
+          setPage(0)
+        }}
+      >
+        <SelectTrigger aria-label="Sort order" className="min-w-0 w-full h-8 text-xs">
+          <SelectValue placeholder="Order" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={SortOrder.Desc}>Descending</SelectItem>
+          <SelectItem value={SortOrder.Asc}>Ascending</SelectItem>
+        </SelectContent>
+      </Select>
+      {hasActiveFilters && (
+        <Button variant="ghost" size="sm" className="h-8 text-xs" onClick={handleClearFilters}>
+          Clear filters
+        </Button>
+      )}
+    </div>
+  )
   const tableWidth = getSessionTableWidth(tableColumnSizes)
 
   return (
@@ -795,7 +906,7 @@ export default function SessionsPage() {
         {/* ── Header ── */}
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
-          <div className="flex flex-nowrap items-center gap-2 px-3 py-2 md:hidden">
+          <div className="relative flex flex-nowrap items-center gap-2 px-3 py-2 md:hidden">
             <div
               className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer min-w-0"
               onClick={() => void reloadSessions({ background: false })}
@@ -812,22 +923,12 @@ export default function SessionsPage() {
               />
             )}
             <div className="flex-1 min-w-0" />
-            <Button
-              variant="ghost"
-              size="icon"
-              className={
-                hasActiveFilters
-                  ? 'text-[hsl(var(--primary))] bg-[hsl(var(--primary))]/10 relative'
-                  : 'relative'
-              }
-              onClick={() => setShowFilters((v) => !v)}
-              aria-label="Toggle filters"
-            >
-              <MixerHorizontalIcon className="h-4 w-4" />
-              {hasActiveFilters && (
-                <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-[hsl(var(--primary))]" />
-              )}
-            </Button>
+            <SessionSearchControl
+              search={search}
+              onSearchChange={handleSearchChange}
+              active={hasActiveFilters}
+              menu={filterMenu}
+            />
             <Button asChild variant="ghost" size="icon">
               <a href="/apps" aria-label="Apps">
                 <GridIcon className="h-4 w-4" />
@@ -844,108 +945,6 @@ export default function SessionsPage() {
             <Button size="icon" onClick={() => setShowNewSession(true)} aria-label="New session">
               <PlusIcon className="h-4 w-4" />
             </Button>
-          </div>
-
-          {/* Mobile filter drawer */}
-          <div
-            className={`md:hidden overflow-hidden transition-all duration-200 ${showFilters ? 'max-h-64 opacity-100' : 'max-h-0 opacity-0'}`}
-          >
-            <div className="px-3 pb-3 mt-1 flex flex-col gap-2">
-              <div className="relative">
-                <Input
-                  className={search ? 'pr-8' : undefined}
-                  placeholder="Search cmd: cwd: title: tag:"
-                  aria-label="Search sessions by id, title, command, or working directory"
-                  value={search}
-                  onChange={(e) => {
-                    setSearch(e.target.value)
-                    setPage(0)
-                  }}
-                />
-                {search && (
-                  <button
-                    type="button"
-                    aria-label="Clear search"
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
-                    onClick={() => {
-                      setSearch('')
-                      setPage(0)
-                    }}
-                  >
-                    <Cross2Icon className="h-3.5 w-3.5" />
-                  </button>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
-                  <SelectTrigger className="min-w-0 flex-1 h-8 text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">No grouping</SelectItem>
-                    <SelectItem value="tag">Tag</SelectItem>
-                    <SelectItem value="cwd">CWD</SelectItem>
-                    <SelectItem value="command">Command</SelectItem>
-                  </SelectContent>
-                </Select>
-                {statusFilterView}
-              </div>
-              <div className="flex gap-2">
-                <Select
-                  value={sortField}
-                  onValueChange={(v) => {
-                    const nextSortField = v as SessionSortField
-                    setSortField(nextSortField)
-                    saveSessionPrefs({
-                      search,
-                      statusFilter,
-                      groupBy,
-                      node: selectedNode,
-                      sortField: nextSortField,
-                      sortOrder,
-                      pageSize,
-                    })
-                    setPage(0)
-                  }}
-                >
-                  <SelectTrigger className="flex-1 h-8 text-xs">
-                    <SelectValue placeholder="Sort by" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {SORT_OPTIONS.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>
-                        {`Sort by ${option.label}`}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Select
-                  value={sortOrder}
-                  onValueChange={(v) => {
-                    const nextSortOrder = v as SortOrder
-                    setSortOrder(nextSortOrder)
-                    saveSessionPrefs({
-                      search,
-                      statusFilter,
-                      groupBy,
-                      node: selectedNode,
-                      sortField,
-                      sortOrder: nextSortOrder,
-                      pageSize,
-                    })
-                    setPage(0)
-                  }}
-                >
-                  <SelectTrigger className="flex-1 h-8 text-xs">
-                    <SelectValue placeholder="Order" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={SortOrder.Desc}>Descending</SelectItem>
-                    <SelectItem value={SortOrder.Asc}>Ascending</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
           </div>
 
           {/* Desktop row */}
