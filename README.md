@@ -177,6 +177,22 @@ oly logs --wait prompt
 oly send <id> "approve" key:enter
 ```
 
+### Scroll while attached
+
+Attach preserves the program's terminal behavior rather than treating every
+TUI repaint as a new transcript line:
+
+- **Main-screen programs** (shells, pi `--tui-mode regular`): use the terminal's
+  scrollbar or its scrollback shortcuts. New output enters scrollback while
+  attached; reattach restores a bounded tail of retained history.
+- **Fullscreen / alternate-screen programs** (pi `--tui-mode fullscreen`,
+  Codex fullscreen): use the application's scroll keys or mouse wheel. The
+  application owns its viewport; the outer terminal's scrollbar is not its
+  conversation history. Picker/fullscreen transitions preserve the main
+  buffer's scrollback instead of mixing TUI frames into it.
+
+For older history beyond the attach seed, use `oly logs <id> --tail <n>`.
+
 ### Watch logs without attaching
 
 ```sh

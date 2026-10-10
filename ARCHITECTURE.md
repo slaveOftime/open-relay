@@ -121,6 +121,17 @@ Two design points worth knowing before touching this code:
   Explicit paste boundaries are decoded before Enter, clipboard, or detach
   handling, preserving pasted CR/LF and Unicode. Windows mouse-mode changes
   preserve raw/VT input bits; teardown restores the console-mode baseline.
+- **A screen repaint is not scrollback.** Windows attach still renders the
+  canonical engine screen instead of forwarding ConPTY's wrap-dependent
+  bytes, but the same parser delegates through `terminal/render_effects.rs`
+  to capture newly scrolled main-buffer rows, alternate-buffer transitions,
+  and explicit history clears. The client forwards those effects to the
+  outer terminal in order, then repaints with row erases (not ED 2, which
+  can manufacture duplicate history). Retention is bounded to a viewport
+  for resize reflow; this is derived display state, not another recording.
+  Fullscreen TUIs keep application-owned scrolling and mouse/key input;
+  main-screen CLIs keep terminal-owned scrollback. Reattach seeds exclude
+  the visible grid and flush every seeded row off-screen before repainting.
 
 ## Node federation
 

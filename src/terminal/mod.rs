@@ -12,6 +12,11 @@
 //! chunk containing `A`, CPR, `B`, CPR yields two responses with two
 //! distinct cursor positions, by construction.
 
+#[cfg(any(windows, test))]
+mod render_effects;
+#[cfg(any(windows, test))]
+pub(crate) use render_effects::RenderEffect;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -169,6 +174,34 @@ impl Terminal {
     /// [`Terminal::drain_events`].
     pub fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// Renderer-only feed: collect real scrollback/buffer effects while the
+    /// same parser advances the same engine. The daemon's normal feed remains
+    /// unchanged; the client forwards new history into its outer terminal.
+    #[cfg(any(windows, test))]
+    pub(crate) fn feed_render(&mut self, bytes: &[u8]) -> Vec<RenderEffect> {
+        let mut effects = Vec::new();
+        self.processor.advance(
+            &mut render_effects::RenderHandler {
+                term: &mut self.term,
+                effects: &mut effects,
+            },
+            bytes,
+        );
+        effects
+    }
+
+    /// Resize the renderer's engine without publishing reflow as newly
+    /// generated history: the outer terminal reflows its own history already.
+    #[cfg(any(windows, test))]
+    pub(crate) fn resize_render(&mut self, rows: u16, cols: u16) {
+        self.resize(rows, cols);
+        // Retain one viewport so a shrink/widen roundtrip can pull logical
+        // lines back into view. Reflow is not emitted as new scrollback.
+        if !self.modes().alt_screen {
+            self.term.grid_mut().update_history(usize::from(rows));
+        }
     }
 
     /// Events raised since the last drain, in stream order.

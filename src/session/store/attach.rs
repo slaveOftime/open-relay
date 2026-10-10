@@ -502,7 +502,12 @@ impl SessionStore {
 /// homed. Shared by the native attach client and the WebSocket attach path,
 /// whose clients render the same byte stream.
 pub fn scrollback_seed_bytes(seed: &[u8], rows: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(seed.len() + usize::from(rows) + 8);
+    let mut out = Vec::with_capacity(seed.len() + usize::from(rows) + 16);
+    // Start on a blank main viewport at a known cursor/scroll region. EL does
+    // not push stale screen contents into history as ED 2 can. History rows
+    // are followed by exactly rows-1 line feeds so even the LAST seeded row
+    // scrolls off; seed length is irrelevant.
+    out.extend_from_slice(b"\x1b[r\x1b[H\x1b[0J");
     // Attaching terminals are in raw mode, so `\n` does not imply a carriage
     // return and every seeded row needs an explicit CRLF. Unlike ED 2
     // (`\x1b[2J`), whose effect on scrollback varies between terminals, the
@@ -513,17 +518,7 @@ pub fn scrollback_seed_bytes(seed: &[u8], rows: u16) -> Vec<u8> {
         }
         out.push(byte);
     }
-    // The seed must end fully scrolled off: the snapshot repaints the visible
-    // screen afterwards, and rows still on screen would be duplicated by it.
-    // A seed at least one screen tall has already scrolled itself off — its
-    // last row's own line feed did the final scroll — so extra newlines would
-    // only push blank rows between the seed and the snapshot in the client's
-    // scrollback.  A shorter seed still needs a full screen of newlines to
-    // guarantee the scroll-off regardless of where the cursor started.
-    let seed_lines = seed.iter().filter(|&&byte| byte == b'\n').count();
-    if seed_lines < usize::from(rows) {
-        out.resize(out.len() + usize::from(rows), b'\n');
-    }
+    out.resize(out.len() + usize::from(rows.max(1) - 1), b'\n');
     out.extend_from_slice(b"\x1b[H");
     out
 }
@@ -571,11 +566,34 @@ mod tests {
     use crate::session::{SessionStatus, pty::collect_chunk_bytes};
 
     #[test]
+    fn scrollback_seed_places_every_row_in_history_without_blank_gap() {
+        for count in [1, 2, 3, 8] {
+            let seed = (0..count)
+                .map(|index| format!("seed {index}\n"))
+                .collect::<String>();
+            let mut outer = crate::terminal::Terminal::new(3, 20, 100);
+            outer.feed(&scrollback_seed_bytes(seed.as_bytes(), 3));
+            assert_eq!(
+                outer.history_size(),
+                count,
+                "seed of {count} rows was not fully scrolled off"
+            );
+            assert_eq!(
+                outer.full_lines()[..count],
+                (0..count)
+                    .map(|index| format!("seed {index}"))
+                    .collect::<Vec<_>>()
+            );
+            assert!(outer.screen_lines().iter().all(String::is_empty));
+        }
+    }
+
+    #[test]
     fn scrollback_seed_uses_crlf_and_scrolls_every_seeded_row_into_history() {
         let bytes = scrollback_seed_bytes(b"line one\nline two\n\x1b[0m", 3);
         assert_eq!(
             bytes,
-            b"line one\r\nline two\r\n\x1b[0m\n\n\n\x1b[H".as_slice()
+            b"\x1b[r\x1b[H\x1b[0Jline one\r\nline two\r\n\x1b[0m\n\n\x1b[H".as_slice()
         );
     }
 
@@ -587,22 +605,25 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_seed_taller_than_screen_needs_no_extra_newlines() {
-        // A deep seed scrolls itself off with its own line feeds; extra
-        // newlines would push blank rows between the seed and the snapshot
-        // repaint in the client's scrollback.
+    fn scrollback_seed_taller_than_screen_scrolls_its_final_rows_off() {
+        // Even a deep seed leaves its final screenful visible until flushed.
         let seed = "row 0\nrow 1\nrow 2\n";
         let bytes = scrollback_seed_bytes(seed.as_bytes(), 3);
-        assert_eq!(bytes, b"row 0\r\nrow 1\r\nrow 2\r\n\x1b[H".as_slice());
+        assert_eq!(
+            bytes,
+            b"\x1b[r\x1b[H\x1b[0Jrow 0\r\nrow 1\r\nrow 2\r\n\n\n\x1b[H".as_slice()
+        );
     }
 
     #[test]
     fn scrollback_seed_one_line_short_of_screen_still_scrolls_off() {
-        // Short seeds keep the full screen of trailing newlines: the seed must
-        // scroll off no matter where the cursor started.
+        // Known starting cursor means rows-1 newlines suffice for any seed.
         let seed = "row 0\nrow 1\n";
         let bytes = scrollback_seed_bytes(seed.as_bytes(), 3);
-        assert_eq!(bytes, b"row 0\r\nrow 1\r\n\n\n\n\x1b[H".as_slice());
+        assert_eq!(
+            bytes,
+            b"\x1b[r\x1b[H\x1b[0Jrow 0\r\nrow 1\r\n\n\n\x1b[H".as_slice()
+        );
     }
 
     use std::time::{Duration, Instant};
