@@ -195,8 +195,9 @@ oly export <ID>                                           # fixed-prefix canonic
   shared byte-budgeted, per-key-coalesced cache. Counts: tail 0..65535, frames
   0..1024; zero prints nothing. Explicit safety failures: frame payload over
   64 MiB, viewport over one million cells, tail/history over eight million
-  cells, rare metadata charge over 64 MiB. Request fewer lines/frames or use
-  byte pages/export; no silent truncation. Oversized cache entries run uncached.
+  cells. Request fewer lines/frames or use byte pages/export; no silent
+  truncation. Oversized cache entries run uncached; conservative Unicode/OSC
+  input charges affect cache admission only, not whether logs can be read.
 - Wait-mode exit codes: `0` condition met, `2` timeout, `1` error.
   `--timeout 0` waits forever; plain numbers are milliseconds (use `30s`).
 
