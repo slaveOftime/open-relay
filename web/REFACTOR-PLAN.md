@@ -244,9 +244,10 @@ SessionsPage data layer remain).
 - [x] **Hooks.** `hooks/` holds `use-session-events`, `use-repeat-while-pressed`,
       `use-reduced-motion`, `repeat-controller`, `use-attach-idle-animation`,
       `use-attach-reconnect`, `use-terminal-keyboard-sync`,
-      `use-session-table-columns`, `use-session-list-gestures`.
-- [x] **Tests.** 388 unit tests across 41 files and 23 Playwright specs
-      (13 Chromium + 10 mobile Safari). Covered directly: the staleness
+      `use-session-table-columns`, `use-session-list-gestures`,
+      `use-long-press`, `use-hold-to-drag`.
+- [x] **Tests.** 402 unit tests across 42 files and 38 Playwright specs
+      (25 Chromium + 13 mobile Safari). Covered directly: the staleness
       contract, the reconnect policy, the session-summary equality (with a
       compile-time exhaustiveness guard), the send path, the storage fallbacks
       and the quick-key validation.

@@ -9,13 +9,19 @@
  * the input; a press-and-hold opens the quick menu instead — the filter
  * dropdowns the page passes as `menu`. The two popups are mutually exclusive:
  * the menu opens from a hold, and a tap toggles whichever of them is open.
+ * A press held still, then dragged, moves the whole control somewhere better
+ * and remembers the spot (`useHoldToDrag`).
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { cn } from '@/utils/cn'
+import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
 import { useLongPress } from '@/hooks/use-long-press'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
 import { Input } from '@/components/ui/input'
+
+/** Where a moved trigger is remembered; the default spot needs no entry. */
+const POSITION_KEY = 'oly.sessions.searchTrigger.v1'
 
 /** QuickKeysMenu's pop ease: a slight overshoot so the popups feel springy. */
 const SPRING_EASE = 'cubic-bezier(0.34, 1.56, 0.64, 1)'
@@ -41,6 +47,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   const iconRef = useRef<HTMLButtonElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
 
   const duration = reducedMotion ? 0 : ENTER_DURATION_MS
 
@@ -52,6 +59,19 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     setExpanded(false)
     setArmed(false)
   }, [])
+
+  // Hold the trigger still, then drag: the control follows the pointer and the
+  // drop is remembered. Taking the button away from a press means the press is
+  // no longer a tap or a hold, so whichever popup is up goes with it.
+  const reposition = useHoldToDrag({
+    handleRef: iconRef,
+    elementRef: rootRef,
+    storageKey: POSITION_KEY,
+    onDragStart: () => {
+      collapseBar()
+      closeMenu()
+    },
+  })
 
   const open = expanded || menuOpen
 
@@ -135,7 +155,11 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     'shadow-none outline-none ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
 
   return (
-    <div className={cn('absolute right-5 bottom-70 z-10 md:hidden', open && 'z-30')}>
+    <div
+      ref={rootRef}
+      className={cn('absolute right-5 bottom-70 z-10 md:hidden', open && 'z-30')}
+      style={reposition.style}
+    >
       {/* The bar: trigger-sized when closed, grown out of the trigger to the
           left when the search is open. */}
       <div
@@ -217,7 +241,9 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
           'absolute right-0 top-0 z-10 flex h-12 w-12 touch-none select-none',
           'items-center justify-center rounded-full',
           'text-[hsl(var(--muted-foreground))] transition-colors',
-          active && 'text-[hsl(var(--primary))]'
+          active && 'text-[hsl(var(--primary))]',
+          // The arm cue: the hold elapsed, so the next move is a reposition.
+          reposition.armed && 'ring-2 ring-[hsl(var(--primary))]'
         )}
       >
         <MagnifyingGlassIcon className="h-5 w-5" />

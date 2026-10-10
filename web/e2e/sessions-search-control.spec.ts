@@ -261,3 +261,48 @@ test('the quick menu changes filters and clears them again', async ({ page }) =>
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeHidden()
   await expect(input).toHaveCount(0)
 })
+
+test('a hold-then-drag relocates the trigger and remembers the spot', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+  const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
+
+  const before = (await icon.boundingBox())!
+  const cx = before.x + before.width / 2
+  const cy = before.y + before.height / 2
+
+  await page.mouse.move(cx, cy)
+  await page.mouse.down()
+  // The hold still opens its menu at 250ms; the arm ring is the 500ms
+  // threshold that turns the next move into a reposition. Both assertions
+  // double as the sync — the drag below only starts once arming is proven.
+  await expect(statusTrigger).toBeVisible()
+  await expect(icon).toHaveClass(/ring-2/)
+  await page.mouse.move(cx - 60, cy + 80, { steps: 6 })
+  await page.mouse.up()
+
+  // The trigger tracked the pointer exactly — down-left of `right-5 bottom-70`
+  // always has room, so no clamp could have adjusted it.
+  const after = (await icon.boundingBox())!
+  expect(Math.abs(after.x - (before.x - 60))).toBeLessThanOrEqual(2)
+  expect(Math.abs(after.y - (before.y + 80))).toBeLessThanOrEqual(2)
+
+  // Taking the button means the press stopped being a tap or a hold: the menu
+  // went with the drag, the release's follow-up click opened no bar, and the
+  // arm cue cleared.
+  await expect(statusTrigger).toHaveCount(0)
+  await expect(input).toHaveCount(0)
+  await expect(icon).not.toHaveClass(/ring-2/)
+
+  // The new spot survives a reload…
+  await page.reload()
+  await expect(list(page).getByText('alpha bash session')).toBeVisible()
+  const restored = (await icon.boundingBox())!
+  expect(Math.abs(restored.x - after.x)).toBeLessThanOrEqual(2)
+  expect(Math.abs(restored.y - after.y)).toBeLessThanOrEqual(2)
+
+  // …and the relocated trigger still works.
+  await icon.click()
+  await expect(input).toBeVisible()
+  await expect(input).toBeFocused()
+})

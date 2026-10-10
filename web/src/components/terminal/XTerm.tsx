@@ -9,6 +9,7 @@ import QuickKeysDialog from './QuickKeysDialog'
 import { markOwnedTerminalWheel } from './scroll-wheel'
 import { getTerminalTheme } from './xterm-theme'
 import { useTerminalKeyboardSync } from '@/hooks/use-terminal-keyboard-sync'
+import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
 import {
   TERMINAL_FONT_FAMILY,
   TERMINAL_FONT_SIZE,
@@ -28,6 +29,9 @@ const SCROLL_LINES_PER_SECOND_PER_PX = 2
 // A press below these limits counts as a tap and toggles the quick-keys ring.
 const QUICK_KEYS_TAP_MAX_PX = 12
 const QUICK_KEYS_TAP_MAX_MS = 350
+
+/** Where a moved scroll handle is remembered; the default spot needs no entry. */
+const SCROLL_HANDLE_POSITION_KEY = 'oly.terminal.scrollHandle.v1'
 
 function loadEmbeddedTerminalFont(): Promise<void> {
   if (typeof document === 'undefined' || !('fonts' in document)) {
@@ -123,10 +127,36 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   } | null>(null)
   const scrollDragRafRef = useRef(0)
   const scrollButtonRef = useRef<HTMLButtonElement>(null)
+  const scrollControlsRef = useRef<HTMLDivElement>(null)
   const [scrollDragActive, setScrollDragActive] = useState(false)
   const tapRef = useRef<{ x: number; y: number; startedAt: number; moved: boolean } | null>(null)
+  // Set while a hold-then-drag reposition owns the press, so the joystick
+  // scroll and the tap detector stand down for it.
+  const repositioningRef = useRef(false)
   const [quickKeysOpen, setQuickKeysOpen] = useState(false)
   const [quickKeysDialogOpen, setQuickKeysDialogOpen] = useState(false)
+
+  // Hold the handle still, then drag: it moves anywhere in the terminal frame
+  // and the drop is remembered for the next visit. Starting the move means
+  // the press was never a joystick scroll or a tap on the ring.
+  const reposition = useHoldToDrag({
+    handleRef: scrollButtonRef,
+    elementRef: scrollControlsRef,
+    storageKey: SCROLL_HANDLE_POSITION_KEY,
+    onDragStart: () => {
+      repositioningRef.current = true
+      if (tapRef.current) tapRef.current.moved = true
+      scrollDragRef.current = null
+      if (scrollDragRafRef.current) {
+        cancelAnimationFrame(scrollDragRafRef.current)
+        scrollDragRafRef.current = 0
+      }
+      setScrollDragActive(false)
+    },
+    onDragEnd: () => {
+      repositioningRef.current = false
+    },
+  })
 
   // Keep callbacks up to date without re-running the mount effect
   useEffect(() => {
@@ -449,6 +479,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
   }
 
   const handleScrollDragMove = (event: React.PointerEvent<HTMLButtonElement>) => {
+    // A reposition owns the press now: the joystick must not (re)start under
+    // the button as the finger carries it somewhere else.
+    if (repositioningRef.current) return
     const tap = tapRef.current
     if (
       tap &&
@@ -525,8 +558,10 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
         />
       ) : null}
       <div
+        ref={scrollControlsRef}
         data-terminal-scroll-controls
         className={cn('absolute right-5 bottom-70 z-10 md:hidden', quickKeysOpen && 'z-30')}
+        style={reposition.style}
       >
         <button
           ref={scrollButtonRef}
@@ -541,7 +576,9 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
           onContextMenu={(event) => event.preventDefault()}
           className={cn(
             'relative flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] shadow-lg transition-opacity md:hidden',
-            scrollDragActive ? 'opacity-90' : 'opacity-80'
+            scrollDragActive ? 'opacity-90' : 'opacity-80',
+            // The arm cue: the hold elapsed, so the next move is a reposition.
+            reposition.armed && 'ring-2 ring-[hsl(var(--primary))]'
           )}
         >
           <ChevronsUpDown className="h-4 w-4" />

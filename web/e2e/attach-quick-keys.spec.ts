@@ -156,3 +156,62 @@ test('holding a quick key repeats and keeps focus', async ({ page }) => {
   expect(inputs.every((data) => data === '\x1b[D')).toBe(true)
   expect(await focusState(page)).toBe('button[Left]')
 })
+
+test('a hold-then-drag moves the scroll handle and remembers it', async ({ page }) => {
+  const inputs: string[] = []
+  await stubApi(page, inputs)
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`/session/${SESSION_ID}?mode=attach`)
+  const handle = page.getByRole('button', { name: 'Scroll terminal' })
+  await expect(handle).toBeVisible()
+  await expect(page.locator('#main-container').getByText('Attached')).toBeVisible()
+
+  const before = (await handle.boundingBox())!
+  const cx = before.x + before.width / 2
+  const cy = before.y + before.height / 2
+
+  // Hold still: the arm ring marks the threshold where the next move carries
+  // the handle instead of scrolling with it. The assertion is the sync.
+  await page.mouse.move(cx, cy)
+  await page.mouse.down()
+  await expect(handle).toHaveClass(/ring-2/)
+  await page.mouse.move(cx - 70, cy + 80, { steps: 6 })
+  // The joystick stood down — the press belongs to the move now.
+  await expect(handle).toHaveClass(/opacity-80/)
+  await page.mouse.up()
+
+  // Exact tracking (no clamp: `right-5 bottom-70` leaves room down-left), and
+  // the move counted as neither a tap (the ring did not toggle) nor a still
+  // held press (the arm cue cleared on release).
+  const after = (await handle.boundingBox())!
+  expect(Math.abs(after.x - (before.x - 70))).toBeLessThanOrEqual(2)
+  expect(Math.abs(after.y - (before.y + 80))).toBeLessThanOrEqual(2)
+  await expect(handle).toHaveAttribute('aria-expanded', 'false')
+  await expect(handle).not.toHaveClass(/ring-2/)
+
+  // A press that moves immediately is still the joystick gesture — scrolling,
+  // not repositioning, and not a tap on the ring either.
+  const held = (await handle.boundingBox())!
+  await page.mouse.move(held.x + 24, held.y + 24)
+  await page.mouse.down()
+  await page.mouse.move(held.x + 30, held.y + 100, { steps: 4 })
+  await expect(handle).toHaveClass(/opacity-90/)
+  await page.mouse.up()
+  const unmoved = (await handle.boundingBox())!
+  expect(unmoved.x).toBe(held.x)
+  expect(unmoved.y).toBe(held.y)
+  await expect(handle).toHaveAttribute('aria-expanded', 'false')
+
+  // The moved spot is remembered across a reload, and the handle still works.
+  await page.reload()
+  await expect(handle).toBeVisible()
+  await expect(page.locator('#main-container').getByText('Attached')).toBeVisible()
+  const restored = (await handle.boundingBox())!
+  expect(Math.abs(restored.x - after.x)).toBeLessThanOrEqual(2)
+  expect(Math.abs(restored.y - after.y)).toBeLessThanOrEqual(2)
+
+  await handle.click()
+  await expect(handle).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.getByRole('button', { name: /^Send / }).first()).toBeVisible()
+})
