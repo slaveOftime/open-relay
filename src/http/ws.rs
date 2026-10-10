@@ -1033,7 +1033,7 @@ mod tests {
         // Seed rows scroll into history, then the snapshot repaints the
         // screen — the same byte stream the native attach writes.
         let data = seed_web_init_data(Some(b"old row\n".to_vec()), Some(2), b"SNAP".to_vec());
-        assert_eq!(data, b"old row\r\n\n\n\x1b[HSNAP".as_slice());
+        assert_eq!(data, b"\x1b[r\x1b[H\x1b[0Jold row\r\n\n\x1b[HSNAP".as_slice());
     }
 
     #[test]

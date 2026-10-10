@@ -2,10 +2,15 @@ use std::io::{IsTerminal, Write};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
-    execute, terminal,
+    terminal,
+};
+#[cfg(not(windows))]
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
 };
 use tokio::{io::BufReader, sync::mpsc};
 
@@ -17,7 +22,7 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
 };
 
-use super::cursor::StreamCursor;
+use super::{attach_input::AttachInputEvent, cursor::StreamCursor};
 
 /// Upper bound on how many bytes of already-queued server output are written
 /// to the terminal in one go. Batching turns a burst of frames into a single
@@ -62,7 +67,13 @@ struct AttachRenderer {
 impl AttachRenderer {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
-            engine: crate::terminal::Terminal::new(rows.max(1), cols.max(1), 0),
+            // Retain a bounded viewport for resize reflow; feed_render emits
+            // newly scrolled rows even when this retention is at capacity.
+            engine: crate::terminal::Terminal::new(
+                rows.max(1),
+                cols.max(1),
+                usize::from(rows.max(1)),
+            ),
             prev_rows: Vec::new(),
             prev_cursor: (0, 0),
             prev_cursor_visible: true,
@@ -71,17 +82,24 @@ impl AttachRenderer {
     }
 
     fn render_initial(&mut self, data: &[u8]) -> Vec<u8> {
+        // Snapshot restoration is not new output/history. Use normal feed,
+        // so ED 2 in the restore program cannot become a spurious scroll row.
         self.engine.feed(data);
         let _ = self.engine.drain_events();
         self.needs_full_repaint = false;
         let mut rendered = passthrough_signals(data);
-        rendered.extend_from_slice(&self.engine.snapshot_stream());
+        rendered.extend_from_slice(if self.engine.modes().alt_screen {
+            b"\x1b[?1049h"
+        } else {
+            b"\x1b[?1049l"
+        });
+        rendered.extend_from_slice(&self.repaint_bytes());
         self.remember_state();
         rendered
     }
 
     fn render_chunk(&mut self, data: &[u8]) -> Vec<u8> {
-        self.engine.feed(data);
+        let effects = self.engine.feed_render(data);
         // The renderer never answers queries: the daemon's engine already
         // did (single responder). Queued events are dropped.
         let _ = self.engine.drain_events();
@@ -90,13 +108,41 @@ impl AttachRenderer {
         // so window title and progress/busy notifications are forwarded from
         // the original bytes; otherwise they would be dropped entirely.
         let mut rendered = passthrough_signals(data);
+        let (rows, _) = self.engine.size();
+        let has_effects = !effects.is_empty();
+        if has_effects {
+            // Scroll/history operations must be atomic with the final repaint,
+            // otherwise a large transcript flashes each staged top row.
+            rendered.extend_from_slice(b"\x1b[?2026h");
+        }
+        for effect in effects {
+            match effect {
+                crate::terminal::RenderEffect::HistoryRow(row) => {
+                    // Write the actual scrolled-off row at the top, then
+                    // scroll one row at the bottom. This appends precisely
+                    // one history row without copying the live screen.
+                    rendered.extend_from_slice(b"\x1b[?6l\x1b[r\x1b[H\x1b[0m");
+                    rendered.extend_from_slice(&row);
+                    rendered.extend_from_slice(b"\x1b[K");
+                    rendered.extend_from_slice(format!("\x1b[{rows};1H\r\n").as_bytes());
+                    self.needs_full_repaint = true;
+                }
+                crate::terminal::RenderEffect::AlternateScreen(alt) => {
+                    rendered.extend_from_slice(if alt { b"\x1b[?1049h" } else { b"\x1b[?1049l" });
+                    self.needs_full_repaint = true;
+                }
+                crate::terminal::RenderEffect::ClearHistory => {
+                    rendered.extend_from_slice(b"\x1b[3J");
+                }
+            }
+        }
 
         // Render from canonical screen state instead of forwarding ConPTY's
         // wrap-dependent bytes. Once the initial snapshot is on screen, row
         // diffs preserve that exact baseline without full-screen flashing.
         let update = if self.needs_full_repaint {
             self.needs_full_repaint = false;
-            let snapshot = self.engine.snapshot_stream();
+            let snapshot = self.repaint_bytes();
             self.remember_state();
             snapshot
         } else {
@@ -115,12 +161,38 @@ impl AttachRenderer {
             update
         };
         if update.is_empty() {
+            if has_effects {
+                rendered.extend_from_slice(b"\x1b[?2026l");
+            }
             return rendered;
         }
-        rendered.extend_from_slice(b"\x1b[?2026h");
+        if !has_effects {
+            rendered.extend_from_slice(b"\x1b[?2026h");
+        }
         rendered.extend_from_slice(&update);
         rendered.extend_from_slice(b"\x1b[?2026l");
         rendered
+    }
+
+    /// Repaint without ED 2: some terminals move the old viewport to history
+    /// when it is erased, manufacturing duplicate scrollback on every resize.
+    fn repaint_bytes(&self) -> Vec<u8> {
+        // Rendering adapters must not inherit a child's origin mode, margins,
+        // or SGR state. Absolute positions use the outer terminal's viewport.
+        let mut out = b"\x1b[?6l\x1b[r".to_vec();
+        for (index, row) in self.engine.styled_screen_rows().iter().enumerate() {
+            out.extend_from_slice(format!("\x1b[{};1H\x1b[0m", index + 1).as_bytes());
+            out.extend_from_slice(row);
+            out.extend_from_slice(b"\x1b[K");
+        }
+        let (row, col) = self.engine.cursor_position();
+        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        out.extend_from_slice(if self.engine.cursor_visible() {
+            b"\x1b[?25h"
+        } else {
+            b"\x1b[?25l"
+        });
+        out
     }
 
     fn remember_state(&mut self) {
@@ -131,9 +203,8 @@ impl AttachRenderer {
 
     fn resize(&mut self, rows: u16, cols: u16) {
         // Non-destructive engine reflow; the repaint is a full snapshot.
-        // The attach renderer repaints only the visible screen, so it keeps
-        // no scrollback of its own.
-        self.engine.resize(rows.max(1), cols.max(1));
+        // History is forwarded as it scrolls, never synthesized from redraws.
+        self.engine.resize_render(rows.max(1), cols.max(1));
         self.needs_full_repaint = true;
     }
 }
@@ -344,6 +415,8 @@ async fn run_attach_inner(
     let mut stream_error: Option<AppError> = None;
     {
         let _raw_mode = crate::terminal_guards::RawModeGuard::new()?;
+        #[cfg(windows)]
+        let _vt_input = super::attach_input::VtInputGuard::new()?;
 
         // Render the current terminal snapshot. The subscribe handshake already
         // asked the daemon to resize to the current terminal size when needed.
@@ -421,18 +494,25 @@ async fn run_attach_inner(
 
         let mut shutdown_rx = spawn_attach_shutdown_listener();
 
-        // Terminal events come from a blocking reader thread (crossterm's
-        // `event::read`); the async loop selects over them alongside
-        // daemon frames and shutdown. Input is fully event-driven — no
-        // polling timeouts, no paste-detection windows. Backpressure via
+        // Terminal events come from a blocking reader thread (crossterm on
+        // Unix, a VT-aware console reader on Windows); the async loop selects
+        // over them alongside daemon frames and shutdown. Input is event-driven
+        // with no paste-detection windows (Windows only times out ambiguous
+        // Escape prefixes, never pasted text). Backpressure via
         // `blocking_send`: input events are never dropped (silent input
         // loss would corrupt the session); the producer waits until the
         // event loop catches up.
         let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_DEPTH);
         let event_reader = std::thread::spawn(move || {
             // stdin closed or unreadable ends the stream.
+            #[cfg(windows)]
+            let _ = super::attach_input::read_events(|ev| event_tx.blocking_send(ev).is_ok());
+            #[cfg(not(windows))]
             while let Ok(ev) = event::read() {
-                if event_tx.blocking_send(ev).is_err() {
+                if event_tx
+                    .blocking_send(AttachInputEvent::Terminal(ev))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -451,6 +531,16 @@ async fn run_attach_inner(
                                 "terminal input stream ended".to_string(),
                             ));
                             break;
+                        };
+                        let ev = match ev {
+                            AttachInputEvent::Terminal(ev) => ev,
+                            #[cfg(windows)]
+                            AttachInputEvent::Raw(data) => {
+                                if can_drive {
+                                    send_attach_input(&mut write_half, &id_owned, data, false).await?;
+                                }
+                                continue;
+                            }
                         };
                         match ev {
                             Event::Paste(data) => {
@@ -1158,6 +1248,13 @@ fn map_mouse_input(mouse: MouseEvent, sgr: bool) -> Option<Vec<u8>> {
 /// enabled them.
 fn sync_local_terminal_modes(mouse_report: bool, focus_events: bool) {
     let mut stdout = std::io::stdout();
+    #[cfg(windows)]
+    {
+        // Crossterm's Windows mouse capture replaces the whole console input
+        // mode, clearing raw mode and VT input. Preserve those bits instead.
+        let _ = super::attach_input::sync_mouse_mode(mouse_report);
+    }
+    #[cfg(not(windows))]
     if mouse_report {
         let _ = execute!(stdout, EnableMouseCapture);
     } else {
@@ -1299,6 +1396,161 @@ mod tests {
         let mut oracle = vt100::Parser::new(rows, cols, 0);
         oracle.process(stream);
         oracle.screen().contents()
+    }
+
+    /// Differential oracle: an outer terminal receiving attach's renderer
+    /// must retain the same scrollback as one receiving the native byte stream.
+    #[test]
+    fn windows_live_output_preserves_native_scrollback() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        let initial = b"\x1b[H";
+        native.feed(initial);
+        outer.feed(&renderer.render_initial(initial));
+        for line in 1..=12 {
+            let chunk = format!("line {line}\r\n");
+            native.feed(chunk.as_bytes());
+            outer.feed(&renderer.render_chunk(chunk.as_bytes()));
+        }
+        assert_eq!(outer.screen_lines(), native.screen_lines());
+        assert_eq!(
+            outer.full_lines(),
+            native.full_lines(),
+            "attach paints the screen but must not discard scrolled-off lines"
+        );
+    }
+
+    #[test]
+    fn windows_alt_screen_roundtrip_matches_native_buffers() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        let initial = b"\x1b[Hmain prompt";
+        native.feed(initial);
+        outer.feed(&renderer.render_initial(initial));
+        let enter = b"\x1b[?1049h\x1b[Hpicker";
+        native.feed(enter);
+        outer.feed(&renderer.render_chunk(enter));
+        assert_eq!(
+            outer.modes().alt_screen,
+            native.modes().alt_screen,
+            "fullscreen TUIs must own the outer alternate buffer too"
+        );
+        let exit = b"\x1b[?1049l\r\nresumed chat\r\n";
+        native.feed(exit);
+        outer.feed(&renderer.render_chunk(exit));
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_coalesced_output_keeps_history_beyond_one_screen() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        let chunk = (1..=30)
+            .map(|line| format!("row {line}\r\n"))
+            .collect::<String>();
+        native.feed(chunk.as_bytes());
+        outer.feed(&renderer.render_chunk(chunk.as_bytes()));
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_repaints_do_not_duplicate_history_and_ed3_clears_it() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"a\r\nb\r\nc\r\nd\r\ne".as_slice(),
+            b"\x1b[Hupdated",
+            b"\x1b[2J\x1b[Hfresh",
+            b"\x1b[3J",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+            assert_eq!(outer.full_lines(), native.full_lines());
+        }
+    }
+
+    #[test]
+    fn windows_split_alt_transitions_do_not_leak_tui_into_history() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"main\r\n\x1b[?10".as_slice(),
+            b"49h\x1b[Hpicker\r\n1\r\n2\r\n3\r\n4\x1b[?1049l\r\nchat",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+        }
+        assert_eq!(outer.modes().alt_screen, native.modes().alt_screen);
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_restricted_scroll_region_matches_native() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"header\r\nbody\r\nmore\r\nfooter".as_slice(),
+            b"\x1b[2;3r\x1b[3;1H\r\ninside\r\nregion\x1b[r",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+        }
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_initial_alt_snapshot_owns_outer_buffer() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b"\x1b[?1049h\x1b[Hpicker"));
+        assert!(outer.modes().alt_screen);
+        assert!(outer.screen_lines()[0].contains("picker"));
+    }
+
+    #[test]
+    fn windows_synchronized_output_keeps_all_scrolled_lines() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"\x1b[?2026h1\r\n2\r\n3\r\n".as_slice(),
+            b"4\r\n5\r\n6\r\n\x1b[?2026l",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+        }
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_resize_does_not_append_reflowed_viewport_to_history_again() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        outer.feed(&renderer.render_chunk(b"a\r\nb\r\nc\r\nd\r\ne"));
+        outer.resize(3, 20);
+        renderer.resize(3, 20);
+        let history_before = outer.history_size();
+        outer.feed(&renderer.render_chunk(b""));
+        assert_eq!(outer.history_size(), history_before);
+        assert_eq!(outer.screen_lines(), renderer.engine.screen_lines());
+        outer.resize(4, 20);
+        renderer.resize(4, 20);
+        let history_before = outer.history_size();
+        outer.feed(&renderer.render_chunk(b""));
+        assert_eq!(outer.history_size(), history_before);
+        assert_eq!(outer.screen_lines(), renderer.engine.screen_lines());
     }
 
     #[test]
