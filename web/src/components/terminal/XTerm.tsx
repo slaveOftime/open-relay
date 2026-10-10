@@ -6,7 +6,7 @@ import { hasTransferredFiles } from '@/components/ui/file-transfer'
 import { cn } from '@/utils/cn'
 import QuickKeysMenu from './QuickKeysMenu'
 import QuickKeysDialog from './QuickKeysDialog'
-import { markOwnedTerminalWheel } from './scroll-wheel'
+import { markOwnedTerminalWheel, wheelOrigin } from './scroll-wheel'
 import { getTerminalTheme } from './xterm-theme'
 import { useTerminalKeyboardSync } from '@/hooks/use-terminal-keyboard-sync'
 import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
@@ -46,10 +46,13 @@ function loadEmbeddedTerminalFont(): Promise<void> {
 // Dispatch a synthetic wheel event that behaves like a real wheel over the
 // terminal: xterm v6 listens on its scrollable overlay element (and on the
 // root element for mouse reporting). Events bubble up, never down, so the
-// container itself cannot be used as the target.
+// container itself cannot be used as the target. The coordinates come from
+// `origin` — the scroll handle, which floats over the terminal — because with
+// mouse tracking on, xterm reports the wheel as the cell under this point.
 function emitTerminalWheel(
   term: Terminal | null,
   deltaY: number,
+  origin?: HTMLElement | null,
   deltaMode: number = WheelEvent.DOM_DELTA_LINE
 ) {
   const element = term?.element
@@ -59,11 +62,12 @@ function emitTerminalWheel(
     element.querySelector('.xterm-screen') ??
     element
   const rect = target.getBoundingClientRect()
+  const at = wheelOrigin(origin?.getBoundingClientRect() ?? null, rect)
   const event = new WheelEvent('wheel', {
     deltaY,
     deltaMode,
-    clientX: rect.left + rect.width / 2,
-    clientY: rect.top + rect.height / 2,
+    clientX: at.x,
+    clientY: at.y,
     bubbles: true,
     cancelable: true,
   })
@@ -405,7 +409,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     const forwardWheel = (event: WheelEvent) => {
       event.preventDefault()
       event.stopPropagation()
-      emitTerminalWheel(termRef.current, event.deltaY, event.deltaMode)
+      emitTerminalWheel(termRef.current, event.deltaY, button, event.deltaMode)
     }
     button.addEventListener('wheel', forwardWheel, { passive: false })
     return () => {
@@ -434,7 +438,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
     const lines = Math.trunc(drag.pendingLines)
     if (lines === 0) return
     drag.pendingLines -= lines
-    emitTerminalWheel(termRef.current, lines)
+    emitTerminalWheel(termRef.current, lines, scrollButtonRef.current)
   }
 
   const beginScrollDrag = (clientY: number) => {

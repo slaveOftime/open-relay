@@ -4,6 +4,7 @@ import {
   isOwnedTerminalWheel,
   markOwnedTerminalWheel,
   SCROLL_CONTROLS_SELECTOR,
+  wheelOrigin,
 } from './scroll-wheel'
 
 /**
@@ -44,5 +45,38 @@ describe('isOwnedTerminalWheel', () => {
 
   it('matches the attribute the terminal sets on its control cluster', () => {
     expect(SCROLL_CONTROLS_SELECTOR).toBe('[data-terminal-scroll-controls]')
+  })
+})
+
+describe('wheelOrigin', () => {
+  // Left/top are non-zero on purpose: coordinates are viewport-absolute, and a
+  // rect at the origin would hide an accidental use of centre-relative maths.
+  const target = { left: 100, top: 50, width: 400, height: 300 }
+
+  it('falls back to the target centre when there is no handle', () => {
+    expect(wheelOrigin(null, target)).toEqual({ x: 300, y: 200 })
+  })
+
+  it('falls back to the target centre when the handle has no box', () => {
+    // The `md:hidden` handle on desktop still has a ref but no layout.
+    expect(wheelOrigin({ left: 0, top: 0, width: 0, height: 0 }, target)).toEqual({
+      x: 300,
+      y: 200,
+    })
+  })
+
+  it('lands on the handle centre when it floats over the target', () => {
+    const handle = { left: 440, top: 300, width: 48, height: 48 }
+    expect(wheelOrigin(handle, target)).toEqual({ x: 464, y: 324 })
+  })
+
+  it('clamps a centre that hangs off the near edge back inside', () => {
+    const handle = { left: -20, top: 100, width: 48, height: 48 }
+    expect(wheelOrigin(handle, target)).toEqual({ x: 100, y: 124 })
+  })
+
+  it('clamps a centre past the far edges back inside', () => {
+    const handle = { left: 490, top: 340, width: 48, height: 48 }
+    expect(wheelOrigin(handle, target)).toEqual({ x: 500, y: 350 })
   })
 })

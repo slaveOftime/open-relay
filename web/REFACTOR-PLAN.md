@@ -246,8 +246,8 @@ SessionsPage data layer remain).
       `use-attach-reconnect`, `use-terminal-keyboard-sync`,
       `use-session-table-columns`, `use-session-list-gestures`,
       `use-long-press`, `use-hold-to-drag`.
-- [x] **Tests.** 402 unit tests across 42 files and 38 Playwright specs
-      (25 Chromium + 13 mobile Safari). Covered directly: the staleness
+- [x] **Tests.** 407 unit tests across 42 files and 40 Playwright specs
+      (26 Chromium + 14 mobile Safari). Covered directly: the staleness
       contract, the reconnect policy, the session-summary equality (with a
       compile-time exhaustiveness guard), the send path, the storage fallbacks
       and the quick-key validation.

@@ -12,6 +12,10 @@ import { test, expect, type Page } from '@playwright/test'
 
 const SESSION_ID = 'attach-session'
 
+/** Mode bits in the INIT header; see `WS_FLAG_*` in `src/api/ws-frames.ts`. */
+const WS_FLAG_MOUSE_REPORT = 1 << 2
+const WS_FLAG_SGR_MOUSE = 1 << 3
+
 function summary() {
   return {
     id: SESSION_ID,
@@ -33,11 +37,13 @@ function summary() {
   }
 }
 
-/** INIT frame: `[tag=1][flags:u8][endOffset:u64][incarnation:u64][running:u8][attachmentId:u64][data]`. */
-function initFrame(data: string): Buffer {
+/**
+ * INIT frame: `[tag=1][flags:u8][endOffset:u64][incarnation:u64][running:u8][attachmentId:u64][data]`.
+ */
+function initFrame(data: string, flags = 0): Buffer {
   const header = Buffer.alloc(27)
   header[0] = 1
-  header[1] = 0
+  header[1] = flags
   header.writeBigUInt64BE(0n, 2)
   header.writeBigUInt64BE(0n, 10)
   header[18] = 1
@@ -45,8 +51,18 @@ function initFrame(data: string): Buffer {
   return Buffer.concat([header, Buffer.from(data)])
 }
 
-/** Stubs everything but the socket, and records every input frame the client sends. */
-async function stubApi(page: Page, inputs: string[]): Promise<void> {
+/**
+ * Stubs everything but the socket, and records every input frame the client
+ * sends. `init` overrides what the attached "program" announces on connect:
+ * the header's mode bits (mirroring `WS_FLAG_*` in `src/api/ws-frames.ts`) are
+ * what actually turn mouse reporting on — the client re-syncs xterm to them
+ * after writing the seed data.
+ */
+async function stubApi(
+  page: Page,
+  inputs: string[],
+  init: { data?: string; flags?: number } = {}
+): Promise<void> {
   await page.addInitScript(() => {
     class OpenEventSource extends EventTarget {
       onopen: ((event: Event) => void) | null = null
@@ -86,7 +102,7 @@ async function stubApi(page: Page, inputs: string[]): Promise<void> {
         // Non-JSON or unrelated frame: not an input.
       }
     })
-    ws.send(initFrame('$ '))
+    ws.send(initFrame(init.data ?? '$ ', init.flags ?? 0))
   })
 }
 
@@ -107,6 +123,29 @@ async function focusState(page: Page) {
         : ''
     }`
   })
+}
+
+/** The ESC byte, named so it stays out of pattern literals (see below). */
+const ESC = '\x1b'
+
+/**
+ * SGR mouse reports for the wheel buttons (64 = up, 65 = down) as `[col, row]`.
+ * With `?1000` + `?1006` on, xterm reports every wheel at the cell under its
+ * coordinates — which is how the emitter's point becomes observable here.
+ *
+ * ESC is interpolated rather than written into the pattern so that
+ * `no-control-regex` keeps flagging accidental control characters elsewhere.
+ */
+const WHEEL_REPORT = new RegExp(`${ESC}\\[<(6[45]);(\\d+);(\\d+)M`, 'g')
+
+function wheelReports(inputs: string[]): Array<{ col: number; row: number }> {
+  const reports: Array<{ col: number; row: number }> = []
+  for (const frame of inputs) {
+    for (const match of frame.matchAll(WHEEL_REPORT)) {
+      reports.push({ col: Number(match[2]), row: Number(match[3]) })
+    }
+  }
+  return reports
 }
 
 test('a quick-key press parks focus on the key, not on xterm', async ({ page }) => {
@@ -214,4 +253,89 @@ test('a hold-then-drag moves the scroll handle and remembers it', async ({ page 
   await handle.click()
   await expect(handle).toHaveAttribute('aria-expanded', 'true')
   await expect(page.getByRole('button', { name: /^Send / }).first()).toBeVisible()
+})
+
+test('a synthetic wheel reports the cell under the scroll handle', async ({ page }) => {
+  const inputs: string[] = []
+  // Mouse tracking on: the attached "program" sees every wheel as a report of
+  // the cell under its coordinates, which makes the emitter's point observable.
+  await stubApi(page, inputs, { flags: WS_FLAG_MOUSE_REPORT | WS_FLAG_SGR_MOUSE })
+
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`/session/${SESSION_ID}?mode=attach`)
+  const handle = page.getByRole('button', { name: 'Scroll terminal' })
+  await expect(handle).toBeVisible()
+  await expect(page.locator('#main-container').getByText('Attached')).toBeVisible()
+
+  // Dispatch a wheel on the terminal itself at `point` (its centre when null)
+  // and return the report it produces — the ground truth for that location.
+  const wheelAt = async (point: { x: number; y: number } | null) => {
+    const before = wheelReports(inputs).length
+    await page.evaluate((at) => {
+      const target =
+        document.querySelector('.xterm-scrollable-element') ??
+        document.querySelector('.xterm-screen') ??
+        document.querySelector('.xterm')
+      if (!target) throw new Error('terminal not mounted')
+      const rect = target.getBoundingClientRect()
+      const where = at ?? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+      target.dispatchEvent(
+        new WheelEvent('wheel', {
+          deltaY: -3,
+          deltaMode: 1, // DOM_DELTA_LINE: whole lines, no sub-line rounding
+          clientX: where.x,
+          clientY: where.y,
+          bubbles: true,
+          cancelable: true,
+        })
+      )
+    }, point)
+    await expect.poll(() => wheelReports(inputs).length).toBeGreaterThan(before)
+    return wheelReports(inputs)[before]
+  }
+
+  // The handle's centre, read in-page: exactly the rect the emitter reads.
+  const point = await handle.evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  })
+
+  // Ground truth: a wheel at the handle's centre names its cell, and the same
+  // wheel at the terminal's centre names a different one — so the checks below
+  // really do distinguish where the wheel came from.
+  const expected = await wheelAt(point)
+  const centre = await wheelAt(null)
+  expect(centre).not.toEqual(expected)
+
+  // The wheel forwarded from the handle lands on the same cell: the emitter
+  // maps the handle's position instead of defaulting to the target's centre.
+  const beforeForward = wheelReports(inputs).length
+  await page.evaluate((at) => {
+    document.querySelector('[aria-label="Scroll terminal"]')?.dispatchEvent(
+      new WheelEvent('wheel', {
+        deltaY: -3,
+        deltaMode: 1,
+        clientX: at.x,
+        clientY: at.y,
+        bubbles: true,
+        cancelable: true,
+      })
+    )
+  }, point)
+  await expect.poll(() => wheelReports(inputs).length).toBeGreaterThan(beforeForward)
+  expect(wheelReports(inputs)[beforeForward]).toEqual(expected)
+
+  // The joystick loop emits the same mapped wheels while it runs: the handle
+  // does not move under the drag, so every report stays on that same cell.
+  const beforeDrag = wheelReports(inputs).length
+  await page.mouse.move(point.x, point.y)
+  await page.mouse.down()
+  await page.mouse.move(point.x, point.y + 100, { steps: 4 })
+  await expect.poll(() => wheelReports(inputs).length).toBeGreaterThan(beforeDrag)
+  await page.mouse.up()
+  const dragged = wheelReports(inputs).slice(beforeDrag)
+  expect(dragged.length).toBeGreaterThan(0)
+  expect(
+    dragged.every((report) => report.col === expected.col && report.row === expected.row)
+  ).toBe(true)
 })
