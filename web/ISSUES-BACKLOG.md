@@ -213,3 +213,40 @@ rather than accidental:
     `useRef` for objects a hook builds itself. **Not yet mitigated:** there is
     no lint rule for this - `react-hooks/exhaustive-deps` catches a _missing_
     dep, not a _fresh_ one, so the guard is the signature and a review.
+
+### Findings from the test-coverage pass, now closed
+
+35. **FIXED** (`2eaa25f`) �� `sameSessionSummary` had zero coverage. It is a
+    20-field equality predicate that decides whether a re-rendered snapshot
+    tears down every store subscriber; a mistake in either direction is
+    invisible (a missed field means stale UI, a false mismatch means needless
+    re-renders). It now has 14 tests, and the test's own mutation table is a
+    `Record<keyof SessionSummary, ...>` typed against the real interface, so a
+    field added to the type fails the build until it is added there �� verified
+    by adding a probe field and watching `tsc` reject the test.
+36. **FIXED** (`2eaa25f`) �� `attach-panel-send.ts` was extracted with the
+    commit message claiming it was "the one part of the panel with real logic,
+    testable without a DOM", and then never tested. 17 tests now cover it with
+    the real wire values and the real parser messages.
+37. **FIXED** (`2eaa25f`) �� `attach-panel-storage.ts` and `quick-keys-storage.ts`
+    had no tests. 18 and 14 respectively, covering the corrupt-JSON and
+    unavailable-storage fallbacks, the all-or-nothing quick-key validation, and
+    the observable store.
+38. **FIXED** (`a494100`) �� 313 lines of dead code: `src/utils/ansi.ts`, a
+    complete ANSI-to-HTML renderer with zero importers, superseded by xterm.js.
+
+### Still open, stated plainly
+
+39. **`lib/push.ts` has no test.** It needs `navigator.serviceWorker`,
+    `PushManager`, `Notification` and `atob` stubbed for roughly a fifth of its
+    statements to be assertions, which is stub code masquerading as coverage.
+    Left e2e-covered only on purpose. _Next step:_ if it is ever reworked,
+    extract the state decision (`unsupported` -> `unconfigured` -> `denied` ->
+    `idle` -> `subscribed`) into a pure function first, then test that �� the
+    same shape as `attach-reconnect-policy.ts`.
+40. **The two DOM-only hooks are untestable in the node environment.**
+    `use-session-list-gestures.ts` (268 lines) and `use-terminal-keyboard-sync.ts`
+    (112) read DOM rects, visual viewport and matchMedia inside their callbacks,
+    so a unit test needs `jsdom`/`happy-dom` installed (item 4). They are
+    covered by e2e only, which is where the regressions they can produce
+    actually appear.

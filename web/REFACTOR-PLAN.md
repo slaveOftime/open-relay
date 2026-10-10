@@ -245,9 +245,11 @@ SessionsPage data layer remain).
       `use-reduced-motion`, `repeat-controller`, `use-attach-idle-animation`,
       `use-attach-reconnect`, `use-terminal-keyboard-sync`,
       `use-session-table-columns`, `use-session-list-gestures`.
-- [x] **Tests.** 325 unit tests across 38 files and 23 Playwright specs
-      (13 Chromium + 10 mobile Safari), with the staleness contract, the
-      reconnect policy and the gesture helpers all covered directly.
+- [x] **Tests.** 388 unit tests across 41 files and 23 Playwright specs
+      (13 Chromium + 10 mobile Safari). Covered directly: the staleness
+      contract, the reconnect policy, the session-summary equality (with a
+      compile-time exhaustiveness guard), the send path, the storage fallbacks
+      and the quick-key validation.
 - [x] **Gates.** `tsc -b`, `eslint src e2e`, `vitest run`, `prettier --check` and
       `playwright test` all clean; the e2e suite keeps a trace and a screenshot
       on failure.
@@ -268,19 +270,20 @@ _had_ to change are called out in their commit messages.
 
 ### Done
 
-| Phase   | Result                                                                                                                                                                     | Commits                                 |
-| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
-| 0       | vitest picks up `.test.tsx` again (30 -> 31 files), `.prettierrc` gains `endOfLine: auto`, eslint ignores `dev-dist`, `max-lines` added, 3 unused `ui/` primitives deleted | `5e0f426`                               |
-| 1       | import-specifier drift, commented-out code, `export { Badge }`                                                                                                             | `d08f32d`                               |
-| 2       | `cn` -> `utils/cn.ts`; `quick-keys` + `sparkline-store` -> `lib/`; `src/hooks/` created; `session-events` split                                                            | `cd81413` `07585b8` `c0aeaa8`           |
-| 3       | `api/client.ts` -> 6 modules behind a facade                                                                                                                               | `9058ed5`                               |
-| 4       | `findScrollContainer` deduped; sparkline geometry/palettes/model; `xterm-fonts`/`xterm-theme`; attach storage + history; detail-page pure helpers; tag normalization       | `6ce694d` `80c9ece` `becf576` `2a2902f` |
-| 5       | row + card + 7 leaf components -> `components/sessions/`                                                                                                                   | `cf88043` `e0148d5`                     |
-| 6       | `components/attach/`, `dialogs/`, `sparkline/` created                                                                                                                     | `e1053c9`                               |
-| 7       | review findings: the `components -> pages` import, 33-file naming rename, alias paths, second `max-lines` tier, orphaned deps                                              | `8a1d8b5`                               |
-| 5 cont. | `sessions-page-prefs.ts` + `sessions-page-data.ts`; `use-attach-idle-animation`; `attach-mobile-key-bar` + `attach-panel-send`; `use-terminal-keyboard-sync`               | `0b82bc7` `6d87e15` `714dc67` `d57c478` |
-| 8       | mobile-Safari project + reconnect e2e spec; `attach-reconnect-policy` + `use-attach-reconnect`; `attach-socket-options`                                                    | `c9eff33` `ba465a8`                     |
-| 5 cont. | `use-session-table-columns`; `use-session-list-gestures`; `sessions-node-swipe` -> `lib/`                                                                                  | `fdd8270` `2c9f4fb`                     |
+| Phase   | Result                                                                                                                                                                                                                                                           | Commits                                 |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| 0       | vitest picks up `.test.tsx` again (30 -> 31 files), `.prettierrc` gains `endOfLine: auto`, eslint ignores `dev-dist`, `max-lines` added, 3 unused `ui/` primitives deleted                                                                                       | `5e0f426`                               |
+| 1       | import-specifier drift, commented-out code, `export { Badge }`                                                                                                                                                                                                   | `d08f32d`                               |
+| 2       | `cn` -> `utils/cn.ts`; `quick-keys` + `sparkline-store` -> `lib/`; `src/hooks/` created; `session-events` split                                                                                                                                                  | `cd81413` `07585b8` `c0aeaa8`           |
+| 3       | `api/client.ts` -> 6 modules behind a facade                                                                                                                                                                                                                     | `9058ed5`                               |
+| 4       | `findScrollContainer` deduped; sparkline geometry/palettes/model; `xterm-fonts`/`xterm-theme`; attach storage + history; detail-page pure helpers; tag normalization                                                                                             | `6ce694d` `80c9ece` `becf576` `2a2902f` |
+| 5       | row + card + 7 leaf components -> `components/sessions/`                                                                                                                                                                                                         | `cf88043` `e0148d5`                     |
+| 6       | `components/attach/`, `dialogs/`, `sparkline/` created                                                                                                                                                                                                           | `e1053c9`                               |
+| 7       | review findings: the `components -> pages` import, 33-file naming rename, alias paths, second `max-lines` tier, orphaned deps                                                                                                                                    | `8a1d8b5`                               |
+| 5 cont. | `sessions-page-prefs.ts` + `sessions-page-data.ts`; `use-attach-idle-animation`; `attach-mobile-key-bar` + `attach-panel-send`; `use-terminal-keyboard-sync`                                                                                                     | `0b82bc7` `6d87e15` `714dc67` `d57c478` |
+| 8       | mobile-Safari project + reconnect e2e spec; `attach-reconnect-policy` + `use-attach-reconnect`; `attach-socket-options`                                                                                                                                          | `c9eff33` `ba465a8`                     |
+| 5 cont. | `use-session-table-columns`; `use-session-list-gestures`; `sessions-node-swipe` -> `lib/`                                                                                                                                                                        | `fdd8270` `2c9f4fb`                     |
+| 10      | 63 tests over the four untested logic modules: session-summary (+14, with a compile-time exhaustiveness guard), attach-panel-send (+17), attach-panel-storage (+18), quick-keys-storage (+14); 313 lines of dead `ansi.ts` deleted; XTerm moved into `terminal/` | `a494100` `2eaa25f`                     |
 
 File sizes, before -> now:
 
