@@ -6,17 +6,19 @@
  *
  * Collapsed it is that one circular button. A tap grows the search bar out of
  * it to the left (one merged pill, the trigger as its right cap) and focuses
- * the input; a press-and-hold opens the quick menu instead — the filter
- * dropdowns the page passes as `menu`. The two popups are mutually exclusive:
- * the menu opens from a hold, and a tap toggles whichever of them is open.
- * A press held still, then dragged, moves the whole control somewhere better
- * and remembers the spot (`useHoldToDrag`).
+ * the input; a double tap opens the quick menu instead — the filter dropdowns
+ * the page passes as `menu`, replacing the bar the first tap of the pair just
+ * opened. The two popups are mutually exclusive, and a tap toggles whichever
+ * of them is up. A drag moves the whole control somewhere better and remembers
+ * the spot (`useHoldToDrag` with `armMs: 0`: nothing else owns a drag on this
+ * button, so a travelling press is a move — no hold-then-move, which used to
+ * fight the hold that opened the menu).
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { cn } from '@/utils/cn'
 import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
-import { useLongPress } from '@/hooks/use-long-press'
+import { useTapGestures } from '@/hooks/use-tap-gestures'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
 import { Input } from '@/components/ui/input'
 
@@ -60,13 +62,15 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     setArmed(false)
   }, [])
 
-  // Hold the trigger still, then drag: the control follows the pointer and the
-  // drop is remembered. Taking the button away from a press means the press is
-  // no longer a tap or a hold, so whichever popup is up goes with it.
+  // Drag the trigger: the control follows the pointer and the drop is
+  // remembered. There is no hold to wait out — the press has no other drag
+  // meaning, so any press that travels past the slop is a move, and taking
+  // the button closes whichever popup is up.
   const reposition = useHoldToDrag({
     handleRef: iconRef,
     elementRef: rootRef,
     storageKey: POSITION_KEY,
+    armMs: 0,
     onDragStart: () => {
       collapseBar()
       closeMenu()
@@ -87,10 +91,11 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     setExpanded(true)
   }, [closeMenu, collapseBar, expanded, menuOpen])
 
-  const hold = useLongPress({
+  const press = useTapGestures({
     onPress: handlePress,
-    // A hold always takes over with the quick menu, collapsing the bar first.
-    onLongPress: () => {
+    // The second tap of a pair is the quick menu, replacing the bar the first
+    // tap just opened.
+    onDoubleTap: () => {
       collapseBar()
       setMenuOpen(true)
     },
@@ -113,7 +118,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
 
   // The menu closes on an outside pointerdown or Escape. Pointerdowns inside a
   // menu select's own dropdown (a Radix popper portal) belong to that select;
-  // pointerdowns on the trigger belong to the hold, which toggles the menu
+  // pointerdowns on the trigger belong to its own tap, which toggles the menu
   // itself.
   useEffect(() => {
     if (!menuOpen) return
@@ -198,6 +203,11 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
               // as the gesture's default action, which blurs the input right
               // after it was focused. That move is not a dismissal.
               if (event.relatedTarget === iconRef.current) return
+              // The bar may already be down: the double tap that opened the
+              // menu hid the focused input, and the browser blurs it for that
+              // — a frame after the menu's entrance arm. Re-collapsing then
+              // would only tear the arm (and the menu's clickability) down.
+              if (!expanded) return
               collapseBar()
             }}
             onKeyDown={(event) => {
@@ -221,29 +231,27 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         </div>
       </div>
 
-      {/* The trigger: the bar's right cap, and the hold anchor for the menu. */}
+      {/* The trigger: the bar's right cap, and the tap/double-tap anchor for
+          the menu. */}
       <button
         ref={iconRef}
         type="button"
         aria-label="Search sessions"
         aria-haspopup="true"
         aria-expanded={menuOpen}
-        {...hold.handlers}
+        {...press.handlers}
         // Only a click with no gesture behind it: the keyboard, assistive
         // tech, a programmatic click. The browser's follow-up click for a tap
-        // or hold is swallowed by the window check — a tap activates twice
-        // without it.
+        // is swallowed by the window check — a tap activates twice without it.
         onClick={(event) => {
-          if (hold.isFollowUpClick(event.timeStamp)) return
+          if (press.isFollowUpClick(event.timeStamp)) return
           handlePress()
         }}
         className={cn(
           'absolute right-0 top-0 z-10 flex h-12 w-12 touch-none select-none',
           'items-center justify-center rounded-full',
           'text-[hsl(var(--muted-foreground))] transition-colors',
-          active && 'text-[hsl(var(--primary))]',
-          // The arm cue: the hold elapsed, so the next move is a reposition.
-          reposition.armed && 'ring-2 ring-[hsl(var(--primary))]'
+          active && 'text-[hsl(var(--primary))]'
         )}
       >
         <MagnifyingGlassIcon className="h-5 w-5" />

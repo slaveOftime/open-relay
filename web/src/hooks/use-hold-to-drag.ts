@@ -14,7 +14,12 @@ interface Options {
   elementRef: RefObject<HTMLElement | null>
   /** localStorage key the dropped position is remembered under. */
   storageKey: string
-  /** How long a press must stay still before a move repositions instead of acts. */
+  /**
+   * How long a press must stay still before a move repositions instead of acts.
+   * `0` arms with the press itself: for a control whose press has no hold
+   * meaning of its own (it only taps, double-taps and moves), any travelling
+   * press is already a reposition.
+   */
   armMs?: number
   /** Pointer travel (px) that abandons arming — a moving press is a normal drag. */
   slopPx?: number
@@ -61,6 +66,8 @@ interface Gesture {
  * never be shadowed by repositioning. The arm and hold timings are
  * independent: a control whose hold opens a menu gets that menu at its own
  * threshold and yields it only once the drag actually starts (`onDragStart`).
+ * With `armMs: 0` the contract is dropped instead: the control arms as the
+ * press lands, because its press has no other meaning to protect.
  *
  * Listeners live outside React on purpose: the components already own their
  * own pointer handlers, and window-level move/up tracking keeps the drag alive
@@ -184,12 +191,19 @@ export function useHoldToDrag({
       window.addEventListener('pointercancel', endGesture)
       // A lost window would otherwise leave the element stuck mid-drag.
       window.addEventListener('blur', endGesture)
-      armTimer = setTimeout(() => {
-        armTimer = null
-        if (!gesture) return
+      if (armMs > 0) {
+        armTimer = setTimeout(() => {
+          armTimer = null
+          if (!gesture) return
+          armedRef.current = true
+          setArmed(true)
+        }, armMs)
+      } else {
+        // No hold to wait out: the press arrives armed, so the next move past
+        // the slop is already a reposition.
         armedRef.current = true
         setArmed(true)
-      }, armMs)
+      }
     }
 
     handle.addEventListener('pointerdown', onPointerDown)

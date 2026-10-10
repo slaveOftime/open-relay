@@ -3,14 +3,14 @@ import { test, expect, type Page } from '@playwright/test'
 /**
  * The mobile header's search control. The control is mobile-only, so the file
  * runs at a phone viewport in the desktop Chromium project — pointer events
- * make the tap/hold gestures identical to touch there.
+ * make the tap/double-tap/drag gestures identical to touch there.
  */
 test.use({ viewport: { width: 375, height: 812 } })
 
 // A real touch tap is a different code path from a synthetic mouse click: no
 // mousedown focus, and a click that arrives after the press already focused the
-// search input. The suite's mouse-driven tests cannot see this, so the gesture
-// runs under touch input here.
+// search input. The suite's mouse-driven tests cannot see this, so the gestures
+// run under touch input here.
 test.describe('with touch input', () => {
   test.use({ hasTouch: true })
 
@@ -28,6 +28,24 @@ test.describe('with touch input', () => {
     await page.waitForTimeout(400)
     await expect(input).toBeVisible()
     await expect(input).toBeFocused()
+  })
+
+  test('a double tap opens the quick menu', async ({ page }) => {
+    const icon = page.getByRole('button', { name: SEARCH_ICON })
+    const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+    const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
+
+    // The pair must land inside the 300ms double window, so both taps go out
+    // back to back at raw coordinates instead of through the slower locator.
+    const box = (await icon.boundingBox())!
+    const cx = box.x + box.width / 2
+    const cy = box.y + box.height / 2
+    await page.touchscreen.tap(cx, cy)
+    await page.touchscreen.tap(cx, cy)
+
+    await expect(statusTrigger).toBeVisible()
+    // The menu replaced the bar the first tap of the pair opened.
+    await expect(input).toHaveCount(0)
   })
 })
 
@@ -126,14 +144,9 @@ test('the trigger floats at the scroll-handle height, right-aligned', async ({ p
   expect(await icon.evaluate((el) => el.closest('[data-testid="mobile-session-list"]'))).toBeNull()
 })
 
-/** Press and hold the search icon past the 400ms hold threshold. */
-async function holdSearchIcon(page: Page) {
-  const icon = page.getByRole('button', { name: SEARCH_ICON })
-  const box = (await icon.boundingBox())!
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
-  await page.mouse.down()
-  await page.waitForTimeout(600)
-  await page.mouse.up()
+/** Double-tap the search icon: the quick menu's opener. */
+async function openQuickMenu(page: Page) {
+  await page.getByRole('button', { name: SEARCH_ICON }).dblclick()
 }
 
 test.beforeEach(async ({ page }) => {
@@ -195,14 +208,14 @@ test('a tap expands the search bar, focuses the input, and blur collapses it', a
   await expect(input).toHaveCount(0)
 })
 
-test('a hold opens the quick menu instead, and its follow-up click is swallowed', async ({
+test('a double tap opens the quick menu, and its follow-up clicks are swallowed', async ({
   page,
 }) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
   const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
 
-  await holdSearchIcon(page)
+  await openQuickMenu(page)
 
   // The menu is up…
   await expect(statusTrigger).toBeVisible()
@@ -218,8 +231,9 @@ test('a hold opens the quick menu instead, and its follow-up click is swallowed'
     8
   )
 
-  // …but the search bar did not expand, neither from the hold nor from the
-  // click the browser synthesizes when the press ends.
+  // …and no search bar is left behind: the menu replaced the bar the first tap
+  // of the pair opened, and the clicks the browser synthesizes for the pair
+  // open nothing further.
   await expect(input).toHaveCount(0)
   await page.waitForTimeout(100)
   await expect(input).toHaveCount(0)
@@ -234,7 +248,7 @@ test('a hold opens the quick menu instead, and its follow-up click is swallowed'
 test('the quick menu changes filters and clears them again', async ({ page }) => {
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
 
-  await holdSearchIcon(page)
+  await openQuickMenu(page)
   await page.getByRole('combobox', { name: 'Filter by status' }).click()
   await page.getByRole('option', { name: 'Running' }).click()
 
@@ -255,14 +269,14 @@ test('the quick menu changes filters and clears them again', async ({ page }) =>
   await expect(input).toHaveCount(0)
 
   // Escape closes it too.
-  await holdSearchIcon(page)
+  await openQuickMenu(page)
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeHidden()
   await expect(input).toHaveCount(0)
 })
 
-test('a hold-then-drag relocates the trigger and remembers the spot', async ({ page }) => {
+test('a drag relocates the trigger and remembers the spot', async ({ page }) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
   const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
@@ -271,14 +285,13 @@ test('a hold-then-drag relocates the trigger and remembers the spot', async ({ p
   const cx = before.x + before.width / 2
   const cy = before.y + before.height / 2
 
+  // No hold, no arm cue: on this button a travelling press is a move. The
+  // menu — which the old hold used to open mid-press, fighting the drag —
+  // must stay shut the whole way.
   await page.mouse.move(cx, cy)
   await page.mouse.down()
-  // The hold still opens its menu at 250ms; the arm ring is the 500ms
-  // threshold that turns the next move into a reposition. Both assertions
-  // double as the sync — the drag below only starts once arming is proven.
-  await expect(statusTrigger).toBeVisible()
-  await expect(icon).toHaveClass(/ring-2/)
   await page.mouse.move(cx - 60, cy + 80, { steps: 6 })
+  await expect(statusTrigger).toHaveCount(0)
   await page.mouse.up()
 
   // The trigger tracked the pointer exactly — down-left of `right-5 bottom-70`
@@ -287,12 +300,9 @@ test('a hold-then-drag relocates the trigger and remembers the spot', async ({ p
   expect(Math.abs(after.x - (before.x - 60))).toBeLessThanOrEqual(2)
   expect(Math.abs(after.y - (before.y + 80))).toBeLessThanOrEqual(2)
 
-  // Taking the button means the press stopped being a tap or a hold: the menu
-  // went with the drag, the release's follow-up click opened no bar, and the
-  // arm cue cleared.
-  await expect(statusTrigger).toHaveCount(0)
+  // Taking the button means the press was never a tap: the release's
+  // follow-up click opens no bar.
   await expect(input).toHaveCount(0)
-  await expect(icon).not.toHaveClass(/ring-2/)
 
   // The new spot survives a reload…
   await page.reload()
