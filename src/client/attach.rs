@@ -2,10 +2,15 @@ use std::io::{IsTerminal, Write};
 
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
-    execute, terminal,
+    terminal,
+};
+#[cfg(not(windows))]
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
 };
 use tokio::{io::BufReader, sync::mpsc};
 
@@ -17,7 +22,7 @@ use crate::{
     protocol::{RpcRequest, RpcResponse},
 };
 
-use super::cursor::StreamCursor;
+use super::{attach_input::AttachInputEvent, cursor::StreamCursor};
 
 /// Upper bound on how many bytes of already-queued server output are written
 /// to the terminal in one go. Batching turns a burst of frames into a single
@@ -344,6 +349,8 @@ async fn run_attach_inner(
     let mut stream_error: Option<AppError> = None;
     {
         let _raw_mode = crate::terminal_guards::RawModeGuard::new()?;
+        #[cfg(windows)]
+        let _vt_input = super::attach_input::VtInputGuard::new()?;
 
         // Render the current terminal snapshot. The subscribe handshake already
         // asked the daemon to resize to the current terminal size when needed.
@@ -421,18 +428,25 @@ async fn run_attach_inner(
 
         let mut shutdown_rx = spawn_attach_shutdown_listener();
 
-        // Terminal events come from a blocking reader thread (crossterm's
-        // `event::read`); the async loop selects over them alongside
-        // daemon frames and shutdown. Input is fully event-driven — no
-        // polling timeouts, no paste-detection windows. Backpressure via
+        // Terminal events come from a blocking reader thread (crossterm on
+        // Unix, a VT-aware console reader on Windows); the async loop selects
+        // over them alongside daemon frames and shutdown. Input is event-driven
+        // with no paste-detection windows (Windows only times out ambiguous
+        // Escape prefixes, never pasted text). Backpressure via
         // `blocking_send`: input events are never dropped (silent input
         // loss would corrupt the session); the producer waits until the
         // event loop catches up.
         let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_DEPTH);
         let event_reader = std::thread::spawn(move || {
             // stdin closed or unreadable ends the stream.
+            #[cfg(windows)]
+            let _ = super::attach_input::read_events(|ev| event_tx.blocking_send(ev).is_ok());
+            #[cfg(not(windows))]
             while let Ok(ev) = event::read() {
-                if event_tx.blocking_send(ev).is_err() {
+                if event_tx
+                    .blocking_send(AttachInputEvent::Terminal(ev))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -451,6 +465,16 @@ async fn run_attach_inner(
                                 "terminal input stream ended".to_string(),
                             ));
                             break;
+                        };
+                        let ev = match ev {
+                            AttachInputEvent::Terminal(ev) => ev,
+                            #[cfg(windows)]
+                            AttachInputEvent::Raw(data) => {
+                                if can_drive {
+                                    send_attach_input(&mut write_half, &id_owned, data, false).await?;
+                                }
+                                continue;
+                            }
                         };
                         match ev {
                             Event::Paste(data) => {
@@ -1158,6 +1182,13 @@ fn map_mouse_input(mouse: MouseEvent, sgr: bool) -> Option<Vec<u8>> {
 /// enabled them.
 fn sync_local_terminal_modes(mouse_report: bool, focus_events: bool) {
     let mut stdout = std::io::stdout();
+    #[cfg(windows)]
+    {
+        // Crossterm's Windows mouse capture replaces the whole console input
+        // mode, clearing raw mode and VT input. Preserve those bits instead.
+        let _ = super::attach_input::sync_mouse_mode(mouse_report);
+    }
+    #[cfg(not(windows))]
     if mouse_report {
         let _ = execute!(stdout, EnableMouseCapture);
     } else {

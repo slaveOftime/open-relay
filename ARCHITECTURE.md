@@ -112,6 +112,15 @@ Two design points worth knowing before touching this code:
   (`web/src/api/ws-frames.ts: terminalModeSequences`) and writes a
   full set-or-clear DECSET stream into xterm. That is why mouse and
   focus work on a page load into an already-enabled program.
+- **CLI paste boundaries belong to the input reader.** The outer terminal
+  keeps bracketed paste enabled even when the child does not; the CLI wraps
+  an `Event::Paste` only when the child's mode snapshot enables it. Unix
+  uses crossterm's event decoder. Windows uses a VT-aware console reader
+  (`src/client/attach_input.rs`), since crossterm 0.29's Windows backend
+  does not decode paste markers and loses raw VT control characters.
+  Explicit paste boundaries are decoded before Enter, clipboard, or detach
+  handling, preserving pasted CR/LF and Unicode. Windows mouse-mode changes
+  preserve raw/VT input bits; teardown restores the console-mode baseline.
 
 ## Node federation
 

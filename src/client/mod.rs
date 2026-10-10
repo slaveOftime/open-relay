@@ -1,4 +1,5 @@
 mod attach;
+mod attach_input;
 #[cfg(windows)]
 mod crash;
 mod cursor;
