@@ -119,7 +119,10 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   }, [closeMenu, menuOpen])
 
   const popStyle: CSSProperties = {
-    transform: armed ? 'scale(1)' : 'scale(0.92)',
+    // The translate folds the vertical centering into the inline transform —
+    // a Tailwind translate class would be overridden by this. Origin is the
+    // right edge, so the menu grows out of the trigger toward the left.
+    transform: armed ? 'translateY(-50%) scale(1)' : 'translateY(-50%) scale(0.92)',
     opacity: armed ? 1 : 0,
     transitionDuration: `${duration}ms`,
     transitionTimingFunction: SPRING_EASE,
@@ -226,9 +229,13 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
       {menuOpen && menu && (
         <div
           ref={menuRef}
+          data-testid="session-search-menu"
           style={popStyle}
           className={cn(
-            'absolute bottom-full right-0 z-40 mb-2 origin-bottom-right rounded-lg',
+            // Anchored to the trigger's left, vertically centred on it, with a
+            // small gap — it reads as opening out of the trigger toward the
+            // list, which is where it points.
+            'absolute right-full top-1/2 z-40 mr-2 w-60 origin-right rounded-lg',
             'border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 p-3',
             'shadow-xl backdrop-blur-sm transition-[transform,opacity]',
             armed ? 'pointer-events-auto' : 'pointer-events-none'

@@ -42,8 +42,12 @@ export interface LongPressControls {
   isFollowUpClick: (at: number) => boolean
 }
 
-/** How long a press is held before it counts as a hold. */
-const HOLD_MS = 400
+/**
+ * How long a press is held before the popup opens. Deliberately short: a
+ * filter menu behind a hold should feel like a shortcut, not a gesture you
+ * commit to.
+ */
+const HOLD_MS = 250
 /** Pointer travel (px) that cancels a pending hold. */
 const SLOP_PX = 10
 

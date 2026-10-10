@@ -206,6 +206,18 @@ test('a hold opens the quick menu instead, and its follow-up click is swallowed'
 
   // The menu is up…
   await expect(statusTrigger).toBeVisible()
+
+  // …anchored to the trigger's left, centred on it, with a small gap.
+  const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
+  const iconBox = (await icon.boundingBox())!
+  const gap = iconBox.x - (menuBox.x + menuBox.width)
+  expect(menuBox.x + menuBox.width).toBeLessThan(iconBox.x)
+  expect(gap).toBeLessThan(24)
+  // Vertically centred on the trigger (the menu is taller than it).
+  expect(Math.abs(menuBox.y + menuBox.height / 2 - (iconBox.y + iconBox.height / 2))).toBeLessThan(
+    8
+  )
+
   // …but the search bar did not expand, neither from the hold nor from the
   // click the browser synthesizes when the press ends.
   await expect(input).toHaveCount(0)
