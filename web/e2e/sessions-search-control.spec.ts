@@ -87,6 +87,18 @@ const SEARCH_INPUT = 'Search sessions by id, title, command, or working director
 // by text queries), so card assertions are scoped to the mobile list.
 const list = (page: Page) => page.getByTestId('mobile-session-content')
 
+test('the trigger floats bottom-right, like the terminal scroll handle', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const box = (await icon.boundingBox())!
+
+  // Bottom-right, in the thumb zone and clear of the bottom meta bar.
+  expect(box.x + box.width / 2).toBeGreaterThan(375 / 2)
+  expect(box.y + box.height / 2).toBeGreaterThan(812 * 0.75)
+  // It is a layer over the list, not list content, so scrolling cannot take it
+  // away.
+  expect(await icon.evaluate((el) => el.closest('[data-testid="mobile-session-list"]'))).toBeNull()
+})
+
 /** Press and hold the search icon past the 400ms hold threshold. */
 async function holdSearchIcon(page: Page) {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
@@ -108,7 +120,7 @@ test('a tap expands the search bar, focuses the input, and blur collapses it', a
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
 
-  // Collapsed by default: one icon, no search box.
+  // Collapsed by default: one floating trigger, no search box.
   await expect(icon).toBeVisible()
   await expect(input).toHaveCount(0)
 
@@ -186,9 +198,9 @@ test('the quick menu changes filters and clears them again', async ({ page }) =>
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toHaveText(/All status/)
 
   // Taps outside the menu dismiss it; the search bar still never opened.
-  // (A raw coordinate below the cards: the list's empty area, which is no
-  // session card and no part of the header.)
-  await page.mouse.click(187, 700)
+  // (A raw coordinate in the list's empty area, left of the bottom-right
+  // trigger cluster and below the cards.)
+  await page.mouse.click(60, 400)
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeHidden()
   await expect(input).toHaveCount(0)
 

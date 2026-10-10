@@ -881,7 +881,7 @@ export default function SessionsPage() {
 
   return (
     <TooltipProvider>
-      <div className="flex flex-col h-full bg-[hsl(var(--background))] text-[hsl(var(--foreground))]">
+      <div className="relative flex flex-col h-full bg-[hsl(var(--background))] text-[hsl(var(--foreground))]">
         <Dialog
           open={loadError !== null}
           onOpenChange={(open) => {
@@ -906,7 +906,7 @@ export default function SessionsPage() {
         {/* ── Header ── */}
         <header className="border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur">
           {/* Mobile row */}
-          <div className="relative flex flex-nowrap items-center gap-2 px-3 py-2 md:hidden">
+          <div className="flex flex-nowrap items-center gap-2 px-3 py-2 md:hidden">
             <div
               className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg cursor-pointer min-w-0"
               onClick={() => void reloadSessions({ background: false })}
@@ -923,12 +923,6 @@ export default function SessionsPage() {
               />
             )}
             <div className="flex-1 min-w-0" />
-            <SessionSearchControl
-              search={search}
-              onSearchChange={handleSearchChange}
-              active={hasActiveFilters}
-              menu={filterMenu}
-            />
             <Button asChild variant="ghost" size="icon">
               <a href="/apps" aria-label="Apps">
                 <GridIcon className="h-4 w-4" />
@@ -1033,6 +1027,15 @@ export default function SessionsPage() {
             </Button>
           </div>
         </header>
+
+        {/* Floating search trigger + quick menu (small screens only): the same
+            bottom-right floating button the terminal's scroll handle uses. */}
+        <SessionSearchControl
+          search={search}
+          onSearchChange={handleSearchChange}
+          active={hasActiveFilters}
+          menu={filterMenu}
+        />
 
         {/* ── Mobile list ── */}
         <div

@@ -118,11 +118,15 @@ export async function runSessionLoad(args: SessionLoadArgs): Promise<void> {
       })
     }
   } finally {
+    // The current load owns both flags: whatever it is (skeleton, spinner,
+    // nothing), settling it ends that state. A superseded load must not touch
+    // them, and the only way `loading` can be set is a foreground load — which,
+    // once superseded, can never clear its own skeleton. Leaving that to the
+    // winner's kind (background = do not clear) is what stuck the list empty:
+    // `loading` true with rows already applied matches none of the list's
+    // render branches.
     if (isCurrent()) {
-      // Only clear the loading flag if this load is the one that set it. A
-      // background refresh that raced a skeleton must not clear it, which is
-      // why the two flags are tracked separately.
-      if (shouldShowSkeleton || foreground) sinks.setLoading(false)
+      sinks.setLoading(false)
       sinks.setRefreshing(false)
     }
   }

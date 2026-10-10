@@ -250,3 +250,21 @@ rather than accidental:
     so a unit test needs `jsdom`/`happy-dom` installed (item 4). They are
     covered by e2e only, which is where the regressions they can produce
     actually appear.
+
+### Found while testing the new mobile search control (2026-10-10)
+
+41. **FIXED** (`runSessionLoad`, `sessions-page-loaders.ts`) �� a foreground load
+    that lost the version race left `loading` stuck true, and the list rendered
+    **empty**: rows have to clear `loading && sessions.length === 0` for the
+    skeleton, the empty state and the cards, so `loading: true` with rows
+    applied matches none of the three branches. The race is ordinary: the
+    search changed (foreground load, skeleton up), an SSE `stream_ready` fires a
+    background refresh that supersedes it, and the foreground response lands
+    after the bump and bails at its guard. The old `finally` cleared `loading`
+    only when "this load set it", which the superseded foreground can never do.
+    The current load now owns both flags and clears them when it settles �� a
+    background winner may clear a skeleton it did not raise, because the load
+    that did raise it is already dead. Two tests were over-strict about the old
+    rule (one of them never even modelled the race �� it ran a single background
+    load and asserted no `setLoading(false)` call at all); both now assert the
+    flag _ownership_ contract instead, with the real race pinned end to end.

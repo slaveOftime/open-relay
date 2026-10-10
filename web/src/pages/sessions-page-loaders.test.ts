@@ -180,21 +180,63 @@ describe('runSessionLoad — loading flags', () => {
 
     await runSessionLoad(args)
 
-    // Matches the original: a background refresh shows the spinner, not the
-    // skeleton, and never touches the loading flag.
-    expect(calls.setLoading).not.toHaveBeenCalled()
+    // A background refresh never raises the skeleton. It may (and now does)
+    // clear the loading flag, because the current load owns the flags — that is
+    // what keeps a superseded foreground load from leaving it stuck.
+    expect(calls.setLoading).not.toHaveBeenCalledWith(true)
     expect(calls.setRefreshing).toHaveBeenCalledWith(true)
   })
 
-  it("leaves a foreground load's skeleton alone when a background one races it", async () => {
-    const { calls, args } = harness({ node: null, hasLoaded: false })
+  it("leaves a foreground load's skeleton alone until a newer load settles", async () => {
+    // The real race: a foreground load is in flight with the skeleton up
+    // (the search just changed), an SSE-triggered background refresh
+    // supersedes it, and the foreground response lands after the bump. The
+    // loser must not apply or clear anything — but it must not leave the
+    // skeleton up either, so the winner owning the flags is what ends the
+    // state.
+    const { refs } = harness({ node: null, hasLoaded: true })
+    const foregroundCalls = {
+      applySessionItems: vi.fn(),
+      setRemoteTotal: vi.fn(),
+      setLoading: vi.fn(),
+      setRefreshing: vi.fn(),
+      setLoadError: vi.fn(),
+    }
+    let releaseForeground: (() => void) | undefined
+    const foreground: SessionLoadArgs = {
+      node: null,
+      opts: undefined,
+      query: QUERY,
+      refs,
+      sinks: { ...foregroundCalls, getErrorMessage: (_e, fallback) => fallback },
+      fetch: async () => {
+        await new Promise<void>((resolve) => {
+          releaseForeground = resolve
+        })
+        return { items: ITEMS, total: 1 }
+      },
+    }
 
-    // A foreground load is in flight (skeleton up), then a background refresh
-    // for the same page answers. It must not clear the skeleton.
-    args.opts = { background: true }
-    await runSessionLoad(args)
+    const inFlight = runSessionLoad(foreground)
+    expect(foregroundCalls.setLoading).toHaveBeenCalledWith(true)
 
-    expect(calls.setLoading).not.toHaveBeenCalledWith(false)
+    // The background winner shares the page's version counter and sinks.
+    const background = harness({ node: null, hasLoaded: true })
+    background.args.refs = refs
+    background.args.opts = { background: true }
+    await runSessionLoad(background.args)
+
+    releaseForeground?.()
+    await inFlight
+
+    // The stale foreground applied and cleared nothing…
+    expect(foregroundCalls.applySessionItems).not.toHaveBeenCalled()
+    expect(foregroundCalls.setLoading).not.toHaveBeenCalledWith(false)
+    // …and the background winner both applied the rows and ended the loading
+    // state, so the list renders instead of hanging empty on a stuck flag.
+    expect(background.calls.applySessionItems).toHaveBeenCalledWith(ITEMS)
+    expect(background.calls.setLoading).toHaveBeenLastCalledWith(false)
+    expect(background.calls.setRefreshing).toHaveBeenLastCalledWith(false)
   })
 })
 

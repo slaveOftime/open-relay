@@ -1,31 +1,30 @@
 /**
- * The sessions header's search control for small screens.
+ * The sessions page's search control for small screens: a floating trigger at
+ * the bottom-right of the list — the same shape and position as the terminal's
+ * scroll handle, so it sits under the thumb and never scrolls away with the
+ * list.
  *
- * Collapsed it is one search icon. A tap expands a search bar over the header
- * row and focuses the input; a press-and-hold opens the quick menu instead —
- * the filter dropdowns the page passes as `menu` — so changing group, status
- * or sort is one long press away rather than behind a toggle button.
- *
- * The bar and the menu are mutually exclusive by construction: the menu opens
- * from a hold on the icon, and once expanded the icon is covered so no hold
- * can start. Opening one still closes the other.
+ * A tap expands a search bar above the trigger and focuses the input; a
+ * press-and-hold opens the quick menu instead — the filter dropdowns the page
+ * passes as `menu`. Both popups anchor above the trigger, and the press itself
+ * decides which one appears: a hold always takes the menu, a tap toggles
+ * whichever is open.
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { cn } from '@/utils/cn'
 import { useLongPress } from '@/hooks/use-long-press'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
-import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 
-/** QuickKeysMenu's pop ease: a slight overshoot so the menu feels springy. */
+/** QuickKeysMenu's pop ease: a slight overshoot so the popups feel springy. */
 const SPRING_EASE = 'cubic-bezier(0.34, 1.56, 0.64, 1)'
 const ENTER_DURATION_MS = 200
 
 interface Props {
   search: string
   onSearchChange: (value: string) => void
-  /** Whether any filter is active; draws the dot on the collapsed icon. */
+  /** Whether any filter is active; tints the trigger and draws its dot. */
   active: boolean
   /** Quick menu content — the page's filter dropdowns. */
   menu?: ReactNode
@@ -43,8 +42,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   const menuRef = useRef<HTMLDivElement>(null)
 
   // Closing disarms immediately (not in an effect — a state set in an effect's
-  // closed branch cascades); opening arms on the next frame so the transform
-  // transition actually runs (same pattern as QuickKeysMenu).
+  // closed branch cascades); opening arms on the next frame.
   const closeMenu = useCallback(() => {
     setMenuOpen(false)
     setArmed(false)
@@ -54,17 +52,23 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     setArmed(false)
   }, [])
 
+  const open = expanded || menuOpen
+
+  const handlePress = useCallback(() => {
+    if (menuOpen) {
+      closeMenu()
+      return
+    }
+    if (expanded) {
+      collapseBar()
+      return
+    }
+    setExpanded(true)
+  }, [closeMenu, collapseBar, expanded, menuOpen])
+
   const hold = useLongPress({
-    // A tap expands the bar — but only when the menu is closed: a tap on the
-    // icon while the menu is open dismisses the menu instead. Opening one
-    // closes the other so the two popups can never stack.
-    onPress: () => {
-      if (menuOpen) {
-        closeMenu()
-        return
-      }
-      setExpanded(true)
-    },
+    onPress: handlePress,
+    // A hold always takes over with the quick menu, closing the search bar.
     onLongPress: () => {
       setExpanded(false)
       setMenuOpen(true)
@@ -72,21 +76,21 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   })
 
   useEffect(() => {
-    if (!expanded && !menuOpen) return
+    if (!open) return
     const raf = requestAnimationFrame(() => setArmed(true))
     return () => cancelAnimationFrame(raf)
-  }, [expanded, menuOpen])
+  }, [open])
 
-  // Focus the input once the bar is up. The bar re-opens, so autoFocus (which
-  // fires on mount only) cannot do this.
+  // Focus the input once the bar is up: it re-opens, so autoFocus (which fires
+  // on mount only) cannot do this.
   useEffect(() => {
     if (expanded) inputRef.current?.focus()
   }, [expanded])
 
   // The menu closes on an outside pointerdown or Escape. Pointerdowns inside a
   // menu select's own dropdown (a Radix popper portal) belong to that select;
-  // pointerdowns on the icon belong to the hold, which dismisses the menu on
-  // tap itself.
+  // pointerdowns on the trigger belong to the hold, which toggles the menu
+  // itself.
   useEffect(() => {
     if (!menuOpen) return
     const onPointerDown = (event: PointerEvent) => {
@@ -119,12 +123,10 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   }
 
   return (
-    <>
-      <Button
+    <div className={cn('absolute right-5 bottom-20 z-10 md:hidden', open && 'z-30')}>
+      <button
         ref={iconRef}
         type="button"
-        variant="ghost"
-        size="icon"
         aria-label="Search sessions"
         aria-haspopup="true"
         aria-expanded={menuOpen}
@@ -133,25 +135,28 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         // the hold, and the click a held press synthesizes must not fire.
         onClick={(event) => {
           if (event.detail !== 0) return
-          setExpanded(true)
+          handlePress()
         }}
         className={cn(
-          'relative touch-none select-none',
-          active && 'text-[hsl(var(--primary))] bg-[hsl(var(--primary))]/10'
+          'relative flex h-12 w-12 touch-none select-none items-center justify-center',
+          'rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))]',
+          'text-[hsl(var(--muted-foreground))] shadow-lg transition-opacity',
+          open ? 'opacity-100' : 'opacity-80',
+          active && 'text-[hsl(var(--primary))]'
         )}
       >
         <MagnifyingGlassIcon className="h-4 w-4" />
         {active && (
-          <span className="absolute top-1 right-1 h-1.5 w-1.5 rounded-full bg-[hsl(var(--primary))]" />
+          <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-[hsl(var(--primary))]" />
         )}
-      </Button>
+      </button>
 
       {menuOpen && menu && (
         <div
           ref={menuRef}
           style={popStyle}
           className={cn(
-            'absolute right-0 top-full z-40 mt-2 w-60 origin-top-right rounded-lg',
+            'absolute bottom-full right-0 z-40 mb-2 w-60 origin-bottom-right rounded-lg',
             'border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 p-3',
             'shadow-xl backdrop-blur-sm transition-[transform,opacity]',
             armed ? 'pointer-events-auto' : 'pointer-events-none'
@@ -164,21 +169,21 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
       {expanded && (
         <div
           className={cn(
-            'absolute inset-0 z-40 flex items-center gap-2 bg-[hsl(var(--background))] px-3',
+            'absolute bottom-full right-0 z-40 mb-2 flex w-60 items-center gap-1 rounded-full',
+            'border border-[hsl(var(--border))] bg-[hsl(var(--muted))] p-1 pl-3 shadow-lg',
             'transition-opacity',
             armed ? 'opacity-100' : 'opacity-0'
           )}
           style={{ transitionDuration: `${duration}ms` }}
-          // Tapping the bar's empty area is not a tap elsewhere: keep focus in
-          // the input, so the blur-close cannot fire and a hidden header
-          // button underneath cannot take the press.
+          // Tapping the bar's padding is not a tap elsewhere: keep focus in the
+          // input, so the blur-close cannot dismiss the bar mid-interaction.
           onPointerDown={(event) => {
             if (event.target === event.currentTarget) event.preventDefault()
           }}
         >
           <Input
             ref={inputRef}
-            className="h-8 min-w-0 flex-1 text-sm"
+            className="h-8 min-w-0 flex-1 border-0 bg-transparent px-0 text-sm shadow-none focus-visible:ring-0"
             placeholder="Search cmd: cwd: title: tag:"
             aria-label="Search sessions by id, title, command, or working directory"
             value={search}
@@ -198,12 +203,12 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
               if (search) onSearchChange('')
               else collapseBar()
             }}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
           >
             <Cross2Icon className="h-3.5 w-3.5" />
           </button>
         </div>
       )}
-    </>
+    </div>
   )
 }
