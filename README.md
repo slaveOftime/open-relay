@@ -262,10 +262,11 @@ with continuous parser/styles/main/alternate state; long lines can wrap at
 that geometry. Cold tail/frame reconstruction is linear in recording size;
 warm reads use a shared byte-budgeted LRU and replay only appended records.
 Rebuilds coalesce per session/mode, not across unrelated sessions. Oversized
-entries are served uncached. Requested frame payload above 64 MiB, recorded
-grids above one million cells, tail grids/history above eight million cells,
-or conservatively charged rare terminal metadata above 64 MiB fail explicitly
-rather than silently dropping observations. For count-related limits, request
+entries are served uncached. The conservative cache-admission charge for
+Unicode/OSC input is not a read limit: large recordings remain readable.
+Requested frame payload above 64 MiB, recorded grids above one million cells,
+or tail grids/history above eight million cells fail explicitly rather than
+silently dropping observations. For count-related limits, request
 fewer frames/lines; use byte paging or export when rendering is unsuitable.
 
 ```bash

@@ -46,9 +46,9 @@ struct Replay {
     retained_bytes: usize,
     capacity: usize,
     tail: bool,
-    // Lifetime input upper-bounds rare retained cell/parser metadata (not
-    // exposed by the engine), including the inactive buffer. Deliberately
-    // conservative: a large recording may be served uncached.
+    // Lifetime input is a conservative cache-admission charge, NOT a
+    // retained-memory measurement or a read limit. Ordinary Unicode and
+    // repeated titles can make a small terminal exceed it; serve uncached.
     input_bytes: usize,
     peak_cols: usize,
     peak_rows: usize,
@@ -110,20 +110,15 @@ impl Replay {
                         if out.filtered.is_empty() {
                             continue;
                         }
-                        // ASCII text cannot allocate combining-cell metadata.
-                        // Charge all non-ASCII input and OSC-bearing records;
-                        // this bounds rare retained extras even in inactive grids.
+                        // Conservatively charge non-ASCII/OSC input for cache
+                        // admission only. Never reject a recording based on
+                        // lifetime throughput: most of these bytes are not retained.
                         let extra = if record.payload.windows(2).any(|b| b == b"\x1b]") {
                             record.payload.len()
                         } else {
                             record.payload.iter().filter(|b| **b >= 128).count()
                         };
                         self.input_bytes = self.input_bytes.saturating_add(extra);
-                        if self.input_bytes.saturating_mul(32) > CACHE_BYTES {
-                            return Err(io::Error::other(
-                                "terminal metadata input exceeds 64 MiB safety budget",
-                            ));
-                        }
                         self.engine.feed(&out.filtered);
                         self.position.offset += out.filtered.len() as u64;
                         out = ScanOut::default();
@@ -638,6 +633,54 @@ mod tests {
         let bytes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
         assert_eq!(bytes.iter().filter(|n| **n == 0).count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn large_unicode_and_title_streams_remain_readable_with_small_retained_views() {
+        // More than 2 MiB of ordinary UTF-8/OSC-bearing input used to hit
+        // the lifetime input * 32 "metadata" read limit, despite a tiny grid.
+        for (name, record) in [
+            ("unicode", "日志输出\r\n".repeat(8192).into_bytes()),
+            (
+                "titles",
+                [
+                    b"\x1b]0;progress\x07".as_slice(),
+                    &b"normal output\r\n".repeat(8192),
+                ]
+                .concat(),
+            ),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("oly-large-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            for _ in 0..32 {
+                journal
+                    .record_output(Bytes::copy_from_slice(&record))
+                    .unwrap();
+            }
+            journal
+                .record_output(Bytes::from_static(b"FINAL-MARKER\r\n"))
+                .unwrap();
+            journal.shutdown();
+            let (output, end) = tail(&dir, 40, false).unwrap();
+            assert!(output.ends_with(b"FINAL-MARKER\n"));
+            assert_eq!(String::from_utf8(output).unwrap().lines().count(), 40);
+            for history in [
+                current(&dir, false).unwrap(),
+                collect(&dir, 0, 1, false).unwrap(),
+            ] {
+                assert_eq!(history.end_position.offset, end);
+                assert_eq!(history.snapshots.len(), 1);
+                assert!(
+                    history.snapshots[0]
+                        .rows_bytes
+                        .iter()
+                        .any(|row| row == b"FINAL-MARKER")
+                );
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
