@@ -87,13 +87,16 @@ const SEARCH_INPUT = 'Search sessions by id, title, command, or working director
 // by text queries), so card assertions are scoped to the mobile list.
 const list = (page: Page) => page.getByTestId('mobile-session-content')
 
-test('the trigger floats bottom-right, like the terminal scroll handle', async ({ page }) => {
+test('the trigger floats at the scroll-handle height, right-aligned', async ({ page }) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const box = (await icon.boundingBox())!
 
-  // Bottom-right, in the thumb zone and clear of the bottom meta bar.
+  // Right side of the screen, in the thumb zone.
   expect(box.x + box.width / 2).toBeGreaterThan(375 / 2)
-  expect(box.y + box.height / 2).toBeGreaterThan(812 * 0.75)
+  // The terminal scroll handle's offset (`bottom-70`): raised well clear of the
+  // bottom meta bar, without floating up into the header.
+  expect(box.y).toBeGreaterThan(375)
+  expect(box.y + box.height).toBeLessThan(650)
   // It is a layer over the list, not list content, so scrolling cannot take it
   // away.
   expect(await icon.evaluate((el) => el.closest('[data-testid="mobile-session-list"]'))).toBeNull()
@@ -128,6 +131,17 @@ test('a tap expands the search bar, focuses the input, and blur collapses it', a
   await expect(input).toBeVisible()
   // The whole point of the tap path: type straight away.
   await expect(input).toBeFocused()
+
+  // The bar grows out of the trigger, to the left: the trigger itself does not
+  // move, and the input sits on its row as one merged pill.
+  const collapsed = (await icon.boundingBox())!
+  await input.fill('x')
+  const expandedTrigger = (await icon.boundingBox())!
+  const inputBox = (await input.boundingBox())!
+  expect(expandedTrigger.x).toBe(collapsed.x)
+  expect(inputBox.x).toBeLessThan(collapsed.x)
+  expect(inputBox.y).toBeLessThan(collapsed.y + collapsed.height)
+  expect(inputBox.y + inputBox.height).toBeGreaterThan(collapsed.y)
 
   await input.fill('bash')
   await expect(list(page).getByText('alpha bash session')).toBeVisible()
