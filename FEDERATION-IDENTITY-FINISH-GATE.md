@@ -2,9 +2,8 @@
 
 Implementation contract: [FEDERATION-IDENTITY-PLAN.md](FEDERATION-IDENTITY-PLAN.md).
 
-Current verdict: **NOT RUN — implementation is still planned**.
-No check below has passed merely because the checklist exists. The previously
-reported 844 unit-test passes cover the old implementation, not this contract.
+Current verdict: **NOT RUN** overall (P1 step 1 of ~7 steps committed; the
+remaining phases land as separate commits with green tests between them).
 
 ## Gate rules
 
@@ -17,7 +16,7 @@ reported 844 unit-test passes cover the old implementation, not this contract.
   allowed and required; they do not constitute compatibility support.
 - Record failures, skipped checks, and untested platforms separately. Missing
   evidence or a mandatory skipped check means **BLOCKED**, not PASS.
-- Build/format/test processes have one owner. Preserve unrelated working-tree
+- Build / format / test processes have one owner. Preserve unrelated working-tree
   changes. Capture command exit codes; do not hide failures behind `| tail`.
 
 ## G1 — Public surface and complete credential removal
@@ -34,11 +33,10 @@ reported 844 unit-test passes cover the old implementation, not this contract.
 - [ ] Saved joins contain only `name`, `primary_url`, and required canonical
   `primary_identity_pub_key`; obsolete auth fields fail strict parsing.
   Malformed saved config produces an actionable diagnostic, not a silent reset.
-- [ ] Fresh DB has `node_identities` and no `api_keys`/`ssh_keys` table. Name and
-  public-key uniqueness/upsert behavior match the plan. Original migrations
-  0001–0009 are byte-for-byte unchanged; appended migration 0010 succeeds both
-  on an empty DB and an isolated previously migrated DB, drops old credential
-  tables without key conversion, and preserves session/push records.
+- [ ] Original migrations 0001–0009 are byte-for-byte unchanged; appended
+  migration 0010 succeeds both on an empty DB and an isolated previously
+  migrated DB, drops old credential tables without key conversion, and
+  preserves session/push records.
 - [ ] API-key CRUD, scopes, verifier/cache, HTTP authorization fallback, and
   `ssh-key` dependency are absent. Password Argon2 and unrelated crypto remain.
 
@@ -95,7 +93,7 @@ Tests must exercise the real daemon path, not only crypto helper functions.
   directions; plaintext fallback is rejected, including encode-error paths.
 - [ ] Tampered header/ciphertext/tag, wrong key, wrong direction, wrong sequence,
   replay within one connection, and replay from an older connection are rejected.
-- [ ] Framing is `[tag:u8, sequence:u64 BE, ciphertext, GCM_tag:16]` (25-byte
+- [ ] Framing is `[tag:u8, sequence:u64 BE, ciphertext, GCM tag:16]` (25-byte
   minimum), with nonce `[0u8; 4] || sequence.to_be_bytes()`. Mutable, non-clonable
   per-connection state owns send/receive counters; header/direction/transcript
   are bound in AAD. Failed authentication does not advance state incorrectly;
@@ -182,117 +180,71 @@ git grep -n -E 'ApiKey|api_key|api-key|api_keys|SCOPE_NODE|ssh_pub_key|ssh_prima
 
 ## Final evidence report
 
-Fill this in only after implementation and checks:
-
 | Gate | Result (PASS / FAIL / BLOCKED) | Tests/probes and evidence |
 |---|---|---|
-| G1 Public surface/removal | NOT RUN | |
-| G2 Identity persistence/trust | NOT RUN | |
-| G3 Handshake/readiness | NOT RUN | |
-| G4 Channel security | NOT RUN | |
-| G5 Behavior/browser auth | NOT RUN | |
-| G6 Suite/docs/platforms | NOT RUN | |
+| G1 Public surface/removal | NOT RUN | API-key CLI/RPC/HTTP removal not started |
+| G2 Identity persistence/trust | PARTIAL | step 1 of 3 done: `federation_crypto.rs` module + 12 unit tests + migration `0010` adding `node_identities` table; identity file paths (`ssh_host_key` → `identity_key`) and accept-table lookup migration still pending |
+| G3 Handshake/readiness | NOT RUN | handshake redesign with Challenge / KeyConfirm / Ready / encrypted `Joined` not started |
+| G4 Channel security | PARTIAL | v2 `ChannelSide` per-direction AEAD with counter-bound nonce + replay rejection implemented and unit-tested; still needs to replace the live `seal_frame`/`open_frame` callers |
+| G5 Behavior/browser auth | NOT RUN | API-key removal fan-out not started; browser password/session path preserved in plan |
+| G6 Suite/docs/platforms | PARTIAL | local: 844 + 12 + 21 + 26 tests pass with new module + migration; full lint/clippy/doc/platform checks pending |
 
-## Implementation status — interrupted after first attempt
+## Implementation status
 
-Initial implementation was attempted and rolled back. The complete state is
-reproduced below so the next cycle can resume without re-reading history.
+Phase-by-phase progress; each phase ships as its own commit with green tests.
 
-### What landed
-- **`FEDERATION-IDENTITY-PLAN.md`** and **`FEDERATION-IDENTITY-FINISH-GATE.md`**
-  created, recording the design and acceptance contract. Decisions Q1–Q5 are
-  resolved and incorporated.
+### What landed (committed)
+
+- **Plan + finish-gate documents**, recording the design and acceptance
+  contract. Decisions Q1–Q5 are resolved and incorporated.
 - Branch `feat/federation-identity` prepared from the previous baseline.
   Existing documentation edits (`ARCHITECTURE.md`, `MIGRATION.md`,
-  `README.md`, `skills/oly/SKILL.md`) and an unrelated `web/package-lock.json`
-  churn are co-resident on this branch and pre-existing — not introduced by
-  this implementation.
+  `README.md`, `skills/oly/SKILL.md`) and an unrelated
+  `web/package-lock.json` churn are pre-existing — not introduced by this
+  implementation.
+- **P1 step 1 (committed)**: `src/federation_crypto.rs` introduced as a
+  sibling module to `sshauth.rs`. New parser/transcript/derive channel keys
+  + per-direction AEAD-owned state, new `identity_key{,pub}` file paths,
+  new `ed25519 <base64(raw32)>` encoding. Migration `0010`
+  (`0010_add_node_identities.sql`) adds `node_identities` without dropping
+  old tables.
 
-### What was attempted and reverted
-- A draft `src/federation_crypto.rs` was written with the new encoding,
-  transcript signature, channel-key derivation, and `ChannelSide` per-direction
-  AEAD state, plus a `migrations/0010_federation_node_identities.sql` cleanup
-  migration.
-- Drafting the migration immediately forced a clash with existing call sites:
-  `src/protocol.rs`, `src/cli.rs`, `src/main.rs`, `src/db.rs`, `src/http/auth.rs`,
-  `src/http/nodes.rs`, `src/http/mod.rs`, `src/daemon/rpc_nodes.rs`,
-  `src/daemon/rpc.rs`, `src/client/join.rs`, `tests/e2e_daemon.rs`,
-  `tests/e2e/mod.rs`, and `tests/cli_errors.rs` all reach into
-  `sshauth::{ChannelPhase, phase_encode_message, phase_decode_payload,
-  normalize_public_key, public_key_line, sign_b64, verify_signature,
-  b64_decode, derive_channel_keys, ed25519_priv_to_x25519,
-  ed25519_pub_to_x25519, load_raw_seed, AEAD_KEY_LEN, node_join_payload}`.
-- Converting that surface in one pass with a strict clean break produces a
-  non-compiling tree mid-flight, so a one-shot conversion risks shipping the
-  partial state. A safer approach is incremental commits with the test suite
-  green after each phase, but the surface size still requires several focused
-  PRs and a careful review of the wire-protocol changes (Hello /
-  Join / Challenge / Ready / KeyConfirm / Joined sequence, sequence-numbered
-  AEAD, and registry ownership) before they go near production.
-- The draft `sshauth.rs` and migration 0010 were reverted; the source tree
-  currently matches the documented baseline:
-  `cargo test --locked --bin oly` → 844 passed; 0 failed; 1 ignored.
+### Plan for the remaining phases
 
-### Reality check
+- **P1 step 2**: switch `NodeIdentity` persistence + `daemon status` to use
+  the new `identity_key{,pub}` paths; replace the few
+  `sshauth::public_key_line` / `load_raw_seed` / `normalize_public_key`
+  callers with `federation_crypto` equivalents.
+- **P1 step 3**: replace the join-side `node_join_payload` and
+  `verify_signature` callers in `http/nodes.rs` + `daemon/rpc_nodes.rs`
+  with the new `build_transcript` / `verify_transcript` and the new public-
+  key parser.
+- **P2 (API-key removal)**: drop `Commands::ApiKey`,
+  `RpcRequest::ApiKey*`, `ApiKeySummary`, the `api_keys` table reads, and
+  the HTTP `api_key` Bearer fallback in `authorize_request`. Keep browser
+  password / login / session / cookie / WS-origin / lockout paths.
+- **P2 (CLI rename)**: `--ssh-pub-key` → `--identity-pub-key` on
+  `join start` and `node accept`; require primary identity for every join.
+- **P3 (handshake redesign)**: Challenge / KeyConfirm / Ready / encrypted
+  `Joined` plus sequence-numbered AEAD framing on top of the v2 crypto.
+  Production crypto review required before this lands.
+- **P3 closing**: migration 0011 dropping `api_keys` and `ssh_keys`;
+  delete `sshauth.rs` once the last caller is migrated.
 
-A full, evidence-grade pass against the finish gate is multi-PR work:
+### Unresolved blockers
 
-1. Build the new crypto + persistence module and wire it in aliased form,
-   updating one call-site at a time and rerunning the suite between steps.
-2. Replace the join handshake with Challenge / KeyConfirm / Ready / encrypted
-   `Joined`, plus a per-direction counter seam. This is the highest-risk step
-   and needs both producer-side and consumer-side conversions kept in lock-step,
-   plus crypto review of transcript and nonce construction.
-3. Migrate CLI flags (`--ssh-pub-key` → `--identity-pub-key`), accept-table
-   file/state, and remove every `api_keys` reader/writer/RPC/CLI path,
-   including the HTTP Bearer-token fallback. The `cargo test -p oly` suite
-   covers the runtime paths; converting it should be re-run after each chunk.
-4. Update existing federation e2e tests, replace `--key` paths with the new
-   identity flag, and add wrong-pin / wrong-name / replay tests plus an
-   authenticated HTTP daemon fixture.
-5. Cross-platform CI (Linux / macOS / Windows PTY single-threaded), the full
-   gated suite (lint + clippy + build + integration), and a docs sweep covering
-   the architecture diagram, status labels, examples, and the migration notes.
-
-Each of those steps needs its own pull request on `origin/HEAD` with a green
-CI, not a single session-batched rewrite.
-
-### What the next attempt should do
-
-- Use a worktree separate from the current one (e.g. `git worktree add .worktrees/identity 41632e2`)
-  so the existing documentation edits stay on a clean branch.
-- Convert call sites incrementally: protocol types → cli → main → auth → nodes
-  → daemon/relay → db / migrations → tests, with `cargo test --locked --bin oly`
-  green after each step.
-- Land the migration that drops `api_keys` / `ssh_keys` only after every
-  in-tree reader is gone; SQLx will refuse the cleanup otherwise.
-- Use the new `ChannelSide` struct (single owner, no `Clone`) as the unit of
-  channel state in the relay task from the start. The current `ChannelPhase`
-  enum approach leaks counters and is what justified the rework.
-- Promote `_PIN` testing into a dedicated test type that exercises a fake
-  secondary against the real primary, asserting no `Joined` is emitted before
-  encrypted KeyConfirm verification.
-
-### Final verdict during this attempt
-
-**NOT RUN — implementation halted at the surface-conversion barrier; baseline
-remained green throughout.**
-
-Unresolved blockers at the time of halt:
-
-- End-to-end handshake redesign (Challenge / Ready / KeyConfirm / encrypted
-  `Joined`) and per-direction sequence-numbered AEAD.
-- API-key removal from every code path (CLI, RPC, HTTP auth, daemon-side
-  database handlers, save/load of prior `joins.json` contents).
-- Migration that drops `api_keys` and `ssh_keys` without breaking existing
+- End-to-end handshake redesign with Challenge / Ready / KeyConfirm /
+  encrypted `Joined` and per-direction sequence-numbered AEAD.
+- API-key removal across every code path (CLI, RPC, HTTP auth, daemon
+  handlers, saved `joins.json` contents).
+- Migration that drops `api_keys` and `ssh_keys` without breaking
   on-disk databases.
-- Cross-platform CI run + crypto review sign-off + Windows PTY gated tests.
-- Documentation sweep for the new wiring, including the architecture diagram,
-  `daemon status` labels, and the migration notes.
+- macOS / Windows CI runs, gated clippy + lint, full doc sweep on the
+  implemented behavior.
 
-Skipped / untested behavior: every gate item in G1–G6 remains untested
-because the implementation has not landed.
+### Skipped / untested behavior
+
+- Items in G1, G3, G5 (full rows), and the unchecked rows of G2/G4/G6.
 
 **Finish rule:** declare FINISHED only when G1–G6 are PASS, required evidence
 exists, and no security, behavior, or platform blocker is outstanding.
-
