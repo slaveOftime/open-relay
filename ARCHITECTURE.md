@@ -112,6 +112,17 @@ Two design points worth knowing before touching this code:
   (`web/src/api/ws-frames.ts: terminalModeSequences`) and writes a
   full set-or-clear DECSET stream into xterm. That is why mouse and
   focus work on a page load into an already-enabled program.
+- **Scripted mouse input is application input, not a history view.**
+  `oly send <id> mouse:wheel+3` or `mouse:left@2,3` uses a one-shot
+  `AttachMouse { id, spec }` RPC. The owning daemon parses once, resolves live
+  mouse modes and viewport geometry, and enqueues bytes under the input lock.
+  `src/mouse.rs` shares encoding with interactive attach. Counts are bounded
+  events, not rows; clicks require explicit positions and emit press/release
+  pairs. Only wheel defaults to the viewport center. Unsupported modes and
+  out-of-viewport positions fail explicitly. The application's redraw stays
+  ordinary journaled PTY output visible through `oly logs --screen`; no
+  viewing offset or second recording is introduced. Node proxies allow this
+  operator RPC, not mid-stream attach messages.
 - **CLI paste boundaries belong to the input reader.** The outer terminal
   keeps bracketed paste enabled even when the child does not; the CLI wraps
   an `Event::Paste` only when the child's mode snapshot enables it. Unix

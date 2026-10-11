@@ -1,10 +1,7 @@
 use std::io::{IsTerminal, Write};
 
 use crossterm::{
-    event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
 };
 #[cfg(not(windows))]
@@ -19,6 +16,7 @@ use crate::{
     config::AppConfig,
     error::{AppError, Result},
     ipc,
+    mouse::encode_mouse_event as map_mouse_input,
     protocol::{RpcRequest, RpcResponse},
 };
 
@@ -1182,66 +1180,6 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
     }
 }
 
-/// Encode a mouse event for the child in the encoding the child
-/// negotiated: SGR (DECSET 1006) when enabled, otherwise the legacy X11
-/// encoding (button press/release and scroll only — motion has no
-/// faithful legacy form and is dropped).
-fn map_mouse_input(mouse: MouseEvent, sgr: bool) -> Option<Vec<u8>> {
-    let mut cb: u16 = match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => 0,
-        MouseEventKind::Down(MouseButton::Middle) => 1,
-        MouseEventKind::Down(MouseButton::Right) => 2,
-        MouseEventKind::Up(MouseButton::Left) => 0,
-        MouseEventKind::Up(MouseButton::Middle) => 1,
-        MouseEventKind::Up(MouseButton::Right) => 2,
-        MouseEventKind::Drag(MouseButton::Left) => 32,
-        MouseEventKind::Drag(MouseButton::Middle) => 33,
-        MouseEventKind::Drag(MouseButton::Right) => 34,
-        MouseEventKind::Moved => 35,
-        MouseEventKind::ScrollUp => 64,
-        MouseEventKind::ScrollDown => 65,
-        MouseEventKind::ScrollLeft => 66,
-        MouseEventKind::ScrollRight => 67,
-    };
-    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-        cb += 4;
-    }
-    if mouse.modifiers.contains(KeyModifiers::ALT) {
-        cb += 8;
-    }
-    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
-        cb += 16;
-    }
-    if sgr {
-        // SGR uses 1-based coordinates.
-        let cx = mouse.column + 1;
-        let cy = mouse.row + 1;
-        let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
-            'm'
-        } else {
-            'M'
-        };
-        Some(format!("\x1b[<{cb};{cx};{cy}{suffix}").into_bytes())
-    } else {
-        // Legacy X11 encoding: `ESC [ M Cb Cx Cy`, every field a single
-        // byte biased by 32; releases report button 3; coordinates
-        // beyond 223 cannot be represented and are dropped rather than
-        // corrupted.
-        if matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved) {
-            return None;
-        }
-        let base = if matches!(mouse.kind, MouseEventKind::Up(_)) {
-            3
-        } else {
-            cb
-        };
-        let cb = u8::try_from(base).ok()?.checked_add(32)?;
-        let cx = u8::try_from(mouse.column).ok()?.checked_add(33)?;
-        let cy = u8::try_from(mouse.row).ok()?.checked_add(33)?;
-        Some(vec![0x1b, b'[', b'M', cb, cx, cy])
-    }
-}
-
 /// Mirror the child's input modes on the outer terminal: mouse capture
 /// and focus-event reporting (DECSET 1004) follow the child so local
 /// selection and focus keys behave normally whenever the child has not
@@ -1345,7 +1283,10 @@ async fn maybe_send_ack(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
 
     // -----------------------------------------------------------------------
     // Helper constructors

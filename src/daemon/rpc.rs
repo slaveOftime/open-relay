@@ -21,8 +21,9 @@ use crate::{
 use super::{JoinHandles, NotificationTx, NotifierHandle, SessionEventTx, SessionStoreHandle};
 use super::{
     rpc_attach::{
-        handle_attach_busy, handle_attach_detach, handle_attach_input, handle_attach_resize,
-        handle_attach_subscribe, handle_observe_window, handle_session_cursor,
+        handle_attach_busy, handle_attach_detach, handle_attach_input, handle_attach_mouse,
+        handle_attach_resize, handle_attach_subscribe, handle_observe_window,
+        handle_session_cursor,
     },
     rpc_nodes::{
         handle_node_accept, handle_node_list, handle_node_proxy, handle_node_proxy_streaming,
@@ -199,6 +200,7 @@ async fn dispatch_request(
             wait_for_change,
             attachment_id,
         } => handle_attach_input(id, data, session_store, wait_for_change, attachment_id).await,
+        RpcRequest::AttachMouse { id, spec } => handle_attach_mouse(id, spec, session_store).await,
         RpcRequest::SessionCursor { id } => handle_session_cursor(id, session_store).await,
         RpcRequest::ObserveWindow {
             id,

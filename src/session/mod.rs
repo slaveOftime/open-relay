@@ -103,6 +103,8 @@ pub enum SessionError {
     Evicted,
     NotRunning,
     Busy,
+    /// An operator input action is invalid or unsupported by the live modes.
+    InvalidInput(String),
     Persistence(String),
     /// A resume cursor named a different journal incarnation than the
     /// session's current one; the client must resnapshot (ADR-0004).
@@ -127,7 +129,7 @@ impl SessionError {
             Self::Evicted => format!("session evicted from memory: {id}"),
             Self::NotRunning => format!("session not running: {id}"),
             Self::Busy => format!("session input queue is full: {id}"),
-            Self::Persistence(message) => message.clone(),
+            Self::InvalidInput(message) | Self::Persistence(message) => message.clone(),
             Self::StaleCursor { requested, current } => format!(
                 "stale resume cursor for {id}: cursor names incarnation {requested:?}, \
                  session incarnation is {current:?}; resnapshot instead of resuming"

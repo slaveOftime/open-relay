@@ -356,24 +356,54 @@ impl SessionStore {
         data: &[u8],
         wait_for_change: bool,
     ) -> std::result::Result<(), SessionError> {
+        self.attach_input_action(id, attachment_id, wait_for_change, |_| Ok(data.to_vec()))
+            .await
+    }
+
+    /// Ungated operator mouse input. Parse once, then resolve live modes and
+    /// geometry under the input lock. Backpressure/activity use the same path
+    /// as raw input; no separate viewing state is introduced.
+    pub async fn attach_mouse(
+        &self,
+        id: &str,
+        spec: &str,
+        wait_for_change: bool,
+    ) -> std::result::Result<(), SessionError> {
+        let input = crate::mouse::parse_mouse_spec(spec).map_err(SessionError::InvalidInput)?;
+        self.attach_input_action(id, None, wait_for_change, move |rt| {
+            if rt.is_completed() || rt.output_closed {
+                return Err(SessionError::NotRunning);
+            }
+            let modes = rt.mode_snapshot();
+            let (rows, cols) = rt.engine.size();
+            input
+                .encode(rows, cols, modes.mouse_report, modes.sgr_mouse)
+                .map_err(SessionError::InvalidInput)
+        })
+        .await
+    }
+
+    async fn attach_input_action(
+        &self,
+        id: &str,
+        attachment_id: Option<u64>,
+        wait_for_change: bool,
+        resolve: impl FnOnce(
+            &crate::session::runtime::SessionRuntime,
+        ) -> std::result::Result<Vec<u8>, SessionError>,
+    ) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
 
-        // Observe-mode enforcement: an attached observer never drives input
-        // directly. `None` is the operator control plane
-        // (`oly send`, HTTP input), which is not an attachment and stays
-        // ungated.
-        if let Some(attachment_id) = attachment_id {
-            let rt = handle.read();
-            check_control(&rt, attachment_id)?;
-        }
-
-        // Read lock: send to the PTY channel. try_write_input() is a
-        // non-blocking channel send that only needs &self.
         let (initial_total_bytes, byte_len) = {
             let rt = handle.read();
+            // Observers never drive. `None` is the ungated operator path.
+            if let Some(attachment_id) = attachment_id {
+                check_control(&rt, attachment_id)?;
+            }
+            let data = resolve(&rt)?;
             let initial_total_bytes = rt.filtered_total_bytes;
             let byte_len = data.len();
-            match rt.pty.try_write_input(data.to_vec()) {
+            match rt.pty.try_write_input(data) {
                 Ok(()) => Ok((initial_total_bytes, byte_len)),
                 Err(TrySendError::Full(_)) => {
                     debug!(
@@ -665,6 +695,155 @@ mod tests {
             written, b"hello\r",
             "expected exact bytes sent via writer_tx"
         );
+    }
+
+    #[tokio::test]
+    async fn mouse_uses_live_modes_and_geometry_and_marks_activity() {
+        let (rt, mut writer_rx) = make_runtime_writable("mouse_align", SessionStatus::Running);
+        {
+            let mut locked = rt.write();
+            locked.engine.resize(24, 80);
+            locked.feed_engine(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        }
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        store
+            .attach_mouse("mouse_align", "wheel+3", false)
+            .await
+            .unwrap();
+        let bytes = writer_rx.recv().await.unwrap();
+        assert_eq!(bytes, b"\x1b[<64;41;13M".repeat(3));
+        assert!(rt.read().last_input_at.is_some());
+
+        // Live modes switch away from SGR; coordinates re-default to viewport center.
+        {
+            let mut locked = rt.write();
+            locked.engine.resize(10, 20);
+            locked.feed_engine(b"\x1b[?1006l");
+        }
+        store
+            .attach_mouse("mouse_align", "wheel-2", false)
+            .await
+            .unwrap();
+        let bytes = writer_rx.recv().await.unwrap();
+        assert_eq!(bytes, [0x1b, b'[', b'M', 97, 43, 38].repeat(2));
+    }
+
+    #[tokio::test]
+    async fn mouse_explicit_coordinates_are_validated_against_live_geometry() {
+        let (rt, mut writer_rx) = make_runtime_writable("mouse_align", SessionStatus::Running);
+        {
+            let mut locked = rt.write();
+            locked.engine.resize(20, 30);
+            locked.feed_engine(b"\x1b[?1000h\x1b[?1006h");
+        }
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        for spec in ["left", "middle", "right", "left+2", "middle+2", "right+2"] {
+            assert!(
+                matches!(store.attach_mouse("mouse_align", spec, false).await,
+                Err(SessionError::InvalidInput(message)) if message.contains("requires @col,row"))
+            );
+        }
+        assert!(writer_rx.try_recv().is_err());
+        assert!(rt.read().last_input_at.is_none());
+        store
+            .attach_mouse("mouse_align", "left+2@5,5", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer_rx.recv().await.unwrap(),
+            b"\x1b[<0;5;5M\x1b[<0;5;5m".repeat(2)
+        );
+        store
+            .attach_mouse("mouse_align", "right@30,20", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            writer_rx.recv().await.unwrap(),
+            b"\x1b[<2;30;20M\x1b[<2;30;20m"
+        );
+        assert!(matches!(
+            store
+                .attach_mouse("mouse_align", "left@300,300", false)
+                .await,
+            Err(SessionError::InvalidInput(_))
+        ));
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn mouse_errors_do_not_inject_input() {
+        let (rt, mut writer_rx) = make_runtime_writable("mouse_errors", SessionStatus::Running);
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        for tag in [
+            "",
+            "left+shift",
+            "left(1)",
+            "wheel+0",
+            "wheel+1001",
+            "@1,2",
+            "left@0,1",
+            "wheel+2junk",
+            "left@2,3junk",
+        ] {
+            assert!(
+                matches!(
+                    store.attach_mouse("mouse_errors", tag, false).await,
+                    Err(SessionError::InvalidInput(_))
+                ),
+                "tag {tag:?} unexpectedly accepted"
+            );
+        }
+        assert!(writer_rx.try_recv().is_err());
+        assert!(rt.read().last_input_at.is_none());
+
+        rt.write().output_closed = true;
+        assert!(matches!(
+            store.attach_mouse("mouse_errors", "left@1,1", false).await,
+            Err(SessionError::NotRunning)
+        ));
+
+        rt.write().output_closed = false;
+        // A large legacy viewport cannot represent the default center.
+        {
+            let mut locked = rt.write();
+            locked.engine.resize(500, 500);
+            locked.feed_engine(b"\x1b[?1000h");
+        }
+        let result = store.attach_mouse("mouse_errors", "wheel", false).await;
+        assert!(matches!(result, Err(SessionError::InvalidInput(_))));
+        assert!(writer_rx.try_recv().is_err());
+
+        // Disabled mouse reporting yields one specific error, no input bytes.
+        let (rt2, mut writer_rx2) = make_runtime_writable("mouse_off", SessionStatus::Running);
+        let store2 = store_with(vec![rt2], make_test_db().await);
+        assert!(matches!(
+            store2.attach_mouse("mouse_off", "left@1,1", false).await,
+            Err(SessionError::InvalidInput(_))
+        ));
+        assert!(writer_rx2.try_recv().is_err());
+
+        assert!(
+            store
+                .attach_mouse("missing", "left@1,1", false)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn mouse_preserves_input_backpressure() {
+        let (rt, _writer_rx) =
+            make_runtime_writable_with_capacity("mouse_full", SessionStatus::Running, 1);
+        rt.write().feed_engine(b"\x1b[?1000h\x1b[?1006h");
+        let store = store_with(vec![rt], make_test_db().await);
+        store
+            .attach_input("mouse_full", None, b"first", false)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.attach_mouse("mouse_full", "left@1,1", false).await,
+            Err(SessionError::Busy)
+        ));
     }
 
     #[tokio::test]

@@ -49,13 +49,18 @@ pub async fn run_send(
 
     // Process ordered chunks left to right
     for chunk in chunks.iter() {
-        let data = resolve_chunk(config, id, chunk, node.as_deref()).await?;
-        send_data(config, id, data, node.as_deref()).await?;
+        match parse_chunk(chunk) {
+            Chunk::Mouse(spec) => send_mouse(config, id, spec, node.as_deref()).await?,
+            _ => {
+                let data = resolve_chunk(config, id, chunk, node.as_deref()).await?;
+                send_data(config, id, data, node.as_deref()).await?;
+            }
+        }
         sent_any = true;
     }
 
     // Free-text payload from `--`: one literal blob, no per-token
-    // dispatch. `key:foo`, `oly-file:...`, `oly-clipboard`, etc. all
+    // dispatch. `key:foo`, `mouse:left`, `oly-file:...`, `oly-clipboard`, etc. all
     // pass through as ordinary text — the point of `--` is to opt out
     // of the chunk classifier.
     if let Some(blob) = free_text.as_deref().filter(|s| !s.is_empty()) {
@@ -83,6 +88,7 @@ pub async fn run_send(
 }
 
 /// Resolve a single CLI chunk into the raw bytes to send.
+/// Mouse actions are dispatched separately by `run_send`, not as raw bytes.
 /// - `key:<spec>` → special key sequence
 /// - `oly-clipboard` → clipboard text or uploaded clipboard file paths
 /// - `oly-file:<local-file-path>` → uploaded file path
@@ -95,6 +101,9 @@ async fn resolve_chunk(
 ) -> Result<Vec<u8>> {
     match parse_chunk(chunk) {
         Chunk::Key(spec) => parse_key_spec(spec),
+        Chunk::Mouse(_) => Err(AppError::Protocol(
+            "mouse is an input action, not text; use `--` or stdin to send literal text".into(),
+        )),
         Chunk::Clipboard => resolve_clipboard_chunk(config, id, node)
             .await
             .map(String::into_bytes),
@@ -109,6 +118,7 @@ async fn resolve_chunk(
 enum Chunk<'a> {
     Literal(&'a str),
     Key(&'a str),
+    Mouse(&'a str),
     Clipboard,
     File(&'a str),
 }
@@ -116,12 +126,39 @@ enum Chunk<'a> {
 fn parse_chunk(chunk: &str) -> Chunk<'_> {
     if let Some(spec) = chunk.strip_prefix("key:") {
         Chunk::Key(spec)
+    } else if let Some(spec) = chunk.strip_prefix("mouse:") {
+        Chunk::Mouse(spec)
     } else if chunk.eq_ignore_ascii_case("oly-clipboard") {
         Chunk::Clipboard
     } else if let Some(path) = chunk.strip_prefix("oly-file:") {
         Chunk::File(path)
     } else {
         Chunk::Literal(chunk)
+    }
+}
+
+async fn send_mouse(config: &AppConfig, id: &str, spec: &str, node: Option<&str>) -> Result<()> {
+    send_request(config, mouse_request(id, spec, node)).await
+}
+
+fn mouse_request(id: &str, spec: &str, node: Option<&str>) -> RpcRequest {
+    let inner = RpcRequest::AttachMouse {
+        id: id.to_string(),
+        spec: spec.to_string(),
+    };
+    match node {
+        Some(node) => RpcRequest::NodeProxy {
+            node: node.to_string(),
+            inner: Box::new(inner),
+        },
+        None => inner,
+    }
+}
+
+async fn send_request(config: &AppConfig, req: RpcRequest) -> Result<()> {
+    match ipc::send_request_checked(config, req).await? {
+        RpcResponse::Ack => Ok(()),
+        _ => Err(AppError::Protocol("unexpected response type".to_string())),
     }
 }
 
@@ -416,6 +453,30 @@ mod tests {
     fn key_chunk_parsed() {
         assert_eq!(parse_chunk("key:enter"), Chunk::Key("enter"));
         assert_eq!(parse_chunk("key:ctrl+c"), Chunk::Key("ctrl+c"));
+    }
+
+    #[test]
+    fn mouse_chunks_keep_the_whole_spec_and_scroll_is_literal() {
+        assert_eq!(parse_chunk("mouse:left@2,3"), Chunk::Mouse("left@2,3"));
+        assert_eq!(parse_chunk("mouse:wheel-3"), Chunk::Mouse("wheel-3"));
+        for text in ["scroll:3", "scroll:+3", "scroll:-3"] {
+            assert_eq!(parse_chunk(text), Chunk::Literal(text));
+        }
+    }
+
+    #[test]
+    fn mouse_requests_preserve_node_routing() {
+        assert!(matches!(mouse_request("s", "left@2,3", None),
+            RpcRequest::AttachMouse { id, spec } if id == "s" && spec == "left@2,3"));
+        let RpcRequest::NodeProxy { node, inner } =
+            mouse_request("s", "wheel+3", Some("secondary"))
+        else {
+            panic!("mouse request did not proxy to the node");
+        };
+        assert_eq!(node, "secondary");
+        assert!(
+            matches!(*inner, RpcRequest::AttachMouse { id, spec } if id == "s" && spec == "wheel+3")
+        );
     }
 
     #[test]

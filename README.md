@@ -134,7 +134,7 @@ oly send <id> key:ctrl+c
 oly send <id> key:up key:enter
 ```
 
-For arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force you to base64-encode and decode inside the target shell — use the free-text form. Once you pass `--`, every argument after it is sent as one literal blob joined with single spaces, with **no** per-token dispatch into `key:` / `oly-clipboard` / `oly-file:`:
+For arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force you to base64-encode and decode inside the target shell — use the free-text form. Once you pass `--`, every argument after it is sent as one literal blob joined with single spaces, with **no** per-token dispatch into `key:` / `mouse:` / `oly-clipboard` / `oly-file:`:
 
 ```sh
 # Multi-line body. The '--' opt-out lets you skip bash's quoting layers.
@@ -192,6 +192,37 @@ TUI repaint as a new transcript line:
   buffer's scrollback instead of mixing TUI frames into it.
 
 For older history beyond the attach seed, use `oly logs <id> --tail <n>`.
+
+### Click or scroll a live application without attaching
+
+Send each mouse action as **one argument**, with no spaces:
+
+```sh
+oly send <id> mouse:wheel+3       # 3 wheel-up ticks
+oly logs <id> --screen           # inspect the application's redraw
+oly send <id> mouse:wheel-3       # 3 wheel-down ticks
+oly send <id> mouse:left@2,3      # click column 2, row 3 (1-based)
+oly send <id> mouse:left+2@2,3    # two press/release pairs there
+oly send <id> mouse:middle@4,5    # one middle click at column 4, row 5
+```
+
+Click syntax: `mouse:<left|middle|right>[+N]@col,row` — a 1-based position
+is required. Wheel syntax: `mouse:wheel[+N|-N][@col,row]` — only wheel defaults
+to the live viewport center when its position is omitted. Counts default to
+one and range from 1 to 1000. Only wheels accept `-N` (down); `+N` is up.
+Counts are **events, not rows**; the application decides the effect. Positions
+outside the viewport fail rather than clicking a clamped location. The owning daemon selects SGR
+(1006) or legacy X11 from live modes; legacy positions cannot exceed 223.
+`--node` routes the action to the owning daemon.
+
+Mouse reporting must be enabled by the application. Otherwise the command
+fails rather than substituting keys; use known application keys such as
+`key:pgup` / `key:pgdn`. This changes the shared application view, not terminal
+scrollback: coordinate with attached users, take small steps, and verify via
+`oly logs --screen`. Delivery alone does not prove the view moved.
+
+There is no `scroll:` alias, modifier/drag/hover syntax, or universal top/bottom
+shortcut. To type `mouse:` text literally, use free-text mode (`--`) or stdin.
 
 ### Watch logs without attaching
 

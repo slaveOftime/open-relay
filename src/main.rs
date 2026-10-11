@@ -8,6 +8,7 @@ mod error;
 mod http;
 mod ipc;
 mod metrics;
+mod mouse;
 mod node;
 mod notification;
 mod protocol;

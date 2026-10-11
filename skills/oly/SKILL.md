@@ -82,7 +82,21 @@ oly send <ID> "cat " oly-file:/path/to/file key:enter
 - Raw hex: `key:hex:...`. Piped stdin is supported when no positional chunks are given.
 - Clipboard content uses `oly-clipboard`. Local file upload uses `oly-file:<path>`. This is normally used for remote node sessions.
 
-**Free-text mode (`--`).** When you need to send arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force base64 round-trips through a target shell — pass `--` and then the text. Everything after `--` is sent as one literal blob joined with single spaces, with **no** `key:` / `oly-clipboard` / `oly-file:` dispatch:
+**Click or scroll a live TUI.** Use `oly send <ID> mouse:wheel+3` for three
+wheel-up ticks, `mouse:wheel-3` for down, or `mouse:left@2,3` to click column 2,
+row 3. Each action is one argument, with no spaces. Click syntax:
+`mouse:<left|middle|right>[+N]@col,row` — position required. Wheel syntax:
+`mouse:wheel[+N|-N][@col,row]` — only wheel defaults to the live viewport
+center. Counts default to one (1..1000 events, not rows); only wheel accepts
+negative counts. Clicks emit press/release pairs. Positions are 1-based and
+fail if outside the viewport or unrepresentable in legacy X11.
+The application must enable mouse reporting; otherwise use its known keys
+(`key:pgup` / `key:pgdn`). This changes the shared application view, not
+terminal history. Coordinate with attached users, take small steps, and
+verify the redraw with `oly logs <ID> --screen`; delivery is not proof of
+movement. There is no `scroll:` alias or universal top/bottom shortcut.
+
+**Free-text mode (`--`).** When you need to send arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force base64 round-trips through a target shell — pass `--` and then the text. Everything after `--` is sent as one literal blob joined with single spaces, with **no** `key:` / `mouse:` / `oly-clipboard` / `oly-file:` dispatch:
 
 ```bash
 # Multi-line body — the `--` opt-outs out of bash quoting layers.
@@ -97,7 +111,7 @@ oly send <ID> -- echo "press key:enter to continue"
 oly send <ID> key:enter -- echo "after the enter"
 ```
 
-Use `--` whenever the payload contains `key:`, `oly-file:`, or `oly-clipboard`, has quotes / newlines, or is awkward to escape through the host shell. Send `key:enter` in a separate `oly send` call after free-text mode; anything after `--` is literal. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
+Use `--` whenever the payload contains `key:`, `mouse:`, `oly-file:`, or `oly-clipboard`, has quotes / newlines, or is awkward to escape through the host shell. Send `key:enter` in a separate `oly send` call after free-text mode; anything after `--` is literal. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
 
 **Input strategy:**
 

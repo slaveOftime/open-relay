@@ -613,6 +613,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
             | RpcRequest::NotifySend { .. }
             | RpcRequest::AttachSubscribe { .. }
             | RpcRequest::AttachInput { .. }
+            | RpcRequest::AttachMouse { .. }
             | RpcRequest::SessionCursor { .. }
             | RpcRequest::ObserveWindow { .. }
             | RpcRequest::AttachBusy { .. }
@@ -979,6 +980,16 @@ mod tests {
             panic!("wrong variant");
         };
         assert!(!credited, "absent credited must default to false");
+    }
+
+    #[test]
+    fn mouse_is_proxyable_but_not_an_attach_stream_message() {
+        let request = RpcRequest::AttachMouse {
+            id: "s".into(),
+            spec: "wheel+3".into(),
+        };
+        assert!(is_supported_proxied_rpc(&request));
+        assert!(!is_stream_message_relayable(&request));
     }
 
     #[test]

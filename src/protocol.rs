@@ -285,6 +285,12 @@ pub enum RpcRequest {
         #[serde(default)]
         attachment_id: Option<u64>,
     },
+    /// Ungated operator mouse input. The owning daemon parses `spec` (the
+    /// part after `mouse:`) and resolves live modes and viewport geometry.
+    AttachMouse {
+        id: String,
+        spec: String,
+    },
     /// Machine-readable session cursor (agent surface): incarnation,
     /// current filtered-stream offset, and liveness in one cheap call.
     SessionCursor {
@@ -437,6 +443,7 @@ impl RpcRequest {
             RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
+            RpcRequest::AttachMouse { .. } => "attach_mouse",
             RpcRequest::SessionCursor { .. } => "session_cursor",
             RpcRequest::ObserveWindow { .. } => "observe_window",
             RpcRequest::AttachBusy { .. } => "attach_busy",
@@ -794,6 +801,19 @@ mod tests {
         NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload,
         encode_node_ws_payload,
     };
+
+    #[test]
+    fn mouse_protocol_round_trips_a_compact_spec() {
+        let request = RpcRequest::AttachMouse {
+            id: "s".into(),
+            spec: "left+2@7,8".into(),
+        };
+        assert_eq!(request.name(), "attach_mouse");
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RpcRequest::AttachMouse { id, spec }
+            if id == "s" && spec == "left+2@7,8"));
+    }
 
     #[test]
     fn restart_protocol_round_trips_and_names_request() {

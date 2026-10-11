@@ -310,6 +310,19 @@ pub(super) async fn handle_attach_input(
     }
 }
 
+pub(super) async fn handle_attach_mouse(
+    id: String,
+    spec: String,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match session_store.attach_mouse(&id, &spec, true).await {
+        Ok(()) => RpcResponse::Ack,
+        Err(err) => RpcResponse::Error {
+            message: err.message(&id),
+        },
+    }
+}
+
 pub(super) async fn handle_attach_busy(
     id: String,
     session_store: &SessionStoreHandle,

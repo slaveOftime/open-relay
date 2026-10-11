@@ -851,7 +851,8 @@ pub async fn set_session_notifications(
         Err(
             err @ (SessionError::StaleCursor { .. }
             | SessionError::ViewOnly
-            | SessionError::StaleAttachment),
+            | SessionError::StaleAttachment
+            | SessionError::InvalidInput(_)),
         ) => {
             warn!(session_id = %id, error = err.message(&id), "notification toggle rejected");
             (

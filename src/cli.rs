@@ -82,7 +82,7 @@ pub enum Commands {
     /// Stream a fixed prefix of canonical filtered bytes (not raw PTY),
     /// including terminal controls, for files and pipes.
     Export(ExportArgs),
-    /// Send text or keys to a session. Example: `oly send <id> "hello" key:enter`.
+    /// Send text, keys, or application mouse input. Example: `oly send <id> mouse:wheel+3`.
     Send(SendArgs),
     /// Manage API keys on this (primary) daemon.
     ApiKey(ApiKeyArgs),
@@ -512,6 +512,12 @@ pub struct SendArgs {
     pub id: Option<String>,
     /// Input chunks, processed left to right. Plain text is sent literally.
     /// Prefix with key: for special keys, e.g. key:enter, key:ctrl+c, key:up.
+    /// Use mouse:left@col,row / mouse:middle@col,row / mouse:right@col,row for
+    /// clicks; positions are required and 1-based. Append +N to repeat clicks,
+    /// e.g. mouse:left+2@2,3. Use mouse:wheel+3 for 3 wheel-up ticks, or
+    /// mouse:wheel-3 for down. Wheel positions are optional (@col,row); only
+    /// wheel defaults to the live viewport center. Counts are 1..1000 events, not rows.
+    /// Requires application mouse reporting. Out-of-viewport positions fail.
     /// Use oly-clipboard to send clipboard text or uploaded clipboard files.
     /// Prefix with oly-file:<path> to upload a local file and send the saved session path.
     /// Supported keys: enter, tab, esc, backspace, up/down/left/right, home/end,
@@ -519,7 +525,7 @@ pub struct SendArgs {
     ///
     /// Use `--` to switch into free-text mode: every argument after `--` is
     /// sent as one literal blob joined with single spaces, with no
-    /// `key:` / `oly-clipboard` / `oly-file:` parsing. Useful for multi-line
+    /// `key:` / `mouse:` / `oly-clipboard` / `oly-file:` parsing. Useful for multi-line
     /// scripts, embedded quotes, or text that happens to start with `key:`.
     /// Example: `oly send <id> -- echo "hello world" key:enter`.
     #[arg(
