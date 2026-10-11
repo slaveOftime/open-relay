@@ -15,6 +15,7 @@ mod protocol;
 mod resume_hint;
 mod session;
 mod sshauth;
+mod federation_crypto;
 mod storage;
 mod terminal;
 mod terminal_guards;
