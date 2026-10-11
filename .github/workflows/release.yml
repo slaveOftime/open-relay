@@ -236,6 +236,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EFFECTIVE_REF }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -277,6 +279,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EFFECTIVE_REF }}
 
       - uses: actions/setup-node@v4
         with:
