@@ -1,6 +1,17 @@
+/*
+ * Terminal fonts. These live in `public/fonts/` and are referenced by absolute
+ * URL on purpose: Vite's CSS pipeline does not rewrite `url()` here, so a
+ * relative path resolved against the source tree and pointed at a file the
+ * build never emits. The daemon then answered every font request with
+ * index.html (200 + text/html), the browser refused it as a font, and the
+ * terminal silently fell back to the system monospace - which is what made
+ * block-character art render with gaps on Android. Files copied verbatim from
+ * `public/` are the only path guaranteed to exist at the URL we name.
+ */
+
 @font-face {
   font-family: 'Open Relay Terminal';
-  src: url('../assets/fonts/JetBrainsMono-Regular.ttf') format('truetype');
+  src: url('/fonts/JetBrainsMono-Regular.ttf') format('truetype');
   font-weight: 400;
   font-style: normal;
   font-display: swap;
@@ -8,7 +19,7 @@
 
 @font-face {
   font-family: 'Open Relay Terminal';
-  src: url('../assets/fonts/JetBrainsMono-Bold.ttf') format('truetype');
+  src: url('/fonts/JetBrainsMono-Bold.ttf') format('truetype');
   font-weight: 700;
   font-style: normal;
   font-display: swap;
@@ -16,7 +27,7 @@
 
 @font-face {
   font-family: 'Open Relay Terminal';
-  src: url('../assets/fonts/JetBrainsMono-Italic.ttf') format('truetype');
+  src: url('/fonts/JetBrainsMono-Italic.ttf') format('truetype');
   font-weight: 400;
   font-style: italic;
   font-display: swap;
@@ -24,7 +35,7 @@
 
 @font-face {
   font-family: 'Open Relay Terminal';
-  src: url('../assets/fonts/JetBrainsMono-BoldItalic.ttf') format('truetype');
+  src: url('/fonts/JetBrainsMono-BoldItalic.ttf') format('truetype');
   font-weight: 700;
   font-style: italic;
   font-display: swap;
@@ -52,7 +63,7 @@
  */
 @font-face {
   font-family: 'Open Relay Terminal Symbols';
-  src: url('../assets/fonts/OpenRelayTerminalSymbols.woff2') format('woff2');
+  src: url('/fonts/OpenRelayTerminalSymbols.woff2') format('woff2');
   /* One static face covers all four styles; the browser synthesises bold and
      italic, which suits symbols and halves the payload. */
   font-weight: 400 700;
