@@ -4,20 +4,29 @@
  * terminal's scroll handle — so it sits under the thumb and never scrolls away
  * with the list.
  *
- * Collapsed it is that one circular button. A tap grows the search bar out of
- * it to the left (one merged pill, the trigger as its right cap) and focuses
- * the input; a press-and-hold opens the quick menu instead — the filter
- * dropdowns the page passes as `menu`. The two popups are mutually exclusive:
- * the menu opens from a hold, and a tap toggles whichever of them is open.
+ * Collapsed it is that one circular button. A tap — classified only after the
+ * double window closes, so a pair never flashes the bar and the keyboard —
+ * grows the search bar out of the trigger's right edge toward the left (one
+ * merged pill, the trigger as its right cap, the icon itself never moving) and
+ * focuses the input; a double tap opens the quick menu instead — the filter
+ * dropdowns the page passes as `menu`. The two popups are mutually exclusive,
+ * and a tap toggles whichever of them is up. A drag moves the whole control
+ * somewhere better and remembers the spot (`useHoldToDrag` with `armMs: 0`:
+ * nothing else owns a drag on this button, so a travelling press is a move —
+ * no hold-then-move, which used to fight the hold that opened the menu).
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { cn } from '@/utils/cn'
-import { useLongPress } from '@/hooks/use-long-press'
+import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
+import { useTapGestures } from '@/hooks/use-tap-gestures'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
 import { Input } from '@/components/ui/input'
 
-/** QuickKeysMenu's pop ease: a slight overshoot so the menu feels springy. */
+/** Where a moved trigger is remembered; the default spot needs no entry. */
+const POSITION_KEY = 'oly.sessions.searchTrigger.v1'
+
+/** QuickKeysMenu's pop ease: a slight overshoot so the popups feel springy. */
 const SPRING_EASE = 'cubic-bezier(0.34, 1.56, 0.64, 1)'
 const ENTER_DURATION_MS = 200
 /** h-12, the scroll handle's size. The bar is the trigger plus its input zone. */
@@ -41,6 +50,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   const iconRef = useRef<HTMLButtonElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
 
   const duration = reducedMotion ? 0 : ENTER_DURATION_MS
 
@@ -52,6 +62,21 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     setExpanded(false)
     setArmed(false)
   }, [])
+
+  // Drag the trigger: the control follows the pointer and the drop is
+  // remembered. There is no hold to wait out — the press has no other drag
+  // meaning, so any press that travels past the slop is a move, and taking
+  // the button closes whichever popup is up.
+  const reposition = useHoldToDrag({
+    handleRef: iconRef,
+    elementRef: rootRef,
+    storageKey: POSITION_KEY,
+    armMs: 0,
+    onDragStart: () => {
+      collapseBar()
+      closeMenu()
+    },
+  })
 
   const open = expanded || menuOpen
 
@@ -67,10 +92,11 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     setExpanded(true)
   }, [closeMenu, collapseBar, expanded, menuOpen])
 
-  const hold = useLongPress({
+  const press = useTapGestures({
     onPress: handlePress,
-    // A hold always takes over with the quick menu, collapsing the bar first.
-    onLongPress: () => {
+    // The second tap of a pair is the quick menu, replacing the bar the first
+    // tap just opened.
+    onDoubleTap: () => {
       collapseBar()
       setMenuOpen(true)
     },
@@ -93,7 +119,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
 
   // The menu closes on an outside pointerdown or Escape. Pointerdowns inside a
   // menu select's own dropdown (a Radix popper portal) belong to that select;
-  // pointerdowns on the trigger belong to the hold, which toggles the menu
+  // pointerdowns on the trigger belong to its own tap, which toggles the menu
   // itself.
   useEffect(() => {
     if (!menuOpen) return
@@ -119,7 +145,10 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   }, [closeMenu, menuOpen])
 
   const popStyle: CSSProperties = {
-    transform: armed ? 'scale(1)' : 'scale(0.92)',
+    // The translate folds the vertical centering into the inline transform —
+    // a Tailwind translate class would be overridden by this. Origin is the
+    // right edge, so the menu grows out of the trigger toward the left.
+    transform: armed ? 'translateY(-50%) scale(1)' : 'translateY(-50%) scale(0.92)',
     opacity: armed ? 1 : 0,
     transitionDuration: `${duration}ms`,
     transitionTimingFunction: SPRING_EASE,
@@ -132,12 +161,18 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     'shadow-none outline-none ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
 
   return (
-    <div className={cn('absolute right-5 bottom-70 z-10 md:hidden', open && 'z-30')}>
-      {/* The bar: trigger-sized when closed, grown out of the trigger to the
-          left when the search is open. */}
+    <div
+      ref={rootRef}
+      className={cn('absolute right-5 bottom-70 z-10 h-12 w-12 md:hidden', open && 'z-30')}
+      style={reposition.style}
+    >
+      {/* The bar: trigger-sized when closed, grown out of the trigger's right
+          edge toward the left when the search is open. It anchors right so the
+          icon never moves — a dragged control is left-anchored, and a bar that
+          grew inside the flow would push the icon right, off the screen. */}
       <div
         className={cn(
-          'relative flex h-12 items-center overflow-hidden rounded-full',
+          'absolute right-0 top-0 flex h-12 items-center overflow-hidden rounded-full',
           'border border-[hsl(var(--border))] bg-[hsl(var(--muted))] shadow-lg',
           'transition-[width]',
           open ? 'opacity-100' : 'opacity-80'
@@ -166,7 +201,18 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
             aria-label="Search sessions by id, title, command, or working directory"
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
-            onBlur={collapseBar}
+            onBlur={(event) => {
+              // The tap that just opened this bar moves focus to the trigger
+              // as the gesture's default action, which blurs the input right
+              // after it was focused. That move is not a dismissal.
+              if (event.relatedTarget === iconRef.current) return
+              // The bar may already be down: the double tap that opened the
+              // menu hid the focused input, and the browser blurs it for that
+              // — a frame after the menu's entrance arm. Re-collapsing then
+              // would only tear the arm (and the menu's clickability) down.
+              if (!expanded) return
+              collapseBar()
+            }}
             onKeyDown={(event) => {
               if (event.key === 'Escape') collapseBar()
             }}
@@ -188,18 +234,20 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         </div>
       </div>
 
-      {/* The trigger: the bar's right cap, and the hold anchor for the menu. */}
+      {/* The trigger: the bar's right cap, and the tap/double-tap anchor for
+          the menu. */}
       <button
         ref={iconRef}
         type="button"
         aria-label="Search sessions"
         aria-haspopup="true"
         aria-expanded={menuOpen}
-        {...hold}
-        // Keyboard activation only. Pointer taps are handled on pointerup by
-        // the hold, and the click a held press synthesizes must not fire.
+        {...press.handlers}
+        // Only a click with no gesture behind it: the keyboard, assistive
+        // tech, a programmatic click. The browser's follow-up click for a tap
+        // is swallowed by the window check — a tap activates twice without it.
         onClick={(event) => {
-          if (event.detail !== 0) return
+          if (press.isFollowUpClick(event.timeStamp)) return
           handlePress()
         }}
         className={cn(
@@ -218,9 +266,13 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
       {menuOpen && menu && (
         <div
           ref={menuRef}
+          data-testid="session-search-menu"
           style={popStyle}
           className={cn(
-            'absolute bottom-full right-0 z-40 mb-2 w-60 origin-bottom-right rounded-lg',
+            // Anchored to the trigger's left, vertically centred on it, with a
+            // small gap — it reads as opening out of the trigger toward the
+            // list, which is where it points.
+            'absolute right-full top-1/2 z-40 mr-2 w-60 origin-right rounded-lg',
             'border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 p-3',
             'shadow-xl backdrop-blur-sm transition-[transform,opacity]',
             armed ? 'pointer-events-auto' : 'pointer-events-none'

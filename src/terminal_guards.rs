@@ -52,6 +52,7 @@ fn terminal_tab_state_restore_bytes() -> &'static [u8] {
 ///                 bracketed-paste modes the app or the attach client may
 ///                 have enabled (belt-and-suspenders alongside crossterm's
 ///                 DisableBracketedPaste below)
+///  \x1b[?9001l  - disable Windows native-key reporting requested by attach
 ///  \x1b[H\x1b[2J - home cursor then erase entire display.  On modern
 ///                 terminals (VTE, xterm, kitty, Windows Terminal) ED 2
 ///                 pushes the visible content into scrollback, so session
@@ -65,7 +66,7 @@ fn terminal_tab_state_restore_bytes() -> &'static [u8] {
 /// `terminal_tab_state_restore_bytes`, written right after this.
 fn terminal_normalize_bytes() -> &'static [u8] {
     b"\x1b[?1049l\x1b[?2026l\x1b[!p\x1b[0m\x1b[?25h\x1b[0 q\
-        \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\
+        \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?9001l\
         \x1b[H\x1b[2J"
 }
 
@@ -168,6 +169,11 @@ mod tests {
             alt_screen_pos < sync_off_pos,
             "expected alt-screen exit before disabling synchronized output"
         );
+    }
+
+    #[test]
+    fn terminal_normalize_disables_windows_native_key_reporting() {
+        assert!(find_subslice(terminal_normalize_bytes(), b"\x1b[?9001l").is_some());
     }
 
     #[test]

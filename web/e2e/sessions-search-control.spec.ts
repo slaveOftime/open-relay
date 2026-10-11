@@ -3,9 +3,57 @@ import { test, expect, type Page } from '@playwright/test'
 /**
  * The mobile header's search control. The control is mobile-only, so the file
  * runs at a phone viewport in the desktop Chromium project — pointer events
- * make the tap/hold gestures identical to touch there.
+ * make the tap/double-tap/drag gestures identical to touch there.
  */
 test.use({ viewport: { width: 375, height: 812 } })
+
+// A real touch tap is a different code path from a synthetic mouse click: no
+// mousedown focus, and a click that arrives after the press already focused the
+// search input. The suite's mouse-driven tests cannot see this, so the gestures
+// run under touch input here.
+test.describe('with touch input', () => {
+  test.use({ hasTouch: true })
+
+  test('a tap expands the bar and hands focus to the input', async ({ page }) => {
+    const icon = page.getByRole('button', { name: SEARCH_ICON })
+    const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+
+    await icon.tap()
+
+    await expect(input).toBeVisible()
+    // The bar must keep the input focused: the tap's own click moves focus to
+    // the trigger as its default action, which would blur the input and close
+    // the bar it just opened.
+    await expect(input).toBeFocused()
+    await page.waitForTimeout(400)
+    await expect(input).toBeVisible()
+    await expect(input).toBeFocused()
+  })
+
+  test('a double tap opens the quick menu', async ({ page }) => {
+    const icon = page.getByRole('button', { name: SEARCH_ICON })
+    const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+    const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
+
+    const box = (await icon.boundingBox())!
+    const cx = box.x + box.width / 2
+    const cy = box.y + box.height / 2
+
+    // The pair must land inside the 300ms double window, and two awaited CDP
+    // round trips can drift past it under load — a miss classifies as two
+    // singles, which toggle the bar twice and settle back closed. So tap
+    // again until the pair lands; every attempt starts from the same state.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await page.touchscreen.tap(cx, cy)
+      await page.touchscreen.tap(cx, cy)
+      await page.waitForTimeout(400) // let a missed pair's two singles fire
+      if (await statusTrigger.isVisible()) break
+    }
+    await expect(statusTrigger).toBeVisible()
+    // The menu replaced the bar the first tap of the pair opened.
+    await expect(input).toHaveCount(0)
+  })
+})
 
 function makeSession(id: string, title: string, status: string) {
   return {
@@ -102,14 +150,9 @@ test('the trigger floats at the scroll-handle height, right-aligned', async ({ p
   expect(await icon.evaluate((el) => el.closest('[data-testid="mobile-session-list"]'))).toBeNull()
 })
 
-/** Press and hold the search icon past the 400ms hold threshold. */
-async function holdSearchIcon(page: Page) {
-  const icon = page.getByRole('button', { name: SEARCH_ICON })
-  const box = (await icon.boundingBox())!
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
-  await page.mouse.down()
-  await page.waitForTimeout(600)
-  await page.mouse.up()
+/** Double-tap the search icon: the quick menu's opener. */
+async function openQuickMenu(page: Page) {
+  await page.getByRole('button', { name: SEARCH_ICON }).dblclick()
 }
 
 test.beforeEach(async ({ page }) => {
@@ -171,19 +214,32 @@ test('a tap expands the search bar, focuses the input, and blur collapses it', a
   await expect(input).toHaveCount(0)
 })
 
-test('a hold opens the quick menu instead, and its follow-up click is swallowed', async ({
+test('a double tap opens the quick menu, and its follow-up clicks are swallowed', async ({
   page,
 }) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
   const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
 
-  await holdSearchIcon(page)
+  await openQuickMenu(page)
 
   // The menu is up…
   await expect(statusTrigger).toBeVisible()
-  // …but the search bar did not expand, neither from the hold nor from the
-  // click the browser synthesizes when the press ends.
+
+  // …anchored to the trigger's left, centred on it, with a small gap.
+  const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
+  const iconBox = (await icon.boundingBox())!
+  const gap = iconBox.x - (menuBox.x + menuBox.width)
+  expect(menuBox.x + menuBox.width).toBeLessThan(iconBox.x)
+  expect(gap).toBeLessThan(24)
+  // Vertically centred on the trigger (the menu is taller than it).
+  expect(Math.abs(menuBox.y + menuBox.height / 2 - (iconBox.y + iconBox.height / 2))).toBeLessThan(
+    8
+  )
+
+  // …and no search bar is left behind: the menu replaced the bar the first tap
+  // of the pair opened, and the clicks the browser synthesizes for the pair
+  // open nothing further.
   await expect(input).toHaveCount(0)
   await page.waitForTimeout(100)
   await expect(input).toHaveCount(0)
@@ -198,7 +254,7 @@ test('a hold opens the quick menu instead, and its follow-up click is swallowed'
 test('the quick menu changes filters and clears them again', async ({ page }) => {
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
 
-  await holdSearchIcon(page)
+  await openQuickMenu(page)
   await page.getByRole('combobox', { name: 'Filter by status' }).click()
   await page.getByRole('option', { name: 'Running' }).click()
 
@@ -219,9 +275,58 @@ test('the quick menu changes filters and clears them again', async ({ page }) =>
   await expect(input).toHaveCount(0)
 
   // Escape closes it too.
-  await holdSearchIcon(page)
+  await openQuickMenu(page)
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeHidden()
   await expect(input).toHaveCount(0)
+})
+
+test('a drag relocates the trigger and remembers the spot', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+  const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
+
+  const before = (await icon.boundingBox())!
+  const cx = before.x + before.width / 2
+  const cy = before.y + before.height / 2
+
+  // No hold, no arm cue: on this button a travelling press is a move. The
+  // menu — which the old hold used to open mid-press, fighting the drag —
+  // must stay shut the whole way.
+  await page.mouse.move(cx, cy)
+  await page.mouse.down()
+  await page.mouse.move(cx - 60, cy + 80, { steps: 6 })
+  await expect(statusTrigger).toHaveCount(0)
+  await page.mouse.up()
+
+  // The trigger tracked the pointer exactly — down-left of `right-5 bottom-70`
+  // always has room, so no clamp could have adjusted it.
+  const after = (await icon.boundingBox())!
+  expect(Math.abs(after.x - (before.x - 60))).toBeLessThanOrEqual(2)
+  expect(Math.abs(after.y - (before.y + 80))).toBeLessThanOrEqual(2)
+
+  // Taking the button means the press was never a tap: the release's
+  // follow-up click opens no bar.
+  await expect(input).toHaveCount(0)
+
+  // The new spot survives a reload…
+  await page.reload()
+  await expect(list(page).getByText('alpha bash session')).toBeVisible()
+  const restored = (await icon.boundingBox())!
+  expect(Math.abs(restored.x - after.x)).toBeLessThanOrEqual(2)
+  expect(Math.abs(restored.y - after.y)).toBeLessThanOrEqual(2)
+
+  // …and the relocated trigger still works.
+  await icon.click()
+  await expect(input).toBeVisible()
+  await expect(input).toBeFocused()
+
+  // Expanding grows the bar toward the left, from the icon: a dragged control
+  // is left-anchored, and this is exactly the case where a bar that grew with
+  // the flow pushed the icon right instead.
+  const expanded = (await icon.boundingBox())!
+  expect(Math.abs(expanded.x - restored.x)).toBeLessThanOrEqual(2)
+  const inputBox = (await input.boundingBox())!
+  expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(restored.x + 1)
 })

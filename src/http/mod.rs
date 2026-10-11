@@ -432,6 +432,15 @@ async fn serve_static_or_proxy(
         }
     }
 
+    // A request that names a concrete asset file is a subresource, not a
+    // client-side route. Answering it with the SPA shell hides build mistakes:
+    // the daemon once served index.html (200 + text/html) for every missing
+    // font, so the browser refused it as a font and the terminal silently fell
+    // back to a system monospace. A 404 shows up in devtools instead.
+    if names_asset_file(uri.path()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let default_asset_name = "index.html";
     if let Some(asset) = WebAssets::get(default_asset_name) {
         return build_bytes_response(default_asset_name, asset.data.into_owned());
@@ -505,6 +514,48 @@ fn static_request_candidates(uri: &Uri) -> Result<Vec<String>, StatusCode> {
     candidates.push(format!("{normalized}/index.html"));
     candidates.dedup();
     Ok(candidates)
+}
+
+/// Extensions that can only belong to a subresource. Deliberately a whitelist
+/// rather than "any path with a dot", so client-side routes keep falling back
+/// to the SPA shell even if an id happens to contain one.
+const ASSET_EXTENSIONS: &[&str] = &[
+    "css",
+    "js",
+    "mjs",
+    "map",
+    "ttf",
+    "otf",
+    "woff",
+    "woff2",
+    "eot",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "ico",
+    "webp",
+    "avif",
+    "json",
+    "webmanifest",
+    "txt",
+    "wasm",
+];
+
+/// True when the request path names a concrete file the build should have
+/// emitted, rather than a client-side route.
+fn names_asset_file(path: &str) -> bool {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.ends_with('/') {
+        return false;
+    }
+    let Some(extension) = Path::new(trimmed).extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    ASSET_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
 }
 
 fn normalize_static_path(path: &str) -> Option<String> {
@@ -657,8 +708,8 @@ fn resolve_route_label(matched: Option<&str>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        METRIC_ROUTES, redirect_unauthorized_proxy_navigation, resolve_route_label,
-        static_request_candidates,
+        METRIC_ROUTES, names_asset_file, redirect_unauthorized_proxy_navigation,
+        resolve_route_label, static_request_candidates,
     };
     use axum::{
         http::{HeaderMap, Method, StatusCode, Uri, header},
@@ -689,6 +740,45 @@ mod tests {
     fn unknown_paths_collapse_to_other() {
         assert_eq!(resolve_route_label(Some("/api/this-is-fake")), "other");
         assert_eq!(resolve_route_label(None), "other");
+    }
+
+    /// A missing subresource must not be answered with the SPA shell. The
+    /// terminal's fonts were once requested at a path the build never emitted;
+    /// the daemon replied 200 + text/html, the browser refused it as a font, and
+    /// the terminal quietly fell back to a system monospace (block-character art
+    /// rendered with gaps on Android).
+    #[test]
+    fn only_asset_files_are_reported_as_assets() {
+        for asset in [
+            "/fonts/JetBrainsMono-Regular.ttf",
+            "/fonts/OpenRelayTerminalSymbols.woff2",
+            "/assets/index-1lAjgh0k.js",
+            "/assets/index-DNUrvibf.css",
+            "/manifest.webmanifest",
+            "/pwa-192x192.png",
+            "/FONTS/JetBrainsMono-Regular.TTF",
+        ] {
+            assert!(
+                names_asset_file(asset),
+                "{asset} should read as an asset file"
+            );
+        }
+
+        // Client-side routes keep the SPA fallback, even with dots in them.
+        for route in [
+            "/",
+            "/sessions",
+            "/sessions/0fdc3fe",
+            "/login",
+            "/sessions/1.2.3/attach",
+            "/assets/",
+            "",
+        ] {
+            assert!(
+                !names_asset_file(route),
+                "{route} should stay a client-side route"
+            );
+        }
     }
 
     #[test]

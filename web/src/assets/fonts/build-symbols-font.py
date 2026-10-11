@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild web/src/assets/fonts/OpenRelayTerminalSymbols.woff2.
+"""Rebuild web/public/fonts/OpenRelayTerminalSymbols.woff2.
 
 Why this exists
 ---------------
@@ -21,11 +21,11 @@ Usage
     curl -L -o NotoSansSymbols2-Regular.ttf \
       https://raw.githubusercontent.com/google/fonts/main/ofl/notosanssymbols2/NotoSansSymbols2-Regular.ttf
     python web/src/assets/fonts/build-symbols-font.py \
-      NotoSansSymbols2-Regular.ttf web/src/assets/fonts/OpenRelayTerminalSymbols.woff2
+      NotoSansSymbols2-Regular.ttf web/public/fonts/OpenRelayTerminalSymbols.woff2
 
-The unicode-range declared in web/src/components/XTerm.css must be kept in step
-with RANGES below (it is currently omitted - see the comment there).
-Licence: OFL, see web/src/assets/fonts/NotoSansSymbols2-OFL.txt.
+Output goes to `public/fonts/`, which Vite copies into the build verbatim; the
+@font-face in terminal/XTerm.css names that absolute URL. Licence: OFL, see
+web/public/fonts/NotoSansSymbols2-OFL.txt.
 """
 
 import sys

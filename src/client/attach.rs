@@ -922,7 +922,12 @@ fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
 /// Wrap pasted text in bracketed-paste markers when the child enabled
 /// DECSET 2004. The pasted bytes themselves are preserved exactly — no
 /// CRLF rewriting, no key substitution.
-fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> Vec<u8> {
+pub(super) fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> Vec<u8> {
+    // Windows Terminal emits an empty bracketed paste for bitmap-only
+    // clipboard contents; the shortcut release separately saves/forwards PNG.
+    if data.is_empty() {
+        return Vec::new();
+    }
     if bracketed_paste_mode {
         let mut out = b"\x1b[200~".to_vec();
         out.extend_from_slice(data.as_bytes());
@@ -1007,11 +1012,12 @@ async fn upload_remote_clipboard_file(
 /// session file area, images are saved as PNGs, and text is normalized.
 /// Shift+Insert is the classic terminal paste shortcut. Both send the
 /// clipboard contents as one bounded paste transaction.
-fn is_clipboard_paste_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('\u{16}'))
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
-        || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert))
+pub(super) fn is_clipboard_paste_key(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press)
+        && (matches!(key.code, KeyCode::Char('\u{16}'))
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+            || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert)))
 }
 // ---------------------------------------------------------------------------
 // Key input mapping
@@ -1207,12 +1213,15 @@ fn sync_local_terminal_modes(mouse_report: bool, focus_events: bool) {
 }
 
 /// Write one input frame to the daemon.
-async fn send_attach_input(
+pub(super) async fn send_attach_input(
     writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
     id: &str,
     data: Vec<u8>,
     wait_for_change: bool,
 ) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
     ipc::write_request_to_writer(
         writer,
         RpcRequest::AttachInput {
@@ -1229,8 +1238,9 @@ async fn send_attach_input(
 /// the EOT byte, but here it is intercepted as the detach signal,
 /// matching the historic key contract.
 fn is_ctrl_d(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+    matches!(key.code, KeyCode::Char('\x04'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')))
 }
 
 /// Push the client's terminal size to the daemon as session geometry.
@@ -1641,6 +1651,12 @@ mod tests {
     }
 
     #[test]
+    fn empty_terminal_paste_is_a_noop() {
+        assert!(wrap_paste_input(String::new(), true).is_empty());
+        assert!(wrap_paste_input(String::new(), false).is_empty());
+    }
+
+    #[test]
     fn test_wrap_paste_input_wraps_when_bracketed_paste_is_enabled() {
         assert_eq!(
             wrap_paste_input("hello\nworld".to_string(), true),
@@ -1689,6 +1705,18 @@ mod tests {
             KeyModifiers::empty(),
             KeyEventKind::Press
         )));
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            assert!(!is_clipboard_paste_key(KeyEvent::new_with_kind(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+                kind,
+            )));
+            assert!(!is_clipboard_paste_key(KeyEvent::new_with_kind(
+                KeyCode::Insert,
+                KeyModifiers::SHIFT,
+                kind,
+            )));
+        }
         // Plain keys without the right modifier do not trigger it.
         assert!(!is_clipboard_paste_key(press(KeyCode::Char('v'))));
         assert!(!is_clipboard_paste_key(press(KeyCode::Insert)));
@@ -1850,6 +1878,7 @@ mod tests {
 
     #[test]
     fn test_is_ctrl_d_true() {
+        assert!(is_ctrl_d(press(KeyCode::Char('\x04'))));
         assert!(is_ctrl_d(ctrl_press(KeyCode::Char('d'))));
         assert!(is_ctrl_d(ctrl_press(KeyCode::Char('D'))));
     }
