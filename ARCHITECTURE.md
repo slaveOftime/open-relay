@@ -169,7 +169,7 @@ Join handshake (WS, binary JSON; `src/sshauth.rs`, `http/nodes.rs`):
 secondary                                      primary
    │ WS /api/nodes/join                          │
    ├─ hello {public_key} ───────────────────────► │  secondary's Ed25519 pubkey
-   ├─ join {name, auth} ─────────────────────────► │  auth = api_key, or Ed25519 sig over
+   ├─ join {name, auth=signature} ─────────────► │  Ed25519 sig over
    │ ◄── joined | error ─────────────────────────┤  "oly-node-join-v1"‖name‖pubkey
    │        (no in-band host-key exchange: pin is trust root)
    ├─ sealed frames (AES-256-GCM) ────────────────────► │  channel keys = ECDH(priv_x, peer_pub_x)
@@ -239,12 +239,15 @@ browser / CLI ──WS──► primary ws.rs ── NodeRegistry::proxy_rpc_str
 
 Federation rules to preserve:
 
-- **Auth happens once, at join.** API keys are stored `0600` on the
-  secondary; SSH auth verifies the secondary's Ed25519 signature over
+- **Auth happens once, at join.** The secondary's join payload is
+  signed by its Ed25519 identity key; the primary verifies it over
   `"oly-node-join-v1"‖name‖pubkey` against the public key registered
-  in the primary's accept-table (no in-band nonce: the trust root is
-  the operator-typed pin, exercised post-Join via the channel ECDH).
-  Join attempts are rate-limited and IP-locked on the primary.
+  in the accept-table (no in-band nonce: the trust root is the
+  operator-typed pin, exercised post-Join via the channel ECDH). The
+  shared-secret / API-key flow was rolled back before this branch
+  was merged to `main` — see `MIGRATION.md` and the federation recipe
+  in `README.md`. Join attempts are rate-limited and IP-locked on the
+  primary regardless of method.
 - **The owning node is the only authority on its sessions.** The
   primary routes and displays; it never bypasses the secondary's lease
   or credit checks — everything goes through that node's own daemon.
@@ -344,9 +347,8 @@ so follow-mode filtering stays in step with the server-side query.
 ## Documents
 
 - `README.md` — what oly is and how to use it.
-- `MIGRATION.md` — 0.3.x → 0.5.0 breaking changes and upgrade steps.
+- `MIGRATION.md` — 0.3.x → 0.5.x breaking changes and upgrade steps.
 - `ARCHITECTURE.md` — the architecture decision records (engine, journal,
   input, streaming, history UX, crash boundary, authz), consolidated here.
-- `MIGRATION.md` — 0.3.x → 0.5.0 breaking changes and upgrade steps.
 - `PERFORMANCE.md` — critical data-path tracking with before/after numbers.
 - `CONTRIBUTING.md` — development workflow.

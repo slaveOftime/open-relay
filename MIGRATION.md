@@ -43,9 +43,9 @@ honest migration instead.
 | CLI ↔ daemon protocol | IPC protocol v4 | IPC protocol **v13** | CLI and daemon must both be 0.5.0. A mismatch exits with a precise version error — no silent misbehavior. |
 | Attach stream framing | base64 chunks inside JSON lines | binary frames after the JSON init line | Only relevant to tooling that spoke IPC directly; update it or pipe through the 0.5.0 CLI. |
 | Federation | 0.3.x node handshake | fenced, deadline/keepalive-driven node links (M5-2…M5-4) | All nodes must run 0.5.0; re-`join` secondaries after upgrading. No rolling mixed-version federation. |
-| SSH auth | — | optional SSH key authentication with MITM protection (M5-4) | New `--ssh-key` flag on `oly join start`; primary serves host key via `GET /api/nodes/host-key`; no action for existing joins. |
+| SSH auth | — | optional SSH key authentication with MITM protection (M5-4) | The new flag is `--ssh-pub-key` on `oly join start`; the secondary pins the **primary's** Ed25519 identity pub key, and the operator registers the **secondary's** identity pub key on the primary via `oly node accept --name <n> -k <...>`. There is **no in-band host-key exchange** and no `GET /api/nodes/host-key` endpoint — the operator-supplied pin is the trust root and ECDH fails closed on a mismatch. Only relevant for federated deployments; local-only installs can ignore this row. |
 | Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed; replaced by `limits.max_journal_bytes_per_session` (live sessions) and `limits.journal_retention_days` (stopped sessions); `max_output_log_bytes` continues to be honored as an alias for `max_journal_bytes_per_session` | Delete the old keys (or leave the alias); set new keys explicitly if you want caps. Both default to `0` (unlimited) so existing behavior is preserved exactly on upgrade. |
-| API keys | one all-powerful daemon key | scoped keys (M5-4) | Old keys stop working; create new scoped keys with `oly api-key`. |
+| API keys | one all-powerful daemon key | **removed before merge** — see "API keys removed" below | The `oly api-key` command group, the scoped-key migration step, and the `--key` flag on `oly join start` are all removed before merge to `main`. Federation is SSH-key auth only. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
 | Input handling | timing heuristics for paste/keys | event-driven; paste boundaries come from bracketed-paste markers only (ADR-0003) | No action; apps that enable bracketed paste get exact paste boundaries. |
 | Detach keys | `Ctrl-]` then `d` (broken in some terminals) | `Ctrl-D` (EOT), matching the historic key contract; Ctrl-V and Shift+Insert are clipboard paste shortcuts. | No action. |
@@ -57,7 +57,28 @@ the `history`/`screen`/`wait` read surfaces are modes of `oly logs` —
 `--from`, `--screen`, and `--after`/`--exit`/`--idle-ms`/`--pattern`
 respectively) and new flags. All 0.x commands
 (`start`, `stop`, `list`, `logs`, `attach`, `send`, `node`, `join`,
-`api-key`, `daemon`) still exist with the same names.
+`daemon`) still exist with the same names.
+
+### API keys removed
+
+The scoped API-key feature that the 0.5 line ships on this preview
+branch is **removed before this branch is merged to `main`**. The
+shared-secret `joined_by_key` flow proved not safe enough for a
+long-lived daemon that exposes the HTTP surface, and we did not want
+to keep two federation auth paths in the docs once we had a viable
+single one:
+
+- The `oly api-key {add,ls,remove}` command group is gone.
+- The `--key` / `-k` flag on `oly join start` is gone (`-k` is now
+  unused on this command; node-side identity uses `--ssh-pub-key`).
+- The accept-table entries on the primary carry **only** registered
+  SSH identity pub keys again — any keys you registered with the
+  scoped-key CLI are deleted on upgrade.
+
+If you only used the API-key path during this preview, re-`join`
+every secondary over SSH once the merged build is installed. The
+operator recipe is the one in `README.md` → "Federation joining";
+there is nothing else to migrate.
 
 ## Upgrade procedure
 

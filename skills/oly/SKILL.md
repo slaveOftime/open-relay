@@ -124,7 +124,7 @@ Use `--` whenever the payload contains `key:`, `mouse:`, `oly-file:`, or `oly-cl
 ### 4) Lifecycle
 
 ```bash
-oly attach <ID>      # Detach: Ctrl-], then d
+oly attach <ID>      # Detach: Ctrl-D
 oly update <ID> --title "better name"
 oly update <ID> --title ""
 oly update <ID> --tag prod --tag release

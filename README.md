@@ -255,10 +255,10 @@ oly logs --node worker-1 --wait prompt <id>
 
 | Command | Purpose |
 | --- | --- |
-| `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--no-auth] [--no-http]` | Start the daemon, optional local web API/UI |
+| `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--notification-hook <path>] [--web-push-proxy <url>] [--no-auth] [--no-auth-without-ask] [--no-http]` | Start the daemon, optional local web API/UI |
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
-| `oly ls [--search <text>] [--json] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-local]` | List sessions |
+| `oly ls [--search <text>] [--tag <tag>]... [--json] [--follow] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-all] [--node-local]` | List sessions |
 | `oly attach [id] [--observe] [--node <name>]` | Reattach to a session (controls it by default; `--observe` is view-only) |
 | `oly logs [id] [--tail <n>] [--screen] [--tail-frames <n>] [--wait <condition>] [--match <regex>] [--idle-for <duration>] [--since <token>] [--limit-bytes <n>] [--cursor] [--color <auto\|always\|never>] [--json] [--timeout <duration>] [--node <name>]` | Read recorded output, optionally after a gate, and hand back a cursor token for the next read |
 | `oly export [id] [--json] [--node <name>]` | Dump the canonical filtered byte stream, control sequences and all, for files and pipes |
@@ -268,7 +268,8 @@ oly logs --node worker-1 --wait prompt <id>
 | `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
 | `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
 | `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
-| `oly update <id> ...` | Override a session's title, tags, and notification setting |
+| `oly notify send [source] [--title <title>] [--description <text>] [--body <text>] [--url <url>] [--node <name>]` | Send a desktop/hook notification, optionally associated with a session |
+| `oly update <id> [--title <title>] [--tag <tag>]... [--notifications enabled\|disabled] [--node <name>]` | Override a session's title, tags, and notification setting |
 | `oly skill [--apps \| --subagent \| --daemon]` | Print the bundled general, app, agent-CLI supervision, or daemon configuration skill |
 | `oly daemon status` | Show the running daemon's effective flags and HTTP endpoint |
 
@@ -394,11 +395,7 @@ filtered stream is the one a user actually saw.
 
 | Command | Purpose |
 | --- | --- |
-| `oly api-key add <name>` | Create an API key on the primary and print it once |
-| `oly api-key ls` | List API key labels on the primary |
-| `oly api-key remove <name>` | Revoke an API key on the primary |
 | `oly node accept --name <name> -k <secondary-pub>` | Register a secondary's Ed25519 pub key on the primary (SSH key auth) |
-| `oly join start --name <name> --key <key> <url>` | Connect this daemon to a primary (API key auth) |
 | `oly join start --name <name> --ssh-pub-key <primary-pub> <url>` | Connect this daemon to a primary (SSH key auth) |
 | `oly join stop --name <name>` | Disconnect and remove a saved join config |
 | `oly join ls` | List saved outbound join configs on this daemon |
@@ -407,20 +404,7 @@ filtered stream is the one a user actually saw.
 
 ---
 
-### Federation joining — two auth methods
-
-**Method 1 — API key (shared secret):**
-
-```bash
-# On the primary, generate a scoped API key
-oly api-key add myserver
-# prints: a3f4c1b2... (copy this once)
-
-# On the secondary, join with the key
-oly join start --name myserver --key a3f4c1b2... http://192.168.1.100:15443
-```
-
-**Method 2 — SSH key (challenge-response, MITM protected):**
+### Federation joining — SSH key (challenge-response, MITM protected)
 
 Every daemon (primary *and* secondary) auto-generates its own Ed25519
 identity key on first start at `<state>/ssh_host_key{,pub}`. To join over
