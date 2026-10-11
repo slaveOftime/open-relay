@@ -2,91 +2,112 @@ name: CI-WEB
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
       - .github/workflows/ci-web.yml
       - web/**
+      # Trigger on dotfile/js config tweaks that web/** alone misses.
+      - web/eslint.config.*
+      - web/playwright.config.*
+      - web/.prettierrc*
+      - web/.editorconfig
+
+# Same concurrency policy as CI: cancel PR runs, never push runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
+# Most steps run inside web/, so make it the default working directory
+# for `run:` commands. actions/setup-node still reads the cache key from
+# the explicit cache-dependency-path below.
+defaults:
+  run:
+    working-directory: web
+
 jobs:
-  build-test:
-    name: lint / test / build
+  lint:
+    name: lint / format
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-
-      - name: Resolve npm cache directory
-        id: npm-cache-dir
-        shell: bash
-        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache npm registry
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: ${{ runner.os }}-npm-${{ hashFiles('web/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
       - name: Install
-        run: |
-          cd web
-          npm ci
+        run: npm ci
 
       - name: Lint
-        run: |
-          cd web
-          npm run lint
+        run: npm run lint
 
       - name: Format check
-        run: |
-          cd web
-          npm run format:check
+        run: npm run format:check
+
+  test:
+    name: vitest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
 
       - name: Test
-        run: |
-          cd web
-          npm test
+        run: npm test
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
 
       - name: Build
-        run: |
-          cd web
-          npm run build
+        run: npm run build
 
   e2e:
     name: playwright (chromium)
     runs-on: ubuntu-latest
+    needs: [build]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
-      - name: Install dependencies
+      - name: Install web deps + Playwright browser
         run: |
-          cd web
           npm ci
           npx playwright install --with-deps chromium
 
       - name: Playwright e2e
-        run: |
-          cd web
-          npm run e2e
+        run: npm run e2e
