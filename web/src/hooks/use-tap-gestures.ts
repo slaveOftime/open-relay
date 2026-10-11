@@ -24,7 +24,11 @@ export interface TapOptions {
   doubleMs?: number
 }
 
-/** How soon the second tap must land after the first to count as a double. */
+/**
+ * How long a tap waits before it counts as a single. The wait is the double
+ * check the consumer asked for: a pair must never perform the single action
+ * (raise the keyboard, open the bar) on its way to the double's.
+ */
 export const DOUBLE_TAP_MS = 300
 /** Pointer travel (px) that cancels a pending tap. */
 export const SLOP_PX = 10
@@ -36,8 +40,14 @@ export type TapKind = 'single' | 'double'
  * Classifies button presses into taps and double taps — pure, so the contract
  * is testable without a renderer.
  *
- * Activation happens on pointerup rather than in click, so the click the
- * browser synthesizes after a gesture can never double-fire: the consumer's
+ * A still press is classified only when the double window closes: the single
+ * tap fires `doubleMs` after its release, unless a second tap lands first,
+ * which cancels the wait and fires the double instead. The first tap of a pair
+ * must never perform the single action on the way to the double's — the single
+ * raises a keyboard and opens a bar that the double would immediately tear
+ * down, and the flash reads as a glitch.
+ *
+ * The browser's follow-up click still can never double-fire: the consumer's
  * `onClick` checks `isFollowUpClick` and lets only click-without-a-gesture
  * through. Same contract `RepeatController.isFollowUpClick` already gives the
  * quick keys: touch-delivered clicks are not reliably distinguishable from
@@ -58,22 +68,27 @@ export class TapGestures {
     this.callbacks = callbacks
   }
 
+  private readonly slopPx: number
+  private readonly doubleMs: number
   private origin: { x: number; y: number } | null = null
   // `timeStamp` of the last gesture event, which is what a follow-up click is
   // measured against. Anchored to the release, never to the press alone.
   private lastGestureAt = Number.NEGATIVE_INFINITY
-  // `timeStamp` of the last tap that fired as a single; the next tap within
-  // `doubleMs` completes the pair. A travelling press breaks a pending pair —
-  // it belongs to whatever the move started (a drag), not to the taps that
-  // happened around it.
-  private lastTapAt = Number.NEGATIVE_INFINITY
-
-  private readonly slopPx: number
-  private readonly doubleMs: number
+  // The single tap that is waiting out the double window. Non-null means the
+  // next still release before the timer fires completes a pair.
+  private pendingSingle: ReturnType<typeof setTimeout> | null = null
 
   constructor(slopPx: number = SLOP_PX, doubleMs: number = DOUBLE_TAP_MS) {
     this.slopPx = slopPx
     this.doubleMs = doubleMs
+  }
+
+  /** Forget a waiting single tap: a drag took over, or the owner went away. */
+  cancelPendingSingle(): void {
+    if (this.pendingSingle) {
+      clearTimeout(this.pendingSingle)
+      this.pendingSingle = null
+    }
   }
 
   readonly handlers: Required<PressHandlers> = {
@@ -94,7 +109,9 @@ export class TapGestures {
       const dy = event.clientY - origin.y
       if (dx * dx + dy * dy > this.slopPx * this.slopPx) {
         this.origin = null
-        this.lastTapAt = Number.NEGATIVE_INFINITY
+        // The press belongs to the drag now, and a single still waiting to be
+        // classified belongs to a gesture the drag superseded.
+        this.cancelPendingSingle()
       }
     },
     onPointerUp: (event) => {
@@ -103,15 +120,17 @@ export class TapGestures {
       // A press that moved away, left the button, or was cancelled is not a tap.
       if (!this.origin) return
       this.origin = null
-      const at = event.timeStamp
-      if (at - this.lastTapAt <= this.doubleMs) {
-        // The pair is spent: the next tap starts a new one.
-        this.lastTapAt = Number.NEGATIVE_INFINITY
+      if (this.pendingSingle) {
+        // A tap is holding the window open for exactly this: it is a pair, and
+        // the single it was waiting to become must never run.
+        this.cancelPendingSingle()
         this.callbacks.onDoubleTap?.()
         return
       }
-      this.lastTapAt = at
-      this.callbacks.onPress?.()
+      this.pendingSingle = setTimeout(() => {
+        this.pendingSingle = null
+        this.callbacks.onPress?.()
+      }, this.doubleMs)
     },
     onPointerCancel: (event) => {
       this.lastGestureAt = event.timeStamp
@@ -144,5 +163,7 @@ export function useTapGestures(options: TapOptions): TapGestures {
   useEffect(() => {
     gestures.setCallbacks(options)
   })
+  // An owner that unmounts with a tap still waiting must not fire it.
+  useEffect(() => () => gestures.cancelPendingSingle(), [gestures])
   return gestures
 }

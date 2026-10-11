@@ -35,14 +35,20 @@ test.describe('with touch input', () => {
     const input = page.getByRole('textbox', { name: SEARCH_INPUT })
     const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
 
-    // The pair must land inside the 300ms double window, so both taps go out
-    // back to back at raw coordinates instead of through the slower locator.
     const box = (await icon.boundingBox())!
     const cx = box.x + box.width / 2
     const cy = box.y + box.height / 2
-    await page.touchscreen.tap(cx, cy)
-    await page.touchscreen.tap(cx, cy)
 
+    // The pair must land inside the 300ms double window, and two awaited CDP
+    // round trips can drift past it under load — a miss classifies as two
+    // singles, which toggle the bar twice and settle back closed. So tap
+    // again until the pair lands; every attempt starts from the same state.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await page.touchscreen.tap(cx, cy)
+      await page.touchscreen.tap(cx, cy)
+      await page.waitForTimeout(400) // let a missed pair's two singles fire
+      if (await statusTrigger.isVisible()) break
+    }
     await expect(statusTrigger).toBeVisible()
     // The menu replaced the bar the first tap of the pair opened.
     await expect(input).toHaveCount(0)
@@ -315,4 +321,12 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
   await icon.click()
   await expect(input).toBeVisible()
   await expect(input).toBeFocused()
+
+  // Expanding grows the bar toward the left, from the icon: a dragged control
+  // is left-anchored, and this is exactly the case where a bar that grew with
+  // the flow pushed the icon right instead.
+  const expanded = (await icon.boundingBox())!
+  expect(Math.abs(expanded.x - restored.x)).toBeLessThanOrEqual(2)
+  const inputBox = (await input.boundingBox())!
+  expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(restored.x + 1)
 })

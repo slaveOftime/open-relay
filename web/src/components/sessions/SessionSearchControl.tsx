@@ -4,15 +4,16 @@
  * terminal's scroll handle — so it sits under the thumb and never scrolls away
  * with the list.
  *
- * Collapsed it is that one circular button. A tap grows the search bar out of
- * it to the left (one merged pill, the trigger as its right cap) and focuses
- * the input; a double tap opens the quick menu instead — the filter dropdowns
- * the page passes as `menu`, replacing the bar the first tap of the pair just
- * opened. The two popups are mutually exclusive, and a tap toggles whichever
- * of them is up. A drag moves the whole control somewhere better and remembers
- * the spot (`useHoldToDrag` with `armMs: 0`: nothing else owns a drag on this
- * button, so a travelling press is a move — no hold-then-move, which used to
- * fight the hold that opened the menu).
+ * Collapsed it is that one circular button. A tap — classified only after the
+ * double window closes, so a pair never flashes the bar and the keyboard —
+ * grows the search bar out of the trigger's right edge toward the left (one
+ * merged pill, the trigger as its right cap, the icon itself never moving) and
+ * focuses the input; a double tap opens the quick menu instead — the filter
+ * dropdowns the page passes as `menu`. The two popups are mutually exclusive,
+ * and a tap toggles whichever of them is up. A drag moves the whole control
+ * somewhere better and remembers the spot (`useHoldToDrag` with `armMs: 0`:
+ * nothing else owns a drag on this button, so a travelling press is a move —
+ * no hold-then-move, which used to fight the hold that opened the menu).
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
@@ -162,14 +163,16 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   return (
     <div
       ref={rootRef}
-      className={cn('absolute right-5 bottom-70 z-10 md:hidden', open && 'z-30')}
+      className={cn('absolute right-5 bottom-70 z-10 h-12 w-12 md:hidden', open && 'z-30')}
       style={reposition.style}
     >
-      {/* The bar: trigger-sized when closed, grown out of the trigger to the
-          left when the search is open. */}
+      {/* The bar: trigger-sized when closed, grown out of the trigger's right
+          edge toward the left when the search is open. It anchors right so the
+          icon never moves — a dragged control is left-anchored, and a bar that
+          grew inside the flow would push the icon right, off the screen. */}
       <div
         className={cn(
-          'relative flex h-12 items-center overflow-hidden rounded-full',
+          'absolute right-0 top-0 flex h-12 items-center overflow-hidden rounded-full',
           'border border-[hsl(var(--border))] bg-[hsl(var(--muted))] shadow-lg',
           'transition-[width]',
           open ? 'opacity-100' : 'opacity-80'
