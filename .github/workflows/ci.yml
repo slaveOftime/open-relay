@@ -4,12 +4,9 @@ on:
   push:
     branches:
       - main
-      # Long-lived preview/beta release line (0.5.x); main stays on 0.3.x.
-      - v0.5.x
   pull_request:
     branches:
       - main
-      - v0.5.x
     paths:
       - .github/workflows/ci.yml
       - Cargo.toml
