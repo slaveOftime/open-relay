@@ -121,6 +121,18 @@ Two design points worth knowing before touching this code:
   Explicit paste boundaries are decoded before Enter, clipboard, or detach
   handling, preserving pasted CR/LF and Unicode. Windows mouse-mode changes
   preserve raw/VT input bits; teardown restores the console-mode baseline.
+  Complete VT input sequences (mouse reports, focus events, and modified
+  keys) also stay in one input frame: ConPTY can turn a CSI split across
+  writes into native keyboard text instead of the intended mouse/key event.
+  VT-encoded Shift+Insert is decoded back into the local clipboard action;
+  it must not bypass file/image saving. VT input suppresses ConPTY's automatic
+  native-key reporting, so attach explicitly requests Windows mode 9001 and
+  unwraps its encoded key records before decoding VT/paste payloads. Windows
+  Terminal can consume Ctrl+V/Shift+Insert key-down for its paste binding;
+  bitmap-only paste emits no text, so an unmatched shortcut key-up must
+  recover the clipboard action once. Key-up after an observed press must
+  not duplicate it. Shortcut bytes inside bracketed paste remain literal.
+  Teardown disables mode 9001 before returning control to the parent shell.
 - **A screen repaint is not scrollback.** Windows attach still renders the
   canonical engine screen instead of forwarding ConPTY's wrap-dependent
   bytes, but the same parser delegates through `terminal/render_effects.rs`
