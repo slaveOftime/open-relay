@@ -23,16 +23,16 @@ Independent crypto review and macOS/Windows CI are not claimed.
 ## G1 — Public surface and complete credential removal
 
 - [ ] `oly --help` has no `api-key` command; `api-key add/ls/remove` fail parsing.
-- [ ] Join requires `--identity-pub-key <PRIMARY_PUB_KEY>` and accepts no
+- [ ] Join requires `--id-pub-key <PRIMARY_PUB_KEY>` and accepts no
   `--key`, join-side `-k`, or `--ssh-pub-key`.
-- [ ] Accept requires the secondary identity via `--identity-pub-key`; its
+- [ ] Accept requires the secondary identity via `--id-pub-key`; its
   `-k` shortcut is explicitly a public key, not a secret.
 - [ ] Missing, blank, malformed, wrong-length, invalid/weak-point, private-key,
   OpenSSH, and old `ssh-ed25519` inputs fail in CLI and daemon validation.
 - [ ] RPC/API-key commands and old federation auth variants cannot deserialize
   or reach a handler. IPC protocol is v14 and the federation version is checked.
 - [ ] Saved joins contain only `name`, `primary_url`, and required canonical
-  `primary_identity_pub_key`; obsolete auth fields fail strict parsing.
+  `primary_id_pub_key`; obsolete auth fields fail strict parsing.
   Malformed saved config produces an actionable diagnostic, not a silent reset.
 - [ ] Original migrations 0001–0009 are byte-for-byte unchanged; appended
   migrations 0010/0011 succeed both on an empty DB and an isolated previously
@@ -45,7 +45,7 @@ Independent crypto review and macOS/Windows CI are not claimed.
 
 - [ ] New daemon generates a 32-byte seed in `identity_key` and publishes the
   matching canonical `ed25519 <base64(raw32)>` in `identity_key.pub`.
-- [ ] `daemon status` prints `IDENTITY-PUB-KEY:` matching that file and the
+- [ ] `daemon status` prints `ID-PUB-KEY:` matching that file and the
   actual signing identity. Help/output/examples agree character-for-character.
 - [ ] Restart preserves the seed/identity; corrupt or inaccessible seed fails
   federation closed without silent regeneration or secret fallback.

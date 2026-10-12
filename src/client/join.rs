@@ -19,7 +19,7 @@ pub struct JoinConfig {
     /// Canonical identity public key of the primary, in the form
     /// `ed25519 <base64(raw32)>`. The connector pins the primary to
     /// exactly this identifier; the trust root lives here, not on the wire.
-    pub primary_identity_pub_key: String,
+    pub primary_id_pub_key: String,
 }
 
 fn joins_path(config: &AppConfig) -> std::path::PathBuf {
@@ -86,31 +86,31 @@ pub fn list_join_summaries(config: &AppConfig) -> Vec<JoinSummary> {
 pub fn build_join_config(
     url: String,
     name: String,
-    primary_identity_pub_key: Option<String>,
+    primary_id_pub_key: Option<String>,
 ) -> Result<JoinConfig> {
     if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
         return Err(AppError::Protocol("invalid node name".into()));
     }
-    let raw = primary_identity_pub_key
+    let raw = primary_id_pub_key
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
             AppError::Protocol(
-                "missing --identity-pub-key <PRIMARY_PUB_KEY> - the operator-pinned identity \
+                "missing --id-pub-key <PRIMARY_PUB_KEY> - the operator-pinned identity \
                  of the primary is the trust root for the join"
                     .into(),
             )
         })?;
     let pk = crate::federation_crypto::parse_public_key(&raw).map_err(|e| {
         AppError::Protocol(format!(
-            "--identity-pub-key: {e} \
+            "--id-pub-key: {e} \
              (expected the canonical \"ed25519 <base64>\" line from `oly daemon status` on the primary)"
         ))
     })?;
     Ok(JoinConfig {
         name,
         primary_url: url,
-        primary_identity_pub_key: pk.to_line(),
+        primary_id_pub_key: pk.to_line(),
     })
 }
 
@@ -119,11 +119,11 @@ pub async fn run_join(
     config: &AppConfig,
     url: String,
     name: String,
-    primary_identity_pub_key: Option<String>,
+    primary_id_pub_key: Option<String>,
 ) -> Result<()> {
-    let join = build_join_config(url.clone(), name.clone(), primary_identity_pub_key.clone())?;
-    // Surface the secondary's own identity pub key so the operator can copy
-    // it onto the primary (`oly node accept --name NAME --identity-pub-key
+    let join = build_join_config(url.clone(), name.clone(), primary_id_pub_key.clone())?;
+    // Surface the secondary's own id pub key so the operator can copy
+    // it onto the primary (`oly node accept --name NAME --id-pub-key
     // ...`). The daemon generates this on first start; read it from disk
     // so the hint is correct even if the daemon has never been started —
     // the connector won't be able to join in that state, but the CLI should
@@ -131,19 +131,19 @@ pub async fn run_join(
     match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
         Ok(Some(pub_key)) => {
             println!(
-                "Register it on the primary node with `oly node accept --name {name} --identity-pub-key \"{pub_key}\"`"
+                "Register it on the primary node with `oly node accept --name {name} --id-pub-key \"{pub_key}\"`"
             );
         }
         Ok(None) => {
             return Err(AppError::Protocol(format!(
-                "identity join requires the daemon's identity pubkey at {}/identity_key.pub, \
+                "identity join requires the daemon's id pubkey at {}/identity_key.pub, \
                  but no file was found. Start the daemon at least once to generate it.",
                 config.paths.state_dir.display()
             )));
         }
         Err(err) => {
             return Err(AppError::Protocol(format!(
-                "failed to read this daemon's identity pub key: {err}"
+                "failed to read this daemon's id pub key: {err}"
             )));
         }
     }
@@ -154,7 +154,7 @@ pub async fn run_join(
         crate::protocol::RpcRequest::JoinStart {
             url,
             name: name.clone(),
-            primary_identity_pub_key: join.primary_identity_pub_key.clone(),
+            primary_id_pub_key: join.primary_id_pub_key.clone(),
         },
     )
     .await
@@ -259,17 +259,17 @@ mod tests {
     fn saved_join_rejects_removed_auth_fields() {
         let key = valid_primary_pub_line();
         for field in ["api_key", "ssh_primary_pubkey"] {
-            let mut value = serde_json::json!({"name":"worker", "primary_url":"http://primary", "primary_identity_pub_key":key});
+            let mut value = serde_json::json!({"name":"worker", "primary_url":"http://primary", "primary_id_pub_key":key});
             value[field] = serde_json::json!("obsolete");
             assert!(serde_json::from_value::<JoinConfig>(value).is_err());
         }
     }
 
     #[test]
-    fn build_join_config_requires_identity_pub_key() {
+    fn build_join_config_requires_id_pub_key() {
         let err = build_join_config("http://primary:15443".into(), "worker1".into(), None)
-            .expect_err("must fail without --identity-pub-key");
-        assert!(format!("{err}").contains("--identity-pub-key"));
+            .expect_err("must fail without --id-pub-key");
+        assert!(format!("{err}").contains("--id-pub-key"));
     }
 
     #[test]
@@ -280,12 +280,12 @@ mod tests {
             "worker1".into(),
             Some(primary_pub.clone()),
         )
-        .expect("identity-pub-key joins succeed");
-        assert!(cfg.primary_identity_pub_key.starts_with("ed25519 "));
+        .expect("id-pub-key joins succeed");
+        assert!(cfg.primary_id_pub_key.starts_with("ed25519 "));
         // The persisted value is the canonical line: parsing it round-trips.
-        let parsed = crate::federation_crypto::parse_public_key(&cfg.primary_identity_pub_key)
+        let parsed = crate::federation_crypto::parse_public_key(&cfg.primary_id_pub_key)
             .expect("persisted value parses");
-        assert_eq!(parsed.to_line(), cfg.primary_identity_pub_key);
+        assert_eq!(parsed.to_line(), cfg.primary_id_pub_key);
     }
 
     #[test]
@@ -312,7 +312,7 @@ mod tests {
             Some("ed25519 !!!notbase64".into()),
         )
         .expect_err("invalid base64 must fail");
-        assert!(format!("{err}").contains("--identity-pub-key"));
+        assert!(format!("{err}").contains("--id-pub-key"));
     }
 
     #[test]
@@ -323,6 +323,6 @@ mod tests {
             Some(String::new()),
         )
         .expect_err("empty string is treated as missing");
-        assert!(format!("{err}").contains("--identity-pub-key"));
+        assert!(format!("{err}").contains("--id-pub-key"));
     }
 }

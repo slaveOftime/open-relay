@@ -75,13 +75,13 @@ cleanup alone cannot pass the security finish gate.
 
 | Surface | Target |
 |---|---|
-| Join flag | `--identity-pub-key <PRIMARY_PUB_KEY>`; required, no `-k` short alias |
-| Accept flag | `--identity-pub-key <SECONDARY_PUB_KEY>`; required; retain `-k` here |
-| CLI/RPC accept field | `identity_pub_key: String` |
-| Saved join / JoinStart RPC | `primary_identity_pub_key: String`, not `Option` |
+| Join flag | `--id-pub-key <PRIMARY_PUB_KEY>`; required, no `-k` short alias |
+| Accept flag | `--id-pub-key <SECONDARY_PUB_KEY>`; required; retain `-k` here |
+| CLI/RPC accept field | `id_pub_key: String` |
+| Saved join / JoinStart RPC | `primary_id_pub_key: String`, not `Option` |
 | Private seed file | `<state>/identity_key` — raw 32-byte Ed25519 seed |
 | Published public file | `<state>/identity_key.pub` |
-| Status label | `IDENTITY-PUB-KEY:` |
+| Status label | `ID-PUB-KEY:` |
 | Canonical public line | `ed25519 <standard-base64(raw32)>` |
 | Module | `src/federation_crypto.rs`, replacing `src/sshauth.rs` |
 | Existing identity type | Keep `NodeIdentity`; avoid unrelated relocation |
@@ -102,10 +102,10 @@ Operator-facing workflow:
 oly daemon status
 
 # On the primary: bind this secondary name to its public identity.
-oly node accept --name worker-1 --identity-pub-key "ed25519 <secondary-base64>"
+oly node accept --name worker-1 --id-pub-key "ed25519 <secondary-base64>"
 
 # On the secondary: pin the primary identity through an independent trusted channel.
-oly join start --name worker-1 --identity-pub-key "ed25519 <primary-base64>" \
+oly join start --name worker-1 --id-pub-key "ed25519 <primary-base64>" \
   http://primary-host:15443
 ```
 
@@ -213,7 +213,7 @@ Files: `src/cli.rs`, `src/main.rs`, `src/protocol.rs`, `src/client/join.rs`,
 
 - Add the target flags/help and make the primary identity mandatory in the CLI,
   daemon-side validation, saved config, and `JoinStart` RPC.
-- Persist only `{name, primary_url, primary_identity_pub_key}` in `joins.json`.
+- Persist only `{name, primary_url, primary_id_pub_key}` in `joins.json`.
   Normalize before saving. Use strict join-config parsing to reject obsolete
   auth fields, and report malformed config rather than silently making it an
   empty list. No loader for old field names or secret-based configs.

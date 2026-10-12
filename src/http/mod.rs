@@ -76,7 +76,7 @@ pub struct AppState {
 ///   in the same ECDH process to derive the channel keys.
 ///
 /// Auth is end-to-end exact-pin (operator types the primary's pubkey on
-/// the secondary via `--identity-pub-key`); no in-band trust-root discovery,
+/// the secondary via `--id-pub-key`); no in-band trust-root discovery,
 /// TOFU, or plaintext fallback exists. Static-static DH does not provide
 /// forward secrecy.
 #[derive(Clone)]

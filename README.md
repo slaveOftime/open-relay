@@ -395,8 +395,8 @@ filtered stream is the one a user actually saw.
 
 | Command | Purpose |
 | --- | --- |
-| `oly node accept --name <name> --identity-pub-key <secondary-pub>` | Bind a secondary name to its Ed25519 identity (`-k` is an accept-only shortcut) |
-| `oly join start --name <name> --identity-pub-key <primary-pub> <url>` | Join a primary using its independently verified identity pin |
+| `oly node accept --name <name> --id-pub-key <secondary-pub>` | Bind a secondary name to its Ed25519 identity (`-k` is an accept-only shortcut) |
+| `oly join start --name <name> --id-pub-key <primary-pub> <url>` | Join a primary using its independently verified identity pin |
 | `oly join stop --name <name>` | Disconnect and remove a saved join config |
 | `oly join ls` | List saved outbound join configs on this daemon |
 | `oly join ls --primary` | Ask the daemon for currently active primary-side joins |
@@ -411,14 +411,14 @@ and publishes `<state>/identity_key.pub`. Exchange **public** identities through
 an independent trusted channel; never copy the private seed.
 
 ```bash
-# On each daemon: note the IDENTITY-PUB-KEY: ed25519 <base64(raw32)> line.
+# On each daemon: note the ID-PUB-KEY: ed25519 <base64(raw32)> line.
 oly daemon status
 
 # On the primary: authorize the secondary's exact name and identity.
-oly node accept --name myserver --identity-pub-key "<secondary's public identity>"
+oly node accept --name myserver --id-pub-key "<secondary's public identity>"
 
 # On the secondary: independently verify and pin the primary identity.
-oly join start --name myserver --identity-pub-key "<primary's public identity>" \
+oly join start --name myserver --id-pub-key "<primary's public identity>" \
     http://192.168.1.100:15443
 ```
 

@@ -456,7 +456,7 @@ async fn run() -> Result<()> {
                     &config,
                     RpcRequest::NodeAccept {
                         name: args.name,
-                        identity_pub_key: args.identity_pub_key,
+                        id_pub_key: args.id_pub_key,
                     },
                 )
                 .await?
@@ -473,9 +473,9 @@ async fn run() -> Result<()> {
         // ── Join management (secondary side) ─────────────────────────────────
         Commands::Join(join_args) => match join_args.command {
             JoinCommand::Start(args) => {
-                let Some(pinned) = args.identity_pub_key else {
+                let Some(pinned) = args.id_pub_key else {
                     return Err(AppError::Protocol(
-                        "missing --identity-pub-key <PRIMARY_PUB_KEY> — `--identity-pub-key` is the trust root for the join".into(),
+                        "missing --id-pub-key <PRIMARY_PUB_KEY> — `--id-pub-key` is the trust root for the join".into(),
                     ));
                 };
                 client::run_join(&config, args.url, args.name, Some(pinned)).await

@@ -180,7 +180,7 @@ secondary                                     primary
 Each daemon persists `identity_key` (32-byte Ed25519 seed) and
 `identity_key.pub` (`ed25519 <standard-base64(raw32)>`). Operators independently
 exchange public identities: accept binds the secondary name/key in
-`node_identities`, and `--identity-pub-key` pins the primary on the secondary.
+`node_identities`, and `--id-pub-key` pins the primary on the secondary.
 There is no in-band replacement key, OpenSSH import, or plaintext fallback.
 The transcript length-prefixes its domain, version, role labels, name, both
 raw identities, and both fresh 32-byte nonces. The primary verifies the

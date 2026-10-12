@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-fn identity(tmp: &Path) -> String {
+fn id_pub_key(tmp: &Path) -> String {
     fs::read_to_string(tmp.join("oly/identity_key.pub"))
         .unwrap()
         .trim()
@@ -139,7 +139,7 @@ fn primary_requires_fresh_proof_and_encrypted_readiness() {
     let _daemon = start_daemon_http(&tmp, port);
     let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
     register(&tmp, "worker", &key);
-    let primary = identity(&tmp);
+    let primary = id_pub_key(&tmp);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (mut socket, mut channel, signature) = introduced(port, &key, "worker", &primary).await;
         prove(&mut socket, &mut channel, &signature).await;
@@ -191,7 +191,7 @@ fn primary_rejects_malformed_order_legacy_and_missing_ready() {
     let _daemon = start_daemon_http(&tmp, port);
     let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
     register(&tmp, "worker", &key);
-    let primary = identity(&tmp);
+    let primary = id_pub_key(&tmp);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         for value in [
             json!({"type":"join", "signature":"sig"}),
@@ -229,7 +229,7 @@ fn replayed_application_frame_has_only_one_observable_side_effect() {
     let _daemon = start_daemon_http(&tmp, port);
     let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
     register(&tmp, "worker", &key);
-    let primary = identity(&tmp);
+    let primary = id_pub_key(&tmp);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let client = reqwest::Client::new();
         let events = client
@@ -314,7 +314,7 @@ fn failed_channel_fails_pending_rpc_and_removes_owned_registry_entry() {
     let _daemon = start_daemon_http(&tmp, port);
     let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
     register(&tmp, "worker", &key);
-    let primary = identity(&tmp);
+    let primary = id_pub_key(&tmp);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (mut socket, mut channel, proof) = introduced(port, &key, "worker", &primary).await;
         prove(&mut socket, &mut channel, &proof).await;
@@ -457,7 +457,7 @@ fn primary_rejects_invalid_proof_weak_identity_and_oversized_handshake() {
     let _daemon = start_daemon_http(&tmp, port);
     let key = ed25519_dalek::SigningKey::from_bytes(&crypto::fresh_nonce());
     register(&tmp, "worker", &key);
-    let primary = identity(&tmp);
+    let primary = id_pub_key(&tmp);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let (mut socket,_,_) = introduced(port,&key,"worker",&primary).await;
         send(&mut socket,json!({"type":"join","signature":crypto::b64_encode(&[0;64])})).await;
@@ -537,7 +537,7 @@ fn real_connector_timeout_and_stop_interrupt_stalled_handshake() {
                 "start",
                 "--name",
                 "worker",
-                "--identity-pub-key",
+                "--id-pub-key",
                 &pin,
                 &format!("http://127.0.0.1:{port}"),
             ])
@@ -604,7 +604,7 @@ fn real_connector_wrong_pin_fails_before_success_and_can_rejoin() {
             "start",
             "--name",
             "worker",
-            "--identity-pub-key",
+            "--id-pub-key",
             &wrong,
             &format!("http://127.0.0.1:{port}"),
         ])
@@ -636,8 +636,8 @@ fn real_connector_wrong_pin_fails_before_success_and_can_rejoin() {
             "start",
             "--name",
             "worker",
-            "--identity-pub-key",
-            &identity(&primary_tmp),
+            "--id-pub-key",
+            &id_pub_key(&primary_tmp),
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
@@ -669,8 +669,8 @@ fn identities_accept_table_and_saved_join_survive_daemon_restart() {
             "start",
             "--name",
             "worker",
-            "--identity-pub-key",
-            &identity(&primary_tmp),
+            "--id-pub-key",
+            &id_pub_key(&primary_tmp),
             &format!("http://127.0.0.1:{port}"),
         ])
         .output()
@@ -745,7 +745,7 @@ fn real_connector_rejects_plaintext_joined_at_each_confirmation_boundary() {
                 "start",
                 "--name",
                 "worker",
-                "--identity-pub-key",
+                "--id-pub-key",
                 &pin,
                 &format!("http://127.0.0.1:{port}"),
             ])

@@ -385,13 +385,13 @@ pub enum RpcRequest {
     },
     /// Signal the daemon to start a persistent outbound join connector
     /// using the daemon's auto-generated identity key. The connector pins
-    /// the primary's identity pubkey to exactly the operator-supplied
+    /// the primary's id pubkey to exactly the operator-supplied
     /// canonical `ed25519 <base64(raw32)>` line — no TOFU file, no
     /// interactive prompts, no shared secret.
     JoinStart {
         url: String,
         name: String,
-        primary_identity_pub_key: String,
+        primary_id_pub_key: String,
     },
     /// Signal the daemon to stop and remove an outbound join connector.
     JoinStop {
@@ -403,14 +403,14 @@ pub enum RpcRequest {
     },
     /// List all secondary nodes currently connected to this (primary) daemon.
     NodeList,
-    /// Register a secondary node's identity pubkey on the primary. The
-    /// `identity_pub_key` field is the canonical `ed25519
+    /// Register a secondary node's id pubkey on the primary. The
+    /// `id_pub_key` field is the canonical `ed25519
     /// <base64(raw32)>` line printed by `oly daemon status` on the
     /// secondary (matched against the secondary's
     /// `<state>/identity_key.pub` on disk).
     NodeAccept {
         name: String,
-        identity_pub_key: String,
+        id_pub_key: String,
     },
 }
 

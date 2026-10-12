@@ -640,7 +640,7 @@ pub enum NodeCommand {
     /// List all secondary nodes currently connected to this (primary) daemon.
     #[command(name = "ls")]
     List,
-    /// Authorize a secondary node's identity pubkey so it can join this
+    /// Authorize a secondary node's id pubkey so it can join this
     /// primary. Pair this with the line printed by `oly daemon status`
     /// (or `<state>/identity_key.pub`) on the secondary box.
     #[command(name = "accept")]
@@ -649,7 +649,7 @@ pub enum NodeCommand {
 
 #[derive(Debug, Args)]
 pub struct AcceptArgs {
-    /// Name of the secondary node to register the identity pubkey for.
+    /// Name of the secondary node to register the id pubkey for.
     #[arg(long, short = 'n')]
     pub name: String,
     /// Canonical identity public key of the secondary, in the form
@@ -657,7 +657,7 @@ pub struct AcceptArgs {
     /// on the secondary box, or the contents of
     /// `<state>/identity_key.pub` on the secondary.
     #[arg(long, short = 'k', value_name = "PUB_KEY")]
-    pub identity_pub_key: String,
+    pub id_pub_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -671,7 +671,7 @@ pub struct JoinStartArgs {
     /// on the primary, or the contents of `<state>/identity_key.pub` on
     /// the primary.
     #[arg(long, value_name = "PRIMARY_PUB_KEY")]
-    pub identity_pub_key: Option<String>,
+    pub id_pub_key: Option<String>,
     #[arg(help = "HTTP base URL of the primary daemon, e.g. http://primary-host:15443")]
     pub url: String,
 }

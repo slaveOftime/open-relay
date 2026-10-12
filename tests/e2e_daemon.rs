@@ -321,7 +321,7 @@ fn e2e_federation_identity_join_lifecycle() {
     // `OLY_STATE_DIR` at `tmp_dir.join("oly")` (see tests/e2e/mod.rs).
     let secondary_state_dir = secondary_tmp.join("oly");
     let secondary_pub = std::fs::read_to_string(secondary_state_dir.join("identity_key.pub"))
-        .expect("read secondary identity pub key")
+        .expect("read secondary id pub key")
         .trim()
         .to_string();
     assert!(
@@ -329,7 +329,7 @@ fn e2e_federation_identity_join_lifecycle() {
         "expected canonical ed25519 line, got: {secondary_pub}"
     );
 
-    // Register the secondary's identity pub key on the primary.
+    // Register the secondary's id pub key on the primary.
     let accept = oly_cmd(&primary_tmp)
         .args(["node", "accept", "-n", "worker1", "-k", &secondary_pub])
         .output()
@@ -339,11 +339,11 @@ fn e2e_federation_identity_join_lifecycle() {
         "`oly node accept` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&accept.stderr)
     );
-    // Fetch the primary's identity pub key and pin it explicitly on the
-    // secondary via `--identity-pub-key`.
+    // Fetch the primary's id pub key and pin it explicitly on the
+    // secondary via `--id-pub-key`.
     let primary_state_dir = primary_tmp.join("oly");
     let primary_pub = std::fs::read_to_string(primary_state_dir.join("identity_key.pub"))
-        .expect("read primary identity pub key")
+        .expect("read primary id pub key")
         .trim()
         .to_string();
     let join = oly_cmd(&secondary_tmp)
@@ -352,7 +352,7 @@ fn e2e_federation_identity_join_lifecycle() {
             "start",
             "--name",
             "worker1",
-            "--identity-pub-key",
+            "--id-pub-key",
             &primary_pub,
             &format!("http://127.0.0.1:{port}"),
         ])
@@ -391,7 +391,7 @@ fn e2e_federation_identity_join_lifecycle() {
             "start",
             "--name",
             "worker1",
-            "--identity-pub-key",
+            "--id-pub-key",
             &primary_pub,
             &format!("http://127.0.0.1:{port}"),
         ])
@@ -424,16 +424,16 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
     let secondary = start_daemon(&secondary_tmp);
 
     // Federation v2: register the secondary identity with the primary,
-    // pin the primary's identity on the secondary via `--identity-pub-key`,
+    // pin the primary's identity on the secondary via `--id-pub-key`,
     // then join.
     let primary_state_dir = primary_tmp.join("oly");
     let primary_pub = std::fs::read_to_string(primary_state_dir.join("identity_key.pub"))
-        .expect("read primary identity pub key")
+        .expect("read primary id pub key")
         .trim()
         .to_string();
     let secondary_state_dir = secondary_tmp.join("oly");
     let secondary_pub = std::fs::read_to_string(secondary_state_dir.join("identity_key.pub"))
-        .expect("read secondary identity pub key")
+        .expect("read secondary id pub key")
         .trim()
         .to_string();
     let accept = oly_cmd(&primary_tmp)
@@ -452,7 +452,7 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
             "start",
             "--name",
             "worker1",
-            "--identity-pub-key",
+            "--id-pub-key",
             &primary_pub,
             &format!("http://127.0.0.1:{port}"),
         ])
@@ -838,12 +838,12 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
     // Federation v2: identity-based join for the streaming-attach test.
     let primary_state_dir = primary_tmp.join("oly");
     let primary_pub = std::fs::read_to_string(primary_state_dir.join("identity_key.pub"))
-        .expect("read primary identity pub key")
+        .expect("read primary id pub key")
         .trim()
         .to_string();
     let secondary_state_dir = secondary_tmp.join("oly");
     let secondary_pub = std::fs::read_to_string(secondary_state_dir.join("identity_key.pub"))
-        .expect("read secondary identity pub key")
+        .expect("read secondary id pub key")
         .trim()
         .to_string();
     let accept = oly_cmd(&primary_tmp)
@@ -858,7 +858,7 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
             "start",
             "--name",
             "worker1",
-            "--identity-pub-key",
+            "--id-pub-key",
             &primary_pub,
             &format!("http://127.0.0.1:{port}"),
         ])
@@ -2170,7 +2170,7 @@ fn e2e_federation_cli_two_joins_same_key_distinct_identities() {
     let _primary = start_daemon_http(&primary_tmp, port);
     let primary_state_dir = primary_tmp.join("oly");
     let primary_pub = std::fs::read_to_string(primary_state_dir.join("identity_key.pub"))
-        .expect("read primary identity pub key")
+        .expect("read primary id pub key")
         .trim()
         .to_string();
     let primary_url = format!("http://127.0.0.1:{port}");
@@ -2183,7 +2183,7 @@ fn e2e_federation_cli_two_joins_same_key_distinct_identities() {
 
         let secondary_state_dir = secondary_tmp.join("oly");
         let secondary_pub = std::fs::read_to_string(secondary_state_dir.join("identity_key.pub"))
-            .expect("read secondary identity pub key")
+            .expect("read secondary id pub key")
             .trim()
             .to_string();
 
@@ -2204,7 +2204,7 @@ fn e2e_federation_cli_two_joins_same_key_distinct_identities() {
                 "start",
                 "--name",
                 name,
-                "--identity-pub-key",
+                "--id-pub-key",
                 &primary_pub,
                 &primary_url,
             ])
@@ -2276,7 +2276,7 @@ fn e2e_federation_join_start_reports_rejection_on_stderr() {
 
     let secondary_state_dir = secondary_tmp.join("oly");
     let secondary_pub = std::fs::read_to_string(secondary_state_dir.join("identity_key.pub"))
-        .expect("read secondary identity pub key")
+        .expect("read secondary id pub key")
         .trim()
         .to_string();
 
@@ -2295,7 +2295,7 @@ fn e2e_federation_join_start_reports_rejection_on_stderr() {
             "start",
             "--name",
             "ghostworker",
-            "--identity-pub-key",
+            "--id-pub-key",
             &wrong_primary_line,
             &url,
         ])

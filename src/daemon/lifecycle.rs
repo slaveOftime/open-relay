@@ -319,20 +319,16 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
     // works even if the daemon was started after this CLI process.
     match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
         Ok(Some(pub_key)) => {
-            let _ = writeln!(out, "IDENTITY-PUB-KEY:  {}", pub_key);
+            let _ = writeln!(out, "ID-PUB-KEY:  {}", pub_key);
         }
         Ok(None) => {
             let _ = writeln!(
                 out,
-                "IDENTITY-PUB-KEY:  (not generated; start the daemon at least once)"
+                "ID-PUB-KEY:  (not generated; start the daemon at least once)"
             );
         }
         Err(err) => {
-            let _ = writeln!(
-                out,
-                "IDENTITY-PUB-KEY:  failed to read identity pub key: {}",
-                err
-            );
+            let _ = writeln!(out, "ID-PUB-KEY:  failed to read id pub key: {}", err);
         }
     }
 

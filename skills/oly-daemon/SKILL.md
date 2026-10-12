@@ -20,7 +20,7 @@ The daemon's configuration is hot-reload aware: the reloader polls `config.json`
 4. $XDG_STATE_HOME/oly  →  ~/.local/state/oly (Linux)
 ```
 
-- `oly daemon status` prints the effective `STATE`, `ROOT`, `LOGS`, `SESSIONS`, `HTTP`, `IDENTITY-PUB-KEY`, and `AUTH` for the daemons in this state dir — that is also where `config.json` lives.
+- `oly daemon status` prints the effective `STATE`, `ROOT`, `LOGS`, `SESSIONS`, `HTTP`, `ID-PUB-KEY`, and `AUTH` for the daemons in this state dir — that is also where `config.json` lives.
 - The first run creates `config.json` and writes a fresh VAPID key pair (Unix: `0600`).
 - Some paths are fixed at startup — `state_dir`, `sessions_dir`, `db_file`, `lock_file`, `info_file`, socket name and file — and cannot be re-pointed by editing `config.json`.
 

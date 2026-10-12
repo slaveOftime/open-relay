@@ -44,7 +44,7 @@ honest migration instead.
 | CLI ↔ daemon protocol | IPC protocol v4 | IPC protocol **v14** | CLI and daemon must both be 0.5.0. A mismatch exits with a precise version error — no silent misbehavior. |
 | Attach stream framing | base64 chunks inside JSON lines | binary frames after the JSON init line | Only relevant to tooling that spoke IPC directly; update it or pipe through the 0.5.0 CLI. |
 | Federation | 0.3.x node handshake | fenced, deadline/keepalive-driven node links (M5-2…M5-4) | All nodes must run 0.5.0; re-`join` secondaries after upgrading. No rolling mixed-version federation. |
-| Node identity auth | — | required Ed25519 identity authentication over WebSocket (federation v2) | Use `--identity-pub-key` to pin the primary on `join start` and register the secondary on `node accept`. Exchange canonical `ed25519 <base64(raw32)>` public identities independently. Fresh signed transcripts and encrypted KeyConfirm/Ready/Joined fail closed on wrong pins. No SSH transport/import, aliases, or old handshake loader. Static-static DH does not provide forward secrecy. |
+| Node identity auth | — | required Ed25519 identity authentication over WebSocket (federation v2) | Use `--id-pub-key` to pin the primary on `join start` and register the secondary on `node accept`. Exchange canonical `ed25519 <base64(raw32)>` public identities independently. Fresh signed transcripts and encrypted KeyConfirm/Ready/Joined fail closed on wrong pins. No SSH transport/import, aliases, or old handshake loader. Static-static DH does not provide forward secrecy. |
 | Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed; replaced by `limits.max_journal_bytes_per_session` (live sessions) and `limits.journal_retention_days` (stopped sessions); `max_output_log_bytes` continues to be honored as an alias for `max_journal_bytes_per_session` | Delete the old keys (or leave the alias); set new keys explicitly if you want caps. Both default to `0` (unlimited) so existing behavior is preserved exactly on upgrade. |
 | API keys | one all-powerful daemon key | **removed before merge** — see "API keys removed" below | The `oly api-key` command group, the scoped-key migration step, and the `--key` flag on `oly join start` are all removed before merge to `main`. Federation uses node identity authentication only. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
@@ -68,7 +68,7 @@ credentials that can also authorize HTTP access.
 
 - `oly api-key {add,ls,remove}`, their RPCs, HTTP machine-key Bearer fallback,
   and join `--key` / `-k` are gone. Accept retains `-k` as a public-key shortcut.
-- `--identity-pub-key` replaces the old flag without an alias. New daemon
+- `--id-pub-key` replaces the old flag without an alias. New daemon
   identities live in `identity_key` / `identity_key.pub`; old key files are
   not moved, converted, or deleted automatically.
 - SQL migrations 0001–0009 stay unchanged. Additive migration 0010 creates

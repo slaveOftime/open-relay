@@ -389,7 +389,7 @@ async fn secondary_handshake(
     let seed =
         federation_crypto::load_seed(&federation_crypto::seed_path(&config.paths.state_dir))?;
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let primary = federation_crypto::parse_public_key(&join.primary_identity_pub_key)?;
+    let primary = federation_crypto::parse_public_key(&join.primary_id_pub_key)?;
     let secondary_nonce = federation_crypto::fresh_nonce();
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(64 * 1024 * 1024))
@@ -662,7 +662,7 @@ pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcRe
 
 pub(super) async fn handle_node_accept(
     name: String,
-    identity_pub_key: String,
+    id_pub_key: String,
     db: &Arc<Database>,
 ) -> RpcResponse {
     if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
@@ -672,7 +672,7 @@ pub(super) async fn handle_node_accept(
     }
     // Validate and normalize the key so lookups at join time (which use the
     // canonical form) always match, regardless of how the key was pasted in.
-    let canonical = match crate::federation_crypto::parse_public_key(&identity_pub_key) {
+    let canonical = match crate::federation_crypto::parse_public_key(&id_pub_key) {
         Ok(key) => key.to_line(),
         Err(e) => {
             return RpcResponse::Error {
@@ -682,10 +682,10 @@ pub(super) async fn handle_node_accept(
     };
     if let Err(e) = db.register_node_identity(&name, &canonical).await {
         return RpcResponse::Error {
-            message: format!("failed to register identity pubkey: {e}"),
+            message: format!("failed to register id pubkey: {e}"),
         };
     }
-    info!(node = %name, "registered accepted identity pubkey");
+    info!(node = %name, "registered accepted id pubkey");
     RpcResponse::Empty
 }
 
