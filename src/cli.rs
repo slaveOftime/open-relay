@@ -84,8 +84,6 @@ pub enum Commands {
     Export(ExportArgs),
     /// Send text, keys, or application mouse input. Example: `oly send <id> mouse:wheel+3`.
     Send(SendArgs),
-    /// Manage API keys on this (primary) daemon.
-    ApiKey(ApiKeyArgs),
     /// Manage this daemon's outbound connections to a primary daemon.
     Join(JoinArgs),
     /// List secondary nodes currently connected to this (primary) daemon.
@@ -607,43 +605,6 @@ pub(crate) fn join_free_text(values: &[std::ffi::OsString]) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// API key management (primary side)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Args)]
-pub struct ApiKeyArgs {
-    #[command(subcommand)]
-    pub command: ApiKeyCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ApiKeyCommand {
-    /// Generate a new API key and print it once. Keys are independent of node names.
-    Add(ApiKeyAddArgs),
-    /// List all registered API keys (names only; raw values are never stored).
-    #[command(name = "ls")]
-    List,
-    /// Remove an API key by name. Nodes using it will be disconnected.
-    Remove(ApiKeyRemoveArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ApiKeyAddArgs {
-    /// Comma-separated scopes: observe,control,manage,node,all
-    /// (default: node — the historical node-join-only key).
-    #[arg(long, default_value = "node")]
-    pub scopes: String,
-    /// Friendly label for this key (must be unique).
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct ApiKeyRemoveArgs {
-    /// Label of the key to remove.
-    pub name: String,
-}
-
-// ---------------------------------------------------------------------------
 // Join management (secondary side)
 // ---------------------------------------------------------------------------
 
@@ -680,23 +641,23 @@ pub enum NodeCommand {
     #[command(name = "ls")]
     List,
     /// Authorize a secondary node's identity pubkey so it can join this
-    /// primary over SSH-key auth. Pair this with the line printed by
-    /// `oly daemon status` (or `<state>/ssh_host_key.pub`) on the
-    /// secondary box.
+    /// primary. Pair this with the line printed by `oly daemon status`
+    /// (or `<state>/identity_key.pub`) on the secondary box.
     #[command(name = "accept")]
     Accept(AcceptArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct AcceptArgs {
-    /// Name of the secondary node to register the SSH key for.
+    /// Name of the secondary node to register the identity pubkey for.
     #[arg(long, short = 'n')]
     pub name: String,
-    /// Canonical SSH public key (`ssh-ed25519 <base64...>`) of the secondary,
-    /// e.g. the line printed by `oly daemon status` on the secondary box, or
-    /// the contents of `<state>/ssh_host_key.pub` on the secondary.
+    /// Canonical identity public key of the secondary, in the form
+    /// `ed25519 <base64(raw32)>` — the line printed by `oly daemon status`
+    /// on the secondary box, or the contents of
+    /// `<state>/identity_key.pub` on the secondary.
     #[arg(long, short = 'k', value_name = "PUB_KEY")]
-    pub ssh_pub_key: String,
+    pub identity_pub_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -704,16 +665,13 @@ pub struct JoinStartArgs {
     /// Name this daemon will be known as on the primary (must be unique per primary).
     #[arg(long, short = 'n')]
     pub name: String,
-    /// API key printed by `oly api-key add` on the primary (mutually exclusive with --ssh-pub-key).
-    #[arg(long, short = 'k', conflicts_with = "ssh_pub_key")]
-    pub key: Option<String>,
-    /// Canonical SSH public key (`ssh-ed25519 <base64...>`) of the primary.
-    /// When provided, the secondary uses SSH-key auth, signs joins with its
-    /// own auto-generated identity key, and pins the primary to exactly the
-    /// public key you specify — copying `ssh_host_key.pub` from the primary
-    /// or the line printed by `oly daemon status` on the primary.
-    #[arg(long, value_name = "PRIMARY_PUB")]
-    pub ssh_pub_key: Option<String>,
+    /// Required canonical identity public key of the primary, in the form
+    /// `ed25519 <base64(raw32)>`. The secondary pins the primary to
+    /// exactly this identifier — the line printed by `oly daemon status`
+    /// on the primary, or the contents of `<state>/identity_key.pub` on
+    /// the primary.
+    #[arg(long, value_name = "PRIMARY_PUB_KEY")]
+    pub identity_pub_key: Option<String>,
     #[arg(help = "HTTP base URL of the primary daemon, e.g. http://primary-host:15443")]
     pub url: String,
 }

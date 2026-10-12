@@ -184,24 +184,18 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum NodeJoinAuth {
-    /// Authenticate with a plaintext API key.
-    ApiKey { key: String },
-    /// Authenticate with an Ed25519 SSH key signature. The connector
-    /// signs `sign("oly-node-join-v1" || name || public_key)` with the
-    /// privkey matching `public_key` (see `sshauth::node_join_payload`).
-    /// The pinned primary pubkey (typed via `--ssh-pub-key`) is the trust
-    /// root — there is no in-band host-key exchange, so a man-in-the-middle
-    /// has no opportunity to substitute a different key.
+    /// Authenticate with an Ed25519 signature over the join payload. The
+    /// connector signs `sign("oly-node-join-v1" || name || public_key)` with
+    /// the privkey matching `public_key`. The pinned primary pubkey (typed
+    /// via the operator on the secondary) is the trust root — there is no
+    /// in-band host-key exchange, so a man-in-the-middle has no opportunity
+    /// to substitute a different key.
     SshKey {
         /// Base64 raw 64-byte Ed25519 signature.
         signature: String,
         /// The signer's public key (canonical or OpenSSH format).
         public_key: String,
     },
-}
-
-fn default_api_key_scopes() -> String {
-    "node".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -382,32 +376,15 @@ pub enum RpcRequest {
         node: String,
         inner: Box<RpcRequest>,
     },
-    /// Register a new named API key on the primary; the daemon generates and
-    /// returns the one-time plaintext key.
-    ApiKeyAdd {
-        name: String,
-        /// Comma-separated scope list (ADR-0007). Defaults to `node` to
-        /// preserve the historical node-join use of API keys.
-        #[serde(default = "default_api_key_scopes")]
-        scopes: String,
-    },
-    /// List all registered API keys.
-    ApiKeyList,
-    /// Remove a named API key.
-    ApiKeyRemove {
-        name: String,
-    },
-    /// Signal the daemon to start a persistent outbound join connector.
-    /// Either `key` (API key auth) or `ssh_primary_pubkey` (SSH-key auth
-    /// using the daemon's auto-generated identity) must be set. With
-    /// `ssh_primary_pubkey`, the connector pins the primary's identity
-    /// to exactly that canonical public key — no TOFU file, no
-    /// interactive prompts.
+    /// Signal the daemon to start a persistent outbound join connector
+    /// using the daemon's auto-generated identity key. The connector pins
+    /// the primary's identity pubkey to exactly the operator-supplied
+    /// canonical `ed25519 <base64(raw32)>` line — no TOFU file, no
+    /// interactive prompts, no shared secret.
     JoinStart {
         url: String,
         name: String,
-        key: Option<String>,
-        ssh_primary_pubkey: Option<String>,
+        primary_identity_pub_key: String,
     },
     /// Signal the daemon to stop and remove an outbound join connector.
     JoinStop {
@@ -419,15 +396,14 @@ pub enum RpcRequest {
     },
     /// List all secondary nodes currently connected to this (primary) daemon.
     NodeList,
-    /// Register a secondary node's identity pubkey on the primary so
-    /// the primary can authenticate and (for plain-WS joins) encrypt
-    /// this secondary's traffic. `ssh_pub_key` is the canonical
-    /// `ssh-ed25519 <base64(raw32)>` line printed by `oly daemon
-    /// status` on the secondary (matched against the secondary's
-    /// `<state>/ssh_host_key.pub` on disk).
+    /// Register a secondary node's identity pubkey on the primary. The
+    /// `identity_pub_key` field is the canonical `ed25519
+    /// <base64(raw32)>` line printed by `oly daemon status` on the
+    /// secondary (matched against the secondary's
+    /// `<state>/identity_key.pub` on disk).
     NodeAccept {
         name: String,
-        ssh_pub_key: String,
+        identity_pub_key: String,
     },
 }
 
@@ -459,9 +435,6 @@ impl RpcRequest {
             RpcRequest::LogsPagination { .. } => "logs_pagination",
             RpcRequest::LogsRead { .. } => "logs_read",
             RpcRequest::NodeProxy { .. } => "node_proxy",
-            RpcRequest::ApiKeyAdd { .. } => "api_key_add",
-            RpcRequest::ApiKeyList => "api_key_list",
-            RpcRequest::ApiKeyRemove { .. } => "api_key_remove",
             RpcRequest::JoinStart { .. } => "join_start",
             RpcRequest::JoinStop { .. } => "join_stop",
             RpcRequest::JoinList { .. } => "join_list",
@@ -657,16 +630,6 @@ pub enum RpcResponse {
         message: String,
     },
     // ── Node federation ──────────────────────────────────────────────────────
-    /// Response to `ApiKeyAdd`: the one-time plaintext key.
-    ApiKeyAdd {
-        plaintext_key: String,
-    },
-    ApiKeyList {
-        keys: Vec<ApiKeySummary>,
-    },
-    ApiKeyRemove {
-        removed: bool,
-    },
     JoinList {
         joins: Vec<JoinSummary>,
     },
@@ -694,17 +657,6 @@ pub enum RpcResponse {
 pub struct NodeSummary {
     pub name: String,
     pub connected: bool,
-}
-
-/// A registered API key as reported by `oly api-key list`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeySummary {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
-    /// Comma-separated scope list (ADR-0007).
-    #[serde(default)]
-    pub scopes: String,
 }
 
 /// A persisted join config as reported to `oly join list`.
@@ -868,8 +820,9 @@ mod tests {
     fn node_ws_payload_round_trips_uncompressed_binary_json() {
         let message = NodeWsMessage::Join {
             name: "worker-a".into(),
-            auth: NodeJoinAuth::ApiKey {
-                key: "secret".into(),
+            auth: NodeJoinAuth::SshKey {
+                signature: "sig".into(),
+                public_key: "ed25519 dummy".into(),
             },
         };
 
@@ -880,7 +833,10 @@ mod tests {
             NodeWsMessage::Join { name, auth } => {
                 assert_eq!(name, "worker-a");
                 match auth {
-                    NodeJoinAuth::ApiKey { key } => assert_eq!(key, "secret"),
+                    NodeJoinAuth::SshKey { signature, public_key } => {
+                        assert_eq!(signature, "sig");
+                        assert_eq!(public_key, "ed25519 dummy");
+                    }
                     other => panic!("unexpected auth: {other:?}"),
                 }
             }

@@ -15,15 +15,10 @@ use crate::{
 pub struct JoinConfig {
     pub name: String,
     pub primary_url: String,
-    /// Plaintext API key — stored with user-private permissions on the secondary.
-    /// Mutually exclusive with `ssh_primary_pubkey`.
-    pub api_key: Option<String>,
-    /// Canonical SSH public key of the primary (`ssh-ed25519 <base64(raw32[]>`).
-    /// When set, the connector uses SSH-key auth: it signs the join with its
-    /// own auto-generated identity (loaded from `<state>/ssh_host_key`) and
-    /// pins the primary's wire-exposed public key to exactly this value.
-    /// Mutually exclusive with `api_key`.
-    pub ssh_primary_pubkey: Option<String>,
+    /// Canonical identity public key of the primary, in the form
+    /// `ed25519 <base64(raw32)>`. The connector pins the primary to
+    /// exactly this identifier; the trust root lives here, not on the wire.
+    pub primary_identity_pub_key: String,
 }
 
 fn joins_path(config: &AppConfig) -> std::path::PathBuf {
@@ -82,56 +77,36 @@ pub fn list_join_summaries(config: &AppConfig) -> Vec<JoinSummary> {
 // ---------------------------------------------------------------------------
 // CLI handlers
 // ---------------------------------------------------------------------------
-
 /// Validate join authentication arguments. Shared by the CLI
 /// (`oly join start`) and the daemon (`join_start` RPC) so both fail
 /// identically on bad input. The connector reads the daemon's own
-/// identity key directly from `<state>/ssh_host_key` at connect time —
+/// identity key directly from `<state>/identity_key` at connect time —
 /// we don't need to track its private material in the persisted config.
 pub fn build_join_config(
     url: String,
     name: String,
-    key: Option<String>,
-    ssh_primary_pubkey: Option<String>,
+    primary_identity_pub_key: Option<String>,
 ) -> Result<JoinConfig> {
-    let key_present = key.as_ref().is_some_and(|s| !s.is_empty());
-    let ssh_present = ssh_primary_pubkey.as_ref().is_some_and(|s| !s.is_empty());
-    if !key_present && !ssh_present {
-        return Err(AppError::Protocol(
-            "authentication required: pass --key <API_KEY> or --ssh-pub-key <PRIMARY_PUB>".into(),
-        ));
-    }
-    if key_present && ssh_present {
-        return Err(AppError::Protocol(
-            "pass either --key <API_KEY> or --ssh-pub-key <PRIMARY_PUB>, not both".into(),
-        ));
-    }
-    // Validate the primary's pub key up-front: the connector requires an
-    // exact canonical match against the wire-exposed pub key, so reject
-    // typos / wrong-key-type here instead of letting the connector fail
-    // on its first attempt.
-    let ssh_primary_pubkey = ssh_primary_pubkey.and_then(|raw| {
-        let trimmed = raw.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    });
-    if let Some(raw) = &ssh_primary_pubkey {
-        crate::sshauth::normalize_public_key(raw).map_err(|e| {
-            AppError::Protocol(format!(
-                "--ssh-pub-key: {e} \
-                 (expected the canonical \"ssh-ed25519 <base64>\" line from `oly daemon status` on the primary)"
-            ))
+    let raw = primary_identity_pub_key
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::Protocol(
+                "missing --identity-pub-key <PRIMARY_PUB_KEY> - the operator-pinned identity \
+                 of the primary is the trust root for the join"
+                    .into(),
+            )
         })?;
-    }
-    let api_key = key.and_then(|k| (!k.is_empty()).then_some(k));
+    let pk = crate::federation_crypto::parse_public_key(&raw).map_err(|e| {
+        AppError::Protocol(format!(
+            "--identity-pub-key: {e} \
+             (expected the canonical \"ed25519 <base64>\" line from `oly daemon status` on the primary)"
+        ))
+    })?;
     Ok(JoinConfig {
         name,
         primary_url: url,
-        api_key,
-        ssh_primary_pubkey,
+        primary_identity_pub_key: pk.to_line(),
     })
 }
 
@@ -140,41 +115,32 @@ pub async fn run_join(
     config: &AppConfig,
     url: String,
     name: String,
-    key: Option<String>,
-    ssh_primary_pubkey: Option<String>,
+    primary_identity_pub_key: Option<String>,
 ) -> Result<()> {
-    let join = build_join_config(
-        url.clone(),
-        name.clone(),
-        key.clone(),
-        ssh_primary_pubkey.clone(),
-    )?;
-    // In SSH-key mode, print the secondary's own identity pub key so the
-    // operator can copy it onto the primary (`oly node accept -n NAME
-    // -k ...`).
-    // The daemon generates this at first start; read it from disk so the
-    // hint is correct even if the daemon has never been started — the
-    // connector won't be able to join in that state, but the CLI should
+    let join = build_join_config(url.clone(), name.clone(), primary_identity_pub_key.clone())?;
+    // Surface the secondary's own identity pub key so the operator can copy
+    // it onto the primary (`oly node accept --name NAME --identity-pub-key
+    // ...`). The daemon generates this on first start; read it from disk
+    // so the hint is correct even if the daemon has never been started —
+    // the connector won't be able to join in that state, but the CLI should
     // still surface the canonical line.
-    if join.ssh_primary_pubkey.is_some() {
-        match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
-            Ok(Some(pub_key)) => {
-                println!(
-                    "Register it on the primary node with `oly node accept --name {name} --ssh-pub-key \"{pub_key}\"`"
-                );
-            }
-            Ok(None) => {
-                return Err(AppError::Protocol(format!(
-                    "ssh-pub-key join requires the daemon's identity key at {}/ssh_host_key.pub, \
-                     but no file was found. Start the daemon at least once to generate it.",
-                    config.paths.state_dir.display()
-                )));
-            }
-            Err(err) => {
-                return Err(AppError::Protocol(format!(
-                    "failed to read this daemon's identity pub key: {err}"
-                )));
-            }
+    match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
+        Ok(Some(pub_key)) => {
+            println!(
+                "Register it on the primary node with `oly node accept --name {name} --identity-pub-key \"{pub_key}\"`"
+            );
+        }
+        Ok(None) => {
+            return Err(AppError::Protocol(format!(
+                "identity join requires the daemon's identity pubkey at {}/identity_key.pub, \
+                 but no file was found. Start the daemon at least once to generate it.",
+                config.paths.state_dir.display()
+            )));
+        }
+        Err(err) => {
+            return Err(AppError::Protocol(format!(
+                "failed to read this daemon's identity pub key: {err}"
+            )));
         }
     }
     save_join_config(config, &join)?;
@@ -184,8 +150,7 @@ pub async fn run_join(
         crate::protocol::RpcRequest::JoinStart {
             url,
             name: name.clone(),
-            key,
-            ssh_primary_pubkey,
+            primary_identity_pub_key: join.primary_identity_pub_key.clone(),
         },
     )
     .await
@@ -274,95 +239,81 @@ pub async fn run_join_stop(config: &AppConfig, name: String) -> Result<()> {
 mod tests {
     use super::*;
 
-    // Build a canonical `ssh-ed25519 <base64(raw32[]>` pub key line that
-    // passes `sshauth::normalize_public_key` so the validation path in
-    // `build_join_config` accepts it. The signing key is generated fresh
-    // each test run; only the canonical-form check matters here.
+    // Build a canonical `ed25519 <base64(raw32)>` pub-key line that
+    // passes `federation_crypto::parse_public_key`. The signing key is
+    // generated fresh each test run; only the canonical-form check
+    // matters here.
     fn valid_primary_pub_line() -> String {
         use rand::Rng;
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
         let sk = ed25519_dalek::SigningKey::from_bytes(&bytes);
-        crate::sshauth::public_key_line(&sk)
+        crate::federation_crypto::public_key_line(&sk)
     }
 
     #[test]
-    fn build_join_config_accepts_api_key_only() {
-        let cfg = build_join_config(
+    fn build_join_config_requires_identity_pub_key() {
+        let err = build_join_config(
             "http://primary:15443".into(),
             "worker1".into(),
-            Some("secret".into()),
             None,
         )
-        .expect("api key only is valid");
-        assert_eq!(cfg.api_key.as_deref(), Some("secret"));
-        assert!(cfg.ssh_primary_pubkey.is_none());
+        .expect_err("must fail without --identity-pub-key");
+        assert!(format!("{err}").contains("--identity-pub-key"));
     }
 
     #[test]
-    fn build_join_config_accepts_ssh_pub_key_only() {
+    fn build_join_config_round_trips_canonical_line() {
         let primary_pub = valid_primary_pub_line();
         let cfg = build_join_config(
             "http://primary:15443".into(),
             "worker1".into(),
-            None,
             Some(primary_pub.clone()),
         )
-        .expect("ssh pub key only is valid");
-        assert!(cfg.api_key.is_none());
-        assert_eq!(
-            cfg.ssh_primary_pubkey.as_deref(),
-            Some(primary_pub.as_str())
-        );
+        .expect("identity-pub-key joins succeed");
+        assert!(cfg.primary_identity_pub_key.starts_with("ed25519 "));
+        // The persisted value is the canonical line: parsing it round-trips.
+        let parsed = crate::federation_crypto::parse_public_key(&cfg.primary_identity_pub_key)
+            .expect("persisted value parses");
+        assert_eq!(parsed.to_line(), cfg.primary_identity_pub_key);
     }
 
     #[test]
-    fn build_join_config_rejects_missing_both() {
-        let err = build_join_config("http://primary:15443".into(), "worker1".into(), None, None)
-            .expect_err("must fail without any auth");
-        assert!(format!("{err}").contains("authentication required"));
-    }
-
-    #[test]
-    fn build_join_config_rejects_setting_both() {
-        let primary_pub = valid_primary_pub_line();
+    fn build_join_config_rejects_legacy_ssh_ed25519_lines() {
+        // The previous (now removed) format used `ssh-ed25519 ...`. The
+        // new canonical form must reject it.
         let err = build_join_config(
             "http://primary:15443".into(),
             "worker1".into(),
-            Some("secret".into()),
-            Some(primary_pub),
+            Some(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHGWpslEDaC/jIdGIrRog0u6edoFj9W9J2kqPG+Sx/jL"
+                    .to_string(),
+            ),
         )
-        .expect_err("must fail when both are set");
-        assert!(format!("{err}").contains("not both"));
+        .expect_err("legacy ssh-ed25519 line is rejected");
+        assert!(format!("{err}").contains("ed25519"));
     }
 
     #[test]
-    fn build_join_config_rejects_bad_ssh_pub_key() {
-        // Wrong algorithm: ssh-rsa is not a valid ssh-ed25519 line.
+    fn build_join_config_rejects_garbage_payload() {
         let err = build_join_config(
             "http://primary:15443".into(),
             "worker1".into(),
-            None,
-            Some("ssh-rsa AAAA".into()),
+            Some("ed25519 !!!notbase64".into()),
         )
-        .expect_err("must reject non-ed25519 line");
-        assert!(format!("{err}").contains("--ssh-pub-key"));
+        .expect_err("invalid base64 must fail");
+        assert!(format!("{err}").contains("--identity-pub-key"));
     }
 
     #[test]
-    fn build_join_config_treats_empty_strings_as_missing() {
-        let primary_pub = valid_primary_pub_line();
-        let cfg = build_join_config(
+    fn build_join_config_treats_empty_string_as_missing() {
+        let err = build_join_config(
             "http://primary:15443".into(),
             "worker1".into(),
             Some(String::new()),
-            Some(primary_pub.clone()),
         )
-        .expect("empty --key falls back to ssh");
-        assert!(cfg.api_key.is_none());
-        assert_eq!(
-            cfg.ssh_primary_pubkey.as_deref(),
-            Some(primary_pub.as_str())
-        );
+        .expect_err("empty string is treated as missing");
+        assert!(format!("{err}").contains("--identity-pub-key"));
     }
 }
+

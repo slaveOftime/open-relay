@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::{
+    federation_crypto,
     http::AppState,
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
@@ -121,26 +122,6 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
 
     // ── Step 2: validate authentication ─────────────────────────────────────────────
     let verified = match auth {
-        NodeJoinAuth::ApiKey { key } => {
-            let entries = match state.db.list_api_key_entries().await {
-                Ok(e) => e,
-                Err(_) => {
-                    send_error(&mut ws_tx, "internal error").await;
-                    return;
-                }
-            };
-
-            let key_clone = key.clone();
-            tokio::task::spawn_blocking(move || {
-                !entries.is_empty()
-                    && entries.iter().any(|(hash, scopes)| {
-                        crate::http::auth::scopes_allow(scopes, crate::http::auth::SCOPE_NODE)
-                            && crate::http::auth::verify_api_key_hash(&key_clone, hash)
-                    })
-            })
-            .await
-            .unwrap_or(false)
-        }
         NodeJoinAuth::SshKey {
             signature,
             public_key,
@@ -152,8 +133,8 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             // node name to a registered signing pubkey. The signature
             // covers `NODE_JOIN_CONTEXT || name || pubkey`, which binds
             // it to the declared node identity.
-            let canonical = match sshauth::normalize_public_key(&public_key) {
-                Ok(k) => k,
+            let canonical = match federation_crypto::parse_public_key(&public_key) {
+                Ok(pk) => pk.to_line(),
                 Err(_) => {
                     send_error(&mut ws_tx, "unauthorized").await;
                     return;
@@ -161,9 +142,16 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             };
             match state.db.get_ssh_key_entry(&canonical).await {
                 Ok(Some(_registered)) => {
+                    let pk = match federation_crypto::parse_public_key(&canonical) {
+                        Ok(pk) => pk,
+                        Err(_) => {
+                            send_error(&mut ws_tx, "unauthorized").await;
+                            return;
+                        }
+                    };
                     let payload = sshauth::node_join_payload(&name, &canonical);
                     tokio::task::spawn_blocking(move || {
-                        sshauth::verify_signature(&canonical, &signature, &payload)
+                        federation_crypto::verify_transcript(&pk, &signature, &payload)
                     })
                     .await
                     .unwrap_or(false)
@@ -213,12 +201,12 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             if let (Some(secondary_pub_line), Some(host_signing_key)) =
                 (hello_record.as_ref(), state.node_identity.signing_key())
             {
-                let secondary_canon = match sshauth::normalize_public_key(secondary_pub_line) {
-                    Ok(k) => k,
+                let secondary_canon = match federation_crypto::parse_public_key(secondary_pub_line) {
+                    Ok(pk) => pk.to_line(),
                     Err(err) => {
                         send_error(
                             &mut ws_tx,
-                            &format!("hello carried an invalid ssh-ed25519 line: {err}"),
+                            &format!("hello carried an invalid ed25519 public key: {err}"),
                         )
                         .await;
                         state.node_registry.disconnect(&name).await;

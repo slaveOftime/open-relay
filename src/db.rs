@@ -674,55 +674,12 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
 }
 
 // ---------------------------------------------------------------------------
-// API key helpers
+// Federation accept-table entries
 // ---------------------------------------------------------------------------
 
-/// A named API key record from the database.
-#[derive(Debug, Clone)]
-pub struct ApiKeyRecord {
-    pub name: String,
-    pub created_at: Option<DateTime<Utc>>,
-    /// Comma-separated scope list (ADR-0007). Legacy keys default to `node`.
-    pub scopes: String,
-}
-
 impl Database {
-    /// Insert a new API key with the given Argon2id-hashed value and scope
-    /// list. Returns an error if a key with that name already exists.
-    pub async fn add_api_key(&self, name: &str, api_key_hash: &str, scopes: &str) -> Result<()> {
-        sqlx::query("INSERT INTO api_keys (name, api_key_hash, scopes) VALUES (?1, ?2, ?3)")
-            .bind(name)
-            .bind(api_key_hash)
-            .bind(scopes)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Return all stored (Argon2id hash, scopes) pairs — used to validate an
-    /// incoming key against any registered key and to read its granted
-    /// scopes (keys are independent of node names).
-    pub async fn list_api_key_entries(&self) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT api_key_hash, scopes FROM api_keys")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get::<String, _>(0), r.get::<String, _>(1)))
-            .collect())
-    }
-
-    /// Delete an API key by name. Returns `true` if a row was deleted.
-    pub async fn delete_api_key(&self, name: &str) -> Result<bool> {
-        let res = sqlx::query("DELETE FROM api_keys WHERE name = ?1")
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    /// Look up an SSH public key entry by its OpenSSH-format key data.
-    /// Returns the key record if found, None otherwise.
+    /// Look up an SSH public key entry by its canonical key data.
+    /// Returns `(name, key_data)` if found, None otherwise.
     pub async fn get_ssh_key_entry(&self, key_data: &str) -> Result<Option<(String, String)>> {
         let rows = sqlx::query("SELECT name, key_data FROM ssh_keys WHERE key_data = ?1")
             .bind(key_data)
@@ -731,7 +688,7 @@ impl Database {
         Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
     }
 
-    /// Register an SSH public key for a named secondary node.
+    /// Register an identity public key for a named secondary node.
     pub async fn insert_ssh_key_entry(&self, name: &str, key_data: &str) -> Result<()> {
         sqlx::query("INSERT OR REPLACE INTO ssh_keys (name, key_data) VALUES (?1, ?2)")
             .bind(name)
@@ -741,20 +698,34 @@ impl Database {
         Ok(())
     }
 
-    /// List all registered API keys (names + creation timestamps + scopes).
-    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
-        let rows =
-            sqlx::query("SELECT name, created_at, scopes FROM api_keys ORDER BY created_at ASC")
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ApiKeyRecord {
-                name: r.get::<String, _>(0),
-                created_at: r.get::<Option<String>, _>(1).as_deref().and_then(parse_dt),
-                scopes: r.get::<String, _>(2),
-            })
-            .collect())
+    /// Look up a registered node identity by primary key (the canonical
+    /// public-key line). Returns the registered name and the stored value
+    /// for round-trip verification, or None if not registered.
+    pub async fn get_node_identity(
+        &self,
+        key_data: &str,
+    ) -> Result<Option<(String, String)>> {
+        let rows = sqlx::query("SELECT name, public_key FROM node_identities WHERE public_key = ?1")
+            .bind(key_data)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
+    }
+
+    /// Register a named identity record. The public key is `UNIQUE`, so a
+    /// fresh valid signature by a key already registered under another name
+    /// cannot authenticate that other name (foreign-key inversion also
+    /// fails because the matching name-key pair is enforced both at lookup
+    /// and at insert).
+    pub async fn register_node_identity(&self, name: &str, public_key: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO node_identities (name, public_key) VALUES (?1, ?2)",
+        )
+        .bind(name)
+        .bind(public_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

@@ -66,8 +66,8 @@ pub struct AppState {
 }
 
 /// Node identity key pair (Ed25519): every daemon auto-generates one of
-/// these on first start, persisted as `<state>/ssh_host_key` (the seed,
-/// mode 0600) + `<state>/ssh_host_key.pub` (the canonical public line).
+/// these on first start, persisted as `<state>/identity_key` (the seed,
+/// mode 0600) + `<state>/identity_key.pub` (the canonical public line).
 ///
 /// The same keypair serves both federation roles:
 ///
@@ -87,7 +87,7 @@ pub struct AppState {
 /// signed payload differs.
 #[derive(Clone)]
 pub struct NodeIdentity {
-    /// Canonical public key line: "ssh-ed25519 <base64(raw32)>".
+    /// Canonical public key line: `ed25519 <base64(raw32)>`.
     public_key: String,
     /// 32-byte Ed25519 private key seed (empty when disabled).
     seed: Vec<u8>,
@@ -105,15 +105,12 @@ impl NodeIdentity {
 
     /// Returns an empty slice when this identity is `disabled()`.
     pub fn public_key_bytes(&self) -> Vec<u8> {
-        // The canonical `public_key` line is `"ssh-ed25519 <b64(raw32)>"`;
-        // strip the prefix and decode when usable.
         if self.public_key.is_empty() {
             return Vec::new();
         }
-        if let Some(b64) = self.public_key.split_whitespace().next_back() {
-            crate::sshauth::b64_decode(b64).unwrap_or_default()
-        } else {
-            Vec::new()
+        match crate::federation_crypto::parse_public_key(&self.public_key) {
+            Ok(pk) => pk.0.to_vec(),
+            Err(_) => Vec::new(),
         }
     }
 
@@ -123,24 +120,27 @@ impl NodeIdentity {
         Some(ed25519_dalek::SigningKey::from_bytes(&seed))
     }
 
-    /// Path to `ssh_host_key.pub` (the on-disk public key) under a state dir.
+    /// Path to `identity_key.pub` under a state dir. The filename is the
+    /// renamed-on-disk equivalent of the previous `ssh_host_key.pub`.
     pub fn pub_key_path(state_dir: &std::path::Path) -> std::path::PathBuf {
-        state_dir.join("ssh_host_key.pub")
+        crate::federation_crypto::pub_key_path(state_dir)
     }
 
-    /// Path to `ssh_host_key` (the on-disk seed) under a state dir.
+    /// Path to `identity_key` under a state dir.
     pub fn seed_path(state_dir: &std::path::Path) -> std::path::PathBuf {
-        state_dir.join("ssh_host_key")
+        crate::federation_crypto::seed_path(state_dir)
     }
 
     /// Generate a new Ed25519 identity key or load an existing one under
-    /// `state_dir`. The seed is persisted as `ssh_host_key` (0600) and the
-    /// canonical public key line as `ssh_host_key.pub`.
+    /// `state_dir`. The seed is persisted as `identity_key` (0600) and the
+    /// canonical public key line as `identity_key.pub`.
     pub async fn create_or_load(state_dir: &std::path::Path) -> std::io::Result<Self> {
         let key_path = Self::seed_path(state_dir);
         let pub_path = Self::pub_key_path(state_dir);
 
-        let seed = if key_path.exists() {
+        let (signing_key, public_key) = if key_path.exists() {
+            // Only accept a *raw* 32-byte seed; structured files, PEM, or
+            // OpenSSH-formatted keys cannot reach this path.
             let seed = tokio::fs::read(&key_path).await?;
             if seed.len() != 32 {
                 return Err(std::io::Error::new(
@@ -152,45 +152,59 @@ impl NodeIdentity {
                     ),
                 ));
             }
-            seed
+            let arr = <[u8; 32]>::try_from(seed.as_slice())
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad seed"))?;
+            let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+            let line = crate::federation_crypto::public_key_line(&sk);
+            (sk, line)
         } else {
-            // Generate new Ed25519 key pair (raw 32-byte seed).
+            // Generate a fresh seed. Write the seed with private permissions
+            // before publishing the public line, so a stray read access can
+            // never observe an unencrypted / wrongly-permissioned file.
             let mut seed_bytes = [0u8; 32];
             rand::Rng::fill_bytes(&mut rand::rng(), &mut seed_bytes);
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
-            let seed = signing_key.to_bytes().to_vec();
-
-            // Write private seed (user-only) and public key line.
-            tokio::fs::write(&key_path, &seed).await?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+                use std::io::Write as _;
+                use std::os::unix::fs::OpenOptionsExt as _;
+                let res = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&key_path)
+                    .and_then(|mut file| {
+                        file.write_all(signing_key.to_bytes().as_slice())?;
+                        file.sync_all()
+                    });
+                if let Err(err) = res {
+                    let _ = std::fs::remove_file(&key_path);
+                    return Err(err);
+                }
             }
-            seed
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::fs::write(&key_path, signing_key.to_bytes().as_slice()).await;
+            }
+            let line = crate::federation_crypto::public_key_line(&signing_key);
+            (signing_key, line)
         };
 
-        // Always derive the public key from the seed so the in-memory value
-        // and the .pub file stay consistent with the private key.
-        let arr = <[u8; 32]>::try_from(seed.as_slice())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad seed"))?;
-        let public_key =
-            crate::sshauth::public_key_line(&ed25519_dalek::SigningKey::from_bytes(&arr));
+        // Always derive the public line from the seed so the in-memory value
+        // and the .pub file stay consistent.
         tokio::fs::write(&pub_path, format!("{public_key}\n")).await?;
-
-        Ok(NodeIdentity { public_key, seed })
+        Ok(NodeIdentity {
+            public_key: public_key.clone(),
+            seed: signing_key.to_bytes().to_vec(),
+        })
     }
 
     /// Read the on-disk public key line for the daemon under `state_dir`,
     /// if present. Used by `oly daemon status` to surface the identity
     /// without having to talk to the running daemon.
     pub fn read_published_pubkey(state_dir: &std::path::Path) -> std::io::Result<Option<String>> {
-        let path = Self::pub_key_path(state_dir);
-        match std::fs::read_to_string(&path) {
-            Ok(s) => Ok(Some(s.trim().to_string())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
-        }
+        crate::federation_crypto::read_published_pubkey(state_dir)
     }
 }
 

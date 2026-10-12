@@ -26,35 +26,29 @@ const LOCKOUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 min
 /// revocable, and expiring. The cookie mirrors this TTL.
 pub const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
 const AUTH_COOKIE_NAME: &str = "oly_auth_token";
-/// How long a verified API-key → scopes mapping is cached, so per-request
-/// Argon2 verification stays off the hot path. Revoking a key takes effect
-/// within this window.
-const API_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 // ── Authorization scopes (ADR-0007) ─────────────────────────────────────
+
+// Federation auth no longer goes through scope-gated API keys. Browser
+// login remains the only HTTP authentication path; it uses password Argon2
+// for hashing and server-issued, expiring, revocable session tokens for
+// ongoing authorization. The constants and helpers below are the only
+// HTTP-auth surface remaining after the API-key removal (P2).
 
 /// Read-only access: lists, session details, logs, SSE events, node list.
 pub const SCOPE_OBSERVE: &str = "observe";
 /// Interactive access: attach streams and session input/upload.
 pub const SCOPE_CONTROL: &str = "control";
 /// Administrative access: create/stop/kill sessions, metadata, notifications,
-/// push subscriptions, API-key management.
+/// push subscriptions.
 pub const SCOPE_MANAGE: &str = "manage";
-/// Federation access: secondary node join.
-pub const SCOPE_NODE: &str = "node";
-/// Wildcard scope granted by legacy keys created before scopes existed.
-pub const SCOPE_ALL: &str = "all";
 
-const KNOWN_SCOPES: [&str; 5] = [
-    SCOPE_OBSERVE,
-    SCOPE_CONTROL,
-    SCOPE_MANAGE,
-    SCOPE_NODE,
-    SCOPE_ALL,
-];
+const KNOWN_SCOPES: [&str; 3] = [SCOPE_OBSERVE, SCOPE_CONTROL, SCOPE_MANAGE];
 
-/// Validate a comma-separated scope list from the CLI. Returns an error
-/// naming the first unknown scope.
+/// Validate a comma-separated scope list. Reserved for future use; the
+/// current code path does not assign scopes to user sessions, but list
+/// validation is kept for compatibility with configs that may still
+/// mention scopes.
 pub fn validate_scope_list(scopes: &str) -> std::result::Result<(), String> {
     if scopes.trim().is_empty() {
         return Err("scope list must not be empty".to_string());
@@ -68,14 +62,6 @@ pub fn validate_scope_list(scopes: &str) -> std::result::Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Does the stored scope list grant `required`?
-pub fn scopes_allow(stored: &str, required: &str) -> bool {
-    stored
-        .split(',')
-        .map(str::trim)
-        .any(|scope| scope == required || scope == SCOPE_ALL)
 }
 
 /// Classify the scope a protected `/api/*` route requires.
@@ -108,9 +94,6 @@ pub struct AuthState {
     /// Epoch bumped on every revocation so open control streams (WebSocket
     /// attach, SSE) can re-validate their token and close loudly.
     revocations: watch::Sender<u64>,
-    /// Cache of verified API keys: sha256(presented key) hex → (scopes,
-    /// verified-at). Bounds per-request Argon2 verification cost.
-    api_key_cache: Mutex<HashMap<String, (String, Instant)>>,
     /// Per-IP lockout table. Each client is tracked independently so that a
     /// brute-force attempt from one IP cannot lock out legitimate users.
     lockout: Mutex<HashMap<IpAddr, LockoutRecord>>,
@@ -134,7 +117,6 @@ impl AuthState {
             password_hash,
             sessions: Mutex::new(HashMap::new()),
             revocations,
-            api_key_cache: Mutex::new(HashMap::new()),
             lockout: Mutex::new(HashMap::new()),
         });
         state.spawn_cleanup_task();
@@ -174,8 +156,6 @@ impl AuthState {
                     debug!(evicted, "auth: background cleanup evicted expired sessions");
                 }
                 drop(sessions);
-                let mut cache = state.api_key_cache.lock().await;
-                cache.retain(|_, (_, verified_at)| now < *verified_at + API_KEY_CACHE_TTL);
             }
         });
     }
@@ -221,53 +201,6 @@ impl AuthState {
         self.revocations.subscribe()
     }
 
-    /// Verify a presented API key against stored (hash, scopes) entries,
-    /// returning the granted scopes. Results are cached briefly so the hot
-    /// path does not pay Argon2 verification per request.
-    ///
-    /// Interim: the `entries.to_vec()` clone below is the
-    /// acknowledged cost of feeding the O(N)·O(argon2) verify loop to a
-    /// blocking-pool task. The clone stays cheap in absolute terms
-    /// (entries already came from `db.list_api_key_entries` as an owned
-    /// `Vec<(String, String)>` — this just re-borrows it for `'static`)
-    /// but the budget grows linearly with the number of registered keys.
-    /// A future O(1) key-id lookup would be the proper fix; this comment
-    /// marks the spot so the next reader knows why we don't reach for
-    /// `Arc<Vec<...>>` here.
-    pub async fn verify_api_key_scopes(
-        &self,
-        presented: &str,
-        entries: &[(String, String)],
-    ) -> Option<String> {
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(presented.as_bytes());
-        let cache_key: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-        {
-            let cache = self.api_key_cache.lock().await;
-            if let Some((scopes, verified_at)) = cache.get(&cache_key)
-                && Instant::now() < *verified_at + API_KEY_CACHE_TTL
-            {
-                return Some(scopes.clone());
-            }
-        }
-        let presented = presented.to_string();
-        let entries = entries.to_vec();
-        let matched = tokio::task::spawn_blocking(move || {
-            entries
-                .into_iter()
-                .find(|(hash, _)| verify_api_key_hash(&presented, hash))
-                .map(|(_, scopes)| scopes)
-        })
-        .await
-        .ok()
-        .flatten()?;
-        self.api_key_cache
-            .lock()
-            .await
-            .insert(cache_key, (matched.clone(), Instant::now()));
-        Some(matched)
-    }
-
     /// Returns `Some(locked_until)` if the IP is currently locked out.
     /// Evicts the record and returns `None` if the lockout has expired.
     pub(crate) async fn locked_until(&self, ip: IpAddr) -> Option<Instant> {
@@ -282,8 +215,8 @@ impl AuthState {
         }
     }
 
-    /// Record a failed login attempt. Returns whether the IP is now locked out
-    /// or how many attempts remain before lockout.
+    /// Record a failed login attempt. Returns whether the IP is now locked
+    /// out or how many attempts remain before lockout.
     pub(crate) async fn record_failure(&self, ip: IpAddr) -> FailureOutcome {
         let mut lockout = self.lockout.lock().await;
         let record = lockout.entry(ip).or_default();
@@ -306,17 +239,6 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
     // argon2 0.6 generates the salt internally (getrandom feature).
     let argon2 = Argon2::default();
     Ok(argon2.hash_password(password.as_bytes())?.to_string())
-}
-
-/// Verify a plaintext API key against a stored Argon2id hash.
-pub(crate) fn verify_api_key_hash(key: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
-    let Ok(parsed) = PasswordHash::new(hash) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(key.as_bytes(), &parsed)
-        .is_ok()
 }
 
 // ── Request / Response DTOs ──────────────────────────────────────────────────
@@ -564,40 +486,11 @@ pub(super) async fn authorize_request(
         return None;
     }
 
-    // Scoped machine credentials (ADR-0007): an API key presented as a
-    // Bearer token authorizes routes matching its scope list. Query-string
-    // and cookie credentials are never treated as API keys.
-    if let Some(key) = bearer {
-        match state.db.list_api_key_entries().await {
-            Ok(entries) => {
-                if let Some(scopes) = auth.verify_api_key_scopes(&key, &entries).await {
-                    let required = required_scope_for(method, path);
-                    if scopes_allow(&scopes, required) {
-                        debug!(path = %path, scope = required, "auth: authorized request (api key)");
-                        return None;
-                    }
-                    warn!(
-                        path = %path,
-                        required_scope = required,
-                        "auth: API key lacks the required scope"
-                    );
-                    return Some(
-                        (
-                            StatusCode::FORBIDDEN,
-                            Json(serde_json::json!({
-                                "error": "insufficient_scope",
-                                "required_scope": required,
-                            })),
-                        )
-                            .into_response(),
-                    );
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "auth: failed to list API keys");
-            }
-        }
-    }
+    // Federation auth no longer uses scoped machine credentials; the only
+    // HTTP authorization path is server-issued, expiring, revocable session
+    // tokens established via password login. Anonymous Bearer strings
+    // therefore do not authorize anything.
+    let _ = bearer;
 
     let client_ip = client_ip.unwrap_or_else(|| "unknown".to_string());
 
@@ -743,9 +636,9 @@ fn request_is_tls(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COOKIE_NAME, AuthState, SCOPE_CONTROL, SCOPE_MANAGE, SCOPE_NODE, SCOPE_OBSERVE,
-        SESSION_TTL, build_auth_cookie, clear_auth_cookie, extract_request_token_parts,
-        hash_password, required_scope_for, scopes_allow, validate_scope_list, ws_origin_allowed,
+        AUTH_COOKIE_NAME, AuthState, SCOPE_CONTROL, SCOPE_MANAGE, SCOPE_OBSERVE, SESSION_TTL,
+        build_auth_cookie, clear_auth_cookie, extract_request_token_parts, hash_password,
+        required_scope_for, validate_scope_list, ws_origin_allowed,
     };
     use axum::http::{HeaderMap, Method, header};
 
@@ -788,18 +681,11 @@ mod tests {
     }
 
     #[test]
-    fn scope_lists_parse_and_gate() {
+    fn scope_lists_parse() {
         assert!(validate_scope_list("observe,control").is_ok());
-        assert!(validate_scope_list("all").is_ok());
+        assert!(validate_scope_list("control").is_ok());
         assert!(validate_scope_list("").is_err());
         assert!(validate_scope_list("observe,root").is_err());
-
-        assert!(scopes_allow("observe,control", SCOPE_OBSERVE));
-        assert!(scopes_allow("observe,control", SCOPE_CONTROL));
-        assert!(!scopes_allow("observe,control", SCOPE_MANAGE));
-        assert!(!scopes_allow("observe,control", SCOPE_NODE));
-        assert!(scopes_allow("all", SCOPE_MANAGE));
-        assert!(scopes_allow(" node ", SCOPE_NODE));
     }
 
     #[test]
@@ -840,33 +726,6 @@ mod tests {
         assert_eq!(
             required_scope_for(&Method::POST, "/api/sessions/abc/metadata"),
             SCOPE_MANAGE
-        );
-    }
-
-    #[tokio::test]
-    async fn api_key_verification_returns_scopes_and_caches() {
-        let state = AuthState::new(hash_password("hunter2").expect("password should hash"));
-        let key = "0123456789abcdef";
-        let hash = hash_password(key).expect("key should hash");
-        let entries = vec![(hash, "observe,node".to_string())];
-
-        let scopes = state
-            .verify_api_key_scopes(key, &entries)
-            .await
-            .expect("key must verify");
-        assert_eq!(scopes, "observe,node");
-        // Cached: second call succeeds even with an empty entry list.
-        let cached = state
-            .verify_api_key_scopes(key, &[])
-            .await
-            .expect("cached verification must succeed");
-        assert_eq!(cached, "observe,node");
-        // Wrong key never verifies.
-        assert!(
-            state
-                .verify_api_key_scopes("ffffffffffffffff", &entries)
-                .await
-                .is_none()
         );
     }
 

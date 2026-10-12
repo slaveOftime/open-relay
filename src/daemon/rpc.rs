@@ -11,7 +11,7 @@ use crate::{
     http::auth,
     ipc,
     node::NodeRegistry,
-    protocol::{ApiKeySummary, JoinSummary, ListQuery, RpcRequest, RpcResponse},
+    protocol::{JoinSummary, ListQuery, RpcRequest, RpcResponse},
     session::{
         SessionStore, StartSpec,
         logs::{read_persisted_log_page, render_log_session_tail},
@@ -270,14 +270,10 @@ async fn dispatch_request(
         RpcRequest::NodeProxy { node, inner } => {
             handle_node_proxy(node, *inner, node_registry).await
         }
-        RpcRequest::ApiKeyAdd { name, scopes } => handle_api_key_add(name, scopes, db).await,
-        RpcRequest::ApiKeyList => handle_api_key_list(db).await,
-        RpcRequest::ApiKeyRemove { name } => handle_api_key_remove(name, db).await,
         RpcRequest::JoinStart {
             url,
             name,
-            key,
-            ssh_primary_pubkey,
+            primary_identity_pub_key,
         } => {
             handle_join_start(
                 config,
@@ -285,16 +281,15 @@ async fn dispatch_request(
                 session_event_tx,
                 url,
                 name,
-                key,
-                ssh_primary_pubkey,
+                primary_identity_pub_key,
             )
             .await?
         }
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
         RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
         RpcRequest::NodeList => handle_node_list(node_registry).await,
-        RpcRequest::NodeAccept { name, ssh_pub_key } => {
-            handle_node_accept(name, ssh_pub_key, db).await
+        RpcRequest::NodeAccept { name, identity_pub_key } => {
+            handle_node_accept(name, identity_pub_key, db).await
         }
     };
 
@@ -646,63 +641,6 @@ async fn handle_logs_pagination(
     }
 }
 
-async fn handle_api_key_add(name: String, scopes: String, db: &Arc<Database>) -> RpcResponse {
-    if let Err(message) = crate::http::auth::validate_scope_list(&scopes) {
-        return RpcResponse::Error { message };
-    }
-    use rand::Rng;
-    let mut key_bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut key_bytes);
-    let plaintext: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
-
-    match auth::hash_password(&plaintext) {
-        Ok(hash) => match db.add_api_key(&name, &hash, &scopes).await {
-            Ok(()) => {
-                info!(name, "api key registered");
-                RpcResponse::ApiKeyAdd {
-                    plaintext_key: plaintext,
-                }
-            }
-            Err(e) => RpcResponse::Error {
-                message: e.to_string(),
-            },
-        },
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
-async fn handle_api_key_list(db: &Arc<Database>) -> RpcResponse {
-    match db.list_api_keys().await {
-        Ok(records) => RpcResponse::ApiKeyList {
-            keys: records
-                .into_iter()
-                .map(|r| ApiKeySummary {
-                    name: r.name,
-                    created_at: r.created_at,
-                    scopes: r.scopes,
-                })
-                .collect(),
-        },
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
-async fn handle_api_key_remove(name: String, db: &Arc<Database>) -> RpcResponse {
-    match db.delete_api_key(&name).await {
-        Ok(removed) => {
-            info!(name, removed, "api key removed");
-            RpcResponse::ApiKeyRemove { removed }
-        }
-        Err(e) => RpcResponse::Error {
-            message: e.to_string(),
-        },
-    }
-}
-
 /// Mirrors `RpcRequest::JoinStart`'s IPC fields plus the dispatch context;
 /// a parameter-object refactor would obscure that this handler is the
 /// 1:1 IPC shim for that request.
@@ -713,10 +651,13 @@ async fn handle_join_start(
     session_event_tx: &SessionEventTx,
     url: String,
     name: String,
-    key: Option<String>,
-    ssh_primary_pubkey: Option<String>,
+    primary_identity_pub_key: String,
 ) -> Result<RpcResponse> {
-    let join = client::join::build_join_config(url, name.clone(), key, ssh_primary_pubkey)?;
+    let join = client::join::build_join_config(
+        url,
+        name.clone(),
+        Some(primary_identity_pub_key),
+    )?;
     client::join::save_join_config(config, &join)?;
     // The connector reports its first-attempt outcome through a oneshot
     // so the IPC handler can surface `joined` / `joining` / `failed` to

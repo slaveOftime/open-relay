@@ -22,7 +22,7 @@ mod terminal_guards;
 mod utils;
 
 use clap::Parser;
-use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
+use cli::{Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
 use error::{AppError, Result};
 use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
 use std::path::{Path, PathBuf};
@@ -433,70 +433,6 @@ async fn run() -> Result<()> {
             client::run_send(&config, &id, send_args.node, send_args.chunks, free_text).await
         }
 
-        // ── API key management (primary side) ────────────────────────────────
-        Commands::ApiKey(api_key_args) => match api_key_args.command {
-            ApiKeyCommand::Add(args) => {
-                match ipc::send_request_checked(
-                    &config,
-                    RpcRequest::ApiKeyAdd {
-                        name: args.name,
-                        scopes: args.scopes.clone(),
-                    },
-                )
-                .await?
-                {
-                    RpcResponse::ApiKeyAdd { plaintext_key } => {
-                        println!(
-                            "API key registered. Key (store it securely — printed only once):"
-                        );
-                        println!("{plaintext_key}");
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-            ApiKeyCommand::List => {
-                match ipc::send_request_checked(&config, RpcRequest::ApiKeyList).await? {
-                    RpcResponse::ApiKeyList { keys } => {
-                        if keys.is_empty() {
-                            println!("No API keys registered.");
-                        } else {
-                            println!("{:<24} {:<20} CREATED", "NAME", "SCOPES");
-                            for k in keys {
-                                let created = k
-                                    .created_at
-                                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                println!("{:<24} {:<20} {}", k.name, k.scopes, created);
-                            }
-                        }
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-            ApiKeyCommand::Remove(args) => {
-                match ipc::send_request_checked(
-                    &config,
-                    RpcRequest::ApiKeyRemove {
-                        name: args.name.clone(),
-                    },
-                )
-                .await?
-                {
-                    RpcResponse::ApiKeyRemove { removed } => {
-                        if removed {
-                            println!("API key \"{}\" removed.", args.name);
-                        } else {
-                            eprintln!("API key \"{}\" not found.", args.name);
-                        }
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-        },
-
         // ── Node listing (primary side) ──────────────────────────────────────
         Commands::Node(node_args) => match node_args.command {
             NodeCommand::List => {
@@ -521,13 +457,13 @@ async fn run() -> Result<()> {
                     &config,
                     RpcRequest::NodeAccept {
                         name: args.name,
-                        ssh_pub_key: args.ssh_pub_key,
+                        identity_pub_key: args.identity_pub_key,
                     },
                 )
                 .await?
                 {
                     RpcResponse::Empty => {
-                        println!("SSH public key registered for node '{}'.", name);
+                        println!("Identity public key registered for node '{}'.", name);
                         Ok(())
                     }
                     _ => Err(AppError::Protocol("unexpected response".into())),
@@ -538,7 +474,12 @@ async fn run() -> Result<()> {
         // ── Join management (secondary side) ─────────────────────────────────
         Commands::Join(join_args) => match join_args.command {
             JoinCommand::Start(args) => {
-                client::run_join(&config, args.url, args.name, args.key, args.ssh_pub_key).await
+                let Some(pinned) = args.identity_pub_key else {
+                    return Err(AppError::Protocol(
+                        "missing --identity-pub-key <PRIMARY_PUB_KEY> — `--identity-pub-key` is the trust root for the join".into(),
+                    ));
+                };
+                client::run_join(&config, args.url, args.name, Some(pinned)).await
             }
             JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
             JoinCommand::List(args) => {

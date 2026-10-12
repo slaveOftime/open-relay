@@ -203,39 +203,52 @@ async fn connect_and_relay(
         [u8; crate::sshauth::AEAD_KEY_LEN],
     )> = None;
 
-    let auth = if let Some(pinned_primary_pubkey) = &join.ssh_primary_pubkey {
+    let auth = {
+        // The CLI guarantees the operator typed `--identity-pub-key` so the
+        // pinned primary identity is non-empty. Reach for it via the
+        // daemon's own identity (loaded fresh from disk) and the pinned
+        // canonical text stored in the join config.
+        let pinned_primary_pubkey = &join.primary_identity_pub_key;
         // Load this daemon's auto-generated identity seed. The file is
         // the raw 32-byte Ed25519 seed written by NodeIdentity at startup
         // (see http/mod.rs), NOT an OpenSSH-format file — load_raw_seed
         // reads the bytes directly.
         let identity_path = crate::http::NodeIdentity::seed_path(&local_config.paths.state_dir);
-        let seed = crate::sshauth::load_raw_seed(&identity_path).map_err(|e| {
-            let msg = format!(
-                "ssh key auth: failed to load daemon identity from {}: {e}",
-                identity_path.display()
-            );
-            attempt_report.fail(&msg);
-            crate::error::AppError::Protocol(msg)
-        })?;
+        let seed = match crate::federation_crypto::load_seed(&identity_path) {
+            Ok(s) => s,
+            Err(err) => {
+                let msg = format!(
+                    "identity auth: failed to load daemon identity from {}: {err}",
+                    identity_path.display()
+                );
+                attempt_report.fail(&msg);
+                return Err(crate::error::AppError::Protocol(msg));
+            }
+        };
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let public_key = crate::sshauth::public_key_line(&signing_key);
+        let public_key = crate::federation_crypto::public_key_line(&signing_key);
 
         // Pins: any operator-supplied --ssh-pub-key must hash to a
         // valid canonical ssh-ed25519 line. We don't probe the primary
         // for the wire key — the operator is the source of truth.
-        let pinned_canonical = crate::sshauth::normalize_public_key(pinned_primary_pubkey)
+        let pinned_canonical = crate::federation_crypto::parse_public_key(pinned_primary_pubkey)
+            .map(|pk| pk.0)
             .map_err(|e| {
                 let msg = format!(
-                    "configured primary pubkey for {host} is not a valid ssh-ed25519 line: {e}"
+                    "configured primary pubkey for {host} is not a valid ed25519 public key: {e}"
                 );
                 attempt_report.fail(&msg);
                 crate::error::AppError::Protocol(msg)
             })?;
 
         // Sign the join payload: protocol || name || pubkey. The
-        // accept-table on the primary is the trust anchor.
+        // accept-table on the primary is the trust anchor. The legacy
+        // single-payload binary shape is kept for P1; the new transcript
+        // with mixed nonces takes over in P3 (handshake redesign), at which
+        // point both sides will produce the same verifier-constructed
+        // payload including both fresh nonces and primary identity.
         let payload = crate::sshauth::node_join_payload(&join.name, &public_key);
-        let signature = crate::sshauth::sign_b64(&signing_key, &payload);
+        let signature = crate::federation_crypto::sign_transcript(&signing_key, &payload);
 
         // Channel-key derivation: long-term Ed25519 identities on both
         // sides get mapped to X25519 (birational map) so we can seal
@@ -245,27 +258,7 @@ async fn connect_and_relay(
         //     connector + the primary's accept-table entry),
         //   * and the per-direction keys are bound to BOTH identities +
         //     direction labels via HKDF-Expand.
-        let primary_pub_ed: [u8; 32] = {
-            let raw = crate::sshauth::b64_decode(
-                pinned_canonical
-                    .split_whitespace()
-                    .next_back()
-                    .unwrap_or(""),
-            )
-            .map_err(|e| {
-                let msg = format!("primary pub-ed decode: {e}");
-                attempt_report.fail(&msg);
-                crate::error::AppError::Protocol(msg)
-            })?;
-            if raw.len() != 32 {
-                let msg = format!("primary pub-ed length wrong: {} (expected 32)", raw.len());
-                attempt_report.fail(&msg);
-                return Err(crate::error::AppError::Protocol(msg));
-            }
-            let mut b = [0u8; 32];
-            b.copy_from_slice(&raw);
-            b
-        };
+        let primary_pub_ed: [u8; 32] = pinned_canonical;
         let primary_verifying =
             ed25519_dalek::VerifyingKey::from_bytes(&primary_pub_ed).map_err(|e| {
                 let msg = format!("primary pub-ed invalid: {e}");
@@ -314,14 +307,6 @@ async fn connect_and_relay(
         NodeJoinAuth::SshKey {
             signature,
             public_key,
-        }
-    } else {
-        // API key authentication — no channel encryption for now;
-        // operators wanting plaintext-safe secondary joins should
-        // either put the primary behind `https://` (TLS) or switch
-        // this connector to the SSH-key path.
-        NodeJoinAuth::ApiKey {
-            key: join.api_key.clone().unwrap_or_default(),
         }
     };
     let handshake = NodeWsMessage::Join {
@@ -768,25 +753,26 @@ pub(super) async fn handle_node_list(node_registry: &Arc<NodeRegistry>) -> RpcRe
 
 pub(super) async fn handle_node_accept(
     name: String,
-    ssh_pub_key: String,
+    identity_pub_key: String,
     db: &Arc<Database>,
 ) -> RpcResponse {
     // Validate and normalize the key so lookups at join time (which use the
     // canonical form) always match, regardless of how the key was pasted in.
-    let canonical = match crate::sshauth::normalize_public_key(&ssh_pub_key) {
-        Ok(key) => key,
-        Err(e) => {
-            return RpcResponse::Error {
-                message: e.to_string(),
-            };
-        }
-    };
+    let canonical =
+        match crate::federation_crypto::parse_public_key(&identity_pub_key) {
+            Ok(key) => key.to_line(),
+            Err(e) => {
+                return RpcResponse::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
     if let Err(e) = db.insert_ssh_key_entry(&name, &canonical).await {
         return RpcResponse::Error {
-            message: format!("failed to register SSH key: {e}"),
+            message: format!("failed to register identity pubkey: {e}"),
         };
     }
-    info!(node = %name, "registered accepted SSH public key");
+    info!(node = %name, "registered accepted identity pubkey");
     RpcResponse::Empty
 }
 
