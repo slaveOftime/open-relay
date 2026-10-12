@@ -142,44 +142,51 @@ fn e2e_attach_multiline_terminal_paste_does_not_submit() {
 
     // Ctrl-D must still detach outside paste, even with VT input active.
     //
-    // This keystroke is written right after a large paste burst, and ConPTY
-    // — which sits between this test and the client — has been observed to
-    // drop the key-down in that position. The probe records everything it
-    // receives after its report, and on the failing runs that file held the
-    // daemon's shutdown inputs but never the EOT: the byte was lost before
-    // it reached the session, so no amount of synchronising first closes it.
-    // Re-send while waiting instead. Detach is idempotent and a client that
-    // is genuinely wedged still fails the deadline below.
+    // ConPTY can lose a key-down after the paste burst, so retry on Windows
+    // only. Unix must detach on a single EOT after the readiness round trip.
     writer.write_all(b"\x04").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
+    #[cfg(windows)]
     let mut resent_at = Instant::now();
-    let mut detached = false;
-    while !detached {
-        detached = child.0.try_wait().unwrap().is_some();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        // Keep collecting output while waiting: otherwise timeout diagnostics
+        // omit the detach banner or error printed after the ready marker.
+        if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(50)) {
+            output.extend(chunk);
+        }
         if Instant::now() >= deadline {
-            // The probe records everything it receives after the report, so
-            // this distinguishes the two ways a keystroke can vanish: bytes
-            // here mean attach forwarded them to the session instead of
-            // intercepting them; an empty file with no detach banner means
-            // the keystroke was dropped inside the client.
+            // A recorded EOT means it was incorrectly forwarded; no EOT only
+            // tells us it never reached the probe, not where it was lost.
             let after = fs::read_to_string(tmp.join("paste-report.json.after")).unwrap_or_default();
             panic!(
                 "Ctrl-D did not detach attach; output: {:?}; probe received after report: {after:?}",
                 String::from_utf8_lossy(&output)
             );
         }
-        if !detached && resent_at.elapsed() >= Duration::from_millis(500) {
-            // Tolerate a write error: it can only mean the client has already
-            // exited, which the try_wait above is about to report.
+        #[cfg(windows)]
+        if resent_at.elapsed() >= Duration::from_millis(500) {
+            // An exit may race the write; the next try_wait checks the result.
             let _ = writer.write_all(b"\x04");
             resent_at = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    };
     while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
         output.extend(chunk);
     }
+    assert!(
+        status.success(),
+        "attach exited non-zero: {status:?}; output: {:?}",
+        String::from_utf8_lossy(&output)
+    );
     assert!(String::from_utf8_lossy(&output).contains(&format!("Detached from session {id}")));
+    let after = fs::read(report.with_extension("json.after")).unwrap_or_default();
+    assert!(
+        !after.contains(&b'\x04'),
+        "Ctrl-D was forwarded to the session before detaching: {after:?}"
+    );
     drop(writer);
     drop(pair.master);
     drop(rx);

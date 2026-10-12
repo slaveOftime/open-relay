@@ -130,9 +130,6 @@ async function mockBackend(page: Page) {
 
 const SEARCH_ICON = 'Search sessions'
 const SEARCH_INPUT = 'Search sessions by id, title, command, or working directory'
-// Mirrors SessionSearchControl's ENTER_DURATION_MS: the bar animates its width
-// over this long when it expands, so geometry must be sampled after it settles.
-const ENTER_DURATION_MS = 200
 
 // At 375px the desktop table still holds the same titles (hidden, but matched
 // by text queries), so card assertions are scoped to the mobile list.
@@ -327,13 +324,23 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
 
   // Expanding grows the bar toward the left, from the icon: a dragged control
   // is left-anchored, and this is exactly the case where a bar that grew with
-  // the flow pushed the icon right instead. The bar animates its width
-  // (ENTER_DURATION_MS), so wait for that transition to settle before measuring
-  // — a bounding box taken mid-transition samples the input part-way along the
-  // growth and would read as an anchor it does not actually have.
-  await page.waitForTimeout(ENTER_DURATION_MS + 100)
-  const expanded = (await icon.boundingBox())!
-  expect(Math.abs(expanded.x - restored.x)).toBeLessThanOrEqual(2)
-  const inputBox = (await input.boundingBox())!
-  expect(inputBox.x + inputBox.width).toBeLessThanOrEqual(restored.x + 1)
+  // the flow pushed the icon right instead. Wait for the browser's actual
+  // width transition, rather than duplicating the component's duration in a
+  // fixed sleep (which can still sample mid-animation on a busy worker).
+  await input.evaluate(async (field) => {
+    const bar = field.parentElement!.parentElement!
+    await Promise.all(bar.getAnimations().map((animation) => animation.finished))
+  })
+  await expect
+    .poll(async () => {
+      const expanded = (await icon.boundingBox())!
+      return Math.abs(expanded.x - restored.x)
+    })
+    .toBeLessThanOrEqual(2)
+  await expect
+    .poll(async () => {
+      const inputBox = (await input.boundingBox())!
+      return inputBox.x + inputBox.width
+    })
+    .toBeLessThanOrEqual(restored.x + 1)
 })

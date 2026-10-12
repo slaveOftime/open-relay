@@ -11,13 +11,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-// Only the Windows PTY teardown reads these; on other platforms the master
-// drops synchronously, so importing them unconditionally would be unused.
-#[cfg(windows)]
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
+// Windows-only in production; the read/close race is tested on every platform.
+#[cfg(any(windows, test))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -55,22 +51,30 @@ const PTY_TEARDOWN_MAX: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for the output stream to drain.
 #[cfg(windows)]
 const PTY_TEARDOWN_POLL: Duration = Duration::from_millis(20);
-/// Sentinel stored in [`SessionRuntime::pty_read_epoch`] by the teardown
-/// thread immediately before it drops the master, i.e. before
-/// `ClosePseudoConsole` fires. No real elapsed-millis value can reach it.
-///
-/// From that point the console host only emits its *own* mode-reset
-/// sequences (`?9001l`, `?1004l`), which are teardown noise rather than
-/// session output: recording them would make the raw transcript diverge
-/// from the canonical export, so the reader drops them.
-#[cfg(windows)]
+/// Permanent closing marker in the PTY read-generation counter. Reads after
+/// this boundary are console teardown noise and are not recorded.
+#[cfg(any(windows, test))]
 const PTY_CONSOLE_CLOSING: u64 = u64::MAX;
 
-/// Process-wide monotonic anchor for [`SessionRuntime::pty_read_epoch`].
-#[cfg(windows)]
-fn pty_read_anchor() -> Instant {
-    static ANCHOR: OnceLock<Instant> = OnceLock::new();
-    *ANCHOR.get_or_init(Instant::now)
+/// Claim a read before the close boundary and advance the drain generation.
+/// A separate load followed by a store could overwrite the closing marker
+/// when teardown races a read. The atomic update makes closing irreversible.
+/// A counter also observes distinct reads occurring in the same millisecond.
+#[cfg(any(windows, test))]
+fn record_pty_read(epoch: &AtomicU64) -> bool {
+    let mut current = epoch.load(Ordering::Relaxed);
+    while current != PTY_CONSOLE_CLOSING {
+        match epoch.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -243,8 +247,8 @@ pub struct SessionRuntime {
     pub spawned_at: Instant,
     /// Timestamp of the last meaningful output chunk.
     pub last_output_epoch: Option<Instant>,
-    /// Millis since [`pty_read_anchor`] at the reader thread's most recent
-    /// successful PTY read.
+    /// Generation counter advanced at every successful PTY read, or
+    /// [`PTY_CONSOLE_CLOSING`] once teardown has claimed the close boundary.
     ///
     /// Unlike `last_output_epoch` — which only advances on *meaningful*
     /// output for notification bookkeeping — this advances on every chunk,
@@ -1406,6 +1410,8 @@ pub fn spawn_session(
     let broadcast_tx_reader = broadcast_tx;
     let reader_event_tx = event_tx;
     let reader_session_id = meta.id.clone();
+    #[cfg(windows)]
+    let pty_read_epoch = runtime.read().pty_read_epoch.clone();
     std::thread::spawn(move || {
         debug!(session_id = %reader_session_id, "PTY reader thread started");
         let mut buf = vec![0u8; PTY_READ_BUFFER_BYTES];
@@ -1431,9 +1437,7 @@ pub fn spawn_session(
                     // diverge from the canonical export, so drop everything
                     // from the point the teardown thread announces the close.
                     #[cfg(windows)]
-                    if runtime_reader.read().pty_read_epoch.load(Ordering::Relaxed)
-                        == PTY_CONSOLE_CLOSING
-                    {
+                    if !record_pty_read(&pty_read_epoch) {
                         continue;
                     }
 
@@ -1464,11 +1468,6 @@ pub fn spawn_session(
                         // data the scan pipeline dropped. This happens even
                         // when the filtered chunk is empty.
                         rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
-                        #[cfg(windows)]
-                        rt.pty_read_epoch.store(
-                            pty_read_anchor().elapsed().as_millis() as u64,
-                            Ordering::Relaxed,
-                        );
                         let query_responses = rt.feed_engine(&buf[..n]);
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
@@ -1913,6 +1912,35 @@ mod tests {
             let id = generate_session_id(|c| seen.contains(c));
             assert!(seen.insert(id.clone()), "duplicate id: {id}");
         }
+    }
+
+    #[test]
+    fn pty_read_generation_advances_for_every_chunk() {
+        let epoch = AtomicU64::new(0);
+        assert!(record_pty_read(&epoch));
+        assert!(record_pty_read(&epoch));
+        assert_eq!(epoch.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn pty_read_cannot_reopen_a_closing_console() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let reader_epoch = epoch.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            assert!(record_pty_read(&reader_epoch));
+            ready_tx.send(()).unwrap();
+            while record_pty_read(&reader_epoch) {
+                std::thread::yield_now();
+            }
+            // Even a subsequent read must preserve the permanent marker.
+            assert!(!record_pty_read(&reader_epoch));
+        });
+        ready_rx.recv().unwrap();
+        epoch.store(PTY_CONSOLE_CLOSING, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(epoch.load(Ordering::Relaxed), PTY_CONSOLE_CLOSING);
+        assert!(!record_pty_read(&epoch));
     }
 
     // -----------------------------------------------------------------------
