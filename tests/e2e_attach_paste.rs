@@ -144,7 +144,11 @@ fn e2e_attach_multiline_terminal_paste_does_not_submit() {
     writer.write_all(b"\x04").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.0.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "Ctrl-D did not detach attach");
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl-D did not detach attach; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
