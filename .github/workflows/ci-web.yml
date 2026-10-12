@@ -13,6 +13,8 @@ on:
       - web/playwright.config.*
       - web/.prettierrc*
       - web/.editorconfig
+  # Manual re-run for a flaky browser run or a workflow-only change.
+  workflow_dispatch:
 
 # Same concurrency policy as CI: cancel PR runs, never push runs.
 concurrency:

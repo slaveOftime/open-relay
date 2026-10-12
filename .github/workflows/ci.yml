@@ -19,6 +19,9 @@ on:
       - web/vite.config.*
       - web/tsconfig*.json
       - web/index.html
+  # Manual re-run for a flaky PTY test or a workflow-only change: neither
+  # re-triggers this workflow reliably from a push.
+  workflow_dispatch:
 
 # Cancel in-progress runs on PRs to save minutes; push runs always
 # complete so we never leave main half-tested.
