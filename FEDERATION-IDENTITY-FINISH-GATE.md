@@ -182,12 +182,84 @@ git grep -n -E 'ApiKey|api_key|api-key|api_keys|SCOPE_NODE|ssh_pub_key|ssh_prima
 
 | Gate | Result (PASS / FAIL / BLOCKED) | Tests/probes and evidence |
 |---|---|---|
-| G1 Public surface/removal | NOT RUN | API-key CLI/RPC/HTTP removal not started |
-| G2 Identity persistence/trust | PARTIAL | step 1 of 3 done: `federation_crypto.rs` module + 12 unit tests + migration `0010` adding `node_identities` table; identity file paths (`ssh_host_key` → `identity_key`) and accept-table lookup migration still pending |
-| G3 Handshake/readiness | NOT RUN | handshake redesign with Challenge / KeyConfirm / Ready / encrypted `Joined` not started |
-| G4 Channel security | PARTIAL | v2 `ChannelSide` per-direction AEAD with counter-bound nonce + replay rejection implemented and unit-tested; still needs to replace the live `seal_frame`/`open_frame` callers |
-| G5 Behavior/browser auth | NOT RUN | API-key removal fan-out not started; browser password/session path preserved in plan |
-| G6 Suite/docs/platforms | PARTIAL | local: 844 + 12 + 21 + 26 tests pass with new module + migration; full lint/clippy/doc/platform checks pending |
+| G1 Public surface/removal | PARTIAL | `Commands::ApiKey` + arg types, `RpcRequest::{ApiKeyAdd,ApiKeyList,ApiKeyRemove}`, `RpcResponse::ApiKey{Add,List,Remove}`, `ApiKeySummary`, `NodeJoinAuth::ApiKey`, HTTP Bearer api-key authorization path, `api_keys`/`ssh_keys` readers in src/db.rs, `tests/e2e_daemon.rs` API-key fixtures — all removed. Still blocked: schema migration that drops `api_keys` and `ssh_keys` (deferred to P3 closing); full row-level privacy migration on existing on-disk databases. |
+| G2 Identity persistence/trust | PARTIAL | `federation_crypto` module added and used end-to-end; `identity_key` / `identity_key.pub` files via `NodeIdentity::create_or_load` with mode 0600 + fsync; `IDENTITY-PUB-KEY:` printed by `daemon status`; `node_identities` table migration `0010` adds the new PK-on-name / UNIQUE-public-key table. The accept-table still reads from `ssh_keys` (legacy table) — the swap to `node_identities` is scheduled for P3 closing. |
+| G3 Handshake/readiness | NOT RUN | The pre-P3 single-shot handshake still verifies auth, sends plain `Joined`, and reports a connect success. Challenge / Ready / KeyConfirm / encrypted `Joined` state machine + raw-WebSocket observability test fixture are not implemented. |
+| G4 Channel security | PARTIAL | v2 `ChannelSide` per-direction AEAD state with monotonic counter (25-byte minimum frame, replay/reject) is implemented and unit-tested in `federation_crypto`; the live relay still uses `sshauth::ChannelPhase::{Plain,Sealed}` with `seal_frame` / `open_frame` carrying no counter. Per-direction counters and replay rejection are not yet wired into application traffic. |
+| G5 Behavior/browser auth | PARTIAL | Browser password/login/session/cookie/WS-origin/IP lockout paths preserved; `authorize_request` now only accepts session tokens (Bearer strings, query-token, or cookie). To prove the HTTP fallback really has no API-key path: the existing `e2e_ws_*` tests use `--no-auth` so the suite does not yet exercise a real password login + issued session round-trip via `http::auth::issue_session`; that fixture is part of P3’s auth-enabled daemon suite. |
+| G6 Suite/docs/platforms | PARTIAL | Local: `cargo build --bin oly` is clean; `cargo test --locked --bin oly` → 852 passed; `cargo test --locked --test cli_errors` → 21 passed; `cargo test --locked --test e2e_daemon -- --test-threads=1` → 26 passed in 46.5s. Full `-D warnings` clippy is not yet evaluated against this branch; cross-platform CI (macOS, Windows PTY single-threaded) is untested. Architecture, README and skills still reference the old `ssh-pub-key` / `SSH-PUB-KEY:` labels in some prose examples. |
+
+## Implementation status
+
+Phase-by-phase progress; each phase ships as its own commit with green tests.
+
+### What landed (committed)
+
+- **Plan + finish-gate documents** archive the design and acceptance contract.
+- Branch `feat/federation-identity` prepared from the previous baseline.
+- **P1 step 1 (committed)**: `src/federation_crypto.rs` introduced as a
+  sibling module to `sshauth.rs`. New parser/transcript/derive channel keys
+  + per-direction AEAD-owned state, new `identity_key{,pub}` file paths,
+  new `ed25519 <base64(raw32)>` encoding, new `NODE_JOIN_CONTEXT` /
+  `CHANNEL_INFO_PREFIX` / `FRAME_TAG_SEALED` / `MAX_SEQUENCE` constants.
+  Migration `0010` (`0010_add_node_identities.sql`) adds the new
+  `node_identities` table preserving all prior migration files.
+- **P1 step 2 (committed)**: rewired `NodeIdentity` persistence, daemon
+  status label (`IDENTITY-PUB-KEY:`), the relay's welcome/accept path, the
+  connector-side identity handoff, and the join-config parse path onto the
+  new module + new file paths. Public-key line is now `ed25519
+  <base64(raw32)>`; OpenSSH-format and `ssh-ed25519` lines are no longer
+  emitted or accepted anywhere.
+- **P2 (committed)**: full API-key removal. `Commands::ApiKey`,
+  `RpcRequest::ApiKeyAdd/List/Remove` and the matching response variants +
+  protocol summary struct, the HTTP Bearer API-key authorization branch,
+  the `api_key_cache`/`verify_api_key_scopes`/`verify_api_key_hash`
+  helpers, the `SCOPE_NODE`/`SCOPE_ALL`/scope-classifier machinery, the
+  `add_api_key`/`list_api_key_entries`/`delete_api_key`/`list_api_keys`
+  DB CRUD, `ApiKeySummary`/`ApiKeyRecord`, the `auth_keys` table usage in
+  the join handler, and the `--key` flag on `oly join start`. CLI flag
+  renamed to `--identity-pub-key` on both `/join start` and `/node
+  accept`; the daemonside accept-field renamed to `identity_pub_key`.
+- **P2 cleanup (committed)**: removed dead `SCOPE_*` constants and
+  scope-classifier helpers that became unreachable after API-key removal;
+  removed the now-unused `method` parameter on `authorize_request`;
+  silenced the live-dead warnings introduced as P3 cleanup.
+
+### Plan for the remaining phases
+
+- **P3 — handshake redesign** (in progress, separate commit): introduce
+  `Challenge` / `KeyConfirm` / `Ready` handshake frames with per-direction
+  AEAD counters and explicit transcript binding; require encrypted
+  confirmation before reporting `joined`; gate the registry with
+  connection-ownership tokens. This eliminates the largest part of the
+  current `(just-takes-our-word-for-it)` weakness noted in the plan.
+- **P3 closing**: drop `sshauth.rs` once the relay + connector are
+  rewired onto `ChannelSide` and the new handshake; delete the legacy
+  `ssh_keys` table in a new forward migration.
+- **P5 — docs sweep** (separate commit): update README, ARCHITECTURE.md,
+  skills and diagrams to match the implemented CLI flags, file paths,
+  status label and handshake. The current docs already mention the new
+  naming (see prior commits) but the handshake diagram in ARCHITECTURE.md
+  is still pre-P3.
+
+### Unresolved blockers
+
+- P3 handshake full implementation (Challenge / Ready / KeyConfirm /
+  encrypted `Joined`) and per-direction sequence-numbered AEAD framing.
+- Schema migration that drops `ssh_keys` (and only `ssh_keys` —
+  `api_keys` is already dropped conceptually but the existing migration
+  file `0003_migrate_to_api_keys.sql` is still on disk; closing is the
+  migration that drops `ssh_keys` once the relay stops reading it).
+- macOS / Windows CI run + gated `-D warnings` clippy.
+- Auth-enabled daemon fixture with real password login + issued session
+  tokens + salt-bearing hashed cookies.
+
+### Skipped / untested behavior
+
+- Items still BLOCKED in G3, and the unchecked rows of G5/G6.
+
+**Finish rule:** declare FINISHED only when G1–G6 are PASS, required evidence
+exists, and no security, behavior, or platform blocker is outstanding.
 
 ## Implementation status
 
