@@ -25,6 +25,7 @@ jobs:
   build-release:
     name: build-release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -79,7 +80,15 @@ jobs:
           fi
 
       - name: Test
-        run: cargo test --locked --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          # Windows PTY e2e tests need single-threaded execution because of
+          # resource contention; the same override ci.yml applies.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test --locked --target ${{ matrix.target }} -- --test-threads=1
+          else
+            cargo test --locked --target ${{ matrix.target }}
+          fi
 
       - name: Build release binary
         env:
@@ -126,9 +135,10 @@ jobs:
     name: attach SHA256SUMS
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      # Inherits contents: write from the workflow; explicit here so the
-      # id-token claim stays scoped to publishing jobs only.
+      # Explicit so the job holds only what it needs, regardless of what the
+      # workflow-level default grants.
       contents: write
     steps:
       - uses: actions/download-artifact@v4
@@ -154,6 +164,7 @@ jobs:
     name: update-homebrew-formula
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Stable tags only: prereleases must not rewrite the Homebrew formula
     # that ships on the default branch.
     if: |
@@ -221,6 +232,7 @@ jobs:
     name: publish-crates
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Stable tags only: crates.io has no dist-tags, so prereleases must
     # never reach the registry.
     if: |
@@ -230,10 +242,6 @@ jobs:
       EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
     permissions:
       contents: read
-      # crates.io trusted publishing via OIDC. Configure the repo +
-      # workflow at https://crates.io/settings/trusted-publishing before
-      # relying on this; otherwise cargo publish will 403.
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -259,11 +267,14 @@ jobs:
           max_attempts: 3
           retry_on: error
           command: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   publish-npm:
     name: publish-npm
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
     # Most native binaries end up in npm/bin/, so run commands under
@@ -273,10 +284,6 @@ jobs:
         working-directory: npm
     permissions:
       contents: read
-      # npm trusted publishing via OIDC. Configure the package +
-      # workflow at https://www.npmjs.com/package/@slaveoftime/oly/access
-      # before relying on this; otherwise npm publish will 403.
-      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -347,10 +354,11 @@ jobs:
 
             cp ../README.md README.md
 
-            npm publish --access public --tag "$DIST_TAG" --provenance
+            npm publish --access public --tag "$DIST_TAG"
 
         env:
           DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # publish-winget:
   #   name: publish-winget

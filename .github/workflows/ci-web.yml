@@ -33,6 +33,7 @@ jobs:
   lint:
     name: lint / format
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +55,7 @@ jobs:
   test:
     name: vitest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +74,7 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [lint, test]
     steps:
       - uses: actions/checkout@v4
@@ -91,6 +94,7 @@ jobs:
   e2e:
     name: playwright (chromium)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [build]
     steps:
       - uses: actions/checkout@v4

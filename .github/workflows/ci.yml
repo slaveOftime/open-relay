@@ -33,6 +33,7 @@ jobs:
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +59,10 @@ jobs:
   build-test:
     name: build-test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Observed: ubuntu 13m, macOS 15m, Windows 23m. The bound exists so a
+    # wedged PTY test (a client that never detaches) fails fast instead of
+    # idling to GitHub's 6-hour default.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -105,6 +110,7 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # Audit only on push to main: gating it out of PR signal keeps the
     # advisory noise off the merge check while still catching issues
     # before a release. Add a scheduled trigger in a follow-up if drift
