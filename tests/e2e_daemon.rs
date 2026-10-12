@@ -121,10 +121,18 @@ fn e2e_start_respects_explicit_cwd() {
     let canonical_cwd = fs::canonicalize(&cwd)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| cwd_str.clone());
+    // The transcript is the session's rendered screen state, so the terminal
+    // engine wraps it at the session's PTY width — and this temp path is
+    // longer than 80 columns, so it is split mid-string. A path never
+    // contains a line break, so match against the unwrapped text: this pins
+    // the honoured `--cwd`, not how wide the session's PTY happened to be.
     let logged = wait_for_log(
         &tmp,
         &id,
-        |log| log.contains(&cwd_str) || log.contains(&canonical_cwd),
+        |log| {
+            let flat = log.replace(['\r', '\n'], "");
+            flat.contains(&cwd_str) || flat.contains(&canonical_cwd)
+        },
         Duration::from_secs(3),
     );
     assert!(
