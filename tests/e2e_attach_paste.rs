@@ -141,14 +141,39 @@ fn e2e_attach_multiline_terminal_paste_does_not_submit() {
     );
 
     // Ctrl-D must still detach outside paste, even with VT input active.
+    //
+    // This keystroke is written right after a large paste burst, and ConPTY
+    // — which sits between this test and the client — has been observed to
+    // drop the key-down in that position. The probe records everything it
+    // receives after its report, and on the failing runs that file held the
+    // daemon's shutdown inputs but never the EOT: the byte was lost before
+    // it reached the session, so no amount of synchronising first closes it.
+    // Re-send while waiting instead. Detach is idempotent and a client that
+    // is genuinely wedged still fails the deadline below.
     writer.write_all(b"\x04").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while child.0.try_wait().unwrap().is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "Ctrl-D did not detach attach; output: {:?}",
-            String::from_utf8_lossy(&output)
-        );
+    let mut resent_at = Instant::now();
+    let mut detached = false;
+    while !detached {
+        detached = child.0.try_wait().unwrap().is_some();
+        if Instant::now() >= deadline {
+            // The probe records everything it receives after the report, so
+            // this distinguishes the two ways a keystroke can vanish: bytes
+            // here mean attach forwarded them to the session instead of
+            // intercepting them; an empty file with no detach banner means
+            // the keystroke was dropped inside the client.
+            let after = fs::read_to_string(tmp.join("paste-report.json.after")).unwrap_or_default();
+            panic!(
+                "Ctrl-D did not detach attach; output: {:?}; probe received after report: {after:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        if !detached && resent_at.elapsed() >= Duration::from_millis(500) {
+            // Tolerate a write error: it can only mean the client has already
+            // exited, which the try_wait above is about to report.
+            let _ = writer.write_all(b"\x04");
+            resent_at = Instant::now();
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     while let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) {
