@@ -364,7 +364,6 @@ async fn serve_static_or_proxy(
         Ok(Some(apps::AppRequestTarget::LocalFile(candidate))) => {
             if let Some(response) = auth::authorize_request(
                 &state,
-                &method,
                 uri.path(),
                 auth_token.clone(),
                 bearer.clone(),
@@ -386,7 +385,6 @@ async fn serve_static_or_proxy(
         Ok(Some(apps::AppRequestTarget::Proxy(target_urls))) => {
             if let Some(response) = auth::authorize_request(
                 &state,
-                &method,
                 uri.path(),
                 auth_token.clone(),
                 bearer.clone(),
@@ -425,7 +423,7 @@ async fn serve_static_or_proxy(
         };
     if let Some(candidate) = local_candidate {
         if let Some(response) =
-            auth::authorize_request(&state, &method, uri.path(), auth_token, bearer, client_ip)
+            auth::authorize_request(&state, uri.path(), auth_token, bearer, client_ip)
                 .await
         {
             return response;

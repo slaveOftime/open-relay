@@ -32,56 +32,7 @@ const AUTH_COOKIE_NAME: &str = "oly_auth_token";
 // Federation auth no longer goes through scope-gated API keys. Browser
 // login remains the only HTTP authentication path; it uses password Argon2
 // for hashing and server-issued, expiring, revocable session tokens for
-// ongoing authorization. The constants and helpers below are the only
-// HTTP-auth surface remaining after the API-key removal (P2).
-
-/// Read-only access: lists, session details, logs, SSE events, node list.
-pub const SCOPE_OBSERVE: &str = "observe";
-/// Interactive access: attach streams and session input/upload.
-pub const SCOPE_CONTROL: &str = "control";
-/// Administrative access: create/stop/kill sessions, metadata, notifications,
-/// push subscriptions.
-pub const SCOPE_MANAGE: &str = "manage";
-
-const KNOWN_SCOPES: [&str; 3] = [SCOPE_OBSERVE, SCOPE_CONTROL, SCOPE_MANAGE];
-
-/// Validate a comma-separated scope list. Reserved for future use; the
-/// current code path does not assign scopes to user sessions, but list
-/// validation is kept for compatibility with configs that may still
-/// mention scopes.
-pub fn validate_scope_list(scopes: &str) -> std::result::Result<(), String> {
-    if scopes.trim().is_empty() {
-        return Err("scope list must not be empty".to_string());
-    }
-    for scope in scopes.split(',').map(str::trim) {
-        if !KNOWN_SCOPES.contains(&scope) {
-            return Err(format!(
-                "unknown scope '{scope}' (known: {})",
-                KNOWN_SCOPES.join(", ")
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Classify the scope a protected `/api/*` route requires.
-pub fn required_scope_for(method: &axum::http::Method, path: &str) -> &'static str {
-    if method == axum::http::Method::GET {
-        // The attach endpoint is a GET WebSocket upgrade but grants
-        // interactive control — classify by capability, not verb.
-        if path.ends_with("/attach") {
-            return SCOPE_CONTROL;
-        }
-        return SCOPE_OBSERVE;
-    }
-    // Mutating routes: input/upload touch a live child; the rest are
-    // lifecycle/admin operations.
-    if path.ends_with("/input") || path.ends_with("/upload") {
-        SCOPE_CONTROL
-    } else {
-        SCOPE_MANAGE
-    }
-}
+// ongoing authorization.
 
 // ── AuthState ────────────────────────────────────────────────────────────────
 
@@ -458,10 +409,9 @@ pub async fn require_auth(
     };
     let token = extract_request_token_parts(request.headers(), query);
     let bearer = extract_bearer_token(request.headers());
-    let method = request.method().clone();
     let client_ip = extract_request_client_ip(&request);
     if let Some(response) =
-        authorize_request(&state, &method, &path, token, bearer, client_ip).await
+        authorize_request(&state, &path, token, bearer, client_ip).await
     {
         return response;
     }
@@ -471,7 +421,6 @@ pub async fn require_auth(
 
 pub(super) async fn authorize_request(
     state: &AppState,
-    method: &axum::http::Method,
     path: &str,
     token: Option<String>,
     bearer: Option<String>,
@@ -485,6 +434,15 @@ pub(super) async fn authorize_request(
         debug!(path = %path, "auth: authorized request (session)");
         return None;
     }
+
+    // FE Federation auth no longer uses scoped machine credentials; the only
+    // HTTP authorization path is server-issued, expiring, revocable session
+    // tokens established via password login. Anonymous Bearer strings
+    // therefore do not authorize anything. The `method` parameter is kept to
+    // mirror the future-required hook when finer-grained capability checks
+    // are reintroduced (e.g. node-only Bearer); see also `required_scope_for`
+    // which is reserved for that purpose.
+    let _ = bearer;
 
     // Federation auth no longer uses scoped machine credentials; the only
     // HTTP authorization path is server-issued, expiring, revocable session
@@ -636,11 +594,10 @@ fn request_is_tls(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COOKIE_NAME, AuthState, SCOPE_CONTROL, SCOPE_MANAGE, SCOPE_OBSERVE, SESSION_TTL,
-        build_auth_cookie, clear_auth_cookie, extract_request_token_parts, hash_password,
-        required_scope_for, validate_scope_list, ws_origin_allowed,
+        AUTH_COOKIE_NAME, AuthState, SESSION_TTL, build_auth_cookie, clear_auth_cookie,
+        extract_request_token_parts, hash_password, ws_origin_allowed,
     };
-    use axum::http::{HeaderMap, Method, header};
+    use axum::http::{HeaderMap, header};
 
     #[tokio::test]
     async fn sessions_are_random_expiring_and_revocable() {
@@ -678,55 +635,6 @@ mod tests {
         assert_eq!(SESSION_TTL.as_secs(), 7 * 24 * 60 * 60);
         let cookie = build_auth_cookie("abc123", false);
         assert!(cookie.contains("Max-Age=604800"));
-    }
-
-    #[test]
-    fn scope_lists_parse() {
-        assert!(validate_scope_list("observe,control").is_ok());
-        assert!(validate_scope_list("control").is_ok());
-        assert!(validate_scope_list("").is_err());
-        assert!(validate_scope_list("observe,root").is_err());
-    }
-
-    #[test]
-    fn routes_classify_into_scopes() {
-        assert_eq!(
-            required_scope_for(&Method::GET, "/api/sessions"),
-            SCOPE_OBSERVE
-        );
-        assert_eq!(
-            required_scope_for(&Method::GET, "/api/sessions/abc/logs"),
-            SCOPE_OBSERVE
-        );
-        // Attach is a GET upgrade but grants interactive control.
-        assert_eq!(
-            required_scope_for(&Method::GET, "/api/sessions/abc/attach"),
-            SCOPE_CONTROL
-        );
-        assert_eq!(
-            required_scope_for(&Method::POST, "/api/sessions/abc/input"),
-            SCOPE_CONTROL
-        );
-        assert_eq!(
-            required_scope_for(&Method::POST, "/api/sessions/abc/upload"),
-            SCOPE_CONTROL
-        );
-        assert_eq!(
-            required_scope_for(&Method::POST, "/api/sessions"),
-            SCOPE_MANAGE
-        );
-        assert_eq!(
-            required_scope_for(&Method::POST, "/api/sessions/abc/kill"),
-            SCOPE_MANAGE
-        );
-        assert_eq!(
-            required_scope_for(&Method::DELETE, "/api/sessions/abc"),
-            SCOPE_MANAGE
-        );
-        assert_eq!(
-            required_scope_for(&Method::POST, "/api/sessions/abc/metadata"),
-            SCOPE_MANAGE
-        );
     }
 
     #[test]

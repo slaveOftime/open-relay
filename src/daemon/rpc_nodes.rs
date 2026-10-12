@@ -198,9 +198,16 @@ async fn connect_and_relay(
     // join with `Joined`. Until then we keep sending plaintext so the
     // auth-validating primary (which only transitions to Sealed after
     // reading Join + verifying auth) and we stay wire-compatible.
+    // `pending_phase_seal` carries the keys derived during the SSH-key
+    // branch and is sealed onto the channel AFTER `Joined` is
+    // acknowledged. Left in the current shape so the P3 handshake
+    // redesign can replace the surrounding phase enum with the new
+    // per-direction state machine without inflating this commit's
+    // surface area.
+    #[allow(dead_code)]
     let mut pending_phase_seal: Option<(
-        [u8; crate::sshauth::AEAD_KEY_LEN],
-        [u8; crate::sshauth::AEAD_KEY_LEN],
+        [u8; crate::federation_crypto::AEAD_KEY_LEN],
+        [u8; crate::federation_crypto::AEAD_KEY_LEN],
     )> = None;
 
     let auth = {

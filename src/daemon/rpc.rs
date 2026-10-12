@@ -8,7 +8,6 @@ use crate::{
     config::{AppConfig, LiveConfig},
     db::Database,
     error::Result,
-    http::auth,
     ipc,
     node::NodeRegistry,
     protocol::{JoinSummary, ListQuery, RpcRequest, RpcResponse},
