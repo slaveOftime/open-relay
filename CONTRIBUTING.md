@@ -60,6 +60,15 @@ If you touch packaging or release behavior, also review:
 - `npm/package.json`
 - `.github/workflows/release.yml`
 
+Run the offline release-workflow regressions on Linux (requires Python 3,
+Bash, `zip`, `unzip`, and `sha256sum`):
+
+```sh
+python3 tests/release_workflow.py
+```
+
+These use fixture binaries and a fake `npm` command; they never publish.
+
 ## Pull request checklist
 
 - Explain the user-visible problem being solved

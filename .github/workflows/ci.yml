@@ -7,6 +7,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/ci.yml
+      - .github/workflows/release.yml
       - Cargo.toml
       - Cargo.lock
       - build.rs
@@ -50,6 +51,9 @@ jobs:
         with:
           shared-key: ${{ runner.os }}-oly
           cache-on-failure: true
+
+      - name: Release workflow regressions (offline)
+        run: python3 tests/release_workflow.py
 
       - name: rustfmt
         run: cargo fmt --all -- --check

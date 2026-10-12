@@ -12,7 +12,7 @@ on:
 # Never cancel a release mid-publish: a half-finished publish leaves the
 # GitHub release / npm / crates.io in an inconsistent state.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -104,7 +104,7 @@ jobs:
           # Use POSIX zip instead of Compress-Archive (PowerShell): it's
           # faster, deterministic across ubuntu/macos, and avoids pwsh as
           # a transient dependency.
-          (cd "$(dirname "$BIN_PATH")" && zip -j "$GITHUB_WORKSPACE/$ASSET_PATH" "$BIN_PATH")
+          (cd "$(dirname "$BIN_PATH")" && zip -j "$GITHUB_WORKSPACE/$ASSET_PATH" "$(basename "$BIN_PATH")")
           sha256sum "$ASSET_PATH" > "$ASSET_PATH.sha256"
 
       - name: Upload binary artifact
@@ -122,6 +122,7 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.EFFECTIVE_REF }}
           files: |
             ${{ matrix.asset_name }}
             ${{ matrix.asset_name }}.sha256
@@ -151,12 +152,13 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          cat */*.sha256 > ../SHA256SUMS.txt
+          cat ./*.sha256 > ../SHA256SUMS.txt
           cat ../SHA256SUMS.txt
 
       - name: Attach SHA256SUMS to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: SHA256SUMS.txt
           generate_release_notes: false
 
@@ -264,6 +266,7 @@ jobs:
       - name: Publish to crates.io
         uses: nick-fields/retry@v3
         with:
+          timeout_minutes: 10
           max_attempts: 3
           retry_on: error
           command: cargo publish --locked
@@ -277,8 +280,8 @@ jobs:
     timeout-minutes: 20
     env:
       EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
-    # Most native binaries end up in npm/bin/, so run commands under
-    # npm/ by default — including the retry step below.
+    # Run shell steps under npm/. `uses:` actions do not inherit this;
+    # the retry action explicitly changes directory below.
     defaults:
       run:
         working-directory: npm
@@ -323,11 +326,14 @@ jobs:
       - name: Bundle binaries + publish to npm
         uses: nick-fields/retry@v3
         with:
+          timeout_minutes: 5
           max_attempts: 3
           retry_on: error
+          shell: bash
           command: |
             set -euo pipefail
-            # cwd is npm/ from defaults; artifact was downloaded to ../dist.
+            cd "$GITHUB_WORKSPACE/npm"
+            # download-artifact paths are relative to GITHUB_WORKSPACE.
             TMP_DIR="$(mktemp -d)"
             trap 'rm -rf "$TMP_DIR"' EXIT
 
