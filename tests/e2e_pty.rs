@@ -942,7 +942,42 @@ fn e2e_attach_ctrl_d_detaches() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_attach_ctrl_d_detach");
     let _daemon = start_daemon(&tmp);
-    let id = start_session(&tmp, &["sh", "-i"]);
+    assert!(
+        program_exists("node"),
+        "node is required for the detach probe"
+    );
+    // The paste probe doubles as the detach probe: it prints PASTE_READY on
+    // startup and answers a `!` with INPUT_READY. That round trip is what
+    // lets this test know the client's input reader is live before it stakes
+    // its assertion on a single keystroke — a bare `sh -i` has no way to
+    // acknowledge anything, which is why the old "wait for the first output
+    // byte, then send EOT" version flaked on ubuntu and macOS.
+    let report = tmp.join("detach-probe.json");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paste_probe.cjs");
+    let id = start_session(
+        &tmp,
+        &[
+            "--disable-notifications",
+            "--tag",
+            "temp",
+            "--tag",
+            "detach-test",
+            "node",
+            fixture.to_str().unwrap(),
+            report.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains("PASTE_READY"),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "probe did not become ready"
+    );
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -985,15 +1020,36 @@ fn e2e_attach_ctrl_d_detaches() {
     });
     let mut output: Vec<u8> = Vec::new();
 
-    // Wait until the attach client is fully up: it enters raw mode and
-    // replays the session; drain whatever arrives first.
+    // Wait for the replay to prove the client is rendering, then round-trip
+    // a keystroke through its input reader. Only once the probe answers the
+    // `!` is that reader guaranteed live, so the Ctrl-D below cannot race
+    // attach's startup — which is exactly the race this test used to hit
+    // when it sent EOT after the first output byte instead.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while output.is_empty() {
+    while !String::from_utf8_lossy(&output).contains("PASTE_READY") {
         assert!(
             std::time::Instant::now() < deadline,
-            "`oly attach` produced no output on the pty"
+            "`oly attach` did not replay the ready marker; output: {:?}",
+            String::from_utf8_lossy(&output)
         );
         match output_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // An ordinary printable key proves the reader is live: the probe
+    // acknowledges it with INPUT_READY.
+    writer.write_all(b"!").expect("write probe round-trip key");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&output).contains("INPUT_READY") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "attach input reader did not become ready; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        match output_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => output.extend_from_slice(&chunk),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1005,24 +1061,9 @@ fn e2e_attach_ctrl_d_detaches() {
 
     // The attach process must exit on its own and report the detach.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    // The EOT above is written the instant the client's first output byte
-    // lands, which races the client's startup: the terminal-event reader
-    // thread only starts a few statements later, and a loaded CI runner can
-    // leave that single keystroke unobserved (this has flaked on both ubuntu
-    // and macOS). Re-send it on a cadence while waiting — detach is
-    // idempotent, and a client that is genuinely wedged still fails the
-    // deadline below, so this only stops one lost keystroke from failing an
-    // otherwise correct run.
-    let mut resent_at = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("check attach child") {
             break status;
-        }
-        if resent_at.elapsed() >= Duration::from_millis(500) {
-            // Tolerate a write error here: it can only mean the client has
-            // already exited, which the try_wait above is about to report.
-            let _ = writer.write_all(b"\x04");
-            resent_at = std::time::Instant::now();
         }
         match output_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => output.extend_from_slice(&chunk),
