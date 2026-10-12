@@ -481,7 +481,10 @@ impl App {
             return Vec::new();
         };
         let folder_node = folder.node.as_deref().or(list_node);
-        let folder_path = folder.cwd.as_deref().map(|cwd| PathBuf::from(normalize_tree_cwd(cwd)));
+        let folder_path = folder
+            .cwd
+            .as_deref()
+            .map(|cwd| PathBuf::from(normalize_tree_cwd(cwd)));
         let mut targets = Vec::new();
         for session in &self.sessions {
             let session_node = session.node.as_deref().or(list_node);

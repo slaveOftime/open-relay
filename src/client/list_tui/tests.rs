@@ -1142,8 +1142,12 @@ fn tree_filter_sessions_by_search_text() {
 #[test]
 fn cwdless_sessions_use_their_oly_storage_directory_in_tree_and_filter_paths() {
     let storage = std::path::PathBuf::from(r"C:\oly-state\sessions");
-    let expected_local_dir =
-        std::path::PathBuf::from(storage.join("orphan-local").to_string_lossy().replace('\\', "/"));
+    let expected_local_dir = std::path::PathBuf::from(
+        storage
+            .join("orphan-local")
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     let mut local = session("orphan-local");
     local.cwd = None;
     let mut remote = session("orphan-remote");
@@ -1168,8 +1172,12 @@ fn cwdless_sessions_use_their_oly_storage_directory_in_tree_and_filter_paths() {
         .iter()
         .find(|node| node.direct_sessions.contains(&1))
         .expect("remote session directory leaf");
-    let expected_remote_dir =
-        std::path::PathBuf::from(std::path::PathBuf::from("sessions").join("orphan-remote").to_string_lossy().replace('\\', "/"));
+    let expected_remote_dir = std::path::PathBuf::from(
+        std::path::PathBuf::from("sessions")
+            .join("orphan-remote")
+            .to_string_lossy()
+            .replace('\\', "/"),
+    );
     assert_eq!(remote_index.cwd.as_deref(), expected_remote_dir.to_str());
 
     app.filter = "orphan-local".to_string();
@@ -1811,10 +1819,7 @@ fn tree_merges_cwd_variants_with_different_slashes_and_case() {
         .map(|node| node.cwd.clone().unwrap_or_default())
         .collect();
     assert_eq!(leaf_cwds.len(), 1, "leaf cwds: {leaf_cwds:?}");
-    assert_eq!(
-        leaf_cwds[0].to_lowercase().replace('\\', "/"),
-        "c:/foo/bar"
-    );
+    assert_eq!(leaf_cwds[0].to_lowercase().replace('\\', "/"), "c:/foo/bar");
 }
 
 #[test]

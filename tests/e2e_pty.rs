@@ -507,7 +507,12 @@ fn e2e_session_id_is_injected_into_the_child_environment() {
     let id = start_session(&tmp, cmd);
 
     let needle = format!("SID={id}");
-    let seen = wait_for_log(&tmp, &id, |log| log.contains(&needle), native_shell_timeout());
+    let seen = wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains(&needle),
+        native_shell_timeout(),
+    );
     assert!(
         seen.is_some(),
         "child did not print its own OLY_SESSION_ID (expected '{needle}').\nLogs:\n{}",
