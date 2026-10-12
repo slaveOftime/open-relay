@@ -63,17 +63,26 @@ impl PtyHandle {
         result
     }
 
-    /// Release pseudo-terminal-owned handles once the session is completed.
+    /// Close the PTY writer so future input writes fail fast.
     ///
-    /// This closes the stored master handle and replaces the public writer
-    /// sender with a permanently closed channel so future writes fail fast.
-    pub fn release_resources(&mut self) {
-        debug!("releasing PTY resources");
-        self.pty_master.lock().take();
+    /// Deliberately separate from [`Self::take_master`]: on Windows dropping
+    /// the master is what fires `ClosePseudoConsole`, and that has to wait
+    /// for the output stream to drain (see
+    /// `SessionRuntime::teardown_pty`), while a finished session must stop
+    /// accepting input immediately.
+    pub fn close_writer(&mut self) {
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let previous_tx = std::mem::replace(&mut self.writer_tx, closed_tx);
         drop(previous_tx);
+    }
+
+    /// Take ownership of the stored master handle, leaving `None` behind so
+    /// resize and writer access fail fast. The caller becomes responsible for
+    /// dropping it — and on Windows for the `ClosePseudoConsole` that drop
+    /// triggers.
+    pub fn take_master(&mut self) -> Option<Box<dyn portable_pty::MasterPty + Send>> {
+        self.pty_master.lock().take()
     }
 
     /// Forcefully terminate the child process or close the Windows ConPTY handle.

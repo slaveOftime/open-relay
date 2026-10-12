@@ -110,6 +110,8 @@ pub(crate) fn make_runtime(
         persisted: false,
         requested_final_status: None,
         spawned_at: Instant::now(),
+        #[cfg(windows)]
+        pty_read_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         last_output_epoch: last_output_at,
         last_input_at: None,
         last_attach_activity_at: None,
@@ -257,6 +259,8 @@ pub(crate) fn make_runtime_writable_with_capacity(
         persisted: false,
         requested_final_status: None,
         spawned_at: Instant::now(),
+        #[cfg(windows)]
+        pty_read_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         last_output_epoch: None,
         last_input_at: None,
         last_attach_activity_at: None,

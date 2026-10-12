@@ -416,6 +416,16 @@ async fn run_attach_inner(
         #[cfg(windows)]
         let _vt_input = super::attach_input::VtInputGuard::new()?;
 
+        // Discard input that queued up while the subscribe handshake and the
+        // replay were still in flight: device-attribute replies and a resize
+        // the terminal reported mid-handshake. This has to run *before* the
+        // first snapshot write below, not after it — once the replay reaches
+        // the outer terminal the client is visibly live, and from that point
+        // on the event-reader thread is the only consumer. Draining any later
+        // would silently swallow keystrokes the user sent while the snapshot
+        // was being painted (input is never dropped; see the reader thread).
+        let _ = drain_pending_terminal_events();
+
         // Render the current terminal snapshot. The subscribe handshake already
         // asked the daemon to resize to the current terminal size when needed.
         let (cols, rows) = initial_size.unwrap_or_else(|| terminal::size().unwrap_or((80, 24)));
@@ -451,12 +461,8 @@ async fn run_attach_inner(
         // normally otherwise.
         sync_local_terminal_modes(child_mouse_report, child_focus_events);
 
-        // Drain any stale resize events queued by writing replay data
-        // before the main event loop.
-        let _ = drain_pending_terminal_events();
-
-        // A resize that landed during the handshake or replay was drained
-        // above as "stale"; reconcile against the real terminal size so a
+        // A resize that landed during the handshake was drained above as
+        // "stale"; reconcile against the real terminal size so a
         // startup-race resize is not silently lost until the next one.
         {
             let (now_cols, now_rows) = terminal::size().unwrap_or((cols, rows));
@@ -530,9 +536,14 @@ async fn run_attach_inner(
                             ));
                             break;
                         };
+                        // `Raw` exists only on Windows, where ConPTY needs raw
+                        // VT passthrough alongside decoded events. Elsewhere the
+                        // enum is a single-variant wrapper, so this is a plain
+                        // irrefutable destructure — a one-arm `match` here would
+                        // trip `clippy::infallible_destructuring_match`.
+                        #[cfg(windows)]
                         let ev = match ev {
                             AttachInputEvent::Terminal(ev) => ev,
-                            #[cfg(windows)]
                             AttachInputEvent::Raw(data) => {
                                 if can_drive {
                                     send_attach_input(&mut write_half, &id_owned, data, false).await?;
@@ -540,6 +551,8 @@ async fn run_attach_inner(
                                 continue;
                             }
                         };
+                        #[cfg(not(windows))]
+                        let AttachInputEvent::Terminal(ev) = ev;
                         match ev {
                             Event::Paste(data) => {
                                 // Explicit bracketed-paste boundaries: send the

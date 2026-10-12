@@ -11,6 +11,13 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+// Only the Windows PTY teardown reads these; on other platforms the master
+// drops synchronously, so importing them unconditionally would be unused.
+#[cfg(windows)]
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -28,9 +35,43 @@ use crate::{
 use super::journal::{self, LifecycleCode, ShadowJournal};
 use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
 use super::scan::{PtyScanner, ScanOut};
-
 use super::{MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus};
 use crate::terminal::{EngineEvent, Terminal};
+
+/// How long the PTY reader must have seen no new bytes before a finished
+/// session's master handle may be dropped on Windows.
+///
+/// Dropping the master is what fires `ClosePseudoConsole`, and that discards
+/// every byte the console host has not yet translated into the output pipe —
+/// a pipe that never reaches EOF on its own, because the console host owns
+/// its write end and keeps it open until the console is closed. Tearing down
+/// at the instant `try_wait` reports exit therefore races the reader thread
+/// and silently truncates the transcript tail.
+#[cfg(windows)]
+const PTY_TEARDOWN_QUIET: Duration = Duration::from_millis(200);
+/// Hard cap on the drain wait, so a session can never pin its master handle.
+#[cfg(windows)]
+const PTY_TEARDOWN_MAX: Duration = Duration::from_secs(2);
+/// Poll interval while waiting for the output stream to drain.
+#[cfg(windows)]
+const PTY_TEARDOWN_POLL: Duration = Duration::from_millis(20);
+/// Sentinel stored in [`SessionRuntime::pty_read_epoch`] by the teardown
+/// thread immediately before it drops the master, i.e. before
+/// `ClosePseudoConsole` fires. No real elapsed-millis value can reach it.
+///
+/// From that point the console host only emits its *own* mode-reset
+/// sequences (`?9001l`, `?1004l`), which are teardown noise rather than
+/// session output: recording them would make the raw transcript diverge
+/// from the canonical export, so the reader drops them.
+#[cfg(windows)]
+const PTY_CONSOLE_CLOSING: u64 = u64::MAX;
+
+/// Process-wide monotonic anchor for [`SessionRuntime::pty_read_epoch`].
+#[cfg(windows)]
+fn pty_read_anchor() -> Instant {
+    static ANCHOR: OnceLock<Instant> = OnceLock::new();
+    *ANCHOR.get_or_init(Instant::now)
+}
 
 // ---------------------------------------------------------------------------
 // SessionRuntime
@@ -202,6 +243,16 @@ pub struct SessionRuntime {
     pub spawned_at: Instant,
     /// Timestamp of the last meaningful output chunk.
     pub last_output_epoch: Option<Instant>,
+    /// Millis since [`pty_read_anchor`] at the reader thread's most recent
+    /// successful PTY read.
+    ///
+    /// Unlike `last_output_epoch` — which only advances on *meaningful*
+    /// output for notification bookkeeping — this advances on every chunk,
+    /// so PTY teardown can tell "the reader is still receiving" apart from
+    /// "the stream has drained". Windows-only: only its teardown needs the
+    /// distinction.
+    #[cfg(windows)]
+    pub(crate) pty_read_epoch: Arc<AtomicU64>,
     /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
@@ -747,7 +798,7 @@ impl SessionRuntime {
             exit_code = ?exit_code,
             "marking PTY session as completed"
         );
-        self.pty.release_resources();
+        self.teardown_pty();
         let event = match &self.meta.status {
             SessionStatus::Stopped => format!(
                 "session stopped exit_code={}",
@@ -777,6 +828,56 @@ impl SessionRuntime {
             if let Some(code) = code {
                 self.queue_journal_completion(code, exit_code, event);
             }
+        }
+    }
+
+    /// Tear down the session's PTY handles.
+    ///
+    /// A finished session must stop accepting input immediately, so the
+    /// writer channel is closed on every platform. The master handle is a
+    /// different matter on Windows: dropping it is what closes the pseudo
+    /// console, and that discards output the console host has not yet
+    /// flushed into the pipe the reader is draining — a pipe that never
+    /// EOFs on its own. So the drop is deferred to a detached thread that
+    /// waits for the reader to go quiet (bounded, so a session can never
+    /// pin its handle), while every other platform reaches EOF naturally
+    /// and tears down synchronously.
+    fn teardown_pty(&mut self) {
+        self.pty.close_writer();
+        #[cfg(not(windows))]
+        drop(self.pty.take_master());
+        #[cfg(windows)]
+        {
+            // `mark_completed` can run twice (a racing kill after a natural
+            // exit); only the first call still owns a master to hand off.
+            let Some(master) = self.pty.take_master() else {
+                return;
+            };
+            let epoch = self.pty_read_epoch.clone();
+            std::thread::spawn(move || {
+                let mut observed = epoch.load(Ordering::Relaxed);
+                let mut observed_at = Instant::now();
+                let deadline = Instant::now() + PTY_TEARDOWN_MAX;
+                loop {
+                    std::thread::sleep(PTY_TEARDOWN_POLL);
+                    let now = epoch.load(Ordering::Relaxed);
+                    if now != observed {
+                        // The reader is still receiving the transcript tail.
+                        observed = now;
+                        observed_at = Instant::now();
+                    } else if observed_at.elapsed() >= PTY_TEARDOWN_QUIET {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                }
+                // Announce the close *before* dropping the master so the
+                // reader stops recording at exactly the point the console
+                // host starts emitting its own teardown sequences.
+                epoch.store(PTY_CONSOLE_CLOSING, Ordering::Relaxed);
+                drop(master);
+            });
         }
     }
 
@@ -1256,6 +1357,8 @@ pub fn spawn_session(
         persisted: false,
         requested_final_status: None,
         spawned_at: Instant::now(),
+        #[cfg(windows)]
+        pty_read_epoch: Arc::new(AtomicU64::new(0)),
         last_output_epoch: None,
         last_input_at: None,
         last_attach_activity_at: None,
@@ -1321,6 +1424,19 @@ pub fn spawn_session(
                     break "pty output closed (eof)".to_string();
                 }
                 Ok(n) => {
+                    // Once the pseudo console is being torn down the console
+                    // host only emits its *own* mode-reset sequences
+                    // (`?9001l`, `?1004l`) — teardown noise, not session
+                    // output. Recording them would make the raw transcript
+                    // diverge from the canonical export, so drop everything
+                    // from the point the teardown thread announces the close.
+                    #[cfg(windows)]
+                    if runtime_reader.read().pty_read_epoch.load(Ordering::Relaxed)
+                        == PTY_CONSOLE_CLOSING
+                    {
+                        continue;
+                    }
+
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
                     // One pass over the chunk produces everything downstream
@@ -1348,6 +1464,11 @@ pub fn spawn_session(
                         // data the scan pipeline dropped. This happens even
                         // when the filtered chunk is empty.
                         rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
+                        #[cfg(windows)]
+                        rt.pty_read_epoch.store(
+                            pty_read_anchor().elapsed().as_millis() as u64,
+                            Ordering::Relaxed,
+                        );
                         let query_responses = rt.feed_engine(&buf[..n]);
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
@@ -1845,6 +1966,8 @@ mod tests {
             persisted: false,
             requested_final_status: None,
             spawned_at: Instant::now(),
+            #[cfg(windows)]
+            pty_read_epoch: Arc::new(AtomicU64::new(0)),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
@@ -2814,6 +2937,8 @@ mod tests {
             persisted: false,
             requested_final_status: None,
             spawned_at: Instant::now(),
+            #[cfg(windows)]
+            pty_read_epoch: Arc::new(AtomicU64::new(0)),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
