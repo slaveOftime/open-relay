@@ -1005,9 +1005,24 @@ fn e2e_attach_ctrl_d_detaches() {
 
     // The attach process must exit on its own and report the detach.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // The EOT above is written the instant the client's first output byte
+    // lands, which races the client's startup: the terminal-event reader
+    // thread only starts a few statements later, and a loaded CI runner can
+    // leave that single keystroke unobserved (this has flaked on both ubuntu
+    // and macOS). Re-send it on a cadence while waiting — detach is
+    // idempotent, and a client that is genuinely wedged still fails the
+    // deadline below, so this only stops one lost keystroke from failing an
+    // otherwise correct run.
+    let mut resent_at = std::time::Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("check attach child") {
             break status;
+        }
+        if resent_at.elapsed() >= Duration::from_millis(500) {
+            // Tolerate a write error here: it can only mean the client has
+            // already exited, which the try_wait above is about to report.
+            let _ = writer.write_all(b"\x04");
+            resent_at = std::time::Instant::now();
         }
         match output_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(chunk) => output.extend_from_slice(&chunk),
