@@ -360,7 +360,7 @@ async fn primary_handshake(
         return Err(fail("expected identity join proof"));
     };
     let registered = state.db.get_node_identity(&name).await?;
-    if !registered.is_some_and(|(_, key)| key == peer.to_line())
+    if registered.is_none_or(|(_, key)| key != peer.to_line())
         || !federation_crypto::verify_transcript(&peer, &signature, &transcript)
     {
         return Err(fail("unauthorized node identity or transcript"));

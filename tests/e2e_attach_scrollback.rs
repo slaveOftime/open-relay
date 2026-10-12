@@ -41,6 +41,9 @@ impl OuterTerminal {
         let child = ChildGuard(pair.slave.spawn_command(command).unwrap());
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
+        // The seed write below is Windows-only; on other platforms `writer` is
+        // only moved into the struct, so the `mut` is unused there.
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut writer = pair.master.take_writer().unwrap();
         #[cfg(windows)]
         writer.write_all(b"\x1b[1;1R").unwrap();

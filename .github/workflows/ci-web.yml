@@ -109,5 +109,9 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
 
+      # This job installs only the Chromium browser (see the step above), so it
+      # must run only the Chromium project. The mobile-safari project needs
+      # WebKit, which is a local opt-in (`--project=mobile-safari`); running it
+      # here would fail with "Executable doesn't exist" for the WebKit binary.
       - name: Playwright e2e
-        run: npm run e2e
+        run: npm run e2e -- --project=chromium

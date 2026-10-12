@@ -6,7 +6,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::{
     fs,
-    path::Path,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -114,10 +113,18 @@ fn e2e_start_respects_explicit_cwd() {
     let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert_eq!(id.len(), 7, "expected 7-char session ID, got: {id:?}");
 
+    // The child prints its cwd with `pwd`, which reports the process's real
+    // working directory. On macOS the temp root lives under `/var`, a symlink
+    // to `/private/var`, so `pwd` echoes the resolved path while `cwd_str`
+    // still holds the unresolved one. Accept either spelling so the assertion
+    // pins the honoured `--cwd` rather than the platform's symlink layout.
+    let canonical_cwd = fs::canonicalize(&cwd)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| cwd_str.clone());
     let logged = wait_for_log(
         &tmp,
         &id,
-        |log| log.contains(&cwd_str),
+        |log| log.contains(&cwd_str) || log.contains(&canonical_cwd),
         Duration::from_secs(3),
     );
     assert!(
@@ -1318,7 +1325,7 @@ fn e2e_ws_attach_frames_conform_and_journal_stays_clean() {
 
 /// Minimal std-only HTTP POST returning the status code — keeps this test
 /// synchronous so the e2e lock is never held across an `.await`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn http_post_kill(port: u16, id: &str) -> u16 {
     use std::io::{Read, Write};
     let mut stream =
@@ -1342,7 +1349,10 @@ fn http_post_kill(port: u16, id: &str) -> u16 {
 
 /// Killing a session must terminate the whole process tree, not just
 /// the direct child — a backgrounded grandchild must not leak.
-#[cfg(not(target_os = "windows"))]
+///
+/// Linux-only: the test detects the grandchild's liveness through `/proc`,
+/// which macOS does not provide.
+#[cfg(target_os = "linux")]
 #[test]
 fn e2e_kill_terminates_the_whole_process_tree() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1360,7 +1370,7 @@ fn e2e_kill_terminates_the_whole_process_tree() {
     while Instant::now() < deadline {
         if let Ok(contents) = fs::read_to_string(&pidfile) {
             let pid = contents.trim();
-            if !pid.is_empty() && Path::new(&format!("/proc/{pid}")).exists() {
+            if !pid.is_empty() && std::path::Path::new(&format!("/proc/{pid}")).exists() {
                 grandchild_pid = pid.to_string();
                 break;
             }
@@ -1392,7 +1402,10 @@ fn e2e_kill_terminates_the_whole_process_tree() {
 
 /// `oly daemon stop` drains sessions with the same process-tree
 /// semantics — a backgrounded grandchild must not survive the shutdown.
-#[cfg(not(target_os = "windows"))]
+///
+/// Linux-only: the test detects the grandchild's liveness through `/proc`,
+/// which macOS does not provide.
+#[cfg(target_os = "linux")]
 #[test]
 fn e2e_daemon_stop_kills_process_trees() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1408,7 +1421,7 @@ fn e2e_daemon_stop_kills_process_trees() {
     while Instant::now() < deadline {
         if let Ok(contents) = fs::read_to_string(&pidfile) {
             let pid = contents.trim();
-            if !pid.is_empty() && Path::new(&format!("/proc/{pid}")).exists() {
+            if !pid.is_empty() && std::path::Path::new(&format!("/proc/{pid}")).exists() {
                 grandchild_pid = pid.to_string();
                 break;
             }

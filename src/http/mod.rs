@@ -123,8 +123,14 @@ impl NodeIdentity {
 // ── Release-only: embed the contents of web/dist into the binary ─────────────
 // `build.rs` guarantees that `npm run build` has already run in release mode,
 // so the folder is always present when this crate is compiled with --release.
+// Debug/test builds (`cargo clippy --all-targets`, `cargo test`) never build
+// the web bundle — the Vite dev server serves those files at runtime — so the
+// folder is legitimately absent there. `allow_missing` keeps the derive from
+// hard-erroring on the missing folder; `WebAssets::get` then returns `None`,
+// which every caller already treats as "fall through to the next candidate".
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
+#[allow_missing = true]
 struct WebAssets;
 
 pub async fn serve(state: AppState) {

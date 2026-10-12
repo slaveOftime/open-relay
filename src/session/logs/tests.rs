@@ -33,9 +33,16 @@ fn expected_fixture(name: &str) -> Vec<u8> {
 }
 
 fn assert_fixture_or_update(name: &str, output: &[u8]) {
+    // Regeneration on Windows targets the platform-specific golden file so the
+    // shared (Unix) fixture is never clobbered by a Windows-only rendering
+    // difference — see `fixture_name`.
+    #[cfg(windows)]
+    let write_name = name.replace(".expected", ".windows.expected");
+    #[cfg(not(windows))]
+    let write_name = name.to_owned();
     let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join(fixture_name(name));
+        .join(write_name);
     if std::env::var_os("OLY_UPDATE_LOG_FIXTURES").is_some() {
         fs::write(&fixture_path, output).expect("write updated log fixture");
     }
@@ -43,11 +50,24 @@ fn assert_fixture_or_update(name: &str, output: &[u8]) {
     assert_eq!(output, expected_fixture(name));
 }
 
-fn fixture_name(name: &str) -> &str {
-    // The engine renders identically on every platform, so there is
-    // one fixture per transcript (the retired parser needed a Windows
-    // variant for its platform-specific erase-sequence choices).
-    name
+fn fixture_name(name: &str) -> String {
+    // The engine renders identically on every platform for most transcripts, so
+    // they share one golden file. A few emoji-heavy transcripts (the copilot
+    // CLI's model picker) measure some wide glyphs differently on Windows than
+    // on Unix, so they ship a platform-specific golden file; when that file is
+    // present, prefer it. `cfg(windows)` keeps the Unix path — and therefore the
+    // committed shared fixture — byte-for-byte unchanged.
+    #[cfg(windows)]
+    {
+        let windows_name = name.replace(".expected", ".windows.expected");
+        let windows_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(&windows_name);
+        if windows_path.exists() {
+            return windows_name;
+        }
+    }
+    name.to_owned()
 }
 
 fn normalize_fixture_line_endings(bytes: &[u8]) -> Vec<u8> {

@@ -126,9 +126,9 @@ impl NodeRegistry {
     /// A stale task must not remove a newer connection under the same name.
     pub async fn disconnect(&self, name: &str, generation: uuid::Uuid) {
         let mut nodes = self.nodes.lock().await;
-        if !nodes
+        if nodes
             .get(name)
-            .is_some_and(|node| node.generation == generation)
+            .is_none_or(|node| node.generation != generation)
         {
             return;
         }
