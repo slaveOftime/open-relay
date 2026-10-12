@@ -23,16 +23,14 @@
 //! signing keys and DH long-term keys. Static-static DH plus per-connection
 //! transcripts and counter nonces give session uniqueness and replay
 //! protection but not forward secrecy. An attacker who later obtains a
-//! daemon's long-term identity seed can derive past session keys if they
-//! also captured ECDH outputs and transcripts. Adopting ephemeral DH or
+//! daemon's long-term identity seed can derive past session keys from
+//! captured public identities and handshake transcripts. Adopting ephemeral DH or
 //! Noise is a separate project.
-
-#![allow(dead_code)] // Public surface is consumed phase-by-phase during the rename.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::Signer as _;
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload, array::typenum::U12};
@@ -90,7 +88,7 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>> {
 
 /// 32-byte Ed25519 public key, structurally validated.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct PublicKeyBytes(pub [u8; 32]);
+pub struct PublicKeyBytes([u8; 32]);
 
 impl PublicKeyBytes {
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -98,7 +96,7 @@ impl PublicKeyBytes {
     }
 
     /// Canonical textual form: `ed25519 <standard-base64(raw32)>`.
-    pub fn to_line(&self) -> String {
+    pub fn to_line(self) -> String {
         format!("{PUBKEY_TAG} {}", b64_encode(&self.0))
     }
 }
@@ -106,7 +104,7 @@ impl PublicKeyBytes {
 impl std::fmt::Debug for PublicKeyBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PublicKeyBytes")
-            .field("hex", &format!("{:02x?}", &self.0))
+            .field("hex", &format!("{:02x?}", self.0))
             .finish()
     }
 }
@@ -126,8 +124,7 @@ impl std::str::FromStr for PublicKeyBytes {
 /// - extra tokens,
 /// - base64 decode errors,
 /// - wrong decoded length,
-/// - Ed25519 points that fail `VerifyingKey::from_bytes` (non-canonical or
-///   small-subgroup encodings).
+/// - invalid, non-canonical, small-order or non-prime-subgroup points.
 pub fn parse_public_key(input: &str) -> Result<PublicKeyBytes> {
     let trimmed = input.trim();
     let mut parts = trimmed.split_whitespace();
@@ -159,12 +156,23 @@ pub fn parse_public_key(input: &str) -> Result<PublicKeyBytes> {
              provided a small-subgroup or non-canonical encoding"
         ))
     })?;
+    let point = curve25519_dalek::edwards::CompressedEdwardsY(arr)
+        .decompress()
+        .ok_or_else(|| AppError::Protocol("invalid Ed25519 point".into()))?;
+    if key.is_weak() || !point.is_torsion_free() || point.compress().to_bytes() != arr {
+        return Err(AppError::Protocol(
+            "weak or non-canonical node identity".into(),
+        ));
+    }
     Ok(PublicKeyBytes(key.to_bytes()))
 }
 
 /// Canonical text form: `ed25519 <standard-base64(raw32)>`.
 pub fn public_key_line(signing_key: &ed25519_dalek::SigningKey) -> String {
-    format!("{PUBKEY_TAG} {}", b64_encode(signing_key.verifying_key().as_bytes()))
+    format!(
+        "{PUBKEY_TAG} {}",
+        b64_encode(signing_key.verifying_key().as_bytes())
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -173,20 +181,9 @@ pub fn public_key_line(signing_key: &ed25519_dalek::SigningKey) -> String {
 
 /// Domain-separated handshake transcript used by both sides to sign / verify.
 ///
-/// Fixed layout:
-///   "oly-node-join-v2" || 0 ||
-///   role || 0 ||
-///   federation_version_be || 0 ||
-///   name || 0 ||
-///   secondary_pub(32) || 0 ||
-///   primary_pub(32) || 0 ||
-///   secondary_nonce(32) || 0 ||
-///   primary_nonce(32)
-///
-/// Lengths are implicit because every field has a fixed size; the `|`
-/// markers are replaced by NUL bytes (which cannot occur inside any field) so
-/// no documented encoding of public keys, names, or nonces can collide with
-/// a marker.
+/// Each field has a u32 big-endian byte length. Binary fields may contain
+/// any byte; delimiter concatenation would not be unambiguous.
+#[allow(clippy::too_many_arguments)]
 pub fn build_transcript(
     federation_version: u16,
     role: &str,
@@ -196,38 +193,26 @@ pub fn build_transcript(
     secondary_nonce: &[u8; 32],
     primary_nonce: &[u8; 32],
 ) -> Vec<u8> {
-    let mut v = Vec::with_capacity(
-        NODE_JOIN_CONTEXT.len()
-            + 1
-            + role.len()
-            + 1
-            + 2
-            + 1
-            + name.len()
-            + 1
-            + 32
-            + 1
-            + 32
-            + 1
-            + 32
-            + 1
-            + 32,
-    );
-    v.extend_from_slice(NODE_JOIN_CONTEXT);
-    v.push(0);
-    v.extend_from_slice(role.as_bytes());
-    v.push(0);
-    v.extend_from_slice(&federation_version.to_be_bytes());
-    v.push(0);
-    v.extend_from_slice(name.as_bytes());
-    v.push(0);
-    v.extend_from_slice(secondary_pub);
-    v.push(0);
-    v.extend_from_slice(primary_pub);
-    v.push(0);
-    v.extend_from_slice(secondary_nonce);
-    v.push(0);
-    v.extend_from_slice(primary_nonce);
+    let mut v = Vec::new();
+    for field in [
+        NODE_JOIN_CONTEXT,
+        &federation_version.to_be_bytes(),
+        role.as_bytes(),
+        b"secondary",
+        b"primary",
+        name.as_bytes(),
+        secondary_pub,
+        primary_pub,
+        secondary_nonce,
+        primary_nonce,
+    ] {
+        v.extend_from_slice(
+            &u32::try_from(field.len())
+                .expect("bounded field")
+                .to_be_bytes(),
+        );
+        v.extend_from_slice(field);
+    }
     v
 }
 
@@ -276,7 +261,10 @@ pub fn pub_key_path(state_dir: &std::path::Path) -> std::path::PathBuf {
 /// Load the raw 32-byte Ed25519 seed.
 pub fn load_seed(path: &std::path::Path) -> Result<[u8; 32]> {
     let bytes = std::fs::read(path).map_err(|e| {
-        AppError::Protocol(format!("failed to read identity seed {}: {e}", path.display()))
+        AppError::Protocol(format!(
+            "failed to read identity seed {}: {e}",
+            path.display()
+        ))
     })?;
     let mut seed = [0u8; 32];
     if bytes.len() != 32 {
@@ -333,25 +321,24 @@ pub fn create_or_load_identity(
         })?;
         if let Err(e) = std::io::Write::write_all(&mut writer, new_key.to_bytes().as_slice()) {
             let _ = std::fs::remove_file(&path);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("write identity seed to {}: {e}", path.display()),
-            ));
+            return Err(std::io::Error::other(format!(
+                "write identity seed to {}: {e}",
+                path.display()
+            )));
         }
         if let Err(e) = writer.sync_all() {
             // Best-effort durability; surface if it actually fails rather than
             // silently keeping an under-flushed seed on disk.
             let _ = std::fs::remove_file(&path);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("flush identity seed to {}: {e}", path.display()),
-            ));
+            return Err(std::io::Error::other(format!(
+                "flush identity seed to {}: {e}",
+                path.display()
+            )));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Belt-and-suspenders for filesystems that ignore `O_<mode>`.
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
         new_key
     };
@@ -378,7 +365,7 @@ pub fn read_published_pubkey(state_dir: &std::path::Path) -> std::io::Result<Opt
 /// Raw pair of per-direction symmetric keys, before side orientation is
 /// applied. Both peers MUST produce the same `(c2s, s2c)` pair from the
 /// same handshake inputs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct DerivedKeys {
     /// Client (secondary) → server (primary).
     pub c2s: [u8; AEAD_KEY_LEN],
@@ -432,11 +419,11 @@ pub fn derive_channel_keys(
     let shared = local_x.diffie_hellman(&peer);
     if shared.as_bytes() == &[0u8; 32] {
         return Err(AppError::Protocol(
-            "X25519 key agreement produced a zero shared secret; refusing to derive keys"
-                .into(),
+            "X25519 key agreement produced a zero shared secret; refusing to derive keys".into(),
         ));
     }
-    let prk = Hkdf::<Sha256>::new(Some(transcript), shared.as_bytes());
+    let hash = transcript_hash(transcript);
+    let prk = Hkdf::<Sha256>::new(Some(&hash), shared.as_bytes());
 
     let (lo, hi) = order_pair(local_ed_bytes, peer_ed_bytes);
 
@@ -483,7 +470,7 @@ pub struct ChannelSide {
     key: [u8; AEAD_KEY_LEN],
     send_seq: u64,
     recv_seq: u64,
-    sealed: bool,
+    failed: bool,
 }
 
 impl ChannelSide {
@@ -492,17 +479,14 @@ impl ChannelSide {
             key,
             send_seq: 0,
             recv_seq: 0,
-            sealed: false,
+            failed: false,
         }
-    }
-
-    pub fn set_sealed(&mut self) {
-        self.sealed = true;
     }
 
     /// Advance the send counter as a side effect.
     pub fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        if self.send_seq >= MAX_SEQUENCE {
+        if self.failed || self.send_seq >= MAX_SEQUENCE {
+            self.failed = true;
             return Err(AppError::Protocol(
                 "sealed send counter near exhaustion; closing connection".into(),
             ));
@@ -510,15 +494,25 @@ impl ChannelSide {
         let seq = self.send_seq;
         self.send_seq += 1;
         let nonce = nonce_for(seq);
+        let aad = frame_aad(aad, seq);
         let cipher = Aes256Gcm::new(
             <&Key<Aes256Gcm>>::try_from(self.key.as_slice()).expect("AEAD key must be 32 bytes"),
         );
-        let ct = cipher
-            .encrypt(
-                <&Nonce<U12>>::try_from(nonce.as_slice()).expect("nonce fits U12"),
-                Payload { msg: plaintext, aad },
-            )
-            .map_err(|e| AppError::Protocol(format!("sealed frame encryption failed: {e}")))?;
+        let ct = match cipher.encrypt(
+            <&Nonce<U12>>::try_from(nonce.as_slice()).expect("nonce fits U12"),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        ) {
+            Ok(ct) => ct,
+            Err(err) => {
+                self.failed = true;
+                return Err(AppError::Protocol(format!(
+                    "sealed frame encryption failed: {err}"
+                )));
+            }
+        };
         let mut out = Vec::with_capacity(SEALED_HEADER_LEN + ct.len());
         out.push(FRAME_TAG_SEALED);
         out.extend_from_slice(&seq.to_be_bytes());
@@ -527,7 +521,25 @@ impl ChannelSide {
     }
 
     /// Open a sealed frame, advancing receive state only on success.
-    pub fn open(&mut self, scratch_aad: &[u8], frame: &[u8]) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    pub fn open(&mut self, aad: &[u8], frame: &[u8]) -> Result<Vec<u8>> {
+        self.open_validated(aad, frame, |bytes| Ok(bytes.to_vec()))
+    }
+
+    /// Poison on any failure; commit the receive sequence only after parsing.
+    fn open_validated<T>(
+        &mut self,
+        aad: &[u8],
+        frame: &[u8],
+        parse: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        if self.failed || self.recv_seq >= MAX_SEQUENCE {
+            self.failed = true;
+            return Err(AppError::Protocol(
+                "sealed channel failed or exhausted".into(),
+            ));
+        }
+        self.failed = true;
         if frame.len() < MIN_SEALED_FRAME_LEN {
             return Err(AppError::Protocol(format!(
                 "sealed frame too short ({} bytes, need at least {})",
@@ -551,12 +563,7 @@ impl ChannelSide {
                 self.recv_seq
             )));
         }
-        if !self.sealed && seq > 0 {
-            return Err(AppError::Protocol(
-                "sealed frame arrived before channel declared ready".into(),
-            ));
-        }
-
+        let aad = frame_aad(aad, seq);
         let nonce = nonce_for(seq);
         let cipher = Aes256Gcm::new(
             <&Key<Aes256Gcm>>::try_from(self.key.as_slice()).expect("AEAD key must be 32 bytes"),
@@ -566,16 +573,112 @@ impl ChannelSide {
                 <&Nonce<U12>>::try_from(nonce.as_slice()).expect("nonce fits U12"),
                 Payload {
                     msg: &frame[SEALED_HEADER_LEN..],
-                    aad: scratch_aad,
+                    aad: &aad,
                 },
             )
-            .map_err(|e| AppError::Protocol(format!("sealed frame AEAD verification failed: {e}")))?;
-        self.recv_seq = self
-            .recv_seq
-            .checked_add(1)
-            .ok_or_else(|| AppError::Protocol("sealed recv counter overflow".into()))?;
-        Ok(plain)
+            .map_err(|e| {
+                AppError::Protocol(format!("sealed frame AEAD verification failed: {e}"))
+            })?;
+        let parsed = parse(&plain)?;
+        self.recv_seq += 1;
+        self.failed = false;
+        Ok(parsed)
     }
+}
+
+/// Transcript digest is public, never a key or a standalone authenticator.
+pub fn transcript_hash(transcript: &[u8]) -> [u8; 32] {
+    Sha256::digest(transcript).into()
+}
+
+fn frame_aad(context: &[u8], seq: u64) -> Vec<u8> {
+    let mut aad = context.to_vec();
+    aad.push(FRAME_TAG_SEALED);
+    aad.extend_from_slice(&seq.to_be_bytes());
+    aad
+}
+
+/// A live connection has exactly one mutable owner and no plaintext mode.
+pub struct Channel {
+    send: ChannelSide,
+    recv: ChannelSide,
+    send_aad: Vec<u8>,
+    recv_aad: Vec<u8>,
+    transcript_hash: [u8; 32],
+}
+
+impl Channel {
+    pub fn new(
+        local: &ed25519_dalek::SigningKey,
+        peer: &PublicKeyBytes,
+        transcript: &[u8],
+        secondary: bool,
+    ) -> Result<Self> {
+        let peer_key = ed25519_dalek::VerifyingKey::from_bytes(peer.as_bytes())
+            .map_err(|e| AppError::Protocol(e.to_string()))?;
+        let keys = derive_channel_keys(
+            &ed25519_priv_to_x25519(local),
+            &ed25519_pub_to_x25519(&peer_key),
+            transcript,
+            local.verifying_key().as_bytes(),
+            peer.as_bytes(),
+        )?;
+        let hash = transcript_hash(transcript);
+        let context = |direction: &[u8]| {
+            let mut aad = b"oly-node-frame-v2".to_vec();
+            aad.extend_from_slice(&hash);
+            aad.extend_from_slice(direction);
+            aad
+        };
+        let (send, recv, send_label, recv_label) = if secondary {
+            (keys.c2s, keys.s2c, b"c2s", b"s2c")
+        } else {
+            (keys.s2c, keys.c2s, b"s2c", b"c2s")
+        };
+        Ok(Self {
+            send: ChannelSide::new(send),
+            recv: ChannelSide::new(recv),
+            send_aad: context(send_label),
+            recv_aad: context(recv_label),
+            transcript_hash: hash,
+        })
+    }
+
+    pub fn transcript_hash(&self) -> [u8; 32] {
+        self.transcript_hash
+    }
+
+    pub fn encode(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        if self.recv.failed {
+            return Err(AppError::Protocol("sealed channel failed".into()));
+        }
+        self.send.seal(&self.send_aad, payload)
+    }
+
+    pub fn decode<T>(&mut self, frame: &[u8], parse: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
+        if self.send.failed {
+            return Err(AppError::Protocol("sealed channel failed".into()));
+        }
+        self.recv.open_validated(&self.recv_aad, frame, parse)
+    }
+}
+
+/// Handshake frames are small uncompressed binary JSON, never text or gzip.
+pub const MAX_HANDSHAKE_BYTES: usize = 4096;
+
+pub fn encode_handshake<T: serde::Serialize>(message: &T) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(message)?;
+    if bytes.len() > MAX_HANDSHAKE_BYTES {
+        return Err(AppError::Protocol("handshake frame too large".into()));
+    }
+    Ok(bytes)
+}
+
+pub fn decode_handshake<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    if bytes.len() > MAX_HANDSHAKE_BYTES {
+        return Err(AppError::Protocol("handshake frame too large".into()));
+    }
+    serde_json::from_slice(bytes).map_err(AppError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -683,8 +786,24 @@ mod tests {
         let primary_pub_ed = pri.verifying_key().to_bytes();
         let secondary_pub_ed = sec.verifying_key().to_bytes();
 
-        let t1 = build_transcript(2, "secondary", "w", &secondary_pub_ed, &primary_pub_ed, &[1; 32], &[2; 32]);
-        let t2 = build_transcript(2, "secondary", "w", &secondary_pub_ed, &primary_pub_ed, &[1; 32], &[3; 32]);
+        let t1 = build_transcript(
+            2,
+            "secondary",
+            "w",
+            &secondary_pub_ed,
+            &primary_pub_ed,
+            &[1; 32],
+            &[2; 32],
+        );
+        let t2 = build_transcript(
+            2,
+            "secondary",
+            "w",
+            &secondary_pub_ed,
+            &primary_pub_ed,
+            &[1; 32],
+            &[3; 32],
+        );
         let a = derive_channel_keys(
             &primary_priv_x,
             &secondary_pub_x,
@@ -710,12 +829,11 @@ mod tests {
         rand::rng().fill_bytes(&mut k);
         let mut sender = ChannelSide::new(k);
         let mut receiver = ChannelSide::new(k);
-        receiver.set_sealed();
         let fa = sender.seal(b"aad", b"hello").unwrap();
         let fb = sender.seal(b"aad", b"world").unwrap();
         assert_eq!(receiver.open(b"aad", &fa).unwrap(), b"hello");
         assert!(receiver.open(b"aad", &fa).is_err(), "replay must fail");
-        assert_eq!(receiver.open(b"aad", &fb).unwrap(), b"world");
+        assert!(receiver.open(b"aad", &fb).is_err(), "failure is terminal");
     }
 
     #[test]
@@ -724,7 +842,6 @@ mod tests {
         rand::rng().fill_bytes(&mut k);
         let mut sender = ChannelSide::new(k);
         let mut receiver = ChannelSide::new(k);
-        receiver.set_sealed();
         let frame = sender.seal(b"", b"").unwrap();
         assert_eq!(frame.len(), MIN_SEALED_FRAME_LEN);
         let plain = receiver.open(b"", &frame).unwrap();
@@ -736,7 +853,6 @@ mod tests {
         let mut k = [0u8; 32];
         rand::rng().fill_bytes(&mut k);
         let mut receiver = ChannelSide::new(k);
-        receiver.set_sealed();
         // Too short.
         assert!(receiver.open(b"", &[0x21]).is_err());
         // Wrong tag byte.
@@ -748,10 +864,8 @@ mod tests {
     #[test]
     fn create_or_load_identity_persists_and_round_trips() {
         let dir = tempdir();
-        let (k1, line1) =
-            create_or_load_identity(&dir.join("s")).expect("first creation succeeds");
-        let (k2, line2) =
-            create_or_load_identity(&dir.join("s")).expect("reload succeeds");
+        let (k1, line1) = create_or_load_identity(&dir.join("s")).expect("first creation succeeds");
+        let (k2, line2) = create_or_load_identity(&dir.join("s")).expect("reload succeeds");
         assert_eq!(k1.to_bytes(), k2.to_bytes());
         assert_eq!(line1, line2);
         // File on disk matches the canonical line.
@@ -767,8 +881,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir();
         let _ = create_or_load_identity(&dir.join("s")).expect("create");
-        let meta = std::fs::metadata(dir.join("s").join("identity_key"))
-            .expect("seed metadata available");
+        let meta =
+            std::fs::metadata(dir.join("s").join("identity_key")).expect("seed metadata available");
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "seed must be readable/writable only by owner");
         std::fs::remove_dir_all(&dir).ok();
@@ -784,6 +898,230 @@ mod tests {
             create_or_load_identity(&dir.join("s")).expect_err("corrupt seed must fail loudly");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transcript_is_unambiguous_and_every_input_is_bound() {
+        let transcript = |version, role: &str, name: &str, sec, pri, sn, pn| {
+            build_transcript(version, role, name, &sec, &pri, &sn, &pn)
+        };
+        let base = transcript(
+            2,
+            "secondary-proof",
+            "worker",
+            [1; 32],
+            [2; 32],
+            [3; 32],
+            [4; 32],
+        );
+        for changed in [
+            transcript(
+                3,
+                "secondary-proof",
+                "worker",
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+            ),
+            transcript(
+                2,
+                "primary-proof",
+                "worker",
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+            ),
+            transcript(
+                2,
+                "secondary-proof",
+                "victim",
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+            ),
+            transcript(
+                2,
+                "secondary-proof",
+                "worker",
+                [9; 32],
+                [2; 32],
+                [3; 32],
+                [4; 32],
+            ),
+            transcript(
+                2,
+                "secondary-proof",
+                "worker",
+                [1; 32],
+                [9; 32],
+                [3; 32],
+                [4; 32],
+            ),
+            transcript(
+                2,
+                "secondary-proof",
+                "worker",
+                [1; 32],
+                [2; 32],
+                [9; 32],
+                [4; 32],
+            ),
+            transcript(
+                2,
+                "secondary-proof",
+                "worker",
+                [1; 32],
+                [2; 32],
+                [3; 32],
+                [9; 32],
+            ),
+        ] {
+            assert_ne!(base, changed);
+        }
+        assert_ne!(
+            transcript(2, "a\0b", "c", [1; 32], [2; 32], [3; 32], [4; 32]),
+            transcript(2, "a", "b\0c", [1; 32], [2; 32], [3; 32], [4; 32])
+        );
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let public = parse_public_key(&public_key_line(&key)).unwrap();
+        let sig = sign_transcript(&key, &base);
+        assert!(verify_transcript(&public, &sig, &base));
+        assert!(!verify_transcript(&public, &sig, b"another transcript"));
+    }
+
+    #[test]
+    fn weak_and_noncanonical_identities_are_rejected() {
+        for raw in [
+            [0; 32],
+            {
+                let mut a = [0; 32];
+                a[0] = 1;
+                a
+            },
+            [255; 32],
+        ] {
+            assert!(parse_public_key(&format!("ed25519 {}", b64_encode(&raw))).is_err());
+        }
+        assert!(
+            derive_channel_keys(
+                &StaticSecret::from([7; 32]),
+                &[0; 32],
+                b"t",
+                &[1; 32],
+                &[2; 32]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sealed_header_aad_and_ciphertext_tampering_are_terminal() {
+        let mut tx = ChannelSide::new([7; 32]);
+        let frame = tx.seal(b"context", b"hello").unwrap();
+        for index in [0, 8, 9, frame.len() - 1] {
+            let mut bad = frame.clone();
+            bad[index] ^= 1;
+            let mut rx = ChannelSide::new([7; 32]);
+            assert!(rx.open(b"context", &bad).is_err());
+            assert_eq!(rx.recv_seq, 0);
+            assert!(rx.open(b"context", &frame).is_err());
+        }
+        let mut rx = ChannelSide::new([7; 32]);
+        assert!(rx.open(b"wrong context", &frame).is_err());
+        let mut rx = ChannelSide::new([7; 32]);
+        let second = tx.seal(b"context", b"second").unwrap();
+        assert!(rx.open(b"context", &second).is_err(), "out of order");
+        let mut tx = ChannelSide::new([7; 32]);
+        tx.send_seq = MAX_SEQUENCE;
+        assert!(tx.seal(b"", b"").is_err());
+        let mut rx = ChannelSide::new([7; 32]);
+        rx.recv_seq = MAX_SEQUENCE;
+        assert!(rx.open(b"context", &frame).is_err());
+    }
+
+    #[test]
+    fn failed_parse_does_not_commit_receive_sequence() {
+        let mut tx = ChannelSide::new([7; 32]);
+        let frame = tx.seal(b"context", b"not json").unwrap();
+        let mut rx = ChannelSide::new([7; 32]);
+        let result = rx.open_validated(b"context", &frame, |bytes| {
+            serde_json::from_slice::<serde_json::Value>(bytes).map_err(AppError::from)
+        });
+        assert!(result.is_err());
+        assert_eq!(rx.recv_seq, 0);
+        assert!(rx.failed);
+    }
+
+    #[test]
+    fn channel_rejects_reflection_wrong_key_and_prior_session_frames() {
+        let primary = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let secondary = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let peer = parse_public_key(&public_key_line(&secondary)).unwrap();
+        let mut sender = Channel::new(&primary, &peer, b"session one", false).unwrap();
+        let frame = sender.encode(b"hello").unwrap();
+        let mut reflected = Channel::new(&primary, &peer, b"session one", false).unwrap();
+        assert!(reflected.decode(&frame, |b| Ok(b.to_vec())).is_err());
+        let primary_pub = parse_public_key(&public_key_line(&primary)).unwrap();
+        let mut next_session =
+            Channel::new(&secondary, &primary_pub, b"session two", true).unwrap();
+        assert!(next_session.decode(&frame, |b| Ok(b.to_vec())).is_err());
+        let wrong = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let mut wrong_peer = Channel::new(&wrong, &primary_pub, b"session one", true).unwrap();
+        assert!(wrong_peer.decode(&frame, |b| Ok(b.to_vec())).is_err());
+    }
+
+    #[test]
+    fn fixed_handshake_crypto_vector() {
+        let primary = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let secondary = ed25519_dalek::SigningKey::from_bytes(&[8; 32]);
+        let transcript = build_transcript(
+            2,
+            "secondary-proof",
+            "worker",
+            secondary.verifying_key().as_bytes(),
+            primary.verifying_key().as_bytes(),
+            &[1; 32],
+            &[2; 32],
+        );
+        let keys = derive_channel_keys(
+            &ed25519_priv_to_x25519(&secondary),
+            &ed25519_pub_to_x25519(&primary.verifying_key()),
+            &transcript,
+            secondary.verifying_key().as_bytes(),
+            primary.verifying_key().as_bytes(),
+        )
+        .unwrap();
+        let mut sender = Channel::new(
+            &primary,
+            &parse_public_key(&public_key_line(&secondary)).unwrap(),
+            &transcript,
+            false,
+        )
+        .unwrap();
+        let frame = sender.encode(br#"{"type":"key_confirm"}"#).unwrap();
+        assert_eq!(
+            b64_encode(&transcript_hash(&transcript)),
+            "HmtdC0lXeYwNKHouLnfydZW8IaLOo3Trj6KGmdDE7DQ="
+        );
+        assert_eq!(
+            sign_transcript(&secondary, &transcript),
+            "DT3jT3pYnGE0YLAbIrpjYIq7kpEqEjUhBLiDqRJDS4cbDcZtGu22pwaBUzFuxyjPomfDEe3obj/yCyfRcbxeCg=="
+        );
+        assert_eq!(
+            b64_encode(&keys.c2s),
+            "mfzqQzh8/eny4kmnF08AM6UmqF39ygIVLzXArYynzgI="
+        );
+        assert_eq!(
+            b64_encode(&keys.s2c),
+            "4InHLOGwjhF5h9bZILyvlzFt+Fdx3jPFzeAoCrVo/O4="
+        );
+        assert_eq!(
+            b64_encode(&frame),
+            "IQAAAAAAAAAAJpkj8mmYdLZyejRx1iDTOjN9SGxhDtokVT0lE2FlJWBhNilDsAc="
+        );
     }
 
     fn tempdir() -> std::path::PathBuf {

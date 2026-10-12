@@ -12,6 +12,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JoinConfig {
     pub name: String,
     pub primary_url: String,
@@ -87,6 +88,9 @@ pub fn build_join_config(
     name: String,
     primary_identity_pub_key: Option<String>,
 ) -> Result<JoinConfig> {
+    if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+        return Err(AppError::Protocol("invalid node name".into()));
+    }
     let raw = primary_identity_pub_key
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -252,13 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn saved_join_rejects_removed_auth_fields() {
+        let key = valid_primary_pub_line();
+        for field in ["api_key", "ssh_primary_pubkey"] {
+            let mut value = serde_json::json!({"name":"worker", "primary_url":"http://primary", "primary_identity_pub_key":key});
+            value[field] = serde_json::json!("obsolete");
+            assert!(serde_json::from_value::<JoinConfig>(value).is_err());
+        }
+    }
+
+    #[test]
     fn build_join_config_requires_identity_pub_key() {
-        let err = build_join_config(
-            "http://primary:15443".into(),
-            "worker1".into(),
-            None,
-        )
-        .expect_err("must fail without --identity-pub-key");
+        let err = build_join_config("http://primary:15443".into(), "worker1".into(), None)
+            .expect_err("must fail without --identity-pub-key");
         assert!(format!("{err}").contains("--identity-pub-key"));
     }
 
@@ -316,4 +326,3 @@ mod tests {
         assert!(format!("{err}").contains("--identity-pub-key"));
     }
 }
-

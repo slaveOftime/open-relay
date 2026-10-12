@@ -1,10 +1,9 @@
 mod e2e;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use e2e::*;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use ed25519_dalek::Signer as _;
 use std::{
     fs,
     path::Path,
@@ -13,59 +12,6 @@ use std::{
 };
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-
-fn node_ws_json_frame(value: serde_json::Value) -> WsMessage {
-    WsMessage::Binary(encode_node_ws_value(value).into())
-}
-
-fn expect_node_ws_json(frame: WsMessage, context: &str) -> serde_json::Value {
-    match frame {
-        WsMessage::Binary(bytes) => {
-            let preview = String::from_utf8_lossy(&bytes);
-            decode_node_ws_value(&bytes)
-                .unwrap_or_else(|err| panic!("parse {context}: {err} (raw={preview:?})"))
-        }
-        other => panic!("unexpected {context} frame: {other:?}"),
-    }
-}
-
-fn encode_node_ws_value(value: serde_json::Value) -> Vec<u8> {
-    use flate2::{Compression, write::GzEncoder};
-    use std::io::Write;
-    let json = value.to_string().into_bytes();
-    // Mirror src/protocol.rs::encode_node_ws_payload: gzip when the
-    // payload crosses NODE_WS_BINARY_COMPRESS_MIN_BYTES (256).
-    if json.len() < 256 {
-        return json;
-    }
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(&json).expect("gzip write");
-    let compressed = encoder.finish().expect("gzip finish");
-    if compressed.len() >= json.len() {
-        return json;
-    }
-    let mut out = Vec::with_capacity(4 + compressed.len());
-    out.extend_from_slice(b"ONW1");
-    out.extend_from_slice(&compressed);
-    out
-}
-
-fn decode_node_ws_value(payload: &[u8]) -> Result<serde_json::Value, String> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-    let magic = b"ONW1";
-    let json = if payload.starts_with(magic) {
-        let mut decoder = GzDecoder::new(&payload[magic.len()..]);
-        let mut json = Vec::new();
-        decoder
-            .read_to_end(&mut json)
-            .map_err(|e| format!("gzip: {e}"))?;
-        json
-    } else {
-        payload.to_vec()
-    };
-    serde_json::from_slice(&json).map_err(|e| format!("json: {e}"))
-}
 
 #[test]
 fn e2e_start_spawn_failure_exits_nonzero_with_clear_error() {
@@ -248,7 +194,6 @@ fn e2e_evicted_session_input_fails_gracefully() {
 #[test]
 fn e2e_federation_identity_key_registrations_and_duplicate_name() {
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-    use ed25519_dalek::Signer as _;
 
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = make_tmp_dir("e2e_federation_identity_registrations");
@@ -287,15 +232,16 @@ fn e2e_federation_identity_key_registrations_and_duplicate_name() {
         );
     }
 
-    // Re-register `worker-a`. The accept-table upsert must require the
-    // canonical key from this registration; if the operator types the
-    // SECONDARY key but the registration already has the FIRST one, the
-    // re-registration must surface a mismatch (the public key is
-    // UNIQUE in the table). The CLI currently uses INSERT OR REPLACE,
-    // which overwrites; this test pins that behaviour explicitly so the
-    // P3 handshake redesign (which moves to the new `node_identities`
-    // PK-on-name table) can revisit it without silently changing the
-    // wire contract.
+    // A key owned by worker-a cannot be stolen by worker-b's upsert.
+    let conflict = oly_cmd(&tmp)
+        .args(["node", "accept", "-n", "worker-b", "-k", &first_pub])
+        .output()
+        .unwrap();
+    assert!(
+        !conflict.status.success(),
+        "accept upsert stole another name's key"
+    );
+    // Re-registering the same name with a new, unowned identity is allowed.
     let mut replacement_seed = [0u8; 32];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut replacement_seed);
     let replacement_key = ed25519_dalek::SigningKey::from_bytes(&replacement_seed);
@@ -337,32 +283,6 @@ fn e2e_federation_identity_key_registrations_and_duplicate_name() {
     }
 }
 
-        // Helper: connect a fresh WebSocket without issuing any handshake
-        // frames. Used by the rejection paths below that only need a
-        // connection to drop a single join frame on.
-        async fn fresh_ws(
-            ws_url: &str,
-        ) -> tokio_tungstenite::WebSocketStream<
-            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-        > {
-            let (ws, _) = tokio_tungstenite::connect_async(ws_url)
-                .await
-                .expect("connect websocket");
-            ws
-        }
-        // Helper: sign the join payload for `name`. There is no nonce;
-        // the payload binds protocol || name || pubkey.
-        fn join_signature(
-            node_key: &ed25519_dalek::SigningKey,
-            name: &str,
-            pubkey: &str,
-        ) -> String {
-            let mut payload = Vec::new();
-            payload.extend_from_slice(b"oly-node-join-v1");
-            payload.extend_from_slice(name.as_bytes());
-            payload.extend_from_slice(pubkey.as_bytes());
-            B64.encode(node_key.sign(&payload).to_bytes())
-        }
 #[test]
 fn e2e_daemon_supports_bind_override() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -386,159 +306,7 @@ fn e2e_daemon_supports_bind_override() {
 }
 
 #[test]
-fn e2e_federation_ssh_key_join_handshake() {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-    use ed25519_dalek::Signer as _;
-
-    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let tmp = make_tmp_dir("e2e_fed_ssh_handshake");
-    let port = pick_free_port();
-    let _daemon = start_daemon_http(&tmp, port);
-
-    // Generate the secondary's Ed25519 identity key and register its
-    // canonical public key on the primary. Federation v2 accepts only the
-    // canonical `ed25519 <base64(raw32)>` line; openssh-format keys do not
-    // reach this path.
-    let mut seed = [0u8; 32];
-    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
-    let node_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let canonical_pub = format!(
-        "ed25519 {}",
-        B64.encode(node_key.verifying_key().as_bytes())
-    );
-
-    let accept = oly_cmd(&tmp)
-        .args(["node", "accept", "-n", "worker1", "-k", &canonical_pub])
-        .output()
-        .expect("`oly node accept` failed to execute");
-    assert!(
-        accept.status.success(),
-        "`oly node accept` exited non-zero.\nstderr: {}",
-        String::from_utf8_lossy(&accept.stderr)
-    );
-
-    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-    rt.block_on(async {
-        let ws_url = format!("ws://127.0.0.1:{port}/api/nodes/join");
-
-
-
-        // ── Happy path: Hello (carrying the secondary identity) then Join.
-        let mut ws = fresh_ws(&ws_url).await;
-        ws.send(node_ws_json_frame(json!({
-            "type": "hello",
-            "public_key": canonical_pub,
-        })))
-        .await
-        .expect("send hello");
-        let signature = join_signature(&node_key, "worker1", &canonical_pub);
-        ws.send(node_ws_json_frame(json!({
-            "type": "join",
-            "name": "worker1",
-            "auth": {"method": "ssh_key", "signature": signature, "public_key": canonical_pub},
-        })))
-        .await
-        .expect("send ssh join");
-        let frame = timeout(Duration::from_secs(2), ws.next())
-            .await
-            .expect("timed out waiting for join response")
-            .expect("websocket closed")
-            .expect("websocket read failed");
-        let json = expect_node_ws_json(frame, "ssh join response");
-        assert_eq!(
-            json.get("type").and_then(|v| v.as_str()),
-            Some("joined"),
-            "expected joined for ssh-key worker1, got: {json}"
-        );
-        drop(ws);
-
-        // ── Missing hello + ssh-key join must be rejected ────────────────
-        let mut ws_no_hello = fresh_ws(&ws_url).await;
-        ws_no_hello
-            .send(node_ws_json_frame(json!({
-                "type": "join",
-                "name": "worker1",
-                "auth": {"method": "ssh_key", "signature": join_signature(&node_key, "worker1", &canonical_pub), "public_key": canonical_pub.clone()},
-            })))
-            .await
-            .expect("send ssh-key join without hello");
-        let frame = timeout(Duration::from_secs(2), ws_no_hello.next())
-            .await
-            .expect("timed out waiting for no-hello response")
-            .expect("websocket closed")
-            .expect("websocket read failed");
-        let json = expect_node_ws_json(frame, "no-hello join response");
-        assert_eq!(
-            json.get("type").and_then(|v| v.as_str()),
-            Some("error"),
-            "ssh-key join without hello must be rejected, got: {json}"
-        );
-        drop(ws_no_hello);
-
-        // ── Name substitution: signature bound to "worker1" used for "victim" ──
-        let mut ws_sub = fresh_ws(&ws_url).await;
-        ws_sub
-            .send(node_ws_json_frame(json!({
-                "type": "join",
-                "name": "victim",
-                "auth": {"method": "ssh_key", "signature": join_signature(&node_key, "worker1", &canonical_pub), "public_key": canonical_pub.clone()},
-            })))
-            .await
-            .expect("send name-substituted join");
-        let frame = timeout(Duration::from_secs(2), ws_sub.next())
-            .await
-            .expect("timed out waiting for substituted join response")
-            .expect("websocket closed")
-            .expect("websocket read failed");
-        let json = expect_node_ws_json(frame, "name-substituted join response");
-        assert_eq!(
-            json.get("type").and_then(|v| v.as_str()),
-            Some("error"),
-            "signature bound to another name must be rejected, got: {json}"
-        );
-        drop(ws_sub);
-
-        // ── Unregistered key: valid signature, key not in registry ────────
-        let mut other_seed = [0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut other_seed);
-        let other_key = ed25519_dalek::SigningKey::from_bytes(&other_seed);
-        let other_pub = format!(
-            "ssh-ed25519 {}",
-            B64.encode(other_key.verifying_key().as_bytes())
-        );
-        let mut ws_unreg = fresh_ws(&ws_url).await;
-        ws_unreg
-            .send(node_ws_json_frame(json!({
-                "type": "hello",
-                "public_key": other_pub,
-            })))
-            .await
-            .expect("send unregistered hello");
-        ws_unreg
-            .send(node_ws_json_frame(json!({
-                "type": "join",
-                "name": "worker9",
-                "auth": {"method": "ssh_key", "signature": join_signature(&other_key, "worker9", &other_pub), "public_key": other_pub},
-            })))
-            .await
-            .expect("send unregistered-key join");
-        let frame = timeout(Duration::from_secs(2), ws_unreg.next())
-            .await
-            .expect("timed out waiting for unregistered join response")
-            .expect("websocket closed")
-            .expect("websocket read failed");
-        let json = expect_node_ws_json(frame, "unregistered join response");
-        assert_eq!(
-            json.get("type").and_then(|v| v.as_str()),
-            Some("error"),
-            "unregistered ssh key must be rejected, got: {json}"
-        );
-        drop(ws_unreg);
-    });
-}
-
-#[test]
-fn e2e_federation_ssh_key_join_lifecycle() {
+fn e2e_federation_identity_join_lifecycle() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     let primary_tmp = make_tmp_dir("e2e_fed_ssh_lifecycle_primary");
@@ -601,12 +369,12 @@ fn e2e_federation_ssh_key_join_lifecycle() {
     let connected = rt.block_on(wait_for_node_connected(port, "worker1", 10));
     assert!(
         connected,
-        "worker1 did not appear in /api/nodes after ssh-key join start"
+        "worker1 did not appear in /api/nodes after identity join start"
     );
 
     // Stop the join cleanly and confirm the secondary disappears from
     // /api/nodes; this verifies basic transport liveness on the
-    // ssh-key path (channel encryption + relay + disconnect).
+    // identity path (channel encryption + relay + disconnect).
     let stop = oly_cmd(&secondary_tmp)
         .args(["join", "stop", "--name", "worker1"])
         .output()
@@ -615,11 +383,8 @@ fn e2e_federation_ssh_key_join_lifecycle() {
     let disconnected = rt.block_on(wait_for_no_nodes(port, 10));
     assert!(disconnected, "worker1 did not disconnect after join stop");
 
-    // Re-join with the *correct* primary pub key. We no longer do an
-    // in-band pin-mismatch check (the host_key wire flow is gone), so a
-    // bogus pin would simply cause the post-Join sealed channel to break
-    // silently. The trust root here is operator-side verification of the
-    // pinned key against `oly daemon status` on the primary.
+    // Re-join with the correct primary identity. Encrypted confirmation
+    // proves the primary owns this independently exchanged pin before success.
     let rejoin = oly_cmd(&secondary_tmp)
         .args([
             "join",
@@ -641,7 +406,7 @@ fn e2e_federation_ssh_key_join_lifecycle() {
     let rejoined = rt.block_on(wait_for_node_connected(port, "worker1", 10));
     assert!(
         rejoined,
-        "worker1 did not re-appear in /api/nodes after ssh-key rejoin"
+        "worker1 did not re-appear in /api/nodes after identity rejoin"
     );
 
     drop(secondary);
@@ -1149,9 +914,9 @@ fn e2e_federation_attach_streams_input_through_the_relay() {
         let mut reader = BufReader::new(read_half);
 
         // IPC control messages are versioned envelopes:
-        // {"version":13,"payload":{...}} (v13: attach streams carry output
-        // as binary frames after the JSON init line).
-        let envelope = |payload: serde_json::Value| json!({"version": 13, "payload": payload});
+        // {"version":14,"payload":{...}}; attach output remains binary
+        // after the JSON init line.
+        let envelope = |payload: serde_json::Value| json!({"version": 14, "payload": payload});
         let subscribe = envelope(json!({
             "type": "node_proxy",
             "node": "worker1",
@@ -2515,10 +2280,8 @@ fn e2e_federation_join_start_reports_rejection_on_stderr() {
         .trim()
         .to_string();
 
-    // Pin a primary identity that the primary does not own. The connector
-    // signs the join with the secondary's identity; the primary's
-    // accept-table classifies this secondary identity as unregistered and
-    // returns "unauthorized" before any channel state advances.
+    // Pin an identity the primary does not own. Unregistered identity and
+    // wrong-pin failures both must surface without reporting success.
     let mut wrong_seed = [0u8; 32];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut wrong_seed);
     let wrong_key = ed25519_dalek::SigningKey::from_bytes(&wrong_seed);
@@ -2544,13 +2307,13 @@ fn e2e_federation_join_start_reports_rejection_on_stderr() {
         out.status.success(),
         "`oly join start` should still succeed even when the first attempt fails;\nstderr: {stderr}"
     );
-    // The CLI prints a hint that includes the named node so the operator
-    // can map the warning to the join attempt without trawling the daemon
-    // log. The actual auth check happens in the daemon's `unauthorized`
-    // path; the CLI surfaces the rejection via the connector report.
     assert!(
-        !stderr.is_empty(),
-        "expected stderr to surface the rejection; got empty stderr"
+        stderr.contains("failed"),
+        "expected explicit failed attempt: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("Joined primary"),
+        "failed attempt reported success"
     );
     let _ = (secondary, secondary_pub, &out.stdout);
 }

@@ -14,9 +14,12 @@ use crate::{
     config::AppConfig,
     db::Database,
     error::Result,
-    ipc,
+    federation_crypto, ipc,
     node::NodeRegistry,
-    protocol::{NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, encode_node_ws_payload},
+    protocol::{
+        FEDERATION_VERSION, MAX_NODE_HANDSHAKE_BYTES, NODE_HANDSHAKE_TIMEOUT, NodeWsMessage,
+        RpcRequest, RpcResponse,
+    },
     session::SessionEvent,
 };
 
@@ -155,226 +158,30 @@ async fn connect_and_relay(
         format!("{}/api/nodes/join", base.replacen("http://", "ws://", 1))
     };
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .map_err(|e| {
-            attempt_report.fail(format!("WebSocket connect failed: {e}"));
-            crate::error::AppError::Protocol(format!("WebSocket connect failed: {e}"))
-        })?;
-
-    let (mut ws_tx, mut ws_rx) = ws_stream.split();
-
-    // ── Channel-mode (AES-256-GCM) state ───────────────────────────────
-    // The connector starts in plaintext: the primary needs to receive the
-    // secondary's pubkey (Hello) to derive channel keys, and that key
-    // announcement must itself land before sealing. As soon as the
-    // primary's HostKey reply has been verified and pinned, we send our
-    // own plain Hello and flip both sides to `Sealed` for everything
-    // that follows (Join, Joined, RPCs, events, keepalives).
-    let mut phase = crate::sshauth::ChannelPhase::Plain;
-
-    // ── Step 1: SSH-key authentication — derive channel keys, sign
-    // the join, send Hello. There is no in-band host-key challenge or
-    // nonce; the operator pinned the primary's pubkey with
-    // `--ssh-pub-key`, and that is the trust root.
-    let host = join
-        .primary_url
-        .strip_prefix("http://")
-        .or_else(|| join.primary_url.strip_prefix("https://"))
-        .and_then(|u| u.split('/').next())
-        .map(|authority| {
-            let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-            // Strip a trailing :port unless that would break an IPv6 literal.
-            match authority.rsplit_once(':') {
-                Some((h, port)) if !h.is_empty() && port.parse::<u16>().is_ok() => h,
-                _ => authority,
-            }
-        })
-        .unwrap_or("localhost");
-
-    // If the SSH-key auth branch successfully derives channel keys
-    // during handshake, we stash them here so the connector-side loop
-    // can flip the phase to Sealed as soon as the primary confirms the
-    // join with `Joined`. Until then we keep sending plaintext so the
-    // auth-validating primary (which only transitions to Sealed after
-    // reading Join + verifying auth) and we stay wire-compatible.
-    // `pending_phase_seal` carries the keys derived during the SSH-key
-    // branch and is sealed onto the channel AFTER `Joined` is
-    // acknowledged. Left in the current shape so the P3 handshake
-    // redesign can replace the surrounding phase enum with the new
-    // per-direction state machine without inflating this commit's
-    // surface area.
-    #[allow(dead_code)]
-    let mut pending_phase_seal: Option<(
-        [u8; crate::federation_crypto::AEAD_KEY_LEN],
-        [u8; crate::federation_crypto::AEAD_KEY_LEN],
-    )> = None;
-
-    let auth = {
-        // The CLI guarantees the operator typed `--identity-pub-key` so the
-        // pinned primary identity is non-empty. Reach for it via the
-        // daemon's own identity (loaded fresh from disk) and the pinned
-        // canonical text stored in the join config.
-        let pinned_primary_pubkey = &join.primary_identity_pub_key;
-        // Load this daemon's auto-generated identity seed. The file is
-        // the raw 32-byte Ed25519 seed written by NodeIdentity at startup
-        // (see http/mod.rs), NOT an OpenSSH-format file — load_raw_seed
-        // reads the bytes directly.
-        let identity_path = crate::http::NodeIdentity::seed_path(&local_config.paths.state_dir);
-        let seed = match crate::federation_crypto::load_seed(&identity_path) {
-            Ok(s) => s,
-            Err(err) => {
-                let msg = format!(
-                    "identity auth: failed to load daemon identity from {}: {err}",
-                    identity_path.display()
-                );
-                attempt_report.fail(&msg);
-                return Err(crate::error::AppError::Protocol(msg));
-            }
-        };
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let public_key = crate::federation_crypto::public_key_line(&signing_key);
-
-        // Pins: any operator-supplied --ssh-pub-key must hash to a
-        // valid canonical ssh-ed25519 line. We don't probe the primary
-        // for the wire key — the operator is the source of truth.
-        let pinned_canonical = crate::federation_crypto::parse_public_key(pinned_primary_pubkey)
-            .map(|pk| pk.0)
-            .map_err(|e| {
-                let msg = format!(
-                    "configured primary pubkey for {host} is not a valid ed25519 public key: {e}"
-                );
-                attempt_report.fail(&msg);
-                crate::error::AppError::Protocol(msg)
-            })?;
-
-        // Sign the join payload: protocol || name || pubkey. The
-        // accept-table on the primary is the trust anchor. The legacy
-        // single-payload binary shape is kept for P1; the new transcript
-        // with mixed nonces takes over in P3 (handshake redesign), at which
-        // point both sides will produce the same verifier-constructed
-        // payload including both fresh nonces and primary identity.
-        let payload = crate::sshauth::node_join_payload(&join.name, &public_key);
-        let signature = crate::federation_crypto::sign_transcript(&signing_key, &payload);
-
-        // Channel-key derivation: long-term Ed25519 identities on both
-        // sides get mapped to X25519 (birational map) so we can seal
-        // application traffic with static-static ECDH. Static keys are
-        // safe here because:
-        //   * both pubkeys are pinned out-of-band (--ssh-pub-key on the
-        //     connector + the primary's accept-table entry),
-        //   * and the per-direction keys are bound to BOTH identities +
-        //     direction labels via HKDF-Expand.
-        let primary_pub_ed: [u8; 32] = pinned_canonical;
-        let primary_verifying =
-            ed25519_dalek::VerifyingKey::from_bytes(&primary_pub_ed).map_err(|e| {
-                let msg = format!("primary pub-ed invalid: {e}");
-                attempt_report.fail(&msg);
-                crate::error::AppError::Protocol(msg)
-            })?;
-        let primary_pub_x = crate::sshauth::ed25519_pub_to_x25519(&primary_verifying);
-        let priv_x = crate::sshauth::ed25519_priv_to_x25519(&signing_key);
-        let secondary_pub_ed: [u8; 32] = signing_key.verifying_key().to_bytes();
-        let keys = crate::sshauth::derive_channel_keys(
-            &priv_x,
-            &primary_pub_x,
-            &primary_pub_ed,
-            &secondary_pub_ed,
-        );
-        pending_phase_seal = Some((keys.c2s, keys.s2c));
-
-        let _ = host; // (kept for log clarity in error paths)
-        let _ = primary_verifying;
-
-        // Send plain Hello so the primary knows *which* of its
-        // accepted keys is talking. Sealing begins AFTER the Join /
-        // Joined exchange because the primary's auth-validating branch
-        // only switches its own phase to Sealed after reading Join,
-        // validating auth, and deriving keys — and we want to receive
-        // the primary's `Joined` reply in plain so we don't
-        // chicken-and-egg ourselves into an unsealable dialogue.
-        let hello = NodeWsMessage::Hello {
-            public_key: public_key.clone(),
-        };
-        let hello_payload = crate::sshauth::phase_encode_message(&phase, &hello)
-            .or_else(|_| encode_node_ws_payload(&hello))
-            .map_err(|e| {
-                let msg = format!("encode hello: {e}");
-                attempt_report.fail(&msg);
-                crate::error::AppError::Protocol(msg)
-            })?;
-        ws_tx
-            .send(WsMessage::Binary(hello_payload.into()))
-            .await
-            .map_err(|e| {
-                attempt_report.fail(format!("send hello: {e}"));
-                crate::error::AppError::Protocol(format!("send hello: {e}"))
-            })?;
-
-        NodeJoinAuth::SshKey {
-            signature,
-            public_key,
-        }
+    // Cancellation and one deadline cover DNS/TCP/WS plus all handshake IO.
+    if *stop_rx.borrow() {
+        return Ok(true);
+    }
+    let established = tokio::select! {
+        biased;
+        _ = stop_rx.changed() => return Ok(true),
+        result = tokio::time::timeout(NODE_HANDSHAKE_TIMEOUT,
+            secondary_handshake(&ws_url, join, local_config)) => result,
     };
-    let handshake = NodeWsMessage::Join {
-        name: join.name.clone(),
-        auth,
-    };
-    let handshake_payload = crate::sshauth::phase_encode_message(&phase, &handshake)
-        .or_else(|_| encode_node_ws_payload(&handshake))
-        .map_err(|e| {
-            attempt_report.fail(format!("encode join handshake: {e}"));
-            crate::error::AppError::Protocol(e.to_string())
-        })?;
-    ws_tx
-        .send(WsMessage::Binary(handshake_payload.into()))
-        .await
-        .map_err(|e| {
-            attempt_report.fail(format!("send join handshake: {e}"));
-            crate::error::AppError::Protocol(e.to_string())
-        })?;
-
-    match ws_rx.next().await {
-        Some(Ok(frame)) => {
-            let raw = match frame {
-                WsMessage::Binary(data) => data.to_vec(),
-                _ => Vec::new(),
-            };
-            match decode_node_message_bytes(&raw, &phase).map_err(|e| {
-                attempt_report.fail(format!("decode join response: {e}"));
-                crate::error::AppError::Protocol(e.to_string())
-            })? {
-                NodeWsMessage::Joined => {
-                    info!(node = %join.name, primary = %join.primary_url, "joined primary");
-                    attempt_report.joined();
-                    // Seal-on-ack: with the primary's confirmation we
-                    // know our SSH-key challenge was accepted; flip
-                    // into Sealed so every subsequent frame (RPCs,
-                    // replies, events, keepalives) lives under
-                    // AES-256-GCM on the wire regardless of whether
-                    // the upstream transport itself was wss:// or ws://.
-                    if let Some((send_key, recv_key)) = pending_phase_seal {
-                        phase.seal(send_key, recv_key);
-                    }
-                }
-                NodeWsMessage::Error { message } => {
-                    let msg = format!("join rejected: {message}");
-                    attempt_report.fail(&msg);
-                    return Err(crate::error::AppError::Protocol(msg));
-                }
-                _ => {
-                    let msg = "unexpected response to join";
-                    attempt_report.fail(msg);
-                    return Err(crate::error::AppError::Protocol(msg.into()));
-                }
-            }
+    let (mut ws_tx, mut ws_rx, mut phase) = match established {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(err)) => {
+            attempt_report.fail(err.to_string());
+            return Err(err);
         }
-        _ => {
-            let msg = "no response to join handshake";
+        Err(_) => {
+            let msg = "node identity handshake timed out before encrypted Joined";
             attempt_report.fail(msg);
             return Err(crate::error::AppError::Protocol(msg.into()));
         }
-    }
+    };
+    info!(node = %join.name, primary = %join.primary_url, "joined primary after encrypted confirmation");
+    attempt_report.joined();
 
     let (stream_frame_tx, mut stream_frame_rx) = mpsc::channel::<(String, RpcResponse, bool)>(256);
     // Open streaming RPCs: rpc_id -> inbound client-message channel.
@@ -407,7 +214,7 @@ async fn connect_and_relay(
                     response: response_json,
                     done,
                 };
-                if !send_node_message(&mut ws_tx, &reply, &phase).await {
+                if !send_node_message(&mut ws_tx, &reply, &mut phase).await {
                     break;
                 }
             }
@@ -426,11 +233,11 @@ async fn connect_and_relay(
                     Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => continue,
                     Ok(frame) => frame,
                 };
-                let node_msg = match decode_node_message(frame, &phase) {
+                let node_msg = match decode_node_message(frame, &mut phase) {
                     Ok(message) => message,
                     Err(err) => {
-                        warn!(node = %join.name, %err, "failed to decode primary node frame");
-                        continue;
+                        warn!(node = %join.name, %err, "invalid sealed primary frame; closing");
+                        break;
                     }
                 };
 
@@ -488,7 +295,7 @@ async fn connect_and_relay(
                             id,
                             response: response_json,
                         };
-                        if !send_node_message(&mut ws_tx, &reply, &phase).await {
+                        if !send_node_message(&mut ws_tx, &reply, &mut phase).await {
                             break;
                         }
                     }
@@ -517,9 +324,10 @@ async fn connect_and_relay(
                         }
                     }
                     NodeWsMessage::Ping => {
-                        let _ = send_node_message(&mut ws_tx, &NodeWsMessage::Pong, &phase).await;
+                        if !send_node_message(&mut ws_tx, &NodeWsMessage::Pong, &mut phase).await { break; }
                     }
-                    _ => {}
+                    NodeWsMessage::Pong => {},
+                    _ => break,
                 }
             }
             session_event = session_event_rx.recv() => {
@@ -527,7 +335,7 @@ async fn connect_and_relay(
                     Ok(event) => {
                         let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
                         debug!(node = %join.name, event = ?event, "relaying session event to primary");
-                        if !send_node_message(&mut ws_tx, &relay, &phase).await {
+                        if !send_node_message(&mut ws_tx, &relay, &mut phase).await {
                             break;
                         }
                     }
@@ -555,6 +363,102 @@ async fn connect_and_relay(
     Ok(false)
 }
 
+type NodeSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type NodeSink = futures_util::stream::SplitSink<NodeSocket, WsMessage>;
+type NodeSource = futures_util::stream::SplitStream<NodeSocket>;
+
+async fn read_handshake_frame(rx: &mut NodeSource) -> Result<Vec<u8>> {
+    match rx.next().await {
+        Some(Ok(WsMessage::Binary(bytes))) if bytes.len() <= MAX_NODE_HANDSHAKE_BYTES => {
+            Ok(bytes.to_vec())
+        }
+        _ => Err(crate::error::AppError::Protocol(
+            "expected bounded binary handshake frame".into(),
+        )),
+    }
+}
+
+async fn secondary_handshake(
+    url: &str,
+    join: &JoinConfig,
+    config: &AppConfig,
+) -> Result<(NodeSink, NodeSource, federation_crypto::Channel)> {
+    use crate::error::AppError;
+    let fail = |message: &str| AppError::Protocol(message.to_string());
+    let seed =
+        federation_crypto::load_seed(&federation_crypto::seed_path(&config.paths.state_dir))?;
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let primary = federation_crypto::parse_public_key(&join.primary_identity_pub_key)?;
+    let secondary_nonce = federation_crypto::fresh_nonce();
+    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(64 * 1024 * 1024))
+        .max_frame_size(Some(64 * 1024 * 1024));
+    let (socket, _) = tokio_tungstenite::connect_async_with_config(url, Some(ws_config), false)
+        .await
+        .map_err(|e| fail(&format!("WebSocket connect failed: {e}")))?;
+    let (mut tx, mut rx) = socket.split();
+    let hello = federation_crypto::encode_handshake(&NodeWsMessage::Hello {
+        version: FEDERATION_VERSION,
+        name: join.name.clone(),
+        public_key: federation_crypto::public_key_line(&signing_key),
+        nonce: secondary_nonce,
+    })?;
+    tx.send(WsMessage::Binary(hello.into()))
+        .await
+        .map_err(|e| fail(&e.to_string()))?;
+    let challenge: NodeWsMessage =
+        federation_crypto::decode_handshake(&read_handshake_frame(&mut rx).await?)?;
+    let primary_nonce = match challenge {
+        NodeWsMessage::Challenge { nonce } => nonce,
+        NodeWsMessage::Error { message } => return Err(fail(&format!("join rejected: {message}"))),
+        _ => return Err(fail("expected freshness challenge, not success")),
+    };
+    let transcript = federation_crypto::build_transcript(
+        FEDERATION_VERSION,
+        "secondary-proof",
+        &join.name,
+        signing_key.verifying_key().as_bytes(),
+        primary.as_bytes(),
+        &secondary_nonce,
+        &primary_nonce,
+    );
+    let proof = federation_crypto::encode_handshake(&NodeWsMessage::Join {
+        signature: federation_crypto::sign_transcript(&signing_key, &transcript),
+    })?;
+    tx.send(WsMessage::Binary(proof.into()))
+        .await
+        .map_err(|e| fail(&e.to_string()))?;
+    let mut channel = federation_crypto::Channel::new(&signing_key, &primary, &transcript, true)?;
+    let hash = channel.transcript_hash();
+    // No plaintext fallback, including an attacker-supplied Joined.
+    let confirmation = channel
+        .decode_message(&read_handshake_frame(&mut rx).await?)
+        .map_err(|err| {
+            fail(&format!(
+                "primary identity confirmation failed; verify the configured pin: {err}"
+            ))
+        })?;
+    match confirmation {
+        NodeWsMessage::KeyConfirm { transcript_hash } if transcript_hash == hash => {}
+        _ => return Err(fail("expected encrypted primary key confirmation")),
+    }
+    let ready = channel.encode_message(&NodeWsMessage::Ready {
+        transcript_hash: hash,
+    })?;
+    tx.send(WsMessage::Binary(ready.into()))
+        .await
+        .map_err(|e| fail(&e.to_string()))?;
+    let acknowledgement = channel
+        .decode_message(&read_handshake_frame(&mut rx).await?)
+        .map_err(|err| fail(&format!("encrypted Joined verification failed: {err}")))?;
+    match acknowledgement {
+        NodeWsMessage::Joined => Ok((tx, rx, channel)),
+        NodeWsMessage::Error { message } => Err(fail(&format!("join rejected: {message}"))),
+        _ => Err(fail("expected encrypted Joined")),
+    }
+}
+
 async fn send_node_message(
     ws_tx: &mut futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<
@@ -563,11 +467,9 @@ async fn send_node_message(
         WsMessage,
     >,
     message: &NodeWsMessage,
-    phase: &crate::sshauth::ChannelPhase,
+    phase: &mut federation_crypto::Channel,
 ) -> bool {
-    let payload = match crate::sshauth::phase_encode_message(phase, message)
-        .or_else(|_| encode_node_ws_payload(message))
-    {
+    let payload = match phase.encode_message(message) {
         Ok(p) => p,
         Err(err) => {
             warn!(%err, "failed to encode node connector frame");
@@ -579,7 +481,7 @@ async fn send_node_message(
 
 fn decode_node_message(
     frame: WsMessage,
-    phase: &crate::sshauth::ChannelPhase,
+    phase: &mut federation_crypto::Channel,
 ) -> std::io::Result<NodeWsMessage> {
     match frame {
         WsMessage::Binary(data) => decode_node_message_bytes(&data, phase),
@@ -589,9 +491,9 @@ fn decode_node_message(
 
 fn decode_node_message_bytes(
     bytes: &[u8],
-    phase: &crate::sshauth::ChannelPhase,
+    phase: &mut federation_crypto::Channel,
 ) -> std::io::Result<NodeWsMessage> {
-    crate::sshauth::phase_decode_payload(phase, bytes).map_err(std::io::Error::other)
+    phase.decode_message(bytes).map_err(std::io::Error::other)
 }
 
 fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
@@ -763,18 +665,22 @@ pub(super) async fn handle_node_accept(
     identity_pub_key: String,
     db: &Arc<Database>,
 ) -> RpcResponse {
+    if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+        return RpcResponse::Error {
+            message: "invalid node name".into(),
+        };
+    }
     // Validate and normalize the key so lookups at join time (which use the
     // canonical form) always match, regardless of how the key was pasted in.
-    let canonical =
-        match crate::federation_crypto::parse_public_key(&identity_pub_key) {
-            Ok(key) => key.to_line(),
-            Err(e) => {
-                return RpcResponse::Error {
-                    message: e.to_string(),
-                };
-            }
-        };
-    if let Err(e) = db.insert_ssh_key_entry(&name, &canonical).await {
+    let canonical = match crate::federation_crypto::parse_public_key(&identity_pub_key) {
+        Ok(key) => key.to_line(),
+        Err(e) => {
+            return RpcResponse::Error {
+                message: e.to_string(),
+            };
+        }
+    };
+    if let Err(e) = db.register_node_identity(&name, &canonical).await {
         return RpcResponse::Error {
             message: format!("failed to register identity pubkey: {e}"),
         };

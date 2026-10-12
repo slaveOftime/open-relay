@@ -78,7 +78,6 @@ base64 = "0.23"
 argon2 = "0.6"
 rpassword = "7.5"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
-ssh-key = "0.6"
 bytes = "1"
 arc-swap = "1.9.2"
 parking_lot = "0.12"

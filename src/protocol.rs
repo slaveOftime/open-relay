@@ -14,7 +14,12 @@ use crate::session::SessionEvent;
 // string — PTY input is byte-exact end to end, so invalid UTF-8 (binary
 // paste, `hex:` specs, piped files) can no longer be mangled by a
 // lossy UTF-8 round-trip. Mode frames also carry mouse/focus flags.
-pub const PROTOCOL_VERSION: u16 = 13;
+// 14: federation uses the sole nonce-bound node identity handshake; API-key
+// RPCs and legacy federation fields are removed.
+pub const PROTOCOL_VERSION: u16 = 14;
+pub const FEDERATION_VERSION: u16 = 2;
+pub const NODE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const MAX_NODE_HANDSHAKE_BYTES: usize = crate::federation_crypto::MAX_HANDSHAKE_BYTES;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
@@ -143,7 +148,7 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
     let compressed = payload.starts_with(NODE_WS_BINARY_MAGIC);
     let json = if compressed {
         let decoder = GzDecoder::new(&payload[NODE_WS_BINARY_MAGIC.len()..]);
-        let mut limited = decoder.take(MAX_NODE_WS_DECOMPRESSED_BYTES);
+        let mut limited = decoder.take(MAX_NODE_WS_DECOMPRESSED_BYTES + 1);
         let mut json = Vec::new();
         limited.read_to_end(&mut json)?;
         json
@@ -151,6 +156,11 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
         payload.to_vec()
     };
 
+    if json.len() as u64 > MAX_NODE_WS_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::other(
+            "node payload exceeds decompressed limit",
+        ));
+    }
     let message = serde_json::from_slice(&json).map_err(std::io::Error::other)?;
     debug!(
         message_type = node_ws_message_type(&message),
@@ -163,11 +173,26 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
     Ok(message)
 }
 
+impl crate::federation_crypto::Channel {
+    pub fn encode_message(&mut self, message: &NodeWsMessage) -> crate::error::Result<Vec<u8>> {
+        self.encode(&encode_node_ws_payload(message)?)
+    }
+
+    pub fn decode_message(&mut self, frame: &[u8]) -> crate::error::Result<NodeWsMessage> {
+        self.decode(frame, |bytes| {
+            decode_node_ws_payload(bytes).map_err(crate::error::AppError::from)
+        })
+    }
+}
+
 fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
     match message {
         NodeWsMessage::Join { .. } => "join",
         NodeWsMessage::Joined => "joined",
         NodeWsMessage::Hello { .. } => "hello",
+        NodeWsMessage::Challenge { .. } => "challenge",
+        NodeWsMessage::KeyConfirm { .. } => "key_confirm",
+        NodeWsMessage::Ready { .. } => "ready",
         NodeWsMessage::Error { .. } => "error",
         NodeWsMessage::Rpc { .. } => "rpc",
         NodeWsMessage::RpcResponse { .. } => "rpc_response",
@@ -178,24 +203,6 @@ fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
         NodeWsMessage::Ping => "ping",
         NodeWsMessage::Pong => "pong",
     }
-}
-
-/// Authentication method for a secondary node joining a primary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
-pub enum NodeJoinAuth {
-    /// Authenticate with an Ed25519 signature over the join payload. The
-    /// connector signs `sign("oly-node-join-v1" || name || public_key)` with
-    /// the privkey matching `public_key`. The pinned primary pubkey (typed
-    /// via the operator on the secondary) is the trust root — there is no
-    /// in-band host-key exchange, so a man-in-the-middle has no opportunity
-    /// to substitute a different key.
-    SshKey {
-        /// Base64 raw 64-byte Ed25519 signature.
-        signature: String,
-        /// The signer's public key (canonical or OpenSSH format).
-        public_key: String,
-    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -669,28 +676,33 @@ pub struct JoinSummary {
 
 /// Messages exchanged over the `/api/nodes/join` WebSocket connection.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)] // Wire-format dict; C/C+1 invariant depends on this exact shape.
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum NodeWsMessage {
-    /// Secondary → Primary: authentication handshake.
-    /// Authentication can be via API key or SSH key signature.
-    Join {
-        name: String,
-        auth: NodeJoinAuth,
-    },
-
-    /// Secondary → Primary: cleartext `hello` from the secondary announcing
-    /// its identity pubkey. The primary uses the canonical ssh-ed25519 line
-    /// to look up the secondary in its accept-table AND to derive the
-    /// AES-256-GCM channel keys (after converting the Ed25519 pubkey to
-    /// X25519 via `VerifyingKey::to_montgomery`). The X25519 form doesn't
-    /// need to be on the wire — both sides can derive it themselves from
-    /// the same canonical Ed25519 key.
+    /// Plaintext introduction. Join cannot supply another identity or name.
     Hello {
+        version: u16,
+        name: String,
         public_key: String,
+        nonce: [u8; 32],
     },
-
-    /// Primary → Secondary: handshake accepted.
+    /// Plaintext freshness challenge; never supplies a replacement primary pin.
+    Challenge {
+        nonce: [u8; 32],
+    },
+    /// Secondary signature over the full, length-delimited transcript.
+    Join {
+        signature: String,
+    },
+    /// Sealed primary key possession proof, bound to this transcript.
+    KeyConfirm {
+        transcript_hash: [u8; 32],
+    },
+    /// Sealed secondary key possession proof, before registry insertion.
+    Ready {
+        transcript_hash: [u8; 32],
+    },
+    /// Sealed final acknowledgement. Only this permits connector success.
     Joined,
     /// Primary → Secondary: handshake rejected or fatal error.
     Error {
@@ -750,8 +762,7 @@ pub enum NodeWsMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        NodeJoinAuth, NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload,
-        encode_node_ws_payload,
+        NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
     };
 
     #[test]
@@ -819,66 +830,58 @@ mod tests {
     #[test]
     fn node_ws_payload_round_trips_uncompressed_binary_json() {
         let message = NodeWsMessage::Join {
-            name: "worker-a".into(),
-            auth: NodeJoinAuth::SshKey {
-                signature: "sig".into(),
-                public_key: "ed25519 dummy".into(),
-            },
+            signature: "sig".into(),
         };
 
         let payload = encode_node_ws_payload(&message).expect("encode payload");
         let decoded = decode_node_ws_payload(&payload).expect("decode payload");
 
-        match decoded {
-            NodeWsMessage::Join { name, auth } => {
-                assert_eq!(name, "worker-a");
-                match auth {
-                    NodeJoinAuth::SshKey { signature, public_key } => {
-                        assert_eq!(signature, "sig");
-                        assert_eq!(public_key, "ed25519 dummy");
-                    }
-                    other => panic!("unexpected auth: {other:?}"),
-                }
-            }
-            other => panic!("unexpected decoded message: {other:?}"),
-        }
+        assert!(matches!(decoded, NodeWsMessage::Join { signature } if signature == "sig"));
     }
 
     #[test]
-    fn node_ws_hello_and_ssh_auth_round_trip() {
+    fn node_ws_identity_handshake_round_trip() {
         let hello = NodeWsMessage::Hello {
-            public_key: "ssh-ed25519 AAAA".into(),
+            version: super::FEDERATION_VERSION,
+            name: "worker-b".into(),
+            nonce: [1; 32],
+            public_key: "ed25519 AAAA".into(),
         };
         let payload = encode_node_ws_payload(&hello).expect("encode payload");
         match decode_node_ws_payload(&payload).expect("decode payload") {
-            NodeWsMessage::Hello { public_key } => {
-                assert_eq!(public_key, "ssh-ed25519 AAAA");
+            NodeWsMessage::Hello {
+                version,
+                name,
+                nonce,
+                public_key,
+            } => {
+                assert_eq!(version, super::FEDERATION_VERSION);
+                assert_eq!(name, "worker-b");
+                assert_eq!(nonce, [1; 32]);
+                assert_eq!(public_key, "ed25519 AAAA");
             }
             other => panic!("unexpected decoded message: {other:?}"),
         }
 
         let join = NodeWsMessage::Join {
-            name: "worker-b".into(),
-            auth: NodeJoinAuth::SshKey {
-                signature: "sig".into(),
-                public_key: "ssh-ed25519 AAAA".into(),
-            },
+            signature: "sig".into(),
         };
         let payload = encode_node_ws_payload(&join).expect("encode payload");
         match decode_node_ws_payload(&payload).expect("decode payload") {
-            NodeWsMessage::Join {
-                name,
-                auth:
-                    NodeJoinAuth::SshKey {
-                        signature,
-                        public_key,
-                    },
-            } => {
-                assert_eq!(name, "worker-b");
-                assert_eq!(signature, "sig");
-                assert_eq!(public_key, "ssh-ed25519 AAAA");
-            }
+            NodeWsMessage::Join { signature } => assert_eq!(signature, "sig"),
             other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn obsolete_auth_union_and_unbound_identity_fields_are_rejected() {
+        for json in [
+            r#"{"type":"join","name":"worker","auth":{"method":"ssh_key","signature":"sig","public_key":"key"}}"#,
+            r#"{"type":"join","signature":"sig","public_key":"another identity"}"#,
+            r#"{"type":"join","signature":"sig","name":"another name"}"#,
+            r#"{"type":"hello","public_key":"key"}"#,
+        ] {
+            assert!(serde_json::from_str::<NodeWsMessage>(json).is_err());
         }
     }
 

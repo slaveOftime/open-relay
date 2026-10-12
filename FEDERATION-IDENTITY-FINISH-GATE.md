@@ -2,8 +2,9 @@
 
 Implementation contract: [FEDERATION-IDENTITY-PLAN.md](FEDERATION-IDENTITY-PLAN.md).
 
-Current verdict: **NOT RUN** overall (P1 step 1 of ~7 steps committed; the
-remaining phases land as separate commits with green tests between them).
+Current verdict: **BLOCKED for final release; P3 implemented and locally tested**.
+The source/construction review is [FEDERATION-IDENTITY-P3-REVIEW.md](FEDERATION-IDENTITY-P3-REVIEW.md).
+Independent crypto review and macOS/Windows CI are not claimed.
 
 ## Gate rules
 
@@ -34,7 +35,7 @@ remaining phases land as separate commits with green tests between them).
   `primary_identity_pub_key`; obsolete auth fields fail strict parsing.
   Malformed saved config produces an actionable diagnostic, not a silent reset.
 - [ ] Original migrations 0001–0009 are byte-for-byte unchanged; appended
-  migration 0010 succeeds both on an empty DB and an isolated previously
+  migrations 0010/0011 succeed both on an empty DB and an isolated previously
   migrated DB, drops old credential tables without key conversion, and
   preserves session/push records.
 - [ ] API-key CRUD, scopes, verifier/cache, HTTP authorization fallback, and
@@ -136,6 +137,7 @@ Run focused tests first, then the full existing CI-equivalent checks:
 cargo test --locked --bin oly
 cargo test --locked --test cli_errors
 cargo test --locked --test e2e_daemon e2e_federation -- --test-threads=1
+cargo test --locked --test e2e_federation_security -- --test-threads=1
 
 # Full acceptance, with real exit codes and retained logs.
 cargo fmt --all -- --check
@@ -156,13 +158,13 @@ git diff --check
   satisfies the required all-features lint check.
 - [ ] README, architecture diagram, migration notes, CLI help/status/hints, and
   daemon skill consistently describe the implemented flags/format/state machine.
-  Database cleanup is accurately limited to migration 0010 dropping credential
+  Database cleanup is accurately limited to migration 0011 dropping credential
   tables; no key/config conversion, file deletion, or unrelated data loss is
   claimed. API-key removal is recorded as the security-driven pre-`master`
   removal actually implemented.
 - [ ] Residue searches are reviewed across tracked source, migrations, tests,
   docs, and Cargo files; no active old implementation remains. Historical
-  removal notes, unchanged historical SQL migrations, migration 0010's DROP
+  removal notes, unchanged historical SQL migrations, migration 0011's DROP
   statements, schema-cleanup fixtures, explicit negative rejection tests, this
   plan/gate, and generic credential-prompt examples are justified old-name
   mentions. None provides a runtime old-credential authorization path.
@@ -178,145 +180,78 @@ git grep -n -E 'ApiKey|api_key|api-key|api_keys|SCOPE_NODE|ssh_pub_key|ssh_prima
   src tests migrations Cargo.toml Cargo.lock README.md ARCHITECTURE.md MIGRATION.md skills
 ```
 
-## Final evidence report
+## Final evidence report (P3 checkpoint)
 
-| Gate | Result (PASS / FAIL / BLOCKED) | Tests/probes and evidence |
+| Gate | Result | Evidence / remaining work |
 |---|---|---|
-| G1 Public surface/removal | PARTIAL | `Commands::ApiKey` + arg types, `RpcRequest::{ApiKeyAdd,ApiKeyList,ApiKeyRemove}`, `RpcResponse::ApiKey{Add,List,Remove}`, `ApiKeySummary`, `NodeJoinAuth::ApiKey`, HTTP Bearer api-key authorization path, `api_keys`/`ssh_keys` readers in src/db.rs, `tests/e2e_daemon.rs` API-key fixtures — all removed. Still blocked: schema migration that drops `api_keys` and `ssh_keys` (deferred to P3 closing); full row-level privacy migration on existing on-disk databases. |
-| G2 Identity persistence/trust | PARTIAL | `federation_crypto` module added and used end-to-end; `identity_key` / `identity_key.pub` files via `NodeIdentity::create_or_load` with mode 0600 + fsync; `IDENTITY-PUB-KEY:` printed by `daemon status`; `node_identities` table migration `0010` adds the new PK-on-name / UNIQUE-public-key table. The accept-table still reads from `ssh_keys` (legacy table) — the swap to `node_identities` is scheduled for P3 closing. |
-| G3 Handshake/readiness | NOT RUN | The pre-P3 single-shot handshake still verifies auth, sends plain `Joined`, and reports a connect success. Challenge / Ready / KeyConfirm / encrypted `Joined` state machine + raw-WebSocket observability test fixture are not implemented. |
-| G4 Channel security | PARTIAL | v2 `ChannelSide` per-direction AEAD state with monotonic counter (25-byte minimum frame, replay/reject) is implemented and unit-tested in `federation_crypto`; the live relay still uses `sshauth::ChannelPhase::{Plain,Sealed}` with `seal_frame` / `open_frame` carrying no counter. Per-direction counters and replay rejection are not yet wired into application traffic. |
-| G5 Behavior/browser auth | PARTIAL | Browser password/login/session/cookie/WS-origin/IP lockout paths preserved; `authorize_request` now only accepts session tokens (Bearer strings, query-token, or cookie). To prove the HTTP fallback really has no API-key path: the existing `e2e_ws_*` tests use `--no-auth` so the suite does not yet exercise a real password login + issued session round-trip via `http::auth::issue_session`; that fixture is part of P3’s auth-enabled daemon suite. |
-| G6 Suite/docs/platforms | PARTIAL | Local: `cargo build --bin oly` is clean; `cargo test --locked --bin oly` → 852 passed; `cargo test --locked --test cli_errors` → 21 passed; `cargo test --locked --test e2e_daemon -- --test-threads=1` → 26 passed in 46.5s. Full `-D warnings` clippy is not yet evaluated against this branch; cross-platform CI (macOS, Windows PTY single-threaded) is untested. Architecture, README and skills still reference the old `ssh-pub-key` / `SSH-PUB-KEY:` labels in some prose examples. |
+| G1 Public surface/removal | PARTIAL | IPC v14/federation v2; legacy auth union removed and rejected; `ssh-key` dependency and `sshauth.rs` deleted. Migration 0010 adds `node_identities`, 0011 drops both old credential tables; upgrade test preserves session/push records/checksums. Saved config rejects obsolete fields, but malformed-config diagnostic behavior is still a P2 follow-up. |
+| G2 Identity persistence/trust | PARTIAL | Production and tests share identity creation; Unix mode 0600 checked; exact name/key authorization and conflict-safe upsert tested. Windows file protection not verified. |
+| G3 Handshake/readiness | LOCAL PASS | Actual binary connector and raw peers verify sealed KeyConfirm/Ready/Joined, wrong pin, fresh Join replay, re-signed wrong name, invalid proof/weak identity, legacy/repeated/oversized/out-of-order messages, idle/missing Ready timeout, connector timeout/stop, duplicates and stale-owner cleanup. Failed handshakes cannot forward an RPC or create a session. |
+| G4 Channel security | PARTIAL | Production channel has directional, transcript/header-bound AEAD and terminal replay rejection; mutation/exhaustion/reflection/prior-session tests plus fixed crypto vectors. Real SSE replay yields exactly one event, then disconnect; pending RPC fails promptly. Source review recorded; independent cryptographic review remains BLOCKED. Static-static DH explicitly does not provide forward secrecy. |
+| G5 Behavior/browser auth | LOCAL PASS for exercised paths | Existing remote lifecycle and credited attach pass. Actual auth-enabled daemon fixture uses existing `OLY_AUTH_HASH_INTERNAL` PHC path; HTTP password login, issued Bearer/cookie sessions and logout pass; arbitrary machine Bearer fails. Full local suite retains origin/session/revocation coverage. |
+| G6 Suite/docs/platforms | BLOCKED | Full Linux suite passes. Strict fmt/clippy hit pre-existing unrelated residue listed below; focused P3 checks pass. macOS/Windows CI and independent crypto review unrun. |
 
-## Implementation status
+### Commands and actual evidence
 
-Phase-by-phase progress; each phase ships as its own commit with green tests.
+Logs retained under `/tmp/p3-*.log` on this implementation host (not permanent
+CI artifacts). All commands capture the real exit status, not pipeline status.
 
-### What landed (committed)
+- `cargo build --locked --bin oly`: PASS, `/tmp/p3-build-final.log`.
+- `cargo test --locked`: PASS; final full suite log `/tmp/p3-full-suite-final.log`:
+  **858 unit passed + 1 existing ignored**, 21 CLI-error, 25 daemon e2e,
+  **28 federation-security target** (18 production crypto unit tests reused in
+  this target + 10 real-daemon adversarial tests), 22 PTY, and 4 other active
+  integration tests. The existing ignored test is a manually invoked Unix
+  isolated PTY helper. One platform-gated target ran zero tests; not evidence
+  for that platform. No new ignored tests.
+- `cargo test --locked --test e2e_federation_security -- --test-threads=1`:
+  PASS, **27 tests** (18 crypto + 9 real-daemon security),
+  `/tmp/p3-security-final.log`. This includes pending-RPC failure and stronger
+  zero-session side-effect assertions. A subsequent additional daemon restart
+  test passed individually (`/tmp/p3-restart.log`) and in the final full suite
+  (**28 security-target tests**).
+- `cargo test --locked --test cli_errors`: PASS, **21 tests**,
+  `/tmp/p3-cli.log`.
+- `cargo test --locked --test e2e_daemon e2e_federation_attach -- --test-threads=1`:
+  PASS, **1 test**, `/tmp/p3-attach.log`. Initial full-daemon run found a raw
+  IPC fixture hardcoded to version 13; updated to 14 and the full suite passed.
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`:
+  FAIL from existing `src/client/attach.rs:533` infallible-destructuring lint
+  and `tests/e2e_attach_scrollback.rs:44` unused-mut. Both code regions exist
+  unchanged in the pre-P3 commit. New federation lint findings were fixed.
+- Same clippy command with explicit `-A clippy::infallible_destructuring_match
+  -A unused_mut`: PASS (`/tmp/p3-clippy-focused.log`). This is a diagnostic
+  run, **not a substitute for the mandatory strict lint gate**.
+- `cargo fmt --all -- --check`: pre-existing formatting residue in
+  `src/client/list_tui/{app,tests}.rs`, `src/http/ws.rs`, `tests/e2e_pty.rs`.
+  Full formatter was inspected; unrelated formatting reverted. Changed
+  P3 Rust files are formatted separately, without child-file traversal.
 
-- **Plan + finish-gate documents** archive the design and acceptance contract.
-- Branch `feat/federation-identity` prepared from the previous baseline.
-- **P1 step 1 (committed)**: `src/federation_crypto.rs` introduced as a
-  sibling module to `sshauth.rs`. New parser/transcript/derive channel keys
-  + per-direction AEAD-owned state, new `identity_key{,pub}` file paths,
-  new `ed25519 <base64(raw32)>` encoding, new `NODE_JOIN_CONTEXT` /
-  `CHANNEL_INFO_PREFIX` / `FRAME_TAG_SEALED` / `MAX_SEQUENCE` constants.
-  Migration `0010` (`0010_add_node_identities.sql`) adds the new
-  `node_identities` table preserving all prior migration files.
-- **P1 step 2 (committed)**: rewired `NodeIdentity` persistence, daemon
-  status label (`IDENTITY-PUB-KEY:`), the relay's welcome/accept path, the
-  connector-side identity handoff, and the join-config parse path onto the
-  new module + new file paths. Public-key line is now `ed25519
-  <base64(raw32)>`; OpenSSH-format and `ssh-ed25519` lines are no longer
-  emitted or accepted anywhere.
-- **P2 (committed)**: full API-key removal. `Commands::ApiKey`,
-  `RpcRequest::ApiKeyAdd/List/Remove` and the matching response variants +
-  protocol summary struct, the HTTP Bearer API-key authorization branch,
-  the `api_key_cache`/`verify_api_key_scopes`/`verify_api_key_hash`
-  helpers, the `SCOPE_NODE`/`SCOPE_ALL`/scope-classifier machinery, the
-  `add_api_key`/`list_api_key_entries`/`delete_api_key`/`list_api_keys`
-  DB CRUD, `ApiKeySummary`/`ApiKeyRecord`, the `auth_keys` table usage in
-  the join handler, and the `--key` flag on `oly join start`. CLI flag
-  renamed to `--identity-pub-key` on both `/join start` and `/node
-  accept`; the daemonside accept-field renamed to `identity_pub_key`.
-- **P2 cleanup (committed)**: removed dead `SCOPE_*` constants and
-  scope-classifier helpers that became unreachable after API-key removal;
-  removed the now-unused `method` parameter on `authorize_request`;
-  silenced the live-dead warnings introduced as P3 cleanup.
+### Implemented in P3
 
-### Plan for the remaining phases
+- Length-prefixed transcript; strict secondary signature; fresh per-session
+  HKDF keys; exact registered name/key trust; sole ordered bounded handshake.
+- Mutable non-cloneable channel with tag/sequence/direction/transcript AAD;
+  counters continue through confirmation into RPC/events/sealed keepalives.
+- Atomic duplicate rejection and generation-owned disconnect; independent
+  bounded federation failure throttling with HTTP `--no-auth` unaffected.
+- New identity table used in production; no `INSERT OR REPLACE` key theft.
+  Migration history unchanged; 0011 deletes obsolete credential records.
+- Legacy module/dependency removed; README/architecture/migration/status skill
+  updated to the actual wire contract; construction review and vectors saved.
 
-- **P3 — handshake redesign** (in progress, separate commit): introduce
-  `Challenge` / `KeyConfirm` / `Ready` handshake frames with per-direction
-  AEAD counters and explicit transcript binding; require encrypted
-  confirmation before reporting `joined`; gate the registry with
-  connection-ownership tokens. This eliminates the largest part of the
-  current `(just-takes-our-word-for-it)` weakness noted in the plan.
-- **P3 closing**: drop `sshauth.rs` once the relay + connector are
-  rewired onto `ChannelSide` and the new handshake; delete the legacy
-  `ssh_keys` table in a new forward migration.
-- **P5 — docs sweep** (separate commit): update README, ARCHITECTURE.md,
-  skills and diagrams to match the implemented CLI flags, file paths,
-  status label and handshake. The current docs already mention the new
-  naming (see prior commits) but the handshake diagram in ARCHITECTURE.md
-  is still pre-P3.
+### Explicit remaining gates
 
-### Unresolved blockers
+- Independent cryptographic review; macOS/Windows build/test and Windows key ACL
+  verification; strict project-wide fmt/clippy baseline cleanup.
+- Strict malformed saved-config diagnostics (the loader still treats parse
+  failure as an empty list; does not enable a legacy auth path).
+- Long-duration sealed-keepalive loss and Windows-specific PTY behavior are not
+  newly verified here beyond existing local suite coverage.
+- WS allocation cap is 64 MiB for supported application messages; the 4096-byte
+  handshake payload bound is enforced after assembly, before parsing. Do not
+  claim a 4096-byte pre-auth allocation bound.
 
-- P3 handshake full implementation (Challenge / Ready / KeyConfirm /
-  encrypted `Joined`) and per-direction sequence-numbered AEAD framing.
-- Schema migration that drops `ssh_keys` (and only `ssh_keys` —
-  `api_keys` is already dropped conceptually but the existing migration
-  file `0003_migrate_to_api_keys.sql` is still on disk; closing is the
-  migration that drops `ssh_keys` once the relay stops reading it).
-- macOS / Windows CI run + gated `-D warnings` clippy.
-- Auth-enabled daemon fixture with real password login + issued session
-  tokens + salt-bearing hashed cookies.
-
-### Skipped / untested behavior
-
-- Items still BLOCKED in G3, and the unchecked rows of G5/G6.
-
-**Finish rule:** declare FINISHED only when G1–G6 are PASS, required evidence
-exists, and no security, behavior, or platform blocker is outstanding.
-
-## Implementation status
-
-Phase-by-phase progress; each phase ships as its own commit with green tests.
-
-### What landed (committed)
-
-- **Plan + finish-gate documents**, recording the design and acceptance
-  contract. Decisions Q1–Q5 are resolved and incorporated.
-- Branch `feat/federation-identity` prepared from the previous baseline.
-  Existing documentation edits (`ARCHITECTURE.md`, `MIGRATION.md`,
-  `README.md`, `skills/oly/SKILL.md`) and an unrelated
-  `web/package-lock.json` churn are pre-existing — not introduced by this
-  implementation.
-- **P1 step 1 (committed)**: `src/federation_crypto.rs` introduced as a
-  sibling module to `sshauth.rs`. New parser/transcript/derive channel keys
-  + per-direction AEAD-owned state, new `identity_key{,pub}` file paths,
-  new `ed25519 <base64(raw32)>` encoding. Migration `0010`
-  (`0010_add_node_identities.sql`) adds `node_identities` without dropping
-  old tables.
-
-### Plan for the remaining phases
-
-- **P1 step 2**: switch `NodeIdentity` persistence + `daemon status` to use
-  the new `identity_key{,pub}` paths; replace the few
-  `sshauth::public_key_line` / `load_raw_seed` / `normalize_public_key`
-  callers with `federation_crypto` equivalents.
-- **P1 step 3**: replace the join-side `node_join_payload` and
-  `verify_signature` callers in `http/nodes.rs` + `daemon/rpc_nodes.rs`
-  with the new `build_transcript` / `verify_transcript` and the new public-
-  key parser.
-- **P2 (API-key removal)**: drop `Commands::ApiKey`,
-  `RpcRequest::ApiKey*`, `ApiKeySummary`, the `api_keys` table reads, and
-  the HTTP `api_key` Bearer fallback in `authorize_request`. Keep browser
-  password / login / session / cookie / WS-origin / lockout paths.
-- **P2 (CLI rename)**: `--ssh-pub-key` → `--identity-pub-key` on
-  `join start` and `node accept`; require primary identity for every join.
-- **P3 (handshake redesign)**: Challenge / KeyConfirm / Ready / encrypted
-  `Joined` plus sequence-numbered AEAD framing on top of the v2 crypto.
-  Production crypto review required before this lands.
-- **P3 closing**: migration 0011 dropping `api_keys` and `ssh_keys`;
-  delete `sshauth.rs` once the last caller is migrated.
-
-### Unresolved blockers
-
-- End-to-end handshake redesign with Challenge / Ready / KeyConfirm /
-  encrypted `Joined` and per-direction sequence-numbered AEAD.
-- API-key removal across every code path (CLI, RPC, HTTP auth, daemon
-  handlers, saved `joins.json` contents).
-- Migration that drops `api_keys` and `ssh_keys` without breaking
-  on-disk databases.
-- macOS / Windows CI runs, gated clippy + lint, full doc sweep on the
-  implemented behavior.
-
-### Skipped / untested behavior
-
-- Items in G1, G3, G5 (full rows), and the unchecked rows of G2/G4/G6.
-
-**Finish rule:** declare FINISHED only when G1–G6 are PASS, required evidence
-exists, and no security, behavior, or platform blocker is outstanding.
+**Finish rule:** this P3 checkpoint is not a claim that the whole change is
+FINISHED. Final merge readiness requires all mandatory G1–G6 evidence and no
+outstanding security/platform blocker.

@@ -219,6 +219,37 @@ pub fn start_daemon_http_with_bind(tmp: &std::path::Path, bind: &str, port: u16)
     wait_for_daemon_ready(child, tmp, &log_path, daemon_ready_timeout(false))
 }
 
+/// Actual foreground-child auth path; no new bypass or plaintext-password env.
+pub fn start_daemon_http_authenticated(
+    tmp: &std::path::Path,
+    port: u16,
+    password: &str,
+) -> DaemonGuard {
+    use argon2::{Argon2, PasswordHasher};
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes())
+        .unwrap()
+        .to_string();
+    let log_path = tmp.join("daemon-stderr.log");
+    let child = oly_cmd(tmp)
+        .args([
+            "daemon",
+            "start",
+            "--foreground-internal",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .env("OLY_AUTH_HASH_INTERNAL", hash)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log_path).unwrap())
+        .spawn()
+        .unwrap();
+    wait_for_daemon_ready(child, tmp, &log_path, daemon_ready_timeout(false))
+}
+
 pub fn start_session(tmp: &std::path::Path, cmd_and_args: &[&str]) -> String {
     let mut args = vec!["start", "--detach"];
     args.extend_from_slice(cmd_and_args);

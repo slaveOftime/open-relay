@@ -287,9 +287,10 @@ async fn dispatch_request(
         RpcRequest::JoinStop { name } => handle_join_stop(config, join_handles, name).await,
         RpcRequest::JoinList { primary } => handle_join_list(config, node_registry, primary).await,
         RpcRequest::NodeList => handle_node_list(node_registry).await,
-        RpcRequest::NodeAccept { name, identity_pub_key } => {
-            handle_node_accept(name, identity_pub_key, db).await
-        }
+        RpcRequest::NodeAccept {
+            name,
+            identity_pub_key,
+        } => handle_node_accept(name, identity_pub_key, db).await,
     };
 
     Ok(response)
@@ -652,11 +653,7 @@ async fn handle_join_start(
     name: String,
     primary_identity_pub_key: String,
 ) -> Result<RpcResponse> {
-    let join = client::join::build_join_config(
-        url,
-        name.clone(),
-        Some(primary_identity_pub_key),
-    )?;
+    let join = client::join::build_join_config(url, name.clone(), Some(primary_identity_pub_key))?;
     client::join::save_join_config(config, &join)?;
     // The connector reports its first-attempt outcome through a oneshot
     // so the IPC handler can surface `joined` / `joining` / `failed` to

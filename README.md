@@ -395,8 +395,8 @@ filtered stream is the one a user actually saw.
 
 | Command | Purpose |
 | --- | --- |
-| `oly node accept --name <name> -k <secondary-pub>` | Register a secondary's Ed25519 pub key on the primary (SSH key auth) |
-| `oly join start --name <name> --ssh-pub-key <primary-pub> <url>` | Connect this daemon to a primary (SSH key auth) |
+| `oly node accept --name <name> --identity-pub-key <secondary-pub>` | Bind a secondary name to its Ed25519 identity (`-k` is an accept-only shortcut) |
+| `oly join start --name <name> --identity-pub-key <primary-pub> <url>` | Join a primary using its independently verified identity pin |
 | `oly join stop --name <name>` | Disconnect and remove a saved join config |
 | `oly join ls` | List saved outbound join configs on this daemon |
 | `oly join ls --primary` | Ask the daemon for currently active primary-side joins |
@@ -404,86 +404,53 @@ filtered stream is the one a user actually saw.
 
 ---
 
-### Federation joining — SSH key (challenge-response, MITM protected)
+### Federation joining — Ed25519 node identity authentication
 
-Every daemon (primary *and* secondary) auto-generates its own Ed25519
-identity key on first start at `<state>/ssh_host_key{,pub}`. To join over
-SSH, the operator copies the **secondary's** identity pub key to the
-**primary** and pins the **primary's** identity pub key on the
-**secondary**.
+Every daemon generates a raw 32-byte Ed25519 seed at `<state>/identity_key`
+and publishes `<state>/identity_key.pub`. Exchange **public** identities through
+an independent trusted channel; never copy the private seed.
 
 ```bash
-# 1. Look up the identities with `oly daemon status` on each side:
-#      it prints "SSH PUB: ssh-ed25519 <base64...>" — the canonical line.
+# On each daemon: note the IDENTITY-PUB-KEY: ed25519 <base64(raw32)> line.
+oly daemon status
 
-# 2. On the primary, register the secondary's identity pub key:
-oly node accept --name myserver -k "<secondary's SSH PUB>"
+# On the primary: authorize the secondary's exact name and identity.
+oly node accept --name myserver --identity-pub-key "<secondary's public identity>"
 
-# 3. On the secondary, start the join, pinning the primary's identity:
-oly join start --name myserver --ssh-pub-key "<primary's SSH PUB>" http://192.168.1.100:15443
-```
-
-`oly join ls` on the secondary prints the canonical pub key it just signed
-with, mirroring the line on the primary. Real `ssh-keygen` public key
-lines are accepted too (in addition to the canonical internal form) and
-normalized automatically; only Ed25519 keys are supported.
-
-**`--ssh-pub-key` is the trust root.** When you start the join, the
-secondary uses this pinned pub key to derive AES-256-GCM channel keys
-(static-static X25519 ECDH against its own identity). There is **no
-in-band host-key exchange** — no `GET /api/nodes/host-key` endpoint,
-no `get_host_key` / `host_key` wire frames, no per-connection nonce.
-If the primary's identity pub key is wrong (typo, restore from a
-different backup, MITM attempt), the connector's handshake still
-completes but the post-Join channel goes silent because both sides
-derive different shared secrets.
-
-**How SSH join works under the hood:**
-
-1. The secondary opens the WebSocket and sends a `hello` frame with
-   its own Ed25519 identity pub key (so the primary can derive the
-   channel keys).
-2. The secondary signs the join payload with its own Ed25519 identity
-   key. The signed payload covers a domain tag, the claimed node
-   **name**, and the signer's **public key** — no plaintext secret
-   ever crosses the wire.
-3. The primary verifies the signature against the public key registered
-   via `oly node accept`. After accepting, both sides derive the same
-   per-direction AES-256-GCM keys from `ED25519→X25519(their pub)` and
-   switch to sealed frames for everything that follows.
-4. The primary's WebSocket layer keeps `Joined` itself in plain, so
-   the secondary can flip its own phase to Sealed only after it sees
-   the success response — sealing begins from the first frame after
-   `Joined` on both sides.
-
-The per-daemon identity key pair lives in the state dir
-(`ssh_host_key` / `ssh_host_key.pub`); when SSH join is used the *only*
-signing key is the one the daemon generated for itself — there is no
-user-managed key file and no TOFU file to hand-edit.
-
-**Combined steps for a typical pair:**
-
-```bash
-# --- On the primary ---
-oly daemon start
-
-# On the primary, capture its own identity pub key:
-oly daemon status   # note the "SSH PUB: ssh-ed25519 ..." line
-
-# --- On the secondary ---
-# A separate SSH key file is no longer required — the daemon's identity
-# key lives in its own state dir. Run `oly daemon status` to read it:
-oly daemon status   # note the "SSH PUB: ..." line
-
-# On the primary (paste the secondary's pub key):
-oly node accept --name myserver -k "<secondary's SSH PUB>"
-
-# On the secondary (pin the primary's pub key you captured above):
-oly join start --name myserver --ssh-pub-key "<primary's SSH PUB>" \
+# On the secondary: independently verify and pin the primary identity.
+oly join start --name myserver --identity-pub-key "<primary's public identity>" \
     http://192.168.1.100:15443
 ```
 
-**Reverse direction (secondary→primary commands):**
+Transport is WebSocket, **not SSH**. There is no SSH agent, system SSH identity,
+OpenSSH import, TOFU, or host-key-discovery endpoint. Only oly's canonical
+`ed25519 <standard-base64(raw32)>` encoding is accepted. Each public identity
+belongs to one registered name per primary. `oly join ls` lists saved joins,
+not identity keys; `--primary` queries the local daemon's connector inventory.
+
+**The pin and accept table are the trust anchors.** A fresh challenge does not
+replace either. The sole federation-v2 handshake is:
+
+1. Plain `Hello`: version, name, secondary identity, fresh secondary nonce.
+2. Plain `Challenge`: fresh primary nonce, never a replacement identity pin.
+3. Plain `Join`: secondary signature over a length-delimited, domain-separated
+   transcript binding version, roles, name, both identities, and both nonces.
+4. The primary verifies the exact registered name/key pair and sends encrypted
+   `KeyConfirm`. The secondary verifies it and sends encrypted `Ready`.
+5. Only after `Ready` does the primary atomically register the connection and
+   send encrypted `Joined`. Only that final acknowledgement reports success
+   to the secondary CLI. A wrong pin, replay, or missing confirmation fails
+   within the handshake deadline; no application RPC runs before success.
+
+Channel keys use static-static X25519 DH derived from the Ed25519 identities,
+with HKDF-SHA-256 salted by the transcript hash. Fresh nonces separate sessions;
+AES-256-GCM sequence numbers reject repeated or reordered frames. All application
+frames and keepalives are sealed, with no plaintext fallback. **This does not
+provide forward secrecy**: a later identity-seed compromise can expose recorded
+sessions. Identity authentication and encryption remain required with `--no-auth`,
+which disables only browser/HTTP password authentication.
+
+**Run commands on the secondary from the primary:**
 
 After joining, run commands targeting the secondary from the primary's CLI:
 

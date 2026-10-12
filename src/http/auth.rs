@@ -410,9 +410,7 @@ pub async fn require_auth(
     let token = extract_request_token_parts(request.headers(), query);
     let bearer = extract_bearer_token(request.headers());
     let client_ip = extract_request_client_ip(&request);
-    if let Some(response) =
-        authorize_request(&state, &path, token, bearer, client_ip).await
-    {
+    if let Some(response) = authorize_request(&state, &path, token, bearer, client_ip).await {
         return response;
     }
 
@@ -434,15 +432,6 @@ pub(super) async fn authorize_request(
         debug!(path = %path, "auth: authorized request (session)");
         return None;
     }
-
-    // FE Federation auth no longer uses scoped machine credentials; the only
-    // HTTP authorization path is server-issued, expiring, revocable session
-    // tokens established via password login. Anonymous Bearer strings
-    // therefore do not authorize anything. The `method` parameter is kept to
-    // mirror the future-required hook when finer-grained capability checks
-    // are reintroduced (e.g. node-only Bearer); see also `required_scope_for`
-    // which is reserved for that purpose.
-    let _ = bearer;
 
     // Federation auth no longer uses scoped machine credentials; the only
     // HTTP authorization path is server-issued, expiring, revocable session

@@ -328,7 +328,11 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
             );
         }
         Err(err) => {
-            let _ = writeln!(out, "IDENTITY-PUB-KEY:  failed to read identity pub key: {}", err);
+            let _ = writeln!(
+                out,
+                "IDENTITY-PUB-KEY:  failed to read identity pub key: {}",
+                err
+            );
         }
     }
 

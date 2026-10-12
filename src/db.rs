@@ -678,48 +678,21 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
 // ---------------------------------------------------------------------------
 
 impl Database {
-    /// Look up an SSH public key entry by its canonical key data.
-    /// Returns `(name, key_data)` if found, None otherwise.
-    pub async fn get_ssh_key_entry(&self, key_data: &str) -> Result<Option<(String, String)>> {
-        let rows = sqlx::query("SELECT name, key_data FROM ssh_keys WHERE key_data = ?1")
-            .bind(key_data)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
-    }
-
-    /// Register an identity public key for a named secondary node.
-    pub async fn insert_ssh_key_entry(&self, name: &str, key_data: &str) -> Result<()> {
-        sqlx::query("INSERT OR REPLACE INTO ssh_keys (name, key_data) VALUES (?1, ?2)")
+    /// Look up the exact identity authorized for a claimed node name.
+    pub async fn get_node_identity(&self, name: &str) -> Result<Option<(String, String)>> {
+        let rows = sqlx::query("SELECT name, public_key FROM node_identities WHERE name = ?1")
             .bind(name)
-            .bind(key_data)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Look up a registered node identity by primary key (the canonical
-    /// public-key line). Returns the registered name and the stored value
-    /// for round-trip verification, or None if not registered.
-    pub async fn get_node_identity(
-        &self,
-        key_data: &str,
-    ) -> Result<Option<(String, String)>> {
-        let rows = sqlx::query("SELECT name, public_key FROM node_identities WHERE public_key = ?1")
-            .bind(key_data)
             .fetch_optional(&self.pool)
             .await?;
         Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
     }
 
-    /// Register a named identity record. The public key is `UNIQUE`, so a
-    /// fresh valid signature by a key already registered under another name
-    /// cannot authenticate that other name (foreign-key inversion also
-    /// fails because the matching name-key pair is enforced both at lookup
-    /// and at insert).
+    /// Replace a name's key explicitly; never steal another name's key.
+    /// The UNIQUE constraint fails atomically rather than REPLACE deleting it.
     pub async fn register_node_identity(&self, name: &str, public_key: &str) -> Result<()> {
         sqlx::query(
-            "INSERT OR REPLACE INTO node_identities (name, public_key) VALUES (?1, ?2)",
+            "INSERT INTO node_identities (name, public_key) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET public_key = excluded.public_key",
         )
         .bind(name)
         .bind(public_key)
@@ -757,6 +730,89 @@ mod tests {
             .await
             .expect("open test db");
         Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn identity_upsert_cannot_steal_another_registered_name() {
+        let db = open_test_db().await;
+        db.register_node_identity("a", "key-a").await.unwrap();
+        db.register_node_identity("b", "key-b").await.unwrap();
+        assert!(db.register_node_identity("b", "key-a").await.is_err());
+        assert_eq!(db.get_node_identity("a").await.unwrap().unwrap().1, "key-a");
+        assert_eq!(db.get_node_identity("b").await.unwrap().unwrap().1, "key-b");
+        db.register_node_identity("a", "replacement").await.unwrap();
+        assert_eq!(
+            db.get_node_identity("a").await.unwrap().unwrap().1,
+            "replacement"
+        );
+        assert!(
+            db.get_node_identity("unregistered")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_cleanup_preserves_previous_schema_data_and_checksums() {
+        use sqlx::migrate::{Migrate, Migrator};
+        let path = temp_path("oly-old-schema", "db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let all = sqlx::migrate!("./migrations");
+        let old =
+            Migrator::with_migrations(all.iter().filter(|m| m.version <= 9).cloned().collect());
+        old.run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,command,status,created_at) VALUES ('keep','echo','stopped','2026-01-01T00:00:00Z')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO push_subscriptions (endpoint,p256dh,auth) VALUES ('test://keep','public','salt')").execute(&pool).await.unwrap();
+        // These are obsolete test records, never real credentials.
+        sqlx::query(
+            "INSERT INTO api_keys (name,api_key_hash) VALUES ('obsolete','isolated-fake-hash')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ssh_keys (name,key_data) VALUES ('obsolete','old-key')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        all.run(&pool).await.unwrap();
+        all.run(&pool).await.unwrap(); // also proves idempotent SQLx history validation
+        for query in [
+            "SELECT COUNT(*) FROM sessions",
+            "SELECT COUNT(*) FROM push_subscriptions",
+        ] {
+            let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 1);
+        }
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(tables.contains(&"node_identities".into()));
+        assert!(!tables.contains(&"api_keys".into()));
+        assert!(!tables.contains(&"ssh_keys".into()));
+        let mut connection = pool.acquire().await.unwrap();
+        let applied = connection
+            .list_applied_migrations("_sqlx_migrations")
+            .await
+            .unwrap();
+        for migration in old.iter() {
+            assert_eq!(
+                applied
+                    .iter()
+                    .find(|m| m.version == migration.version)
+                    .unwrap()
+                    .checksum,
+                migration.checksum
+            );
+        }
+        drop(connection);
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     fn meta(id: &str, status: SessionStatus, ended: Option<DateTime<Utc>>) -> SessionMeta {
@@ -852,12 +908,18 @@ mod tests {
         assert_eq!(search_ids(&db, "title:web").await, vec!["sess-node"]);
         // `cmd:` covers command + args, not cwd.
         assert_eq!(search_ids(&db, "cmd:python").await, vec!["sess-python"]);
-        assert_eq!(search_ids(&db, "cmd:http.server").await, vec!["sess-python"]);
+        assert_eq!(
+            search_ids(&db, "cmd:http.server").await,
+            vec!["sess-python"]
+        );
         // `cwd:` scopes to the working directory only.
         assert_eq!(search_ids(&db, "cwd:web").await, vec!["sess-node"]);
         assert_eq!(search_ids(&db, "cwd:C:/work").await.len(), 2);
         // Terms are ANDed.
-        assert_eq!(search_ids(&db, "cwd:work cmd:node").await, vec!["sess-node"]);
+        assert_eq!(
+            search_ids(&db, "cwd:work cmd:node").await,
+            vec!["sess-node"]
+        );
     }
 
     #[tokio::test]

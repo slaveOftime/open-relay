@@ -5,8 +5,9 @@ stable line remains 0.3.x on `main`.
 
 0.5.0 is a **clean break** from 0.3.x. It will not read your old session
 recordings, and old binaries will not read the new ones. Your data is
-never deleted by upgrading — but you must back it up yourself before
-switching.
+not converted or deleted by this recording change — but back it up before
+switching. Obsolete federation credentials are explicitly deleted by the
+credential-cleanup migration described below.
 
 Read this file fully before upgrading a machine that has sessions you care
 about.
@@ -40,12 +41,12 @@ honest migration instead.
 | Area | 0.3.x | 0.5.0 | What you must do |
 |---|---|---|---|
 | Session recordings | `output.log` + `events.log` per session | `journal/` directory per session (segmented, incarnation-fenced) | Nothing readable automatically; see "Preserving old recordings" below. 0.5.0 prints an explicit error for pre-0.5 sessions instead of guessing. |
-| CLI ↔ daemon protocol | IPC protocol v4 | IPC protocol **v13** | CLI and daemon must both be 0.5.0. A mismatch exits with a precise version error — no silent misbehavior. |
+| CLI ↔ daemon protocol | IPC protocol v4 | IPC protocol **v14** | CLI and daemon must both be 0.5.0. A mismatch exits with a precise version error — no silent misbehavior. |
 | Attach stream framing | base64 chunks inside JSON lines | binary frames after the JSON init line | Only relevant to tooling that spoke IPC directly; update it or pipe through the 0.5.0 CLI. |
 | Federation | 0.3.x node handshake | fenced, deadline/keepalive-driven node links (M5-2…M5-4) | All nodes must run 0.5.0; re-`join` secondaries after upgrading. No rolling mixed-version federation. |
-| SSH auth | — | optional SSH key authentication with MITM protection (M5-4) | The new flag is `--ssh-pub-key` on `oly join start`; the secondary pins the **primary's** Ed25519 identity pub key, and the operator registers the **secondary's** identity pub key on the primary via `oly node accept --name <n> -k <...>`. There is **no in-band host-key exchange** and no `GET /api/nodes/host-key` endpoint — the operator-supplied pin is the trust root and ECDH fails closed on a mismatch. Only relevant for federated deployments; local-only installs can ignore this row. |
+| Node identity auth | — | required Ed25519 identity authentication over WebSocket (federation v2) | Use `--identity-pub-key` to pin the primary on `join start` and register the secondary on `node accept`. Exchange canonical `ed25519 <base64(raw32)>` public identities independently. Fresh signed transcripts and encrypted KeyConfirm/Ready/Joined fail closed on wrong pins. No SSH transport/import, aliases, or old handshake loader. Static-static DH does not provide forward secrecy. |
 | Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed; replaced by `limits.max_journal_bytes_per_session` (live sessions) and `limits.journal_retention_days` (stopped sessions); `max_output_log_bytes` continues to be honored as an alias for `max_journal_bytes_per_session` | Delete the old keys (or leave the alias); set new keys explicitly if you want caps. Both default to `0` (unlimited) so existing behavior is preserved exactly on upgrade. |
-| API keys | one all-powerful daemon key | **removed before merge** — see "API keys removed" below | The `oly api-key` command group, the scoped-key migration step, and the `--key` flag on `oly join start` are all removed before merge to `main`. Federation is SSH-key auth only. |
+| API keys | one all-powerful daemon key | **removed before merge** — see "API keys removed" below | The `oly api-key` command group, the scoped-key migration step, and the `--key` flag on `oly join start` are all removed before merge to `main`. Federation uses node identity authentication only. |
 | Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
 | Input handling | timing heuristics for paste/keys | event-driven; paste boundaries come from bracketed-paste markers only (ADR-0003) | No action; apps that enable bracketed paste get exact paste boundaries. |
 | Detach keys | `Ctrl-]` then `d` (broken in some terminals) | `Ctrl-D` (EOT), matching the historic key contract; Ctrl-V and Shift+Insert are clipboard paste shortcuts. | No action. |
@@ -61,24 +62,25 @@ respectively) and new flags. All 0.x commands
 
 ### API keys removed
 
-The scoped API-key feature that the 0.5 line ships on this preview
-branch is **removed before this branch is merged to `main`**. The
-shared-secret `joined_by_key` flow proved not safe enough for a
-long-lived daemon that exposes the HTTP surface, and we did not want
-to keep two federation auth paths in the docs once we had a viable
-single one:
+The preview API-key feature is removed for security reasons before merge:
+there is one identity-authenticated federation path, not shared machine
+credentials that can also authorize HTTP access.
 
-- The `oly api-key {add,ls,remove}` command group is gone.
-- The `--key` / `-k` flag on `oly join start` is gone (`-k` is now
-  unused on this command; node-side identity uses `--ssh-pub-key`).
-- The accept-table entries on the primary carry **only** registered
-  SSH identity pub keys again — any keys you registered with the
-  scoped-key CLI are deleted on upgrade.
+- `oly api-key {add,ls,remove}`, their RPCs, HTTP machine-key Bearer fallback,
+  and join `--key` / `-k` are gone. Accept retains `-k` as a public-key shortcut.
+- `--identity-pub-key` replaces the old flag without an alias. New daemon
+  identities live in `identity_key` / `identity_key.pub`; old key files are
+  not moved, converted, or deleted automatically.
+- SQL migrations 0001–0009 stay unchanged. Additive migration 0010 creates
+  `node_identities`; appended migration 0011 **drops `api_keys` and `ssh_keys`**
+  without copying credentials. Session/push data and migration checksums are
+  preserved. Re-register each exact secondary name/key and re-create joins
+  using the independently verified primary pin; no mixed-version rollout.
+- Browser password login, issued Bearer **session tokens**, cookies, expiry,
+  logout and revocation remain. `--no-auth` does not disable federation auth.
 
-If you only used the API-key path during this preview, re-`join`
-every secondary over SSH once the merged build is installed. The
-operator recipe is the one in `README.md` → "Federation joining";
-there is nothing else to migrate.
+Follow README → "Federation joining" for the clean-break setup. The new
+handshake reports success only after encrypted confirmation and readiness.
 
 ## Upgrade procedure
 
@@ -123,7 +125,8 @@ oly daemon status             # should report the 0.5.0 daemon
 ```
 
 The SQLite metadata database migrates itself forward automatically (schema
-migrations are additive and applied on open). Session *recordings* are not
+history is preserved and new forward migrations are applied on open;
+credential cleanup drops only the obsolete credential tables). Session *recordings* are not
 migrated — see below.
 
 ### 5. Verify

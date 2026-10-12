@@ -56,12 +56,8 @@ pub struct AppState {
     pub auth: Option<Arc<AuthState>>,
     /// Registry of connected secondary nodes (only populated on a primary daemon).
     pub node_registry: Arc<NodeRegistry>,
-    /// Node identity used for SSH-key channel encryption. On a primary
-    /// it derives the AES-256-GCM channel keys for the post-handshake
-    /// phase using the secondary's pubkey announced in the `Hello`
-    /// frame. On a secondary it derives the matching keys using the
-    /// primary's pubkey pinned via `--ssh-pub-key`. A `disabled()`
-    /// identity causes the side to refuse SSH-key joins.
+    /// Persisted Ed25519 node identity. Disabled identities refuse federation;
+    /// HTTP `--no-auth` never bypasses identity verification or encryption.
     pub node_identity: NodeIdentity,
 }
 
@@ -74,44 +70,25 @@ pub struct AppState {
 /// - On a **primary** it derives the per-direction channel keys
 ///   (`PRIV_X * PEER_X25519_PUB` via the Ed25519→X25519 birational
 ///   map and HKDF-Expand) for the post-handshake AES-256-GCM phase.
-/// - On a **secondary** it signs the join payload
-///   (`NODE_JOIN_CONTEXT || name || pubkey`) so the primary can
-///   authenticate the secondary against the public key registered via
+/// - On a **secondary** it signs the full nonce-bound handshake transcript
+///   so the primary can authenticate the secondary against the key registered via
 ///   `oly node accept --name <n> -k <...>`, and it also participates
 ///   in the same ECDH process to derive the channel keys.
 ///
 /// Auth is end-to-end exact-pin (operator types the primary's pubkey on
-/// the secondary via `--ssh-pub-key`); there is no in-band host-key
-/// fetch, no TOFU, and no fallback. The pubkey the primary advertises
-/// is the same one `oly daemon status` prints on the primary's side.
-/// signed payload differs.
+/// the secondary via `--identity-pub-key`); no in-band trust-root discovery,
+/// TOFU, or plaintext fallback exists. Static-static DH does not provide
+/// forward secrecy.
 #[derive(Clone)]
 pub struct NodeIdentity {
-    /// Canonical public key line: `ed25519 <base64(raw32)>`.
-    public_key: String,
     /// 32-byte Ed25519 private key seed (empty when disabled).
     seed: Vec<u8>,
 }
 
 impl NodeIdentity {
-    /// A identity that cannot sign anything — used when key loading failed
-    /// at startup; SSH-key joins in either direction are then rejected.
+    /// Used when identity loading failed; federation is then rejected.
     pub fn disabled() -> Self {
-        NodeIdentity {
-            public_key: String::new(),
-            seed: Vec::new(),
-        }
-    }
-
-    /// Returns an empty slice when this identity is `disabled()`.
-    pub fn public_key_bytes(&self) -> Vec<u8> {
-        if self.public_key.is_empty() {
-            return Vec::new();
-        }
-        match crate::federation_crypto::parse_public_key(&self.public_key) {
-            Ok(pk) => pk.0.to_vec(),
-            Err(_) => Vec::new(),
-        }
+        NodeIdentity { seed: Vec::new() }
     }
 
     /// The signing key, if this identity is usable.
@@ -120,82 +97,17 @@ impl NodeIdentity {
         Some(ed25519_dalek::SigningKey::from_bytes(&seed))
     }
 
-    /// Path to `identity_key.pub` under a state dir. The filename is the
-    /// renamed-on-disk equivalent of the previous `ssh_host_key.pub`.
-    pub fn pub_key_path(state_dir: &std::path::Path) -> std::path::PathBuf {
-        crate::federation_crypto::pub_key_path(state_dir)
-    }
-
-    /// Path to `identity_key` under a state dir.
-    pub fn seed_path(state_dir: &std::path::Path) -> std::path::PathBuf {
-        crate::federation_crypto::seed_path(state_dir)
-    }
-
     /// Generate a new Ed25519 identity key or load an existing one under
     /// `state_dir`. The seed is persisted as `identity_key` (0600) and the
     /// canonical public key line as `identity_key.pub`.
     pub async fn create_or_load(state_dir: &std::path::Path) -> std::io::Result<Self> {
-        let key_path = Self::seed_path(state_dir);
-        let pub_path = Self::pub_key_path(state_dir);
-
-        let (signing_key, public_key) = if key_path.exists() {
-            // Only accept a *raw* 32-byte seed; structured files, PEM, or
-            // OpenSSH-formatted keys cannot reach this path.
-            let seed = tokio::fs::read(&key_path).await?;
-            if seed.len() != 32 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "node identity key {} has unexpected length {}",
-                        key_path.display(),
-                        seed.len()
-                    ),
-                ));
-            }
-            let arr = <[u8; 32]>::try_from(seed.as_slice())
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad seed"))?;
-            let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
-            let line = crate::federation_crypto::public_key_line(&sk);
-            (sk, line)
-        } else {
-            // Generate a fresh seed. Write the seed with private permissions
-            // before publishing the public line, so a stray read access can
-            // never observe an unencrypted / wrongly-permissioned file.
-            let mut seed_bytes = [0u8; 32];
-            rand::Rng::fill_bytes(&mut rand::rng(), &mut seed_bytes);
-            let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
-            #[cfg(unix)]
-            {
-                use std::io::Write as _;
-                use std::os::unix::fs::OpenOptionsExt as _;
-                let res = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .open(&key_path)
-                    .and_then(|mut file| {
-                        file.write_all(signing_key.to_bytes().as_slice())?;
-                        file.sync_all()
-                    });
-                if let Err(err) = res {
-                    let _ = std::fs::remove_file(&key_path);
-                    return Err(err);
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::fs::write(&key_path, signing_key.to_bytes().as_slice()).await;
-            }
-            let line = crate::federation_crypto::public_key_line(&signing_key);
-            (signing_key, line)
-        };
-
-        // Always derive the public line from the seed so the in-memory value
-        // and the .pub file stay consistent.
-        tokio::fs::write(&pub_path, format!("{public_key}\n")).await?;
+        let state_dir = state_dir.to_path_buf();
+        let (signing_key, _) = tokio::task::spawn_blocking(move || {
+            crate::federation_crypto::create_or_load_identity(&state_dir)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
         Ok(NodeIdentity {
-            public_key: public_key.clone(),
             seed: signing_key.to_bytes().to_vec(),
         })
     }
@@ -423,8 +335,7 @@ async fn serve_static_or_proxy(
         };
     if let Some(candidate) = local_candidate {
         if let Some(response) =
-            auth::authorize_request(&state, uri.path(), auth_token, bearer, client_ip)
-                .await
+            auth::authorize_request(&state, uri.path(), auth_token, bearer, client_ip).await
         {
             return response;
         }

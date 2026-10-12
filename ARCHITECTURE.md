@@ -163,39 +163,45 @@ daemon can attach to a primary as a **secondary** (`oly join start`,
 config persisted in `joins.json`, connector task reconnects with
 exponential backoff 1→60 s — `client/join.rs`, `daemon/rpc_nodes.rs`).
 
-Join handshake (WS, binary JSON; `src/sshauth.rs`, `http/nodes.rs`):
+Federation-v2 handshake (`src/federation_crypto.rs`, `http/nodes.rs`,
+`daemon/rpc_nodes.rs`; transport is WebSocket, not SSH):
 
+```text
+secondary                                     primary
+   | -- plain Hello(version,name,key,nonce) --> |
+   | <-- plain Challenge(primary_nonce) ------ |
+   | -- plain Join(signature of transcript) -->| verify exact registered name/key
+   | <-- sealed KeyConfirm(hash), s2c seq 0 --- | no registration yet
+   | -- sealed Ready(hash), c2s seq 0 --------> | atomic registry insertion
+   | <-- sealed Joined, s2c seq 1 ------------ | connector may now report success
+   | <==== sealed RPCs/events/keepalives =====> |
 ```
-secondary                                      primary
-   │ WS /api/nodes/join                          │
-   ├─ hello {public_key} ───────────────────────► │  secondary's Ed25519 pubkey
-   ├─ join {name, auth=signature} ─────────────► │  Ed25519 sig over
-   │ ◄── joined | error ─────────────────────────┤  "oly-node-join-v1"‖name‖pubkey
-   │        (no in-band host-key exchange: pin is trust root)
-   ├─ sealed frames (AES-256-GCM) ────────────────────► │  channel keys = ECDH(priv_x, peer_pub_x)
-   │                                              │  + HKDF("oly-channel-v1"‖peer_pub_ed
-   │                                              │  ‖self_pub_ed‖"c2s"‖"s2c")
-   │  keepalive: primary pings every 15 s; node dropped after 45 s silent
-```
 
+Each daemon persists `identity_key` (32-byte Ed25519 seed) and
+`identity_key.pub` (`ed25519 <standard-base64(raw32)>`). Operators independently
+exchange public identities: accept binds the secondary name/key in
+`node_identities`, and `--identity-pub-key` pins the primary on the secondary.
+There is no in-band replacement key, OpenSSH import, or plaintext fallback.
+The transcript length-prefixes its domain, version, role labels, name, both
+raw identities, and both fresh 32-byte nonces. The primary verifies the
+secondary's strict Ed25519 signature; encrypted confirmation proves matching
+key possession in both directions. Wrong pins fail before connector success.
 
-Both primary and secondary daemons auto-generate an Ed25519 identity
-key at first start (`<state>/ssh_host_key` / `.pub`); the same file
-serves as the channel-encryption identity on both ends of the
-federated connection. Operators exchange pub keys manually (the
-line is shown by `oly daemon status` on each side, registered into
-the accept-table on the primary via `oly node accept --name <n> -k
-<...>`, and pinned into the secondary via `oly join start
---ssh-pub-key <...>`). There is **no in-band host-key exchange** —
-out-of-band pinning is the trust root. If the operator types a
-wrong primary pub key into `oly join start`, the post-Join ECDH
-channel silently breaks (no warning, just a dead socket). That
-trade-off is deliberate: the previous in-band host-key flow added
-an unnecessary MITM probe (a published pubkey can be substituted in
-transit by an active attacker; the signed challenge was redundant
-once the operator already pins a value). Channel encryption +
-the operator-typed pin + the primary's accept-table are the
-authoritative trust triplet.
+Static-static X25519 DH (converted from Ed25519) feeds HKDF-SHA-256 with the
+transcript hash as salt and identity/direction-bound info. This provides fresh
+session keys and **not forward secrecy**. Frames are `[0x21, seq:u64 BE,
+ciphertext, GCM tag:16]`; nonce is `[0;4] || seq_be`, and AAD binds the domain,
+transcript hash, direction, tag and sequence. Non-cloneable mutable channel
+state requires the next receive sequence, commits it only after authenticated
+parsing, and terminates on failure or counter exhaustion.
+
+A 5-second overall handshake deadline and 4096-byte handshake payload cap
+apply on each side; WS message/frame allocation is additionally capped at
+64 MiB for application traffic. Cancellation interrupts connector handshake
+IO and retry backoff. Registration is atomic after encrypted readiness;
+generation-scoped disconnect cannot evict a newer connection. Federation
+failure throttling is independent of browser authentication. Primary sealed
+pings run every 15 s; only authenticated frames refresh the 45 s liveness clock.
 
 Once joined, exactly three flows run over the one WS connection
 (`NodeWsMessage`, `src/protocol.rs`):
@@ -239,15 +245,9 @@ browser / CLI ──WS──► primary ws.rs ── NodeRegistry::proxy_rpc_str
 
 Federation rules to preserve:
 
-- **Auth happens once, at join.** The secondary's join payload is
-  signed by its Ed25519 identity key; the primary verifies it over
-  `"oly-node-join-v1"‖name‖pubkey` against the public key registered
-  in the accept-table (no in-band nonce: the trust root is the
-  operator-typed pin, exercised post-Join via the channel ECDH). The
-  shared-secret / API-key flow was rolled back before this branch
-  was merged to `main` — see `MIGRATION.md` and the federation recipe
-  in `README.md`. Join attempts are rate-limited and IP-locked on the
-  primary regardless of method.
+- **Identity auth happens once, at join.** The exact registered name/key,
+  fresh signed transcript, and mutual encrypted confirmation are all required
+  even with HTTP `--no-auth`. No API-key or alternate credential branch remains.
 - **The owning node is the only authority on its sessions.** The
   primary routes and displays; it never bypasses the secondary's lease
   or credit checks — everything goes through that node's own daemon.
@@ -258,7 +258,7 @@ Federation rules to preserve:
 Where to look: `src/node/registry.rs` (NodeRegistry, proxy_*),
 `src/daemon/rpc_nodes.rs` (secondary connector, nested-IPC relay,
 allowlists), `src/http/nodes.rs` (join endpoint, keepalive, event
-tagging), `src/sshauth.rs` (channel-key derivation + signature
+tagging), `src/federation_crypto.rs` (channel-key derivation + signature
 helpers), `src/client/join.rs` (join config + CLI).
 
 ## The invariants that matter

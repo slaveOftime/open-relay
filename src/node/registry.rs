@@ -46,9 +46,22 @@ pub struct NodeHandle {
     pub pending: Arc<Mutex<HashMap<String, PendingRpc>>>,
 }
 
+struct RegisteredNode {
+    generation: uuid::Uuid,
+    handle: NodeHandle,
+}
+
+impl std::ops::Deref for RegisteredNode {
+    type Target = NodeHandle;
+    fn deref(&self) -> &NodeHandle {
+        &self.handle
+    }
+}
+
 /// Tracks all connected secondary nodes on the primary.
 pub struct NodeRegistry {
-    nodes: Mutex<HashMap<String, NodeHandle>>,
+    nodes: Mutex<HashMap<String, RegisteredNode>>,
+    join_failures: Mutex<HashMap<std::net::IpAddr, (std::time::Instant, u32)>>,
     /// Deadline applied to one-shot proxied RPCs (test-overridable).
     rpc_timeout: Duration,
     /// Session-event broadcaster used to publish `node_state` when the
@@ -62,6 +75,7 @@ impl NodeRegistry {
     pub fn new() -> Self {
         Self {
             nodes: Mutex::new(HashMap::new()),
+            join_failures: Mutex::new(HashMap::new()),
             rpc_timeout: NODE_RPC_TIMEOUT,
             event_tx: std::sync::OnceLock::new(),
         }
@@ -71,6 +85,7 @@ impl NodeRegistry {
     pub(crate) fn with_rpc_timeout(rpc_timeout: Duration) -> Self {
         Self {
             nodes: Mutex::new(HashMap::new()),
+            join_failures: Mutex::new(HashMap::new()),
             rpc_timeout,
             event_tx: std::sync::OnceLock::new(),
         }
@@ -88,10 +103,16 @@ impl NodeRegistry {
         self.event_tx.get()
     }
 
-    /// Register a newly-connected secondary node.
-    pub async fn connect(&self, name: String, handle: NodeHandle) {
+    /// Atomic check-and-insert. Returns the connection's removal authority.
+    pub async fn connect(&self, name: String, handle: NodeHandle) -> Result<uuid::Uuid> {
         let mut nodes = self.nodes.lock().await;
-        nodes.insert(name.clone(), handle);
+        if nodes.contains_key(&name) {
+            return Err(AppError::Protocol(format!(
+                "name '{name}' is already connected"
+            )));
+        }
+        let generation = uuid::Uuid::new_v4();
+        nodes.insert(name.clone(), RegisteredNode { generation, handle });
         if let Some(tx) = self.event_tx() {
             let _ = tx.send(SessionEvent::NodeState {
                 node: name,
@@ -99,11 +120,18 @@ impl NodeRegistry {
                 last_seen: Some(chrono::Utc::now().timestamp()),
             });
         }
+        Ok(generation)
     }
 
-    /// Remove a secondary node (called on WS disconnect).
-    pub async fn disconnect(&self, name: &str) {
+    /// A stale task must not remove a newer connection under the same name.
+    pub async fn disconnect(&self, name: &str, generation: uuid::Uuid) {
         let mut nodes = self.nodes.lock().await;
+        if !nodes
+            .get(name)
+            .is_some_and(|node| node.generation == generation)
+        {
+            return;
+        }
         nodes.remove(name);
         if let Some(tx) = self.event_tx() {
             let _ = tx.send(SessionEvent::NodeState {
@@ -111,6 +139,23 @@ impl NodeRegistry {
                 connected: false,
                 last_seen: None,
             });
+        }
+    }
+
+    /// Bounded failure window independent of optional HTTP password auth.
+    pub async fn join_rate_limited(&self, ip: std::net::IpAddr) -> bool {
+        let mut failures = self.join_failures.lock().await;
+        failures.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+        failures.get(&ip).is_some_and(|(_, count)| *count >= 8)
+            || (failures.len() >= 1024 && !failures.contains_key(&ip))
+    }
+
+    pub async fn record_join_failure(&self, ip: std::net::IpAddr) {
+        let mut failures = self.join_failures.lock().await;
+        failures.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+        if failures.len() < 1024 || failures.contains_key(&ip) {
+            let (_, count) = failures.entry(ip).or_insert((std::time::Instant::now(), 0));
+            *count = count.saturating_add(1);
         }
     }
 
@@ -234,6 +279,7 @@ impl NodeRegistry {
     }
 
     /// Returns `true` if `name` is currently connected.
+    #[cfg(test)]
     pub async fn is_connected(&self, name: &str) -> bool {
         let nodes = self.nodes.lock().await;
         nodes.contains_key(name)
@@ -281,7 +327,7 @@ mod tests {
         let registry = NodeRegistry::with_rpc_timeout(Duration::from_millis(50));
         let (handle, _send_rx) = fake_handle(); // receiver held, never answered
         let pending = Arc::clone(&handle.pending);
-        registry.connect("worker".into(), handle).await;
+        registry.connect("worker".into(), handle).await.unwrap();
 
         let err = registry
             .proxy_rpc("worker", &RpcRequest::Health)
@@ -302,7 +348,7 @@ mod tests {
         let registry = NodeRegistry::new();
         let (handle, _send_rx) = fake_handle();
         let pending = Arc::clone(&handle.pending);
-        registry.connect("worker".into(), handle).await;
+        let generation = registry.connect("worker".into(), handle).await.unwrap();
 
         let (one_shot_tx, one_shot_rx) = oneshot::channel();
         pending
@@ -315,7 +361,7 @@ mod tests {
             .await
             .insert("rpc-2".into(), PendingRpc::Stream(stream_tx));
 
-        registry.disconnect("worker").await;
+        registry.disconnect("worker", generation).await;
         // Mirror the relay-loop drain (http/nodes.rs): waiters are failed
         // loudly on disconnect.
         {
@@ -353,15 +399,15 @@ mod tests {
     async fn reconnect_routes_to_the_new_generation() {
         let registry = NodeRegistry::new();
         let (old_handle, mut old_rx) = fake_handle();
-        registry.connect("worker".into(), old_handle).await;
-        registry.disconnect("worker").await;
+        let generation = registry.connect("worker".into(), old_handle).await.unwrap();
+        registry.disconnect("worker", generation).await;
         assert!(
             old_rx.try_recv().is_err(),
             "stale generation must not receive traffic"
         );
 
         let (new_handle, mut new_rx) = fake_handle();
-        registry.connect("worker".into(), new_handle).await;
+        registry.connect("worker".into(), new_handle).await.unwrap();
         // Fire-and-forget: the message must land on the new generation's
         // channel even though nothing answers it.
         let registry_ref = &registry;
@@ -374,6 +420,58 @@ mod tests {
             _ = &mut send => panic!("RPC resolved before any response"),
         }
         assert!(old_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn duplicate_insert_is_atomic_and_stale_cleanup_is_inert() {
+        let registry = NodeRegistry::new();
+        let (events, mut rx) = broadcast::channel(16);
+        registry.bind_event_tx(events);
+        let (a, _) = fake_handle();
+        let (b, _) = fake_handle();
+        let (one, two) = tokio::join!(
+            registry.connect("worker".into(), a),
+            registry.connect("worker".into(), b)
+        );
+        assert_ne!(one.is_ok(), two.is_ok());
+        let generation = one.or(two).unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SessionEvent::NodeState {
+                connected: true,
+                ..
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate cannot publish another success"
+        );
+        registry.disconnect("worker", generation).await;
+        let (next, _) = fake_handle();
+        let next_generation = registry.connect("worker".into(), next).await.unwrap();
+        registry.disconnect("worker", generation).await;
+        assert!(
+            registry.is_connected("worker").await,
+            "stale task removed new owner"
+        );
+        registry.disconnect("worker", next_generation).await;
+        assert!(!registry.is_connected("worker").await);
+    }
+
+    #[tokio::test]
+    async fn federation_failure_limit_does_not_need_browser_auth() {
+        let registry = NodeRegistry::new();
+        let ip = "127.0.0.1".parse().unwrap();
+        for _ in 0..8 {
+            assert!(!registry.join_rate_limited(ip).await);
+            registry.record_join_failure(ip).await;
+        }
+        assert!(registry.join_rate_limited(ip).await);
+        assert!(
+            !registry
+                .join_rate_limited("127.0.0.2".parse().unwrap())
+                .await
+        );
     }
 
     /// Journal-backed reads get the extended deadline; everything else

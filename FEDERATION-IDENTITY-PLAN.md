@@ -1,6 +1,9 @@
 # Federation identity cleanup — implementation plan
 
-Status: **planned, not implemented**. Final acceptance is defined in
+Status: **P1/P2 and P3 implemented locally; final release gates remain blocked**.
+P3 construction and regression evidence are recorded in
+[FEDERATION-IDENTITY-P3-REVIEW.md](FEDERATION-IDENTITY-P3-REVIEW.md).
+Final acceptance is defined in
 [FEDERATION-IDENTITY-FINISH-GATE.md](FEDERATION-IDENTITY-FINISH-GATE.md).
 
 ## Scope and decisions
@@ -126,8 +129,9 @@ these choices rather than introducing additional compatibility alternatives.
    plaintext-password environment variable or new startup flag for this fixture.
    Interactive password-prompt UI can be checked separately through a PTY.
 3. **Database cleanup:** leave migrations 0001–0009 byte-for-byte unchanged and
-   append `0010_federation_node_identities.sql`. Create `node_identities`, drop
-   `api_keys` and `ssh_keys`, and do not copy any legacy credentials. Preserve
+   append `0010_add_node_identities.sql` to create `node_identities`, then
+   `0011_drop_legacy_node_credentials.sql` to drop `api_keys` and `ssh_keys`
+   once all readers are removed. Do not copy any legacy credentials. Preserve
    session, push-subscription, and other unrelated tables/records. Test both
    empty-database initialization and an isolated database with migrations
    0001–0009 already applied. This avoids SQLx missing/checksum failures without
@@ -183,14 +187,14 @@ Files: `src/sshauth.rs` → `src/federation_crypto.rs`, `src/http/mod.rs`,
 - Derive the public file from the persisted seed. A corrupt/inaccessible seed
   disables federation with a clear error; never replace it silently or fall
   back to unauthenticated federation. Local-only operation may remain available.
-- Append `0010_federation_node_identities.sql`; preserve all existing migration
+- Append `0010_add_node_identities.sql`; preserve all existing migration
   files unchanged. Create `node_identities` with `name TEXT PRIMARY KEY`,
   `public_key TEXT NOT NULL UNIQUE`, and a creation timestamp. A public key
   identifies one registered name per primary; do not retain wildcard names.
 - Implement accept-table lookup by claimed name and exact canonical key match.
   Use an explicit upsert on the name, not broad `INSERT OR REPLACE` semantics;
   attempts to bind a key already owned by another name must fail clearly.
-- In migration 0010, drop `api_keys` and `ssh_keys` without copying old records.
+- In migration 0011, drop `api_keys` and `ssh_keys` without copying old records.
   Keep historical migrations 0003, 0007, and 0008 unchanged. Verify SQLx applies
   the complete sequence to an empty database and to a previous-schema fixture,
   preserving unrelated session/push records and applied migration checksums.
@@ -336,7 +340,7 @@ other affected skills/help, and the two plan/gate documents.
 - Record API-key removal for security reasons before merge to `master` in
   migration notes; include the HTTP machine-key path, not only node joins.
   Describe the clean-break setup using new daemon identities and registrations.
-  Explain exactly that migration 0010 drops old credential tables without
+  Explain exactly that migration 0011 drops old credential tables without
   converting their records; unrelated session/push data is preserved. Old key
   files/configs are not automatically moved, converted, or deleted.
 - Replace the current migration prose claiming broader automatic state deletion
