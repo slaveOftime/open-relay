@@ -676,6 +676,33 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         "updated title must be stored on the secondary"
     );
 
+    // Inspection must relay to the owning daemon and keep its path/node.
+    for args in [
+        vec!["info", session_id.as_str(), "--node", "worker1", "--json"],
+        vec!["info", "--node", "worker1", "--json"],
+    ] {
+        let output = oly_cmd(&primary_tmp).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(info["id"], session_id);
+        assert_eq!(info["node"], "worker1");
+        assert_eq!(info["title"], "Remote title");
+        assert_eq!(info["tags"], json!(["remote", "edited"]));
+        assert_eq!(info["notifications_enabled"], false);
+        assert_eq!(info["status"], "running");
+        assert!(info["journal_incarnation"].is_u64());
+        assert!(
+            info["session_dir"]
+                .as_str()
+                .unwrap()
+                .contains(&secondary_tmp.to_string_lossy().to_string())
+        );
+    }
+
     const REMOTE_MARKER: &str = "oly_federation_remote_marker";
     let input = oly_cmd(&primary_tmp)
         .args([

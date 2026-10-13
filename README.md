@@ -91,6 +91,9 @@ oly start copilot
 # See what's running
 oly ls
 
+# Inspect a session's full metadata and runtime details
+oly info <id>
+
 # Check recent output and optionally wait for an input-needed checkpoint
 oly logs <id> --wait prompt --timeout 1m
 
@@ -106,7 +109,7 @@ oly stop <id>
 
 Useful behavior to know:
 
-- `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
+- `oly info`, `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
 - To detach from an attached session, press `Ctrl-D`.
 - Attaching (CLI or browser) controls the session by default and resizes it to the attaching client's viewport. Any number of attached clients can drive input at the same time; geometry follows the most recent successful resize. Use `oly attach --observe` for a view-only attach that never drives input or geometry.
 - Resizing an attached terminal window reports the new size to the daemon and resizes the session (controllers only — an observer's resize is gated out). When several controllers resize, the last successful resize wins.
@@ -259,6 +262,7 @@ oly logs --node worker-1 --wait prompt <id>
 | `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
 | `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
 | `oly ls [--search <text>] [--tag <tag>]... [--json] [--follow] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-all] [--node-local]` | List sessions |
+| `oly info [id] [--color <auto\|always\|never>] [--json] [--node <name>]` | Show complete session metadata, process, activity, terminal, and journal details |
 | `oly attach [id] [--observe] [--node <name>]` | Reattach to a session (controls it by default; `--observe` is view-only) |
 | `oly logs [id] [--tail <n>] [--screen] [--tail-frames <n>] [--wait <condition>] [--match <regex>] [--idle-for <duration>] [--since <token>] [--limit-bytes <n>] [--cursor] [--color <auto\|always\|never>] [--json] [--timeout <duration>] [--node <name>]` | Read recorded output, optionally after a gate, and hand back a cursor token for the next read |
 | `oly export [id] [--json] [--node <name>]` | Dump the canonical filtered byte stream, control sequences and all, for files and pipes |
@@ -278,6 +282,41 @@ The interactive view can monitor several nodes at once, for example `oly ls --fo
 Use `Ctrl+G` to switch between the compact table and a working-directory tree. Tree rows show status and ID, then **title before command**, followed immediately by compact start age, output bytes, and numeric rate before the command. Long titles, commands, node names, and folder labels use ellipses; narrow terminals drop command details and activity charts before identity information. Idle flat charts and padded title/command slots are omitted. Deep tree indentation is shortened when necessary to keep the session title visible. Commands display the executable basename rather than its installation path; this changes only the presentation, not how sessions launch. Footer hints adapt to the available width and current view.
 
 Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `key:esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, modifier forms like `key:ctrl+c`, `key:alt+x`, `key:meta+enter`, `key:shift+tab`, and raw bytes via `key:hex:...`.
+
+### Inspecting a session: `oly info`
+
+```sh
+oly info                          # most recently created session
+oly info <id>                     # inspect an exact session ID
+oly info <id> --node worker-1      # inspect a session on its owning node
+oly info <id> --color always       # retain ANSI styles in a pipe
+oly info <id> --json               # one complete machine-readable object
+```
+
+The default view uses aligned, untruncated values grouped into session,
+process, timing/activity, terminal, and storage/journal sections. It includes
+command and individual arguments, working directory, PID, exit code, resume
+command, timestamps, runtime, input-needed and notification settings, filtered
+output bytes, terminal geometry and colors, attached clients, session directory,
+journal incarnation, and available retention counters/limits.
+
+Running sessions are green, pending/stopping states and input-needed hints are
+yellow, and failed/killed states and nonzero exit codes are red. `--color auto`
+colors only terminal output and honors nonempty `NO_COLOR` and `TERM=dumb`;
+`--color never` disables styling. Metadata control characters are escaped so
+child-provided titles cannot inject terminal commands.
+
+Stopped/evicted sessions remain inspectable from persisted metadata. Unavailable
+values appear as `—`; live-only geometry, last-output timestamps, and retention
+counters may be unavailable after eviction or daemon restart. The session
+directory is a path on the owning daemon, including when `--node` is used.
+
+`--json` never emits ANSI styling. It returns a single flat object using the
+session summary field names (`args`, `cwd`, `last_total_bytes`, etc.), plus
+`exit_code`, `session_dir`, and `journal_incarnation`. Optional summary fields
+may be null or omitted when unavailable. This command inspects metadata; use
+`oly logs` or `oly export` for recorded output. The owning daemon must be running
+and support `info`; unknown IDs fail with a nonzero exit code.
 
 ### Reading session output: `oly logs`
 

@@ -132,6 +132,15 @@ async fn dispatch_request(
             handle_daemon_stop(grace_seconds, session_store, shutdown_tx).await
         }
         RpcRequest::List { query } => handle_list(query, session_store, db).await?,
+        RpcRequest::SessionInfo { id } => match session_store.session_info(&id).await {
+            Ok(Some(info)) => RpcResponse::SessionInfo { info },
+            Ok(None) => RpcResponse::Error {
+                message: format!("session not found: {id}"),
+            },
+            Err(err) => RpcResponse::Error {
+                message: err.to_string(),
+            },
+        },
         RpcRequest::Start {
             title,
             tags,

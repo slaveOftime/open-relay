@@ -220,6 +220,7 @@ async fn run() -> Result<()> {
         },
 
         Commands::List(list_args) => client::run_list(&config, list_args).await,
+        Commands::Info(args) => client::run_info(&config, args).await,
 
         Commands::Start(start_args) => {
             let cli::StartArgs {

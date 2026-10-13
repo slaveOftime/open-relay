@@ -11,7 +11,7 @@ use crate::{
     db::meta_to_summary,
     error::AppError,
     error::Result,
-    protocol::{ListQuery, SessionSummary},
+    protocol::{ListQuery, SessionInfo, SessionSummary},
     session::{SessionEvent, validate_session_metadata_update},
 };
 
@@ -110,6 +110,46 @@ impl SessionStore {
         }
 
         Ok(sessions)
+    }
+
+    /// Inspect one exact ID. Live fields share a runtime read lock; evicted
+    /// sessions use persisted metadata and the cached journal byte count.
+    pub async fn session_info(&self, id: &str) -> Result<Option<SessionInfo>> {
+        if let Some(info) = self.live_session_info(id) {
+            return Ok(Some(info));
+        }
+        let Some(meta) = self.db.get_session(id).await? else {
+            return Ok(None);
+        };
+        let dir = self.db.session_dir_by_id(id);
+        let total_bytes = self.persisted_filtered_len(id).await.unwrap_or(0);
+        let journal_dir = dir.clone();
+        let incarnation = tokio::task::spawn_blocking(move || disk_incarnation(&journal_dir))
+            .await
+            .map_err(|err| AppError::Protocol(format!("session info worker failed: {err}")))?;
+        // A runtime may have appeared while the persisted reads were in flight.
+        if let Some(info) = self.live_session_info(id) {
+            return Ok(Some(info));
+        }
+        Ok(Some(SessionInfo {
+            summary: meta_to_summary(&meta, false, total_bytes),
+            exit_code: meta.exit_code,
+            session_dir: dir.to_string_lossy().into_owned(),
+            journal_incarnation: incarnation,
+        }))
+    }
+
+    fn live_session_info(&self, id: &str) -> Option<SessionInfo> {
+        let sessions = self.sessions.load();
+        let rt = sessions.get(id)?.read();
+        let mut summary = rt.to_summary();
+        summary.last_total_bytes = rt.filtered_stream_len();
+        Some(SessionInfo {
+            summary,
+            exit_code: rt.meta.exit_code,
+            session_dir: rt.dir.to_string_lossy().into_owned(),
+            journal_incarnation: rt.journal_incarnation(),
+        })
     }
 
     pub fn get_summary(&self, id: &str) -> Option<SessionSummary> {
@@ -389,6 +429,55 @@ mod tests {
     use chrono::Utc;
 
     use std::time::Duration;
+    #[tokio::test]
+    async fn session_info_reads_live_fields_without_changing_metadata() {
+        let rt = make_runtime("info-live", SessionStatus::Running, "hello", None);
+        {
+            let mut locked = rt.write();
+            locked.meta.title = Some("live title".into());
+            locked.meta.exit_code = Some(7);
+            locked.pty_size = Some((30, 100));
+        }
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let info = store.session_info("info-live").await.unwrap().unwrap();
+        assert_eq!(info.summary.title.as_deref(), Some("live title"));
+        assert_eq!(info.summary.last_total_bytes, 5);
+        assert_eq!(info.summary.rows, Some(30));
+        assert_eq!(info.summary.cols, Some(100));
+        assert_eq!(info.exit_code, Some(7));
+        assert_eq!(info.session_dir, rt.read().dir.to_string_lossy());
+        assert_eq!(rt.read().meta.title.as_deref(), Some("live title"));
+        assert!(store.session_info("missing").await.unwrap().is_none());
+        assert!(store.session_info("info").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_info_reads_persisted_metadata_and_journal() {
+        let db = make_test_db().await;
+        let mut meta = make_runtime("info-persisted", SessionStatus::Stopped, "", None)
+            .read()
+            .meta
+            .clone();
+        meta.exit_code = Some(9);
+        meta.resume_command = Some("agent resume example".into());
+        // Use a unique ID because this fixture DB's session root is the temp dir.
+        meta.id = format!("info-{}", uuid::Uuid::new_v4());
+        db.insert_session(&meta).await.unwrap();
+        let dir = db.session_dir_by_id(&meta.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_journal_output(&dir, b"saved output\n");
+        let store = store_with(vec![], db);
+        let info = store.session_info(&meta.id).await.unwrap().unwrap();
+        assert_eq!(info.summary.status, "stopped");
+        assert_eq!(info.summary.resume_command, meta.resume_command);
+        assert_eq!(info.summary.last_total_bytes, 13);
+        assert_eq!(info.summary.rows, None);
+        assert_eq!(info.exit_code, Some(9));
+        assert!(info.journal_incarnation.is_some());
+        assert_eq!(info.session_dir, dir.to_string_lossy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn render_live_logs_uses_runtime_screen_tail() {
         let runtime = make_runtime(

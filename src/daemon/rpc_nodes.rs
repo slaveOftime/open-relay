@@ -493,6 +493,7 @@ fn is_supported_proxied_rpc(request: &RpcRequest) -> bool {
         RpcRequest::Health
             | RpcRequest::List { .. }
             | RpcRequest::Start { .. }
+            | RpcRequest::SessionInfo { .. }
             | RpcRequest::SessionMetadataSet { .. }
             | RpcRequest::NotifySet { .. }
             | RpcRequest::NotifySend { .. }
@@ -956,6 +957,7 @@ mod tests {
     #[test]
     fn session_scoped_methods_are_proxyable() {
         for req in [
+            RpcRequest::SessionInfo { id: "s".into() },
             RpcRequest::SessionMetadataSet {
                 id: "s".into(),
                 title: Some("new title".into()),

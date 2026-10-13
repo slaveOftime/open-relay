@@ -67,6 +67,8 @@ pub enum Commands {
     /// List sessions. Order is most recently created last.
     #[command(name = "ls")]
     List(ListArgs),
+    /// Show complete metadata and runtime details for a session.
+    Info(InfoArgs),
     /// Start a new session from an existing session's persisted launch metadata.
     Restart(RestartArgs),
     /// Stop a session by ID.
@@ -232,6 +234,21 @@ pub struct ListArgs {
     /// Include the current (or primary) daemon; already included by --node-all.
     #[arg(long)]
     pub node_local: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InfoArgs {
+    /// Session ID to inspect. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Print machine-readable JSON instead of the formatted details.
+    #[arg(long)]
+    pub json: bool,
+    /// Colorize details (auto honors NO_COLOR and disables color for pipes).
+    #[arg(long, value_enum, default_value = "auto")]
+    pub color: ColorMode,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -698,6 +715,38 @@ mod tests {
     };
     use clap::Parser;
     use std::ffi::OsString;
+
+    #[test]
+    fn info_parses_defaults_and_output_options() {
+        let cli = Cli::try_parse_from(["oly", "info"]).unwrap();
+        let Commands::Info(args) = cli.command else {
+            panic!("expected info command");
+        };
+        assert_eq!(args.id, None);
+        assert_eq!(args.node, None);
+        assert!(!args.json);
+        assert_eq!(args.color, super::ColorMode::Auto);
+
+        let cli = Cli::try_parse_from([
+            "oly",
+            "info",
+            "session-1",
+            "--node",
+            "worker-a",
+            "--json",
+            "--color",
+            "never",
+        ])
+        .unwrap();
+        let Commands::Info(args) = cli.command else {
+            panic!("expected info command");
+        };
+        assert_eq!(args.id.as_deref(), Some("session-1"));
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
+        assert!(args.json);
+        assert_eq!(args.color, super::ColorMode::Never);
+        assert!(Cli::try_parse_from(["oly", "info", "--color", "invalid"]).is_err());
+    }
 
     #[test]
     fn restart_parses_required_id_force_and_node() {

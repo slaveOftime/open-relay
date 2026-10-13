@@ -227,6 +227,9 @@ pub enum RpcRequest {
         #[serde(default)]
         disable_notifications: bool,
     },
+    SessionInfo {
+        id: String,
+    },
     SessionMetadataSet {
         id: String,
         title: Option<String>,
@@ -421,6 +424,7 @@ impl RpcRequest {
             RpcRequest::DaemonStop { .. } => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
+            RpcRequest::SessionInfo { .. } => "session_info",
             RpcRequest::SessionMetadataSet { .. } => "session_metadata_set",
             RpcRequest::NotifySet { .. } => "notify_set",
             RpcRequest::NotifySend { .. } => "notify_send",
@@ -495,6 +499,9 @@ pub enum RpcResponse {
     },
     Session {
         summary: SessionSummary,
+    },
+    SessionInfo {
+        info: SessionInfo,
     },
     /// Sent once after AttachSubscribe: a terminal-state snapshot describing the
     /// current visible screen, followed by terminal mode flags.
@@ -766,6 +773,15 @@ mod tests {
     };
 
     #[test]
+    fn session_info_protocol_round_trips_and_names_request() {
+        let request = RpcRequest::SessionInfo { id: "s1".into() };
+        assert_eq!(request.name(), "session_info");
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RpcRequest::SessionInfo { id } if id == "s1"));
+    }
+
+    #[test]
     fn mouse_protocol_round_trips_a_compact_spec() {
         let request = RpcRequest::AttachMouse {
             id: "s".into(),
@@ -911,6 +927,17 @@ mod tests {
             other => panic!("unexpected decoded message: {other:?}"),
         }
     }
+}
+
+/// Full session inspection, including fields absent from list summaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    #[serde(flatten)]
+    pub summary: SessionSummary,
+    pub exit_code: Option<i32>,
+    /// Path on the owning daemon, not necessarily on the CLI's machine.
+    pub session_dir: String,
+    pub journal_incarnation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
