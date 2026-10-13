@@ -2,8 +2,7 @@
 --
 -- This migration only creates the `node_identities` table. Dropping the old
 -- `api_keys` and `ssh_keys` tables happens in a later migration (or PR)
--- once every reader of those tables is gone. See FEDERATION-IDENTITY-PLAN.md
--- for the sequence.
+-- once every reader of those tables is gone.
 --
 -- Schema choice:
 --   * `name` is the PRIMARY KEY (an operator-supplied primary identifier
