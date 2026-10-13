@@ -8,8 +8,9 @@ description: Use when reading or updating oly daemon configuration, checking hot
 Configuration lives at `<STATE_DIR>/config.json`. Read the current file before
 editing; preserve unrelated fields and generated secrets. It is **flat JSON**,
 not JSON-with-comments and not nested under `limits`, `notify`, or `web_push`.
-Unknown keys are ignored, so successful JSON parsing does not prove a setting
-was applied. Confirm the reload diff and observable behavior.
+Unknown keys are ignored **with a warning naming each key**, so successful
+JSON parsing does not prove a setting was applied. Confirm the reload diff and
+observable behavior.
 
 ## Locate state and understand precedence
 
@@ -49,12 +50,13 @@ The daemon polls file mtime every **2 seconds**. A valid changed file replaces
 the live snapshot and applies reload side effects. Read/JSON errors, removed byte-cap keys, and invalid
 resume rules preserve the last good configuration; another file edit retries.
 The same invalid file now fails startup rather than silently loading defaults.
-Invalid **prompt** regexes are instead skipped with a warning during compilation.
+Invalid prompt and resume regexes now reject startup/reload rather than being
+silently skipped. Startup cannot fall back to defaults on an invalid existing file.
 
 | Flat JSON key | Default | When it takes effect |
 |---|---|---|
 | `http_bind` | `127.0.0.1` | Restart required; existing listener is not rebound |
-| `http_port` | `15443` | Restart required |
+| `http_port` | `15443` | Restart required; 1..65535 |
 | `notification_min_interval_seconds` | `10` | Live; minimum 1 second |
 | `notification_hook` | none | Live; channels rebuilt on reload; null/empty disables hook |
 | `prompt_patterns` | `DEFAULT_PROMPT_PATTERNS` below | Live on monitor tick; `[]` disables regex matching only |
@@ -64,12 +66,16 @@ Invalid **prompt** regexes are instead skipped with a warning during compilation
 | `web_push_vapid_private_key` | generated on first load | Live; channels rebuilt; secret |
 | `web_push_proxy` | none | Live subject to CLI/environment overrides |
 | `log_level` | `info` | Live tracing-filter reload |
-| `max_running_sessions` | `50` | Sampled at session start |
+| `max_running_sessions` | `50` | Sampled at session start; 0..1000; 0 blocks new sessions |
 | `session_eviction_seconds` | `15` | Live runtime-eviction delay; minimum 1 second |
-| `screen_scrollback_rows` | `5000` | New session engines; existing engines keep their configured retention |
+| `screen_scrollback_rows` | `5000` | New session engines; 0..100000; existing engines retain their setting |
 | `silence_seconds` | `10` | Live silence fallback; minimum 1 second |
 | `stop_grace_seconds` | `5` | Sampled on stop paths; minimum 1 second |
-| `journal_retention_days` | `0` | Hourly stopped-session sweep; `0` keeps everything |
+| `journal_retention_days` | `0` | Hourly stopped-session sweep; 0..36500; `0` keeps everything |
+
+`http_bind` must be an IP address. Duration settings in seconds cannot exceed
+31536000 (365 days); existing minimum-one-second clamps remain. Invalid values
+reject startup/reload; no partial config is applied.
 
 Attach seeds at least 1000 main-buffer history rows **when available**, or the
 client height if larger, capped by that session's retained rows. This is not a

@@ -270,6 +270,9 @@ struct AppConfigOverrides {
     #[serde(flatten)]
     resume: ResumeOverrides,
     log_level: Option<String>,
+    /// Unconsumed flat keys are reported rather than silently ignored.
+    #[serde(flatten)]
+    unknown: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -321,12 +324,15 @@ struct LimitsOverrides {
 
 impl AppConfig {
     pub fn load() -> Result<Self> {
-        let state_dir = crate::storage::resolve_state_dir();
-        ensure_config_file(&state_dir);
+        Self::load_from_state_dir(crate::storage::resolve_state_dir())
+    }
+
+    fn load_from_state_dir(state_dir: PathBuf) -> Result<Self> {
+        ensure_config_file(&state_dir)?;
         let overrides = try_load_overrides(&state_dir).map_err(crate::error::AppError::Protocol)?;
         let config = Self::resolve(state_dir, overrides);
         config
-            .validate_resume_patterns()
+            .validate()
             .map_err(crate::error::AppError::Protocol)?;
         Ok(config)
     }
@@ -435,8 +441,48 @@ impl AppConfig {
         let mut next = Self::resolve(self.paths.state_dir.clone(), overrides);
         next.runtime_overrides = self.runtime_overrides.clone();
         next.apply_runtime_overrides();
-        next.validate_resume_patterns()?;
+        next.validate()?;
         Ok(next)
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        self.http
+            .bind
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "http_bind must be an IPv4 or IPv6 address".to_string())?;
+        if self.http.port == 0 {
+            return Err("http_port must be 1..65535 (ephemeral listeners are unsupported)".into());
+        }
+        if self.limits.max_running_sessions > 1000 {
+            return Err("max_running_sessions must be 0..1000 (0 prevents new sessions)".into());
+        }
+        if self.limits.screen_scrollback_rows > 100_000 {
+            return Err("screen_scrollback_rows must be 0..100000".into());
+        }
+        for (key, value) in [
+            (
+                "notification_min_interval_seconds",
+                self.notify.min_interval_seconds,
+            ),
+            (
+                "session_eviction_seconds",
+                self.limits.session_eviction_seconds,
+            ),
+            ("silence_seconds", self.limits.silence_seconds),
+            ("stop_grace_seconds", self.limits.stop_grace_seconds),
+        ] {
+            if value > 31_536_000 {
+                return Err(format!("{key} must not exceed 31536000 seconds (365 days)"));
+            }
+        }
+        if self.limits.journal_retention_days > 36_500 {
+            return Err("journal_retention_days must be 0..36500".into());
+        }
+        for (index, pattern) in self.notify.prompt_patterns.iter().enumerate() {
+            regex::Regex::new(pattern)
+                .map_err(|err| format!("prompt pattern {index}: invalid regex: {err}"))?;
+        }
+        self.validate_resume_patterns()
     }
 
     fn validate_resume_patterns(&self) -> std::result::Result<(), String> {
@@ -572,45 +618,37 @@ fn generate_vapid_keypair() -> (String, String) {
     (private_b64, public_b64)
 }
 
-/// Create `config.json` with freshly generated VAPID keys if it does not exist.
-/// Silently skips on any I/O error so the rest of startup can continue.
-pub fn ensure_config_file(state_dir: &Path) {
+/// Generate a missing config without overwriting another process's file.
+/// Existing unreadable/malformed files are diagnosed by strict loading below.
+fn ensure_config_file(state_dir: &Path) -> Result<()> {
+    use std::io::Write as _;
     let path = state_dir.join("config.json");
-    if path.exists() {
-        return;
+    if path.try_exists()? {
+        return Ok(());
     }
-    if let Err(err) = std::fs::create_dir_all(state_dir) {
-        eprintln!("warning: could not create state dir: {err}");
-        return;
+    std::fs::create_dir_all(state_dir)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
     }
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
     let (private_key, public_key) = generate_vapid_keypair();
     let contents = serde_json::json!({
         "web_push_vapid_public_key": public_key,
         "web_push_vapid_private_key": private_key,
         "web_push_subject": "mailto:admin@oly.com"
     });
-    match serde_json::to_string_pretty(&contents) {
-        Ok(json) => match std::fs::write(&path, json) {
-            Ok(()) => {
-                // Restrict permissions to owner-only since the file contains
-                // the VAPID private key.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(err) =
-                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                    {
-                        eprintln!(
-                            "warning: could not restrict config.json permissions to 0o600: {err}"
-                        );
-                    }
-                }
-                eprintln!("info: generated default config at {}", path.display());
-            }
-            Err(err) => eprintln!("warning: could not write config.json: {err}"),
-        },
-        Err(err) => eprintln!("warning: could not serialise default config: {err}"),
-    }
+    file.write_all(serde_json::to_string_pretty(&contents)?.as_bytes())?;
+    file.sync_all()?;
+    eprintln!("info: generated default config at {}", path.display());
+    Ok(())
 }
 
 /// Strict override loading shared by startup and hot reload. Removed recording
@@ -635,8 +673,15 @@ fn try_load_overrides(state_dir: &Path) -> std::result::Result<AppConfigOverride
             }
         }
     }
-    serde_json::from_value::<AppConfigOverrides>(value)
-        .map_err(|err| format!("could not parse {}: {err}", path.display()))
+    let overrides = serde_json::from_value::<AppConfigOverrides>(value)
+        .map_err(|err| format!("could not parse {}: {err}", path.display()))?;
+    for key in overrides.unknown.keys() {
+        eprintln!(
+            "warning: {}: unknown config key '{key}' ignored; config keys must be flat (see oly skill --daemon)",
+            path.display()
+        );
+    }
+    Ok(overrides)
 }
 
 fn normalize_optional_string(value: String) -> Option<String> {
@@ -952,6 +997,82 @@ mod tests {
         assert_eq!(reloaded.http.port, 17000);
 
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn startup_and_reload_share_validation_without_rewriting_existing_files() {
+        let state_dir =
+            std::env::temp_dir().join(format!("oly_config_validation_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut current = test_config();
+        current.paths.state_dir = state_dir.clone();
+        for (text, expected) in [
+            ("{ broken", "could not parse"),
+            (r#"{"http_bind":"hostname"}"#, "http_bind"),
+            (r#"{"http_port":0}"#, "http_port"),
+            (r#"{"max_running_sessions":1001}"#, "max_running_sessions"),
+            (
+                r#"{"screen_scrollback_rows":100001}"#,
+                "screen_scrollback_rows",
+            ),
+            (
+                r#"{"silence_seconds":18446744073709551615}"#,
+                "silence_seconds",
+            ),
+            (
+                r#"{"journal_retention_days":4294967295}"#,
+                "journal_retention_days",
+            ),
+            (r#"{"prompt_patterns":["("]}"#, "prompt pattern"),
+        ] {
+            std::fs::write(state_dir.join("config.json"), text).unwrap();
+            assert!(
+                AppConfig::load_from_state_dir(state_dir.clone())
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+            assert!(current.try_reload().unwrap_err().contains(expected));
+            assert_eq!(
+                std::fs::read_to_string(state_dir.join("config.json")).unwrap(),
+                text
+            );
+        }
+        std::fs::write(
+            state_dir.join("config.json"),
+            r#"{"max_running_sessions":0,"screen_scrollback_rows":0,"prompt_patterns":[]}"#,
+        )
+        .unwrap();
+        assert!(AppConfig::load_from_state_dir(state_dir.clone()).is_ok());
+        std::fs::remove_file(state_dir.join("config.json")).unwrap();
+        assert!(AppConfig::load_from_state_dir(state_dir.clone()).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(state_dir.join("config.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_keys_are_collected_without_misclassifying_known_flat_fields() {
+        let overrides: super::AppConfigOverrides = serde_json::from_str(r#"{"bind":"127.0.0.1","http_port":17000,"notification_hook":"echo done","web_push_subject":"mailto:test@example.invalid","journal_retention_days":1,"resume_patterns":[],"notification_hookk":"typo","limits":{"max_running_sessions":2}}"#).unwrap();
+        assert_eq!(
+            overrides
+                .unknown
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["limits", "notification_hookk"]
+        );
+        assert_eq!(overrides.http.http_port, Some(17000));
     }
 
     #[test]

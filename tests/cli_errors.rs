@@ -99,6 +99,34 @@ fn list_json_without_daemon_prints_machine_readable_output() {
 }
 
 #[test]
+fn malformed_config_fails_startup_and_unknown_keys_warn() {
+    let tmp = make_tmp_dir("config_validation");
+    fs::create_dir_all(tmp.join("oly")).unwrap();
+    fs::write(tmp.join("oly/config.json"), "{ broken").unwrap();
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "start", "--no-http"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not parse"));
+    assert!(!tmp.join("oly/daemon.lock").exists());
+    fs::write(
+        tmp.join("oly/config.json"),
+        r#"{"notification_hookk":"typo","limits":{"max_running_sessions":2}}"#,
+    )
+    .unwrap();
+    let output = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown config key 'notification_hookk'")
+            && stderr.contains("unknown config key 'limits'"),
+        "{stderr}"
+    );
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok());
+}
+
+#[test]
 fn removed_recording_caps_fail_before_daemon_start() {
     for key in ["max_journal_bytes_per_session", "max_output_log_bytes"] {
         let tmp = make_tmp_dir(&format!("removed_cap_{key}"));

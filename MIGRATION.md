@@ -26,6 +26,15 @@ switching.** Live processes cannot move between daemons or versions.
 | Configuration | **Flat JSON**; stopped-session age retention only | Remove `max_output_log_bytes` / `max_journal_bytes_per_session`; they now fail explicitly. Live byte caps are unsupported. Do not wrap keys in `limits`. |
 | Daemon status | Effective running flags and endpoint, not just client config | Check the actual endpoint after restart |
 
+### Configuration validation
+
+An existing unreadable/malformed config or invalid prompt/resume regex now fails
+startup; hot reload preserves the last good snapshot. Unknown keys emit named
+warnings (including mistakenly nested objects). HTTP bind must be an IP address,
+port must be 1..65535; resource/duration bounds are documented in the daemon skill.
+Fix the file rather than relying on a silent default reset. Missing configs are
+created without overwriting an existing file and with owner-only permissions on Unix.
+
 ### Log-script changes
 
 Do not use obsolete `logs --raw`, `--from`, `--from-file`, `--cols`,
