@@ -51,8 +51,9 @@ const PTY_TEARDOWN_MAX: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for the output stream to drain.
 #[cfg(windows)]
 const PTY_TEARDOWN_POLL: Duration = Duration::from_millis(20);
-/// Permanent closing marker in the PTY read-generation counter. Reads after
-/// this boundary are console teardown noise and are not recorded.
+/// Permanent closing marker in the PTY read-generation counter. It prevents
+/// the reader from extending a drain deadline after teardown starts, but is
+/// NOT an output cutoff: bytes already in the pipe must still be recorded.
 #[cfg(any(windows, test))]
 const PTY_CONSOLE_CLOSING: u64 = u64::MAX;
 
@@ -873,9 +874,10 @@ impl SessionRuntime {
                         break;
                     }
                 }
-                // Announce the close *before* dropping the master so the
-                // reader stops recording at exactly the point the console
-                // host starts emitting its own teardown sequences.
+                // Fence the drain generation before ClosePseudoConsole, but
+                // keep the reader alive through EOF. A quiet reader is not an
+                // empty pipe: it can be descheduled with buffered tail bytes.
+                // Dropping those reads here silently truncates short-lived jobs.
                 epoch.store(PTY_CONSOLE_CLOSING, Ordering::Relaxed);
                 drop(master);
             });
@@ -1427,16 +1429,13 @@ pub fn spawn_session(
                     break "pty output closed (eof)".to_string();
                 }
                 Ok(n) => {
-                    // Once the pseudo console is being torn down the console
-                    // host only emits its *own* mode-reset sequences
-                    // (`?9001l`, `?1004l`) — teardown noise, not session
-                    // output. Recording them would make the raw transcript
-                    // diverge from the canonical export, so drop everything
-                    // from the point the teardown thread announces the close.
+                    // Update drain activity without reopening the closing
+                    // fence. Even after that fence, retain EVERY successful
+                    // read through EOF: a read may contain buffered child output
+                    // as well as ConPTY mode resets. Timing cannot classify it
+                    // as teardown noise. Journal and display use the same bytes.
                     #[cfg(windows)]
-                    if !record_pty_read(&pty_read_epoch) {
-                        continue;
-                    }
+                    let _ = record_pty_read(&pty_read_epoch);
 
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 

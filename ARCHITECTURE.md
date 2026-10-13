@@ -155,6 +155,11 @@ Design points worth knowing before touching this code:
   recover the clipboard action once. Key-up after an observed press must
   not duplicate it. Shortcut bytes inside bracketed paste remain literal.
   Teardown disables mode 9001 before returning control to the parent shell.
+- **ConPTY close is not an output cutoff.** Child exit and a quiet reader do
+  not prove the output pipe is empty. Windows defers closing the master with a
+  bounded drain wait, fences its activity counter, and continues recording every
+  successful read through EOF. Buffered child output can arrive alongside console
+  mode-reset bytes after close starts; timing is not a safe reason to discard it.
 - **A screen repaint is not scrollback.** Windows attach still renders the
   canonical engine screen instead of forwarding ConPTY's wrap-dependent
   bytes, but the same parser delegates through `terminal/render_effects.rs`

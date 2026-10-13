@@ -753,6 +753,55 @@ fn e2e_high_bandwidth_output_logs_intact() {
     );
 }
 
+/// Repeated short-lived ConPTY producers must retain their exact final tail,
+/// including bytes read after ClosePseudoConsole starts. Verify cold journal
+/// replay too, not just the live terminal snapshot.
+#[cfg(windows)]
+#[test]
+fn e2e_windows_exited_producers_keep_tail_through_console_close() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("windows_exit_tail");
+    let daemon = start_daemon(&tmp);
+    let mut sessions = Vec::new();
+    for count in [500, 1000, 2000, 500, 1000] {
+        let command = format!("for /L %i in (1,1,{count}) do @echo TAIL_%i");
+        let id = start_session(&tmp, &["cmd.exe", "/c", &command]);
+        let expected = plain_output((1..=count).map(|i| format!("TAIL_{i}")));
+        let tail = count + 100;
+        assert!(
+            wait_for_exact_log_with_tail_ignoring_status_marker(
+                &tmp,
+                &id,
+                tail,
+                &expected,
+                Duration::from_secs(15)
+            )
+            .is_some(),
+            "incomplete ConPTY output for {id}:\n{}",
+            fetch_logs_with_tail(&tmp, &id, tail)
+        );
+        sessions.push((id, tail, expected));
+    }
+    drop(daemon);
+    let _restarted = start_daemon(&tmp);
+    for (id, tail, expected) in sessions {
+        let output = oly_cmd(&tmp)
+            .args(["logs", &id, "--tail", &tail.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            strip_session_status_marker(&String::from_utf8_lossy(&output.stdout), &id),
+            expected,
+            "cold journal replay lost output for {id}"
+        );
+    }
+}
+
 #[test]
 fn e2e_logs_keep_color_preserves_ansi_codes() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -761,21 +810,23 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
 
     #[cfg(target_os = "windows")]
     let cmd: &[&str] = &[
-        "cmd.exe",
-        "/c",
-        "powershell -NoProfile -Command \"Write-Host 'COLOR_TEST' -ForegroundColor Red\"",
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "Write-Host 'COLOR_TEST' -ForegroundColor Red",
     ];
     #[cfg(not(target_os = "windows"))]
     let cmd: &[&str] = &["sh", "-c", "printf '\\033[31mCOLOR_TEST\\033[0m\\n'"];
 
     let id = start_session(&tmp, cmd);
 
-    #[cfg(target_os = "windows")]
-    let expected_plain = plain_output(["Write-Host 'COLOR_TEST' -ForegroundColor Red"]);
-    #[cfg(not(target_os = "windows"))]
     let expected_plain = plain_output(["COLOR_TEST"]);
-    wait_for_exact_log(&tmp, &id, &expected_plain, Duration::from_secs(5))
-        .expect("plain logs did not match exact expected color-stripped output");
+    wait_for_exact_log(&tmp, &id, &expected_plain, native_shell_timeout()).unwrap_or_else(|| {
+        panic!(
+            "plain logs did not match exact expected color-stripped output.\nLogs:\n{}",
+            fetch_logs(&tmp, &id)
+        )
+    });
 
     let plain = normalize_log_text(&fetch_logs(&tmp, &id));
     assert_eq!(
