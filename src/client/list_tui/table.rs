@@ -10,94 +10,139 @@ use super::constants::SELECTED_ROW_BG;
 use super::constants::{COMPACT_SPARKLINE_WIDTH, SPARK_BLOCKS, SPARKLINE_WIDTH};
 use crate::protocol::SessionSummary;
 use ratatui::{
-    layout::{Alignment, Constraint},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Cell, Row},
 };
 
-#[derive(Clone, Copy)]
+pub const SESSION_ID_WIDTH: usize = 8;
+const RATE_WIDTH: u16 = (SPARKLINE_WIDTH + 7) as u16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LayoutMode {
-    /// Below the small-row breakpoint; rows show just status, id, command,
-    /// state, age, and a compact rate column.
+    /// Identity and age only on very small terminals.
+    Minimal,
+    /// Add a compact activity chart.
     Narrow,
-    /// Above the small-row breakpoint but below the wide layout threshold:
-    /// rows include a normal-width sparkline alongside the rate.
+    /// Add a normal activity chart and numeric rate.
     Medium,
-    /// At or above the wide layout threshold; rows gain id, pid, output,
-    /// and command columns.
+    /// Add PID, total output, and command arguments.
     Wide,
 }
 
+impl LayoutMode {
+    pub fn for_width(width: u16) -> Self {
+        match width {
+            100.. => Self::Wide,
+            62.. => Self::Medium,
+            36.. => Self::Narrow,
+            _ => Self::Minimal,
+        }
+    }
+}
+
 pub fn session_table_widths(mode: LayoutMode, show_node: bool) -> Vec<Constraint> {
-    // The session id is rendered inline immediately to the left of the
-    // STATE column, so the table no longer carries a dedicated ID column.
-    // STATE is now wide enough to hold `<8-char-id> <status-word>` plus a
-    // separator (so the inherited status width of 9 became 18).
     let mut widths = match mode {
+        LayoutMode::Minimal => vec![
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(SESSION_ID_WIDTH as u16),
+            Constraint::Length(4),
+        ],
         LayoutMode::Narrow => vec![
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(18),
+            Constraint::Length(SESSION_ID_WIDTH as u16),
             Constraint::Length(5),
             Constraint::Length(COMPACT_SPARKLINE_WIDTH as u16),
         ],
         LayoutMode::Medium => vec![
             Constraint::Length(1),
             Constraint::Fill(1),
-            Constraint::Length(18),
+            Constraint::Length(SESSION_ID_WIDTH as u16),
             Constraint::Length(5),
-            Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
+            Constraint::Length(RATE_WIDTH),
         ],
-        // Same column order as the narrower modes (SESSION before PID
-        // before STATE before AGE before RATE before OUTPUT before COMMAND);
-        // the ID is rendered inline inside the STATE column.
         LayoutMode::Wide => vec![
             Constraint::Length(1),
             Constraint::Length(22),
             Constraint::Length(6),
-            Constraint::Length(20),
+            Constraint::Length(SESSION_ID_WIDTH as u16),
             Constraint::Length(5),
-            Constraint::Length((SPARKLINE_WIDTH + 9) as u16),
-            Constraint::Length(8),
+            Constraint::Length(RATE_WIDTH),
+            Constraint::Length(6),
             Constraint::Fill(1),
         ],
     };
     if show_node {
-        widths.insert(1, Constraint::Length(10));
+        widths.insert(1, Constraint::Length(8));
     }
     widths
 }
 
+/// Resolve once for both ellipsis truncation and table rendering. A single
+/// selection-marker cell keeps header and row origins identical.
+pub fn session_table_columns(
+    mode: LayoutMode,
+    show_node: bool,
+    width: u16,
+    sessions: &[SessionSummary],
+) -> Vec<u16> {
+    let mut constraints = session_table_widths(mode, show_node);
+    if show_node {
+        let node_width = sessions
+            .iter()
+            .map(|session| UnicodeWidthStr::width(session.node.as_deref().unwrap_or("local")))
+            .max()
+            .unwrap_or(5)
+            .clamp(5, 12);
+        // At small widths the title wins over a long machine name.
+        let node_limit = match mode {
+            LayoutMode::Minimal => 3,
+            LayoutMode::Narrow => 5,
+            _ => 12,
+        };
+        constraints[1] = Constraint::Length(node_width.min(node_limit) as u16);
+    }
+    if mode == LayoutMode::Wide {
+        let title_width = sessions
+            .iter()
+            .map(|session| UnicodeWidthStr::width(session_title(session).as_str()))
+            .max()
+            .unwrap_or(18)
+            .clamp(18, 28);
+        constraints[1 + usize::from(show_node)] = Constraint::Length(title_width as u16);
+    }
+    Layout::horizontal(constraints)
+        .spacing(1)
+        .split(Rect::new(0, 0, width.saturating_sub(1), 1))
+        .iter()
+        .map(|column| column.width)
+        .collect()
+}
+
 pub fn session_table_alignments(mode: LayoutMode, show_node: bool) -> Vec<Alignment> {
+    let (left, right) = (Alignment::Left, Alignment::Right);
     let mut alignments = match mode {
-        LayoutMode::Narrow | LayoutMode::Medium => vec![Alignment::Left; 5],
-        LayoutMode::Wide => vec![
-            Alignment::Left,
-            Alignment::Left,
-            Alignment::Right,
-            Alignment::Left,
-            Alignment::Left,
-            Alignment::Left,
-            Alignment::Right,
-            Alignment::Left,
-        ],
+        LayoutMode::Minimal => vec![left, left, left, right],
+        LayoutMode::Narrow => vec![left, left, left, right, left],
+        LayoutMode::Medium => vec![left, left, left, right, right],
+        LayoutMode::Wide => vec![left, left, right, left, right, right, right, left],
     };
     if show_node {
-        alignments.insert(1, Alignment::Left);
+        alignments.insert(1, left);
     }
     alignments
 }
 
 pub fn session_table_header(mode: LayoutMode, show_node: bool) -> Row<'static> {
-    // The session id is rendered inline immediately to the left of the
-    // status text in each row, so the ID column is intentionally absent
-    // from the header.
     let mut labels = match mode {
-        LayoutMode::Narrow => vec!["", "SESSION", "STATE", "AGE", "I/O"],
-        LayoutMode::Medium => vec!["", "SESSION", "STATE", "AGE", "RATE"],
+        LayoutMode::Minimal => vec!["", "SESSION", "ID", "AGE"],
+        LayoutMode::Narrow => vec!["", "SESSION", "ID", "AGE", "I/O"],
+        LayoutMode::Medium => vec!["", "SESSION", "ID", "AGE", "RATE"],
         LayoutMode::Wide => vec![
-            "", "SESSION", "PID", "STATE", "AGE", "RATE", "OUTPUT", "COMMAND",
+            "", "SESSION", "PID", "ID", "AGE", "RATE", "OUTPUT", "COMMAND",
         ],
     };
     if show_node {
@@ -112,6 +157,37 @@ pub fn session_table_header(mode: LayoutMode, show_node: bool) -> Row<'static> {
             .fg(Color::Gray)
             .add_modifier(Modifier::BOLD),
     )
+}
+
+/// Show the executable rather than its install directory so arguments remain
+/// visible. Remote nodes may use either separator; stored commands are unchanged.
+pub fn session_command_label(session: &SessionSummary) -> String {
+    let command = session
+        .command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&session.command);
+    if session.args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, session.args.join(" "))
+    }
+}
+
+pub fn session_title(session: &SessionSummary) -> String {
+    session
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            session
+                .command
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&session.command)
+                .to_string()
+        })
 }
 
 pub fn aligned_cell(content: impl Into<Line<'static>>, alignment: Alignment) -> Cell<'static> {
@@ -142,6 +218,7 @@ pub fn session_row(
     now: Instant,
     show_node: bool,
     selected: bool,
+    column_widths: &[u16],
 ) -> Row<'static> {
     let active = is_active_status(&session.status);
     let (status_glyph, status_style) = session_status_style(session, selected);
@@ -152,16 +229,7 @@ pub fn session_row(
     } else {
         Color::DarkGray
     };
-    // The status text was retired: the icon plus its semantic colour is
-    // both the visual signal and the colour signal, so the human-readable
-    // status word is no longer needed. Only the session id is shown in
-    // this cell so the eye can pair an icon with the daemon-reported id.
-    let status_with_id = session.id.clone();
-    let name = session
-        .title
-        .clone()
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| session.command.clone());
+    let name = session_title(session);
     let age = format_age(session.created_at, session.started_at, session.ended_at);
     let current_rate = rate.map(|value| value.display_rate(now)).unwrap_or(0.0);
     let animation_age = rate
@@ -174,88 +242,92 @@ pub fn session_row(
     };
     let alignments = session_table_alignments(mode, show_node);
     let node_offset = usize::from(show_node);
-    let mut cells = match mode {
-        LayoutMode::Narrow => vec![
-            aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
-            aligned_cell(name, alignments[1 + node_offset]),
-            aligned_cell(status_with_id.clone(), alignments[2 + node_offset]).style(status_style),
-            aligned_cell(age, alignments[3 + node_offset]).style(Style::default().fg(muted)),
-            aligned_cell(
-                if active {
-                    sparkline(rate, COMPACT_SPARKLINE_WIDTH)
-                } else {
-                    String::new()
-                },
-                alignments[4 + node_offset],
-            )
-            .style(Style::default().fg(rate_color)),
-        ],
-        LayoutMode::Medium => vec![
-            aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
-            aligned_cell(name, alignments[1 + node_offset]),
-            aligned_cell(status_with_id.clone(), alignments[2 + node_offset]).style(status_style),
-            aligned_cell(age, alignments[3 + node_offset]).style(Style::default().fg(muted)),
-            aligned_cell(
-                if active {
-                    format!(
-                        "{} {:>6}/s",
-                        sparkline(rate, SPARKLINE_WIDTH),
-                        format_bytes(current_rate)
-                    )
-                } else {
-                    String::new()
-                },
-                alignments[4 + node_offset],
-            )
-            .style(Style::default().fg(rate_color)),
-        ],
-        LayoutMode::Wide => {
-            let command = if session.args.is_empty() {
-                session.command.clone()
-            } else {
-                format!("{} {}", session.command, session.args.join(" "))
-            };
-            vec![
-                aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
-                aligned_cell(name, alignments[1 + node_offset]),
-                aligned_cell(
-                    session.pid.map_or("-".into(), |pid| pid.to_string()),
-                    alignments[2 + node_offset],
-                )
-                .style(Style::default().fg(muted)),
-                aligned_cell(status_with_id.clone(), alignments[3 + node_offset])
-                    .style(status_style),
-                aligned_cell(age, alignments[4 + node_offset]).style(Style::default().fg(muted)),
-                aligned_cell(
-                    if active {
-                        format!(
-                            "{} {:>6}/s",
-                            sparkline(rate, SPARKLINE_WIDTH),
-                            format_bytes(current_rate)
-                        )
-                    } else {
-                        String::new()
-                    },
-                    alignments[5 + node_offset],
-                )
-                .style(Style::default().fg(rate_color)),
-                aligned_cell(
-                    format_bytes(session.last_total_bytes as f64),
-                    alignments[6 + node_offset],
-                )
-                .style(Style::default().fg(muted)),
-                aligned_cell(command, alignments[7 + node_offset]),
-            ]
-        }
+    let text_cell = |text: &str, index: usize| {
+        aligned_cell(
+            truncate(
+                text,
+                column_widths.get(index).copied().unwrap_or(0) as usize,
+            ),
+            alignments[index],
+        )
     };
+    let rate_text = if active {
+        format!(
+            "{} {:>4}/s",
+            sparkline(rate, SPARKLINE_WIDTH),
+            format_bytes(current_rate)
+        )
+    } else {
+        String::new()
+    };
+    let name_index = 1 + node_offset;
+    let name_width = column_widths.get(name_index).copied().unwrap_or(0) as usize;
+    let command = session_command_label(session);
+    // Medium rows have a generous SESSION column but no COMMAND column.
+    // Use otherwise empty space for a subdued preview, without sacrificing
+    // a useful title or repeating the executable when it is also the title.
+    let name_cell = if mode == LayoutMode::Medium && name_width >= 28 && command != name {
+        let title_width = (name_width * 3 / 5).min(26);
+        let title = truncate(&name, title_width);
+        let command_width = name_width.saturating_sub(UnicodeWidthStr::width(title.as_str()) + 3);
+        aligned_cell(
+            Line::from(vec![
+                Span::raw(title),
+                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    truncate(&command, command_width),
+                    Style::default().fg(if selected {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ]),
+            alignments[name_index],
+        )
+    } else {
+        text_cell(&name, name_index)
+    };
+    let mut cells = vec![
+        aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
+        name_cell,
+    ];
+    if mode == LayoutMode::Wide {
+        cells.push(
+            text_cell(
+                &session.pid.map_or("-".into(), |pid| pid.to_string()),
+                2 + node_offset,
+            )
+            .style(Style::default().fg(muted)),
+        );
+    }
+    let id_index = cells.len() + node_offset;
+    cells.push(text_cell(&session.id, id_index).style(status_style));
+    cells.push(text_cell(&age, id_index + 1).style(Style::default().fg(muted)));
+    if mode != LayoutMode::Minimal {
+        let chart = if mode == LayoutMode::Narrow {
+            if active {
+                sparkline(rate, COMPACT_SPARKLINE_WIDTH)
+            } else {
+                String::new()
+            }
+        } else {
+            rate_text
+        };
+        cells.push(text_cell(&chart, id_index + 2).style(Style::default().fg(rate_color)));
+    }
+    if mode == LayoutMode::Wide {
+        cells.push(
+            text_cell(&format_bytes(session.last_total_bytes as f64), id_index + 3)
+                .style(Style::default().fg(muted)),
+        );
+        cells.push(text_cell(&session_command_label(session), id_index + 4));
+    }
     if show_node {
         cells.insert(
             1,
-            aligned_cell(
-                session.node.clone().unwrap_or_else(|| "local".to_string()),
-                alignments[1],
-            )
-            .style(Style::default().fg(Color::Cyan)),
+            text_cell(session.node.as_deref().unwrap_or("local"), 1)
+                .style(Style::default().fg(Color::Cyan)),
         );
     }
     let row = Row::new(cells);

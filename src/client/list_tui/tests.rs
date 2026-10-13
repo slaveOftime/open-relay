@@ -70,10 +70,23 @@ fn render_session_row_selected(
         std::time::Instant::now(),
         false,
         selected,
+        &super::session_table_columns(
+            super::LayoutMode::Wide,
+            false,
+            140,
+            std::slice::from_ref(session),
+        ),
     );
     let table = ratatui::widgets::Table::new(
         vec![row],
-        super::session_table_widths(super::LayoutMode::Wide, false),
+        super::session_table_columns(
+            super::LayoutMode::Wide,
+            false,
+            140,
+            std::slice::from_ref(session),
+        )
+        .into_iter()
+        .map(ratatui::layout::Constraint::Length),
     )
     .column_spacing(1);
     let area = Rect::new(0, 0, 140, 1);
@@ -217,18 +230,25 @@ fn inactive_sessions_have_no_sparkline_and_tree_rows_are_compact() {
             .any(|symbol| super::SPARK_BLOCKS.contains(&symbol))
     }));
     let mut active = item.clone();
-    active.status = "running".to_string();
+    active.status = "running".into();
     let active_line = super::session_line(&active, None, "", false, now);
-    let line_width = |line: &ratatui::text::Line<'_>| {
-        line.spans
+    assert!(
+        !active_line
+            .spans
             .iter()
-            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
-            .sum::<usize>()
-    };
-    assert_eq!(
-        line_width(&active_line) - line_width(&inactive_line),
-        super::SPARKLINE_WIDTH + 2,
-        "inactive tree rows should reclaim the sparkline and its padding"
+            .any(|span| span.content.contains('▁')),
+        "idle flat charts must not waste space"
+    );
+    let text = active_line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("out:0B"));
+    assert!(text.contains("0B/s"));
+    assert!(
+        active_line.width() < 120,
+        "short rows must not be filled with padding"
     );
 }
 #[test]
@@ -1515,10 +1535,10 @@ fn tree_draws_sibling_edges_and_continuing_ancestor_lines() {
     app.toggle_view_mode();
     expand_all_tree_folders(&mut app);
     let rendered = render_app(&mut app, 120, 30);
-    assert!(rendered.contains("├── ▾ config/"), "{rendered}");
-    assert!(rendered.contains("│   ├──"), "{rendered}");
-    assert!(rendered.contains("│   └──"), "{rendered}");
-    assert!(rendered.contains("└── ▾ docs/"), "{rendered}");
+    assert!(rendered.contains("├─▾ config/"), "{rendered}");
+    assert!(rendered.contains("│ ├─"), "{rendered}");
+    assert!(rendered.contains("│ └─"), "{rendered}");
+    assert!(rendered.contains("└─▾ docs/"), "{rendered}");
     assert!(
         !rendered.contains("(2)"),
         "folder counts are redundant: {rendered}"
@@ -1573,34 +1593,41 @@ fn tree_start_time_uses_relative_then_local_datetime() {
 }
 
 #[test]
-fn tree_session_uses_fixed_status_width_and_normal_sparkline() {
+fn tree_session_uses_unpadded_id_and_normal_sparkline() {
     let mut item = session_at("live", Some("/work"));
     item.title = Some("release".into());
     let now = std::time::Instant::now();
     let mut rate = super::RateState::new(&item, now);
     rate.history.extend([4.0, 8.0, 2.0]);
     let line = super::session_line(&item, Some(&rate), "├── ", false, now);
-    // The status text was retired: spans[3] now carries the padded id
-    // alone, occupying TREE_STATUS_WIDTH columns so rows still line up.
+    let id_span = line
+        .spans
+        .iter()
+        .find(|span| span.content.trim_end() == item.id)
+        .expect("fixed-width id span");
     assert_eq!(
-        line.spans[3].content.len(),
-        super::TREE_STATUS_WIDTH,
-        "id cell should keep the fixed status-width column: {:?}",
-        line.spans[3].content
+        unicode_width::UnicodeWidthStr::width(id_span.content.as_ref()),
+        unicode_width::UnicodeWidthStr::width(item.id.as_str())
     );
-    assert!(line.spans[3].content.starts_with(&item.id));
-    assert_eq!(
-        line.spans[9].content.as_ref(),
-        super::sparkline(Some(&rate), super::SPARKLINE_WIDTH)
+    assert!(
+        line.spans
+            .iter()
+            .any(|span| span.content.as_ref()
+                == super::sparkline(Some(&rate), super::SPARKLINE_WIDTH))
     );
     assert!(!line.spans.iter().any(|span| span.content.contains("/work")));
     item.input_needed = true;
     let attention = super::session_line(&item, Some(&rate), "├── ", true, now);
-    assert_eq!(attention.spans[3].content.len(), super::TREE_STATUS_WIDTH);
+    let id_span = attention
+        .spans
+        .iter()
+        .find(|span| span.content.trim_end() == item.id)
+        .expect("attention id span");
     assert_eq!(
-        attention.spans[3].style.fg,
-        Some(ratatui::style::Color::Yellow)
+        unicode_width::UnicodeWidthStr::width(id_span.content.as_ref()),
+        unicode_width::UnicodeWidthStr::width(item.id.as_str())
     );
+    assert_eq!(id_span.style.fg, Some(ratatui::style::Color::Yellow));
 }
 #[test]
 fn tree_render_icon_and_session_id_share_foreground_color() {
@@ -1905,14 +1932,17 @@ fn wide_mode_columns_follow_the_same_order_as_narrow_modes() {
         .lines()
         .find(|line| line.contains("COMMAND"))
         .expect("wide header rendered");
-    let position = |label: &str| header.find(label).expect("column header present");
+    let position = |label: &str| {
+        header
+            .find(&format!(" {label} "))
+            .expect("column header present")
+    };
 
-    // status, SESSION, PID, STATE, AGE, RATE, OUTPUT, COMMAND. The session
-    // id is rendered inline immediately to the left of the status text,
-    // so the table no longer carries a dedicated ID column.
+    // Status glyph, SESSION, PID, ID, AGE, RATE, OUTPUT, COMMAND.
+    // ID has its own compact column rather than an oversized STATE field.
     assert!(position("SESSION") < position("PID"));
-    assert!(position("PID") < position("STATE"));
-    assert!(position("STATE") < position("AGE"));
+    assert!(position("PID") < position("ID"));
+    assert!(position("ID") < position("AGE"));
     assert!(position("AGE") < position("RATE"));
     assert!(position("RATE") < position("OUTPUT"));
     assert!(position("OUTPUT") < position("COMMAND"));
@@ -2512,8 +2542,8 @@ fn list_tips_are_compact_and_dialog_tips_keep_their_top_divider() {
     // extra row; it must still carry the key hints.
     let list = render_app(&mut app, 120, 30);
     let last_line = list.lines().last().unwrap_or_default();
-    assert!(last_line.contains("^D duplicate"));
-    assert!(last_line.contains("^Del remove"));
+    assert!(last_line.contains("^D dup"));
+    assert!(last_line.contains("^Del rm"));
     assert!(!last_line.contains("^R"));
     assert!(!last_line.contains('\u{2500}'));
 
@@ -3697,7 +3727,7 @@ fn table_render_uses_responsive_headers() {
 
     let narrow = render_app(&mut app, 50, 12);
     assert!(narrow.contains("SESSION"));
-    assert!(narrow.contains("STATE"));
+    assert!(narrow.contains("ID"));
     assert!(!narrow.contains("RATE"));
 }
 
@@ -3726,11 +3756,23 @@ fn multi_node_table_displays_node_and_keeps_duplicate_ids_distinct() {
 fn table_headers_share_each_modes_cell_alignments() {
     assert_eq!(
         super::session_table_alignments(super::LayoutMode::Narrow, false),
-        vec![Alignment::Left; 5]
+        vec![
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Right,
+            Alignment::Left
+        ]
     );
     assert_eq!(
         super::session_table_alignments(super::LayoutMode::Medium, false),
-        vec![Alignment::Left; 5]
+        vec![
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Left,
+            Alignment::Right,
+            Alignment::Right
+        ]
     );
     assert_eq!(
         super::session_table_alignments(super::LayoutMode::Wide, false),
@@ -3739,14 +3781,14 @@ fn table_headers_share_each_modes_cell_alignments() {
             Alignment::Left,
             Alignment::Right,
             Alignment::Left,
-            Alignment::Left,
-            Alignment::Left,
+            Alignment::Right,
+            Alignment::Right,
             Alignment::Right,
             Alignment::Left,
         ]
     );
 
-    let mut item = session("alignment-id");
+    let mut item = session("align123");
     item.title = Some("alignment-title".to_string());
     item.command = "alignment-command".to_string();
     item.pid = Some(4242);
@@ -3957,4 +3999,296 @@ fn terminal_restore_is_complete_and_flushed() {
                 .any(|window| window == sequence)
         );
     }
+}
+
+#[test]
+fn compact_table_preserves_identity_and_age_across_breakpoints() {
+    for show_node in [false, true] {
+        let mut app = App {
+            show_node,
+            ..App::default()
+        };
+        let mut item = session("ident42");
+        item.title = Some("Deploy release verification with a long descriptive title".into());
+        item.command = r"C:\Program Files\Toolchain\runner.exe".into();
+        item.args = vec![
+            "--configuration".into(),
+            "very-long-configuration-name".repeat(8),
+        ];
+        item.pid = Some(4242);
+        item.started_at = Some(Utc::now() - chrono::Duration::hours(2));
+        item.node = Some("worker-with-a-long-name".into());
+        app.replace_sessions(vec![item]);
+        for width in [24, 35, 36, 50, 61, 62, 80, 99, 100, 120, 160] {
+            let rendered = render_app(&mut app, width, 8);
+            let row = rendered.lines().nth(3).expect("first table row");
+            assert!(
+                row.contains("ident42"),
+                "width={width}, node={show_node}: {row}"
+            );
+            assert!(row.contains("2h"), "width={width}, node={show_node}: {row}");
+            let mode = super::LayoutMode::for_width(width);
+            let columns = super::session_table_columns(mode, show_node, width, &app.sessions);
+            let title_width = columns[1 + usize::from(show_node)] as usize;
+            let expected_title = super::truncate("Deploy", title_width);
+            assert!(
+                row.contains(&expected_title),
+                "title has priority at width={width}, node={show_node}: {row}"
+            );
+            if unicode_width::UnicodeWidthStr::width(app.sessions[0].title.as_deref().unwrap())
+                > title_width
+            {
+                assert!(
+                    row.contains('…'),
+                    "long title must have visible ellipsis: {row}"
+                );
+            }
+            assert!(
+                !row.contains("Program Files"),
+                "command paths must not bury arguments: {row}"
+            );
+            if width >= 100 {
+                assert!(
+                    row.contains("runner.exe"),
+                    "command basename must remain visible: {row}"
+                );
+                assert!(
+                    row.trim_end().ends_with('…'),
+                    "long command must have visible ellipsis: {row}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_table_headers_and_rows_have_identical_column_origins() {
+    use ratatui::layout::Constraint;
+    for show_node in [false, true] {
+        let mut app = App {
+            show_node,
+            ..App::default()
+        };
+        let mut item = session("ident42");
+        item.title = Some("Deploy".into());
+        item.command = "runner".into();
+        item.started_at = Some(Utc::now() - chrono::Duration::hours(2));
+        app.replace_sessions(vec![item]);
+        for width in [50, 80, 100, 120, 160] {
+            let mode = super::LayoutMode::for_width(width);
+            let columns = super::session_table_columns(mode, show_node, width, &app.sessions);
+            let rects = ratatui::layout::Layout::horizontal(
+                columns.iter().copied().map(Constraint::Length),
+            )
+            .spacing(1)
+            .split(ratatui::layout::Rect::new(1, 0, width - 1, 1));
+            let buffer = render_app_buffer(&mut app, width, 8);
+            let title_index = 1 + usize::from(show_node);
+            let id_index = title_index
+                + if mode == super::LayoutMode::Wide {
+                    2
+                } else {
+                    1
+                };
+            assert_eq!(buffer[(rects[title_index].x, 2)].symbol(), "S");
+            assert_eq!(buffer[(rects[title_index].x, 3)].symbol(), "D");
+            assert_eq!(buffer[(rects[id_index].x, 2)].symbol(), "I");
+            assert_eq!(buffer[(rects[id_index].x, 3)].symbol(), "i");
+            assert_eq!(
+                rects[id_index].width, 8,
+                "ID does not reserve retired status text"
+            );
+            let age = rects[id_index + 1];
+            assert_eq!(buffer[(age.right() - 1, 2)].symbol(), "E");
+            assert_eq!(buffer[(age.right() - 1, 3)].symbol(), "h");
+        }
+    }
+}
+
+#[test]
+fn compact_table_unicode_truncation_keeps_following_columns_intact() {
+    let mut app = App {
+        show_node: true,
+        ..App::default()
+    };
+    let mut item = session("ident42");
+    item.title = Some("部署验证清单 🦀 e\u{301}".repeat(12));
+    item.node = Some("远程机器生产环境".repeat(3));
+    item.command = "/工具/执行器".into();
+    item.args = vec!["生产环境配置".repeat(20)];
+    item.started_at = Some(Utc::now() - chrono::Duration::hours(2));
+    app.replace_sessions(vec![item]);
+    for width in [24, 36, 50, 62, 80, 100, 120] {
+        let rendered = render_app(&mut app, width, 8);
+        let row = rendered.lines().nth(3).unwrap();
+        assert!(row.contains("ident42"), "{width}: {row}");
+        assert!(row.contains("2h"), "{width}: {row}");
+        assert!(row.contains('…'), "{width}: {row}");
+    }
+}
+
+#[test]
+fn compact_footer_keeps_navigation_visible_with_long_messages() {
+    let mut app = App::default();
+    app.replace_sessions(vec![session("ident42")]);
+    for view in [super::ViewMode::List, super::ViewMode::Tree] {
+        app.view_mode = view;
+        for width in [50, 62, 80, 100, 120] {
+            app.message = Some(
+                "A very long action message that must not take away all the navigation help"
+                    .repeat(4),
+            );
+            let rendered = render_app(&mut app, width, 8);
+            let footer = rendered.lines().last().unwrap();
+            assert!(footer.contains("^N new"), "{width}: {footer}");
+            assert!(footer.contains("^G"), "{width}: {footer}");
+            assert!(
+                footer.trim_end().ends_with('…'),
+                "message has explicit ellipsis: {footer}"
+            );
+        }
+    }
+}
+
+#[test]
+fn compact_ui_handles_tiny_viewports_without_panicking() {
+    let mut app = App {
+        show_node: true,
+        ..App::default()
+    };
+    let mut item = session("ident42");
+    item.cwd = Some("/workspace/very/deep/tree/project".into());
+    app.replace_sessions(vec![item]);
+    for view in [super::ViewMode::List, super::ViewMode::Tree] {
+        app.view_mode = view;
+        for width in [0, 1, 8, 16, 24] {
+            for height in [0, 1, 2, 3, 4] {
+                let _ = render_app_buffer(&mut app, width, height);
+            }
+        }
+    }
+}
+
+/// Repeatable, isolated visual fixture. Opt in to print previews using:
+/// cargo test --bin oly list_ui_visual_preview -- --ignored --nocapture
+#[test]
+#[ignore = "manual visual preview; assertions are in the responsive renderer tests"]
+fn list_ui_visual_preview() {
+    let mut app = App {
+        show_node: true,
+        ..App::default()
+    };
+    let specs = [
+        (
+            "23bc98d",
+            "list tui",
+            "codex",
+            "running",
+            "/home/user/Dev/open-relay",
+        ),
+        (
+            "86acb7b",
+            "Notes",
+            "codex",
+            "running",
+            "/home/user/Dev/Notes",
+        ),
+        (
+            "5068376",
+            "list tui",
+            "codex",
+            "running",
+            "/home/user/Dev/open-relay",
+        ),
+        (
+            "8ce3f2d",
+            "debian keep alive",
+            "wsl",
+            "running",
+            "/home/user",
+        ),
+        (
+            "9929b16",
+            "Windows serialized verification",
+            "powershell",
+            "stopped",
+            "/home/user/Dev/open-relay",
+        ),
+        (
+            "f5333d0",
+            "fit kunshan minifiler",
+            "ssh",
+            "stopped",
+            "/home/user/Dev/Notes/Quick",
+        ),
+    ];
+    let items = specs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (id, title, command, status, cwd))| {
+            let mut item = session(id);
+            item.title = Some(title.into());
+            item.command = command.into();
+            item.args = match command {
+                "codex" => vec![
+                    "resume".into(),
+                    "01a0e71f-3a60-7001-9ae5-d1c76edd6532".into(),
+                ],
+                "ssh" => vec![
+                    "-i".into(),
+                    r"C:\Users\user\.ssh\minifiler".into(),
+                    "user@192.168.50.66".into(),
+                ],
+                "powershell" => vec![
+                    "-NoProfile".into(),
+                    "-Command".into(),
+                    "cargo test --lib features --locked --test-threads=1".into(),
+                ],
+                _ => vec!["-d".into(), "debian".into()],
+            };
+            item.status = status.into();
+            item.input_needed = i == 1 || i == 3;
+            item.notifications_enabled = false;
+            item.started_at = Some(Utc::now() - chrono::Duration::minutes(11 + i as i64 * 3));
+            item.pid = Some(42_856 + i as u32 * 32);
+            item.cwd = Some(cwd.into());
+            item.last_total_bytes = (i as u64 + 1) * 83_000;
+            item
+        })
+        .collect();
+    app.replace_sessions(items);
+    for width in [120, 80, 50] {
+        app.view_mode = super::ViewMode::List;
+        println!(
+            "\n--- TABLE {width} ---\n{}",
+            render_app(&mut app, width, 13)
+        );
+        app.view_mode = super::ViewMode::Tree;
+        expand_all_tree_folders(&mut app);
+        println!("--- TREE {width} ---\n{}", render_app(&mut app, width, 19));
+    }
+}
+
+#[test]
+fn medium_table_uses_spare_title_space_for_a_muted_command_preview() {
+    let mut app = App::default();
+    let mut item = session("ident42");
+    item.title = Some("Release".into());
+    item.command = r"C:\Tools\runner.exe".into();
+    item.args = vec![
+        "--verify".into(),
+        "production-release-configuration".repeat(3),
+    ];
+    app.replace_sessions(vec![item]);
+    let buffer = render_app_buffer(&mut app, 80, 8);
+    let row = buffer_symbols(&buffer, 8)[3].clone();
+    assert!(row.contains("Release · runner.exe --verify"), "{row}");
+    assert!(row.contains('…'), "{row}");
+    assert!(row.contains("ident42"), "{row}");
+    let command_byte = row.find("runner.exe").unwrap();
+    let command_x = unicode_width::UnicodeWidthStr::width(&row[..command_byte]);
+    assert_eq!(
+        buffer[(command_x as u16, 3)].fg,
+        ratatui::style::Color::Gray
+    );
 }

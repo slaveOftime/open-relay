@@ -19,19 +19,13 @@ use super::dialog_render::{
 use super::effects::render_effects;
 use super::table::{
     LayoutMode, aggregate_sparkline_data, format_bytes, rate_color, session_row,
-    session_table_header, session_table_widths,
+    session_table_columns, session_table_header, truncate,
 };
 use super::tree::ViewMode;
 use super::tree_render::render_tree;
 pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
-    let mode = if area.width >= 100 {
-        LayoutMode::Wide
-    } else if area.width >= 62 {
-        LayoutMode::Medium
-    } else {
-        LayoutMode::Narrow
-    };
+    let mode = LayoutMode::for_width(area.width);
     // The footer is a single compact line so the session table gets every
     // other row of the terminal.
     let chunks = Layout::vertical([
@@ -52,26 +46,57 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .filter_map(|session| app.rates.get(&session_key(session)))
         .map(|rate| rate.display_rate(now))
         .sum::<f64>();
-    let header = Layout::horizontal([Constraint::Min(0), Constraint::Length(18)]).split(chunks[0]);
+    let throughput_width = if area.width >= 80 { 14 } else { 7 };
+    let header = Layout::horizontal([Constraint::Min(0), Constraint::Length(throughput_width)])
+        .split(chunks[0]);
+    let badge = if area.width >= 62 {
+        " ◉ OPEN RELAY "
+    } else {
+        " oly "
+    };
+    let view_label = match app.view_mode {
+        ViewMode::List => "list",
+        ViewMode::Tree => "tree",
+    };
+    let summary = if area.width >= 100 {
+        format!(
+            " {} sessions · {} live · {} · {} · sort:{}",
+            app.sessions.len(),
+            running,
+            app.status_filter.label(),
+            view_label,
+            app.sort_strategy.label()
+        )
+    } else if area.width >= 62 {
+        format!(
+            " {} / {} live · {} · {} · {}",
+            app.sessions.len(),
+            running,
+            app.status_filter.label(),
+            view_label,
+            app.sort_strategy.label()
+        )
+    } else {
+        format!(
+            " {} / {} live · {} · {}",
+            app.sessions.len(),
+            running,
+            app.status_filter.label(),
+            view_label
+        )
+    };
+    let summary_width =
+        (header[0].width as usize).saturating_sub(unicode_width::UnicodeWidthStr::width(badge));
     let title = Line::from(vec![
         Span::styled(
-            match mode {
-                LayoutMode::Narrow => " oly ",
-                _ => " ◉ OPEN RELAY ",
-            },
+            badge,
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(
-                " {} sessions · {} live · {} · sort:{}",
-                app.sessions.len(),
-                running,
-                app.status_filter.label(),
-                app.sort_strategy.label()
-            ),
+            truncate(&summary, summary_width),
             Style::default().fg(Color::Gray),
         ),
     ]);
@@ -87,18 +112,21 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .map(|rate| now.saturating_duration_since(rate.sampled_at))
         .min()
         .unwrap_or_default();
-    let throughput_header =
-        Layout::horizontal([Constraint::Length(7), Constraint::Min(0)]).split(header[1]);
+    let throughput_header = Layout::horizontal([
+        Constraint::Length(if area.width >= 80 { 6 } else { 0 }),
+        Constraint::Min(0),
+    ])
+    .split(header[1]);
     frame.render_widget(
         Sparkline::default()
-            .data(aggregate_sparkline_data(&app.rates, 6))
+            .data(aggregate_sparkline_data(&app.rates, 5))
             .style(Style::default().fg(rate_color(throughput, animation_age)))
             .block(header_block()),
         throughput_header[0],
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!("{:>8}/s", format_bytes(throughput)),
+            format!("{}/s", format_bytes(throughput)),
             Style::default().fg(if throughput > 0.0 {
                 Color::Cyan
             } else {
@@ -149,28 +177,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         let viewport_start = selected_position
             .saturating_sub(viewport_len / 2)
             .min(visible.len().saturating_sub(viewport_len));
-        let rows = visible.iter().enumerate().filter_map(|(position, index)| {
-            app.sessions.get(*index).map(|session| {
-                session_row(
-                    session,
-                    app.rates.get(&session_key(session)),
-                    mode,
-                    now,
-                    app.show_node,
-                    position == selected_position,
-                )
-            })
-        });
-        // Selection styling lives in `session_row` itself: ratatui applies
-        // `row_highlight_style` *after* the cells render, which would
-        // override the semantic status colours (attention/failure/running).
-        let table = Table::new(rows, session_table_widths(mode, app.show_node))
-            .header(session_table_header(mode, app.show_node))
-            .column_spacing(1)
-            .highlight_symbol("▸ ");
-        let mut state = TableState::new()
-            .with_offset(viewport_start)
-            .with_selected(Some(selected_position));
         let show_scrollbar = visible.len() > viewport_len;
         let table_area = if show_scrollbar {
             Rect {
@@ -180,6 +186,29 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         } else {
             chunks[1]
         };
+        let columns = session_table_columns(mode, app.show_node, table_area.width, &app.sessions);
+        let rows = visible.iter().enumerate().filter_map(|(position, index)| {
+            app.sessions.get(*index).map(|session| {
+                session_row(
+                    session,
+                    app.rates.get(&session_key(session)),
+                    mode,
+                    now,
+                    app.show_node,
+                    position == selected_position,
+                    &columns,
+                )
+            })
+        });
+        // Cell styling preserves semantic status colours on the selection band.
+        // One marker cell also makes headers line up exactly with their rows.
+        let table = Table::new(rows, columns.iter().copied().map(Constraint::Length))
+            .header(session_table_header(mode, app.show_node))
+            .column_spacing(1)
+            .highlight_symbol("▸");
+        let mut state = TableState::new()
+            .with_offset(viewport_start)
+            .with_selected(Some(selected_position));
         frame.render_stateful_widget(table, table_area, &mut state);
 
         // Record where each waiting session's row actually landed (one line
@@ -226,46 +255,32 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         }
     }
 
-    // Footer: compact key hints stay pinned on the left; the latest status
-    // message (if any) renders on the right instead of replacing them, so a
-    // warning never hides the help. One line, no border — the table keeps
-    // the space.
-    // Each hint line is sized to fit the *smallest* width of its layout
-    // mode, so nothing is ever truncated.
-    let help = if app.filter.is_empty() {
-        match mode {
-            LayoutMode::Narrow => {
-                " filter ^N new ^D dup ^K stop ^Del rm ^O sort ⏎ open ^C quit".to_string()
-            }
-            LayoutMode::Medium => {
-                " filter · ^N new · ^D dup · ^K stop · ^Del rm · ^O sort · ⏎ open · ^C quit".to_string()
-            }
-            LayoutMode::Wide => {
-                " filter · ^N new · ^D duplicate · ^U update · ^K stop · ^Del remove · ^S status · ^O sort · ⏎ open · ^⏎ window · ^C quit"
-                    .to_string()
-            }
-        }
-    } else {
-        format!(
-            " filter: {}_ · status: {} ^S · ⌫ edit · esc clear",
-            app.filter,
-            app.status_filter.label()
-        )
-    };
+    // Prioritised hints fit the actual remaining width, not a coarse layout
+    // breakpoint. A long message cannot consume all navigation help.
     let message_width = app
         .message
         .as_deref()
-        .map(|message| unicode_width::UnicodeWidthStr::width(message) as u16 + 1)
+        .map(|message| {
+            unicode_width::UnicodeWidthStr::width(message).min(area.width as usize * 2 / 5) as u16
+        })
         .unwrap_or(0);
-    let footer = Layout::horizontal([Constraint::Min(1), Constraint::Length(message_width)])
-        .split(chunks[2]);
+    let footer = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(if message_width > 0 {
+            message_width + 1
+        } else {
+            0
+        }),
+    ])
+    .split(chunks[2]);
+    let help = footer_help(app, footer[0].width as usize);
     frame.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         footer[0],
     );
     if let Some(message) = app.message.as_deref() {
         frame.render_widget(
-            Paragraph::new(message)
+            Paragraph::new(truncate(message, message_width as usize))
                 .style(
                     Style::default()
                         .fg(Color::Yellow)
@@ -288,4 +303,54 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     render_effects(frame, app, message_area, attention_row_rects);
+}
+
+fn footer_help(app: &App, width: usize) -> String {
+    if !app.filter.is_empty() {
+        return truncate(
+            &format!(
+                " filter: {}_ · ⌫ edit · esc clear · ^S {}",
+                app.filter,
+                app.status_filter.label()
+            ),
+            width,
+        );
+    }
+    let toggle = match app.view_mode {
+        ViewMode::List => "^G tree",
+        ViewMode::Tree => "^G list",
+    };
+    let open = if app.view_mode == ViewMode::Tree && app.focused_session().is_none() {
+        "⏎ expand"
+    } else {
+        "⏎ open"
+    };
+    let hints = [
+        "^N new",
+        open,
+        toggle,
+        "^C quit",
+        "type filter",
+        "^K stop",
+        "^S status",
+        "^O sort",
+        "^D dup",
+        "^U update",
+        "^Del rm",
+        "^⏎ window",
+    ];
+    let mut help = String::from(" ");
+    for hint in hints {
+        let separator = if help.len() > 1 { " · " } else { "" };
+        if unicode_width::UnicodeWidthStr::width(help.as_str())
+            + unicode_width::UnicodeWidthStr::width(separator)
+            + unicode_width::UnicodeWidthStr::width(hint)
+            > width
+        {
+            continue;
+        }
+        help.push_str(separator);
+        help.push_str(hint);
+    }
+    truncate(&help, width)
 }

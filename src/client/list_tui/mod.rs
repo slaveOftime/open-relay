@@ -93,8 +93,8 @@ pub(super) use spawn::{powershell_encoded_command, windows_screen_geometry};
 pub(super) use table::{
     LayoutMode, aggregate_sparkline_data, aligned_cell, format_bytes, named_color, pad_truncated,
     parse_hex_color, parse_terminal_color, rate_color, scale_hex_component, session_row,
-    session_status_style, session_table_alignments, session_table_header, session_table_widths,
-    sparkline, status_glyph, status_label, truncate,
+    session_status_style, session_table_alignments, session_table_columns, session_table_header,
+    session_table_widths, sparkline, status_glyph, status_label, truncate,
 };
 #[cfg(test)]
 #[allow(unused_imports)]
