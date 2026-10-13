@@ -89,13 +89,28 @@ impl OuterTerminal {
         history
     }
 
-    fn detach(&mut self) {
+    fn detach(&mut self, label: &str) {
         self.writer.write_all(b"\x04").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
+        // ConPTY can lose a key-down while output is churning, so retry on
+        // Windows only; Unix must detach on a single EOT.
+        #[cfg(windows)]
+        let mut resent_at = Instant::now();
         while self.child.0.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "attach did not detach");
+            assert!(
+                Instant::now() < deadline,
+                "{label}: attach did not detach; screen: {}",
+                self.screen.screen().contents()
+            );
             if let Ok(bytes) = self.rx.recv_timeout(Duration::from_millis(100)) {
                 self.screen.process(&bytes);
+            }
+            #[cfg(windows)]
+            if resent_at.elapsed() >= Duration::from_millis(500) {
+                // A write error can only mean the client already exited,
+                // which the try_wait above is about to report.
+                let _ = self.writer.write_all(b"\x04");
+                resent_at = Instant::now();
             }
         }
     }
@@ -146,7 +161,7 @@ fn e2e_attach_picker_to_chat_preserves_live_and_reattached_scrollback() {
         outer.history().contains("TRANSCRIPT_001"),
         "old transcript lines must be scrollable while attached"
     );
-    outer.detach();
+    outer.detach("first detach");
 
     let mut reattached = OuterTerminal::attach(&tmp, &id);
     reattached.wait_for("CHAT_READY");
@@ -167,5 +182,5 @@ fn e2e_attach_picker_to_chat_preserves_live_and_reattached_scrollback() {
         reattached.history().contains("TRANSCRIPT_001"),
         "fullscreen roundtrip lost main-buffer history"
     );
-    reattached.detach();
+    reattached.detach("detach after fullscreen roundtrip");
 }
