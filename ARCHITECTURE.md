@@ -157,8 +157,8 @@ Design points worth knowing before touching this code:
   Teardown disables mode 9001 before returning control to the parent shell.
 - **ConPTY close is not an output cutoff.** Child exit and a quiet reader do
   not prove the output pipe is empty. Windows defers closing the master with a
-  bounded drain wait, fences its activity counter, and continues recording every
-  successful read through EOF. Buffered child output can arrive alongside console
+  bounded drain wait between processed chunks, fences its activity counter only
+  when no read is in flight, and continues recording every successful read through EOF. Buffered child output can arrive alongside console
   mode-reset bytes after close starts; timing is not a safe reason to discard it.
   Attach `Done` and byte-observation stream liveness wait for output EOF, not
   just the child's terminal lifecycle status. Only then is the final cursor fixed.

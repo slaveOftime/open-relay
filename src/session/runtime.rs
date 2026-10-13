@@ -45,7 +45,8 @@ use crate::terminal::{EngineEvent, Terminal};
 /// and silently truncates the transcript tail.
 #[cfg(windows)]
 const PTY_TEARDOWN_QUIET: Duration = Duration::from_millis(200);
-/// Hard cap on the drain wait, so a session can never pin its master handle.
+/// Drain deadline between processed chunks. An in-flight chunk is never
+/// interrupted merely because rendering/journaling outlasts this deadline.
 #[cfg(windows)]
 const PTY_TEARDOWN_MAX: Duration = Duration::from_secs(2);
 /// Poll interval while waiting for the output stream to drain.
@@ -58,9 +59,9 @@ const PTY_TEARDOWN_POLL: Duration = Duration::from_millis(20);
 const PTY_CONSOLE_CLOSING: u64 = u64::MAX;
 
 /// Claim a read before the close boundary and advance the drain generation.
-/// A separate load followed by a store could overwrite the closing marker
-/// when teardown races a read. The atomic update makes closing irreversible.
-/// A counter also observes distinct reads occurring in the same millisecond.
+/// Odd generations mean a read is being processed; completion advances to even.
+/// Teardown can claim only an even generation, never an in-flight chunk.
+/// The atomic update also makes the closing marker irreversible.
 #[cfg(any(windows, test))]
 fn record_pty_read(epoch: &AtomicU64) -> bool {
     let mut current = epoch.load(Ordering::Relaxed);
@@ -76,6 +77,47 @@ fn record_pty_read(epoch: &AtomicU64) -> bool {
         }
     }
     false
+}
+
+/// A successful read remains in-flight until its journal/engine/broadcast work
+/// is finished. RAII covers all early-exit paths as well as normal completion.
+#[cfg(any(windows, test))]
+struct PtyReadGuard<'a> {
+    epoch: &'a AtomicU64,
+    claimed: bool,
+}
+
+#[cfg(any(windows, test))]
+impl<'a> PtyReadGuard<'a> {
+    fn new(epoch: &'a AtomicU64) -> Self {
+        Self {
+            epoch,
+            claimed: record_pty_read(epoch),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for PtyReadGuard<'_> {
+    fn drop(&mut self) {
+        if self.claimed {
+            let _ = record_pty_read(self.epoch);
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn try_close_pty_generation(epoch: &AtomicU64, observed: u64) -> bool {
+    observed != PTY_CONSOLE_CLOSING
+        && observed.is_multiple_of(2)
+        && epoch
+            .compare_exchange(
+                observed,
+                PTY_CONSOLE_CLOSING,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -867,18 +909,18 @@ impl SessionRuntime {
                         // The reader is still receiving the transcript tail.
                         observed = now;
                         observed_at = Instant::now();
-                    } else if observed_at.elapsed() >= PTY_TEARDOWN_QUIET {
-                        break;
                     }
-                    if Instant::now() >= deadline {
+                    // A descheduled/busy reader is not a drained pipe. Never
+                    // close while its last chunk is still being journaled or
+                    // rendered; claim the same completed generation atomically.
+                    if (observed_at.elapsed() >= PTY_TEARDOWN_QUIET || Instant::now() >= deadline)
+                        && try_close_pty_generation(&epoch, observed)
+                    {
                         break;
                     }
                 }
-                // Fence the drain generation before ClosePseudoConsole, but
-                // keep the reader alive through EOF. A quiet reader is not an
-                // empty pipe: it can be descheduled with buffered tail bytes.
-                // Dropping those reads here silently truncates short-lived jobs.
-                epoch.store(PTY_CONSOLE_CLOSING, Ordering::Relaxed);
+                // Continue recording successful reads through EOF, including
+                // any tail already buffered when ClosePseudoConsole begins.
                 drop(master);
             });
         }
@@ -1435,7 +1477,7 @@ pub fn spawn_session(
                     // as well as ConPTY mode resets. Timing cannot classify it
                     // as teardown noise. Journal and display use the same bytes.
                     #[cfg(windows)]
-                    let _ = record_pty_read(&pty_read_epoch);
+                    let _read_guard = PtyReadGuard::new(&pty_read_epoch);
 
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
@@ -1916,6 +1958,22 @@ mod tests {
         assert!(record_pty_read(&epoch));
         assert!(record_pty_read(&epoch));
         assert_eq!(epoch.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn console_close_waits_for_in_flight_read_and_rechecks_generation() {
+        let epoch = AtomicU64::new(0);
+        {
+            let _guard = PtyReadGuard::new(&epoch);
+            assert_eq!(epoch.load(Ordering::Relaxed), 1);
+            assert!(!try_close_pty_generation(&epoch, 1));
+            assert!(!try_close_pty_generation(&epoch, 0));
+        }
+        assert_eq!(epoch.load(Ordering::Relaxed), 2);
+        assert!(!try_close_pty_generation(&epoch, 0));
+        assert!(try_close_pty_generation(&epoch, 2));
+        let _guard = PtyReadGuard::new(&epoch);
+        assert_eq!(epoch.load(Ordering::Relaxed), PTY_CONSOLE_CLOSING);
     }
 
     #[test]
