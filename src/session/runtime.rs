@@ -1567,7 +1567,6 @@ pub fn spawn_session(
                     // the engine at their exact stream positions; only the
                     // session-global OSC colour queries keep the scanner
                     // path (their answers are position-independent).
-                    let mut writer_closed = false;
                     for resp in query_responses {
                         trace!(
                             session_id = %reader_session_id,
@@ -1579,7 +1578,9 @@ pub fn spawn_session(
                                 session_id = %reader_session_id,
                                 "failed to queue engine query response because PTY writer closed"
                             );
-                            writer_closed = true;
+                            // A closed input path after child exit does not
+                            // close output. Keep draining buffered PTY bytes;
+                            // this query no longer has a recipient.
                             break;
                         }
                     }
@@ -1588,9 +1589,6 @@ pub fn spawn_session(
                     // answered by the engine above, in exact stream order; the
                     // scanner's list only drives the display filtering.
                     scan_out.queries.clear();
-                    if writer_closed {
-                        break "pty writer channel closed".to_string();
-                    }
                 }
                 Err(err)
                     if matches!(err.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>

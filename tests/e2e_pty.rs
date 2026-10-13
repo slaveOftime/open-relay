@@ -777,8 +777,15 @@ fn e2e_windows_exited_producers_keep_tail_through_console_close() {
                 Duration::from_secs(15)
             )
             .is_some(),
-            "incomplete ConPTY output for {id}:\n{}",
-            fetch_logs_with_tail(&tmp, &id, tail)
+            "incomplete ConPTY output for {id} (expected {count} lines):\n{}\nDaemon stderr:\n{}\nDaemon logs:\n{}",
+            fetch_logs_with_tail(&tmp, &id, tail),
+            fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default(),
+            fs::read_dir(tmp.join("oly/logs"))
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| fs::read_to_string(entry.ok()?.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         sessions.push((id, tail, expected));
     }
