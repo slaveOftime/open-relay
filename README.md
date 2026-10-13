@@ -1,627 +1,134 @@
 # oly — Open Relay
 
 <p align="center">
-  <img src="./assets/icon-demo.svg" width="160" alt="oly logo" />
+  <img src="https://raw.githubusercontent.com/slaveOftime/open-relay/main/assets/icon-demo.svg" width="120" alt="oly logo" />
 </p>
 
+<p align="center"><strong>Your agents keep running. You stay in control.</strong></p>
+
 [![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/slaveOftime/open-relay/blob/main/LICENSE)
+
+Run an interactive CLI once. Close your terminal. Come back from another
+terminal or a browser — with the process still running and its output recorded.
+
+`oly` is a local-first session supervisor for coding agents, REPLs, and
+long-running commands that still need a human in the loop. It works with the
+CLI you already use; no model-provider integration required.
 
 https://github.com/user-attachments/assets/bd52a474-d9c4-48a7-824b-8df328a9d5a7
 
-> Run interactive CLIs and AI agents like managed services.
+## Why oly?
 
-`oly` gives long-running terminal jobs a durable home.
+- **Walk away without losing the job.** The daemon owns the PTY, not your terminal.
+- **Check in, don't babysit.** Read recent output, inspect a live TUI, or wait for a likely input-needed checkpoint.
+- **Intervene without attaching.** Send text, keys, or application mouse input; take over interactively when needed.
+- **Pick up from anywhere.** Use the terminal or browser, and route work to connected machines.
+- **Give agents a reliable control surface.** JSON metadata, bounded byte pages, and resumable cursors support scripted supervision.
 
-> **Preview branch:** this branch (`v0.5.x`) carries the 0.5.x beta line —
-> a ground-up rework of storage, terminal fidelity, and streaming with
-> breaking changes. The stable release line is 0.3.x on `main`. Beta
-> artifacts ship as GitHub *prereleases* and under the npm `beta`
-> dist-tag. See [MIGRATION.md](./MIGRATION.md) before switching.
-
-Start a command once, detach, close your terminal, come back later, inspect logs, send input only when needed, or reattach and take over. It is built for AI agent workflows, interactive CLIs, and any session you do not want tied to one fragile terminal window.
-
-If `oly` saves you time, please star the repo. That helps more people discover it.
-
-Upgrading from 0.3.x? Read [MIGRATION.md](./MIGRATION.md) first — 0.5.0 is a clean break. For internals, see [ARCHITECTURE.md](./ARCHITECTURE.md).
-
----
-
-## Why people use `oly`
-
-- **Detach without losing the process.** The daemon owns the session, not your terminal.
-- **Stop babysitting prompts.** Watch logs or wait for likely input-needed checkpoints.
-- **Intervene surgically.** Send text or keys without attaching.
-- **Resume with context.** Reattach and replay buffered output first.
-- **Keep an audit trail.** Session output and lifecycle events persist on disk.
-- **Control it from more than one place.** Use the CLI, the web UI, or route work to connected nodes.
-
-`oly` is not trying to replace your favorite terminal. It is a supervision layer for long-lived, interactive workloads. A simple CLI proxy.
-
----
+Think **persistent terminal sessions + a supervision API**, not another agent
+framework. Use your shell for quick commands; use oly when a job needs a durable home.
 
 ## Install
 
-### npm
-
 ```sh
-npm i -g @slaveoftime/oly
+npm install -g @slaveoftime/oly
 ```
 
-The published npm package bundles the supported platform binaries directly, so users do not need to download a GitHub release asset during `npm install`.
+The npm package bundles binaries for **Linux x64, macOS Apple Silicon, and
+Windows x64**. No GitHub asset download is needed during installation.
 
-### Cargo
+> **0.5 preview:** this development branch targets the breaking 0.5 release.
+> Stable installs currently use the 0.3 line. For published preview artifacts,
+> use `npm install -g @slaveoftime/oly@beta` or a GitHub prerelease.
+> Read the [migration guide](./MIGRATION.md) before switching existing state.
 
-```sh
-cargo install oly
-```
+<details>
+<summary>Other installation options</summary>
 
-### Homebrew
+**Homebrew** (stable):
 
 ```sh
 brew tap slaveOftime/open-relay https://github.com/slaveOftime/open-relay
 brew install slaveOftime/open-relay/oly
 ```
 
-### Prebuilt binaries
+**Prebuilt binaries:** download a platform archive from
+[GitHub Releases](https://github.com/slaveOftime/open-relay/releases).
 
-Download the latest release from the [Releases page](https://github.com/slaveOftime/open-relay/releases).
-
-Current release artifacts are published for:
-
-- **macOS**: Apple Silicon (`arm64`)
-- **Linux**: `x86_64` / AMD64
-- **Windows**: `x86_64` / AMD64
-
----
-
-## Quick start
-
-If you only try one workflow, make it this one:
+**Cargo** (stable):
 
 ```sh
-# Start the daemon.
-# By default, the local web UI/API is enabled and protected by a password
-# you set at startup.
+cargo install oly
+```
+
+Building from source requires Rust and Node.js/npm: release builds compile and
+embed the web UI. See [Contributing](./CONTRIBUTING.md) for development setup.
+
+</details>
+
+## From launch to handoff
+
+```sh
+# Start the daemon (skip this if it is already running).
+# Default: password-protected web UI at http://127.0.0.1:15443.
 oly daemon start --detach
 
-# Launch a detached session
-oly start copilot
+# Run your preferred CLI in the background; save the returned session ID.
+oly start --detach --title "fix failing tests" copilot
 
-# See what's running
+# See sessions and inspect recent output.
 oly ls
+oly logs <id> --tail 40
 
-# Inspect a session's full metadata and runtime details
-oly info <id>
-
-# Check recent output and optionally wait for an input-needed checkpoint
-oly logs <id> --wait prompt --timeout 1m
-
-# Send input without attaching
-oly send <id> "yes" key:enter
-
-# Reattach when you want full control
-oly attach <id>
-
-# Stop the session
-oly stop <id>
-```
-
-Useful behavior to know:
-
-- `oly info`, `oly attach`, `oly logs`, `oly send`, `oly stop`, and `oly notify` accept an optional session ID. If you omit it, `oly` targets the most recently created session.
-- To detach from an attached session, press `Ctrl-D`.
-- Attaching (CLI or browser) controls the session by default and resizes it to the attaching client's viewport. Any number of attached clients can drive input at the same time; geometry follows the most recent successful resize. Use `oly attach --observe` for a view-only attach that never drives input or geometry.
-- Resizing an attached terminal window reports the new size to the daemon and resizes the session (controllers only — an observer's resize is gated out). When several controllers resize, the last successful resize wins.
-- Input gating is coordination, not a security boundary: operator commands like `oly send` reach the session regardless of attach mode — no ceremony is needed (or available) for scripted input.
-
----
-
-## What `oly` does well
-
-### 1. Supervise agent sessions
-
-Run coding agents, REPLs, installers, or approval-heavy workflows in the background without keeping one terminal open forever.
-
-### 2. Detect likely human checkpoints
-
-`oly logs --wait prompt` lets you block until a session likely needs attention, then inspect the output before deciding what to do next. `--wait output`, `--wait idle`, and `--wait exit` round out the gate.
-
-### 3. Let humans stay in the loop
-
-When a process needs confirmation, credentials, or a decision, you or agent can send input directly:
-
-```sh
+# Inspect a TUI and, after reviewing its prompt, reply without attaching.
+oly logs <id> --screen
 oly send <id> "continue" key:enter
-oly send <id> key:ctrl+c
-oly send <id> key:up key:enter
+
+# Take over interactively. Ctrl-D detaches; the child keeps running.
+oly attach <id>
 ```
 
-For arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force you to base64-encode and decode inside the target shell — use the free-text form. Once you pass `--`, every argument after it is sent as one literal blob joined with single spaces, with **no** per-token dispatch into `key:` / `mouse:` / `oly-clipboard` / `oly-file:`:
-
-```sh
-# Multi-line body. The '--' opt-out lets you skip bash's quoting layers.
-oly send <id> -- 'echo "hello world"
-ls -la
-git status'
-
-# A token that happens to start with `key:` stays literal.
-oly send <id> -- echo "press key:enter to continue"
-
-# Compose with regular chunks before `--` (head still dispatches normally).
-oly send <id> key:enter -- echo "after the enter"
-```
-
-Free-text mode is the easiest way to drive other CLI tools or bash from `oly send` without round-tripping through base64 or fighting shell escaping.
-```
-
-### 4. Keep a browser-accessible control plane
-
-By default, `oly daemon start -d` also serves a local web UI and HTTP API on `http://127.0.0.1:15443`.
-
-- Use `--bind` to change the bind address (for example `--bind 0.0.0.0`).
-- Use `--port` to change the port.
-- Use `--no-http` for CLI-only operation.
-- Use `--no-auth` only if you understand the risk and are protecting access elsewhere.
-
-### 5. Route work to other machines
-
-`oly` can connect multiple daemons together so one primary can supervise sessions on secondary nodes.
-
----
-
-## Core workflow patterns
-
-### Detached agent run
-
-```sh
-oly start --title "fix failing tests" --detach copilot
-oly logs --wait prompt
-oly send <id> "approve" key:enter
-```
-
-### Scroll while attached
-
-Attach preserves the program's terminal behavior rather than treating every
-TUI repaint as a new transcript line:
-
-- **Main-screen programs** (shells, pi `--tui-mode regular`): use the terminal's
-  scrollbar or its scrollback shortcuts. New output enters scrollback while
-  attached; reattach restores a bounded tail of retained history.
-- **Fullscreen / alternate-screen programs** (pi `--tui-mode fullscreen`,
-  Codex fullscreen): use the application's scroll keys or mouse wheel. The
-  application owns its viewport; the outer terminal's scrollbar is not its
-  conversation history. Picker/fullscreen transitions preserve the main
-  buffer's scrollback instead of mixing TUI frames into it.
-
-For older history beyond the attach seed, use `oly logs <id> --tail <n>`.
-
-### Click or scroll a live application without attaching
-
-Send each mouse action as **one argument**, with no spaces:
-
-```sh
-oly send <id> mouse:wheel+3       # 3 wheel-up ticks
-oly logs <id> --screen           # inspect the application's redraw
-oly send <id> mouse:wheel-3       # 3 wheel-down ticks
-oly send <id> mouse:left@2,3      # click column 2, row 3 (1-based)
-oly send <id> mouse:left+2@2,3    # two press/release pairs there
-oly send <id> mouse:middle@4,5    # one middle click at column 4, row 5
-```
-
-Click syntax: `mouse:<left|middle|right>[+N]@col,row` — a 1-based position
-is required. Wheel syntax: `mouse:wheel[+N|-N][@col,row]` — only wheel defaults
-to the live viewport center when its position is omitted. Counts default to
-one and range from 1 to 1000. Only wheels accept `-N` (down); `+N` is up.
-Counts are **events, not rows**; the application decides the effect. Positions
-outside the viewport fail rather than clicking a clamped location. The owning daemon selects SGR
-(1006) or legacy X11 from live modes; legacy positions cannot exceed 223.
-`--node` routes the action to the owning daemon.
-
-Mouse reporting must be enabled by the application. Otherwise the command
-fails rather than substituting keys; use known application keys such as
-`key:pgup` / `key:pgdn`. This changes the shared application view, not terminal
-scrollback: coordinate with attached users, take small steps, and verify via
-`oly logs --screen`. Delivery alone does not prove the view moved.
-
-There is no `scroll:` alias, modifier/drag/hover syntax, or universal top/bottom
-shortcut. To type `mouse:` text literally, use free-text mode (`--`) or stdin.
-
-### Watch logs without attaching
-
-```sh
-oly logs <id> --tail 80
-oly logs <id> --tail 80 --color always
-oly logs <id> --screen                # current/last visible grid, including a blank final screen
-```
-
-### Lossless incremental read (agent API)
-
-```sh
-cursor=$(oly logs <id> --cursor)       # observe new bytes from now
-oly logs <id> --since "$cursor" --json # exact base64 byte page; chain .cursor
-# See the complete paging loop below.
-```
-
-### Start on a connected node
-
-```sh
-oly start --node worker-1 --title "nightly task" --detach claude
-oly logs --node worker-1 --wait prompt <id>
-```
-
----
-
-## Command reference
-
-### Session and daemon commands
-
-| Command | Purpose |
-| --- | --- |
-| `oly daemon start [--detach] [--bind <addr>] [--port <port>] [--notification-hook <path>] [--web-push-proxy <url>] [--no-auth] [--no-auth-without-ask] [--no-http]` | Start the daemon, optional local web API/UI |
-| `oly daemon stop [--grace <seconds>]` | Stop the daemon and let sessions exit cleanly first |
-| `oly start [--title <title>] [--detach] [--disable-notifications] [--cwd <dir>] [--node <name>] <cmd> [args...]` | Start a session |
-| `oly ls [--search <text>] [--tag <tag>]... [--json] [--follow] [--status <status>]... [--since <rfc3339>] [--until <rfc3339>] [--limit <n>] [--node <name>]... [--node-all] [--node-local]` | List sessions |
-| `oly info [id] [--color <auto\|always\|never>] [--json] [--node <name>]` | Show complete session metadata, process, activity, terminal, and journal details |
-| `oly attach [id] [--observe] [--node <name>]` | Reattach to a session (controls it by default; `--observe` is view-only) |
-| `oly logs [id] [--tail <n>] [--screen] [--tail-frames <n>] [--wait <condition>] [--match <regex>] [--idle-for <duration>] [--since <token>] [--limit-bytes <n>] [--cursor] [--color <auto\|always\|never>] [--json] [--timeout <duration>] [--node <name>]` | Read recorded output, optionally after a gate, and hand back a cursor token for the next read |
-| `oly export [id] [--json] [--node <name>]` | Dump the canonical filtered byte stream, control sequences and all, for files and pipes |
-| `oly send [id] [chunk]... [--node <name>]` | Send text or special keys to a session. Use `--` to send arbitrary text verbatim without per-token dispatch (see "Let humans stay in the loop"). |
-| `oly stop [id] [--grace <seconds>] [--node <name>]` | Stop a session |
-| `oly restart <id> [--force] [--node <name>]` | Start a new session from persisted launch metadata (`--force` first kills a running source) |
-| `oly rm [id] [--force] [--node <name>]` | Delete a stopped session and its logs (`--force` also kills a running session first) |
-| `oly notify enable [id] [--node <name>]` | Enable notifications for a session |
-| `oly notify disable [id] [--node <name>]` | Disable notifications for a session |
-| `oly notify send [source] [--title <title>] [--description <text>] [--body <text>] [--url <url>] [--node <name>]` | Send a desktop/hook notification, optionally associated with a session |
-| `oly update <id> [--title <title>] [--tag <tag>]... [--notifications enabled\|disabled] [--node <name>]` | Override a session's title, tags, and notification setting |
-| `oly skill [--apps \| --subagent \| --daemon]` | Print the bundled general, app, agent-CLI supervision, or daemon configuration skill |
-| `oly daemon status` | Show the running daemon's effective flags and HTTP endpoint |
-
-The interactive view can monitor several nodes at once, for example `oly ls --follow --node worker-a --node worker-b`. Add `--node-local` to include sessions from the current daemon (or the primary itself); the table shows a node column when multiple sources are selected. `Ctrl+D` opens a clone editor prefilled from the selected session, while `Ctrl+U` opens an update editor for the selected session's title, tags, and notification setting. `Tab`/`Ctrl+Tab` move between dialog fields, `Space` toggles notifications, and `Enter` submits the current dialog. Use `Ctrl+K` to stop the selected running session, `Enter` to open it inline, `Ctrl+Enter` to open it in another terminal window, and `Ctrl+C` to exit the list view.
-
-Use `Ctrl+G` to switch between the compact table and a working-directory tree. Tree rows show status and ID, then **title before command**, followed immediately by compact start age, output bytes, and numeric rate before the command. Long titles, commands, node names, and folder labels use ellipses; narrow terminals drop command details and activity charts before identity information. Idle flat charts and padded title/command slots are omitted. Deep tree indentation is shortened when necessary to keep the session title visible. Commands display the executable basename rather than its installation path; this changes only the presentation, not how sessions launch. Footer hints adapt to the available width and current view.
-
-Supported `oly send` key forms include named keys like `key:enter`, `key:tab`, `key:esc`, arrows, `home/end`, `pgup/pgdn`, `del/ins`, modifier forms like `key:ctrl+c`, `key:alt+x`, `key:meta+enter`, `key:shift+tab`, and raw bytes via `key:hex:...`.
-
-### Inspecting a session: `oly info`
-
-```sh
-oly info                          # most recently created session
-oly info <id>                     # inspect an exact session ID
-oly info <id> --node worker-1      # inspect a session on its owning node
-oly info <id> --color always       # retain ANSI styles in a pipe
-oly info <id> --json               # one complete machine-readable object
-```
-
-The default view uses aligned, untruncated values grouped into session,
-process, timing/activity, terminal, and storage/journal sections. It includes
-command and individual arguments, working directory, PID, exit code, resume
-command, timestamps, runtime, input-needed and notification settings, filtered
-output bytes, terminal geometry and colors, attached clients, session directory,
-journal incarnation, and available retention counters/limits.
-
-Running sessions are green, pending/stopping states and input-needed hints are
-yellow, and failed/killed states and nonzero exit codes are red. `--color auto`
-colors only terminal output and honors nonempty `NO_COLOR` and `TERM=dumb`;
-`--color never` disables styling. Metadata control characters are escaped so
-child-provided titles cannot inject terminal commands.
-
-Stopped/evicted sessions remain inspectable from persisted metadata. Unavailable
-values appear as `—`; live-only geometry, last-output timestamps, and retention
-counters may be unavailable after eviction or daemon restart. The session
-directory is a path on the owning daemon, including when `--node` is used.
-
-`--json` never emits ANSI styling. It returns a single flat object using the
-session summary field names (`args`, `cwd`, `last_total_bytes`, etc.), plus
-`exit_code`, `session_dir`, and `journal_incarnation`. Optional summary fields
-may be null or omitted when unavailable. This command inspects metadata; use
-`oly logs` or `oly export` for recorded output. The owning daemon must be running
-and support `info`; unknown IDs fail with a nonzero exit code.
-
-### Reading session output: `oly logs`
-
-`oly logs` separates rendered **views** from exact byte **continuation**.
-The default is always the last 40 rendered text lines, even for TUIs.
-Use `--screen` explicitly for a TUI. A wait only gates the selected output:
-
-| Axis | Options |
-| --- | --- |
-| **Print surface** (pick at most one) | `--tail <n>` (default), `--screen`, `--tail-frames <n>` |
-| **Gate** (never changes what is printed) | `--wait output` (alias `--wait new`), `--wait prompt`, `--wait idle`, `--wait exit`, `--wait match`. The last one needs `--match <regex>`. |
-| **Byte continuation** | `--since <cursor>` with no view flag; `--limit-bytes <n>` defaults to 256 KiB (max 8 MiB). `--cursor` prints the current stream-end token. |
-| **Format / routing** | `--color auto\|always\|never`, `--json`, `--node <name>` |
-
-Views are deliberately lossy: terminal cells can be overwritten and tails
-omit older lines. Their JSON cursors are **observation positions**, not claims
-that every preceding byte was delivered. `--since` cannot combine with
-`--tail`, `--screen`, or `--tail-frames`; it returns exact canonical filtered
-bytes, possibly splitting UTF-8/control sequences. Keep a decoder/parser
-across pages. JSON uses `mode: "stream"`, base64 `bytes`, `encoding`,
-`start_cursor`, next `cursor`, `has_more`, `running`, and `exit_code`.
-Empty pages preserve the cursor. `has_more` describes this read's observed end.
-
-Frame history samples after complete recorded output events, not arbitrary
-I/O chunks or application-defined redraws. It includes blanks, preserves
-main/alternate buffers, and deduplicates only consecutive identical styled
-states (A → B → A remains three observations). Resizes affect the next output
-sample; resize-only changes are visible immediately in `--screen`.
-Counts: tail 0..65535, frames 0..1024. Zero prints nothing without replay.
-Tails render retained scrollback plus the visible grid at recorded geometry,
-with continuous parser/styles/main/alternate state; long lines can wrap at
-that geometry. Cold tail/frame reconstruction is linear in recording size;
-warm reads use a shared byte-budgeted LRU and replay only appended records.
-Rebuilds coalesce per session/mode, not across unrelated sessions. Oversized
-entries are served uncached. The conservative cache-admission charge for
-Unicode/OSC input is not a read limit: large recordings remain readable.
-Requested frame payload above 64 MiB, recorded grids above one million cells,
-or tail grids/history above eight million cells fail explicitly rather than
-silently dropping observations. For count-related limits, request
-fewer frames/lines; use byte paging or export when rendering is unsuitable.
-
-```bash
-# Human: read rendered output
-oly logs <ID> --tail 40 --color always
-oly logs <ID> --screen                          # current/last visible grid
-
-# TUI history: last N distinct screens (oldest first)
-oly logs <ID> --tail-frames 3
-
-# Gate, then read
-oly logs <ID> --wait prompt --screen            # block until input needed, then print the live screen
-oly logs <ID> --wait exit  --tail 40            # block until the session ends, then read its tail
-
-# Lossless future-byte observation (requires jq and base64)
-id=<ID>
-cursor=$(oly logs "$id" --cursor)
-while :; do
-  page=$(oly logs "$id" --since "$cursor" --wait output --timeout 60s --json)
-  rc=$?
-  [ "$rc" -eq 2 ] && continue                  # timeout: cursor unchanged
-  [ "$rc" -eq 0 ] || break                    # stale cursor/error: inspect
-  printf '%s' "$page" | jq -r .bytes | base64 --decode
-  cursor=$(printf '%s' "$page" | jq -r .cursor)
-  [ "$(printf '%s' "$page" | jq -r .running)" = false ] &&
-    [ "$(printf '%s' "$page" | jq -r .has_more)" = false ] && break
-done
-
-# Pattern trigger
-oly logs <ID> --wait match --match 'DONE|FAILED' --tail 40
-
-# Status hint: the only line a quiet stream needs (exit 2 on timeout, 0 on met)
-oly logs <ID> --cursor --json                   # {"cursor": "Aa..", "running": true}
-```
-
-- **Cursors are opaque.** A token encodes `session | incarnation | offset`;
-  handing it to the wrong session, or to a session that restarted since, is
-  rejected loudly. Pair `--cursor` with `--since` to resume losslessly.
-- **Wait exit codes:** `0` condition met, `2` timeout, `1` error. `--timeout`
-  accepts plain milliseconds or `s`/`m`/`h` suffixes; `0` waits forever
-  (default 30s).
-- **Idle means "quiet", never "done".** A silent session may be thinking,
-  blocked, or crashed. Confirm with `--screen` or a `--wait match` pattern.
-- **Match is line-scoped.** Regex sees canonical bytes decoded with UTF-8
-  replacement, including controls. Page boundaries are transparent; partial
-  prompts can match. No cross-line matches; an unmatched line over 1 MiB is
-  an error rather than a silently missed match. An ended session without a
-  match fails promptly.
-- **Restart fencing:** every wait/read checks incarnation; a restart fails
-  instead of attaching an old cursor to a new stream.
-- **Timeout:** prints no content and advances no cursor. JSON emits one
-  `outcome: "timeout"` object with `cursor: null`, then exits 2.
-- **Modifier validation:** timeout needs a wait; idle-for needs wait idle;
-  match needs wait match. Cursor-only cannot take wait modifiers.
-- **Combinations that would be silently meaningless** (e.g. `--tail --screen`,
-  `--cursor --since`, `--wait exit --match foo`) are usage errors.
-
-### Canonical byte export: `oly export`
-
-`oly export` writes the canonical filtered byte stream straight to stdout for
-pipes and files, using bounded pages locally and remotely. It exports a fixed
-prefix captured at invocation, not an endless live feed. JSON incrementally
-serializes base64 without buffering the recording. It warns on stderr when
-stdout is a terminal. Restart/read failures are nonzero; streaming output
-already written cannot be retracted, so discard partial output on error:
-
-```bash
-oly export <id> > capture.bin     # canonical bytes, control sequences included
-oly export <id> --json            # {"bytes": "...", "size": 12345}
-```
-
-Subtle: `oly export` writes the **filtered** stream, so terminal queries that
-the scanner has already answered are not present. Use the journal directly if
-you need the unfiltered raw PTY bytes; for normal screen captures the
-filtered stream is the one a user actually saw.
-
-### Federation commands
-
-| Command | Purpose |
-| --- | --- |
-| `oly node accept --name <name> --id-pub-key <secondary-pub>` | Bind a secondary name to its Ed25519 identity (`-k` is an accept-only shortcut) |
-| `oly join start --name <name> --id-pub-key <primary-pub> <url>` | Join a primary using its independently verified identity pin |
-| `oly join stop --name <name>` | Disconnect and remove a saved join config |
-| `oly join ls` | List saved outbound join configs on this daemon |
-| `oly join ls --primary` | Ask the daemon for currently active primary-side joins |
-| `oly node ls` | List secondary nodes currently connected to the primary |
-
----
-
-### Federation joining — Ed25519 node identity authentication
-
-Every daemon generates a raw 32-byte Ed25519 seed at `<state>/identity_key`
-and publishes `<state>/identity_key.pub`. Exchange **public** identities through
-an independent trusted channel; never copy the private seed.
-
-```bash
-# On each daemon: note the ID-PUB-KEY: ed25519 <base64(raw32)> line.
-oly daemon status
-
-# On the primary: authorize the secondary's exact name and identity.
-oly node accept --name myserver --id-pub-key "<secondary's public identity>"
-
-# On the secondary: independently verify and pin the primary identity.
-oly join start --name myserver --id-pub-key "<primary's public identity>" \
-    http://192.168.1.100:15443
-```
-
-Transport is WebSocket, **not SSH**. There is no SSH agent, system SSH identity,
-OpenSSH import, TOFU, or host-key-discovery endpoint. Only oly's canonical
-`ed25519 <standard-base64(raw32)>` encoding is accepted. Each public identity
-belongs to one registered name per primary. `oly join ls` lists saved joins,
-not identity keys; `--primary` queries the local daemon's connector inventory.
-
-**The pin and accept table are the trust anchors.** A fresh challenge does not
-replace either. The sole federation-v2 handshake is:
-
-1. Plain `Hello`: version, name, secondary identity, fresh secondary nonce.
-2. Plain `Challenge`: fresh primary nonce, never a replacement identity pin.
-3. Plain `Join`: secondary signature over a length-delimited, domain-separated
-   transcript binding version, roles, name, both identities, and both nonces.
-4. The primary verifies the exact registered name/key pair and sends encrypted
-   `KeyConfirm`. The secondary verifies it and sends encrypted `Ready`.
-5. Only after `Ready` does the primary atomically register the connection and
-   send encrypted `Joined`. Only that final acknowledgement reports success
-   to the secondary CLI. A wrong pin, replay, or missing confirmation fails
-   within the handshake deadline; no application RPC runs before success.
-
-Channel keys use static-static X25519 DH derived from the Ed25519 identities,
-with HKDF-SHA-256 salted by the transcript hash. Fresh nonces separate sessions;
-AES-256-GCM sequence numbers reject repeated or reordered frames. All application
-frames and keepalives are sealed, with no plaintext fallback. **This does not
-provide forward secrecy**: a later identity-seed compromise can expose recorded
-sessions. Identity authentication and encryption remain required with `--no-auth`,
-which disables only browser/HTTP password authentication.
-
-**Run commands on the secondary from the primary:**
-
-After joining, run commands targeting the secondary from the primary's CLI:
-
-```bash
-oly node ls           # see connected secondaries
-oly send --node myserver --screen --tail 20
-oly attach --node myserver <session-id>
-oly logs --node myserver <session-id>
-oly stop --node myserver <session-id>
-```
-
----
-
-## Browser access and remote supervision
-
-`oly` serves its HTTP API and web UI on loopback by default:
-
-```text
-http://127.0.0.1:15443
-```
-
-That default is deliberate. The safe pattern is:
-
-```text
-browser or phone -> your auth gateway -> your tunnel -> local oly HTTP service
-```
-
-Examples:
-
-- Cloudflare Access
-- Tailscale / Headscale
-- SSH tunnel
-- your own reverse proxy with strong auth
-
-This keeps `oly` small and local-first while still supporting remote intervention when you need it.
-
----
-
-## Notification hooks
-
-If desktop notifications are not enough, you can configure a custom notification hook in `config.json` under `OLY_STATE_DIR` (or the default state directory for your OS).
-
-```json
-{
-  "notification_hook": "python C:\\scripts\\oly_notify.py {kind} {session_ids}"
-}
-```
-
-Placeholders available in the command:
-
-- `{kind}`
-- `{title}` / `{summary}`
-- `{description}`
-- `{body}`
-- `{navigation_url}`
-- `{node}`
-- `{session_ids}`
-- `{trigger_rule}`
-- `{trigger_detail}`
-
-The same values are also exported as `OLY_EVENT_*` environment variables.
-
-Hooks are best-effort: failures are logged, but they do not block the session or notification pipeline.
-
----
-
-## State, config, and files
-
-Default state directory:
-
-- **Windows**: `%LOCALAPPDATA%\oly`
-- **Linux**: `$XDG_STATE_HOME/oly` or `~/.local/state/oly`
-- **macOS**: `~/Library/Application Support/oly`
-
-You can override it with `OLY_STATE_DIR`.
-
-Inside that directory, `oly` stores:
-
-- the SQLite database
-- daemon logs
-- per-session journals and metadata
-- generated default `config.json`
-- saved join configs on secondary nodes
-- optional `wwwroot` static content
-
-### Working on `oly` from a clone
-
-When iterating on `oly` itself, keep the dev daemons and the per-session
-journal directories **out** of the repo root. Set:
-
-```sh
-export OLY_STATE_DIR="$PWD/.dev-state"
-```
-
-before running `oly daemon start` (or `cargo run -- daemon start`). The
-repo's `.gitignore` already excludes `.dev-state/` and the per-session
-`<id>/` directories underneath it, so the working tree stays clean.
-`CONTRIBUTING.md` documents the same convention with examples.
-
-### Tunable `config.json` keys
-
-These keys can be set in `config.json` (runtime overrides win over the file). Several are hot-reloaded when the file changes, so no daemon restart is needed:
-
-| Key | Default | Purpose |
-| --- | --- | --- |
-| `silence_seconds` | `10` | Idle time before a session is considered silent for `input_needed` detection |
-| `notification_min_interval_seconds` | `10` | Minimum seconds between repeat `input_needed` notifications for the same session |
-| `screen_scrollback_rows` | engine default | Scrollback rows kept in memory per live session screen |
-
-Session recordings live in a per-session journal (raw bytes, resizes,
-lifecycle, checkpoints); there is no size cap key — retention is
-checkpoint-gated. Inspect a session's journal; export the filtered stream
-with `oly export <id>`.
-
----
-
-## Good fits for `oly`
-
-- GitHub Copilot CLI, Claude Code, Gemini CLI, OpenCode, and similar agent workflows
-- Long-running installs or migrations that may need approval later
-- Interactive REPLs or TUIs you want to resume safely
-- Background automation that still needs occasional human intervention
-- Single-operator or small-team setups that want a lightweight supervision layer
-
----
-
-## Learn more
-
-- [MIGRATION.md](./MIGRATION.md) for the 0.3.x → 0.5.0 transition
-- [ARCHITECTURE.md](./ARCHITECTURE.md) for the system overview and architecture decision records
-- [CONTRIBUTING.md](./CONTRIBUTING.md) for development workflow
-
-If you are building agent workflows and want durable, inspectable terminal sessions, `oly` is for you.
+Replace `copilot` with `claude`, `codex`, another agent, or any interactive
+command. Pass oly options **before** the child command.
+
+Open **http://127.0.0.1:15443** for the browser UI, or use
+`oly ls --follow` for the live terminal dashboard.
+
+### A few commands worth remembering
+
+| Want to… | Command |
+|---|---|
+| Wait for a likely checkpoint | `oly logs <id> --wait prompt --timeout 5m` |
+| Inspect metadata and exit status | `oly info <id>` / `oly info <id> --json` |
+| Watch without sending input or resizing | `oly attach <id> --observe` |
+| Interrupt the child | `oly send <id> key:ctrl+c` |
+| Export recorded display bytes | `oly export <id> > capture.bin` |
+| Stop a session | `oly stop <id>` |
+| Start a fresh run from saved launch metadata | `oly restart <id>` |
+| Teach an agent how to supervise sessions | `oly skill` / `oly skill --subagent` |
+
+## Know the boundaries
+
+- **Persistent sessions, not immortal processes.** Closing a client does not stop
+  the child. Stopping/crashing the daemon or rebooting the host does; retained
+  recordings remain, but live PTYs cannot be recovered. `restart` launches a new run.
+- **Hints, not task understanding.** Prompt and idle detection can be wrong.
+  Check fresh output and the actual result; successful input delivery is not completion.
+- **Shared control, not exclusive ownership.** Multiple attached controllers can
+  type concurrently; the last successful resize wins. Coordinate with other users.
+- **Local-first, not a sandbox.** Child commands run with the daemon user's
+  privileges. Keep HTTP on loopback or put remote access behind a trusted tunnel
+  and authentication gateway. View-only mode is not a security boundary.
+
+## Go deeper
+
+- [CLI guide](./docs/CLI.md) — logs, cursors, input, scrolling, and session lifecycle
+- [Remote access](./docs/REMOTE.md) — browser security, connected nodes, and notifications
+- [Agent skills](./skills/oly/SKILL.md) — general usage; [worker supervision](./skills/oly-subagent/SKILL.md), [daemon configuration](./skills/oly-daemon/SKILL.md), [web apps](./skills/oly-apps/SKILL.md)
+- [Migration](./MIGRATION.md) — breaking changes and safe upgrades
+- [Architecture](./ARCHITECTURE.md) · [Performance](./PERFORMANCE.md) · [Contributing](./CONTRIBUTING.md)
+- [Release checklist](./docs/RELEASING.md) — gates before promoting the next release
+
+MIT licensed. If oly makes your workflow easier, a
+[star on GitHub](https://github.com/slaveOftime/open-relay) helps others find it.

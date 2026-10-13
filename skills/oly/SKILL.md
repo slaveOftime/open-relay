@@ -18,7 +18,7 @@ Do **not** use `oly` for short, non-interactive commands — a normal terminal i
 
 ## Prerequisite
 
-All commands talk to the daemon. Check with `oly daemon status`; start it with `oly daemon start --detach` **only if it is confirmed stopped**. In a restricted sandbox, `Access is denied` may mean the daemon's IPC is inaccessible even though it is running. Retry the failed `oly` command through the available approval/escalation mechanism; do not stop or start another daemon to work around permissions. If escalation is unavailable, report the limitation.
+Runtime commands require the daemon; local `oly ls` can fall back to persisted metadata, and help/skills are available offline. Check with `oly daemon status`; start it with `oly daemon start --detach` **only if it is confirmed stopped**. In a restricted sandbox, `Access is denied` may mean the daemon's IPC is inaccessible even though it is running. Retry the failed `oly` command through the available approval/escalation mechanism; do not stop or start another daemon to work around permissions. If escalation is unavailable, report the limitation.
 
 
 > For more daemon operation related things you can run `oly skill --daemon`.
@@ -66,7 +66,8 @@ oly logs <ID> --tail-frames 5
   - `exit`: the session ended.
   - `match`: `--match <regex>` appeared in NEW output (only after the gate started).
 - `--timeout` accepts `250ms`, `30s`, `5m`, `1h` (default `30s`; `0` waits forever).
-- Exit codes: `0` condition met, `2` timeout — on timeout a message is written to stderr and **no stdout** is produced. Pipelines should branch on the exit code for that case.
+- Exit codes: `0` condition met, `2` timeout, `1` error. Text timeout produces no stdout; JSON timeout emits `outcome: "timeout"` with `cursor: null`. Keep the previous cursor and branch on the exit code.
+- Prompt/input-needed detection is heuristic (including silence fallback), not proof of a question or task completion. `--wait exit` returns 0 even if the child failed; inspect the child's exit code with `oly info <ID> --json`.
 - Start with `--tail 40`; increase only when recent context is insufficient. Use `--screen` after sending TUI input; check again after the next redraw.
 
 ### 3) Send input
@@ -99,7 +100,7 @@ movement. There is no `scroll:` alias or universal top/bottom shortcut.
 **Free-text mode (`--`).** When you need to send arbitrary text — multi-line scripts, embedded quotes, anything that would otherwise force base64 round-trips through a target shell — pass `--` and then the text. Everything after `--` is sent as one literal blob joined with single spaces, with **no** `key:` / `mouse:` / `oly-clipboard` / `oly-file:` dispatch:
 
 ```bash
-# Multi-line body — the `--` opt-outs out of bash quoting layers.
+# Multi-line body — `--` disables token dispatch; shell quoting still applies.
 oly send <ID> -- 'echo "hello world"
 ls -la
 printf "%s\n" done'
@@ -111,7 +112,7 @@ oly send <ID> -- echo "press key:enter to continue"
 oly send <ID> key:enter -- echo "after the enter"
 ```
 
-Use `--` whenever the payload contains `key:`, `mouse:`, `oly-file:`, or `oly-clipboard`, has quotes / newlines, or is awkward to escape through the host shell. Send `key:enter` in a separate `oly send` call after free-text mode; anything after `--` is literal. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
+Use `--` when payload tokens could be mistaken for `key:`, `mouse:`, `oly-file:`, or `oly-clipboard`, or to group quoted multi-line text into one literal payload. Host-shell escaping is still required. Send `key:enter` in a separate `oly send` call after free-text mode; anything after `--` is literal. Reach for plain stdin (`printf '...' | oly send <ID>`) only when you genuinely need bytes that argv cannot carry.
 
 **Input strategy:**
 
@@ -124,7 +125,9 @@ Use `--` whenever the payload contains `key:`, `mouse:`, `oly-file:`, or `oly-cl
 ### 4) Lifecycle
 
 ```bash
+oly info <ID>        # full metadata, runtime details, exit code; --json for machines
 oly attach <ID>      # Detach: Ctrl-D
+oly attach <ID> --observe  # view-only, never sends input or changes geometry
 oly update <ID> --title "better name"
 oly update <ID> --title ""
 oly update <ID> --tag prod --tag release
@@ -217,16 +220,22 @@ oly export <ID>                                           # fixed-prefix canonic
 
 ### Sharing a session with a human
 
-A session has at most one **controller** — the most recently attached
-interactive client (CLI or browser attach takes control on arrival and
-resizes the session to its viewport). `oly send` is an ungated operator
-action and always works, regardless of who is attached.
+Any number of CLI/browser attachments may be **controllers** concurrently.
+Each controller can send input; the last successful resize sets geometry.
+`oly attach --observe` is view-only and never drives input or geometry.
+`oly send` is an ungated operator action regardless of attach roles (normal
+session validity and input-mode checks still apply). Roles coordinate clients;
+they are not exclusive leases or security boundaries.
 
 - Check `oly ls --json` for the session's `attach_count` before typing into a
   session a human might be driving; coordinate rather than racing them.
 - After any handoff, inspect `oly logs <ID> --screen` again; never assume
   the screen you last saw is current. Resume exact byte observation separately
   with `oly logs <ID> --since "$cursor" --json`.
+
+Closing an attached client leaves the child running, but daemon stop/crash or
+host reboot ends live PTYs. Persisted output is not process recovery;
+`oly restart` starts a fresh run from launch metadata.
 
 ## Recipes
 

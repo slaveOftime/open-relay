@@ -1,58 +1,86 @@
 ---
 name: oly-apps
-description: "Use when building a web app/api to present rich output or interactive experiences to users."
+description: Use when publishing rich HTML output or a web app through the oly daemon, including static files, SPA routing, and proxied local services.
 ---
 
-## Overview
+# Publish a web app through oly
 
-Publish rich output as a web app served by the oly daemon. Each app lives in its own folder under `<OLY-ROOT>/wwwroot/apps/` and is reachable at:
+Run `oly daemon status` to discover `ROOT` (state directory) and the effective
+HTTP endpoint. HTTP must be enabled. An app lives under
+`<ROOT>/wwwroot/apps/<app-name>/` and is served at
+`http://127.0.0.1:<PORT>/apps/<app-name>/` with the daemon's HTTP authentication.
+Use the actual bind/port reported by status, not an assumed default.
 
-```
-http://127.0.0.1:<OLY-PORT>/apps/<app-name>/
-```
+## Static HTML
 
-Run `oly daemon status` to discover `<OLY-PORT>` and `<OLY-ROOT>`.
+Create `<ROOT>/wwwroot/apps/<app-name>/index.html` and its assets. No manifest
+is required; discovery uses the HTML title and supported metadata. Use a simple
+URL-safe app name and verify both its route and its entry in the browser UI.
 
-## Quick start
-
-### Simple HTML app
-
-Drop an `index.html` (plus any assets) into a new folder:
-
-```
-<OLY-ROOT>/wwwroot/apps/<app-name>/index.html
-```
-
-No manifest needed — oly discovers `index.html` automatically.
-
-### SPA or proxied service
+## Static app / SPA manifest
 
 Create `oly.app.json` in the app folder:
 
 ```json
 {
   "title": "My App",
+  "app_type": "spa",
   "entry": "index.html",
   "redirect_files": ["../shared-assets"]
 }
 ```
 
-Set the base href to `./` (or `/apps/<app-name>/`) so relative asset paths resolve correctly when served from the discovered route.
+`../shared-assets` must already exist. Remove `redirect_files` if not needed;
+a missing redirect path makes the manifest invalid.
 
-## Manifest schema (`oly.app.json`)
+Use relative assets with a suitable base (`./` or `/apps/<app-name>/`). For a
+SPA, use hash routing or explicitly provide history fallback: `app_type: "spa"`
+is a display hint, **not** automatic routing. A redirect **file** such as
+`"redirect_files": ["index.html"]` can supply a fallback for unmatched paths;
+it also catches missing assets, so test asset errors and deep links carefully.
+A fixed `/apps/<app-name>/` asset base works better than `./` for deep links.
 
-| Field | Type | Description |
+## Proxy a local service
+
+```json
+{
+  "title": "Local dashboard",
+  "app_type": "spa",
+  "entry": "http://127.0.0.1:5173/"
+}
+```
+
+The service must already be running on the **daemon's machine**. Proxy entries
+support HTTP(S) and WebSocket upgrades. Do not combine them with `redirect_files`
+(local entries only). Loopback targets are supported; private LAN/link-local
+literal targets are rejected by the manifest guard. Do not treat this guard as
+a complete security boundary: manifests are trusted operator configuration,
+not something untrusted users should be allowed to publish.
+
+## Manifest schema
+
+| Field | Type | Meaning |
 |---|---|---|
-| `title` | `string?` | Display name. |
-| `description` | `string?` | Short description. |
-| `icon_href` | `string?` | Icon URL or relative path. |
-| `app_type` | `string?` | App type hint. |
-| `redirect_files` | `string[]` | Extra asset directories outside the app folder. Oly checks the app folder first, then each redirect directory in order; 404 if not found. |
-| `entry` | `string` | **Required.** URL, path, or HTML file to serve as the entry point. |
+| `entry` | required string | Nonempty local relative entry path, or HTTP(S) proxy URL |
+| `title` | optional string | Display title (otherwise HTML title/folder name) |
+| `description` | optional string | Short description |
+| `icon_href` | optional string | Icon URL or relative asset path |
+| `app_type` | optional string | `spa` or `single_html` display hint |
+| `redirect_files` | string array | Existing files/directories to try after app-local assets, in order |
 
-## Rules
+Local entry paths must not be absolute or contain parent traversal. Redirect
+paths may be relative to the app folder or absolute, and are canonicalized;
+**they can expose files outside the app folder**. Only reference assets intended
+for publication; never add a home directory, credentials, or private state.
 
-- Use **relative asset paths** or the `/apps/<app-name>/` base — absolute paths will break.
-- One folder per app, one `index.html` or one `oly.app.json` per folder.
-- Use `redirect_files` to share static assets across apps without copying.
+## Verify and hand back
 
+1. Validate manifest JSON and confirm every local/redirect path exists.
+2. Open the app through oly with normal authentication; confirm content and assets.
+3. For SPAs, test reload on a deep link; for proxies, test the intended interaction
+   and WebSocket behavior, not just an HTTP success code.
+4. Report the app URL, published files, and any untested behavior.
+
+Oly serves/proxies apps; it does not install dependencies, launch a proxy target,
+sandbox app code, or guarantee that arbitrary absolute asset URLs work. Coordinate
+with the operator before exposing an app or starting/stopping its backing service.

@@ -60,14 +60,32 @@ If you touch packaging or release behavior, also review:
 - `npm/package.json`
 - `.github/workflows/release.yml`
 
-Run the offline release-workflow regressions on Linux (requires Python 3,
-Bash, `zip`, `unzip`, and `sha256sum`):
+Run the offline documentation contracts (Python 3) and release-workflow
+regressions (Linux with Python 3, Bash, `zip`, `unzip`, and `sha256sum`):
 
 ```sh
+python3 tests/docs_sync.py
 python3 tests/release_workflow.py
 ```
 
-These use fixture binaries and a fake `npm` command; they never publish.
+The docs check validates local links/fences, copied prompt defaults, config
+coverage, and protocol version. Packaging checks use fixture binaries and a
+fake `npm` command; they never publish. See [Release preparation](./docs/RELEASING.md)
+for promotion gates and manual artifact checks.
+
+### Documentation ownership
+
+- `README.md`: short introduction, install, and quick start (keep under 160 lines).
+- `docs/CLI.md`: detailed user-facing command and byte/view semantics.
+- `docs/REMOTE.md`: remote setup, trust boundaries, notifications, and state.
+- `ARCHITECTURE.md`: implementation map, invariants, and design trade-offs.
+- `skills/*/SKILL.md`: self-contained agent guidance embedded by `oly skill`.
+  Keep the daemon skill's config table/default patterns aligned with `src/config.rs`.
+- `MIGRATION.md`: actual breaking changes and safe backup/upgrade/rollback.
+
+When behavior changes, update the relevant guide and bundled skill together;
+avoid duplicating exhaustive flag tables in the README. Validate assumptions
+against source/tests, and distinguish automated checks from manual-only claims.
 
 ## Pull request checklist
 

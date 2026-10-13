@@ -143,6 +143,21 @@ fn skill_command_prints_embedded_markdown() {
 }
 
 #[test]
+fn skill_apps_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("apps_skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--apps"])
+        .output()
+        .expect("failed to run oly skill --apps");
+
+    assert!(output.status.success(), "`oly skill --apps` should exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        include_str!("../skills/oly-apps/SKILL.md")
+    );
+}
+
+#[test]
 fn skill_subagent_prints_embedded_markdown() {
     let tmp = make_tmp_dir("subagent_skill_markdown");
     let output = oly_cmd(&tmp)

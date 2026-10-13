@@ -11,6 +11,12 @@ on:
       - Cargo.toml
       - Cargo.lock
       - build.rs
+      - README.md
+      - ARCHITECTURE.md
+      - MIGRATION.md
+      - CONTRIBUTING.md
+      - docs/**
+      - skills/**
       - src/**
       - tests/**
       # The web bundle is embedded into the Rust binary at build time.
@@ -51,6 +57,9 @@ jobs:
         with:
           shared-key: ${{ runner.os }}-oly
           cache-on-failure: true
+
+      - name: Documentation contracts (offline)
+        run: python3 tests/docs_sync.py
 
       - name: Release workflow regressions (offline)
         run: python3 tests/release_workflow.py

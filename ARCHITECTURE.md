@@ -2,12 +2,13 @@
 
 `oly` runs interactive terminal programs under a daemon so they survive
 closed terminals, can be observed and driven from several places at once,
-and leave a truthful, durable recording.
+and leave an ordered recording for inspection and replay. A client disconnect
+preserves the child; a daemon stop/crash or host reboot does not recover live PTYs.
 
-This file is the 10-minute orientation. **The code is the source of truth**;
-this document only explains the shape so you know where to look. Design
-decisions and their reasons are captured in this document — read it
-before changing anything structural.
+This is the maintainer orientation for the 0.5 design. **The code is the source
+of truth**; this document maps the implementation and explains its boundaries.
+Historical ADR/invariant IDs in source refer to the consolidated decisions here,
+not separate ADR files. Read this before changing anything structural.
 
 ## The three rules
 
@@ -16,29 +17,34 @@ core concern:
 
 1. **One journal.** Every session persists a single ordered stream — raw PTY
    output, resizes, lifecycle transitions, checkpoints — in a per-session
-   journal (`src/session/journal.rs`). Nothing else is persisted per
-   session. Shared SQLite session metadata may cache *derived hints* (for
+   journal (`src/session/journal/`). It is the only persisted terminal
+   recording; uploaded files can also live in the session directory.
+   Shared SQLite stores launch/lifecycle metadata and may cache *derived hints* (for
    example, a `resume_command` discovered from the rendered journal tail
    after both child exit and PTY EOF using configurable `resume_patterns`);
    it is not another recording.
-   Everything else (the filtered display stream, resize history,
-   logs, attach snapshots) is *derived* from the journal at read time
-   (`src/session/replay.rs`), so derived state can never silently disagree
-   with the recording. Replay is checkpoint-anchored: anchored v2
-   checkpoints carry their filtered-stream offset, so deriving a window
-   costs O(checkpoint cadence), never O(total recording) (the checkpoint-
-   anchored replay design).
+   The filtered display stream and historical reads are derived from the
+   journal (`src/session/replay.rs`, `src/session/logs/`); live screens and
+   attach snapshots use the engine maintained by the same sequencing path.
+   Anchored v2 checkpoints carry filtered offsets, reducing prefix replay
+   when a suitable anchor exists. Missing/unusable anchors fall back to a
+   bounded-batch full-prefix scan; anchor discovery itself scans record
+   headers. Cold rendered tail/frame reconstruction can still be linear
+   in recording size. Do not promise constant-cost historical reads.
    The journal is always on; if it fails, the session
    fails loudly rather than recording nothing (ADR-0002, ADR-0006).
    Sessions left over from pre-0.5 builds (only `output.log`) are rejected
    with an explicit error (see MIGRATION.md).
-2. **One terminal engine.** All terminal-state questions — the live screen,
-   `oly logs` rendering, web views, Windows repaint — are answered by one
-   embedded alacritty engine (`src/terminal/`). vt100 survives only as a
-   test-only conformance oracle (ADR-0001).
-3. **One framing.** Attach streams are binary-framed end to end
-   (`src/ipc.rs`, `web/src/api/ws-frames.ts`): length-delimited frames with
-   raw output bytes, JSON only for low-volume control (ADR-0004).
+2. **One authoritative terminal model.** The daemon's live screen, `oly logs`
+   rendering, snapshots, and Windows repaint use the embedded alacritty
+   engine (`src/terminal/`). Browsers render the canonical stream with
+   xterm.js; they are clients, not another backend source of recording truth.
+   vt100 survives only as a test-only conformance oracle (ADR-0001).
+3. **One attach contract.** Output is binary end to end, with cursor/mode
+   semantics shared by every transport (`src/ipc.rs`,
+   `web/src/api/ws-frames.ts`). IPC and browser WS have transport-specific
+   envelopes; high-volume output avoids base64-in-JSON. IPC control remains
+   JSON, while browser control uses its WS frame layout (ADR-0004).
 
 ## Component map
 
@@ -47,11 +53,11 @@ core concern:
 | CLI | `src/main.rs`, `src/cli.rs`, `src/client/` | Parses commands, talks to the daemon over the local IPC socket. |
 | Daemon | `src/daemon/` | Owns all sessions. Serves IPC (`rpc*.rs`), HTTP + WebSocket (`src/http/`), and node federation (`src/node/`). |
 | Session runtime | `src/session/runtime.rs` | One per session: owns the PTY, feeds the engine, sequences every output chunk through a single point, journals it, broadcasts it. |
-| Journal | `src/session/journal.rs` | Segmented, incarnation-fenced append-only log with durability cursors and checkpoint-gated retention. Integrity is verifiable through manifest validation. |
+| Journal | `src/session/journal/` | Segmented, incarnation-fenced append-only log with durability cursors and checkpoint-gated retention. Integrity is verifiable through manifest validation. |
 | Replay | `src/session/replay.rs`, `src/session/logs/` | Derives the filtered display stream, resize history, and rendered logs from the journal. |
-| Attach pump | `src/session/store/pump.rs` | The single state machine that serves every attach: snapshot from the journal, then gapless live chunks with enforced credits and bounded per-client queues. |
+| Attach pump | `src/session/store/pump.rs` | Shared streaming state machine: fresh live-engine snapshot or journal-backed offset resume, then cursor-checked chunks and bounded recovery/credits. |
 | Attachments | `src/session/store/attach.rs` | Registry with roles fixed at registration (controller, or view-only observer); geometry authority gated by role. |
-| Web UI | `web/` | React + xterm.js; consumes the same binary frame protocol over WebSocket. |
+| Web UI | `web/` | React + xterm.js; consumes the shared attach contract in browser-specific binary WS frames. |
 | Federation | `src/node/`, `src/daemon/rpc_nodes.rs` | A primary supervises sessions on secondary nodes; remote attach relays the same stream with fencing, deadlines, and keepalives. See “Node federation”. |
 
 ## Following a byte: the key data flows
@@ -62,20 +68,21 @@ Output (one producer, fan-out at the sequencing point):
         child process (PTY)
               │ PTY read (reader thread)
         session/runtime.rs — single sequencing point:
-        every chunk becomes SequencedChunk(incarnation, offset)
+        raw bytes → journal; filtered bytes → SequencedChunk(offset, bytes)
+        attach subscription/cursors carry the incarnation fence
               │
       ┌───────┼────────────────────┐
       ▼       ▼                    ▼
   journal   broadcast ring   terminal engine
-  (durable, (live attach,    (live screen, ModeSnapshot:
-  fenced)   bounded lag)     DECCKM/paste/mouse/focus)
+  (append + (live attach,    (live screen, ModeSnapshot:
+  sync ack) bounded lag)     DECCKM/paste/mouse/focus)
       │       ▲
       └───────┘ resync & completion tail read from the journal,
                 never from memory (I2: gaps are errors, not skips)
               │
         AttachPump (store/pump.rs) — THE one streaming state machine:
-        snapshot → gapless chunks → coalesce → bounded queue → credits
-        emits AttachEvent { Chunk | Modes | Resync | End }
+        live snapshot / journal resume → cursor checks → recovery → credits
+        emits AttachEvent { Chunk | Modes | Done | Closed }
               │
    ┌──────────┼──────────────────┐
    ▼          ▼                  ▼
@@ -84,7 +91,7 @@ Output (one producer, fan-out at the sequencing point):
  (CLI)      ws.rs + ws-frames.ts
 ```
 
-Input (one gate):
+Interactive attach input (one role gate):
 
 ```
 CLI keys / xterm onData ──► AttachClientMessage
@@ -96,7 +103,10 @@ CLI keys / xterm onData ──► AttachClientMessage
   PTY writer (runtime.rs) ──► child stdin
 ```
 
-Two design points worth knowing before touching this code:
+Operator `oly send` uses the same PTY input path without an attachment role;
+observe mode is not an authorization boundary or an exclusive controller lease.
+
+Design points worth knowing before touching this code:
 
 - **Flow control is cursor-based, not queue-based.** Clients ack an
   `applied-cursor`; the pump enforces stream credits and bounded queues,
@@ -105,8 +115,9 @@ Two design points worth knowing before touching this code:
 - **Modes are engine state, mirrored per transport.** The engine tracks
   DECCKM, bracketed paste, mouse reporting (1000/1002/1003 collapsed to
   one flag, plus SGR 1006), and focus reporting (1004) in a
-  `ModeSnapshot`. Snapshots never replay raw DECSET bytes; instead each
-  transport mirrors the authoritative snapshot — the CLI drives its own
+  `ModeSnapshot`. Fresh screen snapshots are renderer restore streams,
+  not historical DECSET replay (they can explicitly enter the alternate screen).
+  Each transport mirrors authoritative input-mode flags — the CLI drives its own
   local terminal (`sync_local_terminal_modes` in `client/attach.rs`),
   the browser gets the flags in the INIT/MODE_CHANGED frames
   (`web/src/api/ws-frames.ts: terminalModeSequences`) and writes a
@@ -209,7 +220,7 @@ Once joined, exactly three flows run over the one WS connection
 1. **Event relay (push).** The secondary forwards its `SessionEvent`
    broadcast; the primary tags each event with the node name
    (`for_delivery(node)`) and re-broadcasts it, so web, SSE, and
-   `oly list` show remote sessions with a `node` field. Notifications
+   `oly ls` show remote sessions with a `node` field. Notifications
    are relayed with a `[node]` title prefix.
 2. **Proxied RPCs (one-shot).** Commands carry an optional node
    (`oly logs --node`, web `?node=`); `NodeRegistry::proxy_rpc` sends
@@ -249,7 +260,7 @@ Federation rules to preserve:
   fresh signed transcript, and mutual encrypted confirmation are all required
   even with HTTP `--no-auth`. No API-key or alternate credential branch remains.
 - **The owning node is the only authority on its sessions.** The
-  primary routes and displays; it never bypasses the secondary's lease
+  primary routes and displays; it never bypasses the secondary's role
   or credit checks — everything goes through that node's own daemon.
 - **Relay failure is loud.** Stream frames use bounded queues; a dead
   node ends proxied streams with an explicit error, and connectors
@@ -316,7 +327,7 @@ invariant descriptions throughout this document):
 Start from the session runtime and follow a byte: PTY read →
 `runtime.rs` sequencing → journal append + broadcast → attach pump →
 `ipc.rs`/`ws.rs` frames → client. The reverse direction (input) goes through
-the attachment registry's lease check into the PTY writer. For a federated
+the attachment registry's role check into the PTY writer. For a federated
 session, the same walk continues one hop further: the secondary's connector
 (`daemon/rpc_nodes.rs`) serves the relay through its own local IPC, so there
 is no second streaming implementation to learn.
@@ -371,11 +382,53 @@ The CLI list view keeps a parallel client-side index
 (`session_search_text`, `src/client/list_tui/app.rs`) over the same field set,
 so follow-mode filtering stays in step with the server-side query.
 
+## Configuration and attention hints
+
+`src/config.rs` resolves **flat** JSON into internal substructures. CLI overrides
+remain authoritative across reload; the daemon's inherited `OLY_WEB_PUSH_PROXY`
+also outranks the file. `src/daemon/reload.rs` polls mtime every two seconds,
+swaps `LiveConfig`, and applies channel/eviction/retention/resume/log side effects.
+HTTP listener changes require restart. Live config availability does not mean
+existing session engines are rebuilt: scrollback retention is captured at spawn.
+
+`src/notification/mod.rs` samples silent candidates once a second. Candidates
+use activity epochs and a rendered live-screen excerpt (`store/notify.rs`), not
+a historical byte-pattern scan. Regex prompt hints can trigger after activity
+suppression; silence remains a fallback even with `prompt_patterns: []`.
+The LLM trigger function is currently a stub. None of this establishes task
+completion or approval authority. Resume rules instead scan a completed,
+durable journal tail and store a suggestion; they never execute it.
+
+## Deliberate trade-offs
+
+- **Journal (ADR-0002/0006):** one ordered recording avoids divergent persisted
+  streams; old ambiguous recordings are rejected rather than fabricated.
+  Append/enqueue is not fsync: durable acknowledgements are the persistence boundary.
+- **Terminal model (ADR-0001):** one backend engine keeps replay/rendering aligned;
+  transport clients still render and mirror modes appropriate to their terminals.
+- **Input (ADR-0003):** explicit paste boundaries and live modes replace timing
+  guesses; platform-specific decoders preserve the same input contract.
+- **Framing (ADR-0004):** binary output avoids base64 expansion on high-volume
+  attach paths; transport-specific control carries the same mode/cursor contract.
+  Byte cursors enforce continuity.
+- **History UX:** recorded bytes, rendered views, and application-owned scrolling
+  are different surfaces. Views are lossy observations, not complete transcripts.
+- **Retention:** byte budgets delete eligible older whole incarnations only;
+  current/checkpoint-bearing data is protected and can exceed the budget. This is
+  not a hard disk quota. The hourly age sweeper permanently deletes stopped
+  sessions; both settings default to disabled.
+- **Trust:** the daemon executes as its OS user, without a sandbox. HTTP login
+  protects operator access; attach roles only coordinate input/resize. Federation
+  uses pinned identities and sealed traffic but has no forward secrecy.
+
 ## Documents
 
-- `README.md` — what oly is and how to use it.
-- `MIGRATION.md` — 0.3.x → 0.5.x breaking changes and upgrade steps.
-- `ARCHITECTURE.md` — the architecture decision records (engine, journal,
-  input, streaming, history UX, crash boundary, authz), consolidated here.
-- `PERFORMANCE.md` — critical data-path tracking with before/after numbers.
-- `CONTRIBUTING.md` — development workflow.
+- [README](./README.md) — positioning, install, and quick start.
+- [CLI guide](./docs/CLI.md) — commands and log/input contracts.
+- [Remote access](./docs/REMOTE.md) — browser, federation, notifications, and state.
+- [Skills](./skills/oly/SKILL.md) — bundled agent instructions; configuration lives
+  in the [daemon skill](./skills/oly-daemon/SKILL.md).
+- [Migration](./MIGRATION.md) — breaking changes and safe upgrade/rollback.
+- [Performance](./PERFORMANCE.md) — data-path measurements and recovery budgets.
+- [Contributing](./CONTRIBUTING.md) — development workflow.
+- [Release checklist](./docs/RELEASING.md) — promotion gates and manual checks.

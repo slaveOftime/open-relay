@@ -1,272 +1,204 @@
-# Migrating from 0.3.x to 0.5.x (beta)
+# Migrating from 0.3.x to 0.5
 
-oly 0.5.0 is a **beta / preview release** on the `v0.5.x` branch. The
-stable line remains 0.3.x on `main`.
+The 0.5 development line is a **breaking preview**; stable installs currently
+use 0.3.x. Release channels depend on the **tag**, not the branch: tags with a
+prerelease suffix publish to GitHub prereleases and npm `beta`; stable tags
+publish to the stable channels. See [Releasing](./docs/RELEASING.md).
 
-0.5.0 is a **clean break** from 0.3.x. It will not read your old session
-recordings, and old binaries will not read the new ones. Your data is
-not converted or deleted by this recording change — but back it up before
-switching. Obsolete federation credentials are explicitly deleted by the
-credential-cleanup migration described below.
+0.5 will not read 0.3 session recordings, and old binaries will not read new
+ones. The recording change does not convert or delete old files, but SQLite
+migrations remove obsolete federation credential tables. **Back up state before
+switching.** Live processes cannot move between daemons or versions.
 
-Read this file fully before upgrading a machine that has sessions you care
-about.
+## What changes
 
-## Why 0.5.0 breaks compatibility
+| Area | 0.5 contract | Upgrade action |
+|---|---|---|
+| Recordings | One segmented, incarnation-fenced `journal/` per session instead of `output.log`/`events.log` | Preserve old files separately; old recordings are rejected explicitly, not imported |
+| Terminal model | Alacritty is the authoritative backend engine; vt100 is test-only | No user action; browser xterm.js remains a rendering client |
+| CLI/daemon IPC | Protocol **14** with binary attach frames after JSON init | Upgrade CLI and daemon together; protocol mismatch fails explicitly |
+| Federation | Federation v2, pinned Ed25519 identities, encrypted readiness and application frames | Upgrade every node, re-authorize identities, recreate joins; no mixed-version rollout |
+| Machine credentials | Preview API-key and SSH-key credential paths removed | No `api-key` command or join `--key`; use `--id-pub-key` |
+| Browser auth | Password login and issued session tokens; origin checks and revocation | Log in again; HTTP `--no-auth` never disables federation identity auth |
+| Attach control | Multiple concurrent controllers; `--observe` is view-only | Coordinate input; last successful controller resize wins; roles are not authorization |
+| Input/detach | Explicit paste boundaries; `Ctrl-D` detaches | Clipboard shortcuts include Ctrl-V/Shift+Insert; detach does not stop child |
+| Log reads | Default tail 40, explicit screen/frame views, bounded cursor continuation | Update scripts to the commands below; removed flags are errors |
+| Configuration | **Flat JSON** with journal budget/age retention | Do not wrap keys in `limits`; remove obsolete `ring_buffer_bytes`; old `max_output_log_bytes` aliases the journal budget |
+| Daemon status | Effective running flags and endpoint, not just client config | Check the actual endpoint after restart |
 
-0.3.x accumulated three parallel ways of doing the same thing: two persisted
-output streams (`output.log` + `events.log` vs. the journal), two terminal
-parsers (vt100 vs. the alacritty engine), and two attach wire formats (base64
-JSON vs. binary frames). Each duplicate was a place where behavior could
-silently disagree — and did. 0.5.0 keeps exactly one implementation of each
-concern, chosen by the architecture decision records:
+### Log-script changes
 
-- **Storage:** the per-session journal is the only persisted stream
-  (ADR-0002, ADR-0006). It records raw output, resizes, lifecycle, and
-  checkpoints with durability cursors; everything else (the filtered display
-  stream, resize history, logs, attach snapshots) is *derived* from it at read
-  time, so derived state can never disagree with the recording.
-- **Terminal parsing:** one engine (alacritty_terminal) renders live attach,
-  logs, and web views (ADR-0001). vt100 remains only as a test-only
-  conformance oracle.
-- **Streaming:** attach output travels as binary frames, not base64-in-JSON
-  (ADR-0004). Control messages stay newline-delimited JSON.
-
-Keeping 0.3.x readers alive would mean shipping the old bugs as permanent
-compatibility branches. We chose a single supported stack plus an explicit,
-honest migration instead.
-
-## What breaks
-
-| Area | 0.3.x | 0.5.0 | What you must do |
-|---|---|---|---|
-| Session recordings | `output.log` + `events.log` per session | `journal/` directory per session (segmented, incarnation-fenced) | Nothing readable automatically; see "Preserving old recordings" below. 0.5.0 prints an explicit error for pre-0.5 sessions instead of guessing. |
-| CLI ↔ daemon protocol | IPC protocol v4 | IPC protocol **v14** | CLI and daemon must both be 0.5.0. A mismatch exits with a precise version error — no silent misbehavior. |
-| Attach stream framing | base64 chunks inside JSON lines | binary frames after the JSON init line | Only relevant to tooling that spoke IPC directly; update it or pipe through the 0.5.0 CLI. |
-| Federation | 0.3.x node handshake | fenced, deadline/keepalive-driven node links (M5-2…M5-4) | All nodes must run 0.5.0; re-`join` secondaries after upgrading. No rolling mixed-version federation. |
-| Node identity auth | — | required Ed25519 identity authentication over WebSocket (federation v2) | Use `--id-pub-key` to pin the primary on `join start` and register the secondary on `node accept`. Exchange canonical `ed25519 <base64(raw32)>` public identities independently. Fresh signed transcripts and encrypted KeyConfirm/Ready/Joined fail closed on wrong pins. No SSH transport/import, aliases, or old handshake loader. Static-static DH does not provide forward secrecy. |
-| Config | `ring_buffer_bytes`, `max_output_log_bytes` | keys removed; replaced by `limits.max_journal_bytes_per_session` (live sessions) and `limits.journal_retention_days` (stopped sessions); `max_output_log_bytes` continues to be honored as an alias for `max_journal_bytes_per_session` | Delete the old keys (or leave the alias); set new keys explicitly if you want caps. Both default to `0` (unlimited) so existing behavior is preserved exactly on upgrade. |
-| API keys | one all-powerful daemon key | **removed before merge** — see "API keys removed" below | The `oly api-key` command group, the scoped-key migration step, and the `--key` flag on `oly join start` are all removed before merge to `main`. Federation uses node identity authentication only. |
-| Web UI auth | shared token | per-principal sessions, origin checks (M5-4) | Everyone logs in again after upgrade. |
-| Input handling | timing heuristics for paste/keys | event-driven; paste boundaries come from bracketed-paste markers only (ADR-0003) | No action; apps that enable bracketed paste get exact paste boundaries. |
-| Detach keys | `Ctrl-]` then `d` (broken in some terminals) | `Ctrl-D` (EOT), matching the historic key contract; Ctrl-V and Shift+Insert are clipboard paste shortcuts. | No action. |
-| Daemon status | reported the client's config values | reports the running daemon's effective flags and HTTP endpoint (from the daemon's own record) | No action; `oly daemon start` against a running daemon now prints the running config and the remedy. |
-
-Everything else about the CLI is **additive**: new subcommands
-(`notify`, `restart`, `status`, `skill`, `update`;
-the `history`/`screen`/`wait` read surfaces are modes of `oly logs` —
-`--from`, `--screen`, and `--after`/`--exit`/`--idle-ms`/`--pattern`
-respectively) and new flags. All 0.x commands
-(`start`, `stop`, `list`, `logs`, `attach`, `send`, `node`, `join`,
-`daemon`) still exist with the same names.
-
-### API keys removed
-
-The preview API-key feature is removed for security reasons before merge:
-there is one identity-authenticated federation path, not shared machine
-credentials that can also authorize HTTP access.
-
-- `oly api-key {add,ls,remove}`, their RPCs, HTTP machine-key Bearer fallback,
-  and join `--key` / `-k` are gone. Accept retains `-k` as a public-key shortcut.
-- `--id-pub-key` replaces the old flag without an alias. New daemon
-  identities live in `identity_key` / `identity_key.pub`; old key files are
-  not moved, converted, or deleted automatically.
-- SQL migrations 0001–0009 stay unchanged. Additive migration 0010 creates
-  `node_identities`; appended migration 0011 **drops `api_keys` and `ssh_keys`**
-  without copying credentials. Session/push data and migration checksums are
-  preserved. Re-register each exact secondary name/key and re-create joins
-  using the independently verified primary pin; no mixed-version rollout.
-- Browser password login, issued Bearer **session tokens**, cookies, expiry,
-  logout and revocation remain. `--no-auth` does not disable federation auth.
-
-Follow README → "Federation joining" for the clean-break setup. The new
-handshake reports success only after encrypted confirmation and readiness.
-
-## Upgrade procedure
-
-### 1. Preflight
+Do not use obsolete `logs --raw`, `--from`, `--from-file`, `--cols`,
+`--keep-color`, `--exit`, or `--wait-for-prompt` flags. Current forms:
 
 ```sh
-oly list            # note running sessions — live PTYs cannot be migrated
-oly daemon status   # confirm which daemon version is running
-df -h ~/.local/state/oly   # ensure free space for the backup
+oly logs <id> --tail 40 --color always
+oly logs <id> --screen
+oly logs <id> --tail-frames 3
+oly logs <id> --wait prompt --timeout 5m
+oly logs <id> --wait exit --timeout 5m
+oly logs <id> --wait idle --idle-for 2s --timeout 1m
+oly logs <id> --wait match --match 'DONE|FAILED' --timeout 5m
+oly logs <id> --cursor
+oly logs <id> --since "<cursor>" --json
+oly export <id> > capture.bin
 ```
 
-Finish or stop every session you still need interactively. A running 0.3.x
-session belongs to the 0.3.x daemon; 0.5.0 cannot adopt it.
+Rendered views are lossy. Continuation returns exact **filtered display bytes**,
+base64 in JSON, with a next cursor and `has_more`. Cursors bind session and
+incarnation; preserve them on timeout (exit 2). Exit waits return 0 when the
+child ends, even on child failure: inspect `oly info <id> --json` for exit status.
+See the [CLI guide](./docs/CLI.md#logs-views-waits-and-byte-continuation).
 
-### 2. Back up
+### Federation credential cleanup
 
-```sh
-# State directory: $XDG_STATE_HOME/oly or ~/.local/state/oly on Linux,
-# ~/Library/Application Support/oly on macOS, %LOCALAPPDATA%\oly on
-# Windows. OLY_STATE_DIR overrides it (tests use this).
-cp -a ~/.local/state/oly ~/.local/state/oly-0.x-backup
-```
+Migrations 0001–0009 retain their historical checksums. Migration 0010 creates
+`node_identities`; 0011 drops obsolete `api_keys` and `ssh_keys` **without copying
+credentials**. Session/push data is preserved. Old identity files are not
+converted or deleted automatically.
 
-The backup contains your metadata and every session's `output.log` /
-`events.log`. Keep it somewhere the 0.5.0 daemon does not write.
+Each daemon generates `<state>/identity_key` (private seed) and
+`identity_key.pub` (canonical `ed25519 <standard-base64(raw32)>`). Independently
+verify public identities, register each exact secondary name/key on its primary,
+and pin the primary with `join start --id-pub-key`. Accept keeps `-k` as a
+public-key shortcut; join does not. No SSH transport/import, TOFU, in-band key
+replacement, or shared API-key fallback exists. Static-static DH provides no
+forward secrecy. Follow the [remote setup guide](./docs/REMOTE.md#connect-machines).
 
-### 3. Stop the old daemon
+## Safe upgrade
+
+The following shell examples are for Linux with the default state path. Use
+the actual `OLY_STATE_DIR` or platform path reported by `oly daemon status`.
+On Windows use equivalent PowerShell copy/move commands; on macOS use
+`~/Library/Application Support/oly`.
+
+### 1. Inspect and finish live work
+
+Use the **old binary's supported list command** (the current CLI uses `oly ls`)
+and inspect daemon status. Finish or explicitly stop sessions that matter.
+A 0.3 daemon owns its live PTYs; 0.5 cannot adopt them.
+
+### 2. Stop the old daemon, then back up
 
 ```sh
 oly daemon stop
+cp -a ~/.local/state/oly ~/.local/state/oly-0.3-backup
 ```
 
-Do not start the 0.5.0 daemon while a 0.3.x daemon is running on the same
-state directory.
+Stop before copying to get a quiescent SQLite/journal backup. Choose a fresh
+backup destination, confirm the copy, and keep it outside the new daemon's
+writable state. Backups contain private identity/config/session data; protect
+access. Do not start two versions against the same state directory.
 
-### 4. Install 0.5.0 and start
+### 3. Install the intended version
+
+For a **published preview**:
 
 ```sh
-cargo install --path .        # or: npm install -g oly@beta
-oly daemon start
-oly daemon status             # should report the 0.5.0 daemon
+npm install -g @slaveoftime/oly@beta
 ```
 
-The SQLite metadata database migrates itself forward automatically (schema
-history is preserved and new forward migrations are applied on open;
-credential cleanup drops only the obsolete credential tables). Session *recordings* are not
-migrated — see below.
-
-### 5. Verify
+Or download its exact prerelease archive. To build this checked-out source
+(Rust and Node.js/npm required):
 
 ```sh
-oly list                    # 0.3.x sessions appear; logs/attach report the
-                            # pre-0.5 format explicitly, never garbage
-oly start -- echo hello     # create a fresh 0.5.0 session
-oly logs <id>               # renders from the new journal
-# (journal verification is now via the underlying journal; no separate command)
+cargo install --path . --locked
 ```
 
-## Preserving old recordings
+Do not assume unqualified npm/Cargo/Homebrew stable installs contain the 0.5
+preview. Confirm `oly --version` before opening existing state.
 
-There is **no automatic import**, on purpose. A faithful 0.5.0 journal needs
-ordered raw bytes, resize offsets, and checkpoints; reconstructing those from
-`output.log`/`events.log` would fabricate provenance we cannot guarantee
-(ambiguous resize offsets, unknown timing, truncated tails). The project rule
-is: never present a guess as a faithful recording.
+### 4. Start, inspect, and test a fresh session
 
-Your old bytes are still useful:
+```sh
+oly daemon start                  # follow the password setup; Ctrl+C stops this foreground daemon
+# From another terminal:
+oly daemon status
+oly ls
+oly start --detach --title "upgrade check" echo hello
+oly logs <returned-id> --wait exit --timeout 30s
+oly info <returned-id> --json      # confirm exit code and metadata
+```
 
-- `output.log` contains the filtered display stream (what the terminal
-  showed; device query/response and other control exchanges were filtered
-  out before persisting). Replaying it with `cat output.log` in a wide
-  terminal, or `tmux new-session 'cat output.log; read'`, is a reasonable
-  approximation of the session — but beware the raw byte stream only ever
-  existed in the live PTY and is not recoverable from these files.
-- `events.log` lines are newline-delimited JSON — greppable for lifecycle
-  and resize history.
-- Old sessions remain listed in 0.5.0 with size 0; asking for their logs or
-  attaching produces an explicit `uses the pre-0.5 log format (output.log) …
-  see MIGRATION.md` error rather than empty output.
+Use `--detach` for normal background daemon operation if preferred. SQLite
+migrates forward on open. Old session rows remain visible, but old recordings
+are not readable through the new log/attach paths. Recreate federation joins
+only after all nodes have compatible binaries.
 
-## New retention knobs
+## Preserve old recordings without inventing provenance
 
-0.5.0 introduces two **independent, hot-reloadable** caps on persisted
-session state. They default to `0` (= disabled) so a stock install keeps
-the pre-0.5 behavior exactly; opt in only when you need them.
+There is **no automatic import**. Old filtered bytes and event lines cannot
+reconstruct guaranteed raw-byte ordering, resize offsets, checkpoints, or
+truncated history. 0.5 rejects pre-0.5 logs explicitly instead of guessing.
 
-### `limits.max_journal_bytes_per_session`
+- `output.log` is the old **filtered display stream**, not recoverable raw PTY
+  bytes. Inspect it as untrusted data in a file viewer or isolated terminal
+  parser. Direct replay can execute terminal controls; do not blindly print it
+  into a sensitive terminal.
+- `events.log` contains newline-delimited lifecycle/resize JSON.
+- Retain the old binary and backup if you need the old reader. Never point it
+  at a migrated database.
 
-A byte cap on a **running** session's on-disk journal. When a checkpoint
-is sealed, the daemon computes how many pre-checkpoint incarnations it
-can keep while staying under the cap; the oldest of those are dropped
-(recency bias). Never drops anything from the incarnation that owns the
-checkpoint itself — that would invalidate the recovery anchor (ADR-0002).
-The cap is satisfied at checkpoint boundaries only, so the live tail can
-overshoot by at most one record (one journal part, ~32 MiB filtered
-output, bounded by `segment_byte_budget`), before the next sweep runs.
+The new journal is the sole terminal recording. It captures raw PTY output,
+resizes, lifecycle, and checkpoints; replay derives the filtered stream.
+See [Architecture](./ARCHITECTURE.md) for the design rationale.
 
-This replaces 0.3.x's `max_output_log_bytes`, which is no longer
-recognized as a primary key but **is still accepted as an alias** so
-existing `config.json` files keep working without edits; both knobs are
-mirrored onto the same underlying setting.
+## Retention: flat keys, soft byte budget, permanent age cleanup
 
-Accepts:
+Both settings default to `0` (disabled) and can be hot-reloaded:
 
 ```json
 {
-  "limits": {
-    "max_journal_bytes_per_session": 268435456
-  }
+  "max_journal_bytes_per_session": 268435456,
+  "journal_retention_days": 30
 }
 ```
 
-If you prefer to keep the old spelling, this is equivalent:
+`max_output_log_bytes` remains a **flat** legacy alias for the journal byte
+budget; the canonical key wins if both are provided.
 
-```json
-{
-  "limits": {
-    "max_output_log_bytes": 268435456
-  }
-}
-```
+- **Byte budget:** checkpoint-gated sweeps remove eligible older whole
+  incarnations. The current and checkpoint-bearing incarnation are protected.
+  A single long-lived incarnation can exceed the budget; it is **not a hard
+  filesystem quota**, and checkpoint cadence does not bound total overshoot.
+  Use OS quotas when a hard disk limit is needed.
+- **Age cleanup:** an hourly sweep permanently deletes stopped/killed/failed
+  session directories and DB rows whose `ended_at` exceeds the configured age.
+  Running sessions are excluded. Enabling it can delete old recordings that
+  remained on disk after upgrade, so keep the independent backup first.
+- Inspect live retention counters/limits with `oly info <id>`; runtime-only
+  counters may be unavailable after eviction or daemon restart.
 
-You can fetch the live numbers via `oly list`:
-
-```text
-SESS…  echo hello  stopped  2024-01-15  1.2 MiB / 256 MiB cap  (3 sweeps, dropped 2 incs)
-```
-
-### `limits.journal_retention_days`
-
-A wall-clock cap on **stopped** sessions only. A background sweeper
-(runs hourly) deletes the journal directory + DB row of any session whose
-`ended_at` is older than the configured number of days AND whose status
-is `stopped`, `killed`, or `failed`. Running sessions are never
-auto-deleted: the user did not consent to that, and live PTYs are owned
-by the daemon in ways that would race with a sweeper.
-
-Accepts:
-
-```json
-{
-  "limits": {
-    "journal_retention_days": 30
-  }
-}
-```
-
-Accepts a **post-mortem auto-clean** workflow typical of CI: kick hundreds
-of build sessions per day, never see them again after a month, get a
-fresh state directory the next morning. Set to `0` if you want to keep
-every stopped session forever (the default for backward compatibility;
-0.3.x never garbage-collected anything automatically).
-
-### Trade-offs
-
-- Both caps are honored per session. A daemon-wide `du` will still show
-  ~`cap * session_count` worst case — combine with `oly rm` or a
-  separate rotation script for shared hosts.
-- Checkpoint-gated retention can lag by up to one checkpoint interval
-  (~seconds under normal load) during a surge. If you need hard upper
-  bounds, also enable a separate journal directory quota via your OS
-  (e.g. `btrfs qgroup`, `xfs project quota`).
-- Disabling these caps is intentionally cheap (a single atomic load).
-  Enabling them costs one extra `retain_before` per checkpoint per
-  session — negligible compared to the I/O the checkpoint itself does.
+See the [daemon skill](./skills/oly-daemon/SKILL.md) for all keys and reload
+verification. Nested `{"limits": {...}}` examples are **not supported** by the
+current parser and silently fail to configure these limits.
 
 ## Rollback
 
-1. `oly daemon stop` (the 0.5.0 daemon).
-2. Move the 0.5.0 state aside: `mv ~/.local/state/oly ~/.local/state/oly-0.5`.
-3. Restore: `cp -a ~/.local/state/oly-0.x-backup ~/.local/state/oly`.
-4. Reinstall the 0.3.x binary and start it.
+1. Stop the 0.5 daemon and confirm no live sessions remain.
+2. Move new state aside, preserving it if needed.
+3. Restore the **pre-upgrade backup** to the original path.
+4. Install the old binary and restart using the restored state.
 
-A 0.3.x binary will never be pointed at 0.5.0 state, and 0.5.0 journals are
-not promised to be readable by any 0.3.x build.
+```sh
+oly daemon stop
+mv ~/.local/state/oly ~/.local/state/oly-0.5-saved
+cp -a ~/.local/state/oly-0.3-backup ~/.local/state/oly
+# Reinstall the intended 0.3 binary, then start it.
+```
 
-## Notes for tool authors
+Do not run old binaries against the migrated DB. New journals are not promised
+to be readable by old binaries. Recordings survive client disconnect, not live
+process loss; `oly restart` starts a new process rather than recovering a PTY.
 
-- IPC: requests and one-shot responses are newline-delimited JSON envelopes
-  (`{"version":13,"payload":…}`). Attach streams send one JSON init line,
-  then binary frames: `[u32 LE payload_len][u8 tag][payload]` where tag 1 =
-  output (`[u64 LE offset][raw bytes]`) and tag 2 = control (bare JSON
-  `RpcResponse`). Frame lengths are capped and rejected from the header
-  before allocation.
-- Browser WebSocket attach was already binary in late 0.x and keeps the same
-  frame layout (`web/src/api/ws-frames.ts`, pinned by
-  `tests/fixtures/ws_frames.json`).
-- If your tool only needs terminal output, prefer piping `oly attach <id>`
-  or `oly logs --raw <id>` over speaking IPC yourself.
+## Tool authors
+
+IPC one-shot requests/responses use newline-delimited envelopes with
+`{"version":14,"payload":...}`. Attach sends a JSON init line, then
+`[u32 LE payload_len][u8 tag][payload]`: output tag 1 carries an offset and raw
+output bytes; control tag 2 carries bare JSON `RpcResponse`. Browser WebSocket
+uses its own binary transport envelope over the same attach contract.
+
+Protocol source and fixtures are authoritative: `src/protocol.rs`, `src/ipc.rs`,
+`web/src/api/ws-frames.ts`, and `tests/fixtures/ws_frames.json`. Prefer `info
+--json`, cursor-based `logs`, or `export` over implementing private IPC yourself.
