@@ -277,8 +277,7 @@ mod tests {
     }
 
     fn default_patterns() -> Vec<regex::Regex> {
-        let cfg = crate::config::AppConfig::load().expect("default config");
-        compile_prompt_patterns(&cfg.notify.prompt_patterns)
+        patterns(crate::config::DEFAULT_PROMPT_PATTERNS)
     }
 
     fn sample_summary() -> SessionSummary {

@@ -32,7 +32,7 @@ pub const DEFAULT_ATTACH_SCROLLBACK_SEED_ROWS: usize = 1000;
 ///     ]
 /// }
 /// ```
-const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
+pub(crate) const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
     // Shell / REPL prompt characters at end of line
     r"[>❯›\$#%]\s*$",
     r"❯\s+",
@@ -641,21 +641,30 @@ fn ensure_config_file(state_dir: &Path) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let mut file = match options.open(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
+    let staging = state_dir.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = options.open(&staging)?;
     let (private_key, public_key) = generate_vapid_keypair();
     let contents = serde_json::json!({
         "web_push_vapid_public_key": public_key,
         "web_push_vapid_private_key": private_key,
         "web_push_subject": "mailto:admin@oly.com"
     });
-    file.write_all(serde_json::to_string_pretty(&contents)?.as_bytes())?;
-    file.sync_all()?;
-    eprintln!("info: generated default config at {}", path.display());
-    Ok(())
+    let result = (|| -> Result<()> {
+        file.write_all(serde_json::to_string_pretty(&contents)?.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        // An atomic no-clobber hard link publishes only complete JSON. Rename
+        // can overwrite another creator's file on Unix; create_new exposes an
+        // empty/incomplete destination to concurrent strict readers.
+        match std::fs::hard_link(&staging, &path) {
+            Ok(()) => eprintln!("info: generated default config at {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err.into()),
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staging);
+    result
 }
 
 /// Strict override loading shared by startup and hot reload. Removed recording
@@ -1067,6 +1076,38 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_loads_never_observe_partial_config() {
+        let dir =
+            std::env::temp_dir().join(format!("oly_config_first_load_{}", uuid::Uuid::new_v4()));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let threads = (0..16)
+            .map(|_| {
+                let dir = dir.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    AppConfig::load_from_state_dir(dir).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let configs = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            configs
+                .iter()
+                .all(|c| c.web_push.vapid_public_key == configs[0].web_push.vapid_public_key)
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "staging files cleaned up"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
