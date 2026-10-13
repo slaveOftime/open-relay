@@ -24,6 +24,8 @@ The workflow runs `scripts/release-version.py` to derive the root version in
 publication. It rejects invalid tags and pre-existing root-version mismatches,
 changes no dependency versions, and is repeatable. Source manifest/lock versions
 must match each other, but need not already include the prerelease suffix.
+Packaging uses `scripts/release-package.py` to create one-binary ZIP archives
+with executable metadata and SHA-256 sidecars; no Windows POSIX `zip` is required.
 
 ## Before tagging
 

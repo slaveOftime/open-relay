@@ -120,7 +120,6 @@ class ReleaseWorkflowTests(unittest.TestCase):
             WORKFLOW,
         )
 
-    @unittest.skipUnless(shutil.which("zip"), "POSIX zip unavailable; run archive check in CI")
     def test_package_archive_contains_binary_and_valid_checksum(self):
         command = block(step("Package binary + per-asset checksum"), "run", 8)
         command = command.replace("${{ matrix.target }}", "test-target")
@@ -128,6 +127,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         command = command.replace("${{ matrix.asset_name }}", "oly-test.zip")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "scripts").mkdir()
+            shutil.copyfile(Path(__file__).resolve().parents[1] / "scripts/release-package.py", root / "scripts/release-package.py")
             binary = root / "target/test-target/release/oly"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"benign binary fixture")
@@ -141,6 +142,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             with zipfile.ZipFile(root / "oly-test.zip") as archive:
                 self.assertEqual(archive.namelist(), ["oly"])
                 self.assertEqual(archive.read("oly"), binary.read_bytes())
+                self.assertEqual(archive.getinfo("oly").external_attr >> 16, 0o100755)
+            before = (root / "oly-test.zip").read_bytes()
+            subprocess.run([sys.executable, str(root / "scripts/release-package.py"), str(binary), "oly-test.zip"], cwd=root, check=True)
+            self.assertEqual((root / "oly-test.zip").read_bytes(), before)
             subprocess.run(
                 ["sha256sum", "--check", "oly-test.zip.sha256"],
                 cwd=root,

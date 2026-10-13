@@ -61,7 +61,7 @@ If you touch packaging or release behavior, also review:
 - `.github/workflows/release.yml`
 
 Run the offline documentation contracts (Python 3) and release-workflow
-regressions (Linux with Python 3, Bash, `zip`, `unzip`, and `sha256sum`):
+regressions (Linux with Python 3.11+, Cargo, Bash, `unzip`, and `sha256sum`):
 
 ```sh
 python3 tests/docs_sync.py

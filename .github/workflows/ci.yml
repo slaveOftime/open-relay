@@ -12,6 +12,7 @@ on:
       - Cargo.lock
       - build.rs
       - scripts/release-version.py
+      - scripts/release-package.py
       - README.md
       - ARCHITECTURE.md
       - MIGRATION.md
