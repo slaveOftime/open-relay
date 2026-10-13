@@ -197,11 +197,32 @@ fn e2e_sgr_mouse_input_does_not_become_native_keyboard_text() {
         "mouse report was not delivered as the expected native event: {result}"
     );
     writer.write_all(b"\x04").unwrap();
+    // ConPTY may lose a synthetic key-down immediately after mouse output.
+    // Match the Windows paste/scrollback harness: retry EOT at a bounded pace,
+    // never substitute stopping the session for a successful local detach.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while child.0.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "attach did not detach");
+    let mut retry_at = Instant::now() + Duration::from_millis(500);
+    let mut detach_output = Vec::new();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        while let Ok(bytes) = rx.try_recv() {
+            detach_output.extend(bytes);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach did not detach; output: {:?}",
+            String::from_utf8_lossy(&detach_output)
+        );
+        if Instant::now() >= retry_at {
+            writer.write_all(b"\x04").unwrap();
+            writer.flush().unwrap();
+            retry_at = Instant::now() + Duration::from_millis(500);
+        }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    assert!(status.success(), "attach exited unsuccessfully: {status:?}");
     drop(writer);
     drop(pair.master);
     drop(rx);
