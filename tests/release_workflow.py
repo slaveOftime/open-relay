@@ -5,11 +5,15 @@ Run from any directory: python3 tests/release_workflow.py
 No registry access or publishing occurs.
 """
 
+import importlib.util
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
+import tomllib
 import unittest
 import zipfile
 
@@ -42,6 +46,62 @@ def block(text, key, indent):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_cargo_version_steps_use_shared_locked_transform(self):
+        self.assertEqual(WORKFLOW.count('run: python3 scripts/release-version.py "$EFFECTIVE_REF"'), 2)
+        self.assertIn("cargo build --release --locked --target", WORKFLOW)
+        self.assertIn("python-version: \"3.13\"", WORKFLOW)
+
+    def test_cargo_version_transform_is_exact_repeatable_and_validated(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/release-version.py"
+        spec = importlib.util.spec_from_file_location("release_version", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        for tag in ("v0.5.0-beta.1", "v0.5.0-rc.1", "v0.5.0", "v0.6.0"):
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest = '[package]\nname = "oly"\nversion = "0.5.0"\nedition = "2024"\n'
+                lock = ('version = 4\n\n[[package]]\nname = "dependency"\nversion = "0.5.0"\n'
+                        'source = "registry+https://example.invalid"\n\n[[package]]\n'
+                        'name = "oly"\nversion = "0.5.0"\ndependencies = ["dependency"]\n')
+                (root / "Cargo.toml").write_text(manifest)
+                (root / "Cargo.lock").write_text(lock)
+                self.assertEqual(module.set_version(root, tag), tag[1:])
+                expected_lock = tomllib.loads(lock)
+                expected_lock["package"][1]["version"] = tag[1:]
+                self.assertEqual(tomllib.loads((root / "Cargo.lock").read_text()), expected_lock)
+                self.assertEqual((root / "Cargo.toml").read_text(), manifest.replace('version = "0.5.0"', f'version = "{tag[1:]}"'))
+                before = (root / "Cargo.lock").read_bytes()
+                module.set_version(root, tag)
+                self.assertEqual((root / "Cargo.lock").read_bytes(), before)
+                for invalid in ("v0.5", "0.5.0", "v01.5.0", "v0.5.0-beta.01", "v0.5.0;echo bad"):
+                    with self.assertRaises(ValueError):
+                        module.set_version(root, invalid)
+                    self.assertEqual((root / "Cargo.lock").read_bytes(), before)
+                (root / "Cargo.toml").write_text(manifest.replace('"0.5.0"', '"9.0.0"'))
+                with self.assertRaises(ValueError):
+                    module.set_version(root, tag)
+                self.assertEqual((root / "Cargo.lock").read_bytes(), before)
+
+    @unittest.skipUnless(shutil.which("cargo"), "Cargo unavailable")
+    def test_tagged_fixture_passes_locked_cargo_metadata(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/release-version.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src/main.rs").write_text("fn main() {}\n")
+            (root / "Cargo.toml").write_text('[package]\nname = "oly"\nversion = "0.5.0"\nedition = "2024"\n')
+            subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=root, check=True, capture_output=True)
+            for tag in ("v0.5.0-beta.1", "v0.5.0-rc.1", "v0.5.0"):
+                subprocess.run([sys.executable, str(script), tag], cwd=root, check=True, capture_output=True)
+                result = subprocess.run(["cargo", "metadata", "--locked", "--offline", "--format-version", "1"], cwd=root, check=True, capture_output=True)
+                self.assertIn(f'"version":"{tag[1:]}"'.encode(), result.stdout)
+
+    def test_prerelease_uploads_never_promote_latest(self):
+        for name in ("Upload to GitHub Release", "Attach SHA256SUMS to release"):
+            self.assertIn("prerelease:", step(name))
+            self.assertIn("make_latest:", step(name))
+            self.assertIn("'false'", step(name))
+
     def test_retry_actions_have_required_attempt_timeouts(self):
         for name in ("Publish to crates.io", "Bundle binaries + publish to npm"):
             with self.subTest(step=name):
@@ -60,6 +120,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             WORKFLOW,
         )
 
+    @unittest.skipUnless(shutil.which("zip"), "POSIX zip unavailable; run archive check in CI")
     def test_package_archive_contains_binary_and_valid_checksum(self):
         command = block(step("Package binary + per-asset checksum"), "run", 8)
         command = command.replace("${{ matrix.target }}", "test-target")

@@ -19,17 +19,17 @@ currently `0.5.0`; a preview needs an explicit prerelease suffix. Choose the
 release version deliberately; do not bump to 1.0 just for marketing if the
 protocol and upgrade contract are still changing.
 
-The workflow rewrites `Cargo.toml` from the tag but does **not** update the root
-package version in `Cargo.lock` before `cargo test --locked` / `cargo publish
---locked`. Commit a matching manifest/lockfile for the chosen tag first, or fix
-and verify that workflow path before using a tag different from the source
-version. An arbitrary new tag alone is not a validated version-bump procedure.
+The workflow runs `scripts/release-version.py` to derive the root version in
+**both** `Cargo.toml` and `Cargo.lock` from the tag before locked tests/builds or
+publication. It rejects invalid tags and pre-existing root-version mismatches,
+changes no dependency versions, and is repeatable. Source manifest/lock versions
+must match each other, but need not already include the prerelease suffix.
 
 ## Before tagging
 
 - [ ] Choose version/channel and record scope, breaking changes, and known limits.
-- [ ] Align `Cargo.toml` and the `oly` entry in `Cargo.lock` with the exact tag
-      version; validate the lockfile with `cargo metadata --locked`.
+- [ ] Ensure `Cargo.toml` and the `oly` entry in `Cargo.lock` match. Verify the
+      tag-derived transformation with offline release tests and locked Cargo commands.
 - [ ] Confirm fresh installs and upgrades use the intended npm scoped package,
       Cargo crate, and Homebrew formula. npm's source placeholder version is
       replaced by the workflow; Homebrew hashes must come from actual artifacts,

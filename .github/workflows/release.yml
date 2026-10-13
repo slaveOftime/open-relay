@@ -68,16 +68,13 @@ jobs:
           shared-key: ${{ runner.os }}-oly-release
           cache-on-failure: true
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Set version from tag
         shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${{ env.EFFECTIVE_REF }}"
-          VERSION="${VERSION#v}"
-          CURRENT="$(grep -E '^version = "[^"]+"' Cargo.toml | head -1 | cut -d'"' -f2)"
-          if [ "$CURRENT" != "$VERSION" ]; then
-            sed -i -E "0,/^version = \"[^\"]+\"/{s//version = \"$VERSION\"/}" Cargo.toml
-          fi
+        run: python3 scripts/release-version.py "$EFFECTIVE_REF"
 
       - name: Test
         shell: bash
@@ -93,7 +90,7 @@ jobs:
       - name: Build release binary
         env:
           NPM_CONFIG_INCLUDE: optional
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binary + per-asset checksum
         shell: bash
@@ -131,6 +128,7 @@ jobs:
           # "latest".
           prerelease: ${{ contains(env.EFFECTIVE_REF, '-') }}
           name: ${{ contains(env.EFFECTIVE_REF, '-') && format('{0} (beta)', env.EFFECTIVE_REF) || env.EFFECTIVE_REF }}
+          make_latest: ${{ contains(env.EFFECTIVE_REF, '-') && 'false' || 'true' }}
 
   attach-checksums:
     name: attach SHA256SUMS
@@ -161,6 +159,8 @@ jobs:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: SHA256SUMS.txt
           generate_release_notes: false
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          make_latest: ${{ contains(github.event.inputs.tag || github.ref_name, '-') && 'false' || 'true' }}
 
   update-homebrew-formula:
     name: update-homebrew-formula
@@ -252,15 +252,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Set version from tag
         shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="${EFFECTIVE_REF#v}"
-          CURRENT="$(grep -E '^version = "[^"]+"' Cargo.toml | head -1 | cut -d'"' -f2)"
-          if [ "$CURRENT" != "$VERSION" ]; then
-            sed -i -E "0,/^version = \"[^\"]+\"/{s//version = \"$VERSION\"/}" Cargo.toml
-          fi
+        run: python3 scripts/release-version.py "$EFFECTIVE_REF"
 
       # Registry publishes can flake on 5xx; retry the whole step.
       - name: Publish to crates.io

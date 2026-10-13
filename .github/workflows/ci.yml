@@ -11,6 +11,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - build.rs
+      - scripts/release-version.py
       - README.md
       - ARCHITECTURE.md
       - MIGRATION.md
@@ -57,6 +58,10 @@ jobs:
         with:
           shared-key: ${{ runner.os }}-oly
           cache-on-failure: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
 
       - name: Documentation contracts (offline)
         run: python3 tests/docs_sync.py
