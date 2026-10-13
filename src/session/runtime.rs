@@ -536,10 +536,7 @@ impl SessionRuntime {
             journal_incarnations_dropped: sweep_count
                 .gt(&0)
                 .then(|| self.retention.deleted_incarnations_total()),
-            journal_byte_cap: Some(
-                self.journal_byte_cap
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
+            journal_byte_cap: None,
         }
     }
 

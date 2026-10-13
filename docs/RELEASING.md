@@ -88,8 +88,8 @@ reuse the operator's daemon. Use benign helpers and coordinate port ownership.
       and an app route if included in release scope.
 - [ ] Windows suspend/resume soak test. The named-pipe disconnect regression is
       useful but is **not** evidence of actual laptop sleep/resume reliability.
-- [ ] Disk pressure/retention: explicit failures, protected incarnations, soft
-      byte-budget behavior, age deletion only on isolated stopped-session data.
+- [ ] Disk pressure/retention: explicit recording failures and removed byte-cap
+      errors; age deletion only on isolated stopped-session data.
 
 ## After authorized publication
 

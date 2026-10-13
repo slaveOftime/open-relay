@@ -612,7 +612,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let (store, startup_failed_sessions) = {
         let store = SessionStore::with_journal_byte_cap(
             config.limits.session_eviction_seconds,
-            config.limits.max_journal_bytes_per_session,
+            0, // Live journal deletion is disabled; see MIGRATION.md.
             db.clone(),
         );
         store.set_resume_patterns(config.resume.patterns.clone());
@@ -908,7 +908,6 @@ mod tests {
                 screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
-                max_journal_bytes_per_session: 0,
                 journal_retention_days: 0,
             },
             web_push: crate::config::WebPushConfig {

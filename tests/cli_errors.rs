@@ -98,6 +98,26 @@ fn list_json_without_daemon_prints_machine_readable_output() {
     );
 }
 
+#[test]
+fn removed_recording_caps_fail_before_daemon_start() {
+    for key in ["max_journal_bytes_per_session", "max_output_log_bytes"] {
+        let tmp = make_tmp_dir(&format!("removed_cap_{key}"));
+        fs::create_dir_all(tmp.join("oly")).unwrap();
+        fs::write(tmp.join("oly/config.json"), format!("{{\"{key}\":0}}")).unwrap();
+        let output = oly_cmd(&tmp)
+            .args(["daemon", "start", "--no-http"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(key) && stderr.contains("was removed"),
+            "{stderr}"
+        );
+        assert!(!tmp.join("oly/daemon.lock").exists());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // oly --help – short, neutral language
 // ---------------------------------------------------------------------------

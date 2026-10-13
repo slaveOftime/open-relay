@@ -329,7 +329,6 @@ pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
             screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
             silence_seconds: 10,
             stop_grace_seconds: 5,
-            max_journal_bytes_per_session: 0,
             journal_retention_days: 0,
         },
         web_push: crate::config::WebPushConfig {

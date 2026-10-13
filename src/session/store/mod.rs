@@ -189,14 +189,6 @@ impl SessionStore {
         std::sync::Arc::clone(&self.journal_byte_cap)
     }
 
-    /// Hot-update the journal byte cap after a config reload. The new
-    /// value takes effect on the next retention sweep (every checkpoint,
-    /// ~32 MiB of filtered output) for every live session simultaneously.
-    pub fn set_journal_byte_cap(&self, bytes: u64) {
-        self.journal_byte_cap
-            .store(bytes, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub fn set_resume_patterns(&self, patterns: Vec<ResumePattern>) {
         self.resume_patterns.store(Arc::new(patterns));
     }

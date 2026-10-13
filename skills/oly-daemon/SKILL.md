@@ -46,8 +46,9 @@ environment variable in another shell does not change the running daemon.
 ## Hot reload and restart boundaries
 
 The daemon polls file mtime every **2 seconds**. A valid changed file replaces
-the live snapshot and applies reload side effects. Read/JSON errors and invalid
+the live snapshot and applies reload side effects. Read/JSON errors, removed byte-cap keys, and invalid
 resume rules preserve the last good configuration; another file edit retries.
+The same invalid file now fails startup rather than silently loading defaults.
 Invalid **prompt** regexes are instead skipped with a warning during compilation.
 
 | Flat JSON key | Default | When it takes effect |
@@ -68,7 +69,6 @@ Invalid **prompt** regexes are instead skipped with a warning during compilation
 | `screen_scrollback_rows` | `5000` | New session engines; existing engines keep their configured retention |
 | `silence_seconds` | `10` | Live silence fallback; minimum 1 second |
 | `stop_grace_seconds` | `5` | Sampled on stop paths; minimum 1 second |
-| `max_journal_bytes_per_session` | `0` | Live checkpoint-gated budget; `0` unlimited; alias `max_output_log_bytes` |
 | `journal_retention_days` | `0` | Hourly stopped-session sweep; `0` keeps everything |
 
 Attach seeds at least 1000 main-buffer history rows **when available**, or the
@@ -76,11 +76,13 @@ client height if larger, capped by that session's retained rows. This is not a
 minimum imposed on `screen_scrollback_rows`; setting 250 retains at most 250.
 Eviction releases completed runtime state, not persisted session history.
 
-The journal byte budget only removes eligible older whole incarnations; it
-never deletes the current or checkpoint-bearing incarnation. It is **not a hard
-disk quota** and protected data may exceed the configured budget. Age retention
-permanently removes files and DB rows for stopped/killed/failed sessions older
-than the configured `ended_at` cutoff. Running sessions are excluded.
+Live journal byte caps are **removed**: `max_journal_bytes_per_session`,
+`max_output_log_bytes`, and the internal legacy spelling now fail with an
+explicit error. An ordinary session stays in one incarnation, so the previous
+older-incarnation deletion could not bound its recording. Remove those keys;
+use an OS quota for disk bounds. Age retention permanently removes files and
+DB rows for stopped/killed/failed sessions older than the configured `ended_at`
+cutoff. Running sessions are excluded.
 
 ### Edit and verify
 

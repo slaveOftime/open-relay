@@ -145,12 +145,6 @@ pub struct LimitsConfig {
     pub screen_scrollback_rows: usize,
     pub silence_seconds: u64,
     pub stop_grace_seconds: u64,
-    /// Byte-budget cap on a session's persisted journal. 0 = unlimited.
-    /// When non-zero, checkpoint-gated retention deletes the oldest
-    /// sealed incarnations so surviving bytes stay under the cap. The
-    /// live and the latest checkpoint-bearing incarnation are never
-    /// touched, so live cursors stay valid.
-    pub max_journal_bytes_per_session: u64,
     /// Wall-clock retention for **stopped** sessions, in days. The
     /// sweeper deletes the journal directory and DB row for stopped
     /// sessions older than this cap. 0 = disabled; running sessions
@@ -189,7 +183,6 @@ impl_config_diff!(LimitsConfig {
     screen_scrollback_rows,
     silence_seconds,
     stop_grace_seconds,
-    max_journal_bytes_per_session,
     journal_retention_days,
 });
 impl_config_diff!(WebPushConfig {
@@ -321,18 +314,6 @@ struct LimitsOverrides {
     max_running_sessions: Option<usize>,
     session_eviction_seconds: Option<u64>,
     screen_scrollback_rows: Option<usize>,
-    /// Defaults to 0 (unlimited) so the pre-cap behaviour is preserved.
-    /// `max_journal_bytes_per_session` is the canonical key; the legacy
-    /// `max_output_log_bytes` (0.3.x) is re-mapped to it — see
-    /// MIGRATION.md.
-    max_journal_bytes_per_session: Option<u64>,
-    /// Legacy alias for [`LimitsOverrides::max_journal_bytes_per_session`]:
-    /// the 0.3.x cap on `output.log` size. The 0.x sweep that truncated
-    /// `output.log` mid-stream no longer runs, but the number is morally
-    /// the same one, so we accept it and apply it as the new journal cap.
-    /// Same semantics: 0 = unlimited.
-    #[serde(default, alias = "max_output_log_bytes")]
-    max_journal_bytes_per_session_legacy: Option<u64>,
     /// Wall-clock retention for stopped sessions. 0 = disabled (keep
     /// everything, the pre-cap behaviour).
     journal_retention_days: Option<u32>,
@@ -342,7 +323,7 @@ impl AppConfig {
     pub fn load() -> Result<Self> {
         let state_dir = crate::storage::resolve_state_dir();
         ensure_config_file(&state_dir);
-        let overrides = load_overrides(&state_dir);
+        let overrides = try_load_overrides(&state_dir).map_err(crate::error::AppError::Protocol)?;
         let config = Self::resolve(state_dir, overrides);
         config
             .validate_resume_patterns()
@@ -403,11 +384,6 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_SCREEN_SCROLLBACK_ROWS),
             silence_seconds: overrides.limits.silence_seconds.unwrap_or(10).max(1),
             stop_grace_seconds: overrides.limits.stop_grace_seconds.unwrap_or(5).max(1),
-            max_journal_bytes_per_session: overrides
-                .limits
-                .max_journal_bytes_per_session
-                .or(overrides.limits.max_journal_bytes_per_session_legacy)
-                .unwrap_or(0),
             journal_retention_days: overrides.limits.journal_retention_days.unwrap_or(0),
         };
         let web_push = WebPushConfig {
@@ -637,23 +613,29 @@ pub fn ensure_config_file(state_dir: &Path) {
     }
 }
 
-fn load_overrides(state_dir: &std::path::Path) -> AppConfigOverrides {
-    let path = state_dir.join("config.json");
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return AppConfigOverrides::default();
-    };
-
-    serde_json::from_str::<AppConfigOverrides>(&raw).unwrap_or_default()
-}
-
-/// Strict override loading for hot reload: unlike [`load_overrides`], read
-/// and parse failures are reported so the caller can keep the last good
-/// configuration instead of silently resetting to defaults.
+/// Strict override loading shared by startup and hot reload. Removed recording
+/// cap keys are errors, not silently ignored promises of bounded disk use.
 fn try_load_overrides(state_dir: &Path) -> std::result::Result<AppConfigOverrides, String> {
     let path = state_dir.join("config.json");
     let raw = std::fs::read_to_string(&path)
         .map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    serde_json::from_str::<AppConfigOverrides>(&raw)
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("could not parse {}: {err}", path.display()))?;
+    if let Some(fields) = value.as_object() {
+        for key in [
+            "max_journal_bytes_per_session",
+            "max_output_log_bytes",
+            "max_journal_bytes_per_session_legacy",
+        ] {
+            if fields.contains_key(key) {
+                return Err(format!(
+                    "{}: {key} was removed: live journal byte caps cannot bound a current incarnation; remove this key and use journal_retention_days for stopped sessions or an OS disk quota (see MIGRATION.md)",
+                    path.display()
+                ));
+            }
+        }
+    }
+    serde_json::from_value::<AppConfigOverrides>(value)
         .map_err(|err| format!("could not parse {}: {err}", path.display()))
 }
 
@@ -710,7 +692,6 @@ mod tests {
                 screen_scrollback_rows: super::DEFAULT_SCREEN_SCROLLBACK_ROWS,
                 silence_seconds: 10,
                 stop_grace_seconds: 5,
-                max_journal_bytes_per_session: 0,
                 journal_retention_days: 0,
             },
             web_push: super::WebPushConfig {
@@ -971,6 +952,35 @@ mod tests {
         assert_eq!(reloaded.http.port, 17000);
 
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn removed_byte_cap_keys_fail_explicitly_on_load_and_reload() {
+        let state_dir =
+            std::env::temp_dir().join(format!("oly_removed_caps_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut config = test_config();
+        config.paths.state_dir = state_dir.clone();
+        for key in [
+            "max_journal_bytes_per_session",
+            "max_output_log_bytes",
+            "max_journal_bytes_per_session_legacy",
+        ] {
+            std::fs::write(state_dir.join("config.json"), format!("{{\"{key}\":0}}")).unwrap();
+            let error = super::try_load_overrides(&state_dir).unwrap_err();
+            assert!(error.contains(key) && error.contains("was removed"));
+            assert!(config.try_reload().unwrap_err().contains("was removed"));
+        }
+        std::fs::write(
+            state_dir.join("config.json"),
+            r#"{"journal_retention_days":30}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.try_reload().unwrap().limits.journal_retention_days,
+            30
+        );
+        std::fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]

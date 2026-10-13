@@ -141,9 +141,9 @@ normal operator state. Tests use separate temporary directories.
 
 Config is flat JSON, **not** nested under `limits` or `notify`. For available
 keys, actual defaults, and reload behavior, use `oly skill --daemon` or the
-[daemon skill](../skills/oly-daemon/SKILL.md). Recording retention is disabled
-by default. Its byte budget is checkpoint-gated and not a hard filesystem
-quota; age retention permanently removes stopped sessions and their files.
+[daemon skill](../skills/oly-daemon/SKILL.md). Stopped-session age retention is
+disabled by default and permanently removes session files when enabled. Live
+journal byte caps are unsupported; use OS quotas for hard disk bounds.
 
 To publish an HTML result or proxy a local web app, read `oly skill --apps`
 or the [apps skill](../skills/oly-apps/SKILL.md).

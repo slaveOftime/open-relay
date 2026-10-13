@@ -23,7 +23,7 @@ switching.** Live processes cannot move between daemons or versions.
 | Attach control | Multiple concurrent controllers; `--observe` is view-only | Coordinate input; last successful controller resize wins; roles are not authorization |
 | Input/detach | Explicit paste boundaries; `Ctrl-D` detaches | Clipboard shortcuts include Ctrl-V/Shift+Insert; detach does not stop child |
 | Log reads | Default tail 40, explicit screen/frame views, bounded cursor continuation | Update scripts to the commands below; removed flags are errors |
-| Configuration | **Flat JSON** with journal budget/age retention | Do not wrap keys in `limits`; remove obsolete `ring_buffer_bytes`; old `max_output_log_bytes` aliases the journal budget |
+| Configuration | **Flat JSON**; stopped-session age retention only | Remove `max_output_log_bytes` / `max_journal_bytes_per_session`; they now fail explicitly. Live byte caps are unsupported. Do not wrap keys in `limits`. |
 | Daemon status | Effective running flags and endpoint, not just client config | Check the actual endpoint after restart |
 
 ### Log-script changes
@@ -143,35 +143,34 @@ The new journal is the sole terminal recording. It captures raw PTY output,
 resizes, lifecycle, and checkpoints; replay derives the filtered stream.
 See [Architecture](./ARCHITECTURE.md) for the design rationale.
 
-## Retention: flat keys, soft byte budget, permanent age cleanup
+## Retention: removed live caps and permanent stopped-session cleanup
 
-Both settings default to `0` (disabled) and can be hot-reloaded:
+`max_journal_bytes_per_session`, `max_output_log_bytes`, and the internal legacy
+spelling are removed and fail explicitly, even when set to zero. The previous
+scheme only deleted older incarnations; ordinary long-running sessions stay in
+one incarnation, so it could not provide the advertised disk bound. Remove these
+keys before starting 0.5. The journal recovery/retention primitives remain internal,
+but no supported setting enables live recording deletion.
+
+Use an OS filesystem quota if you need a hard disk bound; disk-write failures stop
+the affected session rather than silently continuing without a recording.
+
+Stopped-session age cleanup remains opt-in and hot-reloadable (default `0`, keep
+all sessions):
 
 ```json
 {
-  "max_journal_bytes_per_session": 268435456,
   "journal_retention_days": 30
 }
 ```
 
-`max_output_log_bytes` remains a **flat** legacy alias for the journal byte
-budget; the canonical key wins if both are provided.
+An hourly sweep permanently deletes stopped/killed/failed session directories
+and DB rows whose `ended_at` exceeds the configured age. Running sessions are
+excluded. Enabling it can delete old recordings left on disk after upgrade,
+so keep the independent backup first.
 
-- **Byte budget:** checkpoint-gated sweeps remove eligible older whole
-  incarnations. The current and checkpoint-bearing incarnation are protected.
-  A single long-lived incarnation can exceed the budget; it is **not a hard
-  filesystem quota**, and checkpoint cadence does not bound total overshoot.
-  Use OS quotas when a hard disk limit is needed.
-- **Age cleanup:** an hourly sweep permanently deletes stopped/killed/failed
-  session directories and DB rows whose `ended_at` exceeds the configured age.
-  Running sessions are excluded. Enabling it can delete old recordings that
-  remained on disk after upgrade, so keep the independent backup first.
-- Inspect live retention counters/limits with `oly info <id>`; runtime-only
-  counters may be unavailable after eviction or daemon restart.
-
-See the [daemon skill](./skills/oly-daemon/SKILL.md) for all keys and reload
-verification. Nested `{"limits": {...}}` examples are **not supported** by the
-current parser and silently fail to configure these limits.
+See the [daemon skill](./skills/oly-daemon/SKILL.md) for configuration/reload
+verification. Config keys are flat, not nested under `limits`.
 
 ## Rollback
 

@@ -996,11 +996,8 @@ pub struct SessionSummary {
     /// incarnations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_incarnations_dropped: Option<u64>,
-    /// Snapshot of the cap currently in effect (0 = unlimited).
-    /// Mirrors `LimitsConfig::max_journal_bytes_per_session`, atomic-loaded
-    /// from the shared `Arc<AtomicU64>` inside the runtime; useful so the
-    /// UI can show "capped at X MiB" without reaching back to the config
-    /// (and crucially without holding a read lock on the whole runtime).
+    /// Legacy preview field retained for wire deserialization compatibility.
+    /// Live journal byte caps are unsupported; production emits None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub journal_byte_cap: Option<u64>,
 }

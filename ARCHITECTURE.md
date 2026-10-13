@@ -413,10 +413,12 @@ durable journal tail and store a suggestion; they never execute it.
   Byte cursors enforce continuity.
 - **History UX:** recorded bytes, rendered views, and application-owned scrolling
   are different surfaces. Views are lossy observations, not complete transcripts.
-- **Retention:** byte budgets delete eligible older whole incarnations only;
-  current/checkpoint-bearing data is protected and can exceed the budget. This is
-  not a hard disk quota. The hourly age sweeper permanently deletes stopped
-  sessions; both settings default to disabled.
+- **Retention:** older-incarnation deletion primitives remain internal, but the
+  live byte-cap configuration was removed: ordinary sessions stay within one
+  incarnation, making that policy ineffective for bounded live storage. No
+  production setting enables live journal deletion. The hourly age sweeper can
+  permanently delete stopped sessions; it defaults to disabled. Use OS quotas
+  for hard disk limits.
 - **Trust:** the daemon executes as its OS user, without a sandbox. HTTP login
   protects operator access; attach roles only coordinate input/resize. Federation
   uses pinned identities and sealed traffic but has no forward secrecy.

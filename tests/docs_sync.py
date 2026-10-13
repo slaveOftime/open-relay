@@ -105,7 +105,6 @@ class DocsSyncTests(unittest.TestCase):
         for name in ("Http", "Notify", "Resume", "WebPush", "Limits"):
             body = re.search(rf"struct {name}Overrides \{{(.*?)\n\}}", CONFIG, re.S).group(1)
             fields.extend(re.findall(r"^    (\w+): Option<", body, re.M))
-        fields.remove("max_journal_bytes_per_session_legacy")
         fields.append("log_level")
         skill = (ROOT / "skills/oly-daemon/SKILL.md").read_text()
         table_fields = re.findall(r"^\| `(\w+)` \|", skill, re.M)
