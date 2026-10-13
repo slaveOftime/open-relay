@@ -12,32 +12,39 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
 
 use crate::http::AppState;
 
 const MAX_FAILED_ATTEMPTS: u32 = 3;
 const LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60); // 15 minutes
-/// How often the background task sweeps the lockout table for expired entries.
+/// How often the background task sweeps the lockout and session tables for
+/// expired entries.
 const LOCKOUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60); // 5 minutes
-/// Session cookie lifetime. Browsers cap cookie lifetimes at ~400 days, so a
-/// 1-year value effectively means "until the password changes". The cookie is
-/// rewritten on every successful login, keeping it fresh.
-const AUTH_COOKIE_MAX_AGE: Duration = Duration::from_secs(365 * 24 * 60 * 60); // 1 year
+/// Browser session lifetime (ADR-0007): sessions are random, server-side,
+/// revocable, and expiring. The cookie mirrors this TTL.
+pub const SESSION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
 const AUTH_COOKIE_NAME: &str = "oly_auth_token";
-/// Domain-separation label for the deterministic session-token derivation.
-/// Bumping the version suffix invalidates all previously issued tokens.
-const TOKEN_DERIVATION_LABEL: &[u8] = b"oly-auth-session-token-v1";
+
+// ── Authorization scopes (ADR-0007) ─────────────────────────────────────
+
+// Federation auth no longer goes through scope-gated API keys. Browser
+// login remains the only HTTP authentication path; it uses password Argon2
+// for hashing and server-issued, expiring, revocable session tokens for
+// ongoing authorization.
 
 // ── AuthState ────────────────────────────────────────────────────────────────
 
 pub struct AuthState {
     password_hash: String,
-    /// The single deterministic session token (see `derive_session_token`).
-    /// It is valid for as long as the password hash is unchanged — no expiry,
-    /// no in-memory registry, and it survives daemon restarts.
-    expected_token: String,
+    /// Server-side session registry (ADR-0007): random token → expiry.
+    /// Sessions are revocable (removal) and expiring; a daemon restart
+    /// invalidates every session, requiring re-login.
+    sessions: Mutex<HashMap<String, Instant>>,
+    /// Epoch bumped on every revocation so open control streams (WebSocket
+    /// attach, SSE) can re-validate their token and close loudly.
+    revocations: watch::Sender<u64>,
     /// Per-IP lockout table. Each client is tracked independently so that a
     /// brute-force attempt from one IP cannot lock out legitimate users.
     lockout: Mutex<HashMap<IpAddr, LockoutRecord>>,
@@ -56,10 +63,11 @@ pub(crate) enum FailureOutcome {
 
 impl AuthState {
     pub fn new(password_hash: String) -> Arc<Self> {
-        let expected_token = derive_session_token(&password_hash);
+        let (revocations, _) = watch::channel(0u64);
         let state = Arc::new(Self {
             password_hash,
-            expected_token,
+            sessions: Mutex::new(HashMap::new()),
+            revocations,
             lockout: Mutex::new(HashMap::new()),
         });
         state.spawn_cleanup_task();
@@ -82,7 +90,7 @@ impl AuthState {
                 let now = Instant::now();
                 let mut lockout = state.lockout.lock().await;
                 let before = lockout.len();
-                lockout.retain(|_, r| r.locked_until.map_or(true, |t| now < t));
+                lockout.retain(|_, r| r.locked_until.is_none_or(|t| now < t));
                 let removed = before - lockout.len();
                 if removed > 0 {
                     debug!(
@@ -90,15 +98,58 @@ impl AuthState {
                         "auth: background cleanup evicted expired lockout records"
                     );
                 }
+                drop(lockout);
+                let mut sessions = state.sessions.lock().await;
+                let before = sessions.len();
+                sessions.retain(|_, expires_at| now < *expires_at);
+                let evicted = before - sessions.len();
+                if evicted > 0 {
+                    debug!(evicted, "auth: background cleanup evicted expired sessions");
+                }
+                drop(sessions);
             }
         });
     }
 
-    /// Validate a session token against the deterministic expected token.
-    /// No lock and no expiry: the token stays valid until the password hash
-    /// changes (daemon restart with a new password) or auth is disabled.
-    pub fn is_valid_token(&self, token: &str) -> bool {
-        constant_time_eq(token.as_bytes(), self.expected_token.as_bytes())
+    /// Issue a new random, expiring session token (ADR-0007).
+    pub async fn issue_session(&self) -> String {
+        use rand::Rng as _;
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        self.sessions
+            .lock()
+            .await
+            .insert(token.clone(), Instant::now() + SESSION_TTL);
+        token
+    }
+
+    /// Validate a session token against the server-side registry. Expired
+    /// sessions are evicted on observation and fail validation.
+    pub async fn validate_token(&self, token: &str) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get(token) {
+            Some(expires_at) if Instant::now() < *expires_at => true,
+            Some(_) => {
+                sessions.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Revoke a session token and notify open streams via the revocation
+    /// epoch so they re-validate and close loudly.
+    pub async fn revoke_token(&self, token: &str) {
+        if self.sessions.lock().await.remove(token).is_some() {
+            let epoch = *self.revocations.borrow() + 1;
+            let _ = self.revocations.send(epoch);
+        }
+    }
+
+    /// Watch handle for the revocation epoch (open streams select on it).
+    pub fn revocation_watch(&self) -> watch::Receiver<u64> {
+        self.revocations.subscribe()
     }
 
     /// Returns `Some(locked_until)` if the IP is currently locked out.
@@ -115,8 +166,8 @@ impl AuthState {
         }
     }
 
-    /// Record a failed login attempt. Returns whether the IP is now locked out
-    /// or how many attempts remain before lockout.
+    /// Record a failed login attempt. Returns whether the IP is now locked
+    /// out or how many attempts remain before lockout.
     pub(crate) async fn record_failure(&self, ip: IpAddr) -> FailureOutcome {
         let mut lockout = self.lockout.lock().await;
         let record = lockout.entry(ip).or_default();
@@ -135,48 +186,10 @@ impl AuthState {
 
 /// Hash a plaintext password with Argon2id. Returns a PHC-format string.
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-    let salt = SaltString::generate(&mut rand::thread_rng());
+    use argon2::{Argon2, PasswordHasher};
+    // argon2 0.6 generates the salt internally (getrandom feature).
     let argon2 = Argon2::default();
-    Ok(argon2
-        .hash_password(password.as_bytes(), &salt)?
-        .to_string())
-}
-
-/// Derive the deterministic session token for a password hash.
-///
-/// The token is `hex(HMAC-SHA256(key = password hash, msg = label))`:
-/// - Knowing the token does not reveal the password hash (HMAC is one-way).
-/// - Changing the password changes the hash, invalidating every previously
-///   issued token/cookie — that is the only revocation mechanism needed.
-/// - The token is stable across daemon restarts, so browsers stay logged in.
-/// - Every oly instance configured with the same password derives the same
-///   token, so cookies forwarded through the reverse proxy are accepted by
-///   upstream instances: proxy and normal access share one login.
-fn derive_session_token(password_hash: &str) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(password_hash.as_bytes())
-        .expect("HMAC-SHA256 accepts keys of any length");
-    mac.update(TOKEN_DERIVATION_LABEL);
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-/// Constant-time byte comparison so token checks do not leak how many leading
-/// characters of the expected token an attacker guessed correctly.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |diff, (l, r)| diff | (l ^ r))
-        == 0
+    Ok(argon2.hash_password(password.as_bytes())?.to_string())
 }
 
 // ── Request / Response DTOs ──────────────────────────────────────────────────
@@ -289,7 +302,7 @@ pub async fn login(
 
     if verified.is_some() {
         auth.lockout.lock().await.remove(&client_ip);
-        let token = auth.expected_token.clone();
+        let token = auth.issue_session().await;
         info!(ip = %client_ip, "auth: login success — session token issued");
         let secure = request_is_tls(&headers);
         return (
@@ -338,9 +351,9 @@ pub async fn login(
 
 /// POST /api/auth/logout — clear the caller's auth cookie.
 ///
-/// Session tokens are deterministic (derived from the password hash), so they
-/// cannot be revoked server-side; logout clears the cookie client-side. A new
-/// password is the only way to invalidate a leaked token.
+/// Sessions are random and server-side (ADR-0007): logout revokes the
+/// caller's token, bumps the revocation epoch so open WebSocket/SSE streams
+/// close loudly, and clears the cookie client-side.
 pub async fn logout(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -356,7 +369,13 @@ pub async fn logout(
             .into_response();
     }
 
-    debug!(ip = %client_ip, "auth: logout — auth cookie cleared");
+    if let Some(auth) = &state.auth
+        && let Some(token) = extract_request_token_parts(&headers, None)
+    {
+        auth.revoke_token(&token).await;
+    }
+
+    info!(ip = %client_ip, "auth: logout — session revoked, cookie cleared");
 
     (
         StatusCode::OK,
@@ -389,8 +408,9 @@ pub async fn require_auth(
         None
     };
     let token = extract_request_token_parts(request.headers(), query);
+    let bearer = extract_bearer_token(request.headers());
     let client_ip = extract_request_client_ip(&request);
-    if let Some(response) = authorize_request(&state, &path, token, client_ip).await {
+    if let Some(response) = authorize_request(&state, &path, token, bearer, client_ip).await {
         return response;
     }
 
@@ -401,18 +421,23 @@ pub(super) async fn authorize_request(
     state: &AppState,
     path: &str,
     token: Option<String>,
+    bearer: Option<String>,
     client_ip: Option<String>,
 ) -> Option<Response> {
-    let Some(auth) = state.auth.as_ref().map(Arc::clone) else {
-        return None;
-    };
+    let auth = state.auth.as_ref().map(Arc::clone)?;
 
-    if let Some(token) = token {
-        if auth.is_valid_token(&token) {
-            debug!(path = %path, "auth: authorized request");
-            return None;
-        }
+    if let Some(token) = token
+        && auth.validate_token(&token).await
+    {
+        debug!(path = %path, "auth: authorized request (session)");
+        return None;
     }
+
+    // Federation auth no longer uses scoped machine credentials; the only
+    // HTTP authorization path is server-issued, expiring, revocable session
+    // tokens established via password login. Anonymous Bearer strings
+    // therefore do not authorize anything.
+    let _ = bearer;
 
     let client_ip = client_ip.unwrap_or_else(|| "unknown".to_string());
 
@@ -454,6 +479,70 @@ pub(super) fn extract_request_token_parts(
         .or_else(|| extract_cookie_token(headers))
 }
 
+/// Extract only the Authorization: Bearer credential (never query/cookie),
+/// used when deciding whether a request carries machine credentials.
+pub(super) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_owned())
+}
+
+/// WebSocket Origin validation (ADR-0007): a browser cross-site WebSocket
+/// must not ride the ambient auth cookie. Non-browser clients (no Origin
+/// header) are unaffected; an Origin whose host[:port] matches neither the
+/// Host header nor a gateway-provided `X-Forwarded-Host` is rejected.
+///
+/// `X-Forwarded-Host` is trusted as a match candidate because this check
+/// only defends against browsers, and the browser WebSocket API cannot set
+/// arbitrary handshake headers — a non-browser client capable of spoofing
+/// `X-Forwarded-Host` could bypass the check trivially by omitting `Origin`.
+/// Without it, any reverse proxy/gateway that rewrites the `Host` header
+/// (nginx's default behaviour without `proxy_set_header Host $host`) would
+/// make every browser attach fail with 403.
+pub fn ws_origin_allowed(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(axum::http::header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let (scheme, rest) = origin.split_once("://").unwrap_or(("", origin));
+    let authority = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
+    if authority.is_empty() {
+        return false;
+    }
+    // Origin always carries an explicit port only when non-default, but be
+    // lenient: treat the scheme's default port as equivalent to no port.
+    let default_port = match scheme {
+        "https" | "wss" => ":443",
+        _ => ":80",
+    };
+    let authority_no_default_port = authority.strip_suffix(default_port);
+    let mut candidates = Vec::new();
+    if let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        candidates.push(host);
+    }
+    let forwarded_host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok());
+    let matches = |candidate: &str| {
+        let candidate = candidate.trim().to_ascii_lowercase();
+        !candidate.is_empty()
+            && (candidate == authority || authority_no_default_port.is_some_and(|a| candidate == a))
+    };
+    let mut matched = candidates.iter().any(|c| matches(c));
+    if !matched && let Some(xfh) = forwarded_host {
+        // Multi-hop proxies append; the first entry is the original Host.
+        matched = xfh.split(',').any(matches);
+    }
+    matched
+}
+
 fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::COOKIE)
@@ -472,7 +561,7 @@ fn extract_cookie_token(headers: &HeaderMap) -> Option<String> {
 
 fn build_auth_cookie(token: &str, secure: bool) -> String {
     let secure_flag = if secure { "; Secure" } else { "" };
-    let max_age = AUTH_COOKIE_MAX_AGE.as_secs();
+    let max_age = SESSION_TTL.as_secs();
     format!(
         "{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure_flag}"
     )
@@ -494,53 +583,109 @@ fn request_is_tls(headers: &HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTH_COOKIE_NAME, AuthState, build_auth_cookie, clear_auth_cookie, constant_time_eq,
-        derive_session_token, extract_request_token_parts, hash_password,
+        AUTH_COOKIE_NAME, AuthState, SESSION_TTL, build_auth_cookie, clear_auth_cookie,
+        extract_request_token_parts, hash_password, ws_origin_allowed,
     };
     use axum::http::{HeaderMap, header};
 
-    #[test]
-    fn derived_token_is_stable_and_password_sensitive() {
-        let hash_a = hash_password("hunter2").expect("password should hash");
-        let hash_b = hash_password("hunter2").expect("password should hash");
-        let hash_c = hash_password("different").expect("password should hash");
-
-        let token_a1 = derive_session_token(&hash_a);
-        let token_a2 = derive_session_token(&hash_a);
-        let token_b = derive_session_token(&hash_b);
-        let token_c = derive_session_token(&hash_c);
-
-        // Same hash → same token (deterministic, survives restarts).
-        assert_eq!(token_a1, token_a2);
-        // Same password, different salt → different token. This is expected:
-        // the daemon re-derives its own token at startup, and password changes
-        // always come with a new hash.
-        assert_ne!(token_a1, token_b);
-        // Different password → different token.
-        assert_ne!(token_a1, token_c);
-        // Token format: 32-byte HMAC output, hex-encoded.
-        assert_eq!(token_a1.len(), 64);
-        assert!(token_a1.bytes().all(|b| b.is_ascii_hexdigit()));
-    }
-
     #[tokio::test]
-    async fn auth_state_validates_derived_token_without_expiry() {
+    async fn sessions_are_random_expiring_and_revocable() {
         let state = AuthState::new(hash_password("hunter2").expect("password should hash"));
 
-        assert!(state.is_valid_token(&state.expected_token));
-        assert!(!state.is_valid_token("not-the-token"));
-        // Prefix of the real token must be rejected (constant-time eq checks
-        // full length).
-        let truncated = &state.expected_token[..state.expected_token.len() - 1];
-        assert!(!state.is_valid_token(truncated));
+        let token_a = state.issue_session().await;
+        let token_b = state.issue_session().await;
+        // Random: two logins never share a token.
+        assert_ne!(token_a, token_b);
+        assert_eq!(token_a.len(), 64);
+        assert!(token_a.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        assert!(state.validate_token(&token_a).await);
+        assert!(state.validate_token(&token_b).await);
+        assert!(!state.validate_token("not-the-token").await);
+        // Prefix of a real token is rejected.
+        assert!(!state.validate_token(&token_a[..token_a.len() - 1]).await);
+
+        // Revocation invalidates only the revoked token and bumps the epoch.
+        let mut watch = state.revocation_watch();
+        let epoch = *watch.borrow();
+        state.revoke_token(&token_a).await;
+        assert!(!state.validate_token(&token_a).await);
+        assert!(state.validate_token(&token_b).await);
+        watch.changed().await.expect("revocation epoch must bump");
+        assert_eq!(*watch.borrow(), epoch + 1);
+
+        // Re-issuing never collides with a revoked token.
+        let token_c = state.issue_session().await;
+        assert_ne!(token_a, token_c);
     }
 
     #[test]
-    fn constant_time_comparison_behaves() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
+    fn cookie_lifetime_matches_session_ttl() {
+        assert_eq!(SESSION_TTL.as_secs(), 7 * 24 * 60 * 60);
+        let cookie = build_auth_cookie("abc123", false);
+        assert!(cookie.contains("Max-Age=604800"));
+    }
+
+    #[test]
+    fn websocket_origin_must_match_host() {
+        let mut headers = HeaderMap::new();
+        // No Origin header (non-browser client) is allowed.
+        assert!(ws_origin_allowed(&headers));
+
+        headers.insert(header::HOST, "localhost:7700".parse().unwrap());
+        assert!(ws_origin_allowed(&headers));
+
+        headers.insert(header::ORIGIN, "http://localhost:7700".parse().unwrap());
+        assert!(ws_origin_allowed(&headers));
+
+        headers.insert(header::ORIGIN, "https://evil.example.com".parse().unwrap());
+        assert!(!ws_origin_allowed(&headers));
+
+        // Origin without a Host header cannot be validated: reject.
+        let mut no_host = HeaderMap::new();
+        no_host.insert(header::ORIGIN, "http://localhost:7700".parse().unwrap());
+        assert!(!ws_origin_allowed(&no_host));
+    }
+
+    #[test]
+    fn websocket_origin_accepts_gateway_forwarded_host() {
+        // Gateway terminates TLS and rewrites Host to the upstream address
+        // (nginx default without `proxy_set_header Host $host`): the browser
+        // Origin no longer matches Host, but the gateway records the original
+        // host in X-Forwarded-Host.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:7700".parse().unwrap());
+        headers.insert(
+            header::ORIGIN,
+            "https://oly.public.example.com".parse().unwrap(),
+        );
+        assert!(!ws_origin_allowed(&headers));
+
+        headers.insert(
+            "x-forwarded-host",
+            "oly.public.example.com".parse().unwrap(),
+        );
+        assert!(ws_origin_allowed(&headers));
+
+        // A forwarded host that does not match the Origin still rejects.
+        headers.insert("x-forwarded-host", "other.example.com".parse().unwrap());
+        assert!(!ws_origin_allowed(&headers));
+
+        // Multi-hop X-Forwarded-Host list: the first (original) entry counts.
+        headers.insert(
+            "x-forwarded-host",
+            "oly.public.example.com, internal-gw".parse().unwrap(),
+        );
+        assert!(ws_origin_allowed(&headers));
+
+        // Explicit default port in Origin equals no port.
+        let mut default_port = HeaderMap::new();
+        default_port.insert(header::HOST, "oly.example.com".parse().unwrap());
+        default_port.insert(
+            header::ORIGIN,
+            "https://oly.example.com:443".parse().unwrap(),
+        );
+        assert!(ws_origin_allowed(&default_port));
     }
 
     #[test]
@@ -585,7 +730,6 @@ mod tests {
 
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
-        assert!(set_cookie.contains("Max-Age=31536000"));
         assert!(!set_cookie.contains("Secure"));
         assert!(secure_cookie.contains("; Secure"));
         assert!(clear_cookie.contains("Max-Age=0"));

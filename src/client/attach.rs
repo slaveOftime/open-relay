@@ -1,14 +1,13 @@
-use std::{
-    io::{IsTerminal, Write},
-    time::{Duration, Instant},
-};
+use std::io::{IsTerminal, Write};
 
 use crossterm::{
-    event::{
-        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    },
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
+};
+#[cfg(not(windows))]
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
+    execute,
 };
 use tokio::{io::BufReader, sync::mpsc};
 
@@ -17,11 +16,11 @@ use crate::{
     config::AppConfig,
     error::{AppError, Result},
     ipc,
+    mouse::encode_mouse_event as map_mouse_input,
     protocol::{RpcRequest, RpcResponse},
 };
 
-const PASTE_BURST_WAIT: Duration = Duration::from_millis(30);
-const PASTE_KEY_SUPPRESS_WINDOW: Duration = Duration::from_millis(150);
+use super::{attach_input::AttachInputEvent, cursor::StreamCursor};
 
 /// Upper bound on how many bytes of already-queued server output are written
 /// to the terminal in one go. Batching turns a burst of frames into a single
@@ -29,73 +28,227 @@ const PASTE_KEY_SUPPRESS_WINDOW: Duration = Duration::from_millis(150);
 /// incrementally rather than freezing on one very large write.
 const MAX_BATCHED_FRAME_BYTES: usize = 1024 * 1024;
 
-struct PendingKeyBurst {
-    data: String,
-    deadline: Instant,
-}
+/// Daemon-frame queue depth between the socket reader task and the render
+/// loop. Frames are coalesced server-side to at most 512 KiB raw
+/// (~700 KiB base64 on the wire), so 16 frames bound the queue at ~11 MiB
+/// worst case; backpressure flows to the socket, never to a dropped byte.
+const ATTACH_FRAME_QUEUE_DEPTH: usize = 16;
 
-#[cfg(windows)]
+/// Terminal-event queue depth between the blocking crossterm reader thread
+/// and the async event loop. Full means the thread blocks — input
+/// is backpressured, never dropped. Paste bursts arrive as one
+/// `Event::Paste`, so this only needs to absorb key-burst jitter.
+const TERMINAL_EVENT_QUEUE_DEPTH: usize = 4096;
+
+/// Windows-only attach renderer (terminal-engine based; the second
+/// `vt100` parser is retired). The struct and its tests compile on every
+/// platform so the logic is type-checked and unit-tested on Linux; only the
+/// *construction* in the attach flow is `cfg(windows)`.
+///
+/// ConPTY output is wrap-dependent, so on Windows the client cannot forward
+/// daemon bytes raw: it maintains a canonical engine screen and emits
+/// row-diffs (or a full snapshot after a resize) wrapped in synchronized
+/// updates. This is the same [`crate::terminal::Terminal`] engine the
+/// daemon runs — one supported terminal policy.
+#[cfg(any(windows, test))]
 struct AttachRenderer {
-    parser: vt100::Parser,
+    engine: crate::terminal::Terminal,
+    /// Styled rows of the last state emitted to the real terminal; the diff
+    /// source for incremental repaints.
+    prev_rows: Vec<Vec<u8>>,
+    prev_cursor: (u16, u16),
+    prev_cursor_visible: bool,
     needs_full_repaint: bool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 impl AttachRenderer {
     fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+            // Retain a bounded viewport for resize reflow; feed_render emits
+            // newly scrolled rows even when this retention is at capacity.
+            engine: crate::terminal::Terminal::new(
+                rows.max(1),
+                cols.max(1),
+                usize::from(rows.max(1)),
+            ),
+            prev_rows: Vec::new(),
+            prev_cursor: (0, 0),
+            prev_cursor_visible: true,
             needs_full_repaint: false,
         }
     }
 
     fn render_initial(&mut self, data: &[u8]) -> Vec<u8> {
-        self.parser.process(data);
+        // Snapshot restoration is not new output/history. Use normal feed,
+        // so ED 2 in the restore program cannot become a spurious scroll row.
+        self.engine.feed(data);
+        let _ = self.engine.drain_events();
         self.needs_full_repaint = false;
         let mut rendered = passthrough_signals(data);
-        rendered.extend_from_slice(&self.parser.screen().state_formatted());
+        rendered.extend_from_slice(if self.engine.modes().alt_screen {
+            b"\x1b[?1049h"
+        } else {
+            b"\x1b[?1049l"
+        });
+        rendered.extend_from_slice(&self.repaint_bytes());
+        self.remember_state();
         rendered
     }
 
     fn render_chunk(&mut self, data: &[u8]) -> Vec<u8> {
-        let previous = self.parser.screen().clone();
-        self.parser.process(data);
+        let effects = self.engine.feed_render(data);
+        // The renderer never answers queries: the daemon's engine already
+        // did (single responder). Queued events are dropped.
+        let _ = self.engine.drain_events();
 
         // The canonical screen state only models the grid, cursor and modes,
         // so window title and progress/busy notifications are forwarded from
         // the original bytes; otherwise they would be dropped entirely.
         let mut rendered = passthrough_signals(data);
+        let (rows, _) = self.engine.size();
+        let has_effects = !effects.is_empty();
+        if has_effects {
+            // Scroll/history operations must be atomic with the final repaint,
+            // otherwise a large transcript flashes each staged top row.
+            rendered.extend_from_slice(b"\x1b[?2026h");
+        }
+        for effect in effects {
+            match effect {
+                crate::terminal::RenderEffect::HistoryRow(row) => {
+                    // Write the actual scrolled-off row at the top, then
+                    // scroll one row at the bottom. This appends precisely
+                    // one history row without copying the live screen.
+                    rendered.extend_from_slice(b"\x1b[?6l\x1b[r\x1b[H\x1b[0m");
+                    rendered.extend_from_slice(&row);
+                    rendered.extend_from_slice(b"\x1b[K");
+                    rendered.extend_from_slice(format!("\x1b[{rows};1H\r\n").as_bytes());
+                    self.needs_full_repaint = true;
+                }
+                crate::terminal::RenderEffect::AlternateScreen(alt) => {
+                    rendered.extend_from_slice(if alt { b"\x1b[?1049h" } else { b"\x1b[?1049l" });
+                    self.needs_full_repaint = true;
+                }
+                crate::terminal::RenderEffect::ClearHistory => {
+                    rendered.extend_from_slice(b"\x1b[3J");
+                }
+            }
+        }
 
         // Render from canonical screen state instead of forwarding ConPTY's
-        // wrap-dependent bytes. Once the initial snapshot is on screen, state
+        // wrap-dependent bytes. Once the initial snapshot is on screen, row
         // diffs preserve that exact baseline without full-screen flashing.
         let update = if self.needs_full_repaint {
             self.needs_full_repaint = false;
-            self.parser.screen().state_formatted()
+            let snapshot = self.repaint_bytes();
+            self.remember_state();
+            snapshot
         } else {
-            self.parser.screen().state_diff(&previous)
+            let rows = self.engine.styled_screen_rows();
+            let cursor = self.engine.cursor_position();
+            let visible = self.engine.cursor_visible();
+            let update = screen_diff_bytes(
+                &self.prev_rows,
+                &rows,
+                (self.prev_cursor, cursor),
+                (self.prev_cursor_visible, visible),
+            );
+            self.prev_rows = rows;
+            self.prev_cursor = cursor;
+            self.prev_cursor_visible = visible;
+            update
         };
         if update.is_empty() {
+            if has_effects {
+                rendered.extend_from_slice(b"\x1b[?2026l");
+            }
             return rendered;
         }
-        rendered.extend_from_slice(b"\x1b[?2026h");
+        if !has_effects {
+            rendered.extend_from_slice(b"\x1b[?2026h");
+        }
         rendered.extend_from_slice(&update);
         rendered.extend_from_slice(b"\x1b[?2026l");
         rendered
     }
 
+    /// Repaint without ED 2: some terminals move the old viewport to history
+    /// when it is erased, manufacturing duplicate scrollback on every resize.
+    fn repaint_bytes(&self) -> Vec<u8> {
+        // Rendering adapters must not inherit a child's origin mode, margins,
+        // or SGR state. Absolute positions use the outer terminal's viewport.
+        let mut out = b"\x1b[?6l\x1b[r".to_vec();
+        for (index, row) in self.engine.styled_screen_rows().iter().enumerate() {
+            out.extend_from_slice(format!("\x1b[{};1H\x1b[0m", index + 1).as_bytes());
+            out.extend_from_slice(row);
+            out.extend_from_slice(b"\x1b[K");
+        }
+        let (row, col) = self.engine.cursor_position();
+        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        out.extend_from_slice(if self.engine.cursor_visible() {
+            b"\x1b[?25h"
+        } else {
+            b"\x1b[?25l"
+        });
+        out
+    }
+
+    fn remember_state(&mut self) {
+        self.prev_rows = self.engine.styled_screen_rows();
+        self.prev_cursor = self.engine.cursor_position();
+        self.prev_cursor_visible = self.engine.cursor_visible();
+    }
+
     fn resize(&mut self, rows: u16, cols: u16) {
-        // The attach renderer repaints only the visible screen, so it keeps
-        // no scrollback of its own.
-        crate::session::screen::safe_resize_parser(&mut self.parser, rows, cols, 0);
+        // Non-destructive engine reflow; the repaint is a full snapshot.
+        // History is forwarded as it scrolls, never synthesized from redraws.
+        self.engine.resize_render(rows.max(1), cols.max(1));
         self.needs_full_repaint = true;
     }
+}
+
+/// Row-based screen diff: rewrite every changed row in place (SGR reset +
+/// styled row + erase-to-EOL for stale tails), then restore the cursor if
+/// it or its visibility changed. Empty when nothing visible changed, so a
+/// title-only chunk emits no repaint at all.
+#[cfg(any(windows, test))]
+fn screen_diff_bytes(
+    prev_rows: &[Vec<u8>],
+    next_rows: &[Vec<u8>],
+    cursors: ((u16, u16), (u16, u16)),
+    visibility: (bool, bool),
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let row_count = prev_rows.len().max(next_rows.len());
+    for index in 0..row_count {
+        let prev = prev_rows.get(index);
+        let next = next_rows.get(index);
+        if prev == next {
+            continue;
+        }
+        out.extend_from_slice(format!("\x1b[{};1H\x1b[0m", index + 1).as_bytes());
+        if let Some(row) = next {
+            out.extend_from_slice(row);
+        }
+        out.extend_from_slice(b"\x1b[K");
+    }
+    let cursor_changed = cursors.0 != cursors.1 || visibility.0 != visibility.1;
+    if out.is_empty() && !cursor_changed {
+        return out;
+    }
+    out.extend_from_slice(format!("\x1b[{};{}H", cursors.1.0 + 1, cursors.1.1 + 1).as_bytes());
+    out.extend_from_slice(if visibility.1 {
+        b"\x1b[?25h"
+    } else {
+        b"\x1b[?25l"
+    });
+    out
 }
 
 /// Extract the semantic terminal signals (window title, progress and busy
 /// indicators, cursor shape) that the canonical screen state does not model,
 /// so they survive a repaint driven by that state.
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn passthrough_signals(data: &[u8]) -> Vec<u8> {
     let mut signals = crate::session::scan::extract_passthrough_osc_sequences(data);
     if let Some(params) = crate::session::scan::last_cursor_style_params(data) {
@@ -110,16 +263,27 @@ fn passthrough_signals(data: &[u8]) -> Vec<u8> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_attach(config: &AppConfig, id: &str) -> Result<()> {
-    run_attach_inner(config, id, None).await
+pub async fn run_attach(config: &AppConfig, id: &str, role: Option<&str>) -> Result<()> {
+    run_attach_inner(config, id, None, role).await
 }
 
-pub async fn run_attach_node(config: &AppConfig, id: &str, node: Option<String>) -> Result<()> {
-    run_attach_inner(config, id, node.as_deref()).await
+pub async fn run_attach_node(
+    config: &AppConfig,
+    id: &str,
+    node: Option<String>,
+    role: Option<&str>,
+) -> Result<()> {
+    run_attach_inner(config, id, node.as_deref(), role).await
 }
 
-async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> Result<()> {
+async fn run_attach_inner(
+    config: &AppConfig,
+    id: &str,
+    node: Option<&str>,
+    role: Option<&str>,
+) -> Result<()> {
     let stream = ipc::connect(config).await?;
+    crate::metrics::mark("attach: ipc connected");
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let interactive = can_use_interactive_terminal();
@@ -140,8 +304,13 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             RpcRequest::AttachSubscribe {
                 id: id_owned.clone(),
                 from_byte_offset: None,
+                incarnation: None,
                 rows: initial_size.map(|(_, rows)| rows),
                 cols: initial_size.map(|(cols, _)| cols),
+                role: role.map(str::to_owned),
+                // This client reports applied-cursor credits every
+                // ACK_STRIDE_BYTES; the daemon gates the stream on them.
+                credited: true,
             },
         ),
     )
@@ -149,12 +318,18 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
     // Receive the init frame.
     let init = ipc::read_checked_response_from_reader(&mut reader).await?;
+    crate::metrics::mark("attach: init frame received");
     let (
         initial_data,
         scrollback_seed,
         mut running,
         mut child_bracketed_paste_mode,
         mut child_app_cursor_keys,
+        mut child_mouse_report,
+        mut child_sgr_mouse,
+        mut child_focus_events,
+        stream_end_offset,
+        granted_role,
     ) = match init {
         RpcResponse::AttachStreamInit {
             data,
@@ -162,6 +337,11 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            mouse_report,
+            sgr_mouse,
+            focus_events,
+            end_offset,
+            role,
             ..
         } => (
             data,
@@ -169,9 +349,29 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             running,
             bracketed_paste_mode,
             app_cursor_keys,
+            mouse_report,
+            sgr_mouse,
+            focus_events,
+            end_offset,
+            role,
         ),
         _ => return Err(AppError::Protocol("unexpected response type".to_string())),
     };
+
+    // Observe-mode attach never drives input or geometry. The server
+    // enforces the gate; this mirrors it client-side so an observer's
+    // keystrokes don't bounce. Every other attach controls the session.
+    let can_drive = granted_role != "observer";
+    if interactive && !can_drive {
+        eprintln!("Attached in observe mode (view-only). Ctrl-D detaches.");
+    }
+
+    // Every chunk must continue exactly at the cursor the init frame left
+    // us at; gaps/duplicates abort the attach loudly and surface the
+    // failure so retry logic can re-anchor instead of silently applying
+    // duplicate bytes.
+    let mut stream_cursor = StreamCursor::new(stream_end_offset);
+    let mut last_acked: u64 = 0;
 
     // When stdio is piped, interactive terminal control fails across platforms,
     // so fall back to a plain stream replay instead of raw-mode attach.
@@ -180,13 +380,28 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
         while running {
-            match ipc::read_checked_response_from_reader(&mut reader).await? {
-                RpcResponse::AttachStreamChunk { data, .. } => write_bytes_to_stdout(&data)?,
-                RpcResponse::AttachModeChanged { .. } => {}
-                RpcResponse::AttachStreamDone { .. } => {
-                    running = false;
+            // After the init line the stream is binary framed (ADR-0004);
+            // output arrives as raw bytes.
+            match ipc::read_checked_attach_frame(&mut reader).await? {
+                ipc::AttachFrame::Output { offset, data } => {
+                    stream_cursor.accept(offset, data.len())?;
+                    write_bytes_to_stdout(&data)?;
+                    maybe_send_ack(
+                        &mut write_half,
+                        &id_owned,
+                        stream_cursor.current(),
+                        &mut last_acked,
+                    )
+                    .await;
                 }
-                _ => {}
+                ipc::AttachFrame::Control(resp) => match *resp {
+                    RpcResponse::AttachModeChanged { .. } => {}
+                    RpcResponse::AttachStreamDone { final_offset, .. } => {
+                        stream_cursor.finish(final_offset)?;
+                        running = false;
+                    }
+                    _ => {}
+                },
             }
         }
 
@@ -198,6 +413,18 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
     let mut stream_error: Option<AppError> = None;
     {
         let _raw_mode = crate::terminal_guards::RawModeGuard::new()?;
+        #[cfg(windows)]
+        let _vt_input = super::attach_input::VtInputGuard::new()?;
+
+        // Discard input that queued up while the subscribe handshake and the
+        // replay were still in flight: device-attribute replies and a resize
+        // the terminal reported mid-handshake. This has to run *before* the
+        // first snapshot write below, not after it — once the replay reaches
+        // the outer terminal the client is visibly live, and from that point
+        // on the event-reader thread is the only consumer. Draining any later
+        // would silently swallow keystrokes the user sent while the snapshot
+        // was being painted (input is never dropped; see the reader thread).
+        let _ = drain_pending_terminal_events();
 
         // Render the current terminal snapshot. The subscribe handshake already
         // asked the daemon to resize to the current terminal size when needed.
@@ -212,7 +439,10 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             // Print the session's recent history so the terminal scrollbar
             // reaches back past the attach point, then push it into
             // scrollback; the snapshot repaints the now-blank screen.
-            write_bytes_to_stdout(&scrollback_seed_bytes(&scrollback_seed, rows))?;
+            write_bytes_to_stdout(&crate::session::scrollback_seed_bytes(
+                &scrollback_seed,
+                rows,
+            ))?;
         }
 
         #[cfg(windows)]
@@ -225,20 +455,39 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
 
         drop(initial_data); // Release up to 1 MB of replay data immediately.
 
-        // Drain any stale resize events queued by writing replay data
-        // before the main event loop.
-        let _ = drain_pending_terminal_events();
+        // Mirror the child's negotiated input modes on the outer terminal:
+        // mouse capture and focus-event reporting (1004) are enabled only
+        // while the child wants them, so local selection and focus behave
+        // normally otherwise.
+        sync_local_terminal_modes(child_mouse_report, child_focus_events);
 
-        // `read_response_from_reader` uses `read_line`, which is not safe to
-        // keep cancelling with timeouts. Read daemon frames in a dedicated task
-        // and receive them over a channel instead.
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+        // A resize that landed during the handshake was drained above as
+        // "stale"; reconcile against the real terminal size so a
+        // startup-race resize is not silently lost until the next one.
+        {
+            let (now_cols, now_rows) = terminal::size().unwrap_or((cols, rows));
+            if (now_cols, now_rows) != last_sent_size {
+                last_sent_size = (now_cols, now_rows);
+                #[cfg(windows)]
+                if can_drive {
+                    renderer.resize(now_rows, now_cols);
+                }
+                send_attach_resize(&mut write_half, &id_owned, now_rows, now_cols).await?;
+            }
+        }
+
+        // Read daemon frames in a dedicated task and channel them in:
+        // cancelling reads with timeouts was not safe, and a bounded
+        // channel backpressures the socket all the way to the daemon's
+        // credit gate, so a slow renderer never bloats memory. Worst
+        // case: 16 frames at ≈ 1 MiB each.
+        let (frame_tx, mut frame_rx) = mpsc::channel(ATTACH_FRAME_QUEUE_DEPTH);
         let reader_task = tokio::spawn(async move {
             let mut reader = reader;
             loop {
-                let frame = ipc::read_checked_response_from_reader(&mut reader).await;
+                let frame = ipc::read_checked_attach_frame(&mut reader).await;
                 let done = frame.is_err();
-                if frame_tx.send(frame).is_err() {
+                if frame_tx.send(frame).await.is_err() {
                     break;
                 }
                 if done {
@@ -247,293 +496,307 @@ async fn run_attach_inner(config: &AppConfig, id: &str, node: Option<&str>) -> R
             }
         });
 
-        let mut pending_key_burst: Option<PendingKeyBurst> = None;
-        let mut suppress_paste_keys_until: Option<Instant> = None;
         let mut shutdown_rx = spawn_attach_shutdown_listener();
 
+        // Terminal events come from a blocking reader thread (crossterm on
+        // Unix, a VT-aware console reader on Windows); the async loop selects
+        // over them alongside daemon frames and shutdown. Input is event-driven
+        // with no paste-detection windows (Windows only times out ambiguous
+        // Escape prefixes, never pasted text). Backpressure via
+        // `blocking_send`: input events are never dropped (silent input
+        // loss would corrupt the session); the producer waits until the
+        // event loop catches up.
+        let (event_tx, mut event_rx) = mpsc::channel(TERMINAL_EVENT_QUEUE_DEPTH);
+        let event_reader = std::thread::spawn(move || {
+            // stdin closed or unreadable ends the stream.
+            #[cfg(windows)]
+            let _ = super::attach_input::read_events(|ev| event_tx.blocking_send(ev).is_ok());
+            #[cfg(not(windows))]
+            while let Ok(ev) = event::read() {
+                if event_tx
+                    .blocking_send(AttachInputEvent::Terminal(ev))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
         while running {
-            if shutdown_rx.try_recv().is_ok() {
-                detached = true;
-                break;
-            }
-
-            // Drain all pending keyboard/resize events first.
-            loop {
-                match event::poll(pending_key_burst_poll_timeout(pending_key_burst.as_ref())) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
+            tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        detached = true;
                         break;
                     }
-                    Err(err) => {
-                        stream_error = Some(err.into());
-                        running = false;
-                        break;
-                    }
-                }
-                match event::read()? {
-                    Event::Paste(data) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
-                        ipc::write_request_to_writer(
-                            &mut write_half,
-                            RpcRequest::AttachInput {
-                                id: id_owned.clone(),
-                                data: wrap_paste_input(
-                                    normalize_paste_text(data),
-                                    child_bracketed_paste_mode,
-                                ),
-                                wait_for_change: false,
-                            },
-                        )
-                        .await?
-                    }
-                    Event::Resize(cols, rows) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        // Re-read the actual terminal size — the event may
-                        // carry stale dimensions on some platforms.
-                        let (actual_cols, actual_rows) = terminal::size().unwrap_or((cols, rows));
-                        if (actual_cols, actual_rows) != last_sent_size {
-                            last_sent_size = (actual_cols, actual_rows);
-
-                            #[cfg(windows)]
-                            renderer.resize(actual_rows, actual_cols);
-
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachResize {
-                                    id: id_owned.clone(),
-                                    rows: actual_rows,
-                                    cols: actual_cols,
-                                },
-                            )
-                            .await?
-                        }
-                    }
-                    Event::Key(key) => {
-                        if should_suppress_paste_followup_key(key, suppress_paste_keys_until) {
-                            continue;
-                        }
-
-                        if let Some(data) = maybe_collect_clipboard_paste(
-                            config,
-                            id,
-                            node,
-                            key,
-                            child_bracketed_paste_mode,
-                        )
-                        .await?
-                        {
-                            pending_key_burst = None;
-                            suppress_paste_keys_until = Some(next_paste_key_suppression_deadline());
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: true,
-                                },
-                            )
-                            .await?;
-                            continue;
-                        }
-
-                        if !matches!(key.kind, KeyEventKind::Press) {
-                            continue;
-                        }
-
-                        if is_ctrl_d(key) {
-                            if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst)
-                            {
-                                ipc::write_request_to_writer(
-                                    &mut write_half,
-                                    RpcRequest::AttachInput {
-                                        id: id_owned.clone(),
-                                        data,
-                                        wait_for_change: true,
-                                    },
-                                )
-                                .await?;
-                            }
-                            detached = true;
-                            running = false;
-                            break;
-                        }
-
-                        if push_pending_key_burst(
-                            &mut pending_key_burst,
-                            key,
-                            child_app_cursor_keys,
-                        ) {
-                            continue;
-                        }
-
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-
-                        if let Some(data) = map_key_to_input(key, child_app_cursor_keys) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                    Event::Mouse(mouse) => {
-                        if let Some(data) = take_pending_key_burst_data(&mut pending_key_burst) {
-                            ipc::write_request_to_writer(
-                                &mut write_half,
-                                RpcRequest::AttachInput {
-                                    id: id_owned.clone(),
-                                    data,
-                                    wait_for_change: false,
-                                },
-                            )
-                            .await?;
-                        }
-                        let data = map_mouse_to_sgr_input(mouse);
-                        ipc::write_request_to_writer(
-                            &mut write_half,
-                            RpcRequest::AttachInput {
-                                id: id_owned.clone(),
-                                data,
-                                wait_for_change: false,
-                            },
-                        )
-                        .await?;
-                    }
-                    _ => {}
-                }
-            }
-            if !running {
-                break;
-            }
-
-            // Wait for next server frame (with a timeout so we keep draining input).
-            let frame =
-                tokio::time::timeout(std::time::Duration::from_millis(60), frame_rx.recv()).await;
-            match frame {
-                Err(_timeout) => continue,
-                Ok(None) => {
-                    stream_error = Some(AppError::Protocol(
-                        "daemon closed the connection".to_string(),
-                    ));
-                    break;
-                }
-                Ok(Some(Err(err))) => {
-                    stream_error = Some(err);
-                    break;
-                }
-                Ok(Some(Ok(response))) => {
-                    // Drain every frame the daemon has already queued and
-                    // concatenate the output chunks into one buffer. A burst of
-                    // output (an echoed paste, a full-screen redraw) otherwise
-                    // costs one blocking write plus one flush of the unbuffered
-                    // stdout handle per frame, which is what makes a large
-                    // paste visibly crawl across the screen.
-                    let mut batch = Vec::new();
-                    let mut response = Some(response);
-                    loop {
-                        let Some(current) = response.take() else {
+                    maybe_event = event_rx.recv() => {
+                        let Some(ev) = maybe_event else {
+                            stream_error = Some(AppError::Protocol(
+                                "terminal input stream ended".to_string(),
+                            ));
                             break;
                         };
-                        match current {
-                            RpcResponse::AttachStreamChunk { data, .. } => {
-                                if batch.is_empty() {
-                                    batch = data;
-                                } else {
-                                    batch.extend_from_slice(&data);
+                        // `Raw` exists only on Windows, where ConPTY needs raw
+                        // VT passthrough alongside decoded events. Elsewhere the
+                        // enum is a single-variant wrapper, so this is a plain
+                        // irrefutable destructure — a one-arm `match` here would
+                        // trip `clippy::infallible_destructuring_match`.
+                        #[cfg(windows)]
+                        let ev = match ev {
+                            AttachInputEvent::Terminal(ev) => ev,
+                            AttachInputEvent::Raw(data) => {
+                                if can_drive {
+                                    send_attach_input(&mut write_half, &id_owned, data, false).await?;
+                                }
+                                continue;
+                            }
+                        };
+                        #[cfg(not(windows))]
+                        let AttachInputEvent::Terminal(ev) = ev;
+                        match ev {
+                            Event::Paste(data) => {
+                                // Explicit bracketed-paste boundaries: send the
+                                // paste as one bounded transaction, bytes
+                                // exactly as the terminal delivered them
+                                // (no CRLF rewriting).
+                                if can_drive {
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        wrap_paste_input(data, child_bracketed_paste_mode),
+                                        false,
+                                    )
+                                    .await?;
                                 }
                             }
-                            RpcResponse::AttachModeChanged {
-                                app_cursor_keys,
-                                bracketed_paste_mode,
-                            } => {
-                                child_app_cursor_keys = app_cursor_keys;
-                                child_bracketed_paste_mode = bracketed_paste_mode;
+                            Event::FocusGained => {
+                                // DECSET 1004: forward focus events only when
+                                // the child asked for them.
+                                if can_drive && child_focus_events {
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        b"\x1b[I".to_vec(),
+                                        false,
+                                    )
+                                    .await?;
+                                }
                             }
-                            RpcResponse::AttachResized { rows: _, cols: _ } => {
-                                // Another client resized the PTY.  We cannot
-                                // programmatically resize the terminal window (only the
-                                // screen buffer on Windows, which corrupts the display).
-                                // Instead, update last_sent_size to the actual terminal
-                                // size so that the dedup guard in Event::Resize prevents
-                                // echoing our unchanged dimensions back to the server.
+                            Event::FocusLost => {
+                                if can_drive && child_focus_events {
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        b"\x1b[O".to_vec(),
+                                        false,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Event::Resize(cols, rows) => {
+                                // Re-read the actual terminal size — the event may
+                                // carry stale dimensions on some platforms.
                                 let (actual_cols, actual_rows) =
-                                    terminal::size().unwrap_or((80, 24));
-                                last_sent_size = (actual_cols, actual_rows);
-                            }
-                            RpcResponse::AttachStreamDone { .. } => {
-                                running = false;
-                            }
-                            _ => {}
-                        }
+                                    terminal::size().unwrap_or((cols, rows));
+                                if (actual_cols, actual_rows) != last_sent_size {
+                                    last_sent_size = (actual_cols, actual_rows);
 
-                        if !running || batch.len() >= MAX_BATCHED_FRAME_BYTES {
+                                    #[cfg(windows)]
+                                    if can_drive {
+                                        renderer.resize(actual_rows, actual_cols);
+                                    }
+
+                                    send_attach_resize(
+                                        &mut write_half,
+                                        &id_owned,
+                                        actual_rows,
+                                        actual_cols,
+                                    )
+                                    .await?
+                                }
+                            }
+                            Event::Key(key) => {
+                                if is_clipboard_paste_key(key) {
+                                    // Explicit paste shortcut: read the clipboard
+                                    // and send the paste in one bounded
+                                    // transaction. An empty or unavailable
+                                    // clipboard swallows the shortcut rather than
+                                    // leaking a stray ^V into the session.
+                                    if let Some(data) = maybe_collect_clipboard_paste(
+                                        config,
+                                        id,
+                                        node,
+                                        key,
+                                        child_bracketed_paste_mode,
+                                    )
+                                    .await?
+                                    {
+                                        send_attach_input(
+                                            &mut write_half,
+                                            &id_owned,
+                                            data,
+                                            true,
+                                        )
+                                        .await?;
+                                    }
+                                } else if !matches!(key.kind, KeyEventKind::Press) {
+                                    // Key release/repeat events: not sent.
+                                } else if is_ctrl_d(key) {
+                                    detached = true;
+                                    running = false;
+                                } else if !can_drive {
+                                    // Observer: keys do not reach the session.
+                                } else if let Some(data) =
+                                    map_key_to_input(key, child_app_cursor_keys)
+                                {
+                                    // Every ordinary key is sent the moment it
+                                    // arrives — no burst buffering.
+                                    send_attach_input(
+                                        &mut write_half,
+                                        &id_owned,
+                                        data.into_bytes(),
+                                        false,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            Event::Mouse(mouse) => {
+                                // Forward mouse input only while the child
+                                // application asked for it (any of
+                                // 1000/1002/1003); otherwise the local
+                                // terminal keeps selection semantics.
+                                if !can_drive || !child_mouse_report {
+                                    continue;
+                                }
+                                if let Some(data) = map_mouse_input(mouse, child_sgr_mouse) {
+                                    send_attach_input(&mut write_half, &id_owned, data, false)
+                                        .await?;
+                                }
+                            }
+                        }
+                        if !running {
                             break;
                         }
-                        match frame_rx.try_recv() {
-                            Ok(Ok(next)) => response = Some(next),
-                            Ok(Err(err)) => {
-                                stream_error = Some(err);
-                                running = false;
-                            }
-                            Err(_) => break,
-                        }
                     }
+                    maybe_frame = frame_rx.recv() => {
+                        match maybe_frame {
+                            None => {
+                                stream_error = Some(AppError::Protocol(
+                                    "daemon closed the connection".to_string(),
+                                ));
+                                break;
+                            }
+                            Some(Err(err)) => {
+                                stream_error = Some(err);
+                                break;
+                            }
+                            Some(Ok(response)) => {
+                            // Drain every frame the daemon has already queued and
+                            // concatenate the output chunks into one buffer. A burst of
+                            // output (an echoed paste, a full-screen redraw) otherwise
+                            // costs one blocking write plus one flush of the unbuffered
+                            // stdout handle per frame, which is what makes a large
+                            // paste visibly crawl across the screen.
+                            let mut batch = Vec::new();
+                            let mut response = Some(response);
+                            while let Some(current) = response.take() {
+                                let current = match current {
+                                    ipc::AttachFrame::Output { offset, data } => {
+                                        RpcResponse::AttachStreamChunk { offset, data }
+                                    }
+                                    ipc::AttachFrame::Control(resp) => *resp,
+                                };
+                                match current {
+                                    RpcResponse::AttachStreamChunk { offset, data } => {
+                                        if let Err(err) =
+                                            stream_cursor.accept(offset, data.len())
+                                        {
+                                            stream_error = Some(err);
+                                            running = false;
+                                            break;
+                                        }
+                                        if batch.is_empty() {
+                                            batch = data;
+                                        } else {
+                                            batch.extend_from_slice(&data);
+                                        }
+                                    }
+                                    RpcResponse::AttachModeChanged {
+                                        app_cursor_keys,
+                                        bracketed_paste_mode,
+                                        mouse_report,
+                                        sgr_mouse,
+                                        focus_events,
+                                    } => {
+                                        child_app_cursor_keys = app_cursor_keys;
+                                        child_bracketed_paste_mode = bracketed_paste_mode;
+                                        child_sgr_mouse = sgr_mouse;
+                                        if (mouse_report, focus_events)
+                                            != (child_mouse_report, child_focus_events)
+                                        {
+                                            child_mouse_report = mouse_report;
+                                            child_focus_events = focus_events;
+                                            sync_local_terminal_modes(
+                                                child_mouse_report,
+                                                child_focus_events,
+                                            );
+                                        }
+                                    }
+                                    RpcResponse::AttachResized { rows: _, cols: _ } => {
+                                        // Another client resized the PTY.  We cannot
+                                        // programmatically resize the terminal window (only the
+                                        // screen buffer on Windows, which corrupts the display).
+                                        // Instead, update last_sent_size to the actual terminal
+                                        // size so that the dedup guard in Event::Resize prevents
+                                        // echoing our unchanged dimensions back to the server.
+                                        let (actual_cols, actual_rows) =
+                                            terminal::size().unwrap_or((80, 24));
+                                        last_sent_size = (actual_cols, actual_rows);
+                                    }
+                                    RpcResponse::AttachStreamDone { final_offset, .. } => {
+                                        if let Err(err) = stream_cursor.finish(final_offset) {
+                                            stream_error = Some(err);
+                                        }
+                                        running = false;
+                                    }
+                                    _ => {}
+                                }
 
-                    if !batch.is_empty() {
-                        #[cfg(windows)]
-                        write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
-                        #[cfg(not(windows))]
-                        write_bytes_to_stdout(&batch)?;
+                                if !running || batch.len() >= MAX_BATCHED_FRAME_BYTES {
+                                    break;
+                                }
+                                match frame_rx.try_recv() {
+                                    Ok(Ok(next)) => response = Some(next),
+                                    Ok(Err(err)) => {
+                                        stream_error = Some(err);
+                                        running = false;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+
+                            if !batch.is_empty() {
+                                #[cfg(windows)]
+                                write_bytes_to_stdout(&renderer.render_chunk(&batch))?;
+                                #[cfg(not(windows))]
+                                write_bytes_to_stdout(&batch)?;
+                                maybe_send_ack(
+                                    &mut write_half,
+                                    &id_owned,
+                                    stream_cursor.current(),
+                                    &mut last_acked,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
             }
         }
+
+        // The terminal-event reader thread may still be parked in a blocking
+        // read; it exits with the process. Nothing may join it here.
+        drop(event_reader);
 
         if detached {
             // Detach while raw mode is still active, then consume any queued
@@ -577,14 +840,15 @@ fn attach_proxy(node: Option<&str>, req: RpcRequest) -> RpcRequest {
     }
 }
 
-fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
-    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+fn spawn_attach_shutdown_listener() -> mpsc::Receiver<()> {
+    // One-shot signal: a single-slot channel is enough.
+    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
     {
         let shutdown_tx = shutdown_tx.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             }
         });
     }
@@ -597,7 +861,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = terminate.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -605,7 +869,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = hangup.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
     }
@@ -618,7 +882,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_break.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -626,7 +890,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_close.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -634,7 +898,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_logoff.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
 
@@ -642,7 +906,7 @@ fn spawn_attach_shutdown_listener() -> mpsc::UnboundedReceiver<()> {
             let shutdown_tx = shutdown_tx.clone();
             tokio::spawn(async move {
                 let _ = ctrl_shutdown.recv().await;
-                let _ = shutdown_tx.send(());
+                let _ = shutdown_tx.try_send(());
             });
         }
     }
@@ -661,38 +925,6 @@ fn can_use_interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
-/// Bytes that land `seed` (daemon-rendered, `\n`-terminated scrollback rows)
-/// in the terminal's scrollback and leave a blank visible screen for the
-/// snapshot repaint.
-///
-/// Raw mode is active, so `\n` does not imply a carriage return and every
-/// seeded row needs an explicit CRLF. `rows` padding newlines then scroll
-/// every seeded row above the visible area — unlike ED 2 (`\x1b[2J`), whose
-/// effect on scrollback varies between terminals, plain scrolling works
-/// everywhere — and `\x1b[H` homes the cursor for the snapshot.
-fn scrollback_seed_bytes(seed: &[u8], rows: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(seed.len() + usize::from(rows) + 8);
-    for &byte in seed {
-        if byte == b'\n' {
-            out.push(b'\r');
-        }
-        out.push(byte);
-    }
-    // The seed must end fully scrolled off: the snapshot repaints the visible
-    // screen afterwards, and rows still on screen would be duplicated by it.
-    // A seed at least one screen tall has already scrolled itself off — its
-    // last row's own line feed did the final scroll — so extra newlines would
-    // only push blank rows between the seed and the snapshot in the client's
-    // scrollback.  A shorter seed still needs a full screen of newlines to
-    // guarantee the scroll-off regardless of where the cursor started.
-    let seed_lines = seed.iter().filter(|&&byte| byte == b'\n').count();
-    if seed_lines < usize::from(rows) {
-        out.resize(out.len() + usize::from(rows), b'\n');
-    }
-    out.extend_from_slice(b"\x1b[H");
-    out
-}
-
 fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
     let mut stdout = std::io::stdout();
     stdout.write_all(data)?;
@@ -700,87 +932,31 @@ fn write_bytes_to_stdout(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> String {
+/// Wrap pasted text in bracketed-paste markers when the child enabled
+/// DECSET 2004. The pasted bytes themselves are preserved exactly — no
+/// CRLF rewriting, no key substitution.
+pub(super) fn wrap_paste_input(data: String, bracketed_paste_mode: bool) -> Vec<u8> {
+    // Windows Terminal emits an empty bracketed paste for bitmap-only
+    // clipboard contents; the shortcut release separately saves/forwards PNG.
+    if data.is_empty() {
+        return Vec::new();
+    }
     if bracketed_paste_mode {
-        format!("\x1b[200~{data}\x1b[201~")
+        let mut out = b"\x1b[200~".to_vec();
+        out.extend_from_slice(data.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
     } else {
-        data
+        data.into_bytes()
     }
 }
 
-fn normalize_paste_text(data: String) -> String {
+/// The explicit clipboard-paste operation (Shift+Insert) is a *text*
+/// operation: line endings are normalized to LF, which is what shells and
+/// REPLs expect from a clipboard. Raw terminal paste events
+/// (`Event::Paste`) are NOT normalized — those bytes go through exactly.
+fn normalize_clipboard_text(data: String) -> String {
     data.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-fn next_pending_key_burst_deadline() -> Instant {
-    Instant::now() + PASTE_BURST_WAIT
-}
-
-fn next_paste_key_suppression_deadline() -> Instant {
-    Instant::now() + PASTE_KEY_SUPPRESS_WINDOW
-}
-
-fn pending_key_burst_poll_timeout(pending: Option<&PendingKeyBurst>) -> Duration {
-    pending.map_or(Duration::from_millis(0), |pending| {
-        pending.deadline.saturating_duration_since(Instant::now())
-    })
-}
-
-fn should_suppress_paste_followup_key(key: KeyEvent, deadline: Option<Instant>) -> bool {
-    let Some(deadline) = deadline else {
-        return false;
-    };
-
-    if Instant::now() >= deadline {
-        return false;
-    }
-
-    is_clipboard_paste_key(key)
-        || matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab)
-}
-
-fn take_pending_key_burst_data(pending: &mut Option<PendingKeyBurst>) -> Option<String> {
-    pending.take().map(|pending| pending.data)
-}
-
-fn push_pending_key_burst(
-    pending: &mut Option<PendingKeyBurst>,
-    key: KeyEvent,
-    app_cursor_keys: bool,
-) -> bool {
-    let Some(data) = paste_candidate_key_data(key, app_cursor_keys) else {
-        return false;
-    };
-
-    match pending {
-        Some(pending) => {
-            pending.data.push_str(&data);
-            pending.deadline = next_pending_key_burst_deadline();
-        }
-        None => {
-            *pending = Some(PendingKeyBurst {
-                data,
-                deadline: next_pending_key_burst_deadline(),
-            });
-        }
-    }
-
-    true
-}
-
-fn paste_candidate_key_data(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
-    match key.code {
-        KeyCode::Enter => Some("\r".to_string()),
-        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => Some("\t".to_string()),
-        KeyCode::Char(_)
-            if !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
-            map_key_to_input(key, app_cursor_keys)
-        }
-        _ => None,
-    }
 }
 
 async fn maybe_collect_clipboard_paste(
@@ -789,7 +965,7 @@ async fn maybe_collect_clipboard_paste(
     node: Option<&str>,
     key: KeyEvent,
     bracketed_paste_mode: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<Vec<u8>>> {
     if !is_clipboard_paste_key(key) {
         return Ok(None);
     }
@@ -800,7 +976,7 @@ async fn maybe_collect_clipboard_paste(
     };
 
     Ok(data
-        .map(normalize_paste_text)
+        .map(normalize_clipboard_text)
         .map(|data| wrap_paste_input(data, bracketed_paste_mode)))
 }
 
@@ -844,52 +1020,177 @@ async fn upload_remote_clipboard_file(
     }
 }
 
-fn is_clipboard_paste_key(key: KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('\u{16}'))
-        || (key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
-        || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert))
+/// The explicit clipboard-paste shortcut: Ctrl-V and Shift+Insert.
+/// Ctrl-V is read as the clipboard operation: files are copied into the
+/// session file area, images are saved as PNGs, and text is normalized.
+/// Shift+Insert is the classic terminal paste shortcut. Both send the
+/// clipboard contents as one bounded paste transaction.
+pub(super) fn is_clipboard_paste_key(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press)
+        && (matches!(key.code, KeyCode::Char('\u{16}'))
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')))
+            || (key.modifiers.contains(KeyModifiers::SHIFT) && matches!(key.code, KeyCode::Insert)))
 }
-
 // ---------------------------------------------------------------------------
 // Key input mapping
 // ---------------------------------------------------------------------------
 
+/// Encode a key event into the bytes an xterm-compatible terminal would
+/// send (ADR-0003 legacy profile; enhanced keyboard profiles such as the
+/// kitty protocol are a separate negotiated capability and never enabled
+/// implicitly).
+///
+/// Coverage contract: no common key is silently dropped. Modifier
+/// combinations use xterm's parameterized forms; Alt on byte-like keys is
+/// an ESC prefix; the Ctrl+@/digit family sends its legacy control bytes.
 fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
+    let mods = key.modifiers;
+    let alt = mods.contains(KeyModifiers::ALT);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+
+    // xterm's modifier parameter: 1 + Shift(1) + Alt(2) + Ctrl(4).
+    let modifier_param = || -> Option<u8> {
+        let mut value = 1u8;
+        if shift {
+            value += 1;
+        }
+        if alt {
+            value += 2;
+        }
+        if ctrl {
+            value += 4;
+        }
+        (value > 1).then_some(value)
+    };
+
+    // Alt on byte-like keys is an ESC prefix.
+    let alt_prefix = |data: &str| -> String {
+        if alt {
+            format!("\x1b{data}")
+        } else {
+            data.to_string()
+        }
+    };
+
     match key.code {
-        KeyCode::Enter => Some("\r".to_string()),
-        KeyCode::Tab => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                Some("\x1b[Z".to_string())
+        KeyCode::Enter => Some(alt_prefix("\r")),
+        KeyCode::Tab if shift => Some(alt_prefix("\x1b[Z")),
+        KeyCode::Tab => Some(alt_prefix("\t")),
+        KeyCode::BackTab => Some(alt_prefix("\x1b[Z")),
+        KeyCode::Backspace if ctrl => {
+            // Ctrl+Backspace → ASCII BS (0x08) for apps that do not handle DEL.
+            Some(alt_prefix("\x08"))
+        }
+        KeyCode::Backspace => Some(alt_prefix("\x7f")),
+        KeyCode::Esc => Some(if alt {
+            "\x1b\x1b".to_string()
+        } else {
+            "\x1b".to_string()
+        }),
+        KeyCode::Up | KeyCode::Down | KeyCode::Right | KeyCode::Left => {
+            let letter = match key.code {
+                KeyCode::Up => 'A',
+                KeyCode::Down => 'B',
+                KeyCode::Right => 'C',
+                _ => 'D',
+            };
+            // Modified arrows are always CSI 1;{mod}{letter} — including
+            // under DECCKM; only the unmodified forms honor the SS3 mode.
+            if let Some(param) = modifier_param() {
+                Some(format!("\x1b[1;{param}{letter}"))
+            } else if app_cursor_keys {
+                Some(format!("\x1bO{letter}"))
             } else {
-                Some("\t".to_string())
+                Some(format!("\x1b[{letter}"))
             }
         }
-        KeyCode::BackTab => Some("\x1b[Z".to_string()),
-        KeyCode::Backspace => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                // Ctrl+Backspace → ASCII BS (0x08) for better compatibility with apps that do not handle DEL.
-                Some("\x08".to_string())
+        KeyCode::Home | KeyCode::End => {
+            let letter = if matches!(key.code, KeyCode::Home) {
+                'H'
             } else {
-                // Backspace → ASCII DEL (0x7f) by default, which is what most terminals send and what most apps expect for the Backspace key.
-                Some("\x7f".to_string())
+                'F'
+            };
+            if let Some(param) = modifier_param() {
+                Some(format!("\x1b[1;{param}{letter}"))
+            } else {
+                Some(format!("\x1b[{letter}"))
             }
         }
-        KeyCode::Esc => Some("\x1b".to_string()),
-        KeyCode::Up => Some(if app_cursor_keys { "\x1bOA" } else { "\x1b[A" }.to_string()),
-        KeyCode::Down => Some(if app_cursor_keys { "\x1bOB" } else { "\x1b[B" }.to_string()),
-        KeyCode::Right => Some(if app_cursor_keys { "\x1bOC" } else { "\x1b[C" }.to_string()),
-        KeyCode::Left => Some(if app_cursor_keys { "\x1bOD" } else { "\x1b[D" }.to_string()),
-        KeyCode::Home => Some("\x1b[H".to_string()),
-        KeyCode::End => Some("\x1b[F".to_string()),
-        KeyCode::Delete => Some("\x1b[3~".to_string()),
-        KeyCode::Insert => Some("\x1b[2~".to_string()),
-        KeyCode::PageUp => Some("\x1b[5~".to_string()),
-        KeyCode::PageDown => Some("\x1b[6~".to_string()),
+        KeyCode::Delete | KeyCode::Insert | KeyCode::PageUp | KeyCode::PageDown => {
+            let number = match key.code {
+                KeyCode::Insert => 2,
+                KeyCode::Delete => 3,
+                KeyCode::PageUp => 5,
+                _ => 6,
+            };
+            if let Some(param) = modifier_param() {
+                Some(format!("\x1b[{number};{param}~"))
+            } else {
+                Some(format!("\x1b[{number}~"))
+            }
+        }
+        KeyCode::F(n) => {
+            // F1–F4 use SS3 final bytes unmodified and CSI 1;{mod}{P..S}
+            // modified; F5+ use the tilde forms.
+            let ss3_letter = match n {
+                1 => Some('P'),
+                2 => Some('Q'),
+                3 => Some('R'),
+                4 => Some('S'),
+                _ => None,
+            };
+            if let Some(letter) = ss3_letter {
+                if let Some(param) = modifier_param() {
+                    Some(format!("\x1b[1;{param}{letter}"))
+                } else {
+                    Some(format!("\x1bO{letter}"))
+                }
+            } else {
+                let number = match n {
+                    5 => 15,
+                    6 => 17,
+                    7 => 18,
+                    8 => 19,
+                    9 => 20,
+                    10 => 21,
+                    11 => 23,
+                    _ => 24,
+                };
+                if let Some(param) = modifier_param() {
+                    Some(format!("\x1b[{number};{param}~"))
+                } else {
+                    Some(format!("\x1b[{number}~"))
+                }
+            }
+        }
         KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                let code = (c.to_ascii_lowercase() as u8) & 0x1f;
-                Some((code as char).to_string())
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                // The Ctrl+@/digit family carries legacy control bytes in
+                // every mainstream terminal (NUL, ESC, FS, GS, RS, US, DEL);
+                // `ch & 0x1f` on digit glyphs would send the wrong bytes.
+                let legacy = match lower {
+                    '2' | ' ' => Some('\0'),
+                    '3' | '[' => Some('\x1b'),
+                    '4' | '\\' => Some('\x1c'),
+                    '5' | ']' => Some('\x1d'),
+                    '6' | '^' | '~' => Some('\x1e'),
+                    '7' | '_' => Some('\x1f'),
+                    '8' => Some('\x7f'),
+                    _ => None,
+                };
+                if let Some(byte) = legacy {
+                    return Some(alt_prefix(&byte.to_string()));
+                }
+                if !c.is_ascii() {
+                    return None;
+                }
+                let byte = (lower as u8) & 0x1f;
+                Some(alt_prefix(&(byte as char).to_string()))
+            } else if alt {
+                Some(format!("\x1b{c}"))
             } else {
                 Some(c.to_string())
             }
@@ -898,87 +1199,117 @@ fn map_key_to_input(key: KeyEvent, app_cursor_keys: bool) -> Option<String> {
     }
 }
 
-fn map_mouse_to_sgr_input(mouse: MouseEvent) -> String {
-    let mut cb: u16 = match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => 0,
-        MouseEventKind::Down(MouseButton::Middle) => 1,
-        MouseEventKind::Down(MouseButton::Right) => 2,
-        MouseEventKind::Up(MouseButton::Left) => 0,
-        MouseEventKind::Up(MouseButton::Middle) => 1,
-        MouseEventKind::Up(MouseButton::Right) => 2,
-        MouseEventKind::Drag(MouseButton::Left) => 32,
-        MouseEventKind::Drag(MouseButton::Middle) => 33,
-        MouseEventKind::Drag(MouseButton::Right) => 34,
-        MouseEventKind::Moved => 35,
-        MouseEventKind::ScrollUp => 64,
-        MouseEventKind::ScrollDown => 65,
-        MouseEventKind::ScrollLeft => 66,
-        MouseEventKind::ScrollRight => 67,
-    };
-    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
-        cb += 4;
+/// Mirror the child's input modes on the outer terminal: mouse capture
+/// and focus-event reporting (DECSET 1004) follow the child so local
+/// selection and focus keys behave normally whenever the child has not
+/// enabled them.
+fn sync_local_terminal_modes(mouse_report: bool, focus_events: bool) {
+    let mut stdout = std::io::stdout();
+    #[cfg(windows)]
+    {
+        // Crossterm's Windows mouse capture replaces the whole console input
+        // mode, clearing raw mode and VT input. Preserve those bits instead.
+        let _ = super::attach_input::sync_mouse_mode(mouse_report);
     }
-    if mouse.modifiers.contains(KeyModifiers::ALT) {
-        cb += 8;
-    }
-    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
-        cb += 16;
-    }
-    // SGR uses 1-based coordinates.
-    let cx = mouse.column + 1;
-    let cy = mouse.row + 1;
-    let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
-        'm'
+    #[cfg(not(windows))]
+    if mouse_report {
+        let _ = execute!(stdout, EnableMouseCapture);
     } else {
-        'M'
-    };
-    format!("\x1b[<{cb};{cx};{cy}{suffix}")
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
+    let _ = stdout.write_all(if focus_events {
+        b"\x1b[?1004h"
+    } else {
+        b"\x1b[?1004l"
+    });
+    let _ = stdout.flush();
 }
 
+/// Write one input frame to the daemon.
+pub(super) async fn send_attach_input(
+    writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    id: &str,
+    data: Vec<u8>,
+    wait_for_change: bool,
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    ipc::write_request_to_writer(
+        writer,
+        RpcRequest::AttachInput {
+            id: id.to_string(),
+            data,
+            wait_for_change,
+            attachment_id: None,
+        },
+    )
+    .await
+}
+
+/// Ctrl-D is the detach key (EOT, 0x04). In the raw wire it maps to
+/// the EOT byte, but here it is intercepted as the detach signal,
+/// matching the historic key contract.
 fn is_ctrl_d(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+    matches!(key.code, KeyCode::Char('\x04'))
+        || (key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D')))
+}
+
+/// Push the client's terminal size to the daemon as session geometry.
+/// Only controllers get through: the daemon rejects an observer's resize
+/// with ViewOnly, and controllers follow a last-successful-resize-wins
+/// rule.
+async fn send_attach_resize(
+    writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    id: &str,
+    rows: u16,
+    cols: u16,
+) -> Result<()> {
+    ipc::write_request_to_writer(
+        writer,
+        RpcRequest::AttachResize {
+            id: id.to_string(),
+            rows,
+            cols,
+        },
+    )
+    .await
+}
+
+/// Applied-cursor credit cadence: credits are backpressure
+/// signals, not per-chunk chatter, so they go out at most once per MiB of
+/// newly applied output.
+const ACK_STRIDE_BYTES: u64 = 1024 * 1024;
+
+/// Send an applied-cursor credit if the cursor advanced past the stride
+/// since the last credit. Best-effort: send failures are ignored.
+async fn maybe_send_ack(
+    writer: &mut tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>,
+    id: &str,
+    cursor: u64,
+    last_acked: &mut u64,
+) {
+    if cursor >= *last_acked + ACK_STRIDE_BYTES {
+        let _ = ipc::write_request_to_writer(
+            writer,
+            RpcRequest::AttachAppliedCursor {
+                id: id.to_string(),
+                cursor,
+            },
+        )
+        .await;
+        *last_acked = cursor;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-
-    #[test]
-    fn scrollback_seed_uses_crlf_and_scrolls_every_seeded_row_into_history() {
-        let bytes = scrollback_seed_bytes(b"line one\nline two\n\x1b[0m", 3);
-        assert_eq!(
-            bytes,
-            b"line one\r\nline two\r\n\x1b[0m\n\n\n\x1b[H".as_slice()
-        );
-    }
-
-    #[test]
-    fn scrollback_seed_leaves_blank_screen_without_ed2() {
-        let bytes = scrollback_seed_bytes(b"only\n", 2);
-        assert!(!bytes.windows(4).any(|window| window == b"\x1b[2J"));
-        assert!(bytes.ends_with(b"\x1b[H"));
-    }
-
-    #[test]
-    fn scrollback_seed_taller_than_screen_needs_no_extra_newlines() {
-        // A deep seed scrolls itself off with its own line feeds; extra
-        // newlines would push blank rows between the seed and the snapshot
-        // repaint in the client's scrollback.
-        let seed = "row 0\nrow 1\nrow 2\n";
-        let bytes = scrollback_seed_bytes(seed.as_bytes(), 3);
-        assert_eq!(bytes, b"row 0\r\nrow 1\r\nrow 2\r\n\x1b[H".as_slice());
-    }
-
-    #[test]
-    fn scrollback_seed_one_line_short_of_screen_still_scrolls_off() {
-        // Short seeds keep the full screen of trailing newlines: the seed must
-        // scroll off no matter where the cursor started.
-        let seed = "row 0\nrow 1\n";
-        let bytes = scrollback_seed_bytes(seed.as_bytes(), 3);
-        assert_eq!(bytes, b"row 0\r\nrow 1\r\n\n\n\n\x1b[H".as_slice());
-    }
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
 
     // -----------------------------------------------------------------------
     // Helper constructors
@@ -1011,26 +1342,199 @@ mod tests {
         }
     }
 
+    /// Visible-screen contents of the renderer's canonical engine state.
+    fn renderer_contents(renderer: &AttachRenderer) -> String {
+        renderer
+            .engine
+            .screen_lines()
+            .iter()
+            .map(|line| line.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim_end_matches('\n')
+            .to_string()
+    }
+
+    /// vt100 is the test-only oracle renderer (dev-dependency).
+    fn oracle_contents(rows: u16, cols: u16, stream: &[u8]) -> String {
+        let mut oracle = vt100::Parser::new(rows, cols, 0);
+        oracle.process(stream);
+        oracle.screen().contents()
+    }
+
+    /// Differential oracle: an outer terminal receiving attach's renderer
+    /// must retain the same scrollback as one receiving the native byte stream.
     #[test]
-    #[cfg(windows)]
+    fn windows_live_output_preserves_native_scrollback() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        let initial = b"\x1b[H";
+        native.feed(initial);
+        outer.feed(&renderer.render_initial(initial));
+        for line in 1..=12 {
+            let chunk = format!("line {line}\r\n");
+            native.feed(chunk.as_bytes());
+            outer.feed(&renderer.render_chunk(chunk.as_bytes()));
+        }
+        assert_eq!(outer.screen_lines(), native.screen_lines());
+        assert_eq!(
+            outer.full_lines(),
+            native.full_lines(),
+            "attach paints the screen but must not discard scrolled-off lines"
+        );
+    }
+
+    #[test]
+    fn windows_alt_screen_roundtrip_matches_native_buffers() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        let initial = b"\x1b[Hmain prompt";
+        native.feed(initial);
+        outer.feed(&renderer.render_initial(initial));
+        let enter = b"\x1b[?1049h\x1b[Hpicker";
+        native.feed(enter);
+        outer.feed(&renderer.render_chunk(enter));
+        assert_eq!(
+            outer.modes().alt_screen,
+            native.modes().alt_screen,
+            "fullscreen TUIs must own the outer alternate buffer too"
+        );
+        let exit = b"\x1b[?1049l\r\nresumed chat\r\n";
+        native.feed(exit);
+        outer.feed(&renderer.render_chunk(exit));
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_coalesced_output_keeps_history_beyond_one_screen() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        let chunk = (1..=30)
+            .map(|line| format!("row {line}\r\n"))
+            .collect::<String>();
+        native.feed(chunk.as_bytes());
+        outer.feed(&renderer.render_chunk(chunk.as_bytes()));
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_repaints_do_not_duplicate_history_and_ed3_clears_it() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"a\r\nb\r\nc\r\nd\r\ne".as_slice(),
+            b"\x1b[Hupdated",
+            b"\x1b[2J\x1b[Hfresh",
+            b"\x1b[3J",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+            assert_eq!(outer.full_lines(), native.full_lines());
+        }
+    }
+
+    #[test]
+    fn windows_split_alt_transitions_do_not_leak_tui_into_history() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"main\r\n\x1b[?10".as_slice(),
+            b"49h\x1b[Hpicker\r\n1\r\n2\r\n3\r\n4\x1b[?1049l\r\nchat",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+        }
+        assert_eq!(outer.modes().alt_screen, native.modes().alt_screen);
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_restricted_scroll_region_matches_native() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"header\r\nbody\r\nmore\r\nfooter".as_slice(),
+            b"\x1b[2;3r\x1b[3;1H\r\ninside\r\nregion\x1b[r",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+        }
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_initial_alt_snapshot_owns_outer_buffer() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b"\x1b[?1049h\x1b[Hpicker"));
+        assert!(outer.modes().alt_screen);
+        assert!(outer.screen_lines()[0].contains("picker"));
+    }
+
+    #[test]
+    fn windows_synchronized_output_keeps_all_scrolled_lines() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut native = crate::terminal::Terminal::new(4, 20, 100);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        for chunk in [
+            b"\x1b[?2026h1\r\n2\r\n3\r\n".as_slice(),
+            b"4\r\n5\r\n6\r\n\x1b[?2026l",
+        ] {
+            native.feed(chunk);
+            outer.feed(&renderer.render_chunk(chunk));
+        }
+        assert_eq!(outer.full_lines(), native.full_lines());
+    }
+
+    #[test]
+    fn windows_resize_does_not_append_reflowed_viewport_to_history_again() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let mut outer = crate::terminal::Terminal::new(4, 20, 100);
+        outer.feed(&renderer.render_initial(b""));
+        outer.feed(&renderer.render_chunk(b"a\r\nb\r\nc\r\nd\r\ne"));
+        outer.resize(3, 20);
+        renderer.resize(3, 20);
+        let history_before = outer.history_size();
+        outer.feed(&renderer.render_chunk(b""));
+        assert_eq!(outer.history_size(), history_before);
+        assert_eq!(outer.screen_lines(), renderer.engine.screen_lines());
+        outer.resize(4, 20);
+        renderer.resize(4, 20);
+        let history_before = outer.history_size();
+        outer.feed(&renderer.render_chunk(b""));
+        assert_eq!(outer.history_size(), history_before);
+        assert_eq!(outer.screen_lines(), renderer.engine.screen_lines());
+    }
+
+    #[test]
     fn windows_live_chunk_is_repainted_from_canonical_screen_state() {
         let mut renderer = AttachRenderer::new(4, 20);
         let initial = renderer.render_initial(b"\x1b[2;5Hbefore");
-        let mut replay = vt100::Parser::new(4, 20, 0);
-        replay.process(&initial);
+        let mut oracle_stream = initial.clone();
 
         let mut redraw = b"\x1b[H".to_vec();
-        redraw.extend_from_slice(&vec![b' '; 25]);
+        redraw.extend(std::iter::repeat_n(b' ', 25));
         redraw.extend_from_slice("工作目录".as_bytes());
 
         let rendered = renderer.render_chunk(&redraw);
 
         assert!(rendered.starts_with(b"\x1b[?2026h"));
         assert!(rendered.ends_with(b"\x1b[?2026l"));
-        replay.process(&rendered);
+        oracle_stream.extend_from_slice(&rendered);
         assert_eq!(
-            replay.screen().contents(),
-            renderer.parser.screen().contents()
+            oracle_contents(4, 20, &oracle_stream),
+            renderer_contents(&renderer)
         );
         assert!(
             !rendered
@@ -1040,7 +1544,22 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    fn windows_resize_repaints_a_full_snapshot() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"row one\r\nrow two");
+
+        renderer.resize(4, 10);
+        let rendered = renderer.render_chunk(b"");
+
+        assert!(rendered.starts_with(b"\x1b[?2026h"));
+        assert!(rendered.ends_with(b"\x1b[?2026l"));
+        let inner = &rendered[b"\x1b[?2026h".len()..rendered.len() - b"\x1b[?2026l".len()];
+        // The snapshot stream clears and repaints: a fresh oracle at the NEW
+        // geometry fed only the snapshot must match the engine's state.
+        assert_eq!(oracle_contents(4, 10, inner), renderer_contents(&renderer));
+    }
+
+    #[test]
     fn windows_live_chunk_forwards_title_and_progress_signals() {
         let mut renderer = AttachRenderer::new(4, 20);
         let _ = renderer.render_initial(b"\x1b[H");
@@ -1052,11 +1571,10 @@ mod tests {
         assert!(rendered.starts_with(expected_signals));
         assert!(rendered[expected_signals.len()..].starts_with(b"\x1b[?2026h"));
         assert!(rendered.ends_with(b"\x1b[?2026l"));
-        assert!(renderer.parser.screen().contents().contains("working"));
+        assert!(renderer_contents(&renderer).contains("working"));
     }
 
     #[test]
-    #[cfg(windows)]
     fn windows_title_only_chunk_is_forwarded_without_repaint() {
         let mut renderer = AttachRenderer::new(4, 20);
         let _ = renderer.render_initial(b"\x1b[Hidle");
@@ -1067,7 +1585,18 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
+    fn windows_cursor_only_chunk_moves_the_cursor() {
+        let mut renderer = AttachRenderer::new(4, 20);
+        let _ = renderer.render_initial(b"\x1b[Hidle");
+
+        let rendered = renderer.render_chunk(b"\x1b[3;3H");
+
+        assert!(rendered.starts_with(b"\x1b[?2026h"));
+        let inner = &rendered[b"\x1b[?2026h".len()..rendered.len() - b"\x1b[?2026l".len()];
+        assert_eq!(inner, b"\x1b[3;3H\x1b[?25h");
+    }
+
+    #[test]
     fn windows_live_chunk_forwards_cursor_shape_changes() {
         // The canonical screen state does not model DECSCUSR, so an editor's
         // bar cursor would be lost on every repaint without this passthrough.
@@ -1077,18 +1606,17 @@ mod tests {
         let rendered = renderer.render_chunk(b"\x1b[6 q\x1b[Hediting");
 
         assert!(rendered.starts_with(b"\x1b[6 q"));
-        assert!(renderer.parser.screen().contents().contains("editing"));
+        assert!(renderer_contents(&renderer).contains("editing"));
     }
 
     #[test]
-    #[cfg(windows)]
     fn windows_initial_snapshot_forwards_restored_signals() {
         let mut renderer = AttachRenderer::new(4, 20);
 
         let rendered = renderer.render_initial(b"\x1b[Hready\x1b]0;relay\x07\x1b[6 q");
 
         assert!(rendered.starts_with(b"\x1b]0;relay\x07\x1b[6 q"));
-        assert!(renderer.parser.screen().contents().contains("ready"));
+        assert!(renderer_contents(&renderer).contains("ready"));
     }
 
     // -----------------------------------------------------------------------
@@ -1131,82 +1659,80 @@ mod tests {
     fn test_wrap_paste_input_passthrough_when_bracketed_paste_is_disabled() {
         assert_eq!(
             wrap_paste_input("hello\nworld".to_string(), false),
-            "hello\nworld"
+            b"hello\nworld".to_vec()
         );
+    }
+
+    #[test]
+    fn empty_terminal_paste_is_a_noop() {
+        assert!(wrap_paste_input(String::new(), true).is_empty());
+        assert!(wrap_paste_input(String::new(), false).is_empty());
     }
 
     #[test]
     fn test_wrap_paste_input_wraps_when_bracketed_paste_is_enabled() {
         assert_eq!(
             wrap_paste_input("hello\nworld".to_string(), true),
-            "\x1b[200~hello\nworld\x1b[201~"
+            b"\x1b[200~hello\nworld\x1b[201~".to_vec()
         );
     }
 
     #[test]
-    fn test_normalize_paste_text_converts_crlf_to_lf() {
+    fn test_wrap_paste_input_preserves_crlf_bytes() {
+        // Terminal paste events are forwarded byte-exact.
         assert_eq!(
-            normalize_paste_text("line1\r\nline2\r\nline3".to_string()),
+            wrap_paste_input("line1\r\nline2".to_string(), false),
+            b"line1\r\nline2".to_vec()
+        );
+    }
+
+    #[test]
+    fn test_normalize_clipboard_text_converts_crlf_to_lf() {
+        // Only the explicit clipboard-paste operation normalizes text.
+        assert_eq!(
+            normalize_clipboard_text("line1\r\nline2\r\nline3".to_string()),
             "line1\nline2\nline3"
         );
     }
 
     #[test]
-    fn test_normalize_paste_text_converts_lone_cr_to_lf() {
+    fn test_normalize_clipboard_text_converts_lone_cr_to_lf() {
         assert_eq!(
-            normalize_paste_text("line1\rline2\rline3".to_string()),
+            normalize_clipboard_text("line1\rline2\rline3".to_string()),
             "line1\nline2\nline3"
         );
     }
 
     #[test]
-    fn test_is_clipboard_paste_key_accepts_ctrl_v_as_control_character() {
-        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('\u{16}'))));
-    }
-
-    #[test]
-    fn test_is_clipboard_paste_key_accepts_bare_control_character() {
-        assert!(is_clipboard_paste_key(press(KeyCode::Char('\u{16}'))));
-    }
-
-    #[test]
-    fn test_paste_candidate_key_data_accepts_plain_text_keys() {
-        assert_eq!(
-            paste_candidate_key_data(press(KeyCode::Char('a')), false),
-            Some("a".to_string())
-        );
-        assert_eq!(
-            paste_candidate_key_data(press(KeyCode::Enter), false),
-            Some("\r".to_string())
-        );
-    }
-
-    #[test]
-    fn test_paste_candidate_key_data_rejects_control_keys() {
-        assert_eq!(
-            paste_candidate_key_data(ctrl_press(KeyCode::Char('c')), false),
-            None
-        );
-        assert_eq!(paste_candidate_key_data(press(KeyCode::Left), false), None);
-    }
-
-    #[test]
-    fn test_push_pending_key_burst_appends_text() {
-        let mut pending = None;
-        assert!(push_pending_key_burst(
-            &mut pending,
-            press(KeyCode::Char('a')),
-            false
-        ));
-        assert!(push_pending_key_burst(
-            &mut pending,
-            press(KeyCode::Char('b')),
-            false
-        ));
-        assert_eq!(
-            take_pending_key_burst_data(&mut pending),
-            Some("ab".to_string())
-        );
+    fn test_is_clipboard_paste_key_accepts_ctrl_v_and_shift_insert() {
+        // Ctrl-V and Shift+Insert both trigger the clipboard paste.
+        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('v'))));
+        assert!(is_clipboard_paste_key(ctrl_press(KeyCode::Char('V'))));
+        assert!(is_clipboard_paste_key(KeyEvent::new_with_kind(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press
+        )));
+        assert!(is_clipboard_paste_key(KeyEvent::new_with_kind(
+            KeyCode::Char('\u{16}'),
+            KeyModifiers::empty(),
+            KeyEventKind::Press
+        )));
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            assert!(!is_clipboard_paste_key(KeyEvent::new_with_kind(
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL,
+                kind,
+            )));
+            assert!(!is_clipboard_paste_key(KeyEvent::new_with_kind(
+                KeyCode::Insert,
+                KeyModifiers::SHIFT,
+                kind,
+            )));
+        }
+        // Plain keys without the right modifier do not trigger it.
+        assert!(!is_clipboard_paste_key(press(KeyCode::Char('v'))));
+        assert!(!is_clipboard_paste_key(press(KeyCode::Insert)));
     }
 
     // -----------------------------------------------------------------------
@@ -1360,11 +1886,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_ctrl_d
+    // is_ctrl_d: Ctrl-D detaches
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_is_ctrl_d_true() {
+        assert!(is_ctrl_d(press(KeyCode::Char('\x04'))));
         assert!(is_ctrl_d(ctrl_press(KeyCode::Char('d'))));
         assert!(is_ctrl_d(ctrl_press(KeyCode::Char('D'))));
     }
@@ -1372,15 +1899,34 @@ mod tests {
     #[test]
     fn test_is_ctrl_d_false_for_plain_d() {
         assert!(!is_ctrl_d(press(KeyCode::Char('d'))));
+        assert!(!is_ctrl_d(press(KeyCode::Char('D'))));
     }
 
     #[test]
     fn test_is_ctrl_d_false_for_other_ctrl() {
         assert!(!is_ctrl_d(ctrl_press(KeyCode::Char('c'))));
+        assert!(!is_ctrl_d(ctrl_press(KeyCode::Char('v'))));
+    }
+
+    #[test]
+    fn test_ctrl_d_maps_to_eot_byte_for_the_session() {
+        // In the raw wire Ctrl-D maps to EOT (0x04); the attach client
+        // intercepts it as the detach signal before it reaches map_key_to_input.
+        let result = map_key_to_input(ctrl_press(KeyCode::Char('d')), false).unwrap();
+        assert_eq!(result.as_bytes(), &[4]);
+    }
+
+    #[test]
+    fn test_ctrl_v_maps_to_syn_byte_for_the_session() {
+        // In the raw wire Ctrl-V maps to SYN (0x16); the attach client
+        // intercepts it as the clipboard paste signal before it reaches
+        // map_key_to_input.
+        let result = map_key_to_input(ctrl_press(KeyCode::Char('v')), false).unwrap();
+        assert_eq!(result.as_bytes(), &[22]);
     }
 
     // -----------------------------------------------------------------------
-    // map_mouse_to_sgr_input
+    // map_mouse_input (SGR encoding)
     // -----------------------------------------------------------------------
 
     fn mouse_event(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
@@ -1409,37 +1955,55 @@ mod tests {
     #[test]
     fn test_mouse_left_press() {
         let ev = mouse_event(MouseEventKind::Down(MouseButton::Left), 9, 4);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<0;10;5M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<0;10;5M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_right_release() {
         let ev = mouse_event(MouseEventKind::Up(MouseButton::Right), 0, 0);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<2;1;1m");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<2;1;1m".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_middle_drag() {
         let ev = mouse_event(MouseEventKind::Drag(MouseButton::Middle), 5, 10);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<33;6;11M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<33;6;11M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_scroll_up() {
         let ev = mouse_event(MouseEventKind::ScrollUp, 20, 15);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<64;21;16M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<64;21;16M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_scroll_down() {
         let ev = mouse_event(MouseEventKind::ScrollDown, 20, 15);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<65;21;16M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<65;21;16M".as_bytes())
+        );
     }
 
     #[test]
     fn test_mouse_moved() {
         let ev = mouse_event(MouseEventKind::Moved, 3, 7);
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<35;4;8M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<35;4;8M".as_bytes())
+        );
     }
 
     #[test]
@@ -1450,7 +2014,10 @@ mod tests {
             0,
             KeyModifiers::SHIFT,
         );
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<4;1;1M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<4;1;1M".as_bytes())
+        );
     }
 
     #[test]
@@ -1461,6 +2028,194 @@ mod tests {
             0,
             KeyModifiers::CONTROL | KeyModifiers::ALT,
         );
-        assert_eq!(map_mouse_to_sgr_input(ev), "\x1b[<24;1;1M");
+        assert_eq!(
+            map_mouse_input(ev, true).as_deref(),
+            Some("\x1b[<24;1;1M".as_bytes())
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Input-codec evidence (ADR-0003). Passing tests pin the incumbent
+    // baseline; ignored repros pin the complete, standard encoding the
+    // 1.0 raw/semantic codec must provide.
+    // -------------------------------------------------------------------
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn map_key_baseline_documents_current_coverage() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Char('a'), KeyModifiers::NONE), false),
+            Some("a".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Enter, KeyModifiers::NONE), false),
+            Some("\r".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Backspace, KeyModifiers::CONTROL), false),
+            Some("\x08".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Backspace, KeyModifiers::NONE), false),
+            Some("\x7f".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Char('c'), KeyModifiers::CONTROL), false),
+            Some("\x03".into())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Left, KeyModifiers::NONE), true),
+            Some("\x1bOD".into())
+        );
+    }
+
+    /// Legacy/xterm-compatible profile (ADR-0001 stable profiles): the
+    /// encoding an xterm-class terminal sends. Enhanced keyboard profiles
+    /// (kitty protocol) are a separate negotiated capability.
+    #[test]
+    fn repro_alt_char_is_esc_prefixed() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Char('x'), KeyModifiers::ALT), false),
+            Some("\x1bx".to_string())
+        );
+    }
+
+    #[test]
+    fn repro_ctrl_arrow_is_parameterized() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Up, KeyModifiers::CONTROL), false),
+            Some("\x1b[1;5A".to_string())
+        );
+    }
+
+    #[test]
+    fn repro_ctrl_digit_family_sends_legacy_control_bytes() {
+        // Ctrl+2 through Ctrl+8 duplicate the C0 control characters in
+        // every mainstream terminal (NUL, ESC, FS, GS, RS, US, DEL).
+        for (digit, expected) in [
+            ('2', '\0'),
+            ('3', '\x1b'),
+            ('4', '\x1c'),
+            ('5', '\x1d'),
+            ('6', '\x1e'),
+            ('7', '\x1f'),
+            ('8', '\x7f'),
+        ] {
+            assert_eq!(
+                map_key_to_input(key(KeyCode::Char(digit), KeyModifiers::CONTROL), false),
+                Some(expected.to_string()),
+                "Ctrl+{digit}"
+            );
+        }
+    }
+
+    #[test]
+    fn repro_function_keys_are_mapped() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::F(5), KeyModifiers::NONE), false),
+            Some("\x1b[15~".to_string())
+        );
+    }
+
+    #[test]
+    fn alt_prefixes_byte_like_keys() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Enter, KeyModifiers::ALT), false),
+            Some("\x1b\r".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Tab, KeyModifiers::ALT), false),
+            Some("\x1b\t".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Esc, KeyModifiers::ALT), false),
+            Some("\x1b\x1b".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Backspace, KeyModifiers::ALT), false),
+            Some("\x1b\x7f".to_string())
+        );
+    }
+
+    #[test]
+    fn modifiers_parameterize_home_delete_page_keys() {
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Home, KeyModifiers::SHIFT), false),
+            Some("\x1b[1;2H".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Delete, KeyModifiers::CONTROL), false),
+            Some("\x1b[3;5~".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::PageUp, KeyModifiers::ALT), false),
+            Some("\x1b[5;3~".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(
+                key(KeyCode::End, KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+                false
+            ),
+            Some("\x1b[1;6F".to_string())
+        );
+    }
+
+    #[test]
+    fn modified_arrows_ignore_app_cursor_keys_mode() {
+        // DECCKM selects the SS3 form only for unmodified arrows; modified
+        // arrows are always CSI 1;{mod}{letter} (xterm behavior).
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Left, KeyModifiers::CONTROL), true),
+            Some("\x1b[1;5D".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::Up, KeyModifiers::NONE), true),
+            Some("\x1bOA".to_string())
+        );
+    }
+
+    #[test]
+    fn function_keys_cover_f1_through_f12_with_modifiers() {
+        let unmodified = [
+            "\x1bOP",   // F1
+            "\x1bOQ",   // F2
+            "\x1bOR",   // F3
+            "\x1bOS",   // F4
+            "\x1b[15~", // F5
+            "\x1b[17~", // F6
+            "\x1b[18~", // F7
+            "\x1b[19~", // F8
+            "\x1b[20~", // F9
+            "\x1b[21~", // F10
+            "\x1b[23~", // F11
+            "\x1b[24~", // F12
+        ];
+        for (n, expected) in (1u8..=12).zip(unmodified) {
+            assert_eq!(
+                map_key_to_input(key(KeyCode::F(n), KeyModifiers::NONE), false),
+                Some(expected.to_string()),
+                "F{n}"
+            );
+        }
+        // Modified low F-keys switch to the parameterized CSI form,
+        // modified high F-keys add the modifier parameter.
+        assert_eq!(
+            map_key_to_input(key(KeyCode::F(1), KeyModifiers::SHIFT), false),
+            Some("\x1b[1;2P".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(
+                key(KeyCode::F(5), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+                false
+            ),
+            Some("\x1b[15;6~".to_string())
+        );
+        assert_eq!(
+            map_key_to_input(key(KeyCode::F(12), KeyModifiers::ALT), false),
+            Some("\x1b[24;3~".to_string())
+        );
     }
 }

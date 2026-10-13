@@ -15,7 +15,7 @@ fn oly_bin() -> PathBuf {
 
 /// Build a `Command` for `oly` with a self-contained state directory so the
 /// tests never interact with a real daemon.
-fn oly_cmd(tmp_dir: &PathBuf) -> Command {
+fn oly_cmd(tmp_dir: &std::path::Path) -> Command {
     let mut cmd = Command::new(oly_bin());
 
     // OLY_STATE_DIR directly overrides resolve_state_dir() — no
@@ -98,6 +98,54 @@ fn list_json_without_daemon_prints_machine_readable_output() {
     );
 }
 
+#[test]
+fn malformed_config_fails_startup_and_unknown_keys_warn() {
+    let tmp = make_tmp_dir("config_validation");
+    fs::create_dir_all(tmp.join("oly")).unwrap();
+    fs::write(tmp.join("oly/config.json"), "{ broken").unwrap();
+    let output = oly_cmd(&tmp)
+        .args(["daemon", "start", "--no-http"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("could not parse"));
+    assert!(!tmp.join("oly/daemon.lock").exists());
+    fs::write(
+        tmp.join("oly/config.json"),
+        r#"{"notification_hookk":"typo","limits":{"max_running_sessions":2}}"#,
+    )
+    .unwrap();
+    let output = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown config key 'notification_hookk'")
+            && stderr.contains("unknown config key 'limits'"),
+        "{stderr}"
+    );
+    assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok());
+}
+
+#[test]
+fn removed_recording_caps_fail_before_daemon_start() {
+    for key in ["max_journal_bytes_per_session", "max_output_log_bytes"] {
+        let tmp = make_tmp_dir(&format!("removed_cap_{key}"));
+        fs::create_dir_all(tmp.join("oly")).unwrap();
+        fs::write(tmp.join("oly/config.json"), format!("{{\"{key}\":0}}")).unwrap();
+        let output = oly_cmd(&tmp)
+            .args(["daemon", "start", "--no-http"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(key) && stderr.contains("was removed"),
+            "{stderr}"
+        );
+        assert!(!tmp.join("oly/daemon.lock").exists());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // oly --help – short, neutral language
 // ---------------------------------------------------------------------------
@@ -135,11 +183,92 @@ fn skill_command_prints_embedded_markdown() {
     assert!(output.status.success(), "`oly skill` should exit 0");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected = include_str!("../.github/skills/oly/SKILL.md");
+    let expected = include_str!("../skills/oly/SKILL.md");
     assert_eq!(
         stdout, expected,
         "`oly skill` should print embedded markdown"
     );
+}
+
+#[test]
+fn skill_apps_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("apps_skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--apps"])
+        .output()
+        .expect("failed to run oly skill --apps");
+
+    assert!(output.status.success(), "`oly skill --apps` should exit 0");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        include_str!("../skills/oly-apps/SKILL.md")
+    );
+}
+
+#[test]
+fn skill_subagent_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("subagent_skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--subagent"])
+        .output()
+        .expect("failed to run oly skill --subagent");
+
+    assert!(
+        output.status.success(),
+        "`oly skill --subagent` should exit 0"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        include_str!("../skills/oly-subagent/SKILL.md")
+    );
+}
+
+#[test]
+fn skill_daemon_prints_embedded_markdown() {
+    let tmp = make_tmp_dir("daemon_skill_markdown");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--daemon"])
+        .output()
+        .expect("failed to run oly skill --daemon");
+
+    assert!(
+        output.status.success(),
+        "`oly skill --daemon` should exit 0"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        include_str!("../skills/oly-daemon/SKILL.md")
+    );
+    let body = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        body.contains("DEFAULT_PROMPT_PATTERNS"),
+        "skill should embed the live prompt patterns"
+    );
+}
+
+#[test]
+fn skill_daemon_mutually_excludes_other_flags() {
+    let tmp = make_tmp_dir("skill_daemon_conflict");
+    let combined = oly_cmd(&tmp)
+        .args(["skill", "--daemon", "--subagent"])
+        .output()
+        .expect("compose");
+    assert!(!combined.status.success());
+
+    let apps = oly_cmd(&tmp)
+        .args(["skill", "--daemon", "--apps"])
+        .output()
+        .expect("compose with apps");
+    assert!(!apps.status.success());
+}
+#[test]
+fn skill_subagent_and_apps_are_mutually_exclusive() {
+    let tmp = make_tmp_dir("skill_flags_conflict");
+    let output = oly_cmd(&tmp)
+        .args(["skill", "--subagent", "--apps"])
+        .output()
+        .expect("failed to run oly skill with conflicting flags");
+    assert!(!output.status.success());
 }
 
 // ---------------------------------------------------------------------------

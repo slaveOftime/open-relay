@@ -1,7 +1,7 @@
 mod e2e;
 
 use e2e::*;
-use std::{fs, path::PathBuf, thread::sleep, time::Duration};
+use std::{fs, path::Path, thread::sleep, time::Duration};
 
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.match_indices(needle).count()
@@ -43,7 +43,7 @@ fn bash_shell_timeout() -> Duration {
 }
 
 fn wait_for_prompted_output<I, S>(
-    tmp: &PathBuf,
+    tmp: &Path,
     id: &str,
     baseline: &str,
     prompt: &str,
@@ -90,7 +90,7 @@ where
     .map(|log| normalize_log_text(&log))
 }
 
-fn start_bash_session(tmp: &PathBuf, test_name: &str) -> Option<String> {
+fn start_bash_session(tmp: &Path, test_name: &str) -> Option<String> {
     if !program_exists("bash") {
         eprintln!("SKIP {test_name}: bash not found on PATH");
         return None;
@@ -486,6 +486,40 @@ fn e2e_logs_available_after_session_exits() {
     );
 }
 
+/// Every PTY child receives its own session id as `OLY_SESSION_ID`, so a
+/// program running under oly can discover which session it is and report it
+/// back to a supervising agent (see `skills/oly-subagent/SKILL.md`). The
+/// child prints a marker immediately followed by the variable's value; the
+/// marker keeps the assertion honest — the daemon's own `--- Session <id>
+/// is <status> ---` trailer also contains the id and would satisfy a bare
+/// `.contains(id)` even if the variable were never set.
+#[test]
+fn e2e_session_id_is_injected_into_the_child_environment() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_session_id_env");
+    let _daemon = start_daemon(&tmp);
+
+    #[cfg(target_os = "windows")]
+    let cmd: &[&str] = &["cmd.exe", "/c", "echo", "SID=%OLY_SESSION_ID%"];
+    #[cfg(not(target_os = "windows"))]
+    let cmd: &[&str] = &["sh", "-c", "printf SID=%s \"$OLY_SESSION_ID\""];
+
+    let id = start_session(&tmp, cmd);
+
+    let needle = format!("SID={id}");
+    let seen = wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains(&needle),
+        native_shell_timeout(),
+    );
+    assert!(
+        seen.is_some(),
+        "child did not print its own OLY_SESSION_ID (expected '{needle}').\nLogs:\n{}",
+        fetch_logs(&tmp, &id)
+    );
+}
+
 #[test]
 fn e2e_local_attach_reports_session_end_on_child_exit() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -709,7 +743,7 @@ fn e2e_high_bandwidth_output_logs_intact() {
     );
 
     let full_log = oly_cmd(&tmp)
-        .args(["logs", &id, "--tail", "600", "--no-truncate"])
+        .args(["logs", &id, "--tail", "600"])
         .output()
         .expect("`oly logs --tail 600` failed");
     let full_text = strip_session_status_marker(&String::from_utf8_lossy(&full_log.stdout), &id);
@@ -717,6 +751,62 @@ fn e2e_high_bandwidth_output_logs_intact() {
         full_text, expected,
         "high-bandwidth --tail 600 output did not match the exact expected transcript.\nLogs:\n{full_text}"
     );
+}
+
+/// Repeated short-lived ConPTY producers must retain their exact final tail,
+/// including bytes read after ClosePseudoConsole starts. Verify cold journal
+/// replay too, not just the live terminal snapshot.
+#[cfg(windows)]
+#[test]
+fn e2e_windows_exited_producers_keep_tail_through_console_close() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("windows_exit_tail");
+    let daemon = start_daemon(&tmp);
+    let mut sessions = Vec::new();
+    for count in [500, 1000, 2000, 500, 1000] {
+        let command = format!("for /L %i in (1,1,{count}) do @echo TAIL_%i");
+        let id = start_session(&tmp, &["cmd.exe", "/c", &command]);
+        let expected = plain_output((1..=count).map(|i| format!("TAIL_{i}")));
+        let tail = count + 100;
+        assert!(
+            wait_for_exact_log_with_tail_ignoring_status_marker(
+                &tmp,
+                &id,
+                tail,
+                &expected,
+                Duration::from_secs(15)
+            )
+            .is_some(),
+            "incomplete ConPTY output for {id} (expected {count} lines):\n{}\nDaemon stderr:\n{}\nDaemon logs:\n{}",
+            fetch_logs_with_tail(&tmp, &id, tail),
+            fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default(),
+            fs::read_dir(tmp.join("oly/logs"))
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| fs::read_to_string(entry.ok()?.path()).ok())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        sessions.push((id, tail, expected));
+    }
+    drop(daemon);
+    let _restarted = start_daemon(&tmp);
+    for (id, tail, expected) in sessions {
+        let output = oly_cmd(&tmp)
+            .args(["logs", &id, "--tail", &tail.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            strip_session_status_marker(&String::from_utf8_lossy(&output.stdout), &id),
+            expected,
+            "cold journal replay lost output for {id}"
+        );
+    }
 }
 
 #[test]
@@ -727,21 +817,23 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
 
     #[cfg(target_os = "windows")]
     let cmd: &[&str] = &[
-        "cmd.exe",
-        "/c",
-        "powershell -NoProfile -Command \"Write-Host 'COLOR_TEST' -ForegroundColor Red\"",
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "Write-Host 'COLOR_TEST' -ForegroundColor Red",
     ];
     #[cfg(not(target_os = "windows"))]
     let cmd: &[&str] = &["sh", "-c", "printf '\\033[31mCOLOR_TEST\\033[0m\\n'"];
 
     let id = start_session(&tmp, cmd);
 
-    #[cfg(target_os = "windows")]
-    let expected_plain = plain_output(["Write-Host 'COLOR_TEST' -ForegroundColor Red"]);
-    #[cfg(not(target_os = "windows"))]
     let expected_plain = plain_output(["COLOR_TEST"]);
-    wait_for_exact_log(&tmp, &id, &expected_plain, Duration::from_secs(5))
-        .expect("plain logs did not match exact expected color-stripped output");
+    wait_for_exact_log(&tmp, &id, &expected_plain, native_shell_timeout()).unwrap_or_else(|| {
+        panic!(
+            "plain logs did not match exact expected color-stripped output.\nLogs:\n{}",
+            fetch_logs(&tmp, &id)
+        )
+    });
 
     let plain = normalize_log_text(&fetch_logs(&tmp, &id));
     assert_eq!(
@@ -750,16 +842,9 @@ fn e2e_logs_keep_color_preserves_ansi_codes() {
     );
 
     let colored = oly_cmd(&tmp)
-        .args([
-            "logs",
-            &id,
-            "--tail",
-            "200",
-            "--no-truncate",
-            "--keep-color",
-        ])
+        .args(["logs", &id, "--tail", "200", "--color", "always"])
         .output()
-        .expect("`oly logs --keep-color` failed");
+        .expect("`oly logs --color always` failed");
     let colored_text = String::from_utf8_lossy(&colored.stdout);
     assert!(
         colored_text.contains("COLOR_TEST"),
@@ -789,25 +874,25 @@ fn e2e_logs_wait_for_prompt_returns_after_command_exits() {
         .args([
             "logs",
             &id,
-            "--wait-for-prompt",
+            "--wait",
+            "prompt",
             "--timeout",
             "5000",
             "--tail",
             "100",
-            "--no-truncate",
         ])
         .output()
-        .expect("`oly logs --wait-for-prompt` failed to execute");
+        .expect("`oly logs --wait prompt` failed to execute");
 
     assert!(
         output.status.success(),
-        "`oly logs --wait-for-prompt` exited non-zero.\nstderr: {}",
+        "`oly logs --wait prompt` exited non-zero.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("PROMPT_DONE"),
-        "expected PROMPT_DONE in wait-for-prompt output.\nstdout:\n{stdout}"
+        "expected PROMPT_DONE in --wait prompt output.\nstdout:\n{stdout}"
     );
 }
 
@@ -901,4 +986,337 @@ fn e2e_input_to_nonexistent_session_fails_gracefully() {
         stderr.contains("not found") || stderr.contains("error") || stderr.contains("evicted"),
         "expected clear error for non-existent session.\nstderr:\n{stderr}"
     );
+}
+
+/// `oly attach` runs under a real PTY; pressing Ctrl-D (EOT, 0x04)
+/// must detach the client. This exercises the full terminal input path
+/// end-to-end.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_attach_ctrl_d_detaches() {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::io::{Read, Write};
+
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_attach_ctrl_d_detach");
+    let _daemon = start_daemon(&tmp);
+    assert!(
+        program_exists("node"),
+        "node is required for the detach probe"
+    );
+    // The paste probe doubles as the detach probe: it prints PASTE_READY on
+    // startup and answers a `!` with INPUT_READY. That round trip is what
+    // lets this test know the client's input reader is live before it stakes
+    // its assertion on a single keystroke — a bare `sh -i` has no way to
+    // acknowledge anything, which is why the old "wait for the first output
+    // byte, then send EOT" version flaked on ubuntu and macOS.
+    let report = tmp.join("detach-probe.json");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/paste_probe.cjs");
+    let id = start_session(
+        &tmp,
+        &[
+            "--disable-notifications",
+            "--tag",
+            "temp",
+            "--tag",
+            "detach-test",
+            "node",
+            fixture.to_str().unwrap(),
+            report.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains("PASTE_READY"),
+            Duration::from_secs(10)
+        )
+        .is_some(),
+        "probe did not become ready"
+    );
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty pair");
+
+    let mut cmd = CommandBuilder::new(oly_bin());
+    cmd.args(["attach", &id]);
+    cmd.env("OLY_STATE_DIR", tmp.join("oly"));
+    cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(&tmp));
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .expect("spawn `oly attach` on the pty");
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let mut writer = pair.master.take_writer().expect("take pty writer");
+    // PTY master reads block; pump them on a thread so every wait below
+    // has a real timeout instead of hanging the test on a stuck client.
+    let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let pump = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let mut output: Vec<u8> = Vec::new();
+
+    // Wait for the replay to prove the client is rendering, then round-trip
+    // a keystroke through its input reader. Only once the probe answers the
+    // `!` is that reader guaranteed live, so the Ctrl-D below cannot race
+    // attach's startup — which is exactly the race this test used to hit
+    // when it sent EOT after the first output byte instead.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&output).contains("PASTE_READY") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`oly attach` did not replay the ready marker; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        match output_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // An ordinary printable key proves the reader is live: the probe
+    // acknowledges it with INPUT_READY.
+    writer.write_all(b"!").expect("write probe round-trip key");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&output).contains("INPUT_READY") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "attach input reader did not become ready; output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+        match output_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Ctrl-D → detach. Send the EOT byte (0x04).
+    writer.write_all(b"\x04").expect("write Ctrl-D / EOT");
+
+    // The attach process must exit on its own and report the detach.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check attach child") {
+            break status;
+        }
+        match output_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`oly attach` did not exit after Ctrl-D.\noutput so far:\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    };
+    // Drain whatever the client printed while exiting.
+    while let Ok(chunk) = output_rx.recv_timeout(Duration::from_millis(200)) {
+        output.extend_from_slice(&chunk);
+    }
+    drop(writer);
+    let _ = pump.join();
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        status.success(),
+        "attach exited non-zero: {status:?}\n{text}"
+    );
+    assert!(
+        text.contains(&format!("Detached from session {id}")),
+        "attach did not report the detach.\noutput:\n{text}"
+    );
+}
+
+/// Helper for attach-under-PTY tests: spawn `oly attach` (extra args
+/// allowed, e.g. `--observe`) at the given size and return the pieces a
+/// resize/detach scenario needs. Output is pumped on a thread so every
+/// wait in the caller has a real timeout.
+#[cfg(not(target_os = "windows"))]
+struct PtyAttach {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn std::io::Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pump: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl PtyAttach {
+    fn spawn(tmp: &Path, id: &str, extra_args: &[&str], rows: u16, cols: u16) -> Self {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::io::Read;
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open pty pair");
+
+        let mut cmd = CommandBuilder::new(oly_bin());
+        cmd.arg("attach");
+        cmd.args(extra_args);
+        cmd.arg(id);
+        cmd.env("OLY_STATE_DIR", tmp.join("oly"));
+        cmd.env("OLY_SOCKET_NAME", socket_name_for_tmp(tmp));
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("spawn `oly attach` on the pty");
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+        let writer = pair.master.take_writer().expect("take pty writer");
+        let (output_tx, output_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let pump = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if output_tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let attach = PtyAttach {
+            master: pair.master,
+            writer,
+            child,
+            output_rx,
+            pump: Some(pump),
+        };
+        attach.wait_for_output(Duration::from_secs(10));
+        attach
+    }
+
+    fn wait_for_output(&self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "`oly attach` produced no output on the pty"
+            );
+            match self.output_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(_) => return,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+
+    fn resize(&self, rows: u16, cols: u16) {
+        self.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("resize outer pty");
+    }
+
+    fn detach(mut self) {
+        use std::io::Write;
+        self.writer.write_all(b"\x04").ok();
+        let _ = self.child.wait();
+        while self
+            .output_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok()
+        {}
+        drop(self.writer);
+        drop(self.master);
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.join();
+        }
+    }
+}
+
+/// Ask the session itself how big it is: run `stty size` in the shell and
+/// watch the logs for the answer. This observes the real session PTY
+/// winsize end-to-end (client event -> IPC -> daemon -> TIOCSWINSZ).
+#[cfg(not(target_os = "windows"))]
+fn wait_for_session_size(tmp: &Path, id: &str, rows: u16, cols: u16, timeout: Duration) {
+    let expected = format!("{rows} {cols}");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        send_line(tmp, id, "stty size");
+        let log = fetch_logs_with_tail(tmp, id, 20);
+        if normalize_log_text(&log).contains(&expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session never reported size {expected}.\nlast logs:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Resizing the outer terminal while attached must reach the daemon and
+/// resize the session PTY (a controller has geometry authority). An
+/// observe-mode attach must NOT get that authority: its window resizes
+/// are gated out and the session keeps the controller's geometry.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn e2e_attach_terminal_resize_reaches_the_daemon() {
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("e2e_attach_resize_propagates");
+    let _daemon = start_daemon(&tmp);
+    let id = start_session(&tmp, &["sh", "-i"]);
+
+    // Controller resize: 24x80 -> 40x100 propagates to the session PTY.
+    let controller = PtyAttach::spawn(&tmp, &id, &[], 24, 80);
+    controller.resize(40, 100);
+    wait_for_session_size(&tmp, &id, 40, 100, Duration::from_secs(15));
+
+    // A second, explicitly read-only attach starts in observe mode.
+    let observer = PtyAttach::spawn(&tmp, &id, &["--observe"], 24, 80);
+
+    // Resizing the observer's window is gated: the session stays at the
+    // controller's geometry for the rest of this check window.
+    observer.resize(50, 120);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        wait_for_session_size(&tmp, &id, 40, 100, Duration::from_secs(5));
+    }
+
+    // The controller still drives geometry afterwards.
+    controller.resize(30, 90);
+    wait_for_session_size(&tmp, &id, 30, 90, Duration::from_secs(15));
+
+    observer.detach();
+    controller.detach();
 }

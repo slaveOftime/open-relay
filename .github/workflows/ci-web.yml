@@ -1,56 +1,123 @@
 name: CI-WEB
 
 on:
+  push:
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
-      # - .github/workflows/**
+      - .github/workflows/ci-web.yml
       - web/**
+      # Trigger on dotfile/js config tweaks that web/** alone misses.
+      - web/eslint.config.*
+      - web/playwright.config.*
+      - web/.prettierrc*
+      - web/.editorconfig
+  # Manual re-run for a flaky browser run or a workflow-only change.
+  workflow_dispatch:
+
+# Same concurrency policy as CI: cancel PR runs, never push runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
-jobs:
-  build-test:
-    name: build-test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          # - macos-latest
-          # - windows-latest
+# Most steps run inside web/, so make it the default working directory
+# for `run:` commands. actions/setup-node still reads the cache key from
+# the explicit cache-dependency-path below.
+defaults:
+  run:
+    working-directory: web
 
+jobs:
+  lint:
+    name: lint / format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+  test:
+    name: vitest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  e2e:
+    name: playwright (chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
-      - name: Resolve npm cache directory
-        id: npm-cache-dir
-        shell: bash
-        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache npm registry
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: ${{ runner.os }}-npm-${{ hashFiles('web/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
-
-      - name: Test
+      - name: Install web deps + Playwright browser
         run: |
-          cd web
-          npm install
-          npm test
-          npm run build
+          npm ci
+          npx playwright install --with-deps chromium
+
+      # This job installs only the Chromium browser (see the step above), so it
+      # must run only the Chromium project. The mobile-safari project needs
+      # WebKit, which is a local opt-in (`--project=mobile-safari`); running it
+      # here would fail with "Executable doesn't exist" for the WebKit binary.
+      - name: Playwright e2e
+        run: npm run e2e -- --project=chromium

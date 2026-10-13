@@ -4,6 +4,7 @@ node_modules
 /target
 /target-test
 /target-tests
+/.dev-state
 /web/dist
 /web/dev-dist
 /npm/README.md
@@ -12,3 +13,6 @@ node_modules
 /npm/bin/oly-win32-x64.exe
 test-results
 .tli.claude/
+
+scripts/
+target-tests/

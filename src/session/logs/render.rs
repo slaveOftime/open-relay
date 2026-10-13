@@ -1,57 +1,349 @@
-//! Replaying raw log bytes through a `vt100` parser into displayable rows.
+//! Replaying raw log bytes through the terminal engine into displayable rows.
 //!
 //! The log is a raw PTY byte stream, so the only way to know what the user saw
-//! is to feed it to a terminal emulator and read the resulting grid.
+//! is to feed it to a terminal emulator and read the resulting grid. The
+//! second (`vt100`) parser was retired: rendering uses the same
+//! [`crate::terminal::Terminal`] engine as live sessions, so what `oly logs`
+//! shows is exactly what the attached renderer saw.
 
 use std::path::Path;
 
 use crate::error::Result;
+use crate::protocol::LogResize;
+use crate::terminal::Terminal;
 
-use super::super::screen::safe_resize_parser;
-use super::index::{read_relevant_resize_events, read_tail_bytes};
+#[cfg(test)]
+use super::index::read_tail_bytes;
+use super::index::viewport_resize_plan;
 use super::{OUTPUT_COLOR_RESET_SUFFIX, RenderBytes, ViewportReplayPlan, ViewportSize};
 
-/// Wide parser column count — prevents any line wrapping inside the vt100 grid
-/// for plain scrollback-style logs.
-const PARSER_COLS: u16 = 2000;
+/// Wide parser column count — prevents any line wrapping inside the engine
+/// grid for plain scrollback-style logs.
+pub const PARSER_COLS: u16 = 2000;
 
 /// Fallback viewport height for alt-screen TUIs when no absolute row movement
 /// is visible in the retained log tail.
 const DEFAULT_ALT_SCREEN_ROWS: u16 = 24;
 
+/// Resize history is returned in the HTTP `x-log-resizes` header, so keep it
+/// safely below common per-header size limits. The renderer still uses the
+/// full history internally.
+const MAX_LOG_RESIZE_EVENTS: usize = 64;
+
+/// The maximum number of journal *lines* the resume-hint fallback pass
+/// scans when the engine-based render produces no match. The engine walks
+/// rows in paint order, so a row that is painted and then overwritten by a
+/// later redraw disappears from the rendered grid even though the
+/// bytes survive in the journal. The fallback skips rendering and
+/// regex-matches the filtered-stream bytes directly, which is cheap and
+/// often recovers hints the engine has wiped.
+///
+/// The window is intentionally generous: a single resume hint is far
+/// shorter than a typical TUI repaint, and a chat scrollback that buries
+/// the hint can still hold it for thousands of lines below the visible
+/// area. Anchors provide seek points, but insufficient suffix context can
+/// require older candidates or an origin scan; this is not a page-size work cap.
+pub const RESUME_FALLBACK_TAIL_LINES: usize = 8192;
+
+/// Filtered-stream tail bytes plus the journal offsets they cover. Used
+/// by the engine-based renderer and by resume-hint extraction, which
+/// scans the raw bytes directly when the rendered output holds no hint.
+pub struct FilteredTail {
+    /// Tail bytes covering approximately the most recent
+    /// `desired_tail_lines`. May be the entire filtered stream for
+    /// short sessions.
+    pub bytes: Vec<u8>,
+    /// Filtered-stream offset where `bytes` begins.
+    pub start_offset: u64,
+    /// Filtered-stream end offset (== current `filtered_stream_len`).
+    pub end_offset: u64,
+    /// Resize events inside `[start_offset, end_offset)` (already bounded
+    /// to the resize window relevant to the tail).
+    pub resizes: Vec<LogResize>,
+}
+
+/// Checkpoint-anchored filtered-stream tail read used by resume hints
+/// and HTTP fallback renderers. CLI continuation uses byte paging instead.
+pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Result<FilteredTail> {
+    let from_offset = 0;
+    if !session_dir
+        .join(crate::session::journal::JOURNAL_DIR_NAME)
+        .is_dir()
+    {
+        return Err(crate::error::AppError::Protocol(format!(
+            "session log in {} uses the pre-0.5 format (output.log) and is no \
+             longer readable; export it with a 0.x build first, see MIGRATION.md",
+            session_dir.display()
+        )));
+    }
+
+    // Checkpoint-anchored tail replay: start at the newest anchored
+    // checkpoint and walk older anchors only until the replayed
+    // suffix covers the requested tail. Short candidates widen, potentially
+    // to the origin; no constant-cost guarantee applies. Bytes and resize history are
+    // derived in the SAME pass — a tail render never scans the journal
+    // more than once per candidate start.
+    let anchors = crate::session::replay::replay_anchors(session_dir).unwrap_or_default();
+    // Walk from newest-to-oldest anchor (newest first) and fall back to
+    // a full scan (`None`) only when no anchor accepts. A `--since` cursor
+    // is a content boundary — anchors past the cursor are not seek points,
+    // because using them would skip the bytes between the cursor and the
+    // anchor's replica of the engine state.
+    // No truncation (`tail == usize::MAX`, e.g. `--screen` on a stopped
+    // session) needs the full prefix; the screen state only rebuilds
+    // once the engine has replayed every style and repaint from the
+    // journal origin.
+    let unbounded = desired_tail_lines == usize::MAX || desired_tail_lines == 0;
+    let mut starts: Vec<Option<&crate::session::journal::CheckpointAnchor>> =
+        if unbounded || from_offset > 0 {
+            // Cursor or full-screen: anchors past the cursor are not seek
+            // points, because using them would skip bytes the cursor bound
+            // semantically claims to span (or trim the prefixes the engine
+            // needs to reach its current screen state).
+            anchors
+                .iter()
+                .rev()
+                .filter(|anchor| anchor.filtered_offset <= from_offset)
+                .map(Some)
+                .collect()
+        } else {
+            // `from_offset == 0` and bounded tail: the newest anchored
+            // checkpoint is the cheapest seek when it covers the requested
+            // tail range.
+            anchors.iter().rev().map(Some).collect()
+        };
+    starts.push(None);
+    let mut candidate: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
+    let mut fallback: Option<(Vec<u8>, u64, u64, Vec<LogResize>)> = None;
+    for anchor in starts {
+        // The anchor is only a seek point; the derived window always starts
+        // at `from_offset`, so a `--since` render never leaks bytes that
+        // precede the cursor.
+        let (bytes, end, resizes, start) =
+            crate::session::replay::filtered_stream_and_resizes_from_anchor(
+                session_dir,
+                from_offset,
+                anchor,
+            )?;
+        let tail_bytes = super::index::tail_window_bytes(&bytes, desired_tail_lines);
+        // An anchor past the requested cursor was a fine seek point for
+        // the journal side, but if the segment that follows it carries no
+        // payload bytes (typical when the live tip just rolled its
+        // checkpoint) replay at an older anchor instead of returning an
+        // empty window.
+        if bytes.is_empty() && start > 0 && anchor.is_some() {
+            continue;
+        }
+        let accepted = |tail_bytes: &super::index::TailBytes| {
+            tail_bytes.start_offset > 0 || anchor.is_none() || from_offset > 0
+        };
+        // `start_offset > 0` means the window found enough lines inside the
+        // suffix; otherwise widen the replay at an older anchor. With a
+        // `--since` cursor the window is bounded below by the cursor, so
+        // widening cannot add earlier lines and the first pass is final.
+        if accepted(&tail_bytes) {
+            let start_offset = start + tail_bytes.start_offset;
+            // Match the previous bounded resize lookup: it starts at the
+            // newest anchor at/before the rendered window and scans no more
+            // than 64 MiB beyond that window. The combined pass may have
+            // gathered earlier/later events to avoid another journal read.
+            let resize_start = anchors
+                .iter()
+                .rev()
+                .find(|anchor| anchor.filtered_offset <= start_offset)
+                .map(|anchor| anchor.filtered_offset)
+                .unwrap_or(0);
+            let resize_end =
+                start_offset.saturating_add(crate::session::replay::MAX_RESIZE_EVENTS_SCAN_BYTES);
+            let resizes = resizes
+                .into_iter()
+                .filter(|resize| resize.offset >= resize_start && resize.offset <= resize_end)
+                .collect();
+            let window = (tail_bytes.bytes, start_offset, end, resizes);
+            if tail_bytes.start_offset > 0 || start == 0 {
+                candidate = Some(window);
+                break;
+            }
+            fallback = Some(window);
+        }
+    }
+    let candidate = candidate.or(fallback);
+
+    let Some((bytes, start_offset, end_offset, resizes)) = candidate else {
+        return Ok(FilteredTail {
+            bytes: Vec::new(),
+            start_offset: 0,
+            end_offset: 0,
+            resizes: Vec::new(),
+        });
+    };
+    Ok(FilteredTail {
+        bytes,
+        start_offset,
+        end_offset,
+        resizes,
+    })
+}
+
+/// Render a session's persisted output via the shared terminal/scanner
+/// cache and return (rendered_bytes, observation_end_offset). The default
+/// `oly logs --tail` path; reused by every CLI Tail RPC.
+pub fn render_log_session_tail(
+    session_dir: &Path,
+    tail: usize,
+    keep_color: bool,
+) -> Result<(Vec<u8>, u64)> {
+    super::screen_history::tail(session_dir, tail, keep_color).map_err(crate::error::AppError::from)
+}
+
+/// Render a session's persisted output for `oly logs` / the HTTP tail
+/// endpoint. Exposed viewport sizing is unused by the live callers
+/// (resume hints and HTTP tails let the journal's recorded geometry
+/// drive replay); kept optional for the byte-fixture test adapter below.
+#[allow(clippy::too_many_arguments)]
+pub fn render_log_session(
+    session_dir: &Path,
+    tail: usize,
+    keep_color: bool,
+    term_cols: u16,
+    viewport: Option<ViewportSize>,
+) -> Result<(Vec<u8>, Vec<LogResize>)> {
+    if viewport.is_none() && tail != usize::MAX {
+        let (output, _end) = super::screen_history::tail(session_dir, tail, keep_color)?;
+        // Resize metadata flows through the screen-history observation
+        // cursor, not via this function. Existing callers ignore it.
+        return Ok((output, Vec::new()));
+    }
+    let FilteredTail {
+        bytes,
+        start_offset,
+        end_offset,
+        resizes,
+    } = replay_filtered_tail(session_dir, tail)?;
+    if bytes.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let viewport_plan = if viewport.is_some() {
+        ViewportReplayPlan::default()
+    } else {
+        viewport_resize_plan(&resizes, start_offset, end_offset)
+    };
+
+    let output = render_log_bytes(
+        &bytes,
+        tail,
+        keep_color,
+        term_cols,
+        viewport,
+        &viewport_plan,
+    );
+    Ok((
+        output,
+        bound_resize_history(resizes, start_offset, end_offset),
+    ))
+}
+
+/// Bound resize metadata returned with a rendered tail while preserving the
+/// geometry in effect at the start and the newest transitions inside it.
+fn bound_resize_history(
+    mut events: Vec<LogResize>,
+    start_offset: u64,
+    end_offset: u64,
+) -> Vec<LogResize> {
+    events.retain(|event| event.offset <= end_offset);
+    if events.len() <= MAX_LOG_RESIZE_EVENTS {
+        return events;
+    }
+
+    let first_after_start = events.partition_point(|event| event.offset <= start_offset);
+    let initial = first_after_start.checked_sub(1).map(|index| events[index]);
+    let keep_after_start = (MAX_LOG_RESIZE_EVENTS - usize::from(initial.is_some()))
+        .min(events.len() - first_after_start);
+    let recent_start = events.len() - keep_after_start;
+    let mut bounded = Vec::with_capacity(keep_after_start + usize::from(initial.is_some()));
+    if let Some(initial) = initial {
+        bounded.push(initial);
+    }
+    bounded.extend_from_slice(&events[recent_start..]);
+    bounded
+}
+
+/// Renders a standalone stream file. Used by the transcript golden tests;
+/// kept because the byte pipeline is shared with journal rendering.
+#[cfg(test)]
 pub fn render_log_file(
     log_path: &Path,
     tail: usize,
     keep_color: bool,
     term_cols: u16,
     viewport: Option<ViewportSize>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Vec<LogResize>)> {
     // Step 1: seek to a position that gives `tail * 2` lines worth of bytes,
-    // providing enough context for the vt100 parser even with heavy escape usage.
+    // providing enough context for the replay engine even with heavy escape usage.
     let tail_bytes = read_tail_bytes(log_path, tail)?;
-    let viewport_plan = if viewport.is_some() {
-        ViewportReplayPlan::default()
-    } else {
-        read_relevant_resize_events(log_path, tail_bytes.start_offset, tail_bytes.end_offset)?
-    };
+    // A standalone stream file has no journal, hence no resize history.
+    let viewport_plan = ViewportReplayPlan::default();
+    let _ = viewport.is_some();
 
-    Ok(render_log_bytes(
-        &tail_bytes.bytes,
-        tail,
-        keep_color,
-        term_cols,
-        viewport,
-        &viewport_plan,
+    Ok((
+        render_log_bytes(
+            &tail_bytes.bytes,
+            tail,
+            keep_color,
+            term_cols,
+            viewport,
+            &viewport_plan,
+        ),
+        Vec::new(),
     ))
 }
 
-pub fn render_screen(
-    parser: &vt100::Parser,
+/// Render the live session engine's visible screen with the same
+/// content-bounded, tail-limited semantics as [`render_screen`]. Plain
+/// rows are truncated to `term_cols` characters; styled rows keep the
+/// session's PTY width so an SGR sequence is never split.
+///
+/// Production live-tail callers should use [`engine_content_rows`] +
+/// [`crate::session::logs::finish_render`] on `spawn_blocking` so the
+/// render doesn't hold the runtime read lock. This helper glues those
+/// two free functions back together for tests and single-step
+/// invocations; it lives here so the live-tail regression
+/// tests can validate the decomposition without re-implementing it.
+#[allow(dead_code)] // exercised by `src/session/logs/tests.rs`; not pulled into the main binary.
+pub fn render_engine_screen(
+    engine: &crate::terminal::Terminal,
     tail: usize,
     keep_color: bool,
     term_cols: u16,
 ) -> Vec<u8> {
-    let content_rows = collect_rows(parser.screen(), keep_color, term_cols);
+    let content_rows = engine_content_rows(engine, keep_color, term_cols);
+    finish_render(content_rows, tail, keep_color)
+}
+
+/// Borrow the engine long enough to copy its visible rows. Requires
+/// `&Terminal`, so callers must already hold the runtime's read lock —
+/// see `SessionStore::render_live_logs` for the off-thread variant that
+/// snapshots this output and renders without holding the lock.
+pub fn engine_content_rows(
+    engine: &crate::terminal::Terminal,
+    keep_color: bool,
+    term_cols: u16,
+) -> Vec<Vec<u8>> {
+    if keep_color {
+        engine.styled_screen_rows()
+    } else {
+        engine
+            .screen_lines()
+            .into_iter()
+            .map(|row| truncate_chars(&row, usize::from(term_cols)).into_bytes())
+            .collect()
+    }
+}
+
+/// Pure CPU step applied to a snapshot of engine rows. Lives outside
+/// the runtime lock so callers can drop the lock and run this on
+/// `tokio::task::spawn_blocking`.
+pub fn finish_render(content_rows: Vec<Vec<u8>>, tail: usize, keep_color: bool) -> Vec<u8> {
     let rows = if let Some((first, last)) = content_bounds(&content_rows) {
         let visible_rows = &content_rows[first..=last];
         let skip = visible_rows.len().saturating_sub(tail);
@@ -62,34 +354,17 @@ pub fn render_screen(
     format_rows_for_output(&rows, keep_color)
 }
 
-/// Render up to `tail` of the parser's retained scrollback rows as formatted
-/// `\n`-terminated lines, for seeding a freshly attached terminal's
-/// scrollback.  Only scrolled-off rows are included: the visible screen is
-/// covered by the attach snapshot, so seeding it would duplicate content in
-/// the client's scrollback.  Rows keep the session's PTY width so the
-/// attaching terminal wraps them natively.  Returns `None` when nothing has
-/// scrolled off yet.
-///
-/// Only the last `tail` rows are collected and formatted (see
-/// [`crate::session::screen::scrollback_rows_tail`]), so a deep seed stays
-/// cheap even when the parser retains its full scrollback capacity.
-pub fn render_screen_history(screen: &vt100::Screen, tail: usize) -> Option<Vec<u8>> {
-    let rows = crate::session::screen::scrollback_rows_tail(screen, tail, u16::MAX);
-    // Trim surrounding blank rows so padding (e.g. blank rows scrolled off by
-    // empty prompts) does not crowd out content rows in the seed.
-    let (first, last) = content_bounds(&rows)?;
-    Some(format_rows_for_output(&rows[first..=last], true))
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
 }
 
-fn collect_rows(screen: &vt100::Screen, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
-    if keep_color {
-        screen.rows_formatted(0, term_cols).collect()
-    } else {
-        screen
-            .rows(0, term_cols)
-            .map(|row| row.into_bytes())
-            .collect()
-    }
+/// Shared scrollback-seed formatting for engine rows: trim
+/// surrounding blank rows so padding (e.g. blank rows scrolled off by
+/// empty prompts) does not crowd out content rows, keep colour, join as
+/// `\n`-terminated lines. `None` when nothing has scrolled off yet.
+pub fn format_history_rows(rows: Vec<Vec<u8>>) -> Option<Vec<u8>> {
+    let (first, last) = content_bounds(&rows)?;
+    Some(format_rows_for_output(&rows[first..=last], true))
 }
 
 /// Parse raw log bytes through a virtual terminal and collect
@@ -104,6 +379,13 @@ fn collect_rows(screen: &vt100::Screen, keep_color: bool, term_cols: u16) -> Vec
 /// For alternate-screen TUIs, `tail` is not a valid parser height. The parser
 /// must approximate the PTY viewport height, otherwise absolute cursor writes
 /// can leave stale off-screen rows visible in an oversized virtual screen.
+///
+/// How many scrollback rows a replay engine retains for a tail render.
+/// Renderers read only visible rows, so replay keeps no history.
+fn replay_scrollback_rows(_tail: usize) -> usize {
+    0
+}
+
 fn render_rows(
     render_bytes: &RenderBytes<'_>,
     tail: usize,
@@ -112,7 +394,7 @@ fn render_rows(
     viewport: Option<ViewportSize>,
     viewport_plan: &ViewportReplayPlan,
 ) -> Vec<Vec<u8>> {
-    let mut parser = vt100::Parser::new(
+    let mut engine = Terminal::new(
         parser_rows(
             render_bytes.frame,
             render_bytes.frame_has_alt_screen,
@@ -126,21 +408,30 @@ fn render_rows(
             viewport,
             viewport_plan,
         ),
-        0,
+        replay_scrollback_rows(tail),
     );
-    process_bytes_with_resizes(&mut parser, render_bytes.frame, viewport_plan);
+    process_bytes_with_resizes(&mut engine, render_bytes.frame, viewport_plan);
 
-    let screen = parser.screen();
-
+    // Plain rows are truncated to `term_cols` characters; styled rows keep
+    // the replay width so an SGR sequence is never split (same semantics as
+    // [`render_engine_screen`]).
     let content_rows: Vec<Vec<u8>> = if keep_color {
-        screen.rows_formatted(0, term_cols).collect()
+        engine.styled_screen_rows()
     } else {
-        screen.rows(0, term_cols).map(|s| s.into_bytes()).collect()
+        engine
+            .screen_lines()
+            .into_iter()
+            .map(|row| truncate_chars(&row, usize::from(term_cols)).into_bytes())
+            .collect()
     };
 
     // Take the last `tail` rows from the content region.
-    let skip = content_rows.len().saturating_sub(tail);
-    content_rows.into_iter().skip(skip).collect()
+    if let Some((first, last)) = content_bounds(&content_rows) {
+        let first = first.max((last + 1).saturating_sub(tail));
+        content_rows[first..=last].to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 pub(super) fn parser_rows(
@@ -160,7 +451,7 @@ pub(super) fn parser_rows(
             .or_else(|| estimate_alt_screen_rows(bytes))
             .unwrap_or(DEFAULT_ALT_SCREEN_ROWS)
     } else {
-        tail.clamp(1, u16::MAX as usize) as u16
+        tail.saturating_add(1).clamp(1, u16::MAX as usize) as u16
     }
 }
 
@@ -184,7 +475,7 @@ pub(super) fn parser_cols(
 }
 
 fn process_bytes_with_resizes(
-    parser: &mut vt100::Parser,
+    engine: &mut Terminal,
     bytes: &[u8],
     viewport_plan: &ViewportReplayPlan,
 ) {
@@ -193,20 +484,24 @@ fn process_bytes_with_resizes(
     for resize in &viewport_plan.resizes {
         let resize_offset = resize.offset.min(bytes.len() as u64) as usize;
         if resize_offset > processed {
-            parser.process(&bytes[processed..resize_offset]);
+            engine.feed(&bytes[processed..resize_offset]);
             processed = resize_offset;
         }
-        // Log replay parsers keep no scrollback: the replay only needs the
-        // final visible state at each size.
-        safe_resize_parser(parser, resize.rows, resize.cols, 0);
+        // Replay is side-effect-free: queued engine events (query answers,
+        // bells) are drained and discarded, never written anywhere. Replay
+        // engines keep no scrollback: only the final visible state matters.
+        let _ = engine.drain_events();
+        // Engine resize is a non-destructive reflow — no parser rebuild.
+        engine.resize(resize.rows, resize.cols);
     }
 
     if processed < bytes.len() {
-        parser.process(&bytes[processed..]);
+        engine.feed(&bytes[processed..]);
+        let _ = engine.drain_events();
     }
 }
 
-fn contains_alt_screen(bytes: &[u8]) -> bool {
+pub fn contains_alt_screen(bytes: &[u8]) -> bool {
     bytes.windows(8).any(|window| {
         matches!(
             window,
@@ -290,9 +585,9 @@ pub(super) fn render_log_bytes(
     let mut fallback_output = None;
 
     for render_bytes in prepare_render_bytes(bytes) {
-        // Step 2: feed bytes into a vt100 parser sized to the inferred frame
-        // dimensions, then collect each visible row formatted and trimmed to
-        // the terminal width.
+        // Step 2: feed bytes into the terminal engine sized to the inferred
+        // frame dimensions, then collect each visible row formatted and
+        // trimmed to the terminal width.
         let rows = render_rows(
             &render_bytes,
             tail,
@@ -464,12 +759,12 @@ fn trim_repeated_trailing_suffix(
 }
 
 fn row_is_blank(row: &[u8]) -> bool {
-    row.is_empty() || row.iter().all(|byte| byte.is_ascii_whitespace())
+    trim_styled_row_end(row).is_empty()
 }
 
 fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
     if keep_color {
-        return row;
+        return trim_styled_row_end(row);
     }
 
     let end = row
@@ -477,4 +772,199 @@ fn trim_row_end(row: &[u8], keep_color: bool) -> &[u8] {
         .rposition(|&byte| !byte.is_ascii_whitespace())
         .map_or(0, |index| index + 1);
     &row[..end]
+}
+
+/// Trim trailing blank runs from a styled row: padding spaces and the SGR
+/// sequences between them are dropped, so log rows don't carry full-width
+/// background-color padding to the replay width. Trailing cells revert to
+/// the terminal's default background — the same display behavior the
+/// legacy renderer had. Non-ASCII (UTF-8 continuation) bytes always count
+/// as content; only CSI sequences (`\x1b[` … final byte) are skipped as
+/// styling, which is all the engine's styled rows emit.
+fn trim_styled_row_end(row: &[u8]) -> &[u8] {
+    let mut last_content_end = 0;
+    let mut index = 0;
+    while index < row.len() {
+        if row[index] == 0x1b && row.get(index + 1) == Some(&b'[') {
+            let mut end = index + 2;
+            while end < row.len() && !(0x40..=0x7e).contains(&row[end]) {
+                end += 1;
+            }
+            index = (end + 1).min(row.len());
+            continue;
+        }
+        index += 1;
+        if !row[index - 1].is_ascii_whitespace() {
+            last_content_end = index;
+        }
+    }
+    &row[..last_content_end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_response_is_bounded_and_keeps_start_geometry_and_recent_events() {
+        let events = (0..10_000)
+            .map(|offset| LogResize {
+                offset,
+                rows: 24,
+                cols: 80,
+            })
+            .collect();
+
+        let bounded = bound_resize_history(events, 5_000, 9_000);
+        assert_eq!(bounded.len(), MAX_LOG_RESIZE_EVENTS);
+        assert_eq!(bounded[0].offset, 5_000, "preserve start geometry");
+        assert_eq!(bounded[1].offset, 8_938, "keep recent transitions");
+        assert_eq!(bounded.last().unwrap().offset, 9_000);
+
+        let worst_case = vec![
+            LogResize {
+                offset: u64::MAX,
+                rows: u16::MAX,
+                cols: u16::MAX,
+            };
+            MAX_LOG_RESIZE_EVENTS
+        ];
+        assert!(serde_json::to_vec(&worst_case).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn bounded_tail_replay_is_independent_of_checkpointed_prefix_size() {
+        use crate::session::journal::{Checkpoint, ShadowJournal};
+        let mut evidence = Vec::new();
+        for prefix_lines in [1000, 10000] {
+            let dir =
+                std::env::temp_dir().join(format!("oly-tail-measure-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            let prefix = b"prefix\n".repeat(prefix_lines);
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(&prefix[..prefix.len() / 2]))
+                .unwrap();
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: (prefix.len() / 2) as u64,
+                    program: bytes::Bytes::new(),
+                })
+                .unwrap();
+            journal
+                .record_output(bytes::Bytes::copy_from_slice(&prefix[prefix.len() / 2..]))
+                .unwrap();
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: prefix.len() as u64,
+                    program: bytes::Bytes::new(),
+                })
+                .unwrap();
+            let suffix: String = (1..=150).map(|n| format!("{n}\r\n")).collect();
+            journal
+                .record_output(bytes::Bytes::from(suffix.clone()))
+                .unwrap();
+            journal.shutdown();
+            let (tail, scanned) = crate::session::journal::stream::measure_replay_bytes(|| {
+                replay_filtered_tail(&dir, 40).unwrap()
+            });
+            assert_eq!(scanned, suffix.len());
+            assert_eq!(tail.end_offset, (prefix.len() + suffix.len()) as u64);
+            assert!(tail.start_offset >= prefix.len() as u64);
+            let rendered = render_log_session_tail(&dir, 40, false).unwrap().0;
+            assert_eq!(
+                String::from_utf8(rendered).unwrap(),
+                (111..=150).map(|n| format!("{n}\n")).collect::<String>()
+            );
+            evidence.push(scanned);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        assert_eq!(evidence[0], evidence[1]);
+    }
+
+    #[test]
+    fn short_anchor_suffix_widens_to_preserve_tail_context() {
+        // Build a journal with two checkpoint anchors covering 80 percent of
+        // the stream; replaying the tail should land on the newest anchor
+        // since the suffix alone holds enough lines, instead of falling back
+        // to a full scan across the recording.
+        let dir =
+            std::env::temp_dir().join(format!("oly_render_unanchored_tail_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test session dir");
+        {
+            use crate::session::journal::{Checkpoint, ShadowJournal};
+            let (mut journal, _, _) = ShadowJournal::open(&dir).unwrap();
+            for chunk in [
+                b"aaaa\n".as_slice(),
+                b"bbbb\n".as_slice(),
+                b"cccc\n".as_slice(),
+                b"dddd\n".as_slice(),
+                b"eeee\n".as_slice(),
+                b"ffff\n".as_slice(),
+                b"gggg\n".as_slice(),
+            ] {
+                journal
+                    .record_output(bytes::Bytes::copy_from_slice(chunk))
+                    .unwrap();
+            }
+            // Anchor after the first three chunks (~after "cccc\n" — bytes
+            // 0..=15, filtered_offset=16 with the trailing newline bytes).
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: 16,
+                    program: bytes::Bytes::from_static(b"\x1b[2Jrepaint"),
+                })
+                .unwrap();
+            journal
+                .record_checkpoint(&Checkpoint {
+                    rows: 24,
+                    cols: 80,
+                    cursor: (1, 1),
+                    alt_screen: false,
+                    app_cursor_keys: false,
+                    bracketed_paste: false,
+                    filtered_offset: 24,
+                    program: bytes::Bytes::from_static(b"\x1b[2Jrepaint"),
+                })
+                .unwrap();
+            for chunk in [
+                b"hhhh\n".as_slice(),
+                b"iiii\n".as_slice(),
+                b"jjjj\n".as_slice(),
+                b"kkkk\n".as_slice(),
+            ] {
+                journal
+                    .record_output(bytes::Bytes::copy_from_slice(chunk))
+                    .unwrap();
+            }
+            journal.shutdown();
+        }
+
+        let tail = replay_filtered_tail(&dir, 3).expect("tail replay");
+        assert_eq!(
+            tail.bytes, b"aaaa\nbbbb\ncccc\ndddd\neeee\nffff\ngggg\nhhhh\niiii\njjjj\nkkkk\n",
+            "short anchor suffix must widen instead of losing requested context"
+        );
+        assert_eq!(tail.end_offset, 55);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

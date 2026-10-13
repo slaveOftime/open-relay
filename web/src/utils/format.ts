@@ -1,4 +1,4 @@
-import type { SessionStatus } from '../api/types.ts'
+import type { SessionStatus } from '@/api/types'
 
 // ---------------------------------------------------------------------------
 // Age / time formatting
@@ -143,13 +143,20 @@ export function agentName(command: string): string {
     python: 'Python',
     python3: 'Python',
     copilot: 'GitHub Copilot',
+    pi: 'Pi',
+    wsl: 'WSL',
   }
   return known[base.toLowerCase()] ?? base
 }
 
+export function normalizeCwdPath(cwd: string | null): string {
+  if (!cwd) return ''
+  return cwd.trim().replace(/\\/g, '/').replace(/\/+$/, '')
+}
+
 export function cwdBasename(cwd: string | null): string {
   if (!cwd) return ''
-  return cwd.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? cwd
+  return normalizeCwdPath(cwd).split('/').filter(Boolean).pop() ?? cwd
 }
 
 // ── Shell arg parser ─────────────────────────────────────────────────────────

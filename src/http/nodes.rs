@@ -12,11 +12,13 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
 use crate::{
+    federation_crypto,
     http::AppState,
     node::{NodeHandle, PendingRpc},
     notification::event::{NotificationEvent, NotificationKind, NotificationTriggerRule},
     protocol::{
-        NodeSummary, NodeWsMessage, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
+        FEDERATION_VERSION, MAX_NODE_HANDSHAKE_BYTES, NODE_HANDSHAKE_TIMEOUT, NodeSummary,
+        NodeWsMessage, RpcResponse,
     },
     session::SessionEvent,
 };
@@ -46,112 +48,95 @@ pub async fn join_handler(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    // Rate-limit join attempts per IP to prevent brute-force API key guessing.
     let client_ip = peer.ip();
-    if let Some(ref auth) = state.auth {
-        if let Some(locked_until) = auth.locked_until(client_ip).await {
-            let secs = locked_until
-                .saturating_duration_since(std::time::Instant::now())
-                .as_secs();
-            warn!(ip = %client_ip, "node join: rate limited (locked for ~{}s)", secs);
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(axum::http::header::RETRY_AFTER, secs.to_string())],
-                "too many failed attempts",
-            )
-                .into_response();
-        }
+    if state.node_registry.join_rate_limited(client_ip).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed identity attempts",
+        )
+            .into_response();
     }
-
-    ws.on_upgrade(move |socket| handle_join(socket, state, client_ip))
+    ws.max_frame_size(64 * 1024 * 1024)
+        .max_message_size(64 * 1024 * 1024)
+        .on_upgrade(move |socket| handle_join(socket, state, client_ip))
 }
 
 async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::IpAddr) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    // ── Step 1: read handshake ────────────────────────────────────────────
-    let first = match ws_rx.next().await {
-        Some(Ok(Message::Binary(data))) => data,
-        _ => return,
-    };
-
-    let handshake: NodeWsMessage = match decode_node_ws_payload(&first) {
-        Ok(m) => m,
-        Err(_) => {
-            send_error(&mut ws_tx, "invalid handshake format").await;
+    // No registry entry exists during the bounded confirmation exchange.
+    let deadline = tokio::time::Instant::now() + NODE_HANDSHAKE_TIMEOUT;
+    let established =
+        tokio::time::timeout_at(deadline, primary_handshake(&mut ws_tx, &mut ws_rx, &state)).await;
+    let (name, mut phase) = match established {
+        Ok(Ok(connection)) => connection,
+        result => {
+            state.node_registry.record_join_failure(client_ip).await;
+            let reason = match result {
+                Ok(Err(err)) => err.to_string(),
+                Err(_) => "node identity handshake timed out".to_string(),
+                _ => unreachable!(),
+            };
+            send_error(&mut ws_tx, &reason).await;
             return;
         }
     };
-
-    let (name, key) = match handshake {
-        NodeWsMessage::Join { name, key } => (name, key),
-        _ => {
-            send_error(&mut ws_tx, "expected join message").await;
-            return;
-        }
-    };
-
-    // ── Step 2: validate API key against any registered key ──────────────
-    let hashes = match state.db.list_api_key_hashes().await {
-        Ok(h) => h,
-        Err(_) => {
-            send_error(&mut ws_tx, "internal error").await;
-            return;
-        }
-    };
-
-    // Run Argon2 verification on a blocking thread to avoid starving the
-    // async runtime with CPU-intensive work.
-    let key_clone = key.clone();
-    let verified = tokio::task::spawn_blocking(move || {
-        !hashes.is_empty() && hashes.iter().any(|h| verify_api_key(&key_clone, h))
-    })
-    .await
-    .unwrap_or(false);
-
-    if !verified {
-        if let Some(ref auth) = state.auth {
-            auth.record_failure(client_ip).await;
-        }
-        send_error(&mut ws_tx, "unauthorized").await;
-        return;
-    }
-
-    // ── Step 3: reject duplicate node names ──────────────────────────────
-    if state.node_registry.is_connected(&name).await {
-        send_error(&mut ws_tx, &format!("name '{name}' is already connected")).await;
-        return;
-    }
-
-    info!(node = %name, "secondary node connected");
-
-    // ── Step 4: set up RPC relay channel and register node ───────────────
-    let (send_tx, mut send_rx) = mpsc::channel::<(String, serde_json::Value)>(64);
+    let (send_tx, mut send_rx) = mpsc::channel::<NodeWsMessage>(64);
     let pending: Arc<Mutex<HashMap<String, PendingRpc>>> = Arc::new(Mutex::new(HashMap::new()));
     let pending_recv = Arc::clone(&pending);
-
     let handle = NodeHandle { send_tx, pending };
-    state.node_registry.connect(name.clone(), handle).await;
-
-    // ── Step 5: send Joined (node is already visible in registry) ────────
-    if send_node_message(&mut ws_tx, &NodeWsMessage::Joined)
-        .await
-        .is_err()
-    {
-        state.node_registry.disconnect(&name).await;
+    let generation = match state.node_registry.connect(name.clone(), handle).await {
+        Ok(generation) => generation,
+        Err(err) => {
+            let _ = tokio::time::timeout_at(
+                deadline,
+                send_node_message(
+                    &mut ws_tx,
+                    &NodeWsMessage::Error {
+                        message: err.to_string(),
+                    },
+                    &mut phase,
+                ),
+            )
+            .await;
+            return;
+        }
+    };
+    if !matches!(
+        tokio::time::timeout_at(
+            deadline,
+            send_node_message(&mut ws_tx, &NodeWsMessage::Joined, &mut phase)
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        state.node_registry.disconnect(&name, generation).await;
         return;
     }
+    info!(node = %name, "secondary node connected after encrypted readiness");
 
     // ── Step 6: relay loop (single task, select! on send_rx and ws_rx) ───
+    // Only authenticated application frames refresh liveness. Unsealed
+    // transport pongs cannot keep an identity-authenticated link alive.
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_inbound = std::time::Instant::now();
     let disconnect_reason = loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if last_inbound.elapsed() > std::time::Duration::from_secs(45) {
+                    break "node keepalive timeout (no inbound frames for 45s)".to_string();
+                }
+                if let Err(err) = send_node_message(&mut ws_tx, &NodeWsMessage::Ping, &mut phase).await {
+                    break format!("failed to send sealed node keepalive: {err}");
+                }
+            }
             // Outgoing: channel → WS
             msg = send_rx.recv() => {
-                let Some((id, req_json)) = msg else {
+                let Some(ws_msg) = msg else {
                     break "node RPC relay channel closed".to_string();
                 };
-                let ws_msg = NodeWsMessage::Rpc { id, request: req_json };
-                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg).await {
+                if let Err(err) = send_node_message(&mut ws_tx, &ws_msg, &mut phase).await {
                     break format!("failed to send proxied RPC to node WebSocket: {err}");
                 }
             }
@@ -159,20 +144,28 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
             incoming = ws_rx.next() => {
                 match incoming {
                     Some(Ok(frame)) => {
+                        // Tungstenite auto-frames Ping / Pong on the
+                        // WebSocket transport — silently drop ones that
+                        // surface here so we do not emit "failed to
+                        // decode secondary node frame" warnings on every
+                        // 15s keepalive tick.
+                        match frame {
+                            Message::Ping(_) | Message::Pong(_) => continue,
+                            _ => {}
+                        }
                         let message = match frame {
                             Message::Close(frame) => {
                                 break close_frame_disconnect_reason(frame);
                             }
-                            other => match parse_node_message(other) {
+                            other => match parse_node_message(other, &mut phase) {
                                 Ok(message) => message,
                                 Err(err) => {
-                                    warn!(node = %name, %err, "failed to decode secondary node frame");
-                                    continue;
+                                    break format!("invalid sealed node frame: {err}");
                                 }
                             },
                         };
+                        last_inbound = std::time::Instant::now();
                         match message {
-                            node_message => match node_message {
                                 NodeWsMessage::RpcResponse { id, response } => {
                                     if let Ok(rpc_resp) = serde_json::from_value::<RpcResponse>(response) {
                                         let sender = {
@@ -217,12 +210,11 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                                     None
                                                 }
                                             };
-                                            if let Some(tx) = tx_clone {
-                                                if tx.send(Ok(rpc_resp)).await.is_err() {
+                                            if let Some(tx) = tx_clone
+                                                && tx.send(Ok(rpc_resp)).await.is_err() {
                                                     let mut pm = pending_recv.lock().await;
                                                     pm.remove(&id);
                                                 }
-                                            }
                                         }
                                     }
                                 }
@@ -230,6 +222,7 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                     if let Err(err) = send_node_message(
                                         &mut ws_tx,
                                         &NodeWsMessage::Pong,
+                                        &mut phase,
                                     )
                                     .await {
                                         break format!("failed to send pong to node WebSocket: {err}");
@@ -267,8 +260,8 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                                     handle_forwarded_session_event(&state, &name, payload)
                                         .await;
                                 }
-                                _ => {}
-                            }
+                                NodeWsMessage::Pong => {},
+                                _ => break "unexpected message in established secondary channel".to_string(),
                         }
                     }
                     Some(Err(err)) => break format!("node WebSocket receive error: {err}"),
@@ -289,15 +282,101 @@ async fn handle_join(socket: WebSocket, state: AppState, client_ip: std::net::Ip
                     let _ = tx.send(Err(err()));
                 }
                 PendingRpc::Stream(tx) => {
-                    let _ = tx.send(Err(err()));
+                    // Never let a full abandoned stream queue block registry
+                    // cleanup. Dropping its sender still closes the receiver.
+                    let _ = tx.try_send(Err(err()));
                 }
             }
         }
         drained_waiters
     };
 
-    state.node_registry.disconnect(&name).await;
+    state.node_registry.disconnect(&name, generation).await;
     warn!(node = %name, reason = %disconnect_reason, drained_waiters, "secondary node disconnected");
+}
+
+async fn read_handshake_frame(
+    rx: &mut futures_util::stream::SplitStream<WebSocket>,
+) -> crate::error::Result<Vec<u8>> {
+    match rx.next().await {
+        Some(Ok(Message::Binary(bytes))) if bytes.len() <= MAX_NODE_HANDSHAKE_BYTES => {
+            Ok(bytes.to_vec())
+        }
+        _ => Err(crate::error::AppError::Protocol(
+            "expected bounded binary handshake frame".into(),
+        )),
+    }
+}
+
+async fn primary_handshake(
+    tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    rx: &mut futures_util::stream::SplitStream<WebSocket>,
+    state: &AppState,
+) -> crate::error::Result<(String, federation_crypto::Channel)> {
+    use crate::error::AppError;
+    let fail = |message: &str| AppError::Protocol(message.to_string());
+    let signing_key = state
+        .node_identity
+        .signing_key()
+        .ok_or_else(|| fail("node identity unavailable; federation disabled"))?;
+    let hello: NodeWsMessage =
+        federation_crypto::decode_handshake(&read_handshake_frame(rx).await?)?;
+    let NodeWsMessage::Hello {
+        version,
+        name,
+        public_key,
+        nonce,
+    } = hello
+    else {
+        return Err(fail("expected hello"));
+    };
+    if version != FEDERATION_VERSION {
+        return Err(fail("unsupported federation version"));
+    }
+    if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+        return Err(fail("invalid node name"));
+    }
+    let peer = federation_crypto::parse_public_key(&public_key)?;
+    let primary_nonce = federation_crypto::fresh_nonce();
+    // A fresh challenge is minted for this socket only. No in-band trust root.
+    let challenge = federation_crypto::encode_handshake(&NodeWsMessage::Challenge {
+        nonce: primary_nonce,
+    })?;
+    tx.send(Message::Binary(challenge.into()))
+        .await
+        .map_err(|e| fail(&e.to_string()))?;
+    let transcript = federation_crypto::build_transcript(
+        version,
+        "secondary-proof",
+        &name,
+        peer.as_bytes(),
+        signing_key.verifying_key().as_bytes(),
+        &nonce,
+        &primary_nonce,
+    );
+    let NodeWsMessage::Join { signature } =
+        federation_crypto::decode_handshake(&read_handshake_frame(rx).await?)?
+    else {
+        return Err(fail("expected identity join proof"));
+    };
+    let registered = state.db.get_node_identity(&name).await?;
+    if registered.is_none_or(|(_, key)| key != peer.to_line())
+        || !federation_crypto::verify_transcript(&peer, &signature, &transcript)
+    {
+        return Err(fail("unauthorized node identity or transcript"));
+    }
+    let mut channel = federation_crypto::Channel::new(&signing_key, &peer, &transcript, false)?;
+    let hash = channel.transcript_hash();
+    let confirmation = channel.encode_message(&NodeWsMessage::KeyConfirm {
+        transcript_hash: hash,
+    })?;
+    tx.send(Message::Binary(confirmation.into()))
+        .await
+        .map_err(|e| fail(&e.to_string()))?;
+    match channel.decode_message(&read_handshake_frame(rx).await?)? {
+        NodeWsMessage::Ready { transcript_hash } if transcript_hash == hash => Ok((name, channel)),
+        _ => Err(fail("expected encrypted readiness for this transcript")),
+    }
 }
 
 async fn handle_forwarded_session_event(state: &AppState, node_name: &str, payload: SessionEvent) {
@@ -365,16 +444,6 @@ async fn handle_forwarded_session_event(state: &AppState, node_name: &str, paylo
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn verify_api_key(key: &str, hash: &str) -> bool {
-    use argon2::{Argon2, PasswordHash, PasswordVerifier};
-    let Ok(parsed) = PasswordHash::new(hash) else {
-        return false;
-    };
-    Argon2::default()
-        .verify_password(key.as_bytes(), &parsed)
-        .is_ok()
-}
-
 async fn send_error(
     ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: &str,
@@ -382,30 +451,39 @@ async fn send_error(
     let msg = NodeWsMessage::Error {
         message: message.to_string(),
     };
-    if let Ok(payload) = encode_node_ws_payload(&msg) {
-        let _ = ws_tx.send(Message::Binary(payload.into())).await;
+    if let Ok(payload) = federation_crypto::encode_handshake(&msg) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ws_tx.send(Message::Binary(payload.into())),
+        )
+        .await;
     }
 }
 
 async fn send_node_message(
     ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     message: &NodeWsMessage,
+    phase: &mut federation_crypto::Channel,
 ) -> Result<(), String> {
-    match encode_node_ws_payload(message) {
-        Ok(payload) => ws_tx
-            .send(Message::Binary(payload.into()))
-            .await
-            .map_err(|err| err.to_string()),
+    let payload = match phase.encode_message(message) {
+        Ok(p) => p,
         Err(err) => {
             warn!(%err, "failed to encode node WebSocket frame");
-            Err(err.to_string())
+            return Err(err.to_string());
         }
-    }
+    };
+    ws_tx
+        .send(Message::Binary(payload.into()))
+        .await
+        .map_err(|err| err.to_string())
 }
 
-fn parse_node_message(frame: Message) -> std::io::Result<NodeWsMessage> {
+fn parse_node_message(
+    frame: Message,
+    phase: &mut federation_crypto::Channel,
+) -> std::io::Result<NodeWsMessage> {
     match frame {
-        Message::Binary(data) => decode_node_ws_payload(&data),
+        Message::Binary(data) => phase.decode_message(&data).map_err(std::io::Error::other),
         _ => Err(std::io::Error::other("unsupported node WebSocket frame")),
     }
 }

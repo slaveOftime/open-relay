@@ -1,0 +1,46 @@
+version: 2
+
+# Keep lockfile churn + security advisories as PR noise that the existing
+# CI matrix will catch and review. Auto-merge is left off on purpose so a
+# human signs off each batch.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Let review, not Dependabot, decide when to merge.
+    auto-merge: false
+    labels:
+      - dependabot
+      - rust
+    ignore:
+      # lto = "fat" +opt-level = "z" + strip in [profile.release] is
+      # sensitive to small toolchain bumps; pin major versions.
+      - dependency-name: rustsec/rustsec
+      - dependency-name: "openssl*"
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependabot
+      - web
+    ignore:
+      # xterm and Radix UI bumps are tested manually against the
+      # terminal pane; pin majors to avoid surprise breakage.
+      - dependency-name: "@xterm/*"
+      - dependency-name: "@radix-ui/*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependabot
+      - ci
+    # Workflow actions are not in this repository's exclude dependencies,
+    # so Dependabot falls back to filtering by major versions only.

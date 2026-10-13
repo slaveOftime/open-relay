@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local, Utc};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::{
     cli::ListArgs,
@@ -33,6 +34,40 @@ pub(super) fn list_targets(args: &ListArgs) -> Vec<ListTarget> {
             .map(|node| ListTarget { node: Some(node) }),
     );
     targets
+}
+
+pub(super) fn list_targets_for_all_nodes(
+    node_names: impl IntoIterator<Item = String>,
+) -> Vec<ListTarget> {
+    let mut nodes: Vec<_> = node_names.into_iter().collect();
+    nodes.sort();
+    nodes.dedup();
+    let mut targets = Vec::with_capacity(nodes.len() + 1);
+    targets.push(ListTarget { node: None });
+    targets.extend(
+        nodes
+            .into_iter()
+            .map(|node| ListTarget { node: Some(node) }),
+    );
+    targets
+}
+pub(super) async fn fetch_node_names(config: &AppConfig) -> Result<Vec<String>> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        ipc::send_request_checked(config, RpcRequest::NodeList),
+    )
+    .await
+    .map_err(|_| AppError::Protocol("node list refresh timed out".to_string()))??;
+    match response {
+        RpcResponse::NodeList { mut nodes } => {
+            nodes.sort();
+            nodes.dedup();
+            Ok(nodes)
+        }
+        _ => Err(AppError::Protocol(
+            "unexpected response to node list".to_string(),
+        )),
+    }
 }
 
 pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
@@ -81,7 +116,8 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
                 if target.node.is_none() && !multiple_targets =>
             {
                 used_db_fallback = true;
-                let db = Database::open(&config.db_file, config.sessions_dir.clone()).await?;
+                let db = Database::open(&config.paths.db_file, config.paths.sessions_dir.clone())
+                    .await?;
                 let total = db.count_summaries(&query).await?;
                 let sessions = db.list_summaries(&query).await?;
                 (sessions, total)
@@ -97,9 +133,10 @@ pub async fn run_list(config: &AppConfig, list_args: ListArgs) -> Result<()> {
         total += target_total;
     }
 
-    sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.created_at));
     sessions.truncate(limit);
     sessions.reverse();
+    crate::metrics::mark("list: data ready");
 
     if list_args.json {
         let items = sessions
@@ -229,6 +266,7 @@ fn session_json(session: &SessionSummary) -> Value {
         "created_at": session.created_at.to_rfc3339() ,
         "started_at": session.started_at.map(|dt| dt.to_rfc3339()),
         "ended_at": session.ended_at.map(|dt| dt.to_rfc3339()),
+        "resume_command": session.resume_command,
         "input_needed": session.input_needed,
         "last_total_bytes": session.last_total_bytes,
         "last_output_epoch": session.last_output_epoch.map(|dt| dt.to_rfc3339()),
@@ -324,6 +362,7 @@ mod tests {
             until: None,
             limit: 25,
             node: vec![],
+            node_all: false,
             node_local: false,
         };
 
@@ -347,6 +386,7 @@ mod tests {
             until: None,
             limit: 100,
             node: vec!["worker-a".into(), "worker-b".into(), "worker-a".into()],
+            node_all: false,
             node_local: true,
         };
 
@@ -357,6 +397,18 @@ mod tests {
         assert_eq!(targets[2].node.as_deref(), Some("worker-b"));
     }
 
+    #[test]
+    fn all_node_targets_include_local_and_deduplicate_connected_nodes() {
+        let targets = super::list_targets_for_all_nodes(vec![
+            "worker-b".to_string(),
+            "worker-a".to_string(),
+            "worker-b".to_string(),
+        ]);
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].node, None);
+        assert_eq!(targets[1].node.as_deref(), Some("worker-a"));
+        assert_eq!(targets[2].node.as_deref(), Some("worker-b"));
+    }
     #[test]
     fn session_json_includes_iso_time_and_input_required_fields() {
         let created_at = Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap();
@@ -371,6 +423,7 @@ mod tests {
             created_at,
             started_at: None,
             ended_at: None,
+            resume_command: Some("codex resume 0199e6e2-b60e-715d-851f-b8713b7064df".into()),
             cwd: Some("C:/work".to_string()),
             input_needed: true,
             notifications_enabled: false,
@@ -382,6 +435,10 @@ mod tests {
             attach_count: 0,
             foreground_color: None,
             background_color: None,
+            journal_bytes_retained: None,
+            journal_retention_sweeps: None,
+            journal_incarnations_dropped: None,
+            journal_byte_cap: None,
         };
 
         let value = session_json(&session);
@@ -391,6 +448,10 @@ mod tests {
         );
         assert_eq!(value["input_needed"], serde_json::json!(true));
         assert_eq!(value["last_total_bytes"], serde_json::json!(4096));
+        assert_eq!(
+            value["resume_command"],
+            serde_json::json!("codex resume 0199e6e2-b60e-715d-851f-b8713b7064df")
+        );
     }
 
     #[test]

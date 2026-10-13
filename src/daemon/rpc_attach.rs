@@ -1,37 +1,39 @@
 use interprocess::local_socket::tokio::Stream;
 use tokio::{io::BufReader, sync::mpsc};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     error::Result,
     ipc,
     protocol::{RpcRequest, RpcResponse},
-    session::pty::collect_chunk_bytes,
-    session::resize::ResizeSubscriber,
+    session::{
+        AttachEvent, AttachPump,
+        registry::{AttachKind, AttachRole},
+        resize::ResizeSubscriber,
+    },
 };
 
 use super::SessionStoreHandle;
 
-/// Upper bound on how much already-queued PTY output one attach frame carries.
+/// Stream one session's output to an IPC client.
 ///
-/// Batching output chunks is what keeps a large paste from costing one framed
-/// write, JSON encode and base64 pass per 64 KiB read. The cap keeps a batch
-/// well under the IPC line limit once base64 expansion is accounted for, and
-/// keeps the client painting incrementally instead of stalling on one huge
-/// frame.
-const MAX_COALESCED_CHUNK_BYTES: usize = 1024 * 1024;
-
+/// The output state machine (follow, coalesce, lag resync, completion
+/// flush, mode tracking) lives in [`AttachPump`]; this handler is the thin
+/// IPC adapter that frames pump events as [`RpcResponse`]s and forwards
+/// client input/resize/detach requests.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_attach_subscribe(
     id: String,
     from_byte_offset: Option<u64>,
+    incarnation: Option<u64>,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
+    role: Option<String>,
+    credited: bool,
     mut reader: BufReader<tokio::io::ReadHalf<Stream>>,
     mut writer: tokio::io::WriteHalf<Stream>,
     session_store: &SessionStoreHandle,
 ) -> Result<()> {
-    use tokio::sync::broadcast::error::RecvError;
-
     debug!(
         session_id = %id,
         from_byte_offset,
@@ -40,52 +42,63 @@ pub(super) async fn handle_attach_subscribe(
         "starting IPC streaming session relay"
     );
 
-    if from_byte_offset.is_none()
-        && let (Some(rows), Some(cols)) = (initial_rows, initial_cols)
-        && rows > 0
-        && cols > 0
-        && let Err(err) = session_store.attach_resize(&id, rows, cols).await
+    // Register the attachment (role + viewport) *before* taking the
+    // snapshot, so a controller's initial geometry is applied through the
+    // sequencer and is already reflected in the init.
+    let role = match AttachRole::parse(role.as_deref()) {
+        Ok(role) => role,
+        Err(message) => {
+            return ipc::write_response_to_writer(&mut writer, RpcResponse::Error { message })
+                .await;
+        }
+    };
+    let viewport = match (from_byte_offset, initial_rows, initial_cols) {
+        (None, Some(rows), Some(cols)) if rows > 0 && cols > 0 => Some((rows, cols)),
+        _ => None,
+    };
+    let registration = match session_store
+        .attach_register(&id, AttachKind::Cli, role, viewport)
+        .await
     {
-        warn!(
-            session_id = %id,
-            rows,
-            cols,
-            error = err.message(&id),
-            "IPC stream pre-snapshot resize failed"
-        );
-    }
+        Ok(registration) => registration,
+        Err(err) => {
+            let resp = RpcResponse::Error {
+                message: err.message(&id),
+            };
+            return ipc::write_response_to_writer(&mut writer, resp).await;
+        }
+    };
+    let attachment_id = registration.attachment_id;
+    let current_role = registration.role;
 
-    let (data, end_offset, mut broadcast_rx, bracketed_paste_mode, app_cursor_keys) =
-        match from_byte_offset {
-            None => match session_store.attach_snapshot_init(&id).await {
-                Ok(t) => t,
-                Err(err) => {
-                    debug!(session_id = %id, error = err.message(&id), "IPC snapshot init failed");
-                    let resp = RpcResponse::Error {
-                        message: err.message(&id),
-                    };
-                    return ipc::write_response_to_writer(&mut writer, resp).await;
-                }
-            },
-            Some(offset) => match session_store.attach_subscribe_init(&id, Some(offset)).await {
-                Ok((chunks, end_offset, rx, bracketed_paste_mode, app_cursor_keys)) => (
-                    collect_chunk_bytes(&chunks),
-                    end_offset,
-                    rx,
-                    bracketed_paste_mode,
-                    app_cursor_keys,
-                ),
-                Err(err) => {
-                    debug!(session_id = %id, error = err.message(&id), "IPC stream init failed");
-                    let resp = RpcResponse::Error {
-                        message: err.message(&id),
-                    };
-                    return ipc::write_response_to_writer(&mut writer, resp).await;
-                }
-            },
-        };
-
-    let running = session_store.is_running(&id);
+    // Local IPC clients ack applied cursors, so their stream is
+    // credit-gated; node-relayed subscriptions arrive with `credited:
+    // false` and run ungated (the relay cannot forward mid-stream credits
+    // — documented limitation until direct remote streams).
+    let credit = if credited {
+        crate::session::PumpCredit::Credited { attachment_id }
+    } else {
+        crate::session::PumpCredit::Uncredited
+    };
+    let (mut pump, init) = match AttachPump::subscribe(
+        session_store,
+        &id,
+        from_byte_offset,
+        incarnation,
+        credit,
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(err) => {
+            debug!(session_id = %id, error = err.message(&id), "IPC attach init failed");
+            let _ = session_store.attach_detach(&id, attachment_id).await;
+            let resp = RpcResponse::Error {
+                message: err.message(&id),
+            };
+            return ipc::write_response_to_writer(&mut writer, resp).await;
+        }
+    };
 
     // Seed scrollback only for fresh interactive attaches: offset-based
     // resumes already have their terminal history, and piped attaches have no
@@ -102,29 +115,34 @@ pub(super) async fn handle_attach_subscribe(
 
     debug!(
         session_id = %id,
-        snapshot_bytes = data.len(),
+        snapshot_bytes = init.data.len(),
         scrollback_bytes = scrollback.len(),
-        end_offset,
-        running,
-        app_cursor_keys,
-        bracketed_paste_mode,
+        end_offset = init.end_offset,
+        running = init.running,
+        app_cursor_keys = init.modes.app_cursor_keys,
+        bracketed_paste_mode = init.modes.bracketed_paste_mode,
         "IPC stream init prepared"
     );
     ipc::write_response_to_writer(
         &mut writer,
         RpcResponse::AttachStreamInit {
-            data,
-            end_offset,
-            running,
-            bracketed_paste_mode,
-            app_cursor_keys,
+            data: init.data,
+            end_offset: init.end_offset,
+            running: init.running,
+            bracketed_paste_mode: init.modes.bracketed_paste_mode,
+            app_cursor_keys: init.modes.app_cursor_keys,
+            mouse_report: init.modes.mouse_report,
+            sgr_mouse: init.modes.sgr_mouse,
+            focus_events: init.modes.focus_events,
             scrollback,
+            incarnation: init.incarnation,
+            attachment_id,
+            role: current_role.as_str().to_owned(),
         },
     )
     .await?;
 
-    session_store.register_attach_client(&id).await;
-    debug!(session_id = %id, "IPC stream client registered");
+    debug!(session_id = %id, attachment_id, role = current_role.as_str(), "IPC stream client registered");
 
     // Subscribe to resize broadcasts so we can notify this client when
     // another attached client changes the PTY size.
@@ -144,74 +162,10 @@ pub(super) async fn handle_attach_subscribe(
         }
     });
 
-    let mut current_offset = end_offset;
-    let mut completion_check = tokio::time::interval(std::time::Duration::from_millis(100));
-    completion_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    let mut last_modes = crate::session::ModeSnapshot {
-        app_cursor_keys,
-        bracketed_paste_mode,
-    };
-    // Held for the lifetime of the stream so mode changes can be detected with
-    // a relaxed atomic load per chunk instead of a session read lock.
-    let shared_modes = session_store.shared_modes(&id);
-
     let result = async {
         loop {
             tokio::select! {
                 biased;
-
-                _ = completion_check.tick() => {
-                    let (running, _output_closed, exit_code) = {
-                        match session_store.attach_stream_status(&id).await {
-                            Ok(state) => state,
-                            Err(err) => {
-                                warn!(session_id = %id, error = err.message(&id), "IPC stream status lookup failed");
-                                break;
-                            }
-                        }
-                    };
-
-                    if !running {
-                        let (chunks, new_end) = {
-                            match session_store.attach_subscribe_init(&id, Some(current_offset)).await {
-                                Ok((chunks, end, _rx, _bpm, _ack)) => (chunks, end),
-                                Err(_) => (Vec::new(), current_offset),
-                            }
-                        };
-
-                        if !chunks.is_empty() {
-                            let raw = collect_chunk_bytes(&chunks);
-                            if !raw.is_empty() {
-                                debug!(
-                                    session_id = %id,
-                                    resync_chunks = chunks.len(),
-                                    resync_bytes = raw.len(),
-                                    from_offset = current_offset,
-                                    to_offset = new_end,
-                                    "IPC stream flushing final buffered output before completion"
-                                );
-                                ipc::write_response_to_writer(
-                                    &mut writer,
-                                    RpcResponse::AttachStreamChunk {
-                                        offset: current_offset,
-                                        data: raw,
-                                    },
-                                )
-                                .await?;
-                            }
-                        }
-                        current_offset = new_end;
-
-                        info!(session_id = %id, ?exit_code, final_offset = current_offset, "IPC stream completed");
-                        let _ = ipc::write_response_to_writer(
-                            &mut writer,
-                            RpcResponse::AttachStreamDone { exit_code },
-                        )
-                        .await;
-                        break;
-                    }
-                }
 
                 client_msg = client_msg_rx.recv() => {
                     match client_msg {
@@ -223,20 +177,41 @@ pub(super) async fn handle_attach_subscribe(
                             warn!(session_id = %id, %err, "IPC client request read failed");
                             break;
                         }
-                        Some(Ok(RpcRequest::AttachInput { id: req_id, data, wait_for_change })) if req_id == id => {
+                        Some(Ok(RpcRequest::AttachInput { id: req_id, data, wait_for_change, .. })) if req_id == id => {
                             trace!(session_id = %id, bytes = data.len(), "IPC client input received");
-                            if session_store.attach_input(&req_id, &data, wait_for_change).await.is_err() {
-                                warn!(session_id = %id, "IPC client input forwarding failed");
-                                break;
+                            if let Err(err) = session_store.attach_input(&req_id, Some(attachment_id), &data, wait_for_change).await {
+                                // Observe-mode violations are
+                                // client-visible; transport failures end
+                                // the stream.
+                                if matches!(err, crate::session::SessionError::ViewOnly | crate::session::SessionError::StaleAttachment) {
+                                    let message = err.message(&id);
+                                    if ipc::write_attach_control_frame(&mut writer, &RpcResponse::Error { message }).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    warn!(session_id = %id, "IPC client input forwarding failed");
+                                    break;
+                                }
                             }
                         }
                         Some(Ok(RpcRequest::AttachResize { id: req_id, rows, cols })) if req_id == id => {
                             debug!(session_id = %id, rows, cols, "IPC client resize received");
                             resize_sub.mark_sent(rows, cols);
-                            if session_store.attach_resize(&req_id, rows, cols).await.is_err() {
+                            if let Err(err) = session_store.attach_resize(&req_id, Some(attachment_id), rows, cols).await {
+                                // Observers never resize the shared PTY; their
+                                // declared size is recorded as a viewport only.
+                                if matches!(err, crate::session::SessionError::ViewOnly | crate::session::SessionError::StaleAttachment) {
+                                    resize_sub.mark_sent(0, 0);
+                                    continue;
+                                }
                                 warn!(session_id = %id, rows, cols, "IPC client resize forwarding failed");
                                 break;
                             }
+                        }
+                        Some(Ok(RpcRequest::AttachAppliedCursor { id: req_id, cursor })) if req_id == id => {
+                            session_store
+                                .attach_report_applied(&req_id, attachment_id, cursor)
+                                .await;
                         }
                         Some(Ok(RpcRequest::AttachDetach { id: req_id })) if req_id == id => {
                             debug!(session_id = %id, "IPC client requested detach");
@@ -248,118 +223,40 @@ pub(super) async fn handle_attach_subscribe(
                     }
                 }
 
-                chunk = broadcast_rx.recv() => {
-                    match chunk {
-                        Ok(mut filtered) => {
-                            // Coalesce every chunk the reader has already
-                            // produced into one IPC frame. A large paste echoes
-                            // back as a burst of 64 KiB reads; forwarding them
-                            // individually costs one framed write, one JSON
-                            // encode and one base64 pass each, which is what
-                            // made pasting feel sluggish.
-                            let mut coalesced: Option<Vec<u8>> = None;
-                            while coalesced.as_ref().map_or(filtered.len(), Vec::len)
-                                < MAX_COALESCED_CHUNK_BYTES
-                            {
-                                let Ok(next) = broadcast_rx.try_recv() else {
-                                    break;
-                                };
-                                let buffer = coalesced
-                                    .get_or_insert_with(|| filtered.as_ref().to_vec());
-                                buffer.extend_from_slice(&next);
-                            }
-                            let batch_len = coalesced
-                                .as_ref()
-                                .map_or(filtered.len(), Vec::len);
-
-                            if batch_len > 0 {
-                                let data = coalesced
-                                    .unwrap_or_else(|| std::mem::take(&mut filtered).into());
-                                ipc::write_response_to_writer(
-                                    &mut writer,
-                                    RpcResponse::AttachStreamChunk {
-                                        offset: current_offset,
-                                        data,
-                                    },
-                                )
-                                .await?;
-                            }
-                            current_offset += batch_len as u64;
-                            trace!(
-                                session_id = %id,
-                                filtered_bytes = batch_len,
-                                current_offset,
-                                "forwarded live PTY output over IPC stream"
-                            );
-
-                            if let Some(modes) = shared_modes.as_ref().map(|shared| shared.load()) {
-                                if modes != last_modes {
-                                    debug!(
-                                        session_id = %id,
-                                        app_cursor_keys = modes.app_cursor_keys,
-                                        bracketed_paste_mode = modes.bracketed_paste_mode,
-                                        "IPC stream terminal mode changed"
-                                    );
-                                    ipc::write_response_to_writer(
-                                        &mut writer,
-                                        RpcResponse::AttachModeChanged {
-                                            app_cursor_keys: modes.app_cursor_keys,
-                                            bracketed_paste_mode: modes.bracketed_paste_mode,
-                                        },
-                                    )
-                                    .await?;
-                                    last_modes = modes;
-                                }
-                            }
+                event = pump.next() => {
+                    match event {
+                        AttachEvent::Chunk { offset, data } => {
+                            // Raw binary frame, no base64 (ADR-0004).
+                            ipc::write_attach_output_frame(&mut writer, offset, &data).await?;
                         }
-                        Err(RecvError::Lagged(skipped)) => {
-                            warn!(
-                                session_id = %id,
-                                skipped,
-                                from_offset = current_offset,
-                                "IPC stream lagged behind broadcast output; resyncing from persisted output"
-                            );
-                            let (chunks, new_end) = {
-                                match session_store.attach_subscribe_init(&id, Some(current_offset)).await {
-                                    Ok((c, e, rx, _bpm, _ack)) => {
-                                        broadcast_rx = rx;
-                                        (c, e)
-                                    }
-                                    Err(err) => {
-                                        warn!(session_id = %id, error = err.message(&id), "IPC stream resync failed");
-                                        break;
-                                    }
-                                }
-                            };
-                            let raw = collect_chunk_bytes(&chunks);
-                            if !raw.is_empty() {
-                                debug!(
-                                    session_id = %id,
-                                    resync_chunks = chunks.len(),
-                                    resync_bytes = raw.len(),
-                                    from_offset = current_offset,
-                                    to_offset = new_end,
-                                    "IPC stream replayed buffered output after lag"
-                                );
-                                ipc::write_response_to_writer(
-                                    &mut writer,
-                                    RpcResponse::AttachStreamChunk {
-                                        offset: current_offset,
-                                        data: raw,
-                                    },
-                                )
-                                .await?;
-                            }
-                            current_offset = new_end;
-                        }
-                        Err(RecvError::Closed) => {
-                            let exit_code = session_store.get_exit_code(&id);
-                            info!(session_id = %id, ?exit_code, "IPC broadcast channel closed");
-                            let _ = ipc::write_response_to_writer(
+                        AttachEvent::Modes(modes) => {
+                            ipc::write_attach_control_frame(
                                 &mut writer,
-                                RpcResponse::AttachStreamDone { exit_code },
+                                &RpcResponse::AttachModeChanged {
+                                    app_cursor_keys: modes.app_cursor_keys,
+                                    bracketed_paste_mode: modes.bracketed_paste_mode,
+                                    mouse_report: modes.mouse_report,
+                                    sgr_mouse: modes.sgr_mouse,
+                                    focus_events: modes.focus_events,
+                                },
+                            )
+                            .await?;
+                        }
+                        AttachEvent::Done {
+                            exit_code,
+                            final_offset,
+                        } => {
+                            let _ = ipc::write_attach_control_frame(
+                                &mut writer,
+                                &RpcResponse::AttachStreamDone {
+                                    exit_code,
+                                    final_offset,
+                                },
                             )
                             .await;
+                            break;
+                        }
+                        AttachEvent::Closed => {
                             break;
                         }
                     }
@@ -372,9 +269,9 @@ pub(super) async fn handle_attach_subscribe(
                         rows, cols,
                         "forwarding resize notification to IPC client"
                     );
-                    ipc::write_response_to_writer(
+                    ipc::write_attach_control_frame(
                         &mut writer,
-                        RpcResponse::AttachResized { rows, cols },
+                        &RpcResponse::AttachResized { rows, cols },
                     )
                     .await?;
                 }
@@ -386,22 +283,39 @@ pub(super) async fn handle_attach_subscribe(
     .await;
 
     client_reader_task.abort();
-    let _ = session_store.attach_detach(&id).await;
+    let _ = session_store.attach_detach(&id, attachment_id).await;
     debug!(session_id = %id, "IPC streaming session relay stopped");
     result
 }
 
 pub(super) async fn handle_attach_input(
     id: String,
-    data: String,
+    data: Vec<u8>,
     session_store: &SessionStoreHandle,
     wait_for_change: bool,
+    attachment_id: Option<u64>,
 ) -> RpcResponse {
     debug!(session_id = %id, bytes = data.len(), "handling one-shot IPC input request");
+    // `attachment_id = None` is the ungated operator one-shot (`oly send`);
+    // `Some(attachment)` is an agent send gated on its attach role: an
+    // observer (view-only) cannot drive input.
     match session_store
-        .attach_input(&id, &data, wait_for_change)
+        .attach_input(&id, attachment_id, &data, wait_for_change)
         .await
     {
+        Ok(()) => RpcResponse::Ack,
+        Err(err) => RpcResponse::Error {
+            message: err.message(&id),
+        },
+    }
+}
+
+pub(super) async fn handle_attach_mouse(
+    id: String,
+    spec: String,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    match session_store.attach_mouse(&id, &spec, true).await {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),
@@ -429,7 +343,8 @@ pub(super) async fn handle_attach_resize(
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     debug!(session_id = %id, rows, cols, "handling one-shot IPC resize request");
-    match session_store.attach_resize(&id, rows, cols).await {
+    // One-shot operator resize: not an attachment, ungated.
+    match session_store.attach_resize(&id, None, rows, cols).await {
         Ok(()) => RpcResponse::Ack,
         Err(err) => RpcResponse::Error {
             message: err.message(&id),
@@ -442,10 +357,74 @@ pub(super) async fn handle_attach_detach(
     session_store: &SessionStoreHandle,
 ) -> RpcResponse {
     debug!(session_id = %id, "handling one-shot IPC detach request");
-    match session_store.attach_detach(&id).await {
-        Ok(()) => RpcResponse::Ack,
-        Err(err) => RpcResponse::Error {
-            message: err.message(&id),
-        },
+    // The streaming handler unregisters its own attachment on exit, so a
+    // one-shot detach has nothing anonymous to remove.
+    let _ = session_store;
+    RpcResponse::Ack
+}
+
+// ---------------------------------------------------------------------------
+// Agent surfaces: cursor, bounded observe windows
+// ---------------------------------------------------------------------------
+
+/// Machine-readable session cursor: liveness + canonical filtered offset.
+pub(super) async fn handle_session_cursor(
+    id: String,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    let (running, exit_code, offset, incarnation, input_needed) =
+        match session_store.stream_observation(&id).await {
+            Some(observation) => observation,
+            None => {
+                return RpcResponse::Error {
+                    message: format!("session not found or no output recorded: {id}"),
+                };
+            }
+        };
+    RpcResponse::SessionCursor {
+        running,
+        exit_code,
+        offset,
+        incarnation,
+        input_needed,
+    }
+}
+
+/// One bounded filtered-stream window (agent `history`).
+pub(super) async fn handle_observe_window(
+    id: String,
+    from: u64,
+    max_bytes: u32,
+    session_store: &SessionStoreHandle,
+) -> RpcResponse {
+    // Hard cap regardless of what the client asked for: reads stay
+    // memory-bounded even when the client requested a multi-GiB window.
+    let max_bytes = (max_bytes as usize).clamp(1, 8 * 1024 * 1024);
+    let before = session_store.stream_observation(&id).await;
+    let data = match session_store
+        .attach_resync_window(&id, from, max_bytes)
+        .await
+    {
+        Ok(data) => data,
+        Err(err) => {
+            return RpcResponse::Error {
+                message: err.message(&id),
+            };
+        }
+    };
+    let next_offset = from + data.len() as u64;
+    let after = session_store.stream_observation(&id).await;
+    let (running, exit_code) = after.as_ref().map(|v| (v.0, v.1)).unwrap_or((false, None));
+    if before.as_ref().map(|v| v.3) != after.as_ref().map(|v| v.3) {
+        return RpcResponse::Error {
+            message: "session restarted during window read".into(),
+        };
+    }
+    RpcResponse::ObserveWindow {
+        data,
+        next_offset,
+        running,
+        exit_code,
+        incarnation: after.and_then(|v| v.3),
     }
 }

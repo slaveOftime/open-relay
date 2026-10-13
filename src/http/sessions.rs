@@ -12,17 +12,33 @@ use crate::{
     db::meta_to_summary,
     error::AppError,
     protocol::{
-        ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SortOrder,
+        ListQuery, ListSortField, PushSubscriptionInput, RpcRequest, RpcResponse, SessionSummary,
+        SortOrder,
     },
     session::{
         SessionError, SessionStore, StartSpec,
         file::{normalize_session_upload_relative_path, write_session_upload},
-        logs::{read_persisted_log_page, read_resize_events, render_log_file},
-        persist::current_output_offset_by_id,
+        logs::{read_persisted_log_page, render_log_session},
     },
 };
 
 use super::AppState;
+
+/// Annotate every session we proxy from a secondary with the node name we
+/// fetched it through. The owning daemon always emits `node = None` on its
+/// own summaries (`SessionRuntime::to_summary` hardcodes it), and HTTP
+/// callers have no way to recover that information from the proxy alone.
+/// Without this tagging the web client (and the SSE `replaceLocalSnapshot`
+/// cleanup keyed by `node\0id`) would store these items under the empty
+/// node prefix, diverging from later SSE forwards that carry
+/// `node = Some(node_name)`. Mirrors what `client::list` and
+/// `client::list_tui` already do for the same proxy path.
+fn tag_sessions_with_node(sessions: &mut [SessionSummary], node: &str) {
+    let node = node.to_string();
+    for session in sessions {
+        session.node = Some(node.clone());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared param for optional node routing
@@ -50,7 +66,7 @@ pub async fn health() -> impl IntoResponse {
 
 pub async fn push_public_key(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
-        "public_key": state.config.get().web_push_vapid_public_key.clone()
+        "public_key": state.config.get().web_push.vapid_public_key.clone()
     }))
 }
 
@@ -162,7 +178,7 @@ pub async fn list(
         })
         .unwrap_or_default();
 
-    let page_limit = params.limit.unwrap_or(20).max(1).min(200);
+    let page_limit = params.limit.unwrap_or(20).clamp(1, 200);
     let offset = params.offset.unwrap_or(0);
 
     let query = ListQuery {
@@ -172,7 +188,7 @@ pub async fn list(
         since: None,
         until: None,
         limit: page_limit,
-        offset: offset,
+        offset,
         sort: params.sort.unwrap_or_default(),
         order: params.order.unwrap_or_default(),
     };
@@ -183,13 +199,19 @@ pub async fn list(
             query: query.clone(),
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::List { total, sessions }) => Json(serde_json::json!({
-                "items": sessions,
-                "total": total,
-                "offset": offset,
-                "limit": page_limit,
-            }))
-            .into_response(),
+            Ok(RpcResponse::List {
+                total,
+                mut sessions,
+            }) => {
+                tag_sessions_with_node(&mut sessions, node);
+                Json(serde_json::json!({
+                    "items": sessions,
+                    "total": total,
+                    "offset": offset,
+                    "limit": page_limit,
+                }))
+                .into_response()
+            }
             Ok(RpcResponse::Error { message }) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({ "error": message })),
@@ -379,7 +401,8 @@ pub async fn get_session(
             },
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::List { sessions, .. }) => {
+            Ok(RpcResponse::List { mut sessions, .. }) => {
+                tag_sessions_with_node(&mut sessions, node);
                 if let Some(s) = sessions.into_iter().find(|s| s.id == id) {
                     Json(s).into_response()
                 } else {
@@ -410,7 +433,12 @@ pub async fn get_session(
 
     match state.db.get_session(&id).await {
         Ok(Some(meta)) => {
-            let total_bytes = current_output_offset_by_id(&state.config.get().sessions_dir, &id);
+            // Journal-backed sessions report the derived filtered stream
+            // length; pre-0.5 sessions report 0. The store
+            // answers live sessions from O(1) runtime counters and caches
+            // the per-incarnation journal decode for persisted ones, so
+            // this stays off the O(journal) path.
+            let total_bytes = state.store.attach_filtered_len(&id).await.unwrap_or(0);
             Json(meta_to_summary(&meta, false, total_bytes)).into_response()
         }
         Ok(None) => {
@@ -471,7 +499,10 @@ pub async fn set_session_metadata(
             notifications_enabled: body.notifications_enabled,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
-            Ok(RpcResponse::Session { summary }) => Json(summary).into_response(),
+            Ok(RpcResponse::Session { mut summary }) => {
+                tag_sessions_with_node(std::slice::from_mut(&mut summary), node);
+                Json(summary).into_response()
+            }
             Ok(RpcResponse::Error { message }) => (
                 if message.starts_with("session not found:") {
                     StatusCode::NOT_FOUND
@@ -537,7 +568,7 @@ pub async fn stop_session(
 ) -> impl IntoResponse {
     let grace = body
         .and_then(|b| b.grace_seconds)
-        .unwrap_or(state.config.get().stop_grace_seconds);
+        .unwrap_or(state.config.get().limits.stop_grace_seconds);
 
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::Stop {
@@ -649,6 +680,85 @@ pub async fn kill_session(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Remove (equivalent to `oly rm <id> --force` when force=true)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RemoveSessionParams {
+    pub node: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn remove_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<RemoveSessionParams>,
+) -> impl IntoResponse {
+    if let Some(ref node) = params.node {
+        let rpc = RpcRequest::Remove {
+            id: id.clone(),
+            force: params.force,
+        };
+        return match state.node_registry.proxy_rpc(node, &rpc).await {
+            Ok(RpcResponse::Remove { removed: true }) => {
+                Json(serde_json::json!({ "removed": true })).into_response()
+            }
+            Ok(RpcResponse::Remove { removed: false }) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("session not found: {id}") })),
+            )
+                .into_response(),
+            Ok(RpcResponse::Error { message }) => (
+                if message.starts_with("session not found:") {
+                    StatusCode::NOT_FOUND
+                } else if message.contains("session is still running:") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response(),
+            Ok(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "unexpected response from node" })),
+            )
+                .into_response(),
+        };
+    }
+
+    match state.store.delete_session(&id, params.force).await {
+        Ok(true) => {
+            info!(session_id = %id, force = params.force, "session removed via HTTP");
+            Json(serde_json::json!({ "removed": true })).into_response()
+        }
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("session not found: {id}") })),
+        )
+            .into_response(),
+        Err(AppError::Protocol(message)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+        Err(error) => {
+            error!(session_id = %id, %error, "failed to remove session via HTTP");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
 #[derive(Debug, Deserialize)]
 pub struct SessionNotificationsBody {
     pub enabled: bool,
@@ -732,6 +842,27 @@ pub async fn set_session_notifications(
         }
         Err(SessionError::Persistence(message)) => {
             warn!(session_id = %id, error = %message, "notification toggle persistence failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+        Err(
+            err @ (SessionError::StaleCursor { .. }
+            | SessionError::ViewOnly
+            | SessionError::StaleAttachment
+            | SessionError::InvalidInput(_)),
+        ) => {
+            warn!(session_id = %id, error = err.message(&id), "notification toggle rejected");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": err.message(&id) })),
+            )
+                .into_response()
+        }
+        Err(SessionError::Internal(message)) => {
+            warn!(session_id = %id, message = %message, "notification toggle: internal failure");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": message })),
@@ -916,8 +1047,9 @@ pub async fn send_input(
     if let Some(ref node) = params.node {
         let rpc = RpcRequest::AttachInput {
             id: id.clone(),
-            data: body.data.clone(),
+            data: body.data.clone().into_bytes(),
             wait_for_change: body.wait_for_change,
+            attachment_id: None,
         };
         return match state.node_registry.proxy_rpc(node, &rpc).await {
             Ok(RpcResponse::Ack) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -941,7 +1073,7 @@ pub async fn send_input(
 
     match state
         .store
-        .attach_input(&id, &body.data, body.wait_for_change)
+        .attach_input(&id, None, body.data.as_bytes(), body.wait_for_change)
         .await
     {
         Ok(()) => {
@@ -963,8 +1095,58 @@ pub async fn send_input(
 mod tests {
     use std::path::PathBuf;
 
-    use super::{SessionMetadataBody, pathbuf_to_rpc_path};
+    use crate::protocol::SessionSummary;
 
+    use super::{
+        RemoveSessionParams, SessionMetadataBody, pathbuf_to_rpc_path, tag_sessions_with_node,
+    };
+
+    fn empty_summary(id: &str) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "bash".to_string(),
+            args: vec![],
+            pid: None,
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            ended_at: None,
+            resume_command: None,
+            cwd: None,
+            input_needed: false,
+            notifications_enabled: true,
+            node: None,
+            last_total_bytes: 0,
+            last_output_epoch: None,
+            rows: None,
+            cols: None,
+            attach_count: 0,
+            foreground_color: None,
+            background_color: None,
+            journal_bytes_retained: None,
+            journal_retention_sweeps: None,
+            journal_incarnations_dropped: None,
+            journal_byte_cap: None,
+        }
+    }
+
+    #[test]
+    fn remove_defaults_to_non_force_but_accepts_force_and_node() {
+        let default: RemoveSessionParams =
+            serde_json::from_value(serde_json::json!({})).expect("defaults parse");
+        assert!(!default.force);
+        assert!(default.node.is_none());
+
+        let forced: RemoveSessionParams = serde_json::from_value(serde_json::json!({
+            "force": true,
+            "node": "worker-a"
+        }))
+        .expect("force and node parse");
+        assert!(forced.force);
+        assert_eq!(forced.node.as_deref(), Some("worker-a"));
+    }
     #[test]
     fn session_metadata_body_accepts_notification_override() {
         let body: SessionMetadataBody = serde_json::from_value(serde_json::json!({
@@ -996,6 +1178,27 @@ mod tests {
     fn rpc_upload_paths_use_forward_slashes() {
         let path = PathBuf::from("subdir").join("file.txt");
         assert_eq!(pathbuf_to_rpc_path(&path), "subdir/file.txt");
+    }
+
+    #[test]
+    fn tag_sessions_with_node_overrides_secondarys_none() {
+        // A proxy's response carries the secondary's raw summaries, which
+        // always have `node = None`. After tagging they must carry the
+        // node we fetched through, otherwise the web client stores them
+        // under the empty-node key and diverges from the live SSE stream
+        // that does forward `node = Some(name)`.
+        let mut summaries = vec![empty_summary("sess-1"), empty_summary("sess-2")];
+        // Mix of an ownership-side None (the typical secondary output) and
+        // a stale entry: the proxy path must overwrite either with the
+        // through-node so the web UI's SessionEventsStore keys match the
+        // SSE forwards that already carry `node = Some(name)`.
+        summaries[0].node = None;
+        summaries[1].node = Some("stale".to_string());
+
+        tag_sessions_with_node(&mut summaries, "worker-a");
+
+        assert_eq!(summaries[0].node.as_deref(), Some("worker-a"));
+        assert_eq!(summaries[1].node.as_deref(), Some("worker-a"));
     }
 }
 
@@ -1089,11 +1292,20 @@ pub async fn get_logs(
     };
 
     match read_persisted_log_page(&session_dir, offset, limit) {
-        Some((lines, mut total)) => {
+        Err(message) => {
+            // Pre-1.0 log format: explicit, actionable error.
+            debug!(session_id = %id, error = %message, "session log unreadable");
+            (
+                StatusCode::GONE,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+        Ok(Some((lines, mut total))) => {
             if let Ok(live_total) = state.store.read_live_log_chunk_count(&id).await {
                 total += live_total;
             }
-            let resizes = read_resize_events(&session_dir).unwrap_or_default();
+            let resizes = crate::session::replay::resize_events(&session_dir).unwrap_or_default();
             logs_response(LogsResponseBody {
                 offset,
                 chunks: lines,
@@ -1101,7 +1313,7 @@ pub async fn get_logs(
                 resizes,
             })
         }
-        None => {
+        Ok(None) => {
             debug!(session_id = %id, "session not found for logs (disk)");
             (
                 StatusCode::NOT_FOUND,
@@ -1191,13 +1403,9 @@ pub async fn get_logs_tail(
         return logs_tail_binary_response(output.0, &output.1);
     }
 
-    // Fall back to persisted log file.
-    let log_path = session_dir.join("output.log");
-    match render_log_file(&log_path, tail, true, term_cols, None) {
-        Ok(output) => {
-            let resizes = read_resize_events(&session_dir).unwrap_or_default();
-            logs_tail_binary_response(output, &resizes)
-        }
+    // Fall back to the persisted stream (journal-derived).
+    match render_log_session(&session_dir, tail, true, term_cols, None) {
+        Ok((output, resizes)) => logs_tail_binary_response(output, &resizes),
         Err(err) => {
             debug!(session_id = %id, %err, "failed to render log file for tail");
             (

@@ -14,6 +14,24 @@ pub struct DaemonInfo {
     pub no_http: bool,
     pub no_auth: bool,
     pub started_at: String,
+    /// The HTTP endpoint the daemon actually bound at startup. This is a
+    /// runtime property of the running process: `--bind`/`--port` CLI
+    /// overrides never reach `config.json`, and bind/port edits require a
+    /// restart, so a client reading only its own config file can disagree
+    /// with the running daemon. `oly daemon status` must report these
+    /// effective values (defaults keep pre-field info files parseable).
+    #[serde(default = "default_daemon_http_bind")]
+    pub http_bind: String,
+    #[serde(default = "default_daemon_http_port")]
+    pub http_port: u16,
+}
+
+fn default_daemon_http_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_daemon_http_port() -> u16 {
+    15443
 }
 
 pub fn write_daemon_info(path: &PathBuf, info: &DaemonInfo) -> Result<()> {
@@ -52,11 +70,11 @@ pub fn resolve_state_dir() -> PathBuf {
         if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
             return PathBuf::from(local_app_data).join("oly");
         }
-        return dirs::home_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AppData")
             .join("Local")
-            .join("oly");
+            .join("oly")
     }
 
     #[cfg(target_os = "linux")]
@@ -65,11 +83,11 @@ pub fn resolve_state_dir() -> PathBuf {
             return PathBuf::from(xdg_state_home).join("oly");
         }
 
-        return dirs::home_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".local")
             .join("state")
-            .join("oly");
+            .join("oly")
     }
 
     #[cfg(target_os = "macos")]
@@ -128,8 +146,7 @@ pub fn write_pid(lock_file: &PathBuf, pid: u32) -> Result<()> {
     Ok(())
 }
 
-/// Reserved for M3 notification engine.
-#[allow(dead_code)]
+/// Read the daemon PID from the lock file, if any.
 pub fn read_pid(lock_file: &PathBuf) -> Result<Option<u32>> {
     let mut file = match OpenOptions::new().read(true).open(lock_file) {
         Ok(file) => file,

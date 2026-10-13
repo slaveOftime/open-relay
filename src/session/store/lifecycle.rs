@@ -22,7 +22,6 @@ use crate::{
 
 use super::super::{
     SessionMeta, SessionStatus, StartSpec,
-    persist::append_event,
     runtime::{SessionRuntime, generate_session_id, spawn_session},
 };
 use super::{
@@ -31,54 +30,15 @@ use super::{
 };
 
 impl SessionStore {
-    /// Persist and evict completed sessions that have aged past the in-memory
-    /// retention window, and cap oversized live output logs.
+    /// Maintenance sweep: prune evicted completed sessions past the
+    /// retention window.
     ///
-    /// `max_output_log_bytes` of `0` disables the size cap.
-    pub async fn run_maintenance(&self, max_output_log_bytes: u64) {
-        if max_output_log_bytes > 0 {
-            self.truncate_oversized_logs(max_output_log_bytes);
-        }
+    /// The 0.x `output.log` size-cap truncation is gone: truncating the
+    /// canonical stream silently renumbered cursors and destroyed history.
+    /// Growth is bounded instead by checkpoint-gated journal retention
+    /// (ADR-0002), which runs at checkpoint cadence in the runtime.
+    pub async fn run_maintenance(&self) {
         self.prune_evicted_sessions().await;
-    }
-
-    /// Truncate any session `output.log` that has grown past
-    /// `max_output_log_bytes`, resetting the persisted log index and the
-    /// runtime byte counters so live attach/tail/pagination stay consistent.
-    ///
-    /// The in-memory rendered screen (`screen_parser`) is untouched, so an
-    /// attached client keeps seeing the correct current screen; only the
-    /// on-disk scrollback history is dropped.
-    fn truncate_oversized_logs(&self, max_output_log_bytes: u64) {
-        use crate::session::persist::{append_event, current_output_offset, truncate_output_log};
-
-        let sessions = self.sessions.load_full();
-        for (id, handle) in sessions.iter() {
-            let mut rt = handle.write();
-            // Only cap sessions that are still producing output; a completed
-            // session's log is frozen and about to be evicted anyway.
-            if rt.is_completed() {
-                continue;
-            }
-            if current_output_offset(&rt.dir) <= max_output_log_bytes {
-                continue;
-            }
-
-            if let Err(err) = truncate_output_log(&rt.dir) {
-                warn!(session_id = %id, %err, "failed to truncate oversized output.log");
-                continue;
-            }
-            crate::session::logs::discard_persisted_log_index(&rt.dir);
-            rt.raw_total_bytes = 0;
-            rt.last_total_bytes = 0;
-            rt.resize_history.clear();
-            let _ = append_event(&rt.dir, "output.log truncated (size cap reached)");
-            info!(
-                session_id = %id,
-                max_output_log_bytes,
-                "truncated oversized output.log"
-            );
-        }
     }
 
     /// Load session history from the SQLite database on daemon startup.
@@ -125,27 +85,59 @@ impl SessionStore {
         let prepared = store_handle.prepare_start_session(config, spec).await?;
 
         let PreparedStart {
-            mut meta,
+            meta,
             session_dir,
             rows,
             cols,
             notifications_enabled,
         } = prepared;
         let session_id = meta.id.clone();
-        let runtime = match spawn_session(
-            &mut meta,
-            session_dir,
-            rows,
-            cols,
-            notifications_enabled,
-            config.screen_scrollback_rows,
-            store_handle.event_tx.clone(),
-        ) {
-            Ok(runtime) => runtime,
-            Err(err) => {
+        // `spawn_session` performs mkdir + ShadowJournal recovery scan
+        // + fsyncs + PATH walks + PTY spawn, all of which block workers.
+        // Run it on the blocking pool so a dirty, large journal can't
+        // stall live attach pumps on a 4-worker runtime.
+        // The `SessionMeta` is shared by `Arc<Mutex<_>>` because
+        // `spawn_session` records the assigned pid back onto the meta;
+        // we unwrap the mutex once the join completes.
+        let screen_scrollback_rows = config.limits.screen_scrollback_rows;
+        let meta = Arc::new(parking_lot::Mutex::new(meta));
+        let journal_byte_cap = store_handle.journal_byte_cap();
+        let runtime = match tokio::task::spawn_blocking({
+            let meta = Arc::clone(&meta);
+            let event_tx = store_handle.event_tx.clone();
+            move || {
+                let mut meta_guard = meta.lock();
+                spawn_session(
+                    &mut meta_guard,
+                    session_dir,
+                    rows,
+                    cols,
+                    notifications_enabled,
+                    screen_scrollback_rows,
+                    journal_byte_cap,
+                    event_tx,
+                )
+            }
+        })
+        .await
+        {
+            Ok(Ok(runtime)) => runtime,
+            Ok(Err(err)) => {
                 let _ = store_handle.abort_started_session(&session_id).await;
                 return Err(err);
             }
+            Err(join_err) => {
+                let _ = store_handle.abort_started_session(&session_id).await;
+                return Err(AppError::Protocol(format!(
+                    "spawn_session worker join failed: {join_err}"
+                )));
+            }
+        };
+        let meta = match Arc::try_unwrap(meta) {
+            Ok(mutex) => mutex.into_inner(),
+            // Other Arcs shouldn't survive; if they do, the lock is
+            // uncontended and the join already finished above.
+            Err(arc) => arc.lock().clone(),
         };
         let cleanup_runtime = Arc::clone(&runtime);
 
@@ -154,7 +146,7 @@ impl SessionStore {
         if result.is_err() {
             {
                 let mut rt = cleanup_runtime.write();
-                let _ = rt.pty.kill();
+                let _ = rt.pty.kill_process_tree();
                 rt.mark_completed(SessionStatus::Failed, None);
             }
             let _ = store_handle.abort_started_session(&session_id).await;
@@ -289,8 +281,10 @@ impl SessionStore {
             .count();
 
         let mut state = self.mutable.lock().await;
-        if running_count + state.starting_sessions.len() >= config.max_running_sessions {
-            return Err(AppError::MaxSessionsReached(config.max_running_sessions));
+        if running_count + state.starting_sessions.len() >= config.limits.max_running_sessions {
+            return Err(AppError::MaxSessionsReached(
+                config.limits.max_running_sessions,
+            ));
         }
 
         let id = generate_session_id(|candidate| {
@@ -312,6 +306,7 @@ impl SessionStore {
             created_at,
             started_at: Some(created_at),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
@@ -330,7 +325,7 @@ impl SessionStore {
 
         Ok(PreparedStart {
             meta,
-            session_dir: config.sessions_dir.join(&id),
+            session_dir: config.paths.sessions_dir.join(&id),
             rows,
             cols,
             notifications_enabled: spec.notifications_enabled,
@@ -497,10 +492,8 @@ impl SessionStore {
         )
         .await;
 
-        if terminated {
-            if let Some(summary) = self.get_summary(id) {
-                let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
-            }
+        if terminated && let Some(summary) = self.get_summary(id) {
+            let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
         }
 
         terminated
@@ -517,6 +510,13 @@ impl SessionStore {
         let deadline = start + grace;
         let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
         let mut next_soft_stop_index = 0usize;
+        // Graceful-drain escalation contract: the app interrupt (soft-stop
+        // input) owns the first half of the grace window; at the midpoint we
+        // ask the whole process group to exit (POSIX SIGTERM — injected
+        // Ctrl-C is not one), and at the deadline the tree is killed.
+        let mut group_sigterm_at = (matches!(requested_final_status, SessionStatus::Stopped)
+            && !grace.is_zero())
+        .then_some(start + grace / 2);
         debug!(
             session_id = %session_id,
             requested_final_status = requested_final_status.as_str(),
@@ -571,6 +571,23 @@ impl SessionStore {
                     return true;
                 }
             }
+            // Process-group SIGTERM at the grace midpoint.
+            if let Some(at) = group_sigterm_at
+                && Instant::now() >= at
+            {
+                group_sigterm_at = None;
+                // Bound only under cfg(unix): on non-unix platforms
+                // `signal_process_group`/`SIGTERM` are not defined, so the
+                // binding would otherwise be unused and trip a warning.
+                #[cfg(unix)]
+                let pid = handle.read().pty.process_id();
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    use crate::session::pty::{SIGTERM, signal_process_group};
+                    debug!(session_id = %session_id, pid, "grace midpoint: SIGTERM to process group");
+                    signal_process_group(pid, SIGTERM);
+                }
+            }
             // Read lock: send any due staged soft-stop inputs.
             {
                 let rt = handle.read();
@@ -609,7 +626,7 @@ impl SessionStore {
             grace_seconds,
             "session did not stop within grace window; forcing termination"
         );
-        if rt.pty.kill().is_ok() {
+        if rt.pty.kill_process_tree().is_ok() {
             let _ = rt.refresh_status();
             info!(
                 session_id = %session_id,
@@ -658,7 +675,8 @@ impl SessionStore {
     async fn prune_evicted_sessions(&self) {
         let now = Instant::now();
         let mut to_persist: Vec<SessionMeta> = Vec::new();
-        let mut evicted_ids: Vec<String> = Vec::new();
+        let mut resume_candidates = Vec::new();
+        let resume_patterns = self.resume_patterns.load_full();
         let sessions = self.sessions.load_full();
 
         for (id, handle) in sessions.iter() {
@@ -669,20 +687,31 @@ impl SessionStore {
                 to_persist.push(rt.meta.clone());
                 rt.persisted = true;
             }
-
-            if rt.is_completed() {
-                let Some(completed_at) = rt.completed_at else {
-                    rt.completed_at = Some(now);
-                    continue;
-                };
-                if now.duration_since(completed_at) >= self.eviction_ttl() {
-                    tracing::info!(
+            // Process exit alone is too early: the PTY reader may still be
+            // draining the final resume line into the journal. EOF also
+            // precedes the async appender's durability acknowledgement.
+            if rt.is_completed() && rt.output_closed && !rt.resume_scanned {
+                let (ready, degraded) = rt.journal.as_ref().map_or((true, false), |journal| {
+                    let mut journal = journal.lock();
+                    journal.poll_acks();
+                    if !journal.core.is_fully_durable() {
+                        journal.request_sync();
+                    }
+                    (journal.core.is_fully_durable(), journal.core.is_degraded())
+                });
+                if degraded {
+                    warn!(
                         session_id = id,
-                        age_seconds = now.duration_since(completed_at).as_secs(),
-                        "evicting completed session from memory after eviction TTL"
+                        "journal degraded; no reliable resume hint available"
                     );
-                    let _ = append_event(&rt.dir, "session evicted from memory");
-                    evicted_ids.push(id.clone());
+                    rt.resume_scanned = true;
+                } else if ready {
+                    resume_candidates.push((
+                        id.clone(),
+                        rt.dir.clone(),
+                        rt.meta.command.clone(),
+                        handle.clone(),
+                    ));
                 }
             }
         }
@@ -692,6 +721,52 @@ impl SessionStore {
             debug!(session_id = %meta.id, status = meta.status.as_str(), "persisting completed session metadata");
             if let Err(err) = self.db.update_session(&meta).await {
                 tracing::error!(%err, session_id = meta.id, "failed to persist completed session");
+            }
+        }
+
+        for (id, dir, command, handle) in resume_candidates {
+            let patterns = resume_patterns.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::resume_hint::from_journal(&dir, &command, &patterns)
+            })
+            .await;
+            match result {
+                Ok(Ok(Some(resume_command))) => {
+                    if let Err(err) = self.db.set_resume_command(&id, &resume_command).await {
+                        warn!(session_id = %id, %err, "failed to persist resume hint; will retry");
+                        continue;
+                    }
+                    let mut rt = handle.write();
+                    rt.meta.resume_command = Some(resume_command);
+                    rt.resume_scanned = true;
+                    drop(rt);
+                    if let Some(summary) = self.get_summary(&id) {
+                        let _ = self.event_tx.send(SessionEvent::SessionUpdated(summary));
+                    }
+                }
+                Ok(Ok(None)) => handle.write().resume_scanned = true,
+                Ok(Err(err)) => {
+                    warn!(session_id = %id, %err, "failed to read resume hint; will retry")
+                }
+                Err(err) => warn!(session_id = %id, %err, "resume scan worker failed; will retry"),
+            }
+        }
+
+        let mut evicted_ids: Vec<String> = Vec::new();
+        for (id, handle) in sessions.iter() {
+            let mut rt = handle.write();
+            if !rt.is_completed() {
+                continue;
+            }
+            let completed_at = *rt.completed_at.get_or_insert(now);
+            if now.duration_since(completed_at) >= self.eviction_ttl()
+                && (!rt.output_closed || rt.resume_scanned)
+            {
+                tracing::info!(
+                    session_id = id,
+                    "evicting completed session from memory after eviction TTL"
+                );
+                evicted_ids.push(id.clone());
             }
         }
 
@@ -716,6 +791,22 @@ impl SessionStore {
         Self::evict_old_tombstones(&mut state.evicted_sessions, now, self.eviction_ttl());
     }
 
+    /// Give freshly stopped children a bounded window to drain their PTY
+    /// before the daemon goes away (the periodic sweep no longer runs then).
+    pub async fn flush_resume_hints_on_shutdown(&self) {
+        for _ in 0..20 {
+            self.prune_evicted_sessions().await;
+            let pending = self.sessions.load().values().any(|handle| {
+                let rt = handle.read();
+                rt.is_completed() && !rt.resume_scanned
+            });
+            if !pending {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     fn evict_old_tombstones(
         evicted_sessions: &mut HashMap<String, Instant>,
         now: Instant,
@@ -726,6 +817,11 @@ impl SessionStore {
 }
 
 #[cfg(test)]
+// Tests hold an in-memory store's `lock.read()` across short `.await`s
+// (DB insert, store method). Production store code stays under this
+// lint; add a per-fn remove-with-rationale here only if the offending
+// test grows complex enough to need factoring.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::super::testsupport::*;
     use super::*;
@@ -733,6 +829,113 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn completed_resume_hint_is_saved_only_after_output_drains() {
+        for (id, status, command, output, expected) in [
+            (
+                "resume-stop",
+                SessionStatus::Stopped,
+                "codex",
+                "To resume: codex resume 0199e6e2-b60e-715d-851f-b8713b7064df\r\n",
+                "codex resume 0199e6e2-b60e-715d-851f-b8713b7064df",
+            ),
+            (
+                "resume-kill",
+                SessionStatus::Killed,
+                "pi",
+                "To resume: pi --session '/tmp/a b/session.jsonl'\r\n",
+                "pi --session '/tmp/a b/session.jsonl'",
+            ),
+            (
+                "resume-custom",
+                SessionStatus::Stopped,
+                "agent",
+                "To resume: agent --resume custom-42\r\n",
+                "agent --restore custom-42",
+            ),
+        ] {
+            let rt = make_runtime(id, status, output, None);
+            {
+                let mut runtime = rt.write();
+                runtime.meta.command = command.to_string();
+                runtime.meta.ended_at = Some(Utc::now());
+                runtime.completed_at = Some(Instant::now());
+            }
+            let db = make_test_db().await;
+            db.insert_session(&rt.read().meta)
+                .await
+                .expect("insert session");
+            let store = store_with(vec![rt.clone()], db.clone());
+            store.set_resume_patterns(vec![
+                crate::config::ResumePattern {
+                    program: "codex".into(),
+                    pattern: r"(?i)(?:^|[^a-z0-9_])codex(?:\.exe)?[ \t]+resume[ \t]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:$|[^a-z0-9-])".into(),
+                    command: "codex resume $1".into(),
+                },
+                crate::config::ResumePattern {
+                    program: "pi".into(),
+                    pattern: r#"(?i)(?:^|[^a-z0-9_])pi(?:\.exe)?[ \t]+--session[ \t]+("[a-z0-9_./:\\~ -]{1,1024}"|'[a-z0-9_./:\\~ -]{1,1024}'|[a-z0-9_./:\\~-]{1,1024})"#.into(),
+                    command: "pi --session $1".into(),
+                },
+                crate::config::ResumePattern {
+                    program: "agent".into(),
+                    pattern: r"agent --resume ([a-z0-9-]+)".into(),
+                    command: "agent --restore $1".into(),
+                },
+            ]);
+
+            store.run_maintenance().await;
+            assert_eq!(
+                db.get_session(id).await.unwrap().unwrap().resume_command,
+                None
+            );
+
+            rt.write().output_closed = true;
+            store.run_maintenance().await;
+            assert_eq!(
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resume_command
+                    .as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                store.get_summary(id).unwrap().resume_command.as_deref(),
+                Some(expected)
+            );
+            let query = crate::protocol::ListQuery {
+                search: None,
+                tags: vec![],
+                statuses: vec![],
+                since: None,
+                until: None,
+                limit: 10,
+                offset: 0,
+                sort: Default::default(),
+                order: Default::default(),
+            };
+            assert_eq!(
+                store.list_summaries(&query).await.unwrap()[0]
+                    .resume_command
+                    .as_deref(),
+                Some(expected)
+            );
+            store.run_maintenance().await; // idempotent
+            assert_eq!(
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resume_command
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_run_maintenance_evicts_completed_session_after_ttl() {
         let rt = make_runtime("evict001", SessionStatus::Stopped, "", None);
@@ -744,7 +947,7 @@ mod tests {
         }
 
         let db = make_test_db().await;
-        let store = SessionStore::new(1, db);
+        let store = SessionStore::with_journal_byte_cap(1, 0, db);
         let handle = Arc::new(SessionHandle::new(rt));
         store.sessions.rcu(|current| {
             let mut next = (**current).clone();
@@ -752,7 +955,7 @@ mod tests {
             next
         });
 
-        store.run_maintenance(0).await;
+        store.run_maintenance().await;
 
         let sessions = store.sessions.load();
         assert!(
@@ -767,50 +970,6 @@ mod tests {
                 .evicted_sessions
                 .contains_key("evict001"),
             "evicted sessions should leave a tombstone for follow-up lookups"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_maintenance_truncates_oversized_live_log() {
-        use crate::session::persist::{append_output_raw, current_output_offset};
-
-        let rt = make_runtime("big01", SessionStatus::Running, "", None);
-        let dir = rt.read().dir.clone();
-        // Write well past the cap we will set.
-        append_output_raw(&dir, &vec![b'x'; 4096]).expect("seed oversized log");
-        assert!(current_output_offset(&dir) >= 4096);
-
-        let store = store_with(vec![rt.clone()], make_test_db().await);
-        store.run_maintenance(1024).await;
-
-        assert_eq!(
-            current_output_offset(&dir),
-            0,
-            "oversized live log should be truncated to zero"
-        );
-        let locked = rt.read();
-        assert_eq!(locked.raw_total_bytes, 0, "attach offset should reset");
-        assert_eq!(
-            locked.last_total_bytes, 0,
-            "meaningful counter should reset"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_run_maintenance_leaves_small_log_untouched() {
-        use crate::session::persist::{append_output_raw, current_output_offset};
-
-        let rt = make_runtime("small1", SessionStatus::Running, "", None);
-        let dir = rt.read().dir.clone();
-        append_output_raw(&dir, b"hello").expect("seed small log");
-
-        let store = store_with(vec![rt], make_test_db().await);
-        store.run_maintenance(1024).await;
-
-        assert_eq!(
-            current_output_offset(&dir),
-            5,
-            "a log under the cap must not be truncated"
         );
     }
 
@@ -845,6 +1004,79 @@ mod tests {
         }
     }
 
+    /// Regression guard: three concurrent `start_session_via_handle`
+    /// calls on a single-thread runtime must finish in roughly the
+    /// wall-clock time of a single call, because the per-call blocking
+    /// work runs on `spawn_blocking` and so the three calls overlap on
+    /// the blocking pool. Without that wrapper, only the (one) worker
+    /// would process them sequentially and the test budget blows up.
+    ///
+    /// Off by default: the wall-clock comparison is sensitive to loads
+    /// unrelated to this test — parallel `cargo test` runs saturate the
+    /// global blocking pool, briefly pinning all 3 concurrent calls
+    /// onto a single worker. Re-verify after a relevant change with:
+    /// `cargo test p11_parallel_starts -- --test-threads=1
+    /// --include-ignored`.
+    #[ignore]
+    #[tokio::test(flavor = "current_thread")]
+    async fn p11_parallel_starts_overlap_on_the_blocking_pool() {
+        let store = Arc::new(store_with(vec![], make_test_db().await));
+        let config = make_test_config(8);
+
+        // Cross-platform dispatcher: on Linux/macOS `echo` is its own
+        // binary, on Windows it is `cmd.exe`'s built-in. The two paths
+        // exercise identical spawn-blocking timing characteristics,
+        // so we pick whichever matches the host without changing the
+        // intent of the budget assertion below.
+        let make_spec = || {
+            #[cfg(target_os = "windows")]
+            let spec = StartSpec {
+                title: None,
+                tags: vec![],
+                cmd: "cmd".into(),
+                args: vec!["/C".into(), "echo".into(), "hi".into()],
+                cwd: None,
+                rows: None,
+                cols: None,
+                notifications_enabled: false,
+            };
+            #[cfg(not(target_os = "windows"))]
+            let spec = StartSpec {
+                title: None,
+                tags: vec![],
+                cmd: "echo".into(),
+                args: vec!["hi".into()],
+                cwd: None,
+                rows: None,
+                cols: None,
+                notifications_enabled: false,
+            };
+            spec
+        };
+
+        let single = std::time::Instant::now();
+        SessionStore::start_session_via_handle(&store, &config, make_spec())
+            .await
+            .expect("single start");
+        let single_ms = single.elapsed().as_millis().max(1);
+
+        let triple = std::time::Instant::now();
+        let (r1, r2, r3) = tokio::join!(
+            SessionStore::start_session_via_handle(&store, &config, make_spec()),
+            SessionStore::start_session_via_handle(&store, &config, make_spec()),
+            SessionStore::start_session_via_handle(&store, &config, make_spec()),
+        );
+        r1.expect("start 1");
+        r2.expect("start 2");
+        r3.expect("start 3");
+        let triple_ms = triple.elapsed().as_millis();
+
+        assert!(
+            triple_ms <= 2 * single_ms + 10,
+            "3 concurrent start_session calls took {triple_ms}ms (single baseline {single_ms}ms);              expected roughly the single-call time, not 3x sequential.              Did something drop the spawn_blocking wrapper?"
+        );
+    }
+
     #[tokio::test]
     async fn restart_rejects_running_source_without_force() {
         let rt = make_runtime("run0001", SessionStatus::Running, "", None);
@@ -877,7 +1109,11 @@ mod tests {
 
     #[tokio::test]
     async fn restart_rejects_missing_source() {
-        let store = Arc::new(SessionStore::new(900, make_test_db().await));
+        let store = Arc::new(SessionStore::with_journal_byte_cap(
+            900,
+            0,
+            make_test_db().await,
+        ));
         let err = SessionStore::restart_session_via_handle(
             &store,
             &make_test_config(2),
@@ -893,7 +1129,7 @@ mod tests {
     async fn test_prepare_start_session_reserves_capacity_until_abort() {
         let config = make_test_config(1);
         let db = make_test_db().await;
-        let store = SessionStore::new(900, db.clone());
+        let store = SessionStore::with_journal_byte_cap(900, 0, db.clone());
         let spec = StartSpec {
             title: None,
             tags: vec![],
@@ -1170,7 +1406,7 @@ mod tests {
         let store = store_with(vec![rt], make_test_db().await);
 
         assert!(
-            store.stop_session("stp0002", 1).await,
+            store.stop_session("stp0002", 2).await,
             "running session should be stoppable"
         );
 
@@ -1179,7 +1415,25 @@ mod tests {
             writes.push(bytes);
         }
 
-        assert_eq!(writes, expected_soft_stop_inputs());
+        // Escalation semantics: the dummy child is a real `sleep` that
+        // never sees the soft-stop input bytes (they land in the test's
+        // channel, not the PTY). Stages due before the grace midpoint are
+        // sent; the midpoint process-group SIGTERM then ends the session
+        // before the final stage comes due. Poll slack: stage 3 is due at
+        // 1333ms, midpoint at 1000ms, poll interval 100ms — no race.
+        //
+        // Windows caveat: there is no POSIX SIGTERM equivalent in the
+        // `cfg(unix)` escalation path, so the dummy child keeps running
+        // until the deadline at 2000ms and all three stages get written.
+        // We gate the count assertion to honour the actual platform
+        // behaviour rather than skip the test entirely; the cross-
+        // platform aspect of "every stage is delivered in order" is
+        // still exercised by collecting `writes` first.
+        let all = expected_soft_stop_inputs();
+        #[cfg(unix)]
+        assert_eq!(writes, all[..all.len() - 1]);
+        #[cfg(not(unix))]
+        assert_eq!(writes, all);
     }
 
     #[tokio::test]

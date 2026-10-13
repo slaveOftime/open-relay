@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    JoinHandles, NotifierHandle,
+    JoinHandles, NotifierHandle, SessionStoreHandle,
     auth::{confirm_no_auth_risk, prompt_and_hash_password},
     crash,
     rpc::handle_client,
@@ -38,9 +38,9 @@ pub struct DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        let _ = storage::remove_file_if_exists(&self.config.lock_file);
-        let _ = storage::remove_file_if_exists(&self.config.info_file);
-        let _ = storage::remove_file_if_exists(&self.config.socket_file);
+        let _ = storage::remove_file_if_exists(&self.config.paths.lock_file);
+        let _ = storage::remove_file_if_exists(&self.config.paths.info_file);
+        let _ = storage::remove_file_if_exists(&self.config.paths.socket_file);
     }
 }
 
@@ -118,23 +118,23 @@ async fn acquire_daemon_start_lock(config: &AppConfig) -> Result<File> {
     let deadline = std::time::Instant::now() + LOCK_STARTUP_GRACE;
 
     loop {
-        match storage::try_acquire_daemon_lock(&config.lock_file) {
+        match storage::try_acquire_daemon_lock(&config.paths.lock_file) {
             Ok(file) => return Ok(file),
             Err(AppError::DaemonAlreadyRunning) => {
                 if daemon_is_healthy(config).await {
                     return Err(AppError::DaemonAlreadyRunning);
                 }
 
-                if let Some(pid) = storage::read_pid(&config.lock_file)? {
-                    if process_is_running(pid) {
-                        return Err(AppError::DaemonAlreadyRunning);
-                    }
+                if let Some(pid) = storage::read_pid(&config.paths.lock_file)?
+                    && process_is_running(pid)
+                {
+                    return Err(AppError::DaemonAlreadyRunning);
                 }
 
                 if std::time::Instant::now() >= deadline {
-                    storage::remove_file_if_exists(&config.lock_file)?;
-                    storage::remove_file_if_exists(&config.socket_file)?;
-                    return storage::try_acquire_daemon_lock(&config.lock_file);
+                    storage::remove_file_if_exists(&config.paths.lock_file)?;
+                    storage::remove_file_if_exists(&config.paths.socket_file)?;
+                    return storage::try_acquire_daemon_lock(&config.paths.lock_file);
                 }
 
                 tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
@@ -154,6 +154,16 @@ pub async fn start(
     auth_hash_internal: Option<String>,
 ) -> Result<()> {
     if daemon_is_healthy(&config).await {
+        // A start request with different flags cannot be honored while
+        // another daemon owns this state directory (the common case: an
+        // auto-spawned or earlier daemon runs with HTTP enabled and the
+        // user now asks for --no-http). Say what is actually running and
+        // how to replace it instead of failing with a bare error.
+        eprintln!("a daemon is already running with this state directory:");
+        eprintln!();
+        eprint!("{}", running_daemon_summary(&config));
+        eprintln!();
+        eprintln!("stop it first (`oly daemon stop`) to start with different flags.");
         return Err(AppError::DaemonAlreadyRunning);
     }
 
@@ -201,7 +211,7 @@ pub async fn start(
             overrides.http_port,
             overrides.notification_hook.as_deref(),
             overrides.web_push_proxy.as_deref(),
-            &config.state_dir,
+            &config.paths.state_dir,
         )?;
         wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
 
@@ -221,16 +231,46 @@ pub async fn status(config: AppConfig) -> Result<()> {
 
     println!("Daemon is running...");
 
-    let (no_http, no_auth, started_at) = storage::read_daemon_info(&config.info_file)?
-        .map(|i| (i.no_http, i.no_auth, Some(i.started_at)))
+    let info = storage::read_daemon_info(&config.paths.info_file)?;
+    let (no_http, no_auth, started_at) = info
+        .as_ref()
+        .map(|i| (i.no_http, i.no_auth, Some(i.started_at.clone())))
         .unwrap_or((false, false, None));
 
     if let Some(started_at) = started_at {
         println!("Started at:   {}", format_status_timestamp(&started_at));
     }
 
-    print_detached_start_summary(&config, no_http, no_auth);
+    let effective = effective_status_config(&config, info.as_ref());
+    print_detached_start_summary(&effective, no_http, no_auth);
     Ok(())
+}
+
+/// Resolve the config view `status`/already-running messages report from:
+/// the running daemon's own recorded flags and effective HTTP endpoint win
+/// over the client's config file (CLI `--bind`/`--port` overrides and any
+/// config drift since the daemon started would otherwise misreport).
+fn effective_status_config(config: &AppConfig, info: Option<&storage::DaemonInfo>) -> AppConfig {
+    let mut effective = config.clone();
+    if let Some(info) = info {
+        effective.http.bind = info.http_bind.clone();
+        effective.http.port = info.http_port;
+    }
+    effective
+}
+
+/// The summary of the currently running daemon for the already-running
+/// error path: same source-of-truth rules as `daemon status`.
+fn running_daemon_summary(config: &AppConfig) -> String {
+    let info = storage::read_daemon_info(&config.paths.info_file)
+        .ok()
+        .flatten();
+    let (no_http, no_auth) = info
+        .as_ref()
+        .map(|i| (i.no_http, i.no_auth))
+        .unwrap_or((false, false));
+    let effective = effective_status_config(config, info.as_ref());
+    detached_start_summary(&effective, no_http, no_auth)
 }
 
 fn format_status_timestamp(value: &str) -> String {
@@ -252,7 +292,7 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
         let _ = writeln!(
             out,
             "HTTP:         {}",
-            format_http_url(&config.http_bind, config.http_port)
+            format_http_url(&config.http.bind, config.http.port)
         );
         let _ = writeln!(
             out,
@@ -265,13 +305,33 @@ fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> S
         );
     }
 
-    let _ = writeln!(out, "ROOT:         {}", config.state_dir.display());
+    let _ = writeln!(out, "ROOT:         {}", config.paths.state_dir.display());
     let _ = writeln!(
         out,
         "LOGS:         {}",
-        config.state_dir.join("logs").display()
+        config.paths.state_dir.join("logs").display()
     );
-    let _ = writeln!(out, "SESSIONS:     {}", config.sessions_dir.display());
+    let _ = writeln!(out, "SESSIONS:     {}", config.paths.sessions_dir.display());
+
+    // Surface the daemon's identity so the operator can paste it onto a
+    // peer (or hand it to `oly node accept -k ...`). Reads from the
+    // on-disk `.pub` file (lifecycle creates it on daemon start) so status
+    // works even if the daemon was started after this CLI process.
+    match crate::http::NodeIdentity::read_published_pubkey(&config.paths.state_dir) {
+        Ok(Some(pub_key)) => {
+            let _ = writeln!(out, "ID-PUB-KEY:   {}", pub_key);
+        }
+        Ok(None) => {
+            let _ = writeln!(
+                out,
+                "ID-PUB-KEY:  (not generated; start the daemon at least once)"
+            );
+        }
+        Err(err) => {
+            let _ = writeln!(out, "ID-PUB-KEY:  failed to read id pub key: {}", err);
+        }
+    }
+
     out
 }
 
@@ -303,13 +363,13 @@ async fn wait_for_daemon_ready(
         // For detached start, track the actual spawned child PID rather than the
         // lockfile PID, which may still contain a stale value until the new daemon
         // acquires the startup lock and writes its own PID.
-        if let Some(pid) = expected_pid {
-            if !process_is_running(pid) {
-                return Err(AppError::DaemonUnavailable(format!(
-                    "daemon process exited before becoming ready. Check logs under {}",
-                    config.state_dir.display()
-                )));
-            }
+        if let Some(pid) = expected_pid
+            && !process_is_running(pid)
+        {
+            return Err(AppError::DaemonUnavailable(format!(
+                "daemon process exited before becoming ready. Check logs under {}",
+                config.paths.state_dir.display()
+            )));
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
@@ -462,24 +522,26 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     info!(
         no_http,
         auth_enabled = auth_hash.is_some(),
-        state_dir = ?config.state_dir,
-        sessions_dir = ?config.sessions_dir,
+        state_dir = ?config.paths.state_dir,
+        sessions_dir = ?config.paths.sessions_dir,
         "daemon foreground initialization"
     );
 
-    storage::ensure_state_dirs(&config.state_dir, &config.sessions_dir)?;
+    storage::ensure_state_dirs(&config.paths.state_dir, &config.paths.sessions_dir)?;
 
     let lock = acquire_daemon_start_lock(&config).await?;
 
-    storage::write_pid(&config.lock_file, std::process::id())?;
+    storage::write_pid(&config.paths.lock_file, std::process::id())?;
 
     let no_auth = auth_hash.is_none();
     storage::write_daemon_info(
-        &config.info_file,
+        &config.paths.info_file,
         &storage::DaemonInfo {
             no_http,
             no_auth,
             started_at: chrono::Utc::now().to_rfc3339(),
+            http_bind: config.http.bind.clone(),
+            http_port: config.http.port,
         },
     )?;
 
@@ -489,7 +551,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     };
 
     let file_appender =
-        tracing_appender::rolling::daily(config.state_dir.join("logs"), "daemon.log");
+        tracing_appender::rolling::daily(config.paths.state_dir.join("logs"), "daemon.log");
     let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = tracing_subscriber::fmt::layer()
@@ -518,17 +580,22 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // wrong silently. See daemon::crash for why this is needed: the process
     // normally runs fully detached with stdout/stderr discarded, so panics
     // and native crashes previously left no trace at all.
-    crash::install_panic_hook(config.state_dir.clone());
-    crash::install_native_crash_handler(config.state_dir.clone());
+    crash::install_panic_hook(config.paths.state_dir.clone());
+    crash::install_native_crash_handler(config.paths.state_dir.clone());
 
     let pid = std::process::id();
     info!(pid, log_level = %config.log_level, "daemon started");
 
-    let db = Arc::new(Database::open(&config.db_file, config.sessions_dir.clone()).await?);
-    info!(db_file = ?config.db_file, "database opened");
+    let db =
+        Arc::new(Database::open(&config.paths.db_file, config.paths.sessions_dir.clone()).await?);
+    info!(db_file = ?config.paths.db_file, "database opened");
 
-    let node_registry = Arc::new(NodeRegistry::new());
+    let node_registry = NodeRegistry::new();
     let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
+    // Wrap in Arc now so every consumer (HTTP, IPC, federation, activity
+    // sampler) shares the same pool. `bind_event_tx` is interior-mutating
+    // (OnceLock) and can be called through the Arc.
+    let node_registry = Arc::new(node_registry);
 
     let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
@@ -538,22 +605,35 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     // existing socket file fails with EADDRINUSE, which silently prevents the
     // daemon from starting and makes the parent `wait_for_daemon_ready` loop
     // appear to hang.
-    storage::remove_file_if_exists(&config.socket_file)?;
+    storage::remove_file_if_exists(&config.paths.socket_file)?;
 
     let listener = ipc::bind(&config)?;
-    info!(socket_file = ?config.socket_file, "ipc listener bound");
+    info!(socket_file = ?config.paths.socket_file, "ipc listener bound");
     let (store, startup_failed_sessions) = {
-        let store = SessionStore::new(config.session_eviction_seconds, db.clone());
+        let store = SessionStore::with_journal_byte_cap(
+            config.limits.session_eviction_seconds,
+            0, // Live journal deletion is disabled; see MIGRATION.md.
+            db.clone(),
+        );
+        store.set_resume_patterns(config.resume.patterns.clone());
         let startup_failed_sessions = store.load_running_stopping_sessions().await;
         (store, startup_failed_sessions)
     };
     let session_store = Arc::new(store);
     let event_tx = session_store.event_tx();
+    // CR-4 (node_state fan-out): wire the registry to event_tx so
+    // connect/disconnect publish `SessionEvent::NodeState {…}` for any
+    // active SSE listener to consume without polling.
+    node_registry.bind_event_tx(event_tx.clone());
     for join in client::join::load_join_configs(&config) {
+        // Lifecycle replay runs at daemon startup before any IPC
+        // client is around; there's no caller to surface the first
+        // attempt outcome to, so don't pass an `on_attempt` oneshot.
         let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
             join.clone(),
             Arc::clone(&config),
-            event_tx.subscribe(),
+            event_tx.clone(),
+            None,
         );
         join_handles
             .lock()
@@ -575,20 +655,51 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let live_config = LiveConfig::from_arc(Arc::clone(&config));
 
     let auth_state = auth_hash.map(AuthState::new);
+    // Every daemon — primary or secondary, HTTP-enabled or not — auto-
+    // generates (or loads) an Ed25519 identity key at startup. The same
+    // keypair serves both federation roles: primaries use it to sign the
+    // host-challenge nonce, secondaries use it to sign the join payload.
+    // We still tolerate a failed load: in that case SSH-key joins in
+    // either direction are rejected (API key auth still works).
+    let node_identity = http::NodeIdentity::create_or_load(&config.paths.state_dir)
+        .await
+        .inspect_err(
+            |e| warn!(%e, "failed to create node identity key, SSH-key node joins will be rejected"),
+        )
+        .unwrap_or_else(|_| http::NodeIdentity::disabled());
     if !no_http {
+        let (event_bytes_tx, _) = tokio::sync::broadcast::channel::<http::EncodedSessionEvent>(
+            http::sse::SSE_BROADCAST_CAPACITY,
+        );
         let http_state = http::AppState {
             store: session_store.clone(),
             config: live_config.clone(),
             db: db.clone(),
             notifier: notifier.clone(),
             event_tx: event_tx.clone(),
+            event_bytes_tx: event_bytes_tx.clone(),
             auth: auth_state,
             node_registry: node_registry.clone(),
+            node_identity: node_identity.clone(),
         };
+        // CR-3: one dedicated task that drains `event_tx` and re-broadcasts
+        // the encoded frames. Every SSE handler that subscribes afterward
+        // does NOT re-serialize events, so a busy relay does not multiply
+        // CPU per reminder count.
+        http::run_event_encoder(event_tx.clone(), event_bytes_tx);
         tokio::spawn(http::serve(http_state));
         info!("http server task spawned");
     } else {
-        info!("http server disabled by --no-web");
+        info!("http server disabled by --no-http");
+    }
+
+    {
+        let activity_store = session_store.clone();
+        let activity_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            activity_store.run_activity_sampler(activity_event_tx).await;
+        });
+        info!("session activity sampler task spawned");
     }
 
     let notify_store = session_store.clone();
@@ -626,6 +737,21 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         info!("config hot-reload task spawned");
     }
 
+    {
+        let retention_config = live_config.clone();
+        let retention_db = db.clone();
+        let retention_root = config.paths.sessions_dir.clone();
+        tokio::spawn(async move {
+            super::journal_retention::run_journal_retention_sweeper(
+                retention_config,
+                retention_db,
+                retention_root,
+            )
+            .await;
+        });
+        info!("journal retention sweeper task spawned");
+    }
+
     if !startup_failed_sessions.is_empty() {
         let notifier = notifier.clone();
         let event = NotificationEvent::startup_recovery(&startup_failed_sessions);
@@ -651,13 +777,32 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
         let _ = event_tx.send(event.into_session_event(0, true));
     }
 
+    // Service managers stop daemons with SIGTERM; give it the same
+    // graceful drain as ctrl-c and the RPC stop path. (cfg'd out on Windows:
+    // select! arms can't carry cfg attributes, so the future pends forever.)
+    #[cfg(unix)]
+    let sigterm_recv = {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        async move { sigterm.recv().await }
+    };
+    #[cfg(not(unix))]
+    let sigterm_recv = std::future::pending::<Option<()>>();
+    tokio::pin!(sigterm_recv);
+
     let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
     session_maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("daemon received ctrl-c, shutting down");
+                info!("daemon received ctrl-c, draining sessions before shutdown");
+                drain_sessions_for_shutdown(&session_store).await;
+                break;
+            }
+            _ = &mut sigterm_recv => {
+                info!("daemon received SIGTERM, draining sessions before shutdown");
+                drain_sessions_for_shutdown(&session_store).await;
                 break;
             }
             _ = shutdown_rx.recv() => {
@@ -665,9 +810,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
                 break;
             }
             _ = session_maintenance_tick.tick() => {
-                session_store
-                    .run_maintenance(live_config.get().max_output_log_bytes)
-                    .await;
+                session_store.run_maintenance().await;
             }
             incoming = listener.accept() => {
                 match incoming {
@@ -712,39 +855,70 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     Ok(())
 }
 
+/// Grace window for the signal-driven shutdown drain. Matches the
+/// `oly daemon stop` default so both shutdown paths behave identically.
+const DAEMON_SHUTDOWN_GRACE_SECONDS: u64 = 15;
+
+/// Signal-driven shutdown must not orphan managed children — drain
+/// every session (soft stop, process-group SIGTERM, tree kill) before the
+/// daemon exits. `oly daemon stop` drains in the RPC handler before the
+/// shutdown signal even arrives, so both paths converge here.
+async fn drain_sessions_for_shutdown(session_store: &SessionStoreHandle) {
+    let drained = session_store
+        .stop_all_sessions(DAEMON_SHUTDOWN_GRACE_SECONDS)
+        .await;
+    if !drained {
+        warn!("shutdown drain finished with sessions still running");
+    }
+    session_store.flush_resume_hints_on_shutdown().await;
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{detached_start_summary, format_status_timestamp};
+    use super::{detached_start_summary, effective_status_config, format_status_timestamp};
     use crate::config::AppConfig;
+    use crate::storage;
 
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
         AppConfig {
-            http_bind: "127.0.0.1".to_string(),
-            http_port: 15443,
+            paths: crate::config::PathsConfig {
+                state_dir: state_dir.clone(),
+                sessions_dir: state_dir.join("sessions"),
+                db_file: state_dir.join("oly.db"),
+                socket_name: "test.sock".to_string(),
+                socket_file: state_dir.join("daemon.sock"),
+                info_file: state_dir.join("daemon.info"),
+                lock_file: state_dir.join("daemon.lock"),
+            },
+            http: crate::config::HttpConfig {
+                bind: "127.0.0.1".to_string(),
+                port: 15443,
+            },
+            notify: crate::config::NotifyConfig {
+                min_interval_seconds: 10,
+                prompt_patterns: Vec::new(),
+                hook: None,
+            },
+            limits: crate::config::LimitsConfig {
+                max_running_sessions: 50,
+                session_eviction_seconds: 15,
+                screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
+                silence_seconds: 10,
+                stop_grace_seconds: 5,
+                journal_retention_days: 0,
+            },
+            web_push: crate::config::WebPushConfig {
+                subject: None,
+                vapid_public_key: None,
+                vapid_private_key: None,
+                proxy: None,
+            },
+            resume: crate::config::ResumeConfig::default(),
             log_level: "info".to_string(),
-            stop_grace_seconds: 5,
-            prompt_patterns: Vec::new(),
-            web_push_subject: None,
-            web_push_vapid_public_key: None,
-            web_push_vapid_private_key: None,
-            state_dir: state_dir.clone(),
-            sessions_dir: state_dir.join("sessions"),
-            db_file: state_dir.join("oly.db"),
-            lock_file: state_dir.join("daemon.lock"),
-            info_file: state_dir.join("daemon.info"),
-            socket_name: "test.sock".to_string(),
-            socket_file: state_dir.join("daemon.sock"),
-            silence_seconds: 10,
-            notification_min_interval_seconds: 10,
-            session_eviction_seconds: 15,
-            max_running_sessions: 50,
-            max_output_log_bytes: 0,
-            screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
-            notification_hook: None,
-            web_push_proxy: None,
+            trusted_apps_enabled: false,
             runtime_overrides: Default::default(),
         }
     }
@@ -793,12 +967,18 @@ mod tests {
 
         assert!(summary.contains("HTTP:         http://127.0.0.1:15443"));
         assert!(summary.contains("Auth:         disabled (--no-auth)"));
-        assert!(summary.contains(&format!("ROOT:         {}", config.state_dir.display())));
+        assert!(summary.contains(&format!(
+            "ROOT:         {}",
+            config.paths.state_dir.display()
+        )));
         assert!(summary.contains(&format!(
             "LOGS:         {}",
-            config.state_dir.join("logs").display()
+            config.paths.state_dir.join("logs").display()
         )));
-        assert!(summary.contains(&format!("SESSIONS:     {}", config.sessions_dir.display())));
+        assert!(summary.contains(&format!(
+            "SESSIONS:     {}",
+            config.paths.sessions_dir.display()
+        )));
     }
 
     #[test]
@@ -808,6 +988,44 @@ mod tests {
 
         assert!(summary.contains("HTTP:         disabled (--no-http)"));
         assert!(!summary.contains("Auth:"));
+    }
+
+    #[test]
+    fn status_endpoint_prefers_the_running_daemons_recorded_values() {
+        // The daemon was started with `--port 9999` (a runtime override
+        // that never reaches config.json): status must report the running
+        // daemon's effective endpoint, not the client's config default.
+        let config = test_config();
+        let info = storage::DaemonInfo {
+            no_http: false,
+            no_auth: true,
+            started_at: "2026-03-27T12:34:56Z".to_string(),
+            http_bind: "0.0.0.0".to_string(),
+            http_port: 9999,
+        };
+        let effective = effective_status_config(&config, Some(&info));
+        let summary = detached_start_summary(&effective, info.no_http, info.no_auth);
+        assert!(summary.contains("HTTP:         http://0.0.0.0:9999"));
+        assert!(!summary.contains("15443"));
+    }
+
+    #[test]
+    fn status_endpoint_falls_back_to_client_config_without_info() {
+        let config = test_config();
+        let effective = effective_status_config(&config, None);
+        assert_eq!(effective.http.bind, "127.0.0.1");
+        assert_eq!(effective.http.port, 15443);
+    }
+
+    #[test]
+    fn daemon_info_without_endpoint_fields_still_parses() {
+        // Info files written before the endpoint fields existed must stay
+        // readable; the defaults mirror config.rs's built-in endpoint.
+        let legacy = r#"{"no_http":true,"no_auth":true,"started_at":"2026-03-27T12:34:56Z"}"#;
+        let info: storage::DaemonInfo = serde_json::from_str(legacy).expect("legacy info parses");
+        assert!(info.no_http);
+        assert_eq!(info.http_bind, "127.0.0.1");
+        assert_eq!(info.http_port, 15443);
     }
 
     #[test]

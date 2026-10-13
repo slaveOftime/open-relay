@@ -1,0 +1,647 @@
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react'
+import { Button } from '@/components/ui/button'
+import { FileDropZone } from '@/components/ui/file-drop-zone'
+import { getTransferredFiles } from '@/components/ui/file-transfer'
+import { ClearableInput } from '@/components/ui/clearable-input'
+import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { PaperclipIcon, SendIcon, XIcon } from 'lucide-react'
+import { findScrollContainer } from '@/utils/scroll-container'
+import { insertUploadedPathAtSelection, removeUploadedPathFromInput } from './attach-panel-input'
+import {
+  loadSessionDrawerOpen,
+  loadSessionImagePreviews,
+  loadSessionInputDraft,
+  readFileAsDataUrl,
+  saveSessionDrawerOpen,
+  saveSessionImagePreviews,
+  saveSessionInputDraft,
+} from './attach-panel-storage'
+import { saveInputHistory } from './attach-input-history'
+import {
+  getVisibleImagePreviewPaths,
+  isPreviewableImageFile,
+  type SessionImagePreviews,
+} from './attach-panel-image-preview'
+import ImagePreviewDialog from '@/components/dialogs/ImagePreviewDialog'
+import {} from '@radix-ui/react-icons'
+import { holdRepeatProps, useRepeatWhilePressed } from '@/hooks/use-repeat-while-pressed'
+import { MobileKeyBar } from './attach-mobile-key-bar'
+import {
+  sendCustomKeys,
+  sendCustomText,
+  sendKeySpec,
+  type AttachSendTarget,
+} from './attach-panel-send'
+import type { UploadSessionFileResponse } from '@/api/client'
+
+const ATTACH_BUSY_INTERVAL_MS = 2000
+
+// ── AttachPanel ───────────────────────────────────────────────────────────────
+/**
+ * Hold-repeat keys park DOM focus on the pressed button (that is what keeps the
+ * soft keyboard down), so that focus is a side effect, not something to
+ * highlight: WebKit carries `:focus-visible` over from a focused text field and
+ * would paint the ring on a key the user merely tapped.
+ */
+const HOLD_KEY_FOCUS_NONE =
+  'focus:outline-none focus:ring-0 focus:ring-offset-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0'
+
+interface AttachPanelProps {
+  sessionId: string
+  sendInput: (data: string) => void
+  sendBusy: () => void
+  showKeyError: (message: string) => void
+  uploadFile?: (file: File) => Promise<UploadSessionFileResponse>
+  onDrawerOpenChange?: (open: boolean) => void
+}
+
+const popularKeys = [
+  { key: 'ctrl', label: 'ctrl', instant: false },
+  { key: 'shift', label: 'shift', instant: false },
+  { key: 'alt', label: 'alt', instant: false },
+  { key: 'meta', label: 'meta', instant: false },
+  { key: 'tab', label: 'tab', instant: true },
+  { key: 'shift+tab', label: 'shift+tab', instant: true },
+  { key: 'esc', label: 'esc', instant: true },
+  { key: 'enter', label: 'enter', instant: true },
+  { key: 'ctrl+d', label: '^D', instant: true },
+  { key: 'ctrl+l', label: '^L', instant: true },
+  { key: 'ctrl+z', label: '^Z', instant: true },
+  { key: 'ctrl+c', label: '^C', instant: true },
+  { key: 'del', label: 'del', instant: true },
+  { key: 'backspace', label: '⌫', instant: true },
+  { key: 'home', label: 'home', instant: true },
+  { key: 'end', label: 'end', instant: true },
+  { key: 'left', label: '←', instant: true },
+  { key: 'up', label: '↑', instant: true },
+  { key: 'down', label: '↓', instant: true },
+  { key: 'right', label: '→', instant: true },
+  { key: 'pgup', label: 'pgup', instant: true },
+  { key: 'pgdn', label: 'pgdn', instant: true },
+  { key: 'ins', label: 'ins', instant: true },
+]
+
+export default function AttachPanel({
+  sessionId,
+  sendInput,
+  sendBusy,
+  showKeyError,
+  uploadFile,
+  onDrawerOpenChange,
+}: AttachPanelProps) {
+  // Per-session persisted UI state is split between two sync sites:
+  //   1. The lazy initializer below populates state on initial mount (covers
+  //      deep links, route-level remounts, and strict-mode dual mounts).
+  //   2. The render-time adjustment below reloads state when sessionId
+  //      changes within an already-mounted instance.
+  // Both sites load from the same per-session localStorage / sessionStorage
+  // keys via `loadSessionInputDraft` / `loadSessionImagePreviews` /
+  // `loadSessionDrawerOpen`. Skipping either one leaves the textarea empty
+  // until the user re-focuses the page and types again — see the regression
+  // introduced when the previous useEffect-cascade load was collapsed.
+  const [drawerOpen, setDrawerOpen] = useState(() => loadSessionDrawerOpen(sessionId))
+  const [customInput, setCustomInput] = useState(() => loadSessionInputDraft(sessionId))
+  const [customKeys, setCustomKeys] = useState('')
+  const customKeysValueRef = useRef(customKeys)
+  const [imagePreviews, setImagePreviews] = useState<SessionImagePreviews>(() =>
+    loadSessionImagePreviews(sessionId)
+  )
+  const [isUploading, setIsUploading] = useState(false)
+  const [previewPath, setPreviewPath] = useState<string | null>(null)
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const customInputRef = useRef<HTMLTextAreaElement | null>(null)
+  const customInputValueRef = useRef(customInput)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const sendClickTimeoutRef = useRef<number | null>(null)
+  const shouldPersistDraftRef = useRef(false)
+  const shouldPersistDrawerOpenRef = useRef(false)
+  const busyIntervalRef = useRef<number | null>(null)
+  const drawerScrollTimeoutsRef = useRef<number[]>([])
+  const pendingCustomInputSelectionRef = useRef<{ start: number; end: number } | null>(null)
+  const repeat = useRepeatWhilePressed()
+
+  // Mirrored alongside the textarea draft so a held key always reads the queue
+  // as it is now, not as it was when the press started.
+  const updateCustomKeys = useCallback((nextValue: string) => {
+    customKeysValueRef.current = nextValue
+    setCustomKeys(nextValue)
+  }, [])
+
+  const updateCustomInput = useCallback((nextValue: string) => {
+    customInputValueRef.current = nextValue
+    setCustomInput(nextValue)
+  }, [])
+
+  const scrollDrawerIntoView = useCallback(() => {
+    const target = findScrollContainer(rootRef.current)
+    if (!target) return
+    target.scrollTo({ top: target.scrollHeight, behavior: 'auto' })
+  }, [])
+
+  function resizeCustomInput() {
+    const textarea = customInputRef.current
+    if (!textarea) return
+
+    textarea.style.height = 'auto'
+
+    const computedStyle = window.getComputedStyle(textarea)
+    const lineHeight = Number.parseFloat(computedStyle.lineHeight) || 20
+    const paddingHeight =
+      Number.parseFloat(computedStyle.paddingTop) + Number.parseFloat(computedStyle.paddingBottom)
+    const borderHeight =
+      Number.parseFloat(computedStyle.borderTopWidth) +
+      Number.parseFloat(computedStyle.borderBottomWidth)
+    const maxHeight = lineHeight * 8 + paddingHeight + borderHeight
+    const nextHeight = Math.min(textarea.scrollHeight, maxHeight)
+
+    textarea.style.height = `${nextHeight}px`
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden'
+  }
+
+  useEffect(() => {
+    resizeCustomInput()
+  }, [customInput])
+
+  // Switching sessions within an existing instance reloads all per-session
+  // persisted UI state in one render-time adjustment (the React-recommended
+  // alternative to setState-in-effect cascades). Deep links and parent-level
+  // remounts (e.g., SessionDetailPage's `key={reloadKey}` flipping on the
+  // mode / node / search-param bucket) are handled by the lazy initializers
+  // above so the draft is restored on first render instead of being wiped to
+  // an empty string.
+  const [prevSessionId, setPrevSessionId] = useState(sessionId)
+  if (prevSessionId !== sessionId) {
+    /* eslint-disable react-hooks/refs -- pre-existing pattern: these guard the
+       persistence effects below and must be cleared before they run, which a
+       render-phase branch can do and an effect cannot. Cleaning this up means
+       reworking the persistence contract, so it is tracked in ISSUES-BACKLOG. */
+    setPrevSessionId(sessionId)
+    shouldPersistDrawerOpenRef.current = false
+    shouldPersistDraftRef.current = false
+    setDrawerOpen(loadSessionDrawerOpen(sessionId))
+    updateCustomInput(loadSessionInputDraft(sessionId))
+    setImagePreviews(loadSessionImagePreviews(sessionId))
+    setPreviewPath(null)
+    /* eslint-enable react-hooks/refs */
+  }
+
+  useEffect(() => {
+    if (!shouldPersistDrawerOpenRef.current) {
+      shouldPersistDrawerOpenRef.current = true
+      return
+    }
+    saveSessionDrawerOpen(sessionId, drawerOpen)
+  }, [drawerOpen, sessionId])
+
+  useEffect(() => {
+    onDrawerOpenChange?.(drawerOpen)
+  }, [drawerOpen, onDrawerOpenChange])
+
+  useEffect(() => {
+    if (!shouldPersistDraftRef.current) {
+      shouldPersistDraftRef.current = true
+      return
+    }
+    saveSessionInputDraft(sessionId, customInput)
+  }, [customInput, sessionId])
+
+  useEffect(() => {
+    saveSessionImagePreviews(sessionId, imagePreviews)
+  }, [imagePreviews, sessionId])
+
+  useEffect(() => {
+    const pendingSelection = pendingCustomInputSelectionRef.current
+    const textarea = customInputRef.current
+    if (!pendingSelection || !textarea) return
+    textarea.setSelectionRange(pendingSelection.start, pendingSelection.end)
+    pendingCustomInputSelectionRef.current = null
+  }, [customInput])
+
+  useEffect(() => {
+    return () => {
+      if (sendClickTimeoutRef.current !== null) {
+        window.clearTimeout(sendClickTimeoutRef.current)
+      }
+      if (busyIntervalRef.current !== null) {
+        window.clearInterval(busyIntervalRef.current)
+      }
+      for (const timeoutId of drawerScrollTimeoutsRef.current) {
+        window.clearTimeout(timeoutId)
+      }
+      drawerScrollTimeoutsRef.current = []
+    }
+  }, [])
+
+  useEffect(() => {
+    if (busyIntervalRef.current !== null) {
+      window.clearInterval(busyIntervalRef.current)
+      busyIntervalRef.current = null
+    }
+  }, [sessionId])
+
+  // The send path itself lives in ./attach-panel-send; these adapt it to this
+  // component's state setters.
+  const sendTarget: AttachSendTarget = {
+    sendInput,
+    showKeyError,
+    recordHistory: saveInputHistory,
+  }
+
+  function handleCustomSend(sendEnter = false) {
+    sendCustomText({
+      text: customInput,
+      withEnter: sendEnter,
+      ...sendTarget,
+      onSent: () => {
+        updateCustomInput('')
+        setImagePreviews({})
+        setPreviewPath(null)
+      },
+    })
+  }
+
+  function handleSendKeySpec(spec: string) {
+    sendKeySpec(spec, sendTarget)
+  }
+
+  function handleSendCustomKeys(raw: string) {
+    sendCustomKeys({
+      text: raw,
+      onSent: () => updateCustomKeys(''),
+      ...sendTarget,
+    })
+  }
+  function toggleDrawer() {
+    const nextOpen = !drawerOpen
+    setDrawerOpen(nextOpen)
+
+    if (!nextOpen) {
+      for (const timeoutId of drawerScrollTimeoutsRef.current) {
+        window.clearTimeout(timeoutId)
+      }
+      drawerScrollTimeoutsRef.current = []
+    }
+  }
+
+  useEffect(() => {
+    for (const timeoutId of drawerScrollTimeoutsRef.current) {
+      window.clearTimeout(timeoutId)
+    }
+    drawerScrollTimeoutsRef.current = []
+
+    if (!drawerOpen) return
+
+    for (const delay of [0, 160, 320]) {
+      const timeoutId = window.setTimeout(() => {
+        scrollDrawerIntoView()
+      }, delay)
+      drawerScrollTimeoutsRef.current.push(timeoutId)
+    }
+  }, [drawerOpen, scrollDrawerIntoView])
+
+  function clearPendingSingleClick() {
+    if (sendClickTimeoutRef.current !== null) {
+      window.clearTimeout(sendClickTimeoutRef.current)
+      sendClickTimeoutRef.current = null
+    }
+  }
+
+  function handleSendButtonClick() {
+    clearPendingSingleClick()
+    sendClickTimeoutRef.current = window.setTimeout(() => {
+      handleCustomSend(false)
+      sendClickTimeoutRef.current = null
+    }, 250)
+  }
+
+  function handleSendButtonDoubleClick() {
+    clearPendingSingleClick()
+    handleCustomSend(true)
+  }
+
+  function startBusyHeartbeat() {
+    sendBusy()
+    if (busyIntervalRef.current !== null) {
+      window.clearInterval(busyIntervalRef.current)
+    }
+    busyIntervalRef.current = window.setInterval(() => {
+      sendBusy()
+    }, ATTACH_BUSY_INTERVAL_MS)
+  }
+
+  function stopBusyHeartbeat() {
+    if (busyIntervalRef.current !== null) {
+      window.clearInterval(busyIntervalRef.current)
+      busyIntervalRef.current = null
+    }
+  }
+
+  function handleUploadButtonClick() {
+    if (!uploadFile || isUploading) return
+    fileInputRef.current?.click()
+  }
+
+  const uploadSelectedFiles = useCallback(
+    async (files: File[]) => {
+      if (!uploadFile) return
+      if (files.length === 0) return
+
+      setIsUploading(true)
+      try {
+        const uploadedPaths: string[] = []
+        const nextImagePreviews: SessionImagePreviews = {}
+
+        for (const file of files) {
+          const response = await uploadFile(file)
+          if (!response.ok) continue
+
+          uploadedPaths.push(response.path)
+          if (isPreviewableImageFile(file)) {
+            try {
+              const previewSource = await readFileAsDataUrl(file)
+              nextImagePreviews[response.path] = previewSource
+            } catch (error) {
+              showKeyError(error instanceof Error ? error.message : 'image preview unavailable')
+            }
+          }
+        }
+
+        if (uploadedPaths.length > 0) {
+          const textarea = customInputRef.current
+          const value = textarea?.value ?? customInputValueRef.current
+          const insertion = insertUploadedPathAtSelection(value, uploadedPaths.join(' '), {
+            start: textarea?.selectionStart ?? value.length,
+            end: textarea?.selectionEnd ?? value.length,
+          })
+          pendingCustomInputSelectionRef.current = insertion.selection
+          updateCustomInput(insertion.value)
+        }
+
+        if (Object.keys(nextImagePreviews).length > 0) {
+          setImagePreviews((previous) => ({
+            ...previous,
+            ...nextImagePreviews,
+          }))
+        }
+      } catch (error) {
+        showKeyError(error instanceof Error ? error.message : 'file upload failed')
+      } finally {
+        setIsUploading(false)
+      }
+    },
+    [showKeyError, updateCustomInput, uploadFile]
+  )
+
+  useEffect(() => {
+    if (!uploadFile) return
+
+    function handlePaste(event: ClipboardEvent) {
+      if (isUploading) return
+      const files = getTransferredFiles(event.clipboardData)
+      if (files.length === 0) return
+      event.preventDefault()
+      void uploadSelectedFiles(files)
+    }
+
+    window.addEventListener('paste', handlePaste)
+    return () => {
+      window.removeEventListener('paste', handlePaste)
+    }
+  }, [isUploading, uploadFile, uploadSelectedFiles])
+
+  async function handleUploadDrop(file: File) {
+    await uploadSelectedFiles([file])
+  }
+
+  async function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || !uploadFile) return
+
+    await uploadSelectedFiles([file])
+  }
+
+  function handleRemoveImagePreview(path: string) {
+    const textarea = customInputRef.current
+    const value = textarea?.value ?? customInputValueRef.current
+    const removal = removeUploadedPathFromInput(value, path, {
+      start: textarea?.selectionStart ?? value.length,
+      end: textarea?.selectionEnd ?? value.length,
+    })
+    pendingCustomInputSelectionRef.current = removal.selection
+    updateCustomInput(removal.value)
+    setImagePreviews((previous) => {
+      const nextPreviews = { ...previous }
+      delete nextPreviews[path]
+      return nextPreviews
+    })
+    if (previewPath === path) {
+      setPreviewPath(null)
+    }
+  }
+
+  const visibleImagePreviewPaths = getVisibleImagePreviewPaths(customInput, imagePreviews)
+  const previewSource = previewPath ? (imagePreviews[previewPath] ?? null) : null
+
+  return (
+    <div ref={rootRef}>
+      <div
+        className={`${drawerOpen ? '' : 'h-0 sm:h-full sm:visible sm:w-[200px] md:w-[300px]'} overflow-hidden transition-all`}
+      >
+        <div className={`flex flex-col gap-4 p-3 `}>
+          <div>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
+              Text Input
+            </p>
+            <div className="relative">
+              <Textarea
+                ref={customInputRef}
+                className="min-h-[72px] pr-12 resize-none"
+                placeholder="Type text here. Enter adds a new line. ctrl+enter to send."
+                rows={3}
+                value={customInput}
+                onChange={(e) => updateCustomInput(e.target.value)}
+                onFocus={startBusyHeartbeat}
+                onBlur={stopBusyHeartbeat}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.ctrlKey) {
+                    e.preventDefault()
+                    // blur to stop busy heartbeat, otherwise it will keep sending busy signals every 2 seconds
+                    e.currentTarget.blur()
+                    handleCustomSend(true)
+                  }
+                }}
+              />
+              <Tooltip>
+                <TooltipContent>
+                  Single click sends text. Double click sends text and Enter.
+                </TooltipContent>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="absolute bottom-2 right-2 p-1"
+                    disabled={!customInput.trim()}
+                    onClick={handleSendButtonClick}
+                    onDoubleClick={handleSendButtonDoubleClick}
+                  >
+                    <SendIcon className="h-5 w-5 text-[hsl(var(--primary))]" />
+                  </Button>
+                </TooltipTrigger>
+              </Tooltip>
+            </div>
+            {visibleImagePreviewPaths.length > 0 && (
+              <div className="flex flex-wrap gap-3 mt-2">
+                {visibleImagePreviewPaths.map((path) => (
+                  <span key={path} className="group relative inline-flex">
+                    <button
+                      type="button"
+                      className="rounded-md text-left transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--card))]"
+                      onClick={() => setPreviewPath(path)}
+                      title={path}
+                    >
+                      <span className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-[hsl(var(--border))] bg-[hsl(var(--secondary))]">
+                        <img
+                          src={imagePreviews[path]}
+                          alt={path}
+                          className="h-8 w-8 object-cover"
+                          draggable={false}
+                        />
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-[hsl(var(--destructive))] text-[hsl(var(--destructive-foreground))] opacity-0 shadow-sm transition-opacity hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))] focus-visible:ring-offset-1 group-hover:opacity-100 group-focus-within:opacity-100"
+                      aria-label={`Remove ${path}`}
+                      onClick={() => handleRemoveImagePreview(path)}
+                    >
+                      <XIcon className="h-3 w-3" aria-hidden="true" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <p className="text-xs text-[hsl(var(--muted-foreground))] font-medium mb-2">
+              Quick Keys
+            </p>
+            <div className="grid grid-cols-4 gap-1.5 max-h-27 sm:max-h-fit overflow-y-auto select-none">
+              {/* eslint-disable-next-line react-hooks/refs -- pre-existing: the ref
+                  reads are inside the hold/click callbacks, not in render, but the
+                  rule cannot prove `holdRepeatProps` does not call back during
+                  render. Surfaced only once the file shrank below the rule's
+                  analysis threshold. */}
+              {popularKeys.map(({ key, label, instant }) => (
+                <Tooltip key={key}>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      className={`${HOLD_KEY_FOCUS_NONE} select-none font-mono text-xs ${key === 'ctrl+c' ? 'bg-red-700 text-white' : key === 'esc' || key === 'enter' ? 'bg-amber-700 text-white' : instant ? 'bg-[hsl(var(--primary))]/30 text-white' : ''}`}
+                      {...(instant
+                        ? holdRepeatProps(repeat, () => {
+                            const queued = customKeysValueRef.current
+                            if (queued.trim()) {
+                              // compose with any pending modifier already in the queue
+                              handleSendCustomKeys(`${queued.trim()} ${key}`)
+                            } else {
+                              handleSendKeySpec(key)
+                            }
+                          })
+                        : {
+                            onClick: () => {
+                              updateCustomKeys(
+                                customKeysValueRef.current.trim()
+                                  ? `${customKeysValueRef.current.trim()} ${key} `
+                                  : key + ' '
+                              )
+                              document.getElementById('custom-keys')?.focus()
+                            },
+                          })}
+                    >
+                      {label}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>{instant ? `${key} (instant)` : `${key} (queue)`}</TooltipContent>
+                </Tooltip>
+              ))}
+            </div>
+            <p className="mt-1 text-xs text-[hsl(var(--primary))]">
+              ⚡colorful key will be sent immediately
+            </p>
+            <div className="mt-2 flex items-center gap-1">
+              <ClearableInput
+                id="custom-keys"
+                className="text-sm"
+                placeholder="Keys separated by whitespace. Press enter to send."
+                clearLabel="Clear keys"
+                value={customKeys}
+                onChange={(e) => updateCustomKeys(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    handleSendCustomKeys(customKeys)
+                  }
+                }}
+              />
+            </div>
+          </div>
+          <div>
+            <FileDropZone
+              className="hidden sm:flex flex-col gap-2 rounded-md border border-dashed border-[hsl(var(--border))] bg-[hsl(var(--muted))]/20 px-3 py-3 transition-colors data-[disabled=true]:bg-[hsl(var(--muted))]/30 data-[disabled=true]:opacity-70 data-[drag-active=true]:border-[hsl(var(--primary))] data-[drag-active=true]:bg-[hsl(var(--primary))]/10"
+              disabled={!uploadFile || isUploading}
+              onFileDrop={handleUploadDrop}
+            >
+              <p className="text-center text-xs text-[hsl(var(--muted-foreground))]">
+                Drop or paste a file here to upload on desktop.
+              </p>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                className="gap-2 w-full"
+                disabled={!uploadFile || isUploading}
+                onClick={handleUploadButtonClick}
+              >
+                <PaperclipIcon className="h-4 w-4" />
+                {isUploading ? 'Uploading...' : 'Upload file'}
+              </Button>
+            </FileDropZone>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              className="gap-2 w-full sm:hidden"
+              disabled={!uploadFile || isUploading}
+              onClick={handleUploadButtonClick}
+            >
+              <PaperclipIcon className="h-4 w-4" />
+              {isUploading ? 'Uploading...' : 'Upload file'}
+            </Button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden"
+              onChange={handleFileInputChange}
+            />
+          </div>
+        </div>
+      </div>
+      <MobileKeyBar
+        repeat={repeat}
+        onSendKeySpec={handleSendKeySpec}
+        drawerOpen={drawerOpen}
+        onToggleDrawer={toggleDrawer}
+      />{' '}
+      <ImagePreviewDialog
+        open={previewPath !== null}
+        path={previewPath}
+        src={previewSource}
+        onOpenChange={(open) => !open && setPreviewPath(null)}
+      />
+    </div>
+  )
+}

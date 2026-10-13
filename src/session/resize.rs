@@ -23,6 +23,10 @@ impl ResizeSubscriber {
     /// Create a subscriber from the result of `SessionStore::subscribe_resize`.
     /// If `result` is `None` (session not found / lock failed), the subscriber
     /// will pend forever without producing any values.
+    /// Param shape mirrors `SessionStore::subscribe_resize`'s return;
+    /// the type alias is internal so the complexity lives here, not in
+    /// every caller's signature.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         result: Option<(broadcast::Receiver<(u16, u16)>, Option<(u16, u16)>)>,
         session_id: String,

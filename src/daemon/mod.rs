@@ -1,9 +1,11 @@
 mod auth;
 mod crash;
+mod journal_retention;
 mod lifecycle;
 mod reload;
 mod rpc;
 mod rpc_attach;
+mod rpc_logs;
 mod rpc_nodes;
 
 use std::{collections::HashMap, sync::Arc};

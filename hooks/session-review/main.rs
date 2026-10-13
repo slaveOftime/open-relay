@@ -275,11 +275,11 @@ impl ReviewApp {
                 cx.quit();
             }
             _ => {
-                if let Some(key_char) = event.keystroke.key_char.as_deref() {
-                    if key_char.chars().all(|character| character.is_ascii_digit()) {
-                        self.tail_buffer.push_str(key_char);
-                        self.status = String::from("Editing tail");
-                    }
+                if let Some(key_char) = event.keystroke.key_char.as_deref()
+                    && key_char.chars().all(|character| character.is_ascii_digit())
+                {
+                    self.tail_buffer.push_str(key_char);
+                    self.status = String::from("Editing tail");
                 }
             }
         }

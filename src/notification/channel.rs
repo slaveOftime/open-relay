@@ -217,7 +217,7 @@ impl WebPushChannel {
         proxy_url: Option<&str>,
         db: std::sync::Arc<Database>,
     ) -> Result<Self> {
-        use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
 
         let raw = b64url_decode(vapid_private_key_b64)?;
         if raw.len() != 32 {
@@ -232,7 +232,7 @@ impl WebPushChannel {
         let fb = p256::elliptic_curve::FieldBytes::<p256::NistP256>::from(key_bytes);
         let secret = p256::SecretKey::from_bytes(&fb)
             .map_err(|e| AppError::Protocol(format!("invalid VAPID private key: {e}")))?;
-        let derived_pub = secret.public_key().to_encoded_point(false);
+        let derived_pub = secret.public_key().to_sec1_point(false);
 
         let provided_pub = b64url_decode(vapid_public_key_b64)?;
         if provided_pub.as_slice() != derived_pub.as_bytes() {
@@ -309,8 +309,8 @@ impl WebPushChannel {
         use aes_gcm::{Aes128Gcm, KeyInit as _};
         use hkdf::Hkdf;
         use p256::SecretKey;
-        use p256::elliptic_curve::{ecdh::diffie_hellman, sec1::ToEncodedPoint as _};
-        use rand::RngCore as _;
+        use p256::elliptic_curve::{ecdh::diffie_hellman, sec1::ToSec1Point as _};
+        use rand::Rng as _;
         use sha2::Sha256;
 
         let p256dh_bytes = b64url_decode(p256dh_b64)?;
@@ -319,11 +319,16 @@ impl WebPushChannel {
         let subscriber_pub = p256::PublicKey::from_sec1_bytes(&p256dh_bytes)
             .map_err(|e| AppError::Protocol(format!("invalid p256dh: {e}")))?;
         // Normalise to uncompressed 65-byte form for key_info.
-        let subscriber_pub_bytes = subscriber_pub.to_encoded_point(false);
+        let subscriber_pub_bytes = subscriber_pub.to_sec1_point(false);
 
         // Ephemeral P-256 keypair.
-        let eph_key = SecretKey::random(&mut rand::thread_rng());
-        let eph_pub_encoded = eph_key.public_key().to_encoded_point(false); // 65 bytes
+        let mut eph_seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut eph_seed);
+        let eph_key = SecretKey::from_slice(&eph_seed).map_err(|e| {
+            AppError::Protocol(format!("ephemeral P-256 key generation failed: {e}"))
+        })?;
+
+        let eph_pub_encoded = eph_key.public_key().to_sec1_point(false); // 65 bytes
 
         // ECDH shared secret (X coordinate only).
         let shared = diffie_hellman(eph_key.to_nonzero_scalar(), subscriber_pub.as_affine());
@@ -343,7 +348,7 @@ impl WebPushChannel {
 
         // Random 16-byte salt for the content key.
         let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
 
         // PRK = HKDF-Extract(salt=salt, IKM=ikm)
         let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);

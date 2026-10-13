@@ -6,34 +6,119 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    io::{ErrorKind, Read, Write},
-    path::PathBuf,
+    io::{self, ErrorKind, Read, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
+// Windows-only in production; the read/close race is tested on every platform.
+#[cfg(any(windows, test))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
     error::{AppError, Result},
     protocol::{LogResize, SessionSummary},
-    session::persist::create_output_log,
 };
 
+use super::journal::{self, LifecycleCode, ShadowJournal};
 use super::pty::{PtyHandle, RuntimeChild, TerminalSignals};
 use super::scan::{PtyScanner, ScanOut};
+use super::{MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus};
+use crate::terminal::{EngineEvent, Terminal};
 
-use super::{
-    MAX_SESSION_TITLE_LEN, SessionEvent, SessionEventTx, SessionMeta, SessionStatus,
-    persist::{OutputLog, append_event, append_resize_event},
-    screen::safe_resize_parser,
-};
+/// How long the PTY reader must have seen no new bytes before a finished
+/// session's master handle may be dropped on Windows.
+///
+/// Dropping the master is what fires `ClosePseudoConsole`, and that discards
+/// every byte the console host has not yet translated into the output pipe —
+/// a pipe that never reaches EOF on its own, because the console host owns
+/// its write end and keeps it open until the console is closed. Tearing down
+/// at the instant `try_wait` reports exit therefore races the reader thread
+/// and silently truncates the transcript tail.
+#[cfg(windows)]
+const PTY_TEARDOWN_QUIET: Duration = Duration::from_millis(200);
+/// Drain deadline between processed chunks. An in-flight chunk is never
+/// interrupted merely because rendering/journaling outlasts this deadline.
+#[cfg(windows)]
+const PTY_TEARDOWN_MAX: Duration = Duration::from_secs(2);
+/// Poll interval while waiting for the output stream to drain.
+#[cfg(windows)]
+const PTY_TEARDOWN_POLL: Duration = Duration::from_millis(20);
+/// Permanent closing marker in the PTY read-generation counter. It prevents
+/// the reader from extending a drain deadline after teardown starts, but is
+/// NOT an output cutoff: bytes already in the pipe must still be recorded.
+#[cfg(any(windows, test))]
+const PTY_CONSOLE_CLOSING: u64 = u64::MAX;
+
+/// Claim a read before the close boundary and advance the drain generation.
+/// Odd generations mean a read is being processed; completion advances to even.
+/// Teardown can claim only an even generation, never an in-flight chunk.
+/// The atomic update also makes the closing marker irreversible.
+#[cfg(any(windows, test))]
+fn record_pty_read(epoch: &AtomicU64) -> bool {
+    let mut current = epoch.load(Ordering::Relaxed);
+    while current != PTY_CONSOLE_CLOSING {
+        match epoch.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+    false
+}
+
+/// A successful read remains in-flight until its journal/engine/broadcast work
+/// is finished. RAII covers all early-exit paths as well as normal completion.
+#[cfg(any(windows, test))]
+struct PtyReadGuard<'a> {
+    epoch: &'a AtomicU64,
+    claimed: bool,
+}
+
+#[cfg(any(windows, test))]
+impl<'a> PtyReadGuard<'a> {
+    fn new(epoch: &'a AtomicU64) -> Self {
+        Self {
+            epoch,
+            claimed: record_pty_read(epoch),
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for PtyReadGuard<'_> {
+    fn drop(&mut self) {
+        if self.claimed {
+            let _ = record_pty_read(self.epoch);
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn try_close_pty_generation(epoch: &AtomicU64, observed: u64) -> bool {
+    observed != PTY_CONSOLE_CLOSING
+        && observed.is_multiple_of(2)
+        && epoch
+            .compare_exchange(
+                observed,
+                PTY_CONSOLE_CLOSING,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+}
 
 // ---------------------------------------------------------------------------
 // SessionRuntime
@@ -43,6 +128,12 @@ use super::{
 pub struct ModeSnapshot {
     pub app_cursor_keys: bool,
     pub bracketed_paste_mode: bool,
+    /// Child has mouse reporting enabled (any of 1000/1002/1003).
+    pub mouse_report: bool,
+    /// Child negotiated SGR (1006) mouse encoding.
+    pub sgr_mouse: bool,
+    /// Child has focus in/out reporting (1004) enabled.
+    pub focus_events: bool,
 }
 
 /// Lock-free publication of the session's input-affecting terminal modes.
@@ -58,6 +149,9 @@ pub struct SharedModes(std::sync::atomic::AtomicU8);
 
 const MODE_BIT_APP_CURSOR_KEYS: u8 = 1 << 0;
 const MODE_BIT_BRACKETED_PASTE: u8 = 1 << 1;
+const MODE_BIT_MOUSE_REPORT: u8 = 1 << 2;
+const MODE_BIT_SGR_MOUSE: u8 = 1 << 3;
+const MODE_BIT_FOCUS_EVENTS: u8 = 1 << 4;
 
 impl SharedModes {
     pub fn load(&self) -> ModeSnapshot {
@@ -65,6 +159,9 @@ impl SharedModes {
         ModeSnapshot {
             app_cursor_keys: bits & MODE_BIT_APP_CURSOR_KEYS != 0,
             bracketed_paste_mode: bits & MODE_BIT_BRACKETED_PASTE != 0,
+            mouse_report: bits & MODE_BIT_MOUSE_REPORT != 0,
+            sgr_mouse: bits & MODE_BIT_SGR_MOUSE != 0,
+            focus_events: bits & MODE_BIT_FOCUS_EVENTS != 0,
         }
     }
 
@@ -76,7 +173,86 @@ impl SharedModes {
         if modes.bracketed_paste_mode {
             bits |= MODE_BIT_BRACKETED_PASTE;
         }
+        if modes.mouse_report {
+            bits |= MODE_BIT_MOUSE_REPORT;
+        }
+        if modes.sgr_mouse {
+            bits |= MODE_BIT_SGR_MOUSE;
+        }
+        if modes.focus_events {
+            bits |= MODE_BIT_FOCUS_EVENTS;
+        }
         self.0.store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// One broadcast unit of the canonical filtered stream. Sent inside the
+/// same write-lock section that sequenced the journal record, so
+/// journal order and broadcast order agree.
+#[derive(Debug, Clone)]
+pub struct SequencedChunk {
+    /// Filtered-stream offset of the first byte. The attach pump trims
+    /// overlaps and detects gaps against this instead of trusting
+    /// broadcast delivery order blindly.
+    pub offset: u64,
+    pub bytes: Bytes,
+}
+
+/// Raw-output interval between journal checkpoints. Bounds the bytes a
+/// replay must re-consume after the newest checkpoint; sized so a
+/// checkpoint is taken roughly every other journal part.
+pub(crate) const JOURNAL_CHECKPOINT_INTERVAL_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Atomic-monotonic publication of the last retention sweep's outcome:
+/// `sealing_passes` and the dropped/swept counters are surfaced on the
+/// session list; `bytes_retained` is read on demand. Together they show
+/// whether the byte-budget cap is actually firing.
+#[derive(Debug)]
+struct RetentionStats {
+    bytes_retained: std::sync::atomic::AtomicU64,
+    sweep_count: std::sync::atomic::AtomicU64,
+    deleted_incarnations_total: std::sync::atomic::AtomicU64,
+}
+
+impl Default for RetentionStats {
+    fn default() -> Self {
+        Self {
+            bytes_retained: std::sync::atomic::AtomicU64::new(0),
+            sweep_count: std::sync::atomic::AtomicU64::new(0),
+            deleted_incarnations_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// Retention-stats handle + shared byte cap, cloned into the retention
+/// thread so the daemon can hot-reload the cap without touching every
+/// session in place.
+#[derive(Debug, Default, Clone)]
+pub struct RetentionHandle {
+    stats: Arc<RetentionStats>,
+}
+
+impl RetentionHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn bytes_retained(&self) -> u64 {
+        self.stats
+            .bytes_retained
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn sweep_count(&self) -> u64 {
+        self.stats
+            .sweep_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn deleted_incarnations_total(&self) -> u64 {
+        self.stats
+            .deleted_incarnations_total
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -87,7 +263,7 @@ pub struct SessionRuntime {
     /// Sends canonical filtered PTY output chunks to all live attach
     /// subscribers. `Bytes` is already reference counted, so subscribers share
     /// one allocation without an extra `Arc` indirection.
-    pub broadcast_tx: broadcast::Sender<Bytes>,
+    pub broadcast_tx: broadcast::Sender<SequencedChunk>,
     /// Broadcasts PTY resize events (rows, cols) to all attach subscribers.
     pub resize_tx: broadcast::Sender<(u16, u16)>,
     /// PTY ownership: master fd, writer channel, child process.
@@ -101,7 +277,10 @@ pub struct SessionRuntime {
     pub persisted: bool,
     pub requested_final_status: Option<SessionStatus>,
     /// Total length of the canonical filtered PTY output stream for persistence and replay.
-    pub raw_total_bytes: u64,
+    /// Total bytes of the canonical FILTERED display stream (what
+    /// `output.log` previously held; attach offsets index this stream).
+    /// Raw pre-filter bytes live in the journal.
+    pub filtered_total_bytes: u64,
     /// Total length of meaningful PTY output bytes that changed the terminal state.
     pub last_total_bytes: u64,
     /// Timestamp the runtime was created (PTY spawned). Used as a fallback
@@ -111,18 +290,32 @@ pub struct SessionRuntime {
     pub spawned_at: Instant,
     /// Timestamp of the last meaningful output chunk.
     pub last_output_epoch: Option<Instant>,
+    /// Generation counter advanced at every successful PTY read, or
+    /// [`PTY_CONSOLE_CLOSING`] once teardown has claimed the close boundary.
+    ///
+    /// Unlike `last_output_epoch` — which only advances on *meaningful*
+    /// output for notification bookkeeping — this advances on every chunk,
+    /// so PTY teardown can tell "the reader is still receiving" apart from
+    /// "the stream has drained". Windows-only: only its teardown needs the
+    /// distinction.
+    #[cfg(windows)]
+    pub(crate) pty_read_epoch: Arc<AtomicU64>,
     /// Timestamp of the last input bytes forwarded to the PTY.
     pub last_input_at: Option<Instant>,
     /// Timestamp of the last interactive attach action (input/resize).
     pub last_attach_activity_at: Option<Instant>,
-    /// Number of currently connected local clients for this session.
-    pub attach_count: usize,
+    /// Identified attachments; the attachment count is
+    /// `attachments.len()`.
+    pub attachments: super::registry::AttachmentRegistry,
     /// Timestamp of the last *successful* notification delivery for this session.
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
     /// Live rendered terminal state for attach snapshot restoration.
-    pub screen_parser: vt100::Parser,
+    /// The session's terminal engine (ADR-0001): fed the exact raw PTY
+    /// stream inside the write lock, it owns screen state, modes, reflow
+    /// resize and exact-position query responses.
+    pub engine: Terminal,
     /// How many scrolled-off rows `screen_parser` retains; applied at spawn
     /// and on every resize rebuild.  From `AppConfig::screen_scrollback_rows`.
     pub screen_scrollback_rows: usize,
@@ -140,7 +333,41 @@ pub struct SessionRuntime {
     pub shared_modes: Arc<SharedModes>,
     /// Set once the PTY reader has reached EOF or a terminal read error.
     pub output_closed: bool,
+    /// True once the closed journal tail was inspected for a resume command.
+    pub resume_scanned: bool,
+    /// Terminal completion fact waiting for the output stream to drain
+    /// before it may be journaled. Process exit and PTY EOF are separate
+    /// facts: completion must be sequenced after the final retained
+    /// output, never at the moment `try_wait` noticed the exit.
+    pub(crate) pending_journal_completion: Option<(LifecycleCode, Option<i32>, String)>,
+    /// Raw-output counter value at the last journal checkpoint.
+    pub(crate) last_journal_checkpoint_at: u64,
+    /// Last terminal mode state journaled as a Policy record this
+    /// incarnation; `None` until the baseline revision is recorded.
+    pub(crate) journaled_modes: Option<ModeSnapshot>,
     pub notifications_enabled: bool,
+    /// Per-session sequencing point for output, resize, and lifecycle
+    /// facts (ADR-0002). `None` only for runtimes with no session
+    /// directory (tests). The mutex covers in-memory sequencing and a
+    /// bounded, non-blocking queue submit — no disk I/O — and is safe
+    /// to take under the runtime write lock.
+    pub journal: Option<parking_lot::Mutex<ShadowJournal>>,
+    /// Set the first time a journal record fails (ADR-0006): a session
+    /// whose history can no longer be recorded is stopped (marked
+    /// `Failed`) instead of continuing to run unrecorded. Atomic because
+    /// `journal_event` only holds `&self`.
+    pub journal_failed: std::sync::atomic::AtomicBool,
+    /// Pointer into the daemon's shared journal byte cap. The retention
+    /// thread re-loads it on every sweep, so a daemon hot reload
+    /// (`store.set_journal_byte_cap`) is visible to every live
+    /// session without a restart. 0 = unlimited (the historical,
+    /// historical behaviour: 0 = no cap).
+    pub journal_byte_cap: Arc<std::sync::atomic::AtomicU64>,
+    /// Handle to the journal byte cap + lock-free retention stats.
+    /// Populated by `spawn_session` and shared (via the inner `Arc`)
+    /// with the retention thread so a hot-reloaded cap is
+    /// visible without re-spawning the runtime.
+    pub retention: RetentionHandle,
 }
 
 /// Capacity of the queue between attach input and the PTY writer thread.
@@ -158,14 +385,109 @@ const PTY_WRITER_QUEUE_CAPACITY: usize = 4096;
 /// therefore as few downstream chunks, broadcasts and IPC frames — as possible.
 const PTY_READ_BUFFER_BYTES: usize = 64 * 1024;
 
-impl SessionRuntime {
-    /// Current terminal mode snapshot (DECCKM, bracketed paste).
-    pub fn mode_snapshot(&self) -> ModeSnapshot {
-        let screen = self.screen_parser.screen();
-        ModeSnapshot {
-            app_cursor_keys: screen.application_cursor(),
-            bracketed_paste_mode: screen.bracketed_paste(),
+/// Run one byte-budgeted journal retention sweep.
+///
+/// Convenience wrapper around `journal::min_incarnation_for_byte_budget` +
+/// `journal::retain_before`. The function never panics on journal I/O:
+/// errors propagate so the runtime can log and retry on the next
+/// checkpoint. The function updates the [`RetentionHandle`] stats after
+/// every successful call so `to_summary()` can publish them later.
+fn run_retention_sweep(
+    session_dir: &Path,
+    byte_cap: &Arc<std::sync::atomic::AtomicU64>,
+    retention: &RetentionHandle,
+) -> io::Result<()> {
+    let journal_dir = session_dir.join(journal::JOURNAL_DIR_NAME);
+    let cap = byte_cap.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_horizon = if cap == 0 {
+        // Unlimited cap: nothing is deleted — `retain_before` clamps any
+        // horizon to the checkpoint gate, preserving the pre-byte-budget
+        // behaviour (no deletion happens unless the byte-budget cap is also
+        // exceeded)
+        // exactly. Horizon 1 keeps ALL manifest entries for the
+        // `bytes_retained` stat (retain_before(dir, 1) clamps to the
+        // gate and deletes nothing).
+        1
+    } else {
+        match journal::min_incarnation_for_byte_budget(&journal_dir, cap) {
+            Ok(effective_horizon) => effective_horizon,
+            Err(err) => {
+                // Misformed/missing manifest: warn and fall through as
+                // if the cap were disabled. Without this, every
+                // post-checkpoint sweep would log the same recovery
+                // failure and the user could never tell what was going
+                // on without reading the journal dir.
+                warn!(
+                    error = %err,
+                    "could not compute journal byte-budget horizon; skipping sweep"
+                );
+                1
+            }
         }
+    };
+    let deleted = journal::retain_before(session_dir, effective_horizon)?;
+    retention
+        .stats
+        .deleted_incarnations_total
+        .fetch_add(deleted.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    retention
+        .stats
+        .sweep_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(manifest) = journal::read_manifest(&journal_dir) {
+        let latest_incarnation = journal::list_incarnations(&journal_dir)
+            .ok()
+            .and_then(|list| list.last().copied());
+        let retained: u64 = manifest
+            .iter()
+            .filter(|entry| {
+                entry.incarnation >= effective_horizon
+                    || Some(&entry.incarnation) == latest_incarnation.as_ref()
+            })
+            .map(|entry| entry.bytes)
+            .sum();
+        retention
+            .stats
+            .bytes_retained
+            .store(retained, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+impl SessionRuntime {
+    /// Current terminal mode snapshot (DECCKM, bracketed paste, mouse
+    /// and focus reporting) — everything an attach client needs to decide
+    /// which local terminal capabilities to enable and forward.
+    pub fn mode_snapshot(&self) -> ModeSnapshot {
+        let modes = self.engine.modes();
+        ModeSnapshot {
+            app_cursor_keys: modes.app_cursor_keys,
+            bracketed_paste_mode: modes.bracketed_paste,
+            mouse_report: modes.mouse_report,
+            sgr_mouse: modes.sgr_mouse,
+            focus_events: modes.focus_events,
+        }
+    }
+
+    /// Feed one raw PTY chunk to the terminal engine and return the query
+    /// responses it generated — each produced at the query's exact stream
+    /// position while the chunk advanced. Title/bell events
+    /// stay on the scanner's signal path; the engine's duplicates are
+    /// drained and ignored there.
+    ///
+    /// Must be called under the same write-lock section that journals the
+    /// chunk so engine state, journal and broadcast never disagree.
+    pub fn feed_engine(&mut self, raw: &[u8]) -> Vec<Vec<u8>> {
+        self.engine.feed(raw);
+        let mut responses = Vec::new();
+        for event in self.engine.drain_events() {
+            match event {
+                EngineEvent::Respond(bytes) => responses.push(bytes),
+                EngineEvent::Title(_) | EngineEvent::Bell => {}
+            }
+        }
+        self.shared_modes.store(self.mode_snapshot());
+        responses
     }
 
     /// Push a filtered PTY chunk into the canonical retained stream.
@@ -174,22 +496,24 @@ impl SessionRuntime {
     /// user can see, as measured by the reader thread's scanner during the same
     /// pass that produced `filtered_data`.
     ///
-    /// Returns the current cursor position so the caller can answer terminal
-    /// queries without re-locking.
-    pub fn push_output(&mut self, filtered_data: &[u8], meaningful_len: usize) -> (u16, u16) {
+    /// Screen state is *not* advanced here: the engine is fed the raw chunk
+    /// separately via [`SessionRuntime::feed_engine`], so queries stripped
+    /// from the display stream still get answered at their exact position.
+    pub fn push_output(&mut self, filtered_data: &[u8], meaningful_len: usize) {
         if !filtered_data.is_empty() {
-            self.raw_total_bytes = self
-                .raw_total_bytes
+            self.filtered_total_bytes = self
+                .filtered_total_bytes
                 .saturating_add(filtered_data.len() as u64);
-            self.screen_parser.process(filtered_data);
             if meaningful_len > 0 {
                 self.last_total_bytes = self.last_total_bytes.saturating_add(meaningful_len as u64);
                 self.last_output_epoch = Some(Instant::now());
             }
-            self.shared_modes.store(self.mode_snapshot());
         }
+    }
 
-        self.screen_parser.screen().cursor_position()
+    /// Current filtered-stream end offset.
+    pub fn filtered_stream_len(&self) -> u64 {
+        self.filtered_total_bytes
     }
 
     /// The output epoch used for silence/notification bookkeeping.
@@ -217,7 +541,16 @@ impl SessionRuntime {
     }
 
     /// Build a `SessionSummary` snapshot from the current runtime state.
+    ///
+    /// Known cost: this clones ~15 strings per call and is invoked
+    /// per-broadcast (attach pump) and per-list (`GET /api/sessions`).
+    /// At `max_running_sessions = 50` that is
+    /// under 1 KiB of garbage per fan-out — well below noise. Revisit
+    /// the per-call allocation budget if `/api/metrics` shows the
+    /// `attach` chunk inter-arrival histogram tail creeping up under a
+    /// `GET /api/sessions` burst, since the two share this code path.
     pub fn to_summary(&self) -> SessionSummary {
+        let sweep_count = self.retention.sweep_count();
         SessionSummary {
             id: self.meta.id.clone(),
             title: self.meta.title.clone(),
@@ -229,6 +562,7 @@ impl SessionRuntime {
             created_at: self.meta.created_at,
             started_at: self.meta.started_at,
             ended_at: self.meta.ended_at,
+            resume_command: self.meta.resume_command.clone(),
             cwd: self.meta.cwd.clone(),
             input_needed: self.input_needed(),
             notifications_enabled: self.meta.notifications_enabled,
@@ -237,9 +571,15 @@ impl SessionRuntime {
             last_output_epoch: self.last_output_epoch.and_then(instant_to_utc),
             rows: self.pty_size.map(|(rows, _)| rows),
             cols: self.pty_size.map(|(_, cols)| cols),
-            attach_count: self.attach_count,
+            attach_count: self.attachments.len(),
             foreground_color: self.meta.foreground_color.clone(),
             background_color: self.meta.background_color.clone(),
+            journal_bytes_retained: sweep_count.gt(&0).then(|| self.retention.bytes_retained()),
+            journal_retention_sweeps: sweep_count.gt(&0).then_some(sweep_count),
+            journal_incarnations_dropped: sweep_count
+                .gt(&0)
+                .then(|| self.retention.deleted_incarnations_total()),
+            journal_byte_cap: None,
         }
     }
 
@@ -320,54 +660,96 @@ impl SessionRuntime {
     }
 
     /// Bytes that restore the session's visible terminal state on a freshly
-    /// attached client: the rendered screen plus the window/icon title and
-    /// progress notifications the terminal parser does not model.
+    /// attached client: the engine-rendered screen (renderer restore
+    /// adapter, ADR-0001 #4) plus the window/icon title and progress
+    /// notifications the renderer stream does not model.
     pub fn attach_snapshot_bytes(&self) -> Vec<u8> {
-        let mut snapshot = self.screen_parser.screen().state_formatted();
+        let mut snapshot = Vec::new();
+        if self.engine.modes().alt_screen {
+            // The app owns the alternate screen, but a freshly attached
+            // terminal is in normal mode. Without entering the alt screen
+            // first, the app's next `\x1b[?1049l` would exit an alt screen
+            // the client never entered, leaving the display a mix of stale
+            // alt-screen content and the redrawn normal screen.
+            snapshot.extend_from_slice(b"\x1b[?1049h");
+        }
+        snapshot.extend_from_slice(&self.engine.snapshot_stream());
         snapshot.extend_from_slice(&self.terminal_signals.restore_bytes());
         snapshot
     }
 
-    pub fn render_logs(&self, tail: usize, keep_color: bool, term_cols: u16) -> Vec<u8> {
-        super::logs::render_screen(&self.screen_parser, tail, keep_color, term_cols)
+    /// Borrow the engine just long enough to copy its visible rows.
+    /// Lets async callers snapshot the rows under the read lock, drop
+    /// the guard, and finish the render on
+    /// `tokio::task::spawn_blocking` so the PTY reader's write lock is
+    /// never starved by a long render. Pairs with
+    /// [`super::logs::finish_render`] which performs the
+    /// CPU-bound tail/skip pass off the lock.
+    pub fn snapshot_engine_rows(&self, keep_color: bool, term_cols: u16) -> Vec<Vec<u8>> {
+        super::logs::engine_content_rows(&self.engine, keep_color, term_cols)
     }
 
-    pub fn register_attach_client(&mut self) {
-        self.attach_count = self.attach_count.saturating_add(1);
+    /// Register an identified attachment. When the attachment is a
+    /// controller and declared a viewport, the initial geometry is applied
+    /// here, through the same sequencer path as any later resize.
+    /// Returns the attachment id (fencing token), the
+    /// granted role, and whether the initial geometry was applied.
+    pub fn register_attachment(
+        &mut self,
+        kind: super::registry::AttachKind,
+        role: super::registry::AttachRole,
+        viewport: Option<(u16, u16)>,
+    ) -> (u64, super::registry::AttachRole, bool) {
+        use super::registry::AttachRole;
         // Attaching is itself user activity: someone just opened this
         // session and saw its current state.
         self.last_attach_activity_at = Some(Instant::now());
+        let (id, role) = self.attachments.register(kind, role, viewport);
+        let mut resized = false;
+        if role == AttachRole::Controller
+            && let Some((rows, cols)) = viewport
+            && rows > 0
+            && cols > 0
+        {
+            resized = self.resize_pty(rows, cols);
+        }
         trace!(
             session_id = %self.meta.id,
-            attach_count = self.attach_count,
+            attachment_id = id,
+            role = role.as_str(),
+            attach_count = self.attachments.len(),
             "attach client registered"
         );
+        (id, role, resized)
     }
 
     pub fn mark_attach_activity(&mut self) {
         debug!(
             session_id = %self.meta.id,
-            attach_count = self.attach_count,
+            attach_count = self.attachments.len(),
             "interactive attach activity marked"
         );
         self.last_attach_activity_at = Some(Instant::now());
     }
 
-    pub fn detach_attach_client(&mut self) {
-        self.attach_count = self.attach_count.saturating_sub(1);
+    /// Remove an attachment by its fencing token. Unknown (stale) ids are
+    /// a no-op.
+    pub fn unregister_attachment(&mut self, attachment_id: u64) {
+        let removed = self.attachments.unregister(attachment_id);
         debug!(
             session_id = %self.meta.id,
-            attach_count = self.attach_count,
+            attachment_id,
+            found = removed.is_some(),
+            attach_count = self.attachments.len(),
             "attach client detached"
         );
-        if self.attach_count == 0 {
+        if self.attachments.is_empty() {
             self.clear_attach_state();
         }
     }
 
     pub fn clear_attach_state(&mut self) {
         debug!(session_id = %self.meta.id, "attach presence cleared");
-        self.attach_count = 0;
         // `last_attach_activity_at` deliberately survives detach: it records
         // when a user last *saw and touched* the session, which stays true
         // after they disconnect. Clearing it would make a just-detached
@@ -392,28 +774,21 @@ impl SessionRuntime {
             notifications_enabled = enabled,
             "session notification setting updated"
         );
-        let event = if enabled {
-            "notifications enabled"
-        } else {
-            "notifications disabled"
-        };
-        if let Err(err) = append_event(&self.dir, event) {
-            warn!(
-                session_id = %self.meta.id,
-                %err,
-                "failed to persist notification-setting event"
-            );
-        }
     }
 
     /// Returns `true` when at least one attach subscriber is currently live.
     #[allow(dead_code)]
     pub fn has_active_attach_client(&self) -> bool {
-        self.attach_count > 0
+        !self.attachments.is_empty()
     }
 
     /// Checks child exit status and updates `meta.status`. Returns `true` if completed.
     pub fn refresh_status(&mut self) -> bool {
+        // Also poll journal acks so `durable_seq` advances even when the
+        // session is idle (acks otherwise only arrive on the next record).
+        if let Some(journal) = &self.journal {
+            journal.lock().poll_acks();
+        }
         if self.is_completed() {
             if self.completed_at.is_none() {
                 self.completed_at = Some(Instant::now());
@@ -424,7 +799,7 @@ impl SessionRuntime {
         match self.pty.try_wait() {
             Ok(Some(code)) => {
                 debug!(session_id = %self.meta.id, exit_code = code, "child process exited");
-                let status = self.requested_final_status.unwrap_or_else(|| {
+                let status = self.requested_final_status.unwrap_or({
                     if code == 0 {
                         SessionStatus::Stopped
                     } else {
@@ -449,7 +824,8 @@ impl SessionRuntime {
     }
 
     pub fn mark_completed(&mut self, status: SessionStatus, exit_code: Option<i32>) {
-        if self.meta.ended_at.is_none() {
+        let newly_ended = self.meta.ended_at.is_none();
+        if newly_ended {
             self.meta.ended_at = Some(chrono::Utc::now());
         }
         self.meta.status = status;
@@ -466,7 +842,7 @@ impl SessionRuntime {
             exit_code = ?exit_code,
             "marking PTY session as completed"
         );
-        self.pty.release_resources();
+        self.teardown_pty();
         let event = match &self.meta.status {
             SessionStatus::Stopped => format!(
                 "session stopped exit_code={}",
@@ -482,8 +858,196 @@ impl SessionRuntime {
             ),
             other => format!("session ended status={}", other.as_str()),
         };
-        if let Err(err) = append_event(&self.dir, &event) {
-            warn!(session_id = %self.meta.id, %err, "failed to persist PTY session completion event");
+        // The completion fact lives only in the journal (events.log was
+        // retired); `event` remains the human-readable detail below.
+        // The end fact is a stream-positioned event too: journal it once,
+        // after the final state is set.
+        if newly_ended {
+            let code = match self.meta.status {
+                SessionStatus::Stopped => Some(LifecycleCode::Stopped),
+                SessionStatus::Killed => Some(LifecycleCode::Killed),
+                SessionStatus::Failed => Some(LifecycleCode::Failed),
+                _ => None,
+            };
+            if let Some(code) = code {
+                self.queue_journal_completion(code, exit_code, event);
+            }
+        }
+    }
+
+    /// Tear down the session's PTY handles.
+    ///
+    /// A finished session must stop accepting input immediately, so the
+    /// writer channel is closed on every platform. The master handle is a
+    /// different matter on Windows: dropping it is what closes the pseudo
+    /// console, and that discards output the console host has not yet
+    /// flushed into the pipe the reader is draining — a pipe that never
+    /// EOFs on its own. So the drop is deferred to a detached thread that
+    /// waits for the reader to go quiet (bounded, so a session can never
+    /// pin its handle), while every other platform reaches EOF naturally
+    /// and tears down synchronously.
+    fn teardown_pty(&mut self) {
+        self.pty.close_writer();
+        #[cfg(not(windows))]
+        drop(self.pty.take_master());
+        #[cfg(windows)]
+        {
+            // `mark_completed` can run twice (a racing kill after a natural
+            // exit); only the first call still owns a master to hand off.
+            let Some(master) = self.pty.take_master() else {
+                return;
+            };
+            let epoch = self.pty_read_epoch.clone();
+            std::thread::spawn(move || {
+                let mut observed = epoch.load(Ordering::Relaxed);
+                let mut observed_at = Instant::now();
+                let deadline = Instant::now() + PTY_TEARDOWN_MAX;
+                loop {
+                    std::thread::sleep(PTY_TEARDOWN_POLL);
+                    let now = epoch.load(Ordering::Relaxed);
+                    if now != observed {
+                        // The reader is still receiving the transcript tail.
+                        observed = now;
+                        observed_at = Instant::now();
+                    }
+                    // A descheduled/busy reader is not a drained pipe. Never
+                    // close while its last chunk is still being journaled or
+                    // rendered; claim the same completed generation atomically.
+                    if (observed_at.elapsed() >= PTY_TEARDOWN_QUIET || Instant::now() >= deadline)
+                        && try_close_pty_generation(&epoch, observed)
+                    {
+                        break;
+                    }
+                }
+                // Continue recording successful reads through EOF, including
+                // any tail already buffered when ClosePseudoConsole begins.
+                drop(master);
+            });
+        }
+    }
+
+    /// Park the terminal end-of-life fact until the output stream has
+    /// fully drained. PTY EOF must precede the closure fact in the
+    /// journal so replay sees both — [`Self::close_output_stream`]
+    /// flushes the parked fact once the reader has caught up.
+    fn queue_journal_completion(
+        &mut self,
+        code: LifecycleCode,
+        exit_code: Option<i32>,
+        detail: String,
+    ) {
+        if self.output_closed {
+            self.journal_terminal_end(code, exit_code, &detail);
+        } else {
+            self.pending_journal_completion = Some((code, exit_code, detail));
+        }
+    }
+
+    /// Record the terminal end-of-life fact under the journal's
+    /// persistence barrier, so a reader that sees the captured marker
+    /// is guaranteed to see every preceding PTY byte.
+    fn journal_terminal_end(&mut self, code: LifecycleCode, exit_code: Option<i32>, detail: &str) {
+        self.journal_event(|journal| {
+            journal
+                .record_lifecycle(code, exit_code, detail)
+                .map(|_| ())
+        });
+        if let Some(journal) = &self.journal {
+            journal.lock().request_sync();
+        }
+    }
+
+    /// The PTY output stream ended (EOF, read error or writer teardown).
+    /// Journals the `OutputClosed` fact and then any parked completion,
+    /// so the journal order is always: final output → OutputClosed →
+    /// completion → durability barrier. If the drain or sync itself
+    /// fails, the journal's degraded state is the explicit
+    /// incomplete-capture boundary rather than a silently mis-ordered or
+    /// non-durable ending.
+    /// `scanner_idle`: whether the reader thread's scanner held no partial
+    /// escape at EOF — the final checkpoint is a replay anchor only then.
+    pub fn close_output_stream_at_boundary(&mut self, detail: String, scanner_idle: bool) {
+        if self.output_closed {
+            return;
+        }
+        self.output_closed = true;
+        self.journal_lifecycle(LifecycleCode::OutputClosed, None, &detail);
+        // Anchor the final state so retention and replay can start from
+        // the checkpoint instead of the raw prefix; a trailing partial
+        // escape at EOF makes this retention-only.
+        self.journal_checkpoint(scanner_idle);
+        if let Some((code, exit_code, completion_detail)) = self.pending_journal_completion.take() {
+            self.journal_terminal_end(code, exit_code, &completion_detail);
+        }
+    }
+
+    /// Journal a checkpoint of the current engine state, then run
+    /// checkpoint-gated retention off the write lock. No-op when the
+    /// runtime has no journal (tests without a session directory).
+    /// `anchored` is true only when the reader thread's scanner is idle at
+    /// this boundary (no partial escape buffered); anchored checkpoints
+    /// carry the filtered-stream offset and double as replay anchors,
+    /// unanchored ones still gate retention.
+    fn journal_checkpoint(&mut self, anchored: bool) {
+        if self.journal.is_none() {
+            return;
+        }
+        let (rows, cols) = self.engine.size();
+        let modes = self.engine.modes();
+        // The restore program repaints scrollback, then the screen: rows
+        // scrolled off are replayed as styled lines, then the snapshot
+        // clears and paints the visible grid and cursor.
+        let mut program = Vec::new();
+        for row in self.engine.styled_history_rows(self.screen_scrollback_rows) {
+            program.extend_from_slice(&row);
+            program.extend_from_slice(b"\r\n");
+        }
+        program.extend_from_slice(&self.engine.snapshot_stream());
+        let checkpoint = journal::Checkpoint {
+            rows,
+            cols,
+            cursor: self.engine.cursor_position(),
+            alt_screen: modes.alt_screen,
+            app_cursor_keys: modes.app_cursor_keys,
+            bracketed_paste: modes.bracketed_paste,
+            // Anchor: replay may start at this record and treat
+            // the derived filtered stream as beginning at this offset. 0 =
+            // unanchored (scanner mid-escape): retention-only.
+            filtered_offset: if anchored {
+                self.filtered_total_bytes
+            } else {
+                0
+            },
+            program: Bytes::from(program),
+        };
+        self.journal_event(|journal| journal.record_checkpoint(&checkpoint).map(|_| ()));
+        self.last_journal_checkpoint_at = self.filtered_total_bytes;
+        // Retention never runs under the write lock (disk I/O).
+        let dir = self.dir.clone();
+        let byte_cap = self.journal_byte_cap.clone();
+        let retention = self.retention.clone();
+        std::thread::spawn(
+            move || match run_retention_sweep(&dir, &byte_cap, &retention) {
+                Ok(()) => {}
+                Err(err) => warn!(
+                    error = %err,
+                    "checkpoint-gated journal retention failed; retrying at the next checkpoint"
+                ),
+            },
+        );
+    }
+
+    /// Emit a checkpoint once the session has produced another
+    /// `JOURNAL_CHECKPOINT_INTERVAL_BYTES` of filtered output (a
+    /// conservative proxy for raw journaled bytes: filtered <= raw) —
+    /// this bounds replay-from-checkpoint work.
+    fn journal_checkpoint_if_due(&mut self, scanner_idle: bool) {
+        if self
+            .filtered_total_bytes
+            .saturating_sub(self.last_journal_checkpoint_at)
+            >= JOURNAL_CHECKPOINT_INTERVAL_BYTES
+        {
+            self.journal_checkpoint(scanner_idle);
         }
     }
 
@@ -492,6 +1056,92 @@ impl SessionRuntime {
             self.meta.status,
             SessionStatus::Stopped | SessionStatus::Killed | SessionStatus::Failed
         )
+    }
+
+    /// Sequence one event into the journal. Failures degrade the journal
+    /// explicitly and are logged once (on the transition into the degraded
+    /// state); the journal is canonical, so a failure also sets the
+    /// fail-loud flag that stops the session (ADR-0006).
+    fn journal_event(
+        &self,
+        record: impl FnOnce(
+            &mut ShadowJournal,
+        ) -> std::result::Result<(), super::journal::JournalSubmitError>,
+    ) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let mut journal = journal.lock();
+        let was_degraded = journal.core.is_degraded();
+        if record(&mut journal).is_err() && !was_degraded {
+            // ADR-0006: never run a session whose history can no longer be
+            // recorded. Flag it; the reader loop turns this into a clean
+            // `Failed` stop (kill child, close stream, persist state).
+            error!(
+                session_id = %self.meta.id,
+                reason = journal.core.degraded_reason().unwrap_or("unknown"),
+                "journal failed; stopping session rather than running unrecorded"
+            );
+            self.journal_failed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a journal record has failed (ADR-0006 fail-loud flag).
+    pub fn journal_failed(&self) -> bool {
+        self.journal_failed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Current journal incarnation, when the session has a live journal.
+    /// Resume cursors from any other incarnation are stale (ADR-0004).
+    pub fn journal_incarnation(&self) -> Option<u64> {
+        self.journal
+            .as_ref()
+            .map(|journal| journal.lock().core.incarnation())
+    }
+
+    /// Journal one raw PTY chunk (ADR-0002: the raw stream is canonical).
+    fn journal_output(&self, payload: Bytes) {
+        self.journal_event(|journal| journal.record_output(payload).map(|_| ()));
+    }
+
+    fn journal_policy(&self, key: &str, value: &str) {
+        self.journal_event(|journal| journal.record_policy(key, value).map(|_| ()));
+    }
+
+    /// Journal a Policy record whenever the terminal mode state observed
+    /// by the screen parser differs from the last journaled revision.
+    /// The first call of an incarnation always records the baseline, so
+    /// seeded replay knows the mode state near the start of the stream;
+    /// later revisions land immediately after the output that caused
+    /// them (both are sequenced under the same write lock).
+    fn journal_modes_if_changed(&mut self) {
+        let current = self.shared_modes.load();
+        if self.journaled_modes == Some(current) {
+            return;
+        }
+        let value = format!(
+            "app_cursor_keys={},bracketed_paste={},mouse_report={},sgr_mouse={},focus_events={}",
+            u8::from(current.app_cursor_keys),
+            u8::from(current.bracketed_paste_mode),
+            u8::from(current.mouse_report),
+            u8::from(current.sgr_mouse),
+            u8::from(current.focus_events),
+        );
+        self.journal_policy("modes", &value);
+        self.journaled_modes = Some(current);
+    }
+
+    fn journal_resize(&self, rows: u16, cols: u16) {
+        self.journal_event(|journal| journal.record_resize(rows, cols).map(|_| ()));
+    }
+
+    fn journal_lifecycle(&self, code: LifecycleCode, exit_code: Option<i32>, detail: &str) {
+        self.journal_event(|journal| {
+            journal
+                .record_lifecycle(code, exit_code, detail)
+                .map(|_| ())
+        });
     }
 
     pub fn resize_pty(&mut self, rows: u16, cols: u16) -> bool {
@@ -508,17 +1158,17 @@ impl SessionRuntime {
         debug!(session_id = %self.meta.id, rows, cols, resized, "PTY resize attempted");
         if resized {
             self.pty_size = Some((rows, cols));
-            safe_resize_parser(
-                &mut self.screen_parser,
-                rows,
-                cols,
-                self.screen_scrollback_rows,
-            );
+            // Native reflow: logical lines survive shrink/widen cycles;
+            // no trimmed-row rebuild anymore.
+            self.engine.resize(rows, cols);
             self.resize_history.push(LogResize {
-                offset: self.raw_total_bytes,
+                offset: self.filtered_total_bytes,
                 rows,
                 cols,
             });
+            // Shadow-journal the geometry change at its ordered stream
+            // position (mutation and sequencing share this write lock).
+            self.journal_resize(rows, cols);
             // Notify all attached clients about the new size.
             let _ = self.resize_tx.send((rows, cols));
         }
@@ -548,6 +1198,19 @@ pub fn generate_session_id<F: Fn(&str) -> bool>(exists: F) -> String {
 /// Reader and writer threads are started automatically and share ownership via the Arc.
 /// `session_dir` is the absolute path for the session's working files; the caller
 /// is responsible for computing it (typically `sessions_dir.join(&meta.id)`).
+/// Spawn a PTY-backed child process and return the runtime handle.
+///
+/// Synchronous by design: it creates the session directory, opens the
+/// shadow journal (which spawns the appender thread), walks PATH for
+/// the command, and PTY-spawns. All of those are blocking syscalls, so
+/// callers running inside an async fn must wrap this call in
+/// `tokio::task::spawn_blocking` to keep that worker free for attach
+/// pumps and SSE/WS multiplexing.
+///
+/// `meta` is mutated to record the assigned `pid` once the PTY child
+/// is live; wrap the caller's `SessionMeta` in a `Mutex` and unwrap
+/// the clone after the blocking task joins.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_session(
     meta: &mut SessionMeta,
     session_dir: PathBuf,
@@ -555,11 +1218,11 @@ pub fn spawn_session(
     cols: u16,
     notifications_enabled: bool,
     screen_scrollback_rows: usize,
+    journal_byte_cap: Arc<std::sync::atomic::AtomicU64>,
     event_tx: SessionEventTx,
 ) -> Result<Arc<RwLock<SessionRuntime>>> {
     meta.notifications_enabled = notifications_enabled;
     let full_dir = session_dir;
-    let reader_dir = full_dir.clone();
     info!(
         session_id = %meta.id,
         command = %meta.command,
@@ -572,7 +1235,46 @@ pub fn spawn_session(
     );
     std::fs::create_dir_all(&full_dir)?;
 
-    let spawn_env = load_spawn_environment();
+    // The journal is the canonical persisted stream (ADR-0002 / ADR-0006)
+    // and must exist before the child starts — a session whose history
+    // cannot be recorded must fail loudly, not run unrecorded.
+    // One sequencing point per session, owned by the runtime: the runtime
+    // write lock orders mutation, sequencing and publication; the appender
+    // thread owns disk.
+    let shadow_journal = match ShadowJournal::open(&full_dir) {
+        Ok((shadow, incarnation, report)) => {
+            if let Some(report) = &report {
+                debug!(
+                    session_id = %meta.id,
+                    incarnation = report.incarnation,
+                    records = report.records,
+                    last_seq = ?report.last_seq,
+                    stop = ?report.stop,
+                    rewound = report.rewound,
+                    "recovered previous journal incarnation"
+                );
+            }
+            info!(
+                session_id = %meta.id,
+                incarnation,
+                "session journal opened"
+            );
+            Some(parking_lot::Mutex::new(shadow))
+        }
+        Err(err) => {
+            return Err(AppError::Protocol(format!(
+                "failed to open session journal in {}: {err}",
+                full_dir.display()
+            )));
+        }
+    };
+
+    // Seed the child environment from the daemon's own (Windows refreshes
+    // it from the user environment block) and inject this session's id as
+    // `OLY_SESSION_ID`, so a program running under oly can discover which
+    // session it is — e.g. an agent CLI that reports its id back to a
+    // supervising agent (see `skills/oly-subagent/SKILL.md`).
+    let spawn_env = session_spawn_environment(&meta.id);
     let command_cwd = meta
         .cwd
         .as_deref()
@@ -631,18 +1333,28 @@ pub fn spawn_session(
     let runtime_child = RuntimeChild::Pty(child);
     meta.pid = runtime_child.process_id();
 
-    create_output_log(&full_dir)?;
-    append_event(&full_dir, "session created")?;
-    append_resize_event(&full_dir, 0, rows, cols)?;
-
+    // The journal (opened above) is the canonical persisted stream
+    // (events.log and output.log fallback were retired).
     let started_pid = meta
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "?".to_string());
-    append_event(&full_dir, &format!("session started pid={started_pid}"))?;
+
+    // The journal is the canonical stream (ADR-0002), so it
+    // was opened — loudly — before the PTY spawn above; here we only record
+    // the first ordered facts: initial geometry, then start.
+    if let Some(journal) = &shadow_journal {
+        let mut journal = journal.lock();
+        let _ = journal.record_resize(rows, cols);
+        let _ = journal.record_lifecycle(
+            LifecycleCode::Started,
+            None,
+            &format!("session started pid={started_pid}"),
+        );
+    }
 
     // Broadcast channel: each live attach subscriber holds a Receiver.
-    let (broadcast_tx, _initial_rx) = broadcast::channel::<Bytes>(256);
+    let (broadcast_tx, _initial_rx) = broadcast::channel::<SequencedChunk>(256);
 
     // Resize broadcast channel: notifies all attached clients of PTY resize.
     let (resize_tx, _initial_resize_rx) = broadcast::channel::<(u16, u16)>(16);
@@ -676,7 +1388,7 @@ pub fn spawn_session(
         meta: meta.clone(),
         dir: full_dir,
         last_total_bytes: 0,
-        raw_total_bytes: 0,
+        filtered_total_bytes: 0,
         broadcast_tx: broadcast_tx.clone(),
         resize_tx,
         pty: pty_handle,
@@ -690,13 +1402,31 @@ pub fn spawn_session(
         persisted: false,
         requested_final_status: None,
         spawned_at: Instant::now(),
+        #[cfg(windows)]
+        pty_read_epoch: Arc::new(AtomicU64::new(0)),
         last_output_epoch: None,
         last_input_at: None,
         last_attach_activity_at: None,
-        attach_count: 0,
+        attachments: Default::default(),
         notified_output_epoch: None,
         last_notified_at: None,
-        screen_parser: vt100::Parser::new(rows, cols, screen_scrollback_rows),
+        engine: {
+            let mut engine = Terminal::new(rows, cols, screen_scrollback_rows);
+            let (foreground, background) = super::pty::terminal_report_rgb();
+            engine.set_report_colors(crate::terminal::ReportColors {
+                foreground: alacritty_terminal::vte::ansi::Rgb {
+                    r: foreground.0,
+                    g: foreground.1,
+                    b: foreground.2,
+                },
+                background: alacritty_terminal::vte::ansi::Rgb {
+                    r: background.0,
+                    g: background.1,
+                    b: background.2,
+                },
+            });
+            engine
+        },
         screen_scrollback_rows,
         terminal_signals: TerminalSignals::default(),
         // A title present at creation was chosen by the caller, so terminal
@@ -704,7 +1434,15 @@ pub fn spawn_session(
         title_user_set: meta.title.is_some(),
         shared_modes: Arc::new(SharedModes::default()),
         output_closed: false,
+        resume_scanned: false,
+        pending_journal_completion: None,
+        last_journal_checkpoint_at: 0,
+        journaled_modes: None,
         notifications_enabled,
+        journal: shadow_journal,
+        journal_failed: std::sync::atomic::AtomicBool::new(false),
+        journal_byte_cap,
+        retention: RetentionHandle::new(),
     }));
 
     // PTY reader thread: reads raw bytes, derives one canonical filtered stream,
@@ -713,27 +1451,34 @@ pub fn spawn_session(
     let broadcast_tx_reader = broadcast_tx;
     let reader_event_tx = event_tx;
     let reader_session_id = meta.id.clone();
+    #[cfg(windows)]
+    let pty_read_epoch = runtime.read().pty_read_epoch.clone();
     std::thread::spawn(move || {
         debug!(session_id = %reader_session_id, "PTY reader thread started");
-        if let Err(err) = append_event(&reader_dir, "pty reader started") {
-            warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader start event");
-        }
         let mut buf = vec![0u8; PTY_READ_BUFFER_BYTES];
         let mut reader = reader;
         let mut scanner = PtyScanner::new();
         let mut scan_out = ScanOut::default();
-        let mut output_log = OutputLog::open(&reader_dir);
-        loop {
+        // Every exit path funnels into one close-out so the runtime
+        // observes — and the shadow journal records — exactly one
+        // `OutputClosed` fact, regardless of how the stream ended (a
+        // crash, a graceful detach, EOF, or a write error all collapse
+        // to the same single fact so replay cannot double-close).
+        let close_detail = loop {
             match reader.read(&mut buf) {
                 Ok(0) => {
-                    runtime_reader.write().output_closed = true;
                     debug!(session_id = %reader_session_id, "PTY reader thread reached EOF");
-                    if let Err(err) = append_event(&reader_dir, "pty reader reached EOF") {
-                        warn!(session_id = %reader_session_id, %err, "failed to persist PTY reader EOF event");
-                    }
-                    break;
+                    break "pty output closed (eof)".to_string();
                 }
                 Ok(n) => {
+                    // Update drain activity without reopening the closing
+                    // fence. Even after that fence, retain EVERY successful
+                    // read through EOF: a read may contain buffered child output
+                    // as well as ConPTY mode resets. Timing cannot classify it
+                    // as teardown noise. Journal and display use the same bytes.
+                    #[cfg(windows)]
+                    let _read_guard = PtyReadGuard::new(&pty_read_epoch);
+
                     trace!(session_id = %reader_session_id, bytes = n, "read PTY output chunk");
 
                     // One pass over the chunk produces everything downstream
@@ -744,49 +1489,72 @@ pub fn spawn_session(
 
                     // A chunk that only carries a stripped signal (e.g. a
                     // pure colour set) has no filtered bytes and no queries,
-                    // but its signals must still be published.
-                    if scan_out.filtered.is_empty()
-                        && scan_out.queries.is_empty()
-                        && !scanner.signals_changed()
-                    {
-                        continue;
-                    }
-
                     let filtered = Bytes::copy_from_slice(&scan_out.filtered);
                     let meaningful_len = scan_out.meaningful_bytes();
                     let changed_signals = scanner.take_changed_signals();
 
-                    // Single write lock: advance the rendered screen and the
-                    // stream counters, publish any changed notifications (and
-                    // adopt a terminal-emitted title while the session has no
-                    // user-chosen one), and read back the cursor position for
-                    // query replies.
-                    let (cursor_position, meta_update) = {
+                    // Single write lock: journal the raw PTY bytes, advance
+                    // the terminal engine on the same raw stream (query
+                    // responses come back generated at their exact stream
+                    // positions), advance the stream counters, and publish
+                    // any changed notifications (adopting a terminal-emitted
+                    // title while the session has no user-chosen one).
+                    let (query_responses, update_summary, chunk_offset, journal_stop) = {
                         let mut rt = runtime_reader.write();
+                        // Journal the exact bytes read from the PTY —
+                        // pre-filter — so replay and post-mortems never lose
+                        // data the scan pipeline dropped. This happens even
+                        // when the filtered chunk is empty.
+                        rt.journal_output(Bytes::copy_from_slice(&buf[..n]));
+                        let query_responses = rt.feed_engine(&buf[..n]);
                         let meta_changed = if let Some(signals) = changed_signals {
                             rt.publish_terminal_signals(signals)
                         } else {
                             false
                         };
-                        let cursor = rt.push_output(&filtered, meaningful_len);
-                        (cursor, meta_changed.then(|| rt.to_summary()))
+                        rt.push_output(&filtered, meaningful_len);
+                        let chunk_offset = rt.filtered_stream_len() - filtered.len() as u64;
+                        // Byte-only updates belong to the daemon-wide activity
+                        // sampler; full summaries are reserved for metadata changes.
+                        // A mode flip lands immediately after the output
+                        // that caused it, in the same order a replay sees.
+                        rt.journal_modes_if_changed();
+                        // Checkpoint past the configured raw-byte interval;
+                        // anchored only at an idle scanner boundary.
+                        rt.journal_checkpoint_if_due(scanner.is_idle());
+                        // ADR-0006: a journal failure stops the session
+                        // cleanly (Failed) instead of running unrecorded.
+                        let journal_stop = rt.journal_failed().then(|| {
+                            rt.requested_final_status = Some(SessionStatus::Failed);
+                            let _ = rt.pty.kill();
+                            "journal failed; stopping session (ADR-0006)".to_string()
+                        });
+                        let update_summary = meta_changed.then(|| rt.to_summary());
+                        (query_responses, update_summary, chunk_offset, journal_stop)
                     };
 
-                    // Let live clients know session metadata (title and/or
-                    // colours) was adopted from the child's notifications.
-                    if let Some(summary) = meta_update {
+                    if let Some(detail) = journal_stop {
+                        warn!(session_id = %reader_session_id, %detail, "journal failure closes the reader");
+                        break detail;
+                    }
+
+                    // Publish changed output/metadata without blocking the PTY reader.
+                    if let Some(summary) = update_summary {
                         let _ = reader_event_tx.send(SessionEvent::SessionUpdated(summary));
                     }
 
-                    if let Err(err) = output_log.append(&filtered) {
-                        warn!(session_id = %reader_session_id, %err, "failed to persist PTY output chunk");
-                    }
+                    // The raw chunk is already journaled (canonical); the
+                    // filtered stream is derived from the journal on read
+                    // (output.log is no longer written).
 
                     // Broadcast canonical filtered output to all live
                     // subscribers (non-blocking; lagged receivers re-sync from
                     // the persisted log on the next tick).
                     if !filtered.is_empty()
-                        && let Ok(receiver_count) = broadcast_tx_reader.send(filtered)
+                        && let Ok(receiver_count) = broadcast_tx_reader.send(SequencedChunk {
+                            offset: chunk_offset,
+                            bytes: filtered.clone(),
+                        })
                     {
                         trace!(
                             session_id = %reader_session_id,
@@ -795,29 +1563,32 @@ pub fn spawn_session(
                         );
                     }
 
-                    // Answer the capability probes that have a session-global
-                    // reply (CPR/DSR and the OSC colour queries).
-                    let mut writer_closed = false;
-                    for query in scan_out.queries.drain(..) {
-                        let resp = query.response(cursor_position);
+                    // Position queries (CPR/DSR/DA/DECRQM) were answered by
+                    // the engine at their exact stream positions; only the
+                    // session-global OSC colour queries keep the scanner
+                    // path (their answers are position-independent).
+                    for resp in query_responses {
                         trace!(
                             session_id = %reader_session_id,
-                            ?query,
                             bytes = resp.len(),
-                            "responding to detached terminal capability query"
+                            "answering engine terminal query at its stream position"
                         );
                         if writer_tx.blocking_send(resp).is_err() {
                             warn!(
                                 session_id = %reader_session_id,
-                                "failed to queue detached terminal query response because PTY writer closed"
+                                "failed to queue engine query response because PTY writer closed"
                             );
-                            writer_closed = true;
+                            // A closed input path after child exit does not
+                            // close output. Keep draining buffered PTY bytes;
+                            // this query no longer has a recipient.
                             break;
                         }
                     }
-                    if writer_closed {
-                        break;
-                    }
+                    // Every query the scanner stripped (CPR/DSR and the OSC
+                    // colour probes — DA/DECRQM are only observed) was already
+                    // answered by the engine above, in exact stream order; the
+                    // scanner's list only drives the display filtering.
+                    scan_out.queries.clear();
                 }
                 Err(err)
                     if matches!(err.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
@@ -826,17 +1597,14 @@ pub fn spawn_session(
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    runtime_reader.write().output_closed = true;
                     warn!(session_id = %reader_session_id, %err, "PTY reader thread failed");
-                    if let Err(append_err) =
-                        append_event(&reader_dir, &format!("pty reader error: {err}"))
-                    {
-                        warn!(session_id = %reader_session_id, %append_err, "failed to persist PTY reader error event");
-                    }
-                    break;
+                    break format!("pty read error: {err}");
                 }
             }
-        }
+        };
+        runtime_reader
+            .write()
+            .close_output_stream_at_boundary(close_detail, scanner.is_idle());
         debug!(session_id = %reader_session_id, "PTY reader thread stopped");
     });
 
@@ -869,6 +1637,40 @@ fn load_spawn_environment() -> Vec<(OsString, OsString)> {
 
     #[cfg(not(windows))]
     inherited
+}
+
+/// Environment variable carrying a session's own id into its PTY child.
+///
+/// Injected for every spawned session (see [`session_spawn_environment`]), so
+/// a program running under oly can discover which session it is. The primary
+/// consumer is an agent CLI that reports its session id back to a supervising
+/// agent (`skills/oly-subagent/SKILL.md`), but any child may read it.
+pub const OLY_SESSION_ID_ENV: &str = "OLY_SESSION_ID";
+
+/// Build the environment for a PTY child of session `session_id`.
+///
+/// Starts from [`load_spawn_environment`] (the daemon's own environment, with
+/// the Windows user block refreshed) and injects [`OLY_SESSION_ID_ENV`] set to
+/// this session's id.
+fn session_spawn_environment(session_id: &str) -> Vec<(OsString, OsString)> {
+    inject_session_id(load_spawn_environment(), session_id)
+}
+
+/// Inject [`OLY_SESSION_ID_ENV`] into `env`, replacing any inherited entry.
+///
+/// Pure and independent of the process environment so it is unit-tested
+/// directly. Any pre-existing `OLY_SESSION_ID` is dropped first (matched with
+/// [`env_key_eq`], which is case-insensitive on Windows) so the child always
+/// sees its own id exactly once — even when the daemon itself runs inside an
+/// oly session and inherited a parent `OLY_SESSION_ID`.
+fn inject_session_id(
+    mut env: Vec<(OsString, OsString)>,
+    session_id: &str,
+) -> Vec<(OsString, OsString)> {
+    let key = OsStr::new(OLY_SESSION_ID_ENV);
+    env.retain(|(existing, _)| !env_key_eq(existing, key));
+    env.push((OsString::from(key), OsString::from(session_id)));
+    env
 }
 
 // Only Windows merges a refreshed user environment, but the merge logic is
@@ -1004,6 +1806,82 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn inject_session_id_adds_the_session_id_alongside_inherited_env() {
+        let env = inject_session_id(
+            vec![
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+                (OsString::from("HOME"), OsString::from("/home/dev")),
+            ],
+            "abc1234",
+        );
+
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| env_key_eq(key, OsStr::new(OLY_SESSION_ID_ENV)))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("abc1234")),
+            "the session id must be injected as OLY_SESSION_ID"
+        );
+        // The rest of the inherited environment is preserved untouched.
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == OsStr::new("PATH"))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("/usr/bin"))
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == OsStr::new("HOME"))
+                .map(|(_, value)| value.as_os_str()),
+            Some(OsStr::new("/home/dev"))
+        );
+    }
+
+    #[test]
+    fn inject_session_id_replaces_an_inherited_value_exactly_once() {
+        // A daemon that itself runs inside an oly session inherits the
+        // parent's OLY_SESSION_ID; every spawned child must instead see its
+        // OWN id — and exactly one entry, never two.
+        let env = inject_session_id(
+            vec![
+                (OsString::from("OLY_SESSION_ID"), OsString::from("parent1")),
+                (OsString::from("PATH"), OsString::from("/usr/bin")),
+            ],
+            "child42",
+        );
+
+        let matches: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| env_key_eq(key, OsStr::new(OLY_SESSION_ID_ENV)))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "OLY_SESSION_ID must appear exactly once, got: {:?}",
+            matches
+        );
+        assert_eq!(matches[0].1, OsStr::new("child42"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_session_id_is_case_insensitive_on_windows() {
+        // Windows env names are case-insensitive; a differently-cased
+        // inherited entry must still be replaced, not duplicated.
+        let env = inject_session_id(
+            vec![(OsString::from("oly_session_id"), OsString::from("stale"))],
+            "win0001",
+        );
+
+        let matches: Vec<_> = env
+            .iter()
+            .filter(|(key, _)| env_key_eq(key, OsStr::new(OLY_SESSION_ID_ENV)))
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].1, OsStr::new("win0001"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn refreshed_environment_keys_are_case_insensitive_on_windows() {
@@ -1072,6 +1950,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pty_read_generation_advances_for_every_chunk() {
+        let epoch = AtomicU64::new(0);
+        assert!(record_pty_read(&epoch));
+        assert!(record_pty_read(&epoch));
+        assert_eq!(epoch.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn console_close_waits_for_in_flight_read_and_rechecks_generation() {
+        let epoch = AtomicU64::new(0);
+        {
+            let _guard = PtyReadGuard::new(&epoch);
+            assert_eq!(epoch.load(Ordering::Relaxed), 1);
+            assert!(!try_close_pty_generation(&epoch, 1));
+            assert!(!try_close_pty_generation(&epoch, 0));
+        }
+        assert_eq!(epoch.load(Ordering::Relaxed), 2);
+        assert!(!try_close_pty_generation(&epoch, 0));
+        assert!(try_close_pty_generation(&epoch, 2));
+        let _guard = PtyReadGuard::new(&epoch);
+        assert_eq!(epoch.load(Ordering::Relaxed), PTY_CONSOLE_CLOSING);
+    }
+
+    #[test]
+    fn pty_read_cannot_reopen_a_closing_console() {
+        let epoch = Arc::new(AtomicU64::new(0));
+        let reader_epoch = epoch.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            assert!(record_pty_read(&reader_epoch));
+            ready_tx.send(()).unwrap();
+            while record_pty_read(&reader_epoch) {
+                std::thread::yield_now();
+            }
+            // Even a subsequent read must preserve the permanent marker.
+            assert!(!record_pty_read(&reader_epoch));
+        });
+        ready_rx.recv().unwrap();
+        epoch.store(PTY_CONSOLE_CLOSING, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(epoch.load(Ordering::Relaxed), PTY_CONSOLE_CLOSING);
+        assert!(!record_pty_read(&epoch));
+    }
+
     // -----------------------------------------------------------------------
     // Helpers for SessionRuntime unit tests
     // -----------------------------------------------------------------------
@@ -1095,6 +2018,7 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             ended_at: None,
             status,
+            resume_command: None,
             pid: None,
             exit_code: None,
             notifications_enabled: true,
@@ -1108,7 +2032,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_unit_tests"),
             last_total_bytes: 0,
-            raw_total_bytes: 0,
+            filtered_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -1122,19 +2046,29 @@ mod tests {
             persisted: false,
             requested_final_status: None,
             spawned_at: Instant::now(),
+            #[cfg(windows)]
+            pty_read_epoch: Arc::new(AtomicU64::new(0)),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
-            attach_count: 0,
+            attachments: Default::default(),
             last_notified_at: None,
             notified_output_epoch: None,
-            screen_parser: vt100::Parser::new(24, 80, 1000),
+            engine: Terminal::new(24, 80, 1000),
             screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
             title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
+            resume_scanned: false,
+            pending_journal_completion: None,
+            last_journal_checkpoint_at: 0,
+            journaled_modes: None,
             notifications_enabled: true,
+            journal: None,
+            journal_failed: std::sync::atomic::AtomicBool::new(false),
+            journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            retention: RetentionHandle::new(),
         }
     }
 
@@ -1142,9 +2076,312 @@ mod tests {
         new_runtime_with(SessionStatus::Running, 0)
     }
 
+    #[test]
+    fn journal_failure_sets_the_fail_loud_flag() {
+        // ADR-0006: once a journal record fails, the runtime is flagged so
+        // the reader loop stops the session (Failed) instead of running
+        // unrecorded. Force the failure deterministically with an oversized
+        // payload (rejected before writing; the journal degrades).
+        let dir = std::env::temp_dir().join(format!("oly-jfail-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (journal, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.journal = Some(parking_lot::Mutex::new(journal));
+
+        assert!(!rt.journal_failed());
+        let huge = Bytes::from(vec![0u8; 65 * 1024 * 1024]);
+        rt.journal_output(huge);
+        assert!(
+            rt.journal_failed(),
+            "a failed journal record must set the fail-loud flag"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mark_completed_journals_the_end_fact_exactly_once() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, incarnation, _) = ShadowJournal::open(&dir).unwrap();
+        assert_eq!(incarnation, 1);
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // The output stream has drained (EOF), so completion is journaled
+        // immediately, after the OutputClosed fact.
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
+        rt.mark_completed(SessionStatus::Killed, Some(-9));
+        // Idempotent completion must not duplicate the end fact.
+        rt.mark_completed(SessionStatus::Killed, Some(-9));
+
+        // Wait for the appender to drain, then verify the journal holds
+        // exactly the close, the final-state checkpoint, and the
+        // completion record — in that order (output-before-completion
+        // and the final-state checkpoint is the last record before it).
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.poll_acks();
+                if journal.core.journal_seq() >= 3 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "journal ack timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(rt);
+
+        let outcome = journal::scan_segment(
+            &dir.join(journal::JOURNAL_DIR_NAME)
+                .join("seg-00000001-0001.ojrn"),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.records.len(),
+            3,
+            "OutputClosed, checkpoint and the end fact are journaled once each"
+        );
+        let (close_code, ..) =
+            journal::decode_lifecycle_payload(&outcome.records[0].payload).unwrap();
+        assert_eq!(close_code, LifecycleCode::OutputClosed);
+        assert_eq!(outcome.records[1].kind, journal::RecordKind::CheckpointRef);
+        journal::decode_checkpoint(&outcome.records[1].payload).expect("valid checkpoint");
+        let record = &outcome.records[2];
+        assert_eq!(record.kind, journal::RecordKind::Lifecycle);
+        let (code, exit_code, detail) = journal::decode_lifecycle_payload(&record.payload).unwrap();
+        assert_eq!(code, LifecycleCode::Killed);
+        assert_eq!(exit_code, Some(-9));
+        assert!(detail.contains("killed"), "unexpected detail: {detail}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §5.3: a checkpoint's restore program repaints equivalent state —
+    /// scrollback, screen text, and cursor — into a fresh engine.
+    #[test]
+    fn checkpoint_program_repaints_equivalent_state() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // Fill scrollback and leave styled text plus a cursor position.
+        let mut stream = Vec::new();
+        for i in 1..=30 {
+            stream.extend_from_slice(format!("history line {i:02}\r\n").as_bytes());
+        }
+        stream.extend_from_slice(b"\x1b[1;31mred screen text\x1b[0m");
+        rt.feed_engine(&stream);
+        let expected_screen = rt.engine.screen_lines();
+        let expected_history_len = rt.engine.history_size();
+        assert!(expected_history_len > 0, "content must have scrolled off");
+
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
+
+        // Drain until the checkpoint is durable.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.request_sync();
+                journal.poll_acks();
+                if journal.core.durable_seq() >= 2 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "journal ack timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let outcome = journal::scan_segment(
+            &dir.join(journal::JOURNAL_DIR_NAME)
+                .join("seg-00000001-0001.ojrn"),
+        )
+        .unwrap();
+        let checkpoint_record = outcome
+            .records
+            .iter()
+            .find(|record| record.kind == journal::RecordKind::CheckpointRef)
+            .expect("checkpoint journaled at stream close");
+        let checkpoint = journal::decode_checkpoint(&checkpoint_record.payload).unwrap();
+
+        // Replay the restore program into a fresh engine of the recorded
+        // geometry: the result must match the source engine's state.
+        let mut restored = crate::terminal::Terminal::new(
+            checkpoint.rows,
+            checkpoint.cols,
+            rt.screen_scrollback_rows,
+        );
+        restored.feed(&checkpoint.program);
+        assert_eq!(restored.screen_lines(), expected_screen);
+        assert_eq!(restored.history_size(), expected_history_len);
+        assert_eq!(restored.cursor_position(), rt.engine.cursor_position());
+        let expected_modes = rt.engine.modes();
+        let restored_modes = restored.modes();
+        assert_eq!(restored_modes.alt_screen, expected_modes.alt_screen);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The byte-cadence checkpoint fires once the journaled raw output
+    /// crosses the configured interval, and not before.
+    #[test]
+    fn checkpoint_cadence_follows_journaled_bytes() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // Below the interval: nothing.
+        rt.filtered_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES - 1;
+        rt.journal_checkpoint_if_due(true);
+        // Crossing the interval: a checkpoint is sequenced.
+        rt.filtered_total_bytes = JOURNAL_CHECKPOINT_INTERVAL_BYTES;
+        rt.journal_checkpoint_if_due(true);
+        assert_eq!(rt.last_journal_checkpoint_at, rt.filtered_total_bytes);
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(1));
+        }
+        // And not again until another interval passes.
+        rt.filtered_total_bytes += 1;
+        rt.journal_checkpoint_if_due(true);
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(1));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Terminal-mode revisions are journaled as Policy records
+    /// immediately after the output that caused them, in one ordered
+    /// stream; unchanged modes never re-record.
+    #[test]
+    fn mode_flips_journal_a_policy_revision_after_the_output() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        // Raw bytes journaled first (as the reader loop does), then the
+        // engine consumes the raw chunk and the mode revision follows.
+        let raw = b"\x1b[?2004h";
+        rt.journal_output(Bytes::from_static(raw));
+        rt.feed_engine(raw);
+        rt.push_output(raw, raw.len());
+        assert!(rt.mode_snapshot().bracketed_paste_mode);
+        rt.journal_modes_if_changed();
+        // No further change: nothing more is sequenced.
+        rt.journal_modes_if_changed();
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(2));
+        }
+
+        let segment = dir
+            .join(journal::JOURNAL_DIR_NAME)
+            .join("seg-00000001-0001.ojrn");
+        // Wait for the two records to be persisted before scanning.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.request_sync();
+                journal.poll_acks();
+                if journal.core.durable_seq() >= 2 {
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "drain timed out");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let outcome = journal::scan_segment(&segment).unwrap();
+        assert_eq!(outcome.records.len(), 2);
+        assert_eq!(outcome.records[0].kind, journal::RecordKind::Output);
+        assert_eq!(&*outcome.records[0].payload, raw);
+        assert_eq!(outcome.records[1].kind, journal::RecordKind::Policy);
+        assert_eq!(
+            journal::parse_policy(&outcome.records[1].payload),
+            Some((
+                "modes",
+                "app_cursor_keys=0,bracketed_paste=1,mouse_report=0,sgr_mouse=0,focus_events=0"
+            ))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Completion-vs-output ordering: a completion observed before the
+    /// PTY output stream has
+    /// drained must be parked and journaled only after the OutputClosed
+    /// fact — completion never precedes the final retained output.
+    #[test]
+    fn completion_is_journaled_only_after_output_eof() {
+        let dir = std::env::temp_dir().join(format!("oly_rt_journal_{}", uuid::Uuid::new_v4()));
+        let (shadow, _, _) = ShadowJournal::open(&dir).unwrap();
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+        rt.journal = Some(parking_lot::Mutex::new(shadow));
+
+        rt.journal_output(Bytes::from_static(b"final prompt bytes"));
+        rt.mark_completed(SessionStatus::Stopped, Some(0));
+        // Completion observed while the stream is still open: nothing is
+        // journaled beyond the output yet.
+        {
+            let journal = rt.journal.as_ref().unwrap().lock();
+            assert_eq!(journal.core.head_seq(), Some(1));
+        }
+
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
+        // A duplicate close must not re-record anything.
+        rt.close_output_stream_at_boundary("pty output closed (eof)".to_string(), true);
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let mut journal = rt.journal.as_ref().unwrap().lock();
+                journal.poll_acks();
+                // output(1) → OutputClosed(2) → checkpoint(3) → Stopped(4).
+                if journal.core.journal_seq() >= 4 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "journal ack timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(rt);
+
+        let outcome = journal::scan_segment(
+            &dir.join(journal::JOURNAL_DIR_NAME)
+                .join("seg-00000001-0001.ojrn"),
+        )
+        .unwrap();
+        let kinds: Vec<LifecycleCode> = outcome
+            .records
+            .iter()
+            .filter(|r| r.kind == journal::RecordKind::Lifecycle)
+            .map(|r| journal::decode_lifecycle_payload(&r.payload).unwrap().0)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![LifecycleCode::OutputClosed, LifecycleCode::Stopped],
+            "ordered ending: output, then close, then completion"
+        );
+        assert_eq!(outcome.records[0].kind, journal::RecordKind::Output);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Drive one raw chunk through the reader thread's pipeline: scan it, then
-    /// push the filtered result into the runtime the way the reader does.
-    fn push_scanned(rt: &mut SessionRuntime, raw: &[u8]) -> (u16, u16) {
+    /// Feed a raw chunk into the runtime the way the reader thread does:
+    /// engine on the raw stream, counters on the filtered stream.
+    fn push_scanned(rt: &mut SessionRuntime, raw: &[u8]) {
         let mut scanner = PtyScanner::new();
         push_scanned_with(rt, &mut scanner, raw)
     }
@@ -1152,18 +2389,15 @@ mod tests {
     /// Same as [`push_scanned`] but reuses a scanner across chunks, the way
     /// the reader thread does — required when a later chunk is only a change
     /// relative to the scanner's carried signal state (e.g. a colour reset).
-    fn push_scanned_with(
-        rt: &mut SessionRuntime,
-        scanner: &mut PtyScanner,
-        raw: &[u8],
-    ) -> (u16, u16) {
+    fn push_scanned_with(rt: &mut SessionRuntime, scanner: &mut PtyScanner, raw: &[u8]) {
         let mut out = ScanOut::default();
         scanner.scan(raw, &mut out);
+        rt.feed_engine(raw);
         if let Some(signals) = scanner.take_changed_signals() {
             rt.publish_terminal_signals(signals);
         }
         let meaningful = out.meaningful_bytes();
-        rt.push_output(&out.filtered, meaningful)
+        rt.push_output(&out.filtered, meaningful);
     }
 
     fn refresh_until_completed(rt: &mut SessionRuntime) {
@@ -1187,6 +2421,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: false,
                 bracketed_paste_mode: true,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
@@ -1206,6 +2443,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: false,
                 bracketed_paste_mode: false,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
@@ -1224,6 +2464,9 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: true,
                 bracketed_paste_mode: false,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
@@ -1243,12 +2486,86 @@ mod tests {
             ModeSnapshot {
                 app_cursor_keys: false,
                 bracketed_paste_mode: false,
+                mouse_report: false,
+                sgr_mouse: false,
+                focus_events: false,
             }
         );
         assert!(
             !rt.mode_snapshot().app_cursor_keys,
             "app_cursor_keys should be cleared after DECCKM disable"
         );
+    }
+
+    /// Every probe is answered at its own position in the stream: a chunk
+    /// containing `A`, CPR, `B`, CPR yields two CPR replies at the cursor
+    /// after `B`.
+    #[test]
+    fn repro_queries_are_answered_at_their_own_stream_position() {
+        // The engine answers each query while advancing the raw chunk,
+        // i.e. at its own stream position.
+        let stream = b"A\x1b[6nB\x1b[6n";
+        let mut rt = new_runtime();
+        let responses = rt.feed_engine(stream);
+        assert_eq!(
+            responses,
+            vec![b"\x1b[1;2R".to_vec(), b"\x1b[1;3R".to_vec()],
+            "the first CPR predates 'B' and must report an earlier column"
+        );
+
+        // Identical answers when the stream is split at every byte boundary.
+        for split in 1..stream.len() {
+            let mut rt = new_runtime();
+            let first = rt.feed_engine(&stream[..split]);
+            let mut all = first;
+            all.extend(rt.feed_engine(&stream[split..]));
+            assert_eq!(all, responses, "split at byte {split}");
+        }
+
+        // The scanner still strips the probes from the display stream so
+        // attached renderers cannot answer them a second time.
+        let mut scanner = PtyScanner::new();
+        let mut out = ScanOut::default();
+        scanner.scan(stream, &mut out);
+        assert_eq!(out.queries.len(), 2);
+        assert_eq!(out.filtered, b"AB");
+    }
+
+    /// Pins the snapshot/resume invariant: the snapshot content and the
+    /// returned resume offset must describe the same boundary so replay
+    /// from that offset re-delivers exactly the bytes the snapshot
+    /// covered.
+    #[test]
+    fn snapshot_boundary_matches_the_live_stream_cursor() {
+        // Snapshot and resume cursor come from the same in-memory state
+        // under the runtime lock, so replay-from-cursor can neither lose
+        // nor duplicate a chunk.
+        let dir = std::env::temp_dir().join(format!("oly_repro_snapshot_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut rt = new_runtime();
+        rt.dir = dir.clone();
+
+        rt.feed_engine(b"stable");
+        rt.push_output(b"stable", 6);
+        // The reader is between steps for the next chunk: pushed into the
+        // screen/counters, not yet broadcast.
+        rt.feed_engine(b"RACY");
+        rt.push_output(b"RACY", 4);
+
+        let snapshot = rt.attach_snapshot_bytes();
+        let end_offset = rt.filtered_stream_len();
+
+        assert!(
+            snapshot.windows(4).any(|window| window == b"RACY"),
+            "snapshot must contain the pushed chunk"
+        );
+        assert_eq!(
+            end_offset, rt.filtered_total_bytes,
+            "snapshot coverage and resume cursor describe the same boundary"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -----------------------------------------------------------------------
@@ -1283,9 +2600,10 @@ mod tests {
 
         push_scanned(&mut rt, filtered.as_ref());
 
-        assert_eq!(
-            rt.screen_parser.screen().contents().trim_end(),
-            "beforeafter"
+        assert!(
+            rt.engine.screen_lines().iter().any(|l| l == "beforeafter"),
+            "screen holds the pushed text: {:?}",
+            rt.engine.screen_lines()
         );
         assert_eq!(rt.last_total_bytes, 11);
     }
@@ -1298,7 +2616,7 @@ mod tests {
         push_scanned(&mut rt, filtered.as_ref());
 
         assert_eq!(rt.last_total_bytes, 11);
-        assert_eq!(rt.raw_total_bytes, 11);
+        assert_eq!(rt.filtered_total_bytes, 11);
     }
 
     #[test]
@@ -1306,9 +2624,9 @@ mod tests {
         let mut rt = new_runtime();
         push_scanned(&mut rt, &[]);
 
-        assert!(rt.screen_parser.screen().contents().trim().is_empty());
+        assert!(rt.engine.screen_lines().iter().all(|l| l.is_empty()));
         assert_eq!(rt.last_total_bytes, 0);
-        assert_eq!(rt.raw_total_bytes, 0);
+        assert_eq!(rt.filtered_total_bytes, 0);
     }
 
     #[test]
@@ -1319,7 +2637,7 @@ mod tests {
 
         assert!(rt.last_output_epoch.is_none());
         assert_eq!(rt.last_total_bytes, 0);
-        assert_eq!(rt.raw_total_bytes, b"\x1b]9;4;3;0\x07".len() as u64);
+        assert_eq!(rt.filtered_total_bytes, b"\x1b]9;4;3;0\x07".len() as u64);
     }
 
     #[test]
@@ -1330,7 +2648,10 @@ mod tests {
 
         assert!(rt.last_output_epoch.is_some());
         assert_eq!(rt.last_total_bytes, 5);
-        assert_eq!(rt.raw_total_bytes, b"hello\x1b]9;4;3;0\x07".len() as u64);
+        assert_eq!(
+            rt.filtered_total_bytes,
+            b"hello\x1b]9;4;3;0\x07".len() as u64
+        );
     }
 
     #[test]
@@ -1345,7 +2666,7 @@ mod tests {
 
         assert!(rt.last_output_epoch.is_none());
         assert_eq!(rt.last_total_bytes, 0);
-        assert_eq!(rt.raw_total_bytes, chunk.len() as u64);
+        assert_eq!(rt.filtered_total_bytes, chunk.len() as u64);
     }
 
     #[test]
@@ -1521,7 +2842,12 @@ mod tests {
         assert!(contains(b"\x1b]0;relay build\x07"));
         assert!(contains(b"\x1b]9;4;3;0\x07"));
         assert!(contains(b"\x1b[6 q"));
-        assert!(rt.screen_parser.screen().contents().contains("building"));
+        assert!(
+            rt.engine
+                .screen_lines()
+                .iter()
+                .any(|l| l.contains("building"))
+        );
     }
 
     #[test]
@@ -1530,10 +2856,45 @@ mod tests {
 
         push_scanned(&mut rt, b"plain output");
 
-        assert_eq!(
-            rt.attach_snapshot_bytes(),
-            rt.screen_parser.screen().state_formatted()
+        assert_eq!(rt.attach_snapshot_bytes(), rt.engine.snapshot_stream());
+    }
+
+    #[test]
+    fn attach_snapshot_enters_alt_screen_before_repainting_it() {
+        let mut rt = new_runtime();
+        push_scanned(&mut rt, b"shell prompt$\r\n");
+        push_scanned(&mut rt, b"\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN APP");
+
+        let snapshot = rt.attach_snapshot_bytes();
+        assert!(
+            snapshot.starts_with(b"\x1b[?1049h"),
+            "alt-screen sessions must put the fresh terminal into alt screen,              snapshot: {}",
+            String::from_utf8_lossy(&snapshot)
         );
+
+        // End-to-end: a fresh terminal fed the snapshot, then the app's
+        // alt-screen exit, must end on a coherent normal screen instead of
+        // mixing stale alt-screen rows with the redraw.
+        let mut client = vt100::Parser::new(6, 40, 0);
+        client.process(&snapshot);
+        client.process(b"\x1b[?1049l\x1b[2J\x1b[Hshell prompt$");
+        assert_eq!(
+            client
+                .screen()
+                .contents()
+                .lines()
+                .next()
+                .unwrap()
+                .trim_end(),
+            "shell prompt$"
+        );
+    }
+
+    #[test]
+    fn attach_snapshot_skips_alt_prefix_on_the_normal_screen() {
+        let mut rt = new_runtime();
+        push_scanned(&mut rt, b"plain output");
+        assert!(!rt.attach_snapshot_bytes().starts_with(b"\x1b[?1049h"));
     }
 
     #[test]
@@ -1549,7 +2910,7 @@ mod tests {
         push_scanned(&mut rt, &chunk);
 
         assert_eq!(rt.last_total_bytes, 4096);
-        assert_eq!(rt.raw_total_bytes, chunk.len() as u64);
+        assert_eq!(rt.filtered_total_bytes, chunk.len() as u64);
     }
 
     // -----------------------------------------------------------------------
@@ -1568,7 +2929,11 @@ mod tests {
     #[test]
     fn test_has_active_attach_client_true_with_registered_client() {
         let mut rt = new_runtime();
-        rt.register_attach_client();
+        rt.register_attachment(
+            crate::session::registry::AttachKind::Cli,
+            crate::session::registry::AttachRole::Controller,
+            None,
+        );
         assert!(
             rt.has_active_attach_client(),
             "one registered client → should report active client"
@@ -1623,6 +2988,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             started_at: Some(chrono::Utc::now()),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Running,
             pid: None,
             exit_code: None,
@@ -1637,7 +3003,7 @@ mod tests {
             meta,
             dir: std::env::temp_dir().join("oly_runtime_release_test"),
             last_total_bytes: 0,
-            raw_total_bytes: 0,
+            filtered_total_bytes: 0,
             broadcast_tx,
             resize_tx,
             pty: PtyHandle {
@@ -1651,19 +3017,29 @@ mod tests {
             persisted: false,
             requested_final_status: None,
             spawned_at: Instant::now(),
+            #[cfg(windows)]
+            pty_read_epoch: Arc::new(AtomicU64::new(0)),
             last_output_epoch: None,
             last_input_at: None,
             last_attach_activity_at: None,
-            attach_count: 0,
+            attachments: Default::default(),
             last_notified_at: None,
             notified_output_epoch: None,
-            screen_parser: vt100::Parser::new(24, 80, 1000),
+            engine: Terminal::new(24, 80, 1000),
             screen_scrollback_rows: 1000,
             terminal_signals: Default::default(),
             title_user_set: false,
             shared_modes: Default::default(),
             output_closed: false,
+            resume_scanned: false,
+            pending_journal_completion: None,
+            last_journal_checkpoint_at: 0,
+            journaled_modes: None,
             notifications_enabled: true,
+            journal: None,
+            journal_failed: std::sync::atomic::AtomicBool::new(false),
+            journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            retention: RetentionHandle::new(),
         };
 
         assert!(rt.pty.try_write_input(b"before".to_vec()).is_ok());

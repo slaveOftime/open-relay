@@ -63,17 +63,26 @@ impl PtyHandle {
         result
     }
 
-    /// Release pseudo-terminal-owned handles once the session is completed.
+    /// Close the PTY writer so future input writes fail fast.
     ///
-    /// This closes the stored master handle and replaces the public writer
-    /// sender with a permanently closed channel so future writes fail fast.
-    pub fn release_resources(&mut self) {
-        debug!("releasing PTY resources");
-        self.pty_master.lock().take();
+    /// Deliberately separate from [`Self::take_master`]: on Windows dropping
+    /// the master is what fires `ClosePseudoConsole`, and that has to wait
+    /// for the output stream to drain (see
+    /// `SessionRuntime::teardown_pty`), while a finished session must stop
+    /// accepting input immediately.
+    pub fn close_writer(&mut self) {
         let (closed_tx, closed_rx) = mpsc::channel(1);
         drop(closed_rx);
         let previous_tx = std::mem::replace(&mut self.writer_tx, closed_tx);
         drop(previous_tx);
+    }
+
+    /// Take ownership of the stored master handle, leaving `None` behind so
+    /// resize and writer access fail fast. The caller becomes responsible for
+    /// dropping it — and on Windows for the `ClosePseudoConsole` that drop
+    /// triggers.
+    pub fn take_master(&mut self) -> Option<Box<dyn portable_pty::MasterPty + Send>> {
+        self.pty_master.lock().take()
     }
 
     /// Forcefully terminate the child process or close the Windows ConPTY handle.
@@ -84,6 +93,22 @@ impl PtyHandle {
             Err(err) => warn!(%err, "failed to kill PTY child"),
         }
         result
+    }
+
+    /// Terminate the entire process tree rooted at the child.
+    ///
+    /// The child is a process-group leader (portable-pty `setsid`), so a
+    /// group signal reaches every descendant; the direct-child kill follows
+    /// as a fallback for children that escaped the group (and is the whole
+    /// implementation on Windows, where ConPTY closes the tree with the
+    /// console).
+    pub fn kill_process_tree(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(pid) = self.child.process_id() {
+            let reached = signal_process_group(pid, SIGKILL);
+            debug!(pid, reached, "SIGKILL sent to session process group");
+        }
+        self.kill()
     }
 
     /// Perform a non-blocking child-process exit check.
@@ -153,6 +178,47 @@ impl RuntimeChild {
 }
 
 // ---------------------------------------------------------------------------
+// Process-group signalling (process-tree kill)
+// ---------------------------------------------------------------------------
+
+/// Signal the process group led by `pgid`.
+///
+/// portable-pty spawns children under `setsid`, so the session child's pid is
+/// also its process-group id and every descendant the child forks shares it.
+/// Signalling `-pgid` therefore reaches the whole tree (grandchildren a bare
+/// `Child::kill` would orphan).
+///
+/// Zero-dependency: `kill(2)` is bound directly. Returns `true` when the
+/// signal was delivered to at least one process in the group. An `ESRCH`
+/// (group fully reaped) is a quiet `false`; other errors log and return
+/// `false`.
+#[cfg(unix)]
+pub fn signal_process_group(pgid: u32, signal: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // Negative pid targets the process group (POSIX killpg semantics).
+    let rc = unsafe { kill(-(pgid as i32), signal) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(3) {
+        // ESRCH: no such process group — the tree is already gone.
+        return false;
+    }
+    warn!(pgid, signal, %err, "process-group signal failed");
+    false
+}
+
+/// POSIX signal numbers used for tree escalation. Defined locally so the
+/// escalation policy reads without a libc dependency.
+#[cfg(unix)]
+pub const SIGTERM: i32 = 15;
+#[cfg(unix)]
+pub const SIGKILL: i32 = 9;
+
+// ---------------------------------------------------------------------------
 // Terminal capability queries
 // ---------------------------------------------------------------------------
 
@@ -178,33 +244,10 @@ pub enum TerminalQuery {
     BackgroundColor,
 }
 
-impl TerminalQuery {
-    /// The reply the daemon writes back to the child's standard input.
-    ///
-    /// `cursor` is the current position of the session's rendered screen, used
-    /// for the cursor position report.
-    pub fn response(self, cursor: (u16, u16)) -> Vec<u8> {
-        match self {
-            Self::CursorPositionReport => {
-                let (row, col) = cursor;
-                format!("\x1b[{row};{col}R").into_bytes()
-            }
-            Self::DeviceStatusReport => b"\x1b[0n".to_vec(),
-            Self::ForegroundColor => {
-                let (foreground, _) = terminal_report_colors();
-                format_osc_color_response(10, &foreground).into_bytes()
-            }
-            Self::BackgroundColor => {
-                let (_, background) = terminal_report_colors();
-                format_osc_color_response(11, &background).into_bytes()
-            }
-        }
-    }
-}
-
-/// Derive foreground and background Operating System Command color responses
-/// from the environment, falling back to a conservative white-on-black pair.
-fn terminal_report_colors() -> (String, String) {
+/// Derive the foreground/background RGB pair the session engine reports for
+/// `OSC 10 ; ?` / `OSC 11 ; ?` probes: the COLORFGBG environment when set,
+/// falling back to a conservative white-on-black pair.
+pub(crate) fn terminal_report_rgb() -> ((u8, u8, u8), (u8, u8, u8)) {
     if let Ok(raw) = std::env::var("COLORFGBG") {
         let parsed: Vec<u8> = raw
             .split(';')
@@ -213,24 +256,11 @@ fn terminal_report_colors() -> (String, String) {
         if parsed.len() >= 2 {
             let foreground = xterm_color_to_rgb(parsed[parsed.len() - 2]);
             let background = xterm_color_to_rgb(parsed[parsed.len() - 1]);
-            return (format_osc_rgb(foreground), format_osc_rgb(background));
+            return (foreground, background);
         }
     }
 
-    (
-        "rgb:ffff/ffff/ffff".to_string(),
-        "rgb:0000/0000/0000".to_string(),
-    )
-}
-
-/// Format one Operating System Command color response.
-fn format_osc_color_response(ps: u8, color: &str) -> String {
-    format!("\x1b]{ps};{color}\x1b\\")
-}
-
-/// Convert an RGB tuple into xterm's `rgb:rrrr/gggg/bbbb` string format.
-fn format_osc_rgb((red, green, blue): (u8, u8, u8)) -> String {
-    format!("rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}")
+    ((0xff, 0xff, 0xff), (0x00, 0x00, 0x00))
 }
 
 /// Convert an xterm 256-color palette index into an RGB triple.
@@ -452,34 +482,28 @@ pub fn collect_chunk_bytes(chunks: &[(u64, bytes::Bytes)]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn signalling_a_nonexistent_process_group_is_quietly_false() {
+        // PGID 0x3FFFFFFF is not a live process group in any test harness.
+        assert!(!super::signal_process_group(0x3FFF_FFFF, super::SIGTERM));
+        assert!(!super::signal_process_group(0x3FFF_FFFF, 0));
+    }
+
     use super::*;
 
-    #[test]
-    fn osc_color_responses_use_the_string_terminator_form() {
-        assert_eq!(
-            format_osc_color_response(10, "rgb:ffff/ffff/ffff"),
-            "\x1b]10;rgb:ffff/ffff/ffff\x1b\\"
-        );
-        assert_eq!(
-            format_osc_color_response(11, "rgb:0000/0000/0000"),
-            "\x1b]11;rgb:0000/0000/0000\x1b\\"
-        );
-    }
+    // The reply formats themselves (CPR/DSR/OSC colours) are generated by the
+    // pinned by the session engine and verified in `terminal::tests`.
 
     #[test]
-    fn cursor_position_response_reports_the_rendered_position() {
-        assert_eq!(
-            TerminalQuery::CursorPositionReport.response((7, 3)),
-            b"\x1b[7;3R"
-        );
-    }
-
-    #[test]
-    fn status_response_reports_device_ok() {
-        assert_eq!(
-            TerminalQuery::DeviceStatusReport.response((1, 1)),
-            b"\x1b[0n"
-        );
+    fn report_rgb_falls_back_to_white_on_black() {
+        // COLORFGBG is not set in the test environment (and the fallback must
+        // not depend on it), so the conservative pair is expected.
+        let (fg, bg) = terminal_report_rgb();
+        if std::env::var_os("COLORFGBG").is_none() {
+            assert_eq!(fg, (0xff, 0xff, 0xff));
+            assert_eq!(bg, (0x00, 0x00, 0x00));
+        }
     }
 
     #[test]

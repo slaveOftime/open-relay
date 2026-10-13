@@ -11,48 +11,152 @@ use crate::{
     db::meta_to_summary,
     error::AppError,
     error::Result,
-    protocol::{ListQuery, SessionSummary},
-    session::{SessionEvent, SessionLiveSummary, validate_session_metadata_update},
+    protocol::{ListQuery, SessionInfo, SessionSummary},
+    session::{SessionEvent, validate_session_metadata_update},
 };
 
 use super::super::SessionError;
-use super::super::logs::split_rendered_log_output;
+use super::super::logs::{finish_render, split_rendered_log_output};
 use super::SessionStore;
 
+/// Atomic result of a live screen render: the rendered bytes, the resize
+/// history the render was generated against, and the filtered-stream end
+/// offset captured under the same runtime read lock. Callers MUST use
+/// `captured_offset` as the cursor they hand back to a follow-up `--since`
+/// call to avoid leaking bytes the render never saw.
+pub struct LiveRenderSnapshot {
+    pub output: Vec<u8>,
+    pub resize_history: Vec<crate::protocol::LogResize>,
+    pub captured_offset: u64,
+    pub incarnation: Option<u64>,
+}
+
 impl SessionStore {
+    /// Stream liveness, incarnation and byte offset share one runtime lock.
+    /// An exited child may still have PTY bytes in flight; byte-page consumers
+    /// must not see running=false until output EOF makes the end offset final.
+    pub async fn stream_observation(
+        &self,
+        id: &str,
+    ) -> Option<(bool, Option<i32>, u64, Option<u64>, bool)> {
+        if let Ok(handle) = self.lookup_runtime(id).await {
+            let rt = handle.read();
+            return Some((
+                !rt.is_completed() || !rt.output_closed,
+                rt.meta.exit_code,
+                rt.filtered_stream_len(),
+                rt.journal_incarnation(),
+                rt.input_needed(),
+            ));
+        }
+        let dir = self.persisted_session_dir(id).await?;
+        let incarnation_dir = dir.clone();
+        let incarnation = tokio::task::spawn_blocking(move || {
+            crate::session::journal::list_incarnations(
+                &incarnation_dir.join(crate::session::journal::JOURNAL_DIR_NAME),
+            )
+            .ok()
+            .and_then(|v| v.last().copied())
+        })
+        .await
+        .ok()
+        .flatten();
+        let offset = self.persisted_filtered_len(id).await?;
+        let after = tokio::task::spawn_blocking(move || {
+            crate::session::journal::list_incarnations(
+                &dir.join(crate::session::journal::JOURNAL_DIR_NAME),
+            )
+            .ok()
+            .and_then(|v| v.last().copied())
+        })
+        .await
+        .ok()
+        .flatten();
+        if after != incarnation {
+            return None;
+        }
+        if let Ok(handle) = self.lookup_runtime(id).await {
+            let rt = handle.read();
+            return Some((
+                !rt.is_completed() || !rt.output_closed,
+                rt.meta.exit_code,
+                rt.filtered_stream_len(),
+                rt.journal_incarnation(),
+                rt.input_needed(),
+            ));
+        }
+        let (_, _, exit_code) = self
+            .attach_stream_status(id)
+            .await
+            .unwrap_or((false, true, None));
+        Some((false, exit_code, offset, incarnation, false))
+    }
+
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
-        let mut sessions = self.db.list_summaries(query).await?;
+        // PERF: the journal-derived byte offset is deliberately not fetched
+        // in SQL. A live session's whole summary comes from its runtime
+        // handle (O(1) counters); only rows without a live handle consult
+        // the persisted stream, through the per-incarnation cache in
+        // `persisted_filtered_len`. Decoding journals inline per row made
+        // every list operation O(total journal bytes) — the source of the
+        // "oly ls is mysteriously slow" reports (see PERFORMANCE.md).
+        let mut sessions = self.db.list_summaries_without_offsets(query).await?;
 
         let live_sessions = self.sessions.load();
         for session in &mut sessions {
             if let Some(handle) = live_sessions.get(&session.id) {
                 *session = handle.read().to_summary();
+            } else if let Some(len) = self.persisted_filtered_len(&session.id).await {
+                session.last_total_bytes = len;
             }
         }
 
         Ok(sessions)
     }
 
+    /// Inspect one exact ID. Live fields share a runtime read lock; evicted
+    /// sessions use persisted metadata and the cached journal byte count.
+    pub async fn session_info(&self, id: &str) -> Result<Option<SessionInfo>> {
+        if let Some(info) = self.live_session_info(id) {
+            return Ok(Some(info));
+        }
+        let Some(meta) = self.db.get_session(id).await? else {
+            return Ok(None);
+        };
+        let dir = self.db.session_dir_by_id(id);
+        let total_bytes = self.persisted_filtered_len(id).await.unwrap_or(0);
+        let journal_dir = dir.clone();
+        let incarnation = tokio::task::spawn_blocking(move || disk_incarnation(&journal_dir))
+            .await
+            .map_err(|err| AppError::Protocol(format!("session info worker failed: {err}")))?;
+        // A runtime may have appeared while the persisted reads were in flight.
+        if let Some(info) = self.live_session_info(id) {
+            return Ok(Some(info));
+        }
+        Ok(Some(SessionInfo {
+            summary: meta_to_summary(&meta, false, total_bytes),
+            exit_code: meta.exit_code,
+            session_dir: dir.to_string_lossy().into_owned(),
+            journal_incarnation: incarnation,
+        }))
+    }
+
+    fn live_session_info(&self, id: &str) -> Option<SessionInfo> {
+        let sessions = self.sessions.load();
+        let rt = sessions.get(id)?.read();
+        let mut summary = rt.to_summary();
+        summary.last_total_bytes = rt.filtered_stream_len();
+        Some(SessionInfo {
+            summary,
+            exit_code: rt.meta.exit_code,
+            session_dir: rt.dir.to_string_lossy().into_owned(),
+            journal_incarnation: rt.journal_incarnation(),
+        })
+    }
+
     pub fn get_summary(&self, id: &str) -> Option<SessionSummary> {
         let sessions = self.sessions.load();
         sessions.get(id).map(|handle| handle.read().to_summary())
-    }
-
-    /// Returns summaries for all sessions that are currently held in memory
-    /// (live or recently evicted), without touching the database.
-    /// Used by the SSE session poller to avoid a DB query every 500 ms.
-    pub fn list_live_summaries(&self) -> Vec<SessionLiveSummary> {
-        let sessions = self.sessions.load();
-        sessions
-            .values()
-            .map(|handle| {
-                let rt = handle.read();
-                SessionLiveSummary {
-                    last_output_at: rt.last_output_epoch,
-                    summary: rt.to_summary(),
-                }
-            })
-            .collect()
     }
 
     pub fn get_exit_code(&self, id: &str) -> Option<i32> {
@@ -70,28 +174,12 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub fn is_input_needed(&self, id: &str) -> bool {
-        let sessions = self.sessions.load();
-        sessions
+        self.sessions
+            .load()
             .get(id)
-            .map(|handle| handle.read().input_needed())
-            .unwrap_or(false)
-    }
-
-    pub fn is_silent_for(&self, id: &str, duration: std::time::Duration) -> bool {
-        let sessions = self.sessions.load();
-        sessions
-            .get(id)
-            .map(|handle| {
-                handle
-                    .read()
-                    .last_output_epoch
-                    .map(|last_output| {
-                        std::time::Instant::now().duration_since(last_output) >= duration
-                    })
-                    .unwrap_or(true)
-            })
-            .unwrap_or(true)
+            .is_some_and(|handle| handle.read().input_needed())
     }
 
     pub async fn update_session_metadata(
@@ -159,13 +247,38 @@ impl SessionStore {
     /// Attach relays hold this for the lifetime of the connection so they can
     /// detect DECCKM/bracketed-paste changes after every output chunk without
     /// taking the session lock.
-    pub fn shared_modes(&self, id: &str) -> Option<Arc<crate::session::SharedModes>> {
+    pub fn shared_modes(&self, id: &str) -> Option<Arc<crate::session::runtime::SharedModes>> {
         let sessions = self.sessions.load();
         sessions
             .get(id)
             .map(|handle| Arc::clone(&handle.read().shared_modes))
     }
+    /// Current journal incarnation of a session, if journaled: the live
+    /// runtime's counter, or — for sessions without a runtime (evicted or
+    /// post-restart, post-review corrective increment) — the newest
+    /// incarnation on disk. `None` for unknown or non-journaled sessions.
+    pub fn journal_incarnation(&self, id: &str) -> Option<u64> {
+        let sessions = self.sessions.load();
+        if let Some(handle) = sessions.get(id) {
+            // Prefer the live writer's incarnation; a runtime without a
+            // live journal (legacy or test fixture) falls through to the
+            // on-disk journal, which is also where `attach_subscribe_init`
+            // reads the stream from — fencing must name the same source.
+            if let Some(incarnation) = handle.read().journal_incarnation() {
+                return Some(incarnation);
+            }
+            let dir = handle.read().dir.clone();
+            return disk_incarnation(&dir);
+        }
+        disk_incarnation(&self.db.session_dir_by_id(id))
+    }
 
+    /// Live-tail render of the engine screen, off the runtime read
+    /// lock. Snapshots the engine's content rows under the guard,
+    /// drops it, then runs the CPU-only `finish_render` on
+    /// `spawn_blocking`. Holding the runtime read lock across a full
+    /// tabular render was starving the PTY reader's write lock when the
+    /// visible region grew.
     pub async fn render_live_logs(
         &self,
         id: &str,
@@ -173,17 +286,56 @@ impl SessionStore {
         keep_color: bool,
         term_cols: u16,
     ) -> std::result::Result<(Vec<u8>, Vec<crate::protocol::LogResize>), SessionError> {
-        let handle = self.lookup_runtime(id).await?;
-        let rt = handle.read();
-        if rt.is_completed() || rt.output_closed {
-            return Err(SessionError::NotRunning);
-        }
-        Ok((
-            rt.render_logs(tail, keep_color, term_cols),
-            rt.resize_history.clone(),
-        ))
+        let snapshot = self
+            .snapshot_live_render(id, tail, keep_color, term_cols)
+            .await?;
+        Ok((snapshot.output, snapshot.resize_history))
     }
 
+    /// Atomic variant of [`Self::render_live_logs`]: returns the rendered
+    /// screen bytes together with the filtered-stream end offset as
+    /// captured under the same runtime read lock that produced them. The
+    /// captured offset is the right cursor to hand back to a subsequent
+    /// `--since` read; using a separately-locked `attach_filtered_len`
+    /// call would race the PTY writer and leak bytes the render never
+    /// saw.
+    pub async fn snapshot_live_render(
+        &self,
+        id: &str,
+        tail: usize,
+        keep_color: bool,
+        term_cols: u16,
+    ) -> std::result::Result<LiveRenderSnapshot, SessionError> {
+        let handle = self.lookup_runtime(id).await?;
+        let (rows, resize_history, offset, incarnation) = {
+            let rt = handle.read();
+            if rt.is_completed() || rt.output_closed {
+                return Err(SessionError::NotRunning);
+            }
+            (
+                rt.snapshot_engine_rows(keep_color, term_cols),
+                rt.resize_history.clone(),
+                rt.filtered_stream_len(),
+                rt.journal_incarnation(),
+            )
+        };
+
+        let rendered = tokio::task::spawn_blocking(move || finish_render(rows, tail, keep_color))
+            .await
+            .map_err(|join_err| {
+                SessionError::Internal(format!("log render worker join failed: {join_err}"))
+            })?;
+
+        Ok(LiveRenderSnapshot {
+            output: rendered,
+            resize_history,
+            captured_offset: offset,
+            incarnation,
+        })
+    }
+
+    /// Same off-lock pattern as [`Self::render_live_logs`], but
+    /// returns the typed chunks used by the HTTP live-tail endpoint.
     pub async fn read_live_log_tail_page(
         &self,
         id: &str,
@@ -193,21 +345,32 @@ impl SessionStore {
         SessionError,
     > {
         let handle = self.lookup_runtime(id).await?;
-        let rt = handle.read();
-        if rt.is_completed() || rt.output_closed {
-            return Err(SessionError::NotRunning);
-        }
+        let (rows, resize_history) = {
+            let rt = handle.read();
+            if rt.is_completed() || rt.output_closed {
+                return Err(SessionError::NotRunning);
+            }
+            let term_cols = rt
+                .pty_size
+                .map(|(_, cols)| cols)
+                .or_else(|| rt.resize_history.last().map(|resize| resize.cols))
+                .filter(|cols| *cols > 0)
+                .unwrap_or(80);
+            (
+                rt.snapshot_engine_rows(true, term_cols),
+                rt.resize_history.clone(),
+            )
+        };
 
-        let term_cols = rt
-            .pty_size
-            .map(|(_, cols)| cols)
-            .or_else(|| rt.resize_history.last().map(|resize| resize.cols))
-            .filter(|cols| *cols > 0)
-            .unwrap_or(80);
-        let chunks = split_rendered_log_output(&rt.render_logs(tail, true, term_cols));
+        let rendered = tokio::task::spawn_blocking(move || finish_render(rows, tail, true))
+            .await
+            .map_err(|join_err| {
+                SessionError::Internal(format!("log render worker join failed: {join_err}"))
+            })?;
+
+        let chunks = split_rendered_log_output(&rendered);
         let total = chunks.len();
-
-        Ok((chunks, total, 0, rt.resize_history.clone()))
+        Ok((chunks, total, 0, resize_history))
     }
 
     pub async fn read_live_log_chunk_count(
@@ -247,7 +410,20 @@ impl SessionStore {
     }
 }
 
+/// Latest journal incarnation on disk for a session directory, if any.
+fn disk_incarnation(session_dir: &std::path::Path) -> Option<u64> {
+    let journal_dir = session_dir.join(super::super::journal::JOURNAL_DIR_NAME);
+    super::super::journal::list_incarnations(&journal_dir)
+        .ok()?
+        .last()
+        .copied()
+}
+
 #[cfg(test)]
+// Mirror of the lifecycle/notify convention: tests hold `state.read()`
+// across `.await`s so they can assert on a consistent snapshot.
+// Production store code in this file stays linted.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::super::testsupport::*;
     use super::*;
@@ -255,6 +431,70 @@ mod tests {
     use chrono::Utc;
 
     use std::time::Duration;
+    #[tokio::test]
+    async fn stream_observation_waits_for_pty_eof_after_child_exit() {
+        let rt = make_runtime("stream-drain", SessionStatus::Stopped, "prefix", None);
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        assert!(store.stream_observation("stream-drain").await.unwrap().0);
+        {
+            let mut rt = rt.write();
+            rt.push_output(b"tail", 4);
+            rt.output_closed = true;
+        }
+        let observation = store.stream_observation("stream-drain").await.unwrap();
+        assert!(!observation.0);
+        assert_eq!(observation.2, 10);
+    }
+
+    #[tokio::test]
+    async fn session_info_reads_live_fields_without_changing_metadata() {
+        let rt = make_runtime("info-live", SessionStatus::Running, "hello", None);
+        {
+            let mut locked = rt.write();
+            locked.meta.title = Some("live title".into());
+            locked.meta.exit_code = Some(7);
+            locked.pty_size = Some((30, 100));
+        }
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let info = store.session_info("info-live").await.unwrap().unwrap();
+        assert_eq!(info.summary.title.as_deref(), Some("live title"));
+        assert_eq!(info.summary.last_total_bytes, 5);
+        assert_eq!(info.summary.rows, Some(30));
+        assert_eq!(info.summary.cols, Some(100));
+        assert_eq!(info.exit_code, Some(7));
+        assert_eq!(info.session_dir, rt.read().dir.to_string_lossy());
+        assert_eq!(rt.read().meta.title.as_deref(), Some("live title"));
+        assert!(store.session_info("missing").await.unwrap().is_none());
+        assert!(store.session_info("info").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_info_reads_persisted_metadata_and_journal() {
+        let db = make_test_db().await;
+        let mut meta = make_runtime("info-persisted", SessionStatus::Stopped, "", None)
+            .read()
+            .meta
+            .clone();
+        meta.exit_code = Some(9);
+        meta.resume_command = Some("agent resume example".into());
+        // Use a unique ID because this fixture DB's session root is the temp dir.
+        meta.id = format!("info-{}", uuid::Uuid::new_v4());
+        db.insert_session(&meta).await.unwrap();
+        let dir = db.session_dir_by_id(&meta.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_journal_output(&dir, b"saved output\n");
+        let store = store_with(vec![], db);
+        let info = store.session_info(&meta.id).await.unwrap().unwrap();
+        assert_eq!(info.summary.status, "stopped");
+        assert_eq!(info.summary.resume_command, meta.resume_command);
+        assert_eq!(info.summary.last_total_bytes, 13);
+        assert_eq!(info.summary.rows, None);
+        assert_eq!(info.exit_code, Some(9));
+        assert!(info.journal_incarnation.is_some());
+        assert_eq!(info.session_dir, dir.to_string_lossy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn render_live_logs_uses_runtime_screen_tail() {
         let runtime = make_runtime(
@@ -265,9 +505,8 @@ mod tests {
         );
         {
             let mut rt = runtime.write();
-            rt.screen_parser = vt100::Parser::new(24, 80, 0);
-            rt.screen_parser
-                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
         }
         let store = store_with(vec![runtime], make_test_db().await);
 
@@ -302,6 +541,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_live_render_captures_rows_and_offset_atomically() {
+        let runtime = make_runtime(
+            "atomic123",
+            SessionStatus::Running,
+            "persisted line\n",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"alpha\nbeta\n");
+            // Force filtered_total_bytes to a known value so the snapshot
+            // has a deterministic offset to assert against.
+            const SAMPLE_OFFSET: u64 = 7;
+            rt.filtered_total_bytes = SAMPLE_OFFSET;
+        }
+        let store = store_with(vec![runtime], make_test_db().await);
+
+        let snapshot = store
+            .snapshot_live_render("atomic123", usize::MAX, false, 80)
+            .await
+            .expect("atomic snapshot");
+
+        // The captured offset must reflect the bytes the engine has seen
+        // at the moment the snapshot was taken; a follow-up `--since`
+        // cursor derived from it must NOT replay any bytes between the
+        // snapshot and a separately-locked `attach_filtered_len`.
+        assert_eq!(
+            snapshot.captured_offset, 7,
+            "snapshot cursor must be paired with the engine rows"
+        );
+        assert!(
+            snapshot.output.starts_with(b"alpha\n"),
+            "rendered output preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_snapshot_cursor_stays_paired_with_concurrent_output() {
+        let runtime = make_runtime(
+            "race123",
+            SessionStatus::Running,
+            "",
+            Some(Duration::from_secs(5)),
+        );
+        {
+            let mut rt = runtime.write();
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"0");
+            rt.filtered_total_bytes = 0;
+        }
+        let store = store_with(vec![runtime.clone()], make_test_db().await);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut generation = 0u64;
+            while !writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                generation += 1;
+                let mut rt = runtime.write();
+                rt.feed_engine(format!("\x1b[H\x1b[2J{generation}").as_bytes());
+                rt.filtered_total_bytes = generation;
+                drop(rt);
+                std::thread::yield_now();
+            }
+        });
+        let mut mismatch = None;
+        for _ in 0..100 {
+            let snapshot = store
+                .snapshot_live_render("race123", usize::MAX, false, 80)
+                .await
+                .unwrap();
+            let visible = String::from_utf8(snapshot.output)
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap();
+            if visible != snapshot.captured_offset {
+                mismatch = Some((visible, snapshot.captured_offset));
+                break;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(
+            mismatch, None,
+            "rows and cursor must be from one generation"
+        );
+    }
+
+    #[tokio::test]
     async fn read_live_log_tail_page_returns_runtime_chunks() {
         let runtime = make_runtime(
             "live-page123",
@@ -311,9 +640,8 @@ mod tests {
         );
         {
             let mut rt = runtime.write();
-            rt.screen_parser = vt100::Parser::new(24, 80, 0);
-            rt.screen_parser
-                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
         }
         let store = store_with(vec![runtime], make_test_db().await);
 
@@ -344,9 +672,8 @@ mod tests {
         );
         {
             let mut rt = runtime.write();
-            rt.screen_parser = vt100::Parser::new(24, 80, 0);
-            rt.screen_parser
-                .process(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
+            rt.engine = crate::terminal::Terminal::new(24, 80, 0);
+            rt.feed_engine(b"\x1b[1;1Hscreen one\x1b[2;1Hscreen two\x1b[3;1Hscreen three");
         }
         let store = store_with(vec![runtime], make_test_db().await);
 
@@ -402,6 +729,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
@@ -454,6 +782,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
@@ -500,6 +829,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             ended_at: None,
+            resume_command: None,
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),
@@ -541,6 +871,7 @@ mod tests {
             created_at: Utc::now(),
             started_at: Some(Utc::now()),
             ended_at: Some(Utc::now()),
+            resume_command: None,
             status: SessionStatus::Stopped,
             pid: None,
             exit_code: Some(0),

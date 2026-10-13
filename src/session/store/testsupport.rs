@@ -17,7 +17,38 @@ use crate::session::{SessionMeta, SessionStatus};
 
 use super::{SessionHandle, SessionStore};
 
-pub(super) fn make_runtime(
+/// Seed a fresh session dir with a journal holding `data` as one output
+/// record — the replacement for legacy `output.log` fixtures (the
+/// legacy format was retired). For
+/// repeated appends keep one journal open and use [`sync_journal`]
+/// instead; each `ShadowJournal::open` starts a new incarnation.
+pub(crate) fn seed_journal_output(dir: &std::path::Path, data: &[u8]) {
+    let (mut journal, _, _) =
+        crate::session::journal::ShadowJournal::open(dir).expect("open seed journal");
+    journal
+        .record_output(bytes::Bytes::copy_from_slice(data))
+        .expect("record seed output");
+    sync_journal(&mut journal, 1);
+}
+
+/// Block until the journal is durable up to `expected_seq` (test helper).
+pub(crate) fn sync_journal(
+    journal: &mut crate::session::journal::ShadowJournal,
+    expected_seq: u64,
+) {
+    journal.request_sync();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while journal.core.durable_seq() < expected_seq {
+        journal.poll_acks();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seed journal sync timed out"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+pub(crate) fn make_runtime(
     id: &str,
     status: SessionStatus,
     excerpt: &str,
@@ -28,8 +59,7 @@ pub(super) fn make_runtime(
     let dir = std::env::temp_dir().join(format!("oly_store_test_{id}_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).expect("create runtime test dir");
     if !excerpt.is_empty() {
-        crate::session::persist::append_output_raw(&dir, excerpt.as_bytes())
-            .expect("persist runtime excerpt");
+        seed_journal_output(&dir, excerpt.as_bytes());
     }
 
     let meta = SessionMeta {
@@ -42,6 +72,7 @@ pub(super) fn make_runtime(
         created_at: Utc::now(),
         started_at: Some(Utc::now()),
         ended_at: None,
+        resume_command: None,
         status,
         pid: None,
         exit_code: None,
@@ -51,10 +82,10 @@ pub(super) fn make_runtime(
     };
 
     let last_output_at = last_output_ago.map(|ago| Instant::now() - ago);
-    let mut screen_parser =
-        vt100::Parser::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS);
+    let mut engine =
+        crate::terminal::Terminal::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS);
     if !excerpt.is_empty() {
-        screen_parser.process(excerpt.as_bytes());
+        engine.feed(excerpt.as_bytes());
     }
 
     let (broadcast_tx, _rx) = broadcast::channel(4);
@@ -64,8 +95,8 @@ pub(super) fn make_runtime(
     Arc::new(RwLock::new(super::super::runtime::SessionRuntime {
         meta,
         dir,
-        last_total_bytes: excerpt.as_bytes().len() as u64,
-        raw_total_bytes: excerpt.as_bytes().len() as u64,
+        last_total_bytes: excerpt.len() as u64,
+        filtered_total_bytes: excerpt.len() as u64,
         broadcast_tx,
         resize_tx,
         pty: super::super::pty::PtyHandle {
@@ -79,23 +110,33 @@ pub(super) fn make_runtime(
         persisted: false,
         requested_final_status: None,
         spawned_at: Instant::now(),
+        #[cfg(windows)]
+        pty_read_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         last_output_epoch: last_output_at,
         last_input_at: None,
         last_attach_activity_at: None,
-        attach_count: 0,
+        attachments: Default::default(),
         last_notified_at: None,
         notified_output_epoch: None,
-        screen_parser,
+        engine,
         screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         terminal_signals: Default::default(),
         title_user_set: false,
         shared_modes: Default::default(),
         output_closed: false,
+        resume_scanned: false,
+        pending_journal_completion: None,
+        last_journal_checkpoint_at: 0,
+        journaled_modes: None,
+        journal: None,
+        journal_failed: std::sync::atomic::AtomicBool::new(false),
         notifications_enabled: true,
+        journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        retention: super::super::runtime::RetentionHandle::new(),
     }))
 }
 
-pub(super) fn make_dummy_child() -> (
+pub(crate) fn make_dummy_child() -> (
     super::super::pty::RuntimeChild,
     Box<dyn portable_pty::MasterPty + Send>,
 ) {
@@ -123,7 +164,7 @@ pub(super) fn make_dummy_child() -> (
     (super::super::pty::RuntimeChild::Pty(child), pty.master)
 }
 
-pub(super) async fn make_test_db() -> Arc<Database> {
+pub(crate) async fn make_test_db() -> Arc<Database> {
     // Use a unique per-test file-based DB in the temp directory so
     // concurrent tests don't interfere with each other.
     let path = std::env::temp_dir().join(format!("oly_test_{}.db", uuid::Uuid::new_v4()));
@@ -134,11 +175,11 @@ pub(super) async fn make_test_db() -> Arc<Database> {
     )
 }
 
-pub(super) fn store_with(
+pub(crate) fn store_with(
     runtimes: Vec<Arc<RwLock<super::super::runtime::SessionRuntime>>>,
     db: Arc<Database>,
 ) -> SessionStore {
-    let store = SessionStore::new(900, db);
+    let store = SessionStore::with_journal_byte_cap(900, 0, db);
     for rt in runtimes {
         let id = rt.read().meta.id.clone();
         let handle = Arc::new(SessionHandle::new(rt));
@@ -155,7 +196,7 @@ pub(super) fn store_with(
 // silent_candidates
 // -----------------------------------------------------------------------
 
-pub(super) fn make_runtime_writable(
+pub(crate) fn make_runtime_writable(
     id: &str,
     status: SessionStatus,
 ) -> (
@@ -165,7 +206,7 @@ pub(super) fn make_runtime_writable(
     make_runtime_writable_with_capacity(id, status, 8)
 }
 
-pub(super) fn make_runtime_writable_with_capacity(
+pub(crate) fn make_runtime_writable_with_capacity(
     id: &str,
     status: SessionStatus,
     capacity: usize,
@@ -177,6 +218,7 @@ pub(super) fn make_runtime_writable_with_capacity(
 
     let dir =
         std::env::temp_dir().join(format!("oly_store_writable_{id}_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("create writable runtime test dir");
     let meta = SessionMeta {
         id: id.to_string(),
         title: None,
@@ -187,6 +229,7 @@ pub(super) fn make_runtime_writable_with_capacity(
         created_at: Utc::now(),
         started_at: Some(Utc::now()),
         ended_at: None,
+        resume_command: None,
         status,
         pid: None,
         exit_code: None,
@@ -202,7 +245,7 @@ pub(super) fn make_runtime_writable_with_capacity(
         meta,
         dir,
         last_total_bytes: 0,
-        raw_total_bytes: 0,
+        filtered_total_bytes: 0,
         broadcast_tx,
         resize_tx,
         pty: super::super::pty::PtyHandle {
@@ -216,58 +259,97 @@ pub(super) fn make_runtime_writable_with_capacity(
         persisted: false,
         requested_final_status: None,
         spawned_at: Instant::now(),
+        #[cfg(windows)]
+        pty_read_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         last_output_epoch: None,
         last_input_at: None,
         last_attach_activity_at: None,
-        attach_count: 0,
+        attachments: Default::default(),
         last_notified_at: None,
         notified_output_epoch: None,
-        screen_parser: vt100::Parser::new(24, 80, crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS),
+        engine: crate::terminal::Terminal::new(
+            24,
+            80,
+            crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
+        ),
         screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
         terminal_signals: Default::default(),
         title_user_set: false,
         shared_modes: Default::default(),
         output_closed: false,
+        resume_scanned: false,
+        pending_journal_completion: None,
+        last_journal_checkpoint_at: 0,
+        journaled_modes: None,
+        journal: None,
+        journal_failed: std::sync::atomic::AtomicBool::new(false),
         notifications_enabled: true,
+        journal_byte_cap: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        retention: super::super::runtime::RetentionHandle::new(),
     }));
     (rt, writer_rx)
 }
-pub(super) fn make_test_config(max_running_sessions: usize) -> AppConfig {
+pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
     use std::path::PathBuf;
+    // Per-call tempdir root so the spawned sessions land under
+    // `<temp>/oly_test_sessions_<uuid>/` rather than the process CWD.
+    // Pre-fix, `make_test_config` used `PathBuf::from(".")` for every
+    // path entry, and `SessionStore::start_session_via_handle` writes
+    // `<sessions_dir>/<id>/` for each spawned session — so every
+    // `cargo test --bin oly` run littered the repo root with a brute of
+    // hex-named directories. Funnelling through `std::env::temp_dir()`
+    // (which cargo wipes between runs on most setups, and where leftover
+    // dirs are at least not in the user's working tree) keeps `git
+    // status` and `ls` clean without changing the storage contract for
+    // anything but this test helper.
+    let tmp_root = std::env::temp_dir().join(format!("oly_test_sessions_{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&tmp_root);
     AppConfig {
-        http_bind: "127.0.0.1".to_string(),
-        silence_seconds: 10,
-        notification_min_interval_seconds: 10,
-        stop_grace_seconds: 5,
-        session_eviction_seconds: 15,
-        http_port: 0,
+        paths: crate::config::PathsConfig {
+            state_dir: tmp_root.clone(),
+            sessions_dir: tmp_root,
+            db_file: PathBuf::from("."),
+            socket_name: "test.sock".into(),
+            socket_file: PathBuf::from("."),
+            info_file: PathBuf::from("."),
+            lock_file: PathBuf::from("."),
+        },
+        http: crate::config::HttpConfig {
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+        },
+        notify: crate::config::NotifyConfig {
+            min_interval_seconds: 10,
+            prompt_patterns: vec![],
+            hook: None,
+        },
+        limits: crate::config::LimitsConfig {
+            max_running_sessions,
+            session_eviction_seconds: 15,
+            screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
+            silence_seconds: 10,
+            stop_grace_seconds: 5,
+            journal_retention_days: 0,
+        },
+        web_push: crate::config::WebPushConfig {
+            subject: None,
+            vapid_public_key: None,
+            vapid_private_key: None,
+            proxy: None,
+        },
+        resume: crate::config::ResumeConfig::default(),
         log_level: "info".into(),
-        prompt_patterns: vec![],
-        web_push_vapid_public_key: None,
-        web_push_vapid_private_key: None,
-        web_push_subject: None,
-        web_push_proxy: None,
-        state_dir: PathBuf::from("."),
-        sessions_dir: PathBuf::from("."),
-        db_file: PathBuf::from("."),
-        socket_name: "test.sock".into(),
-        socket_file: PathBuf::from("."),
-        info_file: PathBuf::from("."),
-        lock_file: PathBuf::from("."),
-        max_running_sessions,
-        max_output_log_bytes: 0,
-        screen_scrollback_rows: crate::config::DEFAULT_SCREEN_SCROLLBACK_ROWS,
-        notification_hook: None,
+        trusted_apps_enabled: false,
         runtime_overrides: Default::default(),
     }
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+pub(crate) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
     vec![vec![0x03], vec![0x03], vec![0x1a, b'\r']]
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(super) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
+pub(crate) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
     vec![vec![0x03], vec![0x03], vec![0x04]]
 }

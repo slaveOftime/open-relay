@@ -83,25 +83,43 @@ export default defineConfig({
     },
   },
   server: {
-    port: 8060,
+    port: 8061,
     host: '127.0.0.1',
     allowedHosts: ['host.docker.internal'],
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:15443',
+        target: 'http://127.0.0.1:8060',
         changeOrigin: true,
         ws: true,
+        // The backend validates the WebSocket handshake Origin against the
+        // Host it sees or X-Forwarded-Host (ADR-0007). changeOrigin rewrites
+        // Host to the backend address, so mirror the dev server's own
+        // authority into X-Forwarded-Host on every WS upgrade; that keeps
+        // terminal attach working on any dev port without weakening the
+        // check in production (which has no proxy in front).
+        configure: (proxy) => {
+          proxy.on('proxyReqWs', (proxyReq, req) => {
+            if (req.headers.host) proxyReq.setHeader('x-forwarded-host', req.headers.host)
+          })
+        },
       },
       '/apps': {
         target: 'http://127.0.0.1:15443',
         changeOrigin: true,
         ws: true,
+        configure: (proxy) => {
+          proxy.on('proxyReqWs', (proxyReq, req) => {
+            if (req.headers.host) proxyReq.setHeader('x-forwarded-host', req.headers.host)
+          })
+        },
       },
     },
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts'],
+    // .tsx test files exist (StatusBadge.test.tsx) and were silently skipped by
+    // the old `*.test.ts` glob, so match both extensions now.
+    include: ['src/**/*.test.{ts,tsx}'],
   },
   build: {
     target: 'es2020',

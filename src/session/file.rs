@@ -29,7 +29,7 @@ fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
 }
 
 pub(crate) fn ensure_session_files_dir(config: &AppConfig, id: &str) -> Result<PathBuf> {
-    let files_dir = config.sessions_dir.join(id).join("files");
+    let files_dir = config.paths.sessions_dir.join(id).join("files");
     fs::create_dir_all(&files_dir)?;
     Ok(files_dir)
 }

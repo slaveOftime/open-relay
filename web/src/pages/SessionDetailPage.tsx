@@ -10,7 +10,13 @@ import {
   uploadSessionFile,
   AttachSocket,
 } from '@/api/client'
-import { formatByteSize, formatTimestamp, sessionDisplayName } from '@/utils/format'
+import {
+  formatByteSize,
+  formatTimestamp,
+  normalizeCwdPath,
+  sessionDisplayName,
+} from '@/utils/format'
+import { HistoryAnchorError, HistoryController } from '@/lib/history-controller'
 import {
   encodeLogChunks,
   initialLogReplayState,
@@ -18,16 +24,21 @@ import {
   replayLogChunks,
   seekLogChunks,
   type LogReplayState,
-} from '@/utils/logReplay'
+} from '@/utils/log-replay'
 import StatusBadge from '@/components/StatusBadge'
+import { useAttachIdleAnimation } from '@/hooks/use-attach-idle-animation'
+import { useAttachReconnect } from '@/hooks/use-attach-reconnect'
+import { buildAttachSocketOptions } from '@/components/attach/attach-socket-options'
 import CommandLogo from '@/components/CommandLogo'
-import SessionActivitySparkline from '@/components/SessionActivitySparkline'
-import XTerm, { type XTermHandle } from '@/components/XTerm'
+import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
+import XTerm, { type XTermHandle } from '@/components/terminal/XTerm'
+import { isOwnedTerminalWheel } from '@/components/terminal/scroll-wheel'
 import Logo from '@/components/Logo'
-import NewSessionDialog from '@/components/NewSessionDialog'
-import { buildNewSessionInitialValues } from '@/components/new-session-dialog-values'
-import SessionMetadataDialog from '@/components/SessionMetadataDialog'
-import SessionActionConfirmDialog from '@/components/SessionActionConfirmDialog'
+import NewSessionDialog from '@/components/dialogs/NewSessionDialog'
+import { buildNewSessionInitialValues } from '@/components/dialogs/new-session-dialog-values'
+import SessionMetadataDialog from '@/components/dialogs/SessionMetadataDialog'
+import SessionActionConfirmDialog from '@/components/dialogs/SessionActionConfirmDialog'
+import SessionDeleteConfirmDialog from '@/components/dialogs/SessionDeleteConfirmDialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { getTransferredFiles } from '@/components/ui/file-transfer'
@@ -38,13 +49,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-// import {
-//   Select,
-//   SelectContent,
-//   SelectItem,
-//   SelectTrigger,
-//   SelectValue,
-// } from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
@@ -63,55 +67,27 @@ import {
   ReloadIcon,
   StopIcon,
   TrackNextIcon,
+  TrashIcon,
 } from '@radix-ui/react-icons'
 import { Link } from 'react-router-dom'
-import AttachPanel from '@/components/AttachPanel'
-import { ingestSessionSummary, useLiveSessionSummary } from '@/lib/sessionEvents'
-
-function isSessionRunning(session: SessionSummary | null): boolean {
-  return session
-    ? session.status === 'running' || session.status === 'stopping' || session.status === 'created'
-    : false
-}
-
-function normalizeSnapshotOutputForXterm(output: Uint8Array): Uint8Array {
-  let extra = 0
-  for (let i = 0; i < output.length; i += 1) {
-    if (output[i] === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
-      extra += 1
-    }
-  }
-  if (extra === 0) return output
-
-  const normalized = new Uint8Array(output.length + extra)
-  let writeIndex = 0
-  for (let i = 0; i < output.length; i += 1) {
-    const byte = output[i]
-    if (byte === 0x0a && (i === 0 || output[i - 1] !== 0x0d)) {
-      normalized[writeIndex] = 0x0d
-      writeIndex += 1
-    }
-    normalized[writeIndex] = byte
-    writeIndex += 1
-  }
-  return normalized
-}
-
-function didSessionVisibleOutputAdvance(
-  previous: SessionSummary | null,
-  next: SessionSummary
-): boolean {
-  if (!previous) {
-    return Boolean(next.last_output_epoch) || next.last_total_bytes > 0
-  }
-  if (next.last_output_epoch && next.last_output_epoch !== previous.last_output_epoch) {
-    return true
-  }
-  return next.last_total_bytes > previous.last_total_bytes
-}
+import AttachPanel from '@/components/attach/AttachPanel'
+import { ingestSessionSummary } from '@/lib/session-events'
+import { useLiveSessionSummary, useReconcileTrigger } from '@/hooks/use-session-events'
+import {
+  PENDING_TERMINATION_STATUS,
+  withPendingTermination,
+  type SessionTermination,
+} from '@/utils/session-termination'
+import {
+  didSessionVisibleOutputAdvance,
+  isSessionRunning,
+  normalizeSnapshotOutputForXterm,
+} from './session-detail-output'
 
 const DEFAULT_LOG_TAIL = 200
-const ATTACH_IDLE_BORDER_DELAY_MS = 10_000
+
+/** Encodes the authoritative DECSET mode sequences into the terminal's
+ * byte output queue (see onInit/onModeChanged). */
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
 export default function SessionDetailPage() {
@@ -140,10 +116,12 @@ function SessionDetailPageContent() {
   const [wsEverConnected, setWsEverConnected] = useState(false)
   const [wsReconnectKey, setWsReconnectKey] = useState(0)
   const [wsError, setWsError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
   const [connectTraceOpen, setConnectTraceOpen] = useState(false)
   const [connectTrace, setConnectTrace] = useState<string[]>([])
   const [exitCode, setExitCode] = useState<number | null | undefined>(undefined)
   const [pendingAction, setPendingAction] = useState<'stop' | 'kill' | null>(null)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isReplaying, setIsReplaying] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [replaySpeed] = useState(0.5)
@@ -156,7 +134,6 @@ function SessionDetailPageContent() {
   const [isAttachPanelOpen, setIsAttachPanelOpen] = useState(false)
   const [tailLimit, setTailLimit] = useState<number | null>(null)
   const [tailLimitInput, setTailLimitInput] = useState('40')
-  const [isAttachViewportIdle, setIsAttachViewportIdle] = useState(false)
   const [showNewSessionDialog, setShowNewSessionDialog] = useState(false)
   const [showMetadataDialog, setShowMetadataDialog] = useState(false)
 
@@ -166,22 +143,21 @@ function SessionDetailPageContent() {
   const wsConnectingRef = useRef(false)
   const modeRef = useRef(mode)
   const replayTimerRef = useRef<number | null>(null)
-  const logChunksRef = useRef<Uint8Array[]>([])
+  // History paging/anchoring lives in the extracted HistoryController;
+  // the page only keeps the xterm-facing replay state.
+  const historyRef = useRef<HistoryController | null>(null)
+  const historyKeyRef = useRef('')
+  // Live output may only auto-scroll while the user is pinned to the
+  // bottom: scrolling up to read history must never be stolen.
+  const userAtBottomRef = useRef(true)
   const replaySpeedRef = useRef(0.5)
   const isPausedRef = useRef(false)
   const isRunningRef = useRef(false)
   const isReplayingRef = useRef(false)
-  const totalChunksRef = useRef(0)
   const logReplayStateRef = useRef<LogReplayState>(initialLogReplayState())
-  const logResizesRef = useRef<{ offset: number; rows: number; cols: number }[]>([])
-  const loadedLogCountRef = useRef(0)
-  const isFetchingMoreRef = useRef(false)
   const termContainerRef = useRef<HTMLDivElement>(null)
   const isMounted = useRef(true)
   const replayIdxRef = useRef(0)
-  const reconnectAttemptRef = useRef(0)
-  const reconnectTimerRef = useRef<number | null>(null)
-  const pendingReconnectRef = useRef(false)
   const connectAttemptStartedAtRef = useRef(0)
   const outputBufferRef = useRef<Uint8Array[]>([])
   const outputFlushRafRef = useRef<number | null>(null)
@@ -194,68 +170,24 @@ function SessionDetailPageContent() {
   const lastWsFrameAtRef = useRef(0)
   const replayUiLastCommitAtRef = useRef(0)
   const replayCommittedIdxRef = useRef(0)
-  const attachIdleTimerRef = useRef<number | null>(null)
-  const attachIdleCountdownArmedRef = useRef(false)
   const previousLiveSessionRef = useRef<SessionSummary | null>(null)
 
-  const clearAttachIdleTimer = useCallback(() => {
-    if (attachIdleTimerRef.current !== null) {
-      clearTimeout(attachIdleTimerRef.current)
-      attachIdleTimerRef.current = null
-    }
-  }, [])
+  const {
+    isIdle: isAttachViewportIdle,
+    noteVisibleActivity: noteVisibleSessionActivity,
+    noteUserActivity: noteAttachUserActivity,
+    requestIdleBorder,
+    clearTimer: clearAttachIdleTimer,
+  } = useAttachIdleAnimation({
+    mode: modeRef,
+    connected: wsConnectedRef,
+    mounted: isMounted,
+  })
 
-  const stopAttachIdleAnimation = useCallback(() => {
-    clearAttachIdleTimer()
-    if (isMounted.current) {
-      setIsAttachViewportIdle(false)
-    }
-  }, [clearAttachIdleTimer])
-
-  const disarmAttachIdleAnimation = useCallback(() => {
-    attachIdleCountdownArmedRef.current = false
-    stopAttachIdleAnimation()
-  }, [stopAttachIdleAnimation])
-
-  const scheduleAttachIdleAnimation = useCallback(() => {
-    clearAttachIdleTimer()
-    if (
-      !attachIdleCountdownArmedRef.current ||
-      modeRef.current !== 'attach' ||
-      !wsConnectedRef.current
-    ) {
-      if (isMounted.current) {
-        setIsAttachViewportIdle(false)
-      }
-      return
-    }
-
-    attachIdleTimerRef.current = window.setTimeout(() => {
-      attachIdleTimerRef.current = null
-      if (
-        !isMounted.current ||
-        modeRef.current !== 'attach' ||
-        !wsConnectedRef.current ||
-        !attachIdleCountdownArmedRef.current
-      ) {
-        return
-      }
-      setIsAttachViewportIdle(true)
-    }, ATTACH_IDLE_BORDER_DELAY_MS)
-  }, [clearAttachIdleTimer])
-
-  const noteVisibleSessionActivity = useCallback(() => {
-    if (!isMounted.current) return
-
-    attachIdleCountdownArmedRef.current = true
-    setIsAttachViewportIdle(false)
-    scheduleAttachIdleAnimation()
-  }, [scheduleAttachIdleAnimation])
-
-  const noteAttachUserActivity = useCallback(() => {
-    disarmAttachIdleAnimation()
-  }, [disarmAttachIdleAnimation])
-
+  // Self-reference for the trailing-frame reflush below: a useCallback
+  // cannot reference itself directly, so the recursive call goes through
+  // a ref that is synced in an effect.
+  const flushTerminalOutputRef = useRef<() => void>(() => {})
   const flushTerminalOutput = useCallback(() => {
     if (outputWriteInFlightRef.current) {
       return
@@ -285,20 +217,27 @@ function SessionDetailPageContent() {
       off += c.length
     }
     outputWriteInFlightRef.current = true
+    const wasAtBottom = userAtBottomRef.current
     term.write(merged, () => {
       outputWriteInFlightRef.current = false
-      term.scrollToBottom()
+      if (wasAtBottom) {
+        term.scrollToBottom()
+      }
       if (
         (pendingResetRef.current || outputBufferRef.current.length > 0) &&
         outputFlushRafRef.current === null
       ) {
         outputFlushRafRef.current = requestAnimationFrame(() => {
           outputFlushRafRef.current = null
-          flushTerminalOutput()
+          flushTerminalOutputRef.current()
         })
       }
     })
   }, [])
+
+  useEffect(() => {
+    flushTerminalOutputRef.current = flushTerminalOutput
+  }, [flushTerminalOutput])
 
   const enqueueTerminalOutput = useCallback(
     (chunks: Uint8Array[], opts?: { reset?: boolean }) => {
@@ -325,6 +264,28 @@ function SessionDetailPageContent() {
     setConnectTrace((prev) => [`${ts} ${step}`, ...prev].slice(0, 200))
   }, [])
 
+  // Reconnect backoff, attempt counting and deferred-while-hidden state.
+  // The two closures are memoized so the hook's returned callbacks are stable:
+  // a fresh `triggerReconnect` each render would make `scheduleReconnect` a new
+  // function every render, which is the same trap that broke the session loaders.
+  const triggerReconnect = useCallback(() => setWsReconnectKey((k) => k + 1), [])
+  const isReconnectCurrent = useCallback(
+    () => isMounted.current && modeRef.current === 'attach',
+    []
+  )
+  const reconnect = useAttachReconnect({
+    pushTrace: pushConnectTrace,
+    setError: setWsError,
+    setConnecting: setWsConnecting,
+    triggerReconnect,
+    isCurrent: isReconnectCurrent,
+  })
+  const reconnectTimerRef = reconnect.timerRef
+  const pendingReconnectRef = reconnect.pendingRef
+  const resetReconnectAttempts = reconnect.resetAttempts
+  const cancelReconnect = reconnect.cancelReconnect
+  const scheduleReconnect = reconnect.scheduleReconnect
+
   const requestReconnect = useCallback(
     (source: string, force = false) => {
       if (document.visibilityState !== 'visible') return false
@@ -349,7 +310,7 @@ function SessionDetailPageContent() {
       setWsReconnectKey((k) => k + 1)
       return true
     },
-    [pushConnectTrace]
+    [pushConnectTrace, pendingReconnectRef]
   )
 
   const sendInput = useCallback((data: string, waitForChange: boolean) => {
@@ -447,9 +408,9 @@ function SessionDetailPageContent() {
 
   useEffect(() => {
     if (mode !== 'attach' || !wsConnected) {
-      disarmAttachIdleAnimation()
+      noteAttachUserActivity()
     }
-  }, [disarmAttachIdleAnimation, mode, wsConnected])
+  }, [noteAttachUserActivity, mode, wsConnected])
 
   const commitReplayIdx = useCallback((idx: number, opts?: { force?: boolean }) => {
     replayIdxRef.current = idx
@@ -479,69 +440,96 @@ function SessionDetailPageContent() {
     }
   }, [])
 
+  // Mirror the store's live session into local state. Identity-compare
+  // render-time adjustment (React-recommended) instead of a
+  // setState-in-effect cascade.
+  const [prevLiveSession, setPrevLiveSession] = useState(liveSession)
+  if (liveSession !== prevLiveSession) {
+    setPrevLiveSession(liveSession)
+    if (liveSession) {
+      setSession((current) => (current === liveSession ? current : liveSession))
+      // A terminate error only stays truthful while the session is alive: if
+      // the daemon finished it anyway, the lost response was not a lost stop.
+      if (actionError !== null && !isSessionRunning(liveSession)) {
+        setActionError(null)
+      }
+    }
+  }
+
   useEffect(() => {
     if (!liveSession) return
-
-    setSession((current) => (current === liveSession ? current : liveSession))
 
     if (modeRef.current === 'attach') {
       const previous = previousLiveSessionRef.current
       const becameResponsive = Boolean(previous?.input_needed) && !liveSession.input_needed
 
       if (!isSessionRunning(liveSession)) {
-        disarmAttachIdleAnimation()
+        noteAttachUserActivity()
       } else if (liveSession.input_needed) {
-        attachIdleCountdownArmedRef.current = false
-        clearAttachIdleTimer()
-        if (isMounted.current) {
-          setIsAttachViewportIdle(true)
-        }
+        requestIdleBorder()
       } else if (becameResponsive || didSessionVisibleOutputAdvance(previous, liveSession)) {
         noteVisibleSessionActivity()
       }
     }
 
     previousLiveSessionRef.current = liveSession
-  }, [clearAttachIdleTimer, disarmAttachIdleAnimation, liveSession, noteVisibleSessionActivity])
+  }, [
+    clearAttachIdleTimer,
+    noteAttachUserActivity,
+    liveSession,
+    noteVisibleSessionActivity,
+    requestIdleBorder,
+  ])
+
+  // One HistoryController per (id, node): owns anchored paging state.
+  const getHistory = useCallback((): HistoryController | null => {
+    if (!id) return null
+    const key = `${node ?? ''}:${id}`
+    if (historyRef.current === null || historyKeyRef.current !== key) {
+      historyKeyRef.current = key
+      historyRef.current = new HistoryController(async (offset, limit) => {
+        const res = await fetchLogs(id, { offset, limit }, node ?? undefined)
+        return {
+          offset: res.offset,
+          chunks: encodeLogChunks(res.chunks),
+          total: res.total,
+          resizes: res.resizes,
+        }
+      }, DEFAULT_LOG_TAIL)
+    }
+    return historyRef.current
+  }, [id, node])
 
   const fetchMoreLogs = useCallback(async () => {
-    if (!id || isFetchingMoreRef.current) return false
-    const requestOffset = loadedLogCountRef.current
-    if (requestOffset >= totalChunksRef.current && totalChunksRef.current !== 0) return false
-    isFetchingMoreRef.current = true
+    const history = getHistory()
+    if (!history || history.isFetching) return false
     try {
-      const res = await fetchLogs(
-        id,
-        { offset: requestOffset, limit: DEFAULT_LOG_TAIL },
-        node ?? undefined
-      )
+      const loaded = await history.loadMore()
       if (!isMounted.current) return false
-      logResizesRef.current = res.resizes
-      const encodedChunks = encodeLogChunks(res.chunks)
-      if (res.chunks.length > 0) {
-        const next = [...logChunksRef.current, ...encodedChunks]
-        logChunksRef.current = next
-        loadedLogCountRef.current = res.offset + encodedChunks.length
-        setScrubberMax(next.length)
-      } else {
-        loadedLogCountRef.current = res.offset
-      }
-      if (res.total !== totalChunksRef.current) {
-        totalChunksRef.current = res.total
-        setTotalChunks(res.total)
-      }
-      return encodedChunks.length > 0
-    } catch {
+      setScrubberMax(history.chunkCount)
+      setTotalChunks(history.totalChunks)
+      return loaded > 0
+    } catch (err) {
+      // Anchor mismatches must be loud: retained history is never silently
+      // duplicated or truncated (anchor-mismatch must be loud).
+      if (err instanceof HistoryAnchorError) console.error(err)
       return false
-    } finally {
-      isFetchingMoreRef.current = false
     }
-  }, [id, node])
+  }, [getHistory])
 
   const fetchMoreLogsRef = useRef<(() => Promise<boolean>) | null>(null)
   useEffect(() => {
     fetchMoreLogsRef.current = fetchMoreLogs
   }, [fetchMoreLogs])
+
+  // Synced before `stepReplay` (which captures the ref) below — refs
+  // captured by hooks must not be mutated after the capture point.
+  // `handleScrub` is a hoisted function declaration, so the effect can
+  // reference it before its textual position.
+  const handleScrubRef = useRef<((val: number) => void) | null>(null)
+  useEffect(() => {
+    handleScrubRef.current = handleScrub
+  })
 
   const stepReplayRef = useRef<((delta: number) => Promise<void>) | null>(null)
   const stepReplay = useCallback(async (delta: number) => {
@@ -553,14 +541,15 @@ function SessionDetailPageContent() {
       return
     }
 
+    const history = historyRef.current
     const targetIdx = currentIdx + delta
-    if (targetIdx <= logChunksRef.current.length) {
+    if (!history || targetIdx <= history.chunkCount) {
       handleScrubRef.current?.(targetIdx)
       return
     }
 
     const loaded = await fetchMoreLogsRef.current?.()
-    handleScrubRef.current?.(Math.min(targetIdx, loaded ? logChunksRef.current.length : currentIdx))
+    handleScrubRef.current?.(Math.min(targetIdx, loaded ? history.chunkCount : currentIdx))
   }, [])
   useEffect(() => {
     stepReplayRef.current = stepReplay
@@ -570,6 +559,11 @@ function SessionDetailPageContent() {
     const el = termContainerRef.current
     if (!el || mode !== 'logs') return
     const handleWheel = (e: WheelEvent) => {
+      // The mobile scroll handle owns its gestures: the real wheel is captured
+      // here before the handle can stop it, and the synthetic wheels it emits
+      // scroll the terminal directly. Either way this scrubber must not also
+      // step — that would jump the replay while the log is being scrolled.
+      if (isOwnedTerminalWheel(e)) return
       if (e.deltaY < 0 && replayIdxRef.current > 0) {
         const step = e.shiftKey ? 50 : 10
         void stepReplayRef.current?.(-step)
@@ -601,26 +595,58 @@ function SessionDetailPageContent() {
     return () => window.removeEventListener('keyup', handleKeyUp)
   }, [mode])
 
+  const requestDetailReconcile = useRef<(() => void) | null>(null)
   useEffect(() => {
     if (!id) return
     isMounted.current = true
     let cancelled = false
-    // Defer to avoid StrictMode double-fetch
-    const raf = requestAnimationFrame(() => {
+    let version = 0
+    let inflight = false
+    let pending = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const controller = new AbortController()
+    const schedule = () => {
+      version += 1
+      pending = true
+      if (inflight || timer !== null) return
+      timer = setTimeout(() => {
+        timer = null
+        void load()
+      }, 250)
+    }
+    const load = async () => {
       if (cancelled) return
-      fetchSession(id, node ?? undefined)
-        .then((s) => {
+      const requestedVersion = version
+      pending = false
+      inflight = true
+      try {
+        const s = await fetchSession(id, node ?? undefined, controller.signal)
+        if (!cancelled && requestedVersion === version) {
           ingestSessionSummary(s)
-          if (!cancelled && isMounted.current) setSession(s)
-        })
-        .catch(() => { })
-    })
+          setSession(s)
+        }
+      } catch {
+        /* A later reconnect or manual reload retries. */
+      } finally {
+        inflight = false
+        if (!cancelled && pending) schedule()
+      }
+    }
+    requestDetailReconcile.current = schedule
+    schedule()
     return () => {
       cancelled = true
-      cancelAnimationFrame(raf)
+      controller.abort()
+      if (timer !== null) clearTimeout(timer)
+      requestDetailReconcile.current = null
       isMounted.current = false
     }
   }, [id, node, reloadTick])
+
+  const reconcileSessionDetail = useCallback(() => {
+    requestDetailReconcile.current?.()
+  }, [])
+  useReconcileTrigger(id, node, reconcileSessionDetail)
 
   // Only connect after session metadata is loaded so the info bar has
   // rendered and the terminal container has its final dimensions.  This
@@ -632,7 +658,9 @@ function SessionDetailPageContent() {
     if (mode !== 'attach' || !id || !sessionReady) return
 
     // ── WebSocket attach (local + remote node) ─────────────────────────────
-    pushConnectTrace('mode entered realtime connect view')
+    // Deferred: the trace is a state update and must not run synchronously
+    // inside the effect body.
+    queueMicrotask(() => pushConnectTrace('mode entered realtime connect view'))
     // Mark the start of this connection attempt before any async work so that
     // the visibilitychange / pageshow handlers (which fire during iOS PWA app
     // launch / page transitions) see a fresh attempt and do NOT trigger a
@@ -641,53 +669,14 @@ function SessionDetailPageContent() {
     // "don't reconnect while already connecting" guard in requestReconnect.
     connectAttemptStartedAtRef.current = Date.now()
     lastReconnectTriggerAtRef.current = Date.now()
-    setWsConnecting(true)
+    // Deferred: the connecting flag is a state update and must not run
+    // synchronously inside the effect body.
+    queueMicrotask(() => setWsConnecting(true))
 
     // ended: server sent an 'end' frame — session finished normally, no reconnect.
     // discarded: this effect run is being cleaned up — prevents stale onClose from
     // scheduling a reconnect after we've already torn down intentionally.
-    let ended = false
     let discarded = false
-    let gotSnapshot = false
-
-    const scheduleReconnect = (code: number, reason: string) => {
-      setWsConnecting(true)
-      const attempt = reconnectAttemptRef.current + 1
-      reconnectAttemptRef.current = attempt
-      const delay = Math.min(2000, 120 * 2 ** Math.min(6, attempt - 1))
-      const hidden = document.visibilityState !== 'visible'
-      const offline = typeof navigator !== 'undefined' && !navigator.onLine
-
-      if (reconnectTimerRef.current !== null) {
-        clearTimeout(reconnectTimerRef.current)
-        reconnectTimerRef.current = null
-      }
-
-      if (hidden || offline) {
-        pendingReconnectRef.current = true
-        pushConnectTrace(
-          `reconnect deferred (${hidden ? 'hidden' : ''}${hidden && offline ? '+' : ''}${offline ? 'offline' : ''}) attempt=${attempt}`
-        )
-        setWsError(null)
-        return
-      }
-
-      pendingReconnectRef.current = false
-      const transientClose = code === 1006 || code === 1001 || code === 1005 || code === 0
-      if (!transientClose) {
-        pushConnectTrace(
-          `non-transient close treated as retryable (code=${code}${reason ? ` reason=${reason}` : ''}) attempt=${attempt}`
-        )
-      }
-      setWsError(null)
-
-      reconnectTimerRef.current = window.setTimeout(() => {
-        if (!discarded && isMounted.current && modeRef.current === 'attach') {
-          pushConnectTrace(`retry timer fired (attempt=${attempt}) -> reconnect`)
-          setWsReconnectKey((k) => k + 1)
-        }
-      }, delay)
-    }
 
     connectAttemptStartedAtRef.current = Date.now()
     // Defer WebSocket creation to requestAnimationFrame so that:
@@ -703,86 +692,37 @@ function SessionDetailPageContent() {
       const initialSize = termRef.current?.fit() ?? undefined
       const sock = new AttachSocket(
         id,
-        {
-          onOpen: () => {
-            pushConnectTrace('websocket open')
-            reconnectAttemptRef.current = 0
-            pendingReconnectRef.current = false
+        buildAttachSocketOptions({
+          sessionId: id,
+          node: node ?? undefined,
+          pushTrace: pushConnectTrace,
+          enqueueOutput: enqueueTerminalOutput,
+          noteFrame: () => {
+            lastWsFrameAtRef.current = Date.now()
+          },
+          noteActivity: noteAttachUserActivity,
+          termRef,
+          isMounted,
+          setError: setWsError,
+          setExitCode: setExitCode,
+          setConnected: setWsConnected,
+          setEverConnected: () => setWsEverConnected(true),
+          openLogsView: () => setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' }),
+          setSession,
+          // Reconnect bookkeeping the effect owns, not the frame table.
+          afterOpen: () => {
             connectAttemptStartedAtRef.current = 0
             lastSentResizeRef.current = null
             pendingResizeRef.current = null
-            lastWsFrameAtRef.current = Date.now()
-            setWsError(null)
-            setWsConnecting(false)
-            setWsEverConnected(true)
-            if (reconnectTimerRef.current !== null) {
-              clearTimeout(reconnectTimerRef.current)
-              reconnectTimerRef.current = null
-            }
-            if (isMounted.current) setWsConnected(true)
-            disarmAttachIdleAnimation()
+            resetReconnectAttempts()
+            cancelReconnect()
           },
-          onInit: (data) => {
-            if (!gotSnapshot) {
-              pushConnectTrace(`init received (${data.length} bytes)`)
-              gotSnapshot = true
-            }
-            lastWsFrameAtRef.current = Date.now()
-            enqueueTerminalOutput([data], { reset: true })
+          afterClose: (ended, code, reason) => {
+            if (ended) return
+            setWsConnecting(true)
+            scheduleReconnect(code, reason)
           },
-          onData: (data) => {
-            lastWsFrameAtRef.current = Date.now()
-            enqueueTerminalOutput([data])
-          },
-          onModeChanged: () => {
-            lastWsFrameAtRef.current = Date.now()
-            // Mode changes are tracked server-side; client doesn't need to act.
-          },
-          onResized: (rows, cols) => {
-            lastWsFrameAtRef.current = Date.now()
-            // If the PTY was resized to dimensions that don't match our
-            // viewport (e.g. a CLI client resized), push our actual size
-            // back so the PTY adapts to the web client.
-            termRef.current?.resize(cols, rows)
-          },
-          onSessionEnded: (code) => {
-            ended = true
-            lastWsFrameAtRef.current = Date.now()
-            disarmAttachIdleAnimation()
-            pushConnectTrace(`server end frame received (exit=${code ?? 'null'})`)
-            if (!isMounted.current) return
-            const exitMsg = code != null ? ` (exit code: ${code})` : ''
-            termRef.current?.writeln(`\r\n\x1b[2m[Session ended${exitMsg}]\x1b[0m`)
-            setExitCode(code)
-            setWsConnected(false)
-            setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
-            fetchSession(id!, node ?? undefined)
-              .then((s) => {
-                ingestSessionSummary(s)
-                if (isMounted.current) setSession(s)
-              })
-              .catch(() => { })
-          },
-          onError: (msg) => {
-            lastWsFrameAtRef.current = Date.now()
-            pushConnectTrace(`server error frame: ${msg}`)
-            if (!isMounted.current) return
-            termRef.current?.writeln(`\r\n\x1b[31mError: ${msg}\x1b[0m`)
-            setWsError(`Server error: ${msg}`)
-          },
-          onClose: (code, reason) => {
-            disarmAttachIdleAnimation()
-            pushConnectTrace(`websocket close (code=${code}${reason ? ` reason=${reason}` : ''})`)
-            if (isMounted.current) setWsConnected(false)
-            // iOS PWA kills WebSocket connections when the app goes to background.
-            // Reconnect automatically for unexpected drops (not when the session
-            // ended normally or this effect is being cleaned up).
-            if (!ended && !discarded) {
-              setWsConnecting(true)
-              scheduleReconnect(code, reason)
-            }
-          },
-        },
+        }),
         node ?? undefined,
         initialSize ?? undefined
       )
@@ -793,10 +733,7 @@ function SessionDetailPageContent() {
     return () => {
       discarded = true
       cancelAnimationFrame(connectRaf)
-      if (reconnectTimerRef.current !== null) {
-        clearTimeout(reconnectTimerRef.current)
-        reconnectTimerRef.current = null
-      }
+      cancelReconnect()
       if (outputFlushRafRef.current !== null) {
         cancelAnimationFrame(outputFlushRafRef.current)
         outputFlushRafRef.current = null
@@ -804,7 +741,7 @@ function SessionDetailPageContent() {
       outputWriteInFlightRef.current = false
       outputBufferRef.current = []
       pendingResetRef.current = false
-      disarmAttachIdleAnimation()
+      noteAttachUserActivity()
       pushConnectTrace('teardown current websocket')
       socketRef.current?.close()
       socketRef.current = null
@@ -820,16 +757,25 @@ function SessionDetailPageContent() {
     setSearchParams,
     wsReconnectKey,
     enqueueTerminalOutput,
-    disarmAttachIdleAnimation,
+    noteAttachUserActivity,
+    cancelReconnect,
+    resetReconnectAttempts,
+    scheduleReconnect,
   ])
 
   useEffect(() => {
-    if (mode !== 'attach') setWsConnecting(false)
+    // Deferred: clearing the flag is a state update, not an effect-body
+    // responsibility.
+    if (mode !== 'attach') queueMicrotask(() => setWsConnecting(false))
   }, [mode])
 
   useEffect(() => {
     if (mode !== 'logs' || !isTailMode) return
-    setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
+    // Deferred: syncing the input is a state update, not an effect-body
+    // responsibility.
+    queueMicrotask(() =>
+      setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
+    )
   }, [mode, logsView, isTailMode, tailLimit])
 
   // iOS PWA: reconnect the WebSocket immediately when the app returns from
@@ -895,7 +841,7 @@ function SessionDetailPageContent() {
       window.removeEventListener('pageshow', handlePageShow)
       window.removeEventListener('online', handleOnline)
     }
-  }, [mode, requestReconnect])
+  }, [mode, requestReconnect, pendingReconnectRef, reconnectTimerRef])
 
   // Reconnect watchdog: if attach view is visible+online but remains disconnected
   // without a scheduled retry, force a fresh socket attempt. This covers stale
@@ -918,31 +864,31 @@ function SessionDetailPageContent() {
     }, 1600)
 
     return () => window.clearInterval(tick)
-  }, [mode, requestReconnect])
+  }, [mode, requestReconnect, pendingReconnectRef, reconnectTimerRef])
 
   useEffect(() => {
     if (mode !== 'logs' || !id) return
 
-    // Reset common state.
+    // Reset common state. Terminal/ref resets belong to the effect; the
+    // React state resets are deferred so they are not synchronous
+    // setState-in-effect cascades.
     termRef.current?.reset()
-    commitReplayIdx(0, { force: true })
+    queueMicrotask(() => {
+      commitReplayIdx(0, { force: true })
+      setIsReplaying(false)
+      setIsPaused(false)
+      setScrubberMax(0)
+      setTotalChunks(0)
+    })
     replayCommittedIdxRef.current = 0
     isReplayingRef.current = false
-    setIsReplaying(false)
-    setIsPaused(false)
     isPausedRef.current = false
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)
       replayTimerRef.current = null
     }
-    logChunksRef.current = []
-    setScrubberMax(0)
-    loadedLogCountRef.current = 0
-    totalChunksRef.current = 0
+    getHistory()?.reset()
     logReplayStateRef.current = initialLogReplayState()
-    logResizesRef.current = []
-    isFetchingMoreRef.current = false
-    setTotalChunks(0)
 
     let cancelled = false
 
@@ -965,9 +911,9 @@ function SessionDetailPageContent() {
                 ingestSessionSummary(s)
                 if (!cancelled && isMounted.current) setSession(s)
               })
-              .catch(() => { })
+              .catch(() => {})
           })
-          .catch(() => { })
+          .catch(() => {})
       })
       return () => {
         cancelled = true
@@ -975,43 +921,44 @@ function SessionDetailPageContent() {
       }
     }
 
-    // Replay mode: fetch paginated chunks.
+    // Replay mode: fetch paginated chunks through the history controller.
+    const history = getHistory()
+    if (!history) return
     const raf = requestAnimationFrame(() => {
       if (cancelled) return
-      fetchLogs(id!, { limit: DEFAULT_LOG_TAIL }, node ?? undefined)
-        .then((res) => {
+      history
+        .loadInitial()
+        .then(() => {
           if (cancelled || !isMounted.current) return
-          const encodedChunks = encodeLogChunks(res.chunks)
-          logChunksRef.current = encodedChunks
-          loadedLogCountRef.current = res.offset + encodedChunks.length
-          logResizesRef.current = res.resizes
-          totalChunksRef.current = res.total
-          setTotalChunks(res.total)
-          setScrubberMax(res.chunks.length)
+          setTotalChunks(history.totalChunks)
+          setScrubberMax(history.chunkCount)
           if (termRef.current) {
-            logReplayStateRef.current = replayLogChunks(termRef.current, encodedChunks, res.resizes)
+            logReplayStateRef.current = replayLogChunks(
+              termRef.current,
+              [...history.getChunks()],
+              [...history.getResizes()]
+            )
           }
-          commitReplayIdx(res.chunks.length, { force: true })
+          commitReplayIdx(history.chunkCount, { force: true })
           fetchSession(id!, node ?? undefined)
             .then((s) => {
               ingestSessionSummary(s)
               if (!cancelled && isMounted.current) setSession(s)
             })
-            .catch(() => { })
+            .catch(() => {})
         })
-        .catch(() => { })
+        .catch(() => {})
     })
 
     return () => {
       cancelled = true
       cancelAnimationFrame(raf)
     }
-  }, [mode, id, node, reloadTick, commitReplayIdx, isTailMode, tailLimit])
+  }, [mode, id, node, reloadTick, commitReplayIdx, isTailMode, tailLimit, getHistory])
 
   const isScrubbingRef = useRef(false)
   const wasPlayingBeforeScrubRef = useRef(false)
 
-  const handleScrubRef = useRef<((val: number) => void) | null>(null)
   function handleScrub(val: number) {
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)
@@ -1024,18 +971,17 @@ function SessionDetailPageContent() {
     isPausedRef.current = true
 
     commitReplayIdx(val, { force: true })
-    if (termRef.current) {
+    const history = historyRef.current
+    if (termRef.current && history) {
       logReplayStateRef.current = seekLogChunks(
         termRef.current,
-        logChunksRef.current,
-        logResizesRef.current,
+        [...history.getChunks()],
+        [...history.getResizes()],
         logReplayStateRef.current,
         val
       )
     }
   }
-  handleScrubRef.current = handleScrub
-
   function startReplay(fromIdx = 0) {
     if (replayTimerRef.current !== null) {
       clearTimeout(replayTimerRef.current)
@@ -1049,11 +995,15 @@ function SessionDetailPageContent() {
       commitReplayIdx(0, { force: true })
       logReplayStateRef.current = initialLogReplayState()
       termRef.current?.reset()
-    } else if (termRef.current && logReplayStateRef.current.chunkCount !== fromIdx) {
+    } else if (
+      termRef.current &&
+      historyRef.current &&
+      logReplayStateRef.current.chunkCount !== fromIdx
+    ) {
       logReplayStateRef.current = seekLogChunks(
         termRef.current,
-        logChunksRef.current,
-        logResizesRef.current,
+        [...historyRef.current.getChunks()],
+        [...historyRef.current.getResizes()],
         logReplayStateRef.current,
         fromIdx
       )
@@ -1064,11 +1014,12 @@ function SessionDetailPageContent() {
         replayTimerRef.current = null
         return
       }
-      const chunks = logChunksRef.current
+      const history = historyRef.current
+      const chunks = history ? [...history.getChunks()] : []
       const idx = logReplayStateRef.current.chunkCount
       if (idx >= chunks.length) {
-        if (chunks.length < totalChunksRef.current) {
-          if (isFetchingMoreRef.current) {
+        if (history && history.hasMore && history.totalChunks !== 0) {
+          if (history.isFetching) {
             replayTimerRef.current = window.setTimeout(step, 30)
             return
           }
@@ -1125,7 +1076,7 @@ function SessionDetailPageContent() {
         logReplayStateRef.current = playNextBatch(
           termRef.current,
           chunks,
-          logResizesRef.current,
+          history ? [...history.getResizes()] : [],
           logReplayStateRef.current,
           adjustedMaxBytes,
           () => {
@@ -1220,25 +1171,54 @@ function SessionDetailPageContent() {
     setTailLimitInput(String(tailLimit ?? termRef.current?.getSize()?.rows ?? 40))
   }
 
-  async function handleStop() {
-    if (!id) return
-    await stopSession(id, undefined, node ?? undefined).catch(() => { })
+  // Stop/Kill paint their result optimistically. The daemon moves the runtime to
+  // `stopping` immediately but only publishes a summary once the whole grace
+  // window has elapsed, so waiting for the request to answer would leave the
+  // header reading `running` for up to `stop_grace_seconds`.
+  async function runTermination(action: SessionTermination) {
+    if (!id || !session) return
+    const pending = withPendingTermination(session)
+    // Already stopping or finished: re-sending would restart the daemon's
+    // escalation schedule and push the kill deadline further out.
+    if (!pending) return
+
+    const previous = session
+    setActionError(null)
+    setSession(pending)
+
+    try {
+      if (action === 'stop') {
+        await stopSession(id, undefined, node ?? undefined)
+      } else {
+        await killSession(id, node ?? undefined)
+      }
+    } catch (error) {
+      // Only revert if nothing authoritative landed in the meantime: the
+      // `session_updated` mirror would otherwise immediately overwrite it.
+      if (isMounted.current) {
+        setSession((current) =>
+          current?.status === PENDING_TERMINATION_STATUS ? previous : current
+        )
+        setActionError(
+          `Failed to ${action} session: ${
+            error instanceof Error && error.message.trim() !== ''
+              ? error.message.trim()
+              : 'the request did not reach the daemon.'
+          }`
+        )
+      }
+      return
+    }
+
+    if (!isMounted.current) return
+    // A failed refresh must not undo a stop that already succeeded; the next
+    // `session_updated` still carries the authoritative status.
     fetchSession(id, node ?? undefined)
       .then((s) => {
         ingestSessionSummary(s)
         if (isMounted.current) setSession(s)
       })
-      .catch(() => { })
-  }
-  async function handleKill() {
-    if (!id) return
-    await killSession(id, node ?? undefined).catch(() => { })
-    fetchSession(id, node ?? undefined)
-      .then((s) => {
-        ingestSessionSummary(s)
-        if (isMounted.current) setSession(s)
-      })
-      .catch(() => { })
+      .catch(() => {})
   }
 
   function handleTermResize(cols: number, rows: number) {
@@ -1296,14 +1276,14 @@ function SessionDetailPageContent() {
     <TooltipProvider>
       <div className="flex h-screen w-full min-w-0 flex-col bg-[hsl(var(--background))] text-[hsl(var(--foreground))] supports-[height:100dvh]:h-dvh">
         {/* ── Header ── */}
-        <header className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
+        <header className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-3 sm:px-4 py-2 sm:py-2.5 border-b border-[hsl(var(--border))] bg-[hsl(var(--background))]/95 sticky top-0 z-30 backdrop-blur shrink-0">
           <Link to="/">
             <div className="flex items-center gap-2 text-[hsl(var(--primary))] font-bold text-lg select-none">
               <Logo />
               <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
-          <div className="flex items-center gap-3 min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <button
               className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold truncate hover:text-[hsl(var(--primary))] transition-colors"
               onClick={() => setShowMetadataDialog(true)}
@@ -1341,12 +1321,6 @@ function SessionDetailPageContent() {
                 View Logs
               </Button>
             )}
-            {/* {mode === 'attach' && (
-              <Button size="sm" variant="ghost" onClick={() => setConnectTraceOpen(true)}>
-                <TrackNextIcon className="h-4 w-4" />
-                Trace
-              </Button>
-            )} */}
             {isRunning && (
               <>
                 <Button size="sm" variant="stop" onClick={() => setPendingAction('stop')}>
@@ -1363,6 +1337,12 @@ function SessionDetailPageContent() {
               <Button size="sm" variant="ghost" onClick={() => setShowNewSessionDialog(true)}>
                 <CopyIcon className="h-4 w-4" />
                 Run Again
+              </Button>
+            )}
+            {session && (
+              <Button size="sm" variant="destructive" onClick={() => setShowDeleteConfirm(true)}>
+                <TrashIcon className="h-4 w-4" />
+                Delete
               </Button>
             )}
             {mode === 'logs' && isRunning && (
@@ -1382,17 +1362,25 @@ function SessionDetailPageContent() {
           <div className="sm:hidden shrink-0">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" aria-label="Session actions">
-                  <DotsVerticalIcon className="h-4 w-4" />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Session actions"
+                  className="h-11 w-11"
+                >
+                  <DotsVerticalIcon className="h-5 w-5" />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={handleManualRefresh}>
+              <DropdownMenuContent
+                align="end"
+                className="min-w-48 max-h-[var(--radix-dropdown-menu-content-available-height)] overflow-y-auto overscroll-contain p-1.5"
+              >
+                <DropdownMenuItem touch onClick={handleManualRefresh}>
                   <ReloadIcon className="w-4 h-4" />
                   Refresh
                 </DropdownMenuItem>
                 {session && (
-                  <DropdownMenuItem onClick={() => setShowNewSessionDialog(true)}>
+                  <DropdownMenuItem touch onClick={() => setShowNewSessionDialog(true)}>
                     <CopyIcon className="w-4 h-4" />
                     Run Again
                   </DropdownMenuItem>
@@ -1401,6 +1389,7 @@ function SessionDetailPageContent() {
                   <>
                     {mode === 'attach' && (
                       <DropdownMenuItem
+                        touch
                         onClick={() =>
                           setSearchParams(node ? { mode: 'logs', node } : { mode: 'logs' })
                         }
@@ -1410,13 +1399,24 @@ function SessionDetailPageContent() {
                       </DropdownMenuItem>
                     )}
                     {mode === 'attach' && (
-                      <DropdownMenuItem onClick={() => setConnectTraceOpen(true)}>
+                      <DropdownMenuItem touch onClick={() => setConnectTraceOpen(true)}>
                         <TrackNextIcon className="w-4 h-4" />
                         Trace
                       </DropdownMenuItem>
                     )}
+                    {session && (
+                      <DropdownMenuItem
+                        touch
+                        className="text-[hsl(var(--destructive))] focus:text-[hsl(var(--destructive))]"
+                        onClick={() => setShowDeleteConfirm(true)}
+                      >
+                        <TrashIcon className="w-4 h-4" />
+                        Delete
+                      </DropdownMenuItem>
+                    )}
                     {isRunning && (
                       <DropdownMenuItem
+                        touch
                         className="text-amber-400 focus:text-amber-300"
                         onClick={() => setPendingAction('stop')}
                       >
@@ -1426,6 +1426,7 @@ function SessionDetailPageContent() {
                     )}
                     {isRunning && (
                       <DropdownMenuItem
+                        touch
                         className="text-red-400 focus:text-red-300"
                         onClick={() => setPendingAction('kill')}
                       >
@@ -1435,6 +1436,7 @@ function SessionDetailPageContent() {
                     )}
                     {mode === 'logs' && isRunning && (
                       <DropdownMenuItem
+                        touch
                         className="text-indigo-400 focus:text-indigo-300"
                         onClick={() =>
                           setSearchParams(node ? { mode: 'attach', node } : { mode: 'attach' })
@@ -1457,7 +1459,7 @@ function SessionDetailPageContent() {
             <span className="inline-flex min-w-0 items-start gap-2 text-[hsl(var(--foreground))]">
               <CommandLogo command={session.command} size={24} />
               <div
-                className={`space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
+                className={`mt-0.5 space-x-2 ${isInfoBarToggled ? '' : 'truncate'}`}
                 onClick={() => setIsInfoBarToggled(!isInfoBarToggled)}
               >
                 {session?.title && (
@@ -1465,7 +1467,9 @@ function SessionDetailPageContent() {
                 )}
                 <span className="break-all">{sessionDisplayName(session)}</span>
                 {session.cwd && (
-                  <span className="text-[hsl(var(--foreground))] break-all">{session.cwd}</span>
+                  <span className="text-[hsl(var(--foreground))] break-all">
+                    {normalizeCwdPath(session.cwd)}
+                  </span>
                 )}
                 <span className="text-[hsl(var(--foreground))]">
                   {formatTimestamp(session.created_at)}
@@ -1497,170 +1501,191 @@ function SessionDetailPageContent() {
         )}
 
         {wsError && <div className="text-sm text-[hsl(var(--destructive))]">{wsError}</div>}
+        {actionError && (
+          <div className="flex items-center gap-2 text-sm text-[hsl(var(--destructive))]">
+            <span className="min-w-0 flex-1">{actionError}</span>
+            <Button size="sm" variant="ghost" onClick={() => setActionError(null)}>
+              Dismiss
+            </Button>
+          </div>
+        )}
 
         {/* ── Main body ── */}
         <ScrollArea type={isAttachPanelOpen ? 'always' : 'auto'} className="min-h-0 flex-1">
-          <div
-            id="main-container"
-            className={`h-full ${isAttachPanelOpen ? 'overflow-y-visible' : 'overflow-y-hidden'} sm:flex sm:overflow-y-hidden`}
-          >
-          {/* Terminal area */}
-          <div
-            className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
-          >
+          {/*
+            The ScrollArea viewport owns vertical scrolling here. Keep both
+            axes `visible` on mobile so the open drawer's overflow propagates up
+            to the Radix viewport; setting only one axis to `hidden` would make
+            the other compute `auto` and turn this element into a second,
+            redundant scroll container. On sm+ the panel is a fixed sidebar, so
+            clip instead of scroll.
+          */}
+          <div id="main-container" className="h-full sm:flex sm:overflow-hidden">
+            {/* Terminal area */}
             <div
-              aria-hidden="true"
-              className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
-            />
-            <div
-              ref={termContainerRef}
-              className="flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full overflow-x-auto"
+              className={`relative flex flex-col flex-1 w-full overflow-hidden ${mode === 'logs' ? 'h-full' : 'h-[calc(100%-72px)] sm:h-full'}`}
             >
-              <XTerm
-                key={mode === 'logs' ? `logs-${logsView}` : mode}
-                ref={termRef}
-                autoFit={mode === 'attach' || isTailMode}
-                onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
-                onPaste={mode === 'attach' ? handleTerminalPaste : undefined}
-                onResize={mode === 'attach' ? handleTermResize : undefined}
-                className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full' : 'w-500'}`}
+              <div
+                aria-hidden="true"
+                className={`terminal-viewport-idle-overlay ${mode === 'attach' && isAttachViewportIdle ? 'is-active' : ''}`}
               />
-            </div>
-
-            {/* Tail mode controls */}
-            {mode === 'logs' && isTailMode && (
-              <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
-                <span className="text-xs text-[hsl(var(--muted-foreground))]">Tail</span>
-                <input
-                  type="number"
-                  className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
-                  value={tailLimitInput}
-                  min={1}
-                  max={5000}
-                  onChange={(e) => setTailLimitInput(e.target.value)}
-                  onBlur={() => commitTailLimit(tailLimitInput)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      commitTailLimit(tailLimitInput)
-                    }
-                  }}
-                  aria-label="Tail line limit"
+              <div
+                ref={termContainerRef}
+                className={`flex-1 min-h-0 bg-[hsl(var(--terminal-bg))] pl-2 pr-0 h-full w-full ${mode === 'attach' ? 'overflow-clip' : 'overflow-x-auto'}`}
+              >
+                <XTerm
+                  key={mode === 'logs' ? `logs-${logsView}` : mode}
+                  ref={termRef}
+                  autoFit={mode === 'attach' || isTailMode}
+                  onData={(x) => (mode === 'attach' ? sendInput(x, false) : undefined)}
+                  onPaste={mode === 'attach' ? handleTerminalPaste : undefined}
+                  onResize={mode === 'attach' ? handleTermResize : undefined}
+                  onScrollBottomChange={
+                    mode === 'attach'
+                      ? (atBottom) => {
+                          userAtBottomRef.current = atBottom
+                        }
+                      : undefined
+                  }
+                  className={`h-full ${mode === 'attach' || isTailMode ? 'min-w-full -mr-3.5 md:mr-0' : 'w-500'}`}
                 />
-                <span className="text-xs text-[hsl(var(--muted-foreground))]">lines</span>
-                <div className="flex-1" />
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button variant="secondary" size="icon" onClick={handleReplayButton}>
-                      <PlayIcon className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Replay from start</TooltipContent>
-                </Tooltip>
               </div>
-            )}
 
-            {/* Scrubber (replay mode) */}
-            {mode === 'logs' && !isTailMode && scrubberMax > 0 && (
-              <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
-                <div className="flex flex-1 items-center gap-2">
-                  <Slider
-                    className="flex-1"
-                    min={0}
-                    max={scrubberMax}
-                    value={[replayIdx]}
-                    onValueChange={handleSliderChange}
-                    onValueCommit={handleSliderCommit}
-                    aria-label="Replay scrubber"
+              {/* Tail mode controls */}
+              {mode === 'logs' && isTailMode && (
+                <div className="flex flex-row items-center gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+                  <span className="text-xs text-[hsl(var(--muted-foreground))]">Tail</span>
+                  <input
+                    type="number"
+                    className="w-16 h-7 rounded border border-[hsl(var(--border))] bg-[hsl(var(--background))] text-sm text-center px-1 [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    value={tailLimitInput}
+                    min={1}
+                    max={5000}
+                    onChange={(e) => setTailLimitInput(e.target.value)}
+                    onBlur={() => commitTailLimit(tailLimitInput)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        commitTailLimit(tailLimitInput)
+                      }
+                    }}
+                    aria-label="Tail line limit"
                   />
-                  <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
-                    {totalChunks > scrubberMax
-                      ? `${replayIdx}/${scrubberMax} loaded (${totalChunks} total)`
-                      : `${replayIdx}/${scrubberMax}`}
-                  </span>
+                  <span className="text-xs text-[hsl(var(--muted-foreground))]">lines</span>
+                  <div className="flex-1" />
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button variant="secondary" size="icon" onClick={handleReplayButton}>
+                        <PlayIcon className="h-4 w-4" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Replay from start</TooltipContent>
+                  </Tooltip>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="secondary"
-                        size="icon"
-                        onClick={() => void stepReplayRef.current?.(-10)}
-                      >
-                        <ChevronLeftIcon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Back 10 chunks</TooltipContent>
-                  </Tooltip>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="secondary"
-                        size="icon"
-                        onClick={() => void stepReplayRef.current?.(10)}
-                      >
-                        <ChevronRightIcon className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Forward 10 chunks</TooltipContent>
-                  </Tooltip>
-                  <div className="flex items-center gap-1 ml-auto">
+              )}
+
+              {/* Scrubber (replay mode) */}
+              {mode === 'logs' && !isTailMode && scrubberMax > 0 && (
+                <div className="flex flex-row gap-2 px-3 sm:px-4 py-2 border-t border-[hsl(var(--border))] bg-[hsl(var(--card))]/80 shrink-0">
+                  <div className="flex flex-1 items-center gap-2">
+                    <Slider
+                      className="flex-1"
+                      min={0}
+                      max={scrubberMax}
+                      value={[replayIdx]}
+                      onValueChange={handleSliderChange}
+                      onValueCommit={handleSliderCommit}
+                      aria-label="Replay scrubber"
+                    />
+                    <span className="hidden sm:inline text-sm text-[hsl(var(--muted-foreground))] tabular-nums whitespace-nowrap">
+                      {totalChunks > scrubberMax
+                        ? `${replayIdx}/${scrubberMax} loaded (${totalChunks} total)`
+                        : `${replayIdx}/${scrubberMax}`}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button variant="secondary" size="icon" onClick={handleReplayButton}>
-                          {!isReplaying ? (
-                            <PlayIcon className="h-4 w-4" />
-                          ) : isPaused ? (
-                            <PlayIcon className="h-4 w-4" />
-                          ) : (
-                            <PauseIcon className="h-4 w-4" />
-                          )}
+                        <Button
+                          variant="secondary"
+                          size="icon"
+                          onClick={() => void stepReplayRef.current?.(-10)}
+                        >
+                          <ChevronLeftIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>
-                        {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
-                      </TooltipContent>
+                      <TooltipContent>Back 10 chunks</TooltipContent>
                     </Tooltip>
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Button variant="secondary" size="sm" onClick={handleSwitchToTail}>
-                          <TrackNextIcon className="h-4 w-4" />
-                          Tail
+                        <Button
+                          variant="secondary"
+                          size="icon"
+                          onClick={() => void stepReplayRef.current?.(10)}
+                        >
+                          <ChevronRightIcon className="h-4 w-4" />
                         </Button>
                       </TooltipTrigger>
-                      <TooltipContent>Switch to tail view</TooltipContent>
+                      <TooltipContent>Forward 10 chunks</TooltipContent>
                     </Tooltip>
+                    <div className="flex items-center gap-1 ml-auto">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button variant="secondary" size="icon" onClick={handleReplayButton}>
+                            {!isReplaying ? (
+                              <PlayIcon className="h-4 w-4" />
+                            ) : isPaused ? (
+                              <PlayIcon className="h-4 w-4" />
+                            ) : (
+                              <PauseIcon className="h-4 w-4" />
+                            )}
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          {!isReplaying ? 'Replay' : isPaused ? 'Resume' : 'Pause'}
+                        </TooltipContent>
+                      </Tooltip>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button variant="secondary" size="sm" onClick={handleSwitchToTail}>
+                            <TrackNextIcon className="h-4 w-4" />
+                            Tail
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>Switch to tail view</TooltipContent>
+                      </Tooltip>
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
 
-          {mode === 'attach' && (
-            <>
-              <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
-                <AttachPanel
-                  sessionId={id ?? ''}
-                  sendInput={(x) => sendInput(x, true)}
-                  sendBusy={sendBusy}
-                  showKeyError={showKeyError}
-                  uploadFile={handleUploadFile}
-                  onDrawerOpenChange={setIsAttachPanelOpen}
-                />
-              </div>
-              <div className="sm:hidden flex items-center justify-center h-8 relative">
-                {session &&
-                  <SessionActivitySparkline
-                    sessionId={session.id}
-                    isRunning={isSessionRunning(session)}
-                    fullWidth
-                    height={24}
-                    className="absolute left-0 bottom-0 right-0 opacity-50"
+            {mode === 'attach' && (
+              <>
+                <div className="overflow-hidden rounded-t-md bg-[hsl(var(--card))]/90">
+                  <AttachPanel
+                    sessionId={id ?? ''}
+                    sendInput={(x) => sendInput(x, false)}
+                    sendBusy={sendBusy}
+                    showKeyError={showKeyError}
+                    uploadFile={handleUploadFile}
+                    onDrawerOpenChange={setIsAttachPanelOpen}
                   />
-                }
-                {attachedState}
-              </div>
-            </>
-          )}
+                </div>
+                <div className="sm:hidden flex items-center justify-center h-8 relative">
+                  {session && (
+                    <SessionActivitySparkline
+                      sessionId={session.id}
+                      node={node}
+                      isRunning={isSessionRunning(session)}
+                      fullWidth
+                      height={24}
+                      className="absolute left-0 bottom-0 right-0 opacity-50"
+                    />
+                  )}
+                  {attachedState}
+                </div>
+              </>
+            )}
           </div>
         </ScrollArea>
 
@@ -1681,14 +1706,24 @@ function SessionDetailPageContent() {
           action={pendingAction}
           sessionId={id ?? ''}
           onConfirm={(action) => {
-            if (action === 'stop') void handleStop()
-            else void handleKill()
+            if (action === 'stop') void runTermination('stop')
+            else void runTermination('kill')
           }}
           onClose={() => setPendingAction(null)}
         />
+        {session && (
+          <SessionDeleteConfirmDialog
+            open={showDeleteConfirm}
+            session={session}
+            node={node ?? undefined}
+            onClose={() => setShowDeleteConfirm(false)}
+            onRemoved={() => navigate('/', { replace: true })}
+          />
+        )}
         <NewSessionDialog
           open={showNewSessionDialog}
           onClose={() => setShowNewSessionDialog(false)}
+          onRemovedOriginal={() => navigate('/', { replace: true })}
           initialValues={session ? buildNewSessionInitialValues(session) : undefined}
           node={node ?? undefined}
         />
@@ -1702,40 +1737,6 @@ function SessionDetailPageContent() {
             setSession(updated)
           }}
         />
-        {/* 
-        <Dialog
-          open={wsError !== null}
-          onOpenChange={(open) => {
-            if (!open) setWsError(null)
-          }}
-        >
-          <DialogContent className="max-w-lg">
-            <DialogHeader>
-              <DialogTitle className="text-red-400">Attach Error</DialogTitle>
-            </DialogHeader>
-            <p className="text-xs text-[hsl(var(--muted-foreground))] mb-2">
-              Raw error detail for debugging:
-            </p>
-            <pre className="text-xs text-[hsl(var(--foreground))] bg-[hsl(var(--secondary))] rounded p-3 overflow-x-auto whitespace-pre-wrap break-all border border-[hsl(var(--border))]">
-              {wsError}
-            </pre>
-            <div className="flex justify-end gap-2 pt-1">
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  if (wsError) navigator.clipboard?.writeText(wsError).catch(() => { })
-                }}
-              >
-                Copy
-              </Button>
-              <Button size="sm" onClick={() => setWsError(null)}>
-                Dismiss
-              </Button>
-            </div>
-          </DialogContent>
-        </Dialog> */}
-
         <Dialog open={connectTraceOpen} onOpenChange={setConnectTraceOpen}>
           <DialogContent className="max-w-2xl">
             <DialogHeader>

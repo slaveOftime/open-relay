@@ -107,6 +107,17 @@ impl PtyScanner {
         }
     }
 
+    /// True when no partial escape sequence is buffered: a checkpoint taken
+    /// at an idle boundary is a safe replay anchor, because the next output
+    /// record begins a fresh sequence (idle boundary = replay anchor).
+    pub(crate) fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.pending.capacity() + self.joined.capacity()
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     /// The retained one-way notifications, if they changed since the last call.
     ///
     /// Returning `None` for an unchanged snapshot lets the reader thread skip
@@ -122,9 +133,9 @@ impl PtyScanner {
     /// Whether any retained signal changed since the last
     /// [`Self::take_changed_signals`], without clearing the flag.
     ///
-    /// The reader uses this to avoid skipping a chunk that carries only a
-    /// stripped signal (e.g. a pure colour set produces no filtered bytes but
-    /// still updates session metadata).
+    /// Test-only: the reader always processes every chunk now (raw
+    /// journaling must see fully-filtered chunks too).
+    #[cfg(test)]
     pub fn signals_changed(&self) -> bool {
         self.signals_dirty
     }

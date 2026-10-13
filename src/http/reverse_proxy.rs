@@ -301,8 +301,12 @@ enum AppWebsocketConnectError {
 }
 
 fn should_forward_http_header(header_name: &HeaderName, connection_headers: &[String]) -> bool {
+    // ADR-0007 credential isolation: oly's own credentials are never
+    // forwarded to arbitrary upstreams as implicit SSO.
     !header_name.as_str().eq_ignore_ascii_case("host")
         && !header_name.as_str().eq_ignore_ascii_case("content-length")
+        && !header_name.as_str().eq_ignore_ascii_case("authorization")
+        && !header_name.as_str().eq_ignore_ascii_case("cookie")
         && !HOP_BY_HOP_HEADERS
             .iter()
             .any(|candidate| header_name.as_str().eq_ignore_ascii_case(candidate))
@@ -312,7 +316,10 @@ fn should_forward_http_header(header_name: &HeaderName, connection_headers: &[St
 }
 
 fn should_forward_websocket_header(header_name: &HeaderName) -> bool {
+    // ADR-0007 credential isolation (see should_forward_http_header).
     !header_name.as_str().eq_ignore_ascii_case("host")
+        && !header_name.as_str().eq_ignore_ascii_case("authorization")
+        && !header_name.as_str().eq_ignore_ascii_case("cookie")
         && !header_name
             .as_str()
             .eq_ignore_ascii_case("sec-websocket-extensions")
@@ -366,6 +373,7 @@ fn websocket_target_url(target_url: &Url) -> Result<Url, &'static str> {
 
 fn websocket_host_header(target_url: &Url) -> String {
     let host = match target_url.host_str() {
+        Some(host) if host.starts_with('[') => host.to_string(),
         Some(host) if host.contains(':') => format!("[{host}]"),
         Some(host) => host.to_string(),
         None => String::from("localhost"),
@@ -379,6 +387,9 @@ fn websocket_host_header(target_url: &Url) -> String {
 fn app_proxy_client() -> &'static reqwest::Client {
     APP_PROXY_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // The literal-loopback policy must not be rerouted through an
+            // inherited HTTP(S)_PROXY to a remote service.
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("app proxy client should build")
@@ -449,6 +460,12 @@ mod tests {
             .expect("target URL should convert to WebSocket");
 
         assert_eq!(url.as_str(), "wss://example.com/app/socket");
+    }
+
+    #[test]
+    fn websocket_host_header_brackets_ipv6_exactly_once() {
+        let host = websocket_host_header(&Url::parse("ws://[::1]:5173/socket").unwrap());
+        assert_eq!(host, "[::1]:5173");
     }
 
     #[test]

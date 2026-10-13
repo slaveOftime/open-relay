@@ -8,7 +8,7 @@ use crate::{
 /// Prompt the user for a new password (twice to confirm) and return an Argon2id PHC hash.
 pub(super) fn prompt_and_hash_password() -> Result<String> {
     loop {
-        let pass1 = rpassword::prompt_password("Set daemon password: ").map_err(AppError::Io)?;
+        let pass1 = rpassword::prompt_password("Daemon password: ").map_err(AppError::Io)?;
         if pass1.is_empty() {
             eprintln!("error: password must not be empty");
             continue;

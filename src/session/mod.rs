@@ -2,24 +2,38 @@
 //! metadata types the rest of the daemon speaks in.
 
 pub(crate) mod file;
+// The single canonical per-session recording (ADR-0002):
+// record format, segment writer/reader, torn-tail recovery, the bounded
+// journal appender, ordered resize/lifecycle records, fixed-range/tail/
+// history reads and checkpoint-gated retention. Always on; if it fails,
+// the session fails loudly.
+pub(crate) mod journal;
 pub mod logs;
-pub(crate) mod persist;
 pub mod pty;
+pub mod registry;
+pub(crate) mod replay;
 pub(crate) mod resize;
-mod runtime;
+// `pub(crate)` so test code outside this submodule tree can
+// reach types such as `runtime::SequencedChunk` directly, without a
+// `#[cfg(test)]` re-export flip mirroring the production module graph.
+pub(crate) mod runtime;
 pub(crate) mod scan;
-pub(crate) mod screen;
-mod store;
+// `pub(crate)` (not `mod`) is required unconditionally so test code outside
+// this submodule tree can reach `crate::session::store::testsupport`
+// without a `#[cfg(test)]` visibility flip — the shipping module graph
+// has no `cfg(test)`-gated `pub(crate)` modifiers.
+pub(crate) mod store;
+pub use runtime::ModeSnapshot;
+pub use store::pump::{AttachEvent, AttachPump, PumpCredit};
+pub(crate) use store::scrollback_seed_bytes;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::time::Instant;
 use tokio::sync::broadcast;
 
 use crate::error::{AppError, Result};
 use crate::protocol::SessionSummary;
-pub(crate) use runtime::{ModeSnapshot, SharedModes};
 pub use store::SessionStore;
 pub use store::SilentCandidate;
 
@@ -58,6 +72,9 @@ pub struct SessionMeta {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    /// Best-effort resume command advertised by the child near shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<String>,
     pub status: SessionStatus,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
@@ -86,7 +103,24 @@ pub enum SessionError {
     Evicted,
     NotRunning,
     Busy,
+    /// An operator input action is invalid or unsupported by the live modes.
+    InvalidInput(String),
     Persistence(String),
+    /// A resume cursor named a different journal incarnation than the
+    /// session's current one; the client must resnapshot (ADR-0004).
+    StaleCursor {
+        requested: Option<u64>,
+        current: Option<u64>,
+    },
+    /// A view-only attach (`oly attach --observe`) tried to drive
+    /// geometry/input (observe-mode invariant).
+    ViewOnly,
+    /// The attachment id is unknown to the session (stale fencing token).
+    StaleAttachment,
+    /// A background worker join/sync failed. Surfaces only when a
+    /// `spawn_blocking` task panics or is cancelled mid-flight; it
+    /// indicates an internal invariant was violated.
+    Internal(String),
 }
 
 impl SessionError {
@@ -95,19 +129,28 @@ impl SessionError {
             Self::Evicted => format!("session evicted from memory: {id}"),
             Self::NotRunning => format!("session not running: {id}"),
             Self::Busy => format!("session input queue is full: {id}"),
-            Self::Persistence(message) => message.clone(),
+            Self::InvalidInput(message) | Self::Persistence(message) => message.clone(),
+            Self::StaleCursor { requested, current } => format!(
+                "stale resume cursor for {id}: cursor names incarnation {requested:?}, \
+                 session incarnation is {current:?}; resnapshot instead of resuming"
+            ),
+            Self::ViewOnly => format!(
+                "session {id} is attached in view-only mode (observe): \
+                 re-attach without --observe to send input or resize"
+            ),
+            Self::StaleAttachment => {
+                format!("attachment is no longer registered for session {id}; re-attach")
+            }
+            Self::Internal(message) => {
+                format!("session {id} internal error: {message}")
+            }
         }
     }
 }
 
-pub struct SessionLiveSummary {
-    pub summary: SessionSummary,
-    pub last_output_at: Option<Instant>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
-#[allow(dead_code)]
+#[allow(clippy::enum_variant_names)] // Session-prefix is the protocol contract; renaming diverges from wire docs.
 pub enum SessionEvent {
     SessionCreated(SessionSummary),
     SessionUpdated(SessionSummary),
@@ -133,9 +176,64 @@ pub enum SessionEvent {
         last_total_bytes: u64,
         enabled_for_channels: bool,
     },
+
+    /// Compact activity batch produced by the daemon-wide sampler. Rebroadcast
+    /// by the primary with `batch.node` populated so a single SSE consumer
+    /// sees the global activity stream. Frontends apply these in place to
+    /// already-known summaries; activity never creates or deletes rows.
+    SessionActivity(SessionActivityBatch),
+
+    /// Emitted when a session-event stream diverged past its bounded ring
+    /// (local SSE receiver, federation relay, or any fold over `event_tx`)
+    /// so the frontend can request a fresh inventory via REST instead of
+    /// painting a partially-stale UI.
+    ResyncRequired {
+        /// Affected node name; absent when the local receiver is the cause.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node: Option<String>,
+        /// Diagnostic tag for telemetry only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Emitted when the local pool of connected secondary nodes changes,
+    /// or a known secondary toggles online/offline. Frontends add or remove
+    /// bare rows in the list view without re-fetching the full inventory.
+    NodeState {
+        /// Affected node name.
+        node: String,
+        /// `true` when the node joined; `false` when it left.
+        connected: bool,
+        /// Wall-clock seconds since the UNIX epoch of the last received
+        /// heartbeat; only set for `connected: true`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_seen: Option<i64>,
+    },
 }
 
 pub type SessionEventTx = broadcast::Sender<SessionEvent>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionActivitySample {
+    pub id: String,
+    /// Cumulative `last_total_bytes` for the session's filtered stream as
+    /// observed by the local activity sampler on the **owning** daemon.
+    pub last_total_bytes: u64,
+    /// Calendar timestamp of the last meaningful PTY chunk observed by the
+    /// sampler. `None` only when the session has not produced meaningful
+    /// output yet (in which case the byte counter stays `0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionActivityBatch {
+    /// Owning daemon's node name. `None` when emitted by the daemon that
+    /// owns the session; populated by the primary as it rebroadcasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub samples: Vec<SessionActivitySample>,
+}
 
 pub const MAX_SESSION_TITLE_LEN: usize = 256;
 

@@ -1,4 +1,4 @@
-import { cn } from '@/lib/utils'
+import { cn } from '@/utils/cn'
 import { agentName, commandBaseName } from '@/utils/format'
 
 type CommandBrand =
@@ -18,6 +18,8 @@ type CommandBrand =
   | 'aider'
   | 'copilot'
   | 'ollama'
+  | 'pi'
+  | 'wsl'
 
 type CommandVisual = {
   src?: string
@@ -52,6 +54,8 @@ const COMMAND_ALIASES: Record<string, CommandBrand> = {
   copilot: 'copilot',
   'github-copilot': 'copilot',
   ollama: 'ollama',
+  pi: 'pi',
+  wsl: 'wsl',
 }
 
 const COMMAND_VISUALS: Record<CommandBrand, CommandVisual> = {
@@ -83,6 +87,8 @@ const COMMAND_VISUALS: Record<CommandBrand, CommandVisual> = {
     fallbackClassName: 'bg-[#0078d4]/15 text-[#38bdf8]',
   },
   codex: {
+    src: '/command-logos/codex.svg',
+    monochrome: true,
     fallbackText: 'CX',
     fallbackClassName: 'bg-[#10b981]/15 text-[#34d399]',
   },
@@ -136,6 +142,16 @@ const COMMAND_VISUALS: Record<CommandBrand, CommandVisual> = {
     fallbackText: 'OL',
     fallbackClassName: 'bg-[#0ea5e9]/15 text-[#38bdf8]',
   },
+  pi: {
+    src: '/command-logos/pi.svg',
+    fallbackText: 'PI',
+    fallbackClassName: 'bg-[#ec4899]/15 text-[#ec4899]',
+  },
+  wsl: {
+    src: '/command-logos/wsl.png',
+    fallbackText: 'WS',
+    fallbackClassName: 'bg-[#3f6fd1]/15 text-[#9fc6ff]',
+  },
 }
 
 function resolveCommandBrand(command: string): CommandBrand {
@@ -179,7 +195,7 @@ export default function CommandLogo({
         <img
           src={visual.src}
           alt=""
-          className={cn('h-full w-full object-contain p-[2px]', visual.monochrome && 'dark:invert')}
+          className={cn('h-full w-full object-contain', visual.monochrome && 'dark:invert')}
         />
       ) : (
         <span

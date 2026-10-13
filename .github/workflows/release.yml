@@ -2,17 +2,32 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish from (must already exist on origin, e.g. v0.3.4)"
+        required: true
+
+# Never cancel a release mid-publish: a half-finished publish leaves the
+# GitHub release / npm / crates.io in an inconsistent state.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
+# On tag-triggered runs github.ref_name is the just-pushed tag. On
+# workflow_dispatch runs we use the supplied tag input so a re-publish
+# after a transient registry outage can retry from the existing tag.
 jobs:
   build-release:
-    name: build-release
+    name: build-release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -28,96 +43,139 @@ jobs:
             artifact_name: oly.exe
             asset_name: oly-windows-amd64.zip
 
+    env:
+      EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EFFECTIVE_REF }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
-      - name: Resolve npm cache directory
-        id: npm-cache-dir
-        shell: bash
-        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cargo/git/checkouts/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          shared-key: ${{ runner.os }}-oly-release
+          cache-on-failure: true
 
-      - name: Cache npm registry
-        uses: actions/cache@v4
+      - uses: actions/setup-python@v5
         with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: ${{ runner.os }}-npm-${{ hashFiles('web/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
+          python-version: "3.13"
 
       - name: Set version from tag
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          VERSION: ${{ github.ref_name }}
-        shell: pwsh
+        shell: bash
+        run: python3 scripts/release-version.py "$EFFECTIVE_REF"
+
+      - name: Test
+        shell: bash
         run: |
-          $version = $env:VERSION -replace '^v', ''
-          $cargoToml = 'Cargo.toml'
-          $content = Get-Content $cargoToml -Raw
-          $updated = [regex]::Replace($content, '(?m)^version = "[^"]+"', "version = `"$version`"", 1)
+          # Windows PTY e2e tests need single-threaded execution because of
+          # resource contention; the same override ci.yml applies.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test --locked --target ${{ matrix.target }} -- --test-threads=1
+          else
+            cargo test --locked --target ${{ matrix.target }}
+          fi
 
-          if ($updated -eq $content) {
-            throw "Failed to update Cargo.toml version from tag $version"
-          }
-
-          Set-Content $cargoToml $updated -NoNewline
-
-      # - name: Test
-      #   run: cargo test --target ${{ matrix.target }}
-        
       - name: Build release binary
         env:
           NPM_CONFIG_INCLUDE: optional
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package binary (zip)
+      - name: Package binary + per-asset checksum
+        shell: bash
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" -DestinationPath "target/${{ matrix.target }}/release/${{ matrix.asset_name }}" -Force
-        shell: pwsh
+          set -euo pipefail
+          BIN_PATH="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          ASSET_PATH="${{ matrix.asset_name }}"
+          # Python is installed above on every runner; do not depend on a
+          # POSIX zip utility being on the Windows PATH.
+          python3 scripts/release-package.py "$BIN_PATH" "$ASSET_PATH"
 
-      - name: Upload workflow artifact
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
+          # retention-days: 1 — the matrix only needs the artifact alive
+          # for the fan-out publish jobs (seconds to minutes). Permanent
+          # copies live on the GitHub release + crates.io + npmjs.
           name: ${{ matrix.asset_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
+          path: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+          retention-days: 1
 
-      - name: Upload binary to Release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/release/${{ matrix.asset_name }}
-          generate_release_notes: false
+          tag_name: ${{ env.EFFECTIVE_REF }}
+          files: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+          generate_release_notes: true
+          # Prerelease tags publish as preview/beta releases, never as
+          # "latest".
+          prerelease: ${{ contains(env.EFFECTIVE_REF, '-') }}
+          name: ${{ contains(env.EFFECTIVE_REF, '-') && format('{0} (beta)', env.EFFECTIVE_REF) || env.EFFECTIVE_REF }}
+          make_latest: ${{ contains(env.EFFECTIVE_REF, '-') && 'false' || 'true' }}
 
-  update-homebrew-formula-and-cargo-toml:
-    name: update-homebrew-formula-and-cargo-toml
+  attach-checksums:
+    name: attach SHA256SUMS
     needs: build-release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    timeout-minutes: 15
+    permissions:
+      # Explicit so the job holds only what it needs, regardless of what the
+      # workflow-level default grants.
+      contents: write
     steps:
-      - name: Checkout default branch
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate per-asset checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+
+      - name: Attach SHA256SUMS to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: SHA256SUMS.txt
+          generate_release_notes: false
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
+          make_latest: ${{ contains(github.event.inputs.tag || github.ref_name, '-') && 'false' || 'true' }}
+
+  update-homebrew-formula:
+    name: update-homebrew-formula
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Stable tags only: prereleases must not rewrite the Homebrew formula
+    # that ships on the default branch.
+    if: |
+      (github.event_name == 'push' && !contains(github.ref_name, '-')) ||
+      (github.event_name == 'workflow_dispatch' && !contains(github.event.inputs.tag, '-'))
+    env:
+      EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch }}
 
@@ -125,21 +183,22 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          merge-multiple: true
 
       - name: Update Formula/oly.rb
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.EFFECTIVE_REF }}
+        shell: bash
         run: |
+          set -euo pipefail
           VERSION="${VERSION#v}"
-          MACOS_SHA="$(sha256sum dist/oly-macos-arm64.zip/oly-macos-arm64.zip | awk '{print $1}')"
-          LINUX_SHA="$(sha256sum dist/oly-linux-amd64.zip/oly-linux-amd64.zip | awk '{print $1}')"
+          MACOS_SHA="$(awk '{print $1}' dist/oly-macos-arm64.zip.sha256)"
+          LINUX_SHA="$(awk '{print $1}' dist/oly-linux-amd64.zip.sha256)"
           export VERSION MACOS_SHA LINUX_SHA
 
           ruby <<'RUBY'
           formula_path = "Formula/oly.rb"
           formula = File.read(formula_path)
-          cargo_toml_path = "Cargo.toml"
-          cargo_toml = File.read(cargo_toml_path)
           version = ENV.fetch("VERSION")
           macos_sha = ENV.fetch("MACOS_SHA")
           linux_sha = ENV.fetch("LINUX_SHA")
@@ -147,121 +206,166 @@ jobs:
           formula.sub!(/^  version "[^"]+"/, %(  version "#{version}"))
           formula.sub!(/(on_macos do.*?sha256 ")([^"]+)(")/m, "\\1#{macos_sha}\\3")
           formula.sub!(/(on_linux do.*?sha256 ")([^"]+)(")/m, "\\1#{linux_sha}\\3")
-          cargo_toml.sub!(/^version = "[^"]+"/, %(version = "#{version}"))
 
           File.write(formula_path, formula)
-          File.write(cargo_toml_path, cargo_toml)
           RUBY
 
       - name: Commit updated formula
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ env.EFFECTIVE_REF }}
         run: |
           VERSION="${VERSION#v}"
-          if git diff --quiet -- Cargo.toml Formula/oly.rb; then
-            echo "Release metadata already up to date"
+          if git diff --quiet -- Formula/oly.rb; then
+            echo "Formula already up to date"
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Formula/oly.rb
-          git commit -m "chore(release): sync release metadata for ${VERSION}"
+          git add Formula/oly.rb
+          # [skip ci] so the auto-commit doesn't queue the full CI matrix
+          # just to confirm "yes the version bump matches the tag".
+          git commit -m "chore(release): sync homebrew formula for ${VERSION} [skip ci]"
           git push origin HEAD:${{ github.event.repository.default_branch }}
 
   publish-crates:
     name: publish-crates
     needs: build-release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    timeout-minutes: 20
+    # Stable tags only: crates.io has no dist-tags, so prereleases must
+    # never reach the registry.
+    if: |
+      (github.event_name == 'push' && !contains(github.ref_name, '-')) ||
+      (github.event_name == 'workflow_dispatch' && !contains(github.event.inputs.tag, '-'))
+    env:
+      EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EFFECTIVE_REF }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-python@v5
         with:
-          node-version: 22
+          python-version: "3.13"
 
       - name: Set version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          sed -i -E "s/^version = \"[^\"]+\"/version = \"$VERSION\"/" Cargo.toml
+        shell: bash
+        run: python3 scripts/release-version.py "$EFFECTIVE_REF"
 
+      # Registry publishes can flake on 5xx; retry the whole step.
       - name: Publish to crates.io
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_on: error
+          command: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-verify --allow-dirty
 
   publish-npm:
     name: publish-npm
     needs: build-release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    timeout-minutes: 20
+    env:
+      EFFECTIVE_REF: ${{ github.event.inputs.tag || github.ref_name }}
+    # Run shell steps under npm/. `uses:` actions do not inherit this;
+    # the retry action explicitly changes directory below.
+    defaults:
+      run:
+        working-directory: npm
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.EFFECTIVE_REF }}
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: "https://registry.npmjs.org"
 
-      - name: Set version from tag
+      - name: Resolve version + npm dist-tag
+        id: meta
+        env:
+          REF: ${{ env.EFFECTIVE_REF }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version
-        working-directory: npm
+          VERSION="${REF#v}"
+          if [[ "$REF" == *-* ]]; then
+            DIST_TAG="beta"
+          else
+            DIST_TAG="latest"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=${DIST_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
+          merge-multiple: true
 
-      - name: Bundle release binaries into npm package
-        run: |
-          TMP_DIR="$(mktemp -d)"
-          trap 'rm -rf "$TMP_DIR"' EXIT
-
-          LINUX_ZIP="$(find dist -type f -name 'oly-linux-amd64.zip' -print -quit)"
-          MACOS_ZIP="$(find dist -type f -name 'oly-macos-arm64.zip' -print -quit)"
-          WINDOWS_ZIP="$(find dist -type f -name 'oly-windows-amd64.zip' -print -quit)"
-
-          test -n "$LINUX_ZIP"
-          test -n "$MACOS_ZIP"
-          test -n "$WINDOWS_ZIP"
-
-          unzip -j "$LINUX_ZIP" oly -d "$TMP_DIR"
-          mv "$TMP_DIR/oly" npm/bin/oly-linux-x64
-          unzip -j "$MACOS_ZIP" oly -d "$TMP_DIR"
-          mv "$TMP_DIR/oly" npm/bin/oly-darwin-arm64
-          unzip -j "$WINDOWS_ZIP" oly.exe -d "$TMP_DIR"
-          mv "$TMP_DIR/oly.exe" npm/bin/oly-win32-x64.exe
-          chmod +x npm/bin/oly-linux-x64 npm/bin/oly-darwin-arm64
-
-          test -f npm/bin/oly.js
-          test -f npm/bin/oly-linux-x64
-          test -f npm/bin/oly-darwin-arm64
-          test -f npm/bin/oly-win32-x64.exe
-
-      - name: Copy README to npm package
-        run: cp README.md npm/README.md
-
-      - name: Publish to npm
+      - name: Set package.json version
+        run: npm version "$VERSION" --no-git-tag-version
         env:
+          VERSION: ${{ steps.meta.outputs.version }}
+
+      # npm registry publishes can flake under load; retry the whole step.
+      - name: Bundle binaries + publish to npm
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_on: error
+          shell: bash
+          command: |
+            set -euo pipefail
+            cd "$GITHUB_WORKSPACE/npm"
+            # download-artifact paths are relative to GITHUB_WORKSPACE.
+            TMP_DIR="$(mktemp -d)"
+            trap 'rm -rf "$TMP_DIR"' EXIT
+
+            LINUX_ZIP="$(find ../dist -type f -name 'oly-linux-amd64.zip' -print -quit)"
+            MACOS_ZIP="$(find ../dist -type f -name 'oly-macos-arm64.zip' -print -quit)"
+            WINDOWS_ZIP="$(find ../dist -type f -name 'oly-windows-amd64.zip' -print -quit)"
+
+            test -n "$LINUX_ZIP"
+            test -n "$MACOS_ZIP"
+            test -n "$WINDOWS_ZIP"
+
+            unzip -j "$LINUX_ZIP" oly -d "$TMP_DIR"
+            mv "$TMP_DIR/oly" bin/oly-linux-x64
+            unzip -j "$MACOS_ZIP" oly -d "$TMP_DIR"
+            mv "$TMP_DIR/oly" bin/oly-darwin-arm64
+            unzip -j "$WINDOWS_ZIP" oly.exe -d "$TMP_DIR"
+            mv "$TMP_DIR/oly.exe" bin/oly-win32-x64.exe
+            chmod +x bin/oly-linux-x64 bin/oly-darwin-arm64
+
+            test -f bin/oly.js
+            test -f bin/oly-linux-x64
+            test -f bin/oly-darwin-arm64
+            test -f bin/oly-win32-x64.exe
+
+            cp ../README.md README.md
+
+            npm publish --access public --tag "$DIST_TAG"
+
+        env:
+          DIST_TAG: ${{ steps.meta.outputs.dist_tag }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
-        working-directory: npm
 
   # publish-winget:
   #   name: publish-winget
   #   needs: build-release
   #   runs-on: windows-latest
-  #   if: startsWith(github.ref, 'refs/tags/')
   #   steps:
   #     - name: Submit to Windows Package Manager
   #       uses: vedantmgoyal9/winget-releaser@v2

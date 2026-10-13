@@ -7,11 +7,50 @@ use tracing::debug;
 
 use crate::session::SessionEvent;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+// 12: attach streams carry PTY output as binary length-delimited frames
+// after the JSON init line (ADR-0004); pre-12 peers expect base64
+// JSON chunks and are rejected.
+// 13: `AttachInput.data` is raw bytes (base64 in JSON) instead of a JSON
+// string — PTY input is byte-exact end to end, so invalid UTF-8 (binary
+// paste, `hex:` specs, piped files) can no longer be mangled by a
+// lossy UTF-8 round-trip. Mode frames also carry mouse/focus flags.
+// 14: federation uses the sole nonce-bound node identity handshake; API-key
+// RPCs and legacy federation fields are removed.
+pub const PROTOCOL_VERSION: u16 = 14;
+pub const FEDERATION_VERSION: u16 = 2;
+pub const NODE_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const MAX_NODE_HANDSHAKE_BYTES: usize = crate::federation_crypto::MAX_HANDSHAKE_BYTES;
 pub const NODE_WS_BINARY_COMPRESS_MIN_BYTES: usize = 256;
 const NODE_WS_BINARY_MAGIC: &[u8; 4] = b"ONW1";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+/// A position in a session's canonical output stream, as handed to
+/// `--since`. The incarnation is part of the position: a restarted session
+/// reuses offset numbering for a different stream, so reads carrying a
+/// stale incarnation are rejected instead of silently misaligned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamPosition {
+    pub incarnation: u64,
+    pub offset: u64,
+}
+
+/// One captured screen snapshot from the screen-snapshot history
+/// (`oly logs --tail-frames`): the visible screen the TUI held at the
+/// capture point, rendered at the recorded viewport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFrame {
+    /// The stream position the snapshot was captured at: every byte at
+    /// or before `position.offset` is guaranteed to have contributed to
+    /// this frame, so hand the token back to `--since` to read the next
+    /// batch of history without skipping paint states.
+    pub position: StreamPosition,
+    pub rows: u16,
+    pub cols: u16,
+    /// Rendered rows (SGR-styled with `keep_color`), newline-joined.
+    #[serde(with = "base64_bytes")]
+    pub content: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LogResize {
     pub offset: u64,
     pub rows: u16,
@@ -109,7 +148,7 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
     let compressed = payload.starts_with(NODE_WS_BINARY_MAGIC);
     let json = if compressed {
         let decoder = GzDecoder::new(&payload[NODE_WS_BINARY_MAGIC.len()..]);
-        let mut limited = decoder.take(MAX_NODE_WS_DECOMPRESSED_BYTES);
+        let mut limited = decoder.take(MAX_NODE_WS_DECOMPRESSED_BYTES + 1);
         let mut json = Vec::new();
         limited.read_to_end(&mut json)?;
         json
@@ -117,6 +156,11 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
         payload.to_vec()
     };
 
+    if json.len() as u64 > MAX_NODE_WS_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::other(
+            "node payload exceeds decompressed limit",
+        ));
+    }
     let message = serde_json::from_slice(&json).map_err(std::io::Error::other)?;
     debug!(
         message_type = node_ws_message_type(&message),
@@ -129,14 +173,31 @@ pub fn decode_node_ws_payload(payload: &[u8]) -> std::io::Result<NodeWsMessage> 
     Ok(message)
 }
 
+impl crate::federation_crypto::Channel {
+    pub fn encode_message(&mut self, message: &NodeWsMessage) -> crate::error::Result<Vec<u8>> {
+        self.encode(&encode_node_ws_payload(message)?)
+    }
+
+    pub fn decode_message(&mut self, frame: &[u8]) -> crate::error::Result<NodeWsMessage> {
+        self.decode(frame, |bytes| {
+            decode_node_ws_payload(bytes).map_err(crate::error::AppError::from)
+        })
+    }
+}
+
 fn node_ws_message_type(message: &NodeWsMessage) -> &'static str {
     match message {
         NodeWsMessage::Join { .. } => "join",
-        NodeWsMessage::Joined { .. } => "joined",
+        NodeWsMessage::Joined => "joined",
+        NodeWsMessage::Hello { .. } => "hello",
+        NodeWsMessage::Challenge { .. } => "challenge",
+        NodeWsMessage::KeyConfirm { .. } => "key_confirm",
+        NodeWsMessage::Ready { .. } => "ready",
         NodeWsMessage::Error { .. } => "error",
         NodeWsMessage::Rpc { .. } => "rpc",
         NodeWsMessage::RpcResponse { .. } => "rpc_response",
         NodeWsMessage::RpcStreamFrame { .. } => "rpc_stream_frame",
+        NodeWsMessage::RpcStreamMessage { .. } => "rpc_stream_message",
         NodeWsMessage::Notification { .. } => "notification",
         NodeWsMessage::SessionEvent { .. } => "session_event",
         NodeWsMessage::Ping => "ping",
@@ -166,6 +227,9 @@ pub enum RpcRequest {
         #[serde(default)]
         disable_notifications: bool,
     },
+    SessionInfo {
+        id: String,
+    },
     SessionMetadataSet {
         id: String,
         title: Option<String>,
@@ -187,6 +251,26 @@ pub enum RpcRequest {
     AttachSubscribe {
         id: String,
         from_byte_offset: Option<u64>,
+        /// Whether this stream reports applied-cursor credits and is
+        /// therefore gated on them (credit-gated). Local interactive
+        /// clients set
+        /// `true` and ack; node-relayed subscriptions must set `false`
+        /// because the relay cannot forward mid-stream credits (fail-open
+        /// until direct remote streams land). Defaults to `false`
+        /// (safe: no enforcement) when absent.
+        #[serde(default)]
+        credited: bool,
+        /// Incarnation the `from_byte_offset` cursor was issued by. Resume is
+        /// only valid within the same incarnation; a mismatch is rejected with
+        /// a precise stale-cursor error. Required when `from_byte_offset` is
+        /// set.
+        #[serde(default)]
+        incarnation: Option<u64>,
+        /// Requested attach mode: "observe" (view-only) or absent /
+        /// "controller" (default: drives input and geometry).
+        /// Unknown values are rejected.
+        #[serde(default)]
+        role: Option<String>,
         #[serde(default)]
         rows: Option<u16>,
         #[serde(default)]
@@ -194,8 +278,34 @@ pub enum RpcRequest {
     },
     AttachInput {
         id: String,
-        data: String,
+        /// Raw PTY input bytes (base64 on the JSON wire): input is
+        /// byte-exact end to end — no UTF-8 validation or lossy
+        /// conversion anywhere on the path.
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
         wait_for_change: bool,
+        /// Fencing token of the sending attachment (streaming attach input);
+        /// `None` is the ungated operator one-shot path (`oly send`).
+        #[serde(default)]
+        attachment_id: Option<u64>,
+    },
+    /// Ungated operator mouse input. The owning daemon parses `spec` (the
+    /// part after `mouse:`) and resolves live modes and viewport geometry.
+    AttachMouse {
+        id: String,
+        spec: String,
+    },
+    /// Machine-readable session cursor (agent surface): incarnation,
+    /// current filtered-stream offset, and liveness in one cheap call.
+    SessionCursor {
+        id: String,
+    },
+    /// Bounded window read of the filtered stream: never unbounded,
+    /// resumable via the returned `next_offset`.
+    ObserveWindow {
+        id: String,
+        from: u64,
+        max_bytes: u32,
     },
     AttachBusy {
         id: String,
@@ -215,6 +325,13 @@ pub enum RpcRequest {
     },
     AttachDetach {
         id: String,
+    },
+    /// Report the applied-cursor credit for this attach connection:
+    /// the highest stream offset the client has rendered. Handled on the
+    /// streaming path only.
+    AttachAppliedCursor {
+        id: String,
+        cursor: u64,
     },
     Stop {
         id: String,
@@ -249,11 +366,19 @@ pub enum RpcRequest {
         offset: Option<usize>,
         limit: usize,
     },
-    /// Block until the session emits an `InputNeeded` notification (or exits /
-    /// times out), then return a snapshot.  Response is `LogsTail`.
-    LogsWait {
+    /// One-shot rendered view with an observation cursor, not byte delivery.
+    LogsRead {
         id: String,
-        timeout_ms: u64,
+        /// `tail` | `screen` | `frames`.
+        mode: String,
+        /// Rows for `tail`, snapshots for `frames`; ignored by the other
+        /// modes. 0 prints nothing (wait-only reads).
+        count: usize,
+        /// Must be None for views. Byte continuation uses ObserveWindow.
+        #[serde(default)]
+        from: Option<StreamPosition>,
+        keep_color: bool,
+        term_cols: u16,
     },
     // ── Node federation ──────────────────────────────────────────────────────
     /// Proxy an inner request to a named secondary node.
@@ -261,22 +386,15 @@ pub enum RpcRequest {
         node: String,
         inner: Box<RpcRequest>,
     },
-    /// Register a new named API key on the primary; the daemon generates and
-    /// returns the one-time plaintext key.
-    ApiKeyAdd {
-        name: String,
-    },
-    /// List all registered API keys.
-    ApiKeyList,
-    /// Remove a named API key.
-    ApiKeyRemove {
-        name: String,
-    },
-    /// Signal the daemon to start a persistent outbound join connector.
+    /// Signal the daemon to start a persistent outbound join connector
+    /// using the daemon's auto-generated identity key. The connector pins
+    /// the primary's id pubkey to exactly the operator-supplied
+    /// canonical `ed25519 <base64(raw32)>` line — no TOFU file, no
+    /// interactive prompts, no shared secret.
     JoinStart {
         url: String,
         name: String,
-        key: String,
+        primary_id_pub_key: String,
     },
     /// Signal the daemon to stop and remove an outbound join connector.
     JoinStop {
@@ -288,6 +406,15 @@ pub enum RpcRequest {
     },
     /// List all secondary nodes currently connected to this (primary) daemon.
     NodeList,
+    /// Register a secondary node's id pubkey on the primary. The
+    /// `id_pub_key` field is the canonical `ed25519
+    /// <base64(raw32)>` line printed by `oly daemon status` on the
+    /// secondary (matched against the secondary's
+    /// `<state>/identity_key.pub` on disk).
+    NodeAccept {
+        name: String,
+        id_pub_key: String,
+    },
 }
 
 impl RpcRequest {
@@ -297,37 +424,65 @@ impl RpcRequest {
             RpcRequest::DaemonStop { .. } => "daemon_stop",
             RpcRequest::List { .. } => "list",
             RpcRequest::Start { .. } => "start",
+            RpcRequest::SessionInfo { .. } => "session_info",
             RpcRequest::SessionMetadataSet { .. } => "session_metadata_set",
             RpcRequest::NotifySet { .. } => "notify_set",
             RpcRequest::NotifySend { .. } => "notify_send",
             RpcRequest::AttachSubscribe { .. } => "attach_subscribe",
             RpcRequest::AttachInput { .. } => "attach_input",
+            RpcRequest::AttachMouse { .. } => "attach_mouse",
+            RpcRequest::SessionCursor { .. } => "session_cursor",
+            RpcRequest::ObserveWindow { .. } => "observe_window",
             RpcRequest::AttachBusy { .. } => "attach_busy",
             RpcRequest::UploadFile { .. } => "upload_file",
             RpcRequest::AttachResize { .. } => "attach_resize",
             RpcRequest::AttachDetach { .. } => "attach_detach",
+            RpcRequest::AttachAppliedCursor { .. } => "attach_applied_cursor",
             RpcRequest::Stop { .. } => "stop",
             RpcRequest::Restart { .. } => "restart",
             RpcRequest::Kill { .. } => "kill",
             RpcRequest::Remove { .. } => "remove",
             RpcRequest::LogsTail { .. } => "logs_tail",
             RpcRequest::LogsPagination { .. } => "logs_pagination",
-            RpcRequest::LogsWait { .. } => "logs_wait",
+            RpcRequest::LogsRead { .. } => "logs_read",
             RpcRequest::NodeProxy { .. } => "node_proxy",
-            RpcRequest::ApiKeyAdd { .. } => "api_key_add",
-            RpcRequest::ApiKeyList => "api_key_list",
-            RpcRequest::ApiKeyRemove { .. } => "api_key_remove",
             RpcRequest::JoinStart { .. } => "join_start",
             RpcRequest::JoinStop { .. } => "join_stop",
             RpcRequest::JoinList { .. } => "join_list",
             RpcRequest::NodeList => "node_list",
+            RpcRequest::NodeAccept { .. } => "node_accept",
         }
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+// `Attach` carries a full session snapshot for streaming tail-renders;
+// boxing it would move a hot-path buffer behind an extra pointer per RPC
+// response for no runtime win at this enum size.
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RpcResponse {
+    /// Machine-readable session cursor answer.
+    SessionCursor {
+        running: bool,
+        exit_code: Option<i32>,
+        /// Canonical filtered-stream length (bytes available to read).
+        offset: u64,
+        incarnation: Option<u64>,
+        /// The session is running and its last output looked like a prompt
+        /// awaiting input (`--wait prompt`).
+        #[serde(default)]
+        input_needed: bool,
+    },
+    /// One bounded filtered-stream window.
+    ObserveWindow {
+        #[serde(with = "base64_bytes")]
+        data: Vec<u8>,
+        next_offset: u64,
+        running: bool,
+        exit_code: Option<i32>,
+        incarnation: Option<u64>,
+    },
     Empty,
     Health {
         daemon_pid: u32,
@@ -345,6 +500,9 @@ pub enum RpcResponse {
     Session {
         summary: SessionSummary,
     },
+    SessionInfo {
+        info: SessionInfo,
+    },
     /// Sent once after AttachSubscribe: a terminal-state snapshot describing the
     /// current visible screen, followed by terminal mode flags.
     AttachStreamInit {
@@ -358,6 +516,15 @@ pub enum RpcResponse {
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
+        /// Child has mouse reporting enabled (any of 1000/1002/1003).
+        #[serde(default)]
+        mouse_report: bool,
+        /// Child negotiated SGR (1006) mouse encoding.
+        #[serde(default)]
+        sgr_mouse: bool,
+        /// Child has focus in/out reporting (1004) enabled.
+        #[serde(default)]
+        focus_events: bool,
         /// Rendered scrolled-off rows (color, `\n`-terminated), at most the
         /// client's screen height, which a CLI client prints before the
         /// snapshot so the terminal scrollbar covers pre-attach history.
@@ -366,6 +533,18 @@ pub enum RpcResponse {
         /// piped attaches, and older daemons.
         #[serde(default, with = "base64_bytes")]
         scrollback: Vec<u8>,
+        /// Journal incarnation the snapshot and `end_offset` cursor belong
+        /// to; 0 when the session predates journaling. A later resume must
+        /// present the same incarnation (ADR-0004).
+        #[serde(default)]
+        incarnation: u64,
+        /// This attachment's fencing token.
+        #[serde(default)]
+        attachment_id: u64,
+        /// This attachment's role, fixed at register time:
+        /// "controller" (default) or "observer" (view-only attach).
+        #[serde(default)]
+        role: String,
     },
     /// Stream chunk of new canonical filtered PTY output, ready to write to the terminal.
     AttachStreamChunk {
@@ -374,11 +553,24 @@ pub enum RpcResponse {
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
     },
-    /// Terminal mode changed (bracketed-paste / app-cursor-keys) mid-stream.
+    /// Terminal mode changed (bracketed-paste / app-cursor-keys /
+    /// mouse reporting / focus events) mid-stream.
     AttachModeChanged {
         bracketed_paste_mode: bool,
         #[serde(default)]
         app_cursor_keys: bool,
+        /// The child application enabled mouse reporting (any of
+        /// 1000/1002/1003). Attach clients should capture and forward
+        /// mouse events while set.
+        #[serde(default)]
+        mouse_report: bool,
+        /// The child negotiated SGR (1006) mouse encoding; otherwise
+        /// legacy X11 encoding applies.
+        #[serde(default)]
+        sgr_mouse: bool,
+        /// The child application enabled focus in/out reporting (1004).
+        #[serde(default)]
+        focus_events: bool,
     },
     /// Another attached client resized the PTY; receivers should adapt.
     AttachResized {
@@ -388,6 +580,12 @@ pub enum RpcResponse {
     /// Session ended; attach stream is done.
     AttachStreamDone {
         exit_code: Option<i32>,
+        /// Inclusive end-of-stream cursor: a client able to apply a
+        /// partial frame at offset `final_offset` has applied everything
+        /// the daemon signalled — by induction on contiguous
+        /// application, no later chunk exists to wait for.
+        #[serde(default)]
+        final_offset: u64,
     },
     Stop {
         stopped: bool,
@@ -416,6 +614,27 @@ pub enum RpcResponse {
         #[serde(default)]
         resizes: Vec<LogResize>,
     },
+    /// Answer to [`RpcRequest::LogsRead`]: the rendered surface plus the
+    /// cursor it was taken at, so a caller can chain `--since` reads.
+    LogsRead {
+        /// The explicit mode served.
+        mode: String,
+        /// Rendered text for `tail` / `screen` modes (empty for `frames`).
+        #[serde(default, with = "base64_bytes")]
+        output: Vec<u8>,
+        /// Screen snapshots for `frames` mode, oldest first.
+        #[serde(default)]
+        frames: Vec<LogFrame>,
+        /// Terminal width the read was rendered at.
+        width: u16,
+        /// Stream position at read time: the cursor a follow-up `--since`
+        /// starts from (`None` while nothing has been journaled yet).
+        cursor: Option<StreamPosition>,
+        running: bool,
+        exit_code: Option<i32>,
+        #[serde(default)]
+        status: Option<String>,
+    },
     UploadFile {
         path: String,
         bytes: usize,
@@ -425,18 +644,18 @@ pub enum RpcResponse {
         message: String,
     },
     // ── Node federation ──────────────────────────────────────────────────────
-    /// Response to `ApiKeyAdd`: the one-time plaintext key.
-    ApiKeyAdd {
-        plaintext_key: String,
-    },
-    ApiKeyList {
-        keys: Vec<ApiKeySummary>,
-    },
-    ApiKeyRemove {
-        removed: bool,
-    },
     JoinList {
         joins: Vec<JoinSummary>,
+    },
+    /// Outcome of the first attempt of a `JoinStart` request. The
+    /// connector keeps retrying in the background regardless — these
+    /// states are informational and the user is expected to check
+    /// `oly join ls` for the live view.
+    JoinStartStatus {
+        /// `"connected" | "joining" | "failed"`.
+        state: String,
+        /// Human-readable detail for `joining`/`failed`; empty for `connected`.
+        message: String,
     },
     NodeList {
         nodes: Vec<String>,
@@ -454,14 +673,6 @@ pub struct NodeSummary {
     pub connected: bool,
 }
 
-/// A registered API key as reported by `oly api-key list`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApiKeySummary {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<DateTime<Utc>>,
-}
-
 /// A persisted join config as reported to `oly join list`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinSummary {
@@ -472,14 +683,33 @@ pub struct JoinSummary {
 
 /// Messages exchanged over the `/api/nodes/join` WebSocket connection.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum NodeWsMessage {
-    /// Secondary → Primary: authentication handshake.
-    Join {
+    /// Plaintext introduction. Join cannot supply another identity or name.
+    Hello {
+        version: u16,
         name: String,
-        key: String,
+        public_key: String,
+        nonce: [u8; 32],
     },
-    /// Primary → Secondary: handshake accepted.
+    /// Plaintext freshness challenge; never supplies a replacement primary pin.
+    Challenge {
+        nonce: [u8; 32],
+    },
+    /// Secondary signature over the full, length-delimited transcript.
+    Join {
+        signature: String,
+    },
+    /// Sealed primary key possession proof, bound to this transcript.
+    KeyConfirm {
+        transcript_hash: [u8; 32],
+    },
+    /// Sealed secondary key possession proof, before registry insertion.
+    Ready {
+        transcript_hash: [u8; 32],
+    },
+    /// Sealed final acknowledgement. Only this permits connector success.
     Joined,
     /// Primary → Secondary: handshake rejected or fatal error.
     Error {
@@ -502,6 +732,15 @@ pub enum NodeWsMessage {
         response: serde_json::Value,
         #[serde(default)]
         done: bool,
+    },
+    /// Primary → Secondary: one mid-stream client message for an open
+    /// streaming RPC. Carries attach input, resize, applied-cursor
+    /// credits, and detach to the owning node's stream task so remote
+    /// attachments get the same fencing and credit-gate enforcement as
+    /// local ones.
+    RpcStreamMessage {
+        id: String,
+        request: serde_json::Value,
     },
     /// Secondary -> Primary: notification event produced by the secondary daemon.
     Notification {
@@ -532,6 +771,28 @@ mod tests {
     use super::{
         NodeWsMessage, RpcRequest, RpcResponse, decode_node_ws_payload, encode_node_ws_payload,
     };
+
+    #[test]
+    fn session_info_protocol_round_trips_and_names_request() {
+        let request = RpcRequest::SessionInfo { id: "s1".into() };
+        assert_eq!(request.name(), "session_info");
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RpcRequest::SessionInfo { id } if id == "s1"));
+    }
+
+    #[test]
+    fn mouse_protocol_round_trips_a_compact_spec() {
+        let request = RpcRequest::AttachMouse {
+            id: "s".into(),
+            spec: "left+2@7,8".into(),
+        };
+        assert_eq!(request.name(), "attach_mouse");
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: RpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, RpcRequest::AttachMouse { id, spec }
+            if id == "s" && spec == "left+2@7,8"));
+    }
 
     #[test]
     fn restart_protocol_round_trips_and_names_request() {
@@ -585,19 +846,58 @@ mod tests {
     #[test]
     fn node_ws_payload_round_trips_uncompressed_binary_json() {
         let message = NodeWsMessage::Join {
-            name: "worker-a".into(),
-            key: "secret".into(),
+            signature: "sig".into(),
         };
 
         let payload = encode_node_ws_payload(&message).expect("encode payload");
         let decoded = decode_node_ws_payload(&payload).expect("decode payload");
 
-        match decoded {
-            NodeWsMessage::Join { name, key } => {
-                assert_eq!(name, "worker-a");
-                assert_eq!(key, "secret");
+        assert!(matches!(decoded, NodeWsMessage::Join { signature } if signature == "sig"));
+    }
+
+    #[test]
+    fn node_ws_identity_handshake_round_trip() {
+        let hello = NodeWsMessage::Hello {
+            version: super::FEDERATION_VERSION,
+            name: "worker-b".into(),
+            nonce: [1; 32],
+            public_key: "ed25519 AAAA".into(),
+        };
+        let payload = encode_node_ws_payload(&hello).expect("encode payload");
+        match decode_node_ws_payload(&payload).expect("decode payload") {
+            NodeWsMessage::Hello {
+                version,
+                name,
+                nonce,
+                public_key,
+            } => {
+                assert_eq!(version, super::FEDERATION_VERSION);
+                assert_eq!(name, "worker-b");
+                assert_eq!(nonce, [1; 32]);
+                assert_eq!(public_key, "ed25519 AAAA");
             }
             other => panic!("unexpected decoded message: {other:?}"),
+        }
+
+        let join = NodeWsMessage::Join {
+            signature: "sig".into(),
+        };
+        let payload = encode_node_ws_payload(&join).expect("encode payload");
+        match decode_node_ws_payload(&payload).expect("decode payload") {
+            NodeWsMessage::Join { signature } => assert_eq!(signature, "sig"),
+            other => panic!("unexpected decoded message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn obsolete_auth_union_and_unbound_identity_fields_are_rejected() {
+        for json in [
+            r#"{"type":"join","name":"worker","auth":{"method":"ssh_key","signature":"sig","public_key":"key"}}"#,
+            r#"{"type":"join","signature":"sig","public_key":"another identity"}"#,
+            r#"{"type":"join","signature":"sig","name":"another name"}"#,
+            r#"{"type":"hello","public_key":"key"}"#,
+        ] {
+            assert!(serde_json::from_str::<NodeWsMessage>(json).is_err());
         }
     }
 
@@ -629,6 +929,17 @@ mod tests {
     }
 }
 
+/// Full session inspection, including fields absent from list summaries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    #[serde(flatten)]
+    pub summary: SessionSummary,
+    pub exit_code: Option<i32>,
+    /// Path on the owning daemon, not necessarily on the CLI's machine.
+    pub session_dir: String,
+    pub journal_incarnation: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -642,6 +953,9 @@ pub struct SessionSummary {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    /// Suggested command extracted from the completed session's journal tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -665,10 +979,32 @@ pub struct SessionSummary {
     /// spec).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_color: Option<String>,
+    /// Bytes currently retained on disk for this session's journal
+    /// (sealed parts only). `None` until the first checkpoint-gated
+    /// sweep has run, so the UI can distinguish "cap is happily off"
+    /// from "cap is firing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_bytes_retained: Option<u64>,
+    /// Cumulative count of journal retention sweeps run for this session.
+    /// Increments on every checkpoint (≈ 32 MiB of filtered output). 0
+    /// means no sweeps have occurred yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_retention_sweeps: Option<u64>,
+    /// Cumulative count of sealed incarnations dropped from this
+    /// session's journal across all retention sweeps. May exceed
+    /// `journal_retention_sweeps` when a single sweep drops several
+    /// incarnations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_incarnations_dropped: Option<u64>,
+    /// Legacy preview field retained for wire deserialization compatibility.
+    /// Live journal byte caps are unsupported; production emits None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_byte_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ListSortField {
     Id,
     Title,
@@ -676,13 +1012,8 @@ pub enum ListSortField {
     Cwd,
     Status,
     Pid,
+    #[default]
     CreatedAt,
-}
-
-impl Default for ListSortField {
-    fn default() -> Self {
-        Self::CreatedAt
-    }
 }
 
 impl ListSortField {
@@ -701,15 +1032,11 @@ impl ListSortField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SortOrder {
     Asc,
+    #[default]
     Desc,
-}
-
-impl Default for SortOrder {
-    fn default() -> Self {
-        Self::Desc
-    }
 }
 
 impl SortOrder {
@@ -747,7 +1074,6 @@ pub struct PushSubscriptionInput {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PushSubscriptionRecord {
     pub endpoint: String,
     pub p256dh: String,

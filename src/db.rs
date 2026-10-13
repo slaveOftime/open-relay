@@ -6,7 +6,7 @@ use sqlx::{Row, SqlitePool, sqlite::SqliteConnectOptions};
 use crate::{
     error::Result,
     protocol::{ListQuery, PushSubscriptionInput, PushSubscriptionRecord, SessionSummary},
-    session::{SessionMeta, SessionStatus, persist::current_output_offset_by_id},
+    session::{SessionMeta, SessionStatus},
 };
 
 // ---------------------------------------------------------------------------
@@ -19,8 +19,42 @@ pub struct Database {
     sessions_dir: PathBuf,
 }
 
+/// Fields a `field:value` search term can scope to (see
+/// [`Database::push_search_filter`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchField {
+    Id,
+    Title,
+    Tags,
+    Command,
+    Args,
+    Cwd,
+}
+
+impl SearchField {
+    /// Resolve a `field:` prefix (case-insensitive). Returns `None` for
+    /// unknown prefixes or bare terms so Windows paths such as `C:\src`
+    /// stay broad rather than being read as a scope.
+    fn from_prefix(prefix: &str) -> Option<Self> {
+        match prefix.trim().to_ascii_lowercase().as_str() {
+            "id" => Some(Self::Id),
+            "title" => Some(Self::Title),
+            "tag" | "tags" => Some(Self::Tags),
+            "cmd" | "command" => Some(Self::Command),
+            "arg" | "args" => Some(Self::Args),
+            "cwd" => Some(Self::Cwd),
+            _ => None,
+        }
+    }
+}
+
+/// SQL `LIKE` needle for a case-insensitive substring match.
+fn like_needle(value: &str) -> String {
+    format!("%{}%", value.trim().to_ascii_lowercase())
+}
+
 impl Database {
-    fn push_list_filters(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, query: &ListQuery) {
+    fn push_list_filters(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, query: &ListQuery) {
         for tag in &query.tags {
             qb.push(" AND EXISTS (SELECT 1 FROM json_each(tags) WHERE LOWER(value) = ");
             qb.push_bind(tag.to_ascii_lowercase());
@@ -47,18 +81,91 @@ impl Database {
         }
 
         if let Some(search) = query.search.as_deref() {
-            let needle = format!("%{}%", search.to_ascii_lowercase());
-            qb.push(" AND (LOWER(id) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(COALESCE(title,'')) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(COALESCE(tags,'')) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(command) LIKE ");
-            qb.push_bind(needle.clone());
-            qb.push(" OR LOWER(args) LIKE ");
-            qb.push_bind(needle);
-            qb.push(")");
+            Self::push_search_filter(qb, search);
+        }
+    }
+
+    /// Apply the `search` box as whitespace-separated, ANDed terms.
+    ///
+    /// A term of the form `field:value` scopes the match to one column
+    /// (`cmd:python`, `cwd:api`); any other term matches the broad field set
+    /// — id, title, tags, command, args and cwd — so a plain query finds a
+    /// session by its command or its working directory. Prefixes are
+    /// case-insensitive; an unknown prefix (or a Windows path such as
+    /// `C:\src`) is treated as a bare term. A scoped term with an empty value
+    /// (`cmd:`) is ignored so typing a prefix mid-edit never blanks the list.
+    fn push_search_filter(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, search: &str) {
+        for term in search.split_whitespace() {
+            if let Some((prefix, value)) = term.split_once(':') {
+                let value = value.trim();
+                if value.is_empty() {
+                    continue;
+                }
+                if let Some(field) = SearchField::from_prefix(prefix) {
+                    Self::push_scoped_search(qb, field, value);
+                    continue;
+                }
+            }
+            Self::push_broad_search(qb, term);
+        }
+    }
+
+    /// The union of columns a bare search term matches. Mirrors the fields
+    /// the CLI list view indexes client-side (`session_search_text`), so the
+    /// server-filtered and client-filtered results stay in step.
+    fn push_broad_search(qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>, term: &str) {
+        let needle = like_needle(term);
+        qb.push(" AND (LOWER(id) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(COALESCE(title,'')) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(COALESCE(tags,'')) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(command) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(args) LIKE ");
+        qb.push_bind(needle.clone());
+        qb.push(" OR LOWER(COALESCE(cwd,'')) LIKE ");
+        qb.push_bind(needle);
+        qb.push(")");
+    }
+
+    fn push_scoped_search(
+        qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+        field: SearchField,
+        value: &str,
+    ) {
+        let needle = like_needle(value);
+        match field {
+            SearchField::Id => {
+                qb.push(" AND LOWER(id) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Title => {
+                qb.push(" AND LOWER(COALESCE(title,'')) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Tags => {
+                qb.push(" AND LOWER(COALESCE(tags,'')) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Cwd => {
+                qb.push(" AND LOWER(COALESCE(cwd,'')) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Args => {
+                qb.push(" AND LOWER(args) LIKE ");
+                qb.push_bind(needle);
+            }
+            SearchField::Command => {
+                // `cmd:` covers the program and its arguments, matching the
+                // command cell the web table renders.
+                qb.push(" AND (LOWER(command) LIKE ");
+                qb.push_bind(needle.clone());
+                qb.push(" OR LOWER(args) LIKE ");
+                qb.push_bind(needle);
+                qb.push(")");
+            }
         }
     }
 
@@ -103,8 +210,8 @@ impl Database {
 
         sqlx::query(
             "INSERT INTO sessions \
-             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at, notifications_enabled, foreground_color, background_color) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             (id, title, tags, command, args, cwd, status, pid, exit_code, created_at, started_at, ended_at, notifications_enabled, foreground_color, background_color, resume_command) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )
         .bind(&meta.id)
         .bind(&meta.title)
@@ -121,13 +228,15 @@ impl Database {
         .bind(meta.notifications_enabled)
         .bind(&meta.foreground_color)
         .bind(&meta.background_color)
+        .bind(&meta.resume_command)
         .execute(&self.pool)
         .await?;
 
         Ok(())
     }
 
-    /// Update mutable fields of an existing session row.
+    /// Update mutable fields of an existing session row. The derived resume
+    /// hint is updated separately to avoid overwriting concurrent scans.
     pub async fn update_session(&self, meta: &SessionMeta) -> Result<()> {
         let args = serde_json::to_string(&meta.args)?;
         let tags = serde_json::to_string(&meta.tags)?;
@@ -162,6 +271,16 @@ impl Database {
         Ok(())
     }
 
+    /// Store a derived resume hint without overwriting concurrent title/tag/status edits.
+    pub async fn set_resume_command(&self, id: &str, command: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET resume_command=?1 WHERE id=?2")
+            .bind(command)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn delete_session(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM sessions WHERE id=?1")
             .bind(id)
@@ -172,7 +291,23 @@ impl Database {
     }
 
     pub fn session_output_offset(&self, id: &str) -> u64 {
-        current_output_offset_by_id(&self.sessions_dir, id)
+        let session_dir = self.sessions_dir.join(id);
+        // Only journal-backed sessions have a stream; pre-0.5 sessions
+        // report 0 (see MIGRATION.md).
+        if session_dir
+            .join(crate::session::journal::JOURNAL_DIR_NAME)
+            .is_dir()
+        {
+            return crate::session::replay::filtered_stream_len(&session_dir).unwrap_or(0);
+        }
+        0
+    }
+
+    /// `<sessions_dir>/<id>` without an existence check — the sync
+    /// companion of [`get_session_dir`](Self::get_session_dir) for
+    /// lock-free readers (e.g. `journal_incarnation`).
+    pub fn session_dir_by_id(&self, id: &str) -> PathBuf {
+        self.sessions_dir.join(id)
     }
 
     /// Returns `<sessions_dir>/<id>` if the session exists in the database, else `None`.
@@ -189,7 +324,7 @@ impl Database {
         let row = sqlx::query(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions WHERE id=?1",
         )
         .bind(id)
@@ -212,13 +347,32 @@ impl Database {
 
     /// List all sessions as `SessionSummary` DTOs, applying the `ListQuery` filter.
     pub async fn list_summaries(&self, query: &ListQuery) -> Result<Vec<SessionSummary>> {
+        self.list_summaries_inner(query, true).await
+    }
+
+    /// [`list_summaries`](Self::list_summaries) without the journal-derived
+    /// `total_bytes` (left at 0). Computing it decodes the session's whole
+    /// journal, so [`SessionStore::list_summaries`] fills it only for rows
+    /// that no live handle covers — never inline for every row.
+    pub async fn list_summaries_without_offsets(
+        &self,
+        query: &ListQuery,
+    ) -> Result<Vec<SessionSummary>> {
+        self.list_summaries_inner(query, false).await
+    }
+
+    async fn list_summaries_inner(
+        &self,
+        query: &ListQuery,
+        with_offsets: bool,
+    ) -> Result<Vec<SessionSummary>> {
         let limit = query.limit.max(1) as i64;
-        let offset = query.offset.max(0) as i64;
+        let offset = query.offset as i64;
 
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions WHERE 1=1",
         );
 
@@ -244,7 +398,11 @@ impl Database {
             .iter()
             .map(|r| {
                 let row = row_to_meta(r);
-                let total_bytes = self.session_output_offset(&row.id);
+                let total_bytes = if with_offsets {
+                    self.session_output_offset(&row.id)
+                } else {
+                    0
+                };
                 meta_to_summary(&row, false, total_bytes)
             })
             .collect();
@@ -264,7 +422,7 @@ impl Database {
         let mut qb = sqlx::QueryBuilder::new(
             "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
                     created_at, started_at, ended_at, notifications_enabled, \
-                    foreground_color, background_color \
+                    foreground_color, background_color, resume_command \
              FROM sessions
              WHERE status IN (",
         );
@@ -289,7 +447,52 @@ impl Database {
             .collect())
     }
 
-    #[allow(dead_code)]
+    /// List stopped sessions whose `ended_at` is strictly older than
+    /// `cutoff`. Used by the daemon's periodic sweeper to decide which
+    /// rows to delete alongside their journal directories.
+    ///
+    /// Live sessions (`status IN ('created', 'running', 'stopping')`)
+    /// are filtered out by SQL: the sweeper must never see them. That
+    /// invariant is preserved even if `cutoff` is in the past (e.g.
+    /// someone just changed the cap to a tiny value).
+    pub async fn list_stopped_sessions_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<(String, SessionMeta)>> {
+        let rows = sqlx::query(
+            "SELECT id, title, tags, command, args, cwd, status, pid, exit_code, \
+                    created_at, started_at, ended_at, notifications_enabled, \
+                    foreground_color, background_color, resume_command \
+             FROM sessions
+             WHERE ended_at IS NOT NULL \
+               AND ended_at < ?1 \
+               AND status IN ('stopped', 'killed', 'failed')",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let meta = row_to_meta(r);
+                (meta.id.clone(), meta)
+            })
+            .collect())
+    }
+
+    /// Delete a single session row by id. Returns the number of rows
+    /// removed (0 means the row was already gone — the sweeper treats
+    /// this as success because it implies a concurrent
+    /// removal has already cleaned up).
+    pub async fn delete_session_by_id(&self, id: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM sessions WHERE id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     pub async fn list_push_subscriptions(&self) -> Result<Vec<PushSubscriptionRecord>> {
         let rows = sqlx::query(
             "SELECT endpoint, p256dh, auth FROM push_subscriptions ORDER BY updated_at DESC",
@@ -355,6 +558,7 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
     let notifications_enabled: bool = r.get(12);
     let foreground_color: Option<String> = r.get(13);
     let background_color: Option<String> = r.get(14);
+    let resume_command: Option<String> = r.get(15);
 
     build_meta(
         id,
@@ -372,6 +576,7 @@ fn row_to_meta(r: &sqlx::sqlite::SqliteRow) -> SessionMeta {
         notifications_enabled,
         foreground_color,
         background_color,
+        resume_command,
     )
 }
 
@@ -392,6 +597,7 @@ fn build_meta(
     notifications_enabled: bool,
     foreground_color: Option<String>,
     background_color: Option<String>,
+    resume_command: Option<String>,
 ) -> SessionMeta {
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
     let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
@@ -409,6 +615,7 @@ fn build_meta(
         created_at,
         started_at,
         ended_at,
+        resume_command,
         status: parse_status(&status_str),
         pid: pid.map(|p| p as u32),
         exit_code: exit_code.map(|c| c as i32),
@@ -447,6 +654,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         created_at: meta.created_at,
         started_at: meta.started_at,
         ended_at: meta.ended_at,
+        resume_command: meta.resume_command.clone(),
         cwd: meta.cwd.clone(),
         input_needed,
         notifications_enabled: meta.notifications_enabled,
@@ -458,61 +666,363 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         attach_count: 0,
         foreground_color: meta.foreground_color.clone(),
         background_color: meta.background_color.clone(),
+        journal_bytes_retained: None,
+        journal_retention_sweeps: None,
+        journal_incarnations_dropped: None,
+        journal_byte_cap: None,
     }
 }
 
 // ---------------------------------------------------------------------------
-// API key helpers
+// Federation accept-table entries
 // ---------------------------------------------------------------------------
-
-/// A named API key record from the database.
-#[derive(Debug, Clone)]
-pub struct ApiKeyRecord {
-    pub name: String,
-    pub created_at: Option<DateTime<Utc>>,
-}
 
 impl Database {
-    /// Insert a new API key with the given Argon2id-hashed value.
-    /// Returns an error if a key with that name already exists.
-    pub async fn add_api_key(&self, name: &str, api_key_hash: &str) -> Result<()> {
-        sqlx::query("INSERT INTO api_keys (name, api_key_hash) VALUES (?1, ?2)")
+    /// Look up the exact identity authorized for a claimed node name.
+    pub async fn get_node_identity(&self, name: &str) -> Result<Option<(String, String)>> {
+        let rows = sqlx::query("SELECT name, public_key FROM node_identities WHERE name = ?1")
             .bind(name)
-            .bind(api_key_hash)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await?;
+        Ok(rows.map(|r| (r.get::<String, _>(0), r.get::<String, _>(1))))
+    }
+
+    /// Replace a name's key explicitly; never steal another name's key.
+    /// The UNIQUE constraint fails atomically rather than REPLACE deleting it.
+    pub async fn register_node_identity(&self, name: &str, public_key: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO node_identities (name, public_key) VALUES (?1, ?2) \
+             ON CONFLICT(name) DO UPDATE SET public_key = excluded.public_key",
+        )
+        .bind(name)
+        .bind(public_key)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
+}
 
-    /// Return all stored Argon2id hashes — used to validate an incoming key
-    /// against any registered key (keys are independent of node names).
-    pub async fn list_api_key_hashes(&self) -> Result<Vec<String>> {
-        let rows = sqlx::query("SELECT api_key_hash FROM api_keys")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}.{suffix}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ))
     }
 
-    /// Delete an API key by name. Returns `true` if a row was deleted.
-    pub async fn delete_api_key(&self, name: &str) -> Result<bool> {
-        let res = sqlx::query("DELETE FROM api_keys WHERE name = ?1")
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
+    async fn open_test_db() -> Arc<Database> {
+        let db_path = temp_path("oly-p26-test", "db");
+        let sessions_dir = temp_path("oly-p26-test-sessions", "dir");
+        let db = Database::open(&db_path, sessions_dir)
+            .await
+            .expect("open test db");
+        Arc::new(db)
     }
 
-    /// List all registered API keys (names + creation timestamps).
-    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>> {
-        let rows = sqlx::query("SELECT name, created_at FROM api_keys ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| ApiKeyRecord {
-                name: r.get::<String, _>(0),
-                created_at: r.get::<Option<String>, _>(1).as_deref().and_then(parse_dt),
+    #[tokio::test]
+    async fn identity_upsert_cannot_steal_another_registered_name() {
+        let db = open_test_db().await;
+        db.register_node_identity("a", "key-a").await.unwrap();
+        db.register_node_identity("b", "key-b").await.unwrap();
+        assert!(db.register_node_identity("b", "key-a").await.is_err());
+        assert_eq!(db.get_node_identity("a").await.unwrap().unwrap().1, "key-a");
+        assert_eq!(db.get_node_identity("b").await.unwrap().unwrap().1, "key-b");
+        db.register_node_identity("a", "replacement").await.unwrap();
+        assert_eq!(
+            db.get_node_identity("a").await.unwrap().unwrap().1,
+            "replacement"
+        );
+        assert!(
+            db.get_node_identity("unregistered")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_cleanup_preserves_previous_schema_data_and_checksums() {
+        use sqlx::migrate::{Migrate, Migrator};
+        let path = temp_path("oly-old-schema", "db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await.unwrap();
+        let all = sqlx::migrate!("./migrations");
+        let old =
+            Migrator::with_migrations(all.iter().filter(|m| m.version <= 9).cloned().collect());
+        old.run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions (id,command,status,created_at) VALUES ('keep','echo','stopped','2026-01-01T00:00:00Z')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO push_subscriptions (endpoint,p256dh,auth) VALUES ('test://keep','public','salt')").execute(&pool).await.unwrap();
+        // These are obsolete test records, never real credentials.
+        sqlx::query(
+            "INSERT INTO api_keys (name,api_key_hash) VALUES ('obsolete','isolated-fake-hash')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ssh_keys (name,key_data) VALUES ('obsolete','old-key')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        all.run(&pool).await.unwrap();
+        all.run(&pool).await.unwrap(); // also proves idempotent SQLx history validation
+        for query in [
+            "SELECT COUNT(*) FROM sessions",
+            "SELECT COUNT(*) FROM push_subscriptions",
+        ] {
+            let count: i64 = sqlx::query_scalar(query).fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 1);
+        }
+        let tables: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(tables.contains(&"node_identities".into()));
+        assert!(!tables.contains(&"api_keys".into()));
+        assert!(!tables.contains(&"ssh_keys".into()));
+        let mut connection = pool.acquire().await.unwrap();
+        let applied = connection
+            .list_applied_migrations("_sqlx_migrations")
+            .await
+            .unwrap();
+        for migration in old.iter() {
+            assert_eq!(
+                applied
+                    .iter()
+                    .find(|m| m.version == migration.version)
+                    .unwrap()
+                    .checksum,
+                migration.checksum
+            );
+        }
+        drop(connection);
+        pool.close().await;
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn meta(id: &str, status: SessionStatus, ended: Option<DateTime<Utc>>) -> SessionMeta {
+        let now = Utc::now();
+        SessionMeta {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "bash".to_string(),
+            args: vec![],
+            cwd: None,
+            status,
+            pid: None,
+            exit_code: None,
+            created_at: now,
+            started_at: Some(now),
+            ended_at: ended,
+            resume_command: None,
+            notifications_enabled: true,
+            foreground_color: None,
+            background_color: None,
+        }
+    }
+    async fn insert_search_fixture(db: &Database) {
+        let mut python = meta("sess-python", SessionStatus::Stopped, Some(Utc::now()));
+        python.command = "python".to_string();
+        python.args = vec!["-m".to_string(), "http.server".to_string()];
+        python.cwd = Some("C:/work/api-server".to_string());
+        python.title = Some("API dev".to_string());
+        python.tags = vec!["backend".to_string()];
+        db.insert_session(&python).await.expect("insert python");
+
+        let mut node = meta("sess-node", SessionStatus::Running, None);
+        node.command = "node".to_string();
+        node.args = vec!["server.js".to_string()];
+        node.cwd = Some("C:/work/web-ui".to_string());
+        node.title = Some("Web dev".to_string());
+        node.tags = vec!["frontend".to_string()];
+        db.insert_session(&node).await.expect("insert node");
+    }
+
+    async fn search_ids(db: &Database, search: &str) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .list_summaries(&ListQuery {
+                search: Some(search.to_string()),
+                tags: vec![],
+                statuses: vec![],
+                since: None,
+                until: None,
+                limit: 50,
+                offset: 0,
+                sort: crate::protocol::ListSortField::CreatedAt,
+                order: crate::protocol::SortOrder::Asc,
             })
-            .collect())
+            .await
+            .expect("list summaries")
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn search_matches_command_and_cwd() {
+        let db = open_test_db().await;
+        insert_search_fixture(&db).await;
+
+        // Command substring (the program, and separately its arguments).
+        assert_eq!(search_ids(&db, "python").await, vec!["sess-python"]);
+        assert_eq!(search_ids(&db, "server.js").await, vec!["sess-node"]);
+        // Working-directory substring, the field the search box previously
+        // could not reach.
+        assert_eq!(search_ids(&db, "web-ui").await, vec!["sess-node"]);
+        assert_eq!(search_ids(&db, "work/api").await, vec!["sess-python"]);
+        // A bare term still spans every indexed column.
+        assert_eq!(
+            search_ids(&db, "work").await,
+            vec!["sess-node", "sess-python"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_search_restricts_to_one_field() {
+        let db = open_test_db().await;
+        insert_search_fixture(&db).await;
+
+        // `dev` only appears in titles.
+        assert_eq!(
+            search_ids(&db, "title:dev").await,
+            vec!["sess-node", "sess-python"]
+        );
+        assert_eq!(search_ids(&db, "title:web").await, vec!["sess-node"]);
+        // `cmd:` covers command + args, not cwd.
+        assert_eq!(search_ids(&db, "cmd:python").await, vec!["sess-python"]);
+        assert_eq!(
+            search_ids(&db, "cmd:http.server").await,
+            vec!["sess-python"]
+        );
+        // `cwd:` scopes to the working directory only.
+        assert_eq!(search_ids(&db, "cwd:web").await, vec!["sess-node"]);
+        assert_eq!(search_ids(&db, "cwd:C:/work").await.len(), 2);
+        // Terms are ANDed.
+        assert_eq!(
+            search_ids(&db, "cwd:work cmd:node").await,
+            vec!["sess-node"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_search_falls_back_for_unknown_prefixes_and_empty_values() {
+        let db = open_test_db().await;
+        insert_search_fixture(&db).await;
+
+        // An unknown prefix is a plain substring, not a scope.
+        assert!(search_ids(&db, "nope:python").await.is_empty());
+        // An empty scoped value is ignored rather than matching nothing.
+        assert_eq!(
+            search_ids(&db, "cmd:").await,
+            vec!["sess-node", "sess-python"]
+        );
+        // Windows drive paths are not mistaken for a scope.
+        assert_eq!(search_ids(&db, "C:/work/web-ui").await, vec!["sess-node"]);
+    }
+
+    #[tokio::test]
+    async fn list_stopped_sessions_older_than_returns_only_aged_out_stopped_ones() {
+        let db = open_test_db().await;
+        let cutoff = Utc::now();
+
+        // 10 days ago: stopped → candidate.
+        let aged_stopped = meta(
+            "aged-stopped",
+            SessionStatus::Stopped,
+            Some(cutoff - chrono::Duration::days(10)),
+        );
+        // 1 hour in the **future**: clearly not aged out, even though the
+        // status is `stopped`. (A sweep with `retention_days = 0` should
+        // still find nothing here; this exercises the `ended_at >= cutoff`
+        // branch.)
+        let fresh_stopped = meta(
+            "fresh-stopped",
+            SessionStatus::Stopped,
+            Some(cutoff + chrono::Duration::hours(1)),
+        );
+        // 30 days ago: failed → candidate.
+        let aged_failed = meta(
+            "aged-failed",
+            SessionStatus::Failed,
+            Some(cutoff - chrono::Duration::days(30)),
+        );
+        // 10 days ago: running → never swept (live work).
+        let aged_running = meta(
+            "aged-running",
+            SessionStatus::Running,
+            Some(cutoff - chrono::Duration::days(10)),
+        );
+        // 10 days ago: stopping → never swept.
+        let aged_stopping = meta(
+            "aged-stopping",
+            SessionStatus::Stopping,
+            Some(cutoff - chrono::Duration::days(10)),
+        );
+        // `ended_at == cutoff`: strict `<`, so NOT a candidate. Verifies
+        // the boundary just barely.
+        let exactly_cutoff = meta("exactly-cutoff", SessionStatus::Stopped, Some(cutoff));
+
+        for m in [
+            &aged_stopped,
+            &fresh_stopped,
+            &aged_failed,
+            &aged_running,
+            &aged_stopping,
+            &exactly_cutoff,
+        ] {
+            db.insert_session(m).await.expect("insert");
+        }
+
+        let mut ids: Vec<String> = db
+            .list_stopped_sessions_older_than(cutoff)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort();
+
+        assert_eq!(
+            ids,
+            vec!["aged-failed".to_string(), "aged-stopped".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_by_id_removes_row_and_reports_zero_on_missing() {
+        let db = open_test_db().await;
+        let m = meta("d1", SessionStatus::Stopped, Some(Utc::now()));
+        db.insert_session(&m).await.expect("insert");
+        assert!(db.session_exists("d1").await);
+
+        let removed = db.delete_session_by_id("d1").await.expect("delete");
+        assert_eq!(removed, 1);
+        assert!(!db.session_exists("d1").await);
+
+        // Second call returns 0; the sweeper treats this as success-on-row
+        // (concurrent manual `oly rm` already cleaned it up).
+        let removed_again = db
+            .delete_session_by_id("d1")
+            .await
+            .expect("delete idempotent");
+        assert_eq!(removed_again, 0);
     }
 }

@@ -1,28 +1,26 @@
 //! Shared log-reading utilities.
 //!
-//! Both the CLI (`oly logs`) and the HTTP `/sessions/{id}/logs` endpoint read
-//! persisted `output.log` files from disk. This module consolidates that logic
-//! so every consumer shares the same code path.
-//!
-//! It splits into two halves that meet only at the types declared here:
-//!
-//! - [`index`] turns an `output.log` into addressable records: boundary
-//!   detection, the on-disk `output.log.idx` offset index, and pagination.
-//! - [`render`] replays raw bytes through a `vt100` parser to produce the rows
-//!   a human sees.
+//! CLI and HTTP consumers read canonical filtered output from journals.
+//! `screen_history` continuously replays recorded geometry for terminal views;
+//! `render` also supplies adapters for legacy byte fixtures and resume hints.
+//! `index` supplies bounded canonical byte pages.
 
 mod index;
 mod render;
+mod screen_history;
 #[cfg(test)]
 mod tests;
 
 use crate::protocol::LogResize;
 
-pub use index::{
-    discard_persisted_log_index, read_persisted_log_page, read_resize_events,
-    split_rendered_log_output,
+pub use index::{read_persisted_log_page, split_rendered_log_output};
+pub use render::{
+    PARSER_COLS, RESUME_FALLBACK_TAIL_LINES, engine_content_rows, finish_render,
+    format_history_rows, render_log_session, render_log_session_tail, replay_filtered_tail,
 };
-pub use render::{render_log_file, render_screen, render_screen_history};
+pub use screen_history::{
+    ScreenSnapshot, collect as collect_screen_history, current as current_recorded_screen,
+};
 
 /// Terminal dimensions a caller wants the log replayed at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

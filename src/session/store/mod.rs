@@ -4,11 +4,17 @@
 //! by concern into private submodules that each add an `impl SessionStore`
 //! block. The shared state and helpers live here.
 
+mod activity;
 mod attach;
 mod lifecycle;
+
+#[allow(unused_imports)] // re-exported for sibling module AttachSource
+pub(crate) use attach::scrollback_seed_bytes;
 mod notify;
+pub mod pump;
 mod query;
-mod testsupport;
+#[cfg(test)]
+pub(crate) mod testsupport;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,7 +29,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, trace, warn};
 
-use crate::{db::Database, session::SessionEventTx};
+use crate::{config::ResumePattern, db::Database, session::SessionEventTx};
 
 use super::{SessionError, SessionMeta, SessionStatus, runtime::SessionRuntime};
 
@@ -32,6 +38,14 @@ pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']
 
 #[cfg(not(target_os = "windows"))]
 pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
+
+/// Earliest keystroke window some agentic TUIs (claude-code, codex, opencode)
+/// treat as a "press Ctrl-C again to confirm" overlay before reverting. The
+/// second 0x03 stage must arrive inside this window even at long grace
+/// values. Capped at `grace / 4` so a short grace keeps the second nudge
+/// well clear of the SIGTERM midpoint and the deadline.
+pub(super) const DOUBLE_CTRL_C_DELAY: Duration = Duration::from_millis(500);
+pub(super) const DOUBLE_CTRL_C_DELAY_GRACE_DIVISOR: u32 = 4;
 
 pub(super) const TERMINATE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Output landing this soon after user activity (text input, mouse
@@ -57,6 +71,12 @@ pub(super) type SessionMap = HashMap<String, Arc<SessionHandle>>;
 pub(super) struct StoreMutableState {
     pub(super) starting_sessions: HashSet<String>,
     pub(super) evicted_sessions: HashMap<String, Instant>,
+    /// Persisted filtered-stream lengths for sessions without a live
+    /// runtime, keyed by session id: `(incarnation, len)`. The incarnation
+    /// component invalidates the entry when the journal advances
+    /// (keeps `oly wait` polling cheap against
+    /// completed sessions with large journals).
+    pub(super) persisted_stream_len_cache: HashMap<String, (u64, u64)>,
 }
 
 pub(super) struct SessionHandle {
@@ -72,6 +92,13 @@ impl SessionHandle {
         self.runtime.read()
     }
 
+    /// Non-blocking read: returns `None` when a writer currently owns
+    /// the runtime. Used by the activity sampler so it can skip
+    /// mid-write sessions without stalling the reader thread.
+    pub(super) fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, SessionRuntime>> {
+        self.runtime.try_read()
+    }
+
     pub(super) fn write(&self) -> parking_lot::RwLockWriteGuard<'_, SessionRuntime> {
         self.runtime.write()
     }
@@ -83,6 +110,13 @@ pub struct SessionStore {
     /// TTL for evicting completed sessions, in seconds. Atomic so the
     /// daemon's config hot-reload can adjust it without a restart.
     pub(super) eviction_ttl_secs: std::sync::atomic::AtomicU64,
+    /// Byte-budget cap on a session's persisted journal, shared with
+    /// `SessionRuntime` so every retention sweep across the process sees
+    /// the same value (0 = unlimited). Updated on the
+    /// daemon's config hot-reload pass.
+    pub(super) journal_byte_cap: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Reloadable rules applied when a completed journal is scanned.
+    pub(super) resume_patterns: ArcSwap<Vec<ResumePattern>>,
     pub(super) db: Arc<Database>,
     pub(super) event_tx: SessionEventTx,
 }
@@ -109,15 +143,24 @@ pub(super) struct PreparedStart {
 }
 
 impl SessionStore {
-    pub fn new(eviction_seconds: u64, db: Arc<Database>) -> Self {
+    pub fn with_journal_byte_cap(
+        eviction_seconds: u64,
+        journal_byte_cap: u64,
+        db: Arc<Database>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(100);
         Self {
             sessions: ArcSwap::from_pointee(HashMap::new()),
             mutable: TokioMutex::new(StoreMutableState {
                 starting_sessions: HashSet::new(),
                 evicted_sessions: HashMap::new(),
+                persisted_stream_len_cache: HashMap::new(),
             }),
             eviction_ttl_secs: std::sync::atomic::AtomicU64::new(eviction_seconds.max(1)),
+            journal_byte_cap: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                journal_byte_cap,
+            )),
+            resume_patterns: ArcSwap::from_pointee(Vec::new()),
             db,
             event_tx,
         }
@@ -135,6 +178,19 @@ impl SessionStore {
     pub fn set_eviction_seconds(&self, seconds: u64) {
         self.eviction_ttl_secs
             .store(seconds.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Handle to the shared journal byte cap so a retention sweep
+    /// scheduled by one session can read it through the runtime's `Arc`
+    /// clone. The handle stays valid for the daemon's lifetime
+    /// (the `SessionStore` itself is `Arc`-shared, so this is just a
+    /// borrow-of-`Arc` from `Arc::clone`).
+    pub(super) fn journal_byte_cap(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.journal_byte_cap)
+    }
+
+    pub fn set_resume_patterns(&self, patterns: Vec<ResumePattern>) {
+        self.resume_patterns.store(Arc::new(patterns));
     }
 
     pub fn event_tx(&self) -> SessionEventTx {
@@ -219,17 +275,132 @@ pub(super) fn build_soft_stop_schedule(
         return Vec::new();
     }
 
+    // Plan timestamp for each staged soft-stop input.
+    //
+    // Stage 0 fires immediately at `start`. Stage 1 (the second 0x03 that
+    // confirms an in-TUI "press again to exit" overlay) lands inside the
+    // confirm window regardless of how big `grace` is, by clamping to
+    // `min(DOUBLE_CTRL_C_DELAY, grace / divisor)`. Stage 2 (the EOF/SIGTSTP
+    // fallback) keeps the original `grace * 2/3` so we still try one more
+    // nudge before SIGTERM at the midpoint.
     let stage_count = SOFT_STOP_INPUTS.len();
+    let grace_cap = grace
+        .checked_div(DOUBLE_CTRL_C_DELAY_GRACE_DIVISOR)
+        .unwrap_or(Duration::ZERO);
+    let one_ctrl_c_delay = if grace.is_zero() {
+        Duration::ZERO
+    } else {
+        DOUBLE_CTRL_C_DELAY.min(grace_cap)
+    };
     SOFT_STOP_INPUTS
         .iter()
         .enumerate()
         .map(|(index, input)| {
-            let offset_millis = if index == 0 || grace.is_zero() {
-                0
-            } else {
-                ((grace.as_millis() * index as u128) / stage_count as u128) as u64
-            };
-            (start + Duration::from_millis(offset_millis), *input)
+            let offset = Duration::from_millis(stage_offset_millis(
+                index,
+                stage_count,
+                grace,
+                one_ctrl_c_delay,
+            ));
+            (start + offset, *input)
         })
         .collect()
+}
+
+fn stage_offset_millis(
+    index: usize,
+    stage_count: usize,
+    grace: Duration,
+    one_ctrl_c_delay: Duration,
+) -> u64 {
+    if index == 0 || grace.is_zero() {
+        return 0;
+    }
+    if index == 1 {
+        return one_ctrl_c_delay.as_millis() as u64;
+    }
+    ((grace.as_millis() * index as u128) / stage_count as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn schedule_for_grace(grace: Duration) -> Vec<(Instant, &'static [u8])> {
+        let start = Instant::now();
+        build_soft_stop_schedule(start, grace, SessionStatus::Stopped)
+    }
+
+    #[test]
+    fn soft_stop_schedule_starts_immediately_with_ctrl_c() {
+        let start = Instant::now();
+        let sched = build_soft_stop_schedule(start, Duration::from_secs(5), SessionStatus::Stopped);
+        assert_eq!(sched.len(), 3, "stages 1, 2, 3 should all be present");
+        assert_eq!(sched[0].1, &[0x03][..]);
+        let first_offset = sched[0].0.duration_since(start);
+        assert_eq!(first_offset, Duration::ZERO, "stage 1 must fire at start");
+    }
+
+    #[test]
+    fn soft_stop_schedule_second_ctrl_c_lands_inside_double_ctrl_c_window() {
+        // For grace=5s, the second 0x03 must arrive inside the ~1.5s
+        // overlay confirm window that modern agentic TUIs (claude-code,
+        // codex, opencode) display after the first Ctrl-C — not at
+        // grace/3 = 1666 ms which can already miss the overlay on slower
+        // machines, and not at grace*2/3 = 3333 ms which definitely does.
+        for grace_seconds in [1u64, 5, 15] {
+            let grace = Duration::from_secs(grace_seconds);
+            let cap = DOUBLE_CTRL_C_DELAY.min(
+                grace
+                    .checked_div(DOUBLE_CTRL_C_DELAY_GRACE_DIVISOR)
+                    .unwrap_or(Duration::ZERO),
+            );
+            let sched = schedule_for_grace(grace);
+            assert_eq!(sched[1].1, &[0x03][..], "stage 2 must always be Ctrl-C");
+            let offset = sched[1].0.duration_since(sched[0].0);
+            assert_eq!(
+                offset, cap,
+                "second Ctrl-C must land at min(500ms, grace/4) for grace={grace_seconds}s, got {offset:?}"
+            );
+            assert!(
+                offset <= Duration::from_millis(500),
+                "second Ctrl-C must never exceed 500 ms"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_stop_schedule_third_stage_offsets_remain_proportional() {
+        // Stage 3 (EOF fallback) keeps the legacy grace*2/3 placement so
+        // programs that really do respond to Ctrl-D/Ctrl-Z still get a
+        // last nudge before SIGTERM at grace/2 and SIGKILL on deadline.
+        let grace = Duration::from_secs(6);
+        let sched = schedule_for_grace(grace);
+        assert_eq!(
+            sched[2].0.duration_since(sched[0].0),
+            Duration::from_millis(4_000)
+        );
+    }
+
+    #[test]
+    fn soft_stop_schedule_is_empty_for_kill_request() {
+        let start = Instant::now();
+        let sched = build_soft_stop_schedule(start, Duration::from_secs(5), SessionStatus::Killed);
+        assert!(sched.is_empty(), "kill must skip soft-stop keystrokes");
+    }
+
+    #[test]
+    fn soft_stop_schedule_zero_grace_collapses_to_immediate_pair() {
+        // The existing kill_session path passes grace=0 to terminate_runtime.
+        // Even though build_soft_stop_schedule is only consulted when status
+        // == Stopped, a future caller might pass grace=0 plus Stopped; we
+        // must not produce overlapping offsets, so all stages collapse to
+        // t=start.
+        let sched = schedule_for_grace(Duration::ZERO);
+        let start = sched[0].0;
+        for stage in &sched {
+            assert_eq!(stage.0, start, "zero grace must collapse every stage");
+        }
+    }
 }

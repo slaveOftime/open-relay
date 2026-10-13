@@ -1,0 +1,357 @@
+// Tree presentations of the session list. The data shape lives here;
+// formatting helpers used by both render_tree and the inline session line
+// (TREE_STATUS_WIDTH) stay in render.rs because they're a tighter pairing
+// with the actual ratatui Cell rendering than with the tree-state itself.
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+impl Default for TreeView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Top-level presentation of the session list: either the responsive table
+/// view (`List`) or a `cwd`-grouped tree (`Tree`). Toggled with Ctrl+G.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ViewMode {
+    #[default]
+    List,
+    Tree,
+}
+
+/// One folder node in the tree. Folder rows are emitted by `TreeView`'s
+/// `visible` walker; their `direct_sessions` are emitted as siblings at the
+/// same effective depth so each session sits visually beneath the deepest
+/// folder that still sits above it.
+#[derive(Debug)]
+pub struct TreeNode {
+    pub path: PathBuf,
+    /// Full cwd for folders, even when the displayed path is abbreviated.
+    pub cwd: Option<String>,
+    /// Owner of this branch; keeps identical paths on different nodes distinct.
+    pub node: Option<String>,
+    pub is_node: bool,
+    /// Cached `basename` of `path`; empty for the synthetic root.
+    pub name: String,
+    /// Sessions whose cwd or storage fallback resolves to this folder.
+    pub direct_sessions: Vec<usize>,
+    /// Indices of child folder nodes (in DFS order; not sorted).
+    pub subfolders: Vec<usize>,
+}
+
+/// What `TreeView::visible` emits: a single row that is either a folder
+/// header or a session leaf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeEntry {
+    Folder { node: usize, depth: usize },
+    Session { session: usize, depth: usize },
+}
+
+/// Folder-and-session tree built from session summaries. The visible walker
+/// emits folder rows according to per-folder expansion state while retaining
+/// direct session rows under collapsed folders.
+#[derive(Debug)]
+pub struct TreeView {
+    pub nodes: Vec<TreeNode>,
+    /// Index of the synthetic root node (path = `PathBuf::new()`).
+    pub root: usize,
+    /// Number of folder levels expanded automatically from each tree root.
+    pub auto_depth: usize,
+    /// Folders explicitly expanded by the user.
+    pub drilled: HashSet<TreeFolderKey>,
+    /// Folders explicitly collapsed by the user, overriding auto expansion.
+    pub collapsed: HashSet<TreeFolderKey>,
+    /// Search/status filters reveal all matching folder ancestors by default.
+    pub auto_expand_all: bool,
+    pub grouped_nodes: bool,
+    /// Flat row list produced by `recompute_visible`.
+    pub visible: Vec<TreeEntry>,
+    /// Cursor index into `visible`.
+    pub cursor: usize,
+}
+
+impl TreeView {
+    pub fn new() -> Self {
+        let mut nodes = Vec::with_capacity(64);
+        nodes.push(TreeNode {
+            path: PathBuf::new(),
+            cwd: None,
+            node: None,
+            is_node: false,
+            name: String::new(),
+            direct_sessions: Vec::new(),
+            subfolders: Vec::new(),
+        });
+        Self {
+            nodes,
+            root: 0,
+            auto_depth: TREE_AUTO_DEPTH,
+            drilled: HashSet::new(),
+            collapsed: HashSet::new(),
+            auto_expand_all: false,
+            grouped_nodes: false,
+            visible: Vec::new(),
+            cursor: 0,
+        }
+    }
+}
+
+/// Number of path-folder levels expanded by default under each tree root.
+pub const TREE_AUTO_DEPTH: usize = 1;
+
+/// Canonical separator form for a stored cwd: remote sessions on a different
+/// OS report paths with the other platform's slashes, and the host `PathBuf`
+/// is not guaranteed to parse those. Folding `\` to `/` makes the tree the
+/// same regardless of which side produced the path.
+pub fn normalize_tree_cwd(cwd: &str) -> String {
+    cwd.trim().replace('\\', "/")
+}
+
+fn component_key(component: std::path::Component<'_>) -> String {
+    component
+        .as_os_str()
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
+fn components_lower(path: &Path) -> Vec<String> {
+    path.components().map(component_key).collect()
+}
+
+/// Component-wise equality that ignores case, so `C:/Foo` and `c:/foo`
+/// bucket into one folder. The first spelling seen keeps the display name.
+pub fn path_eq_ci(a: &Path, b: &Path) -> bool {
+    components_lower(a) == components_lower(b)
+}
+
+pub fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
+    let mut components = path.components();
+    for prefix_component in prefix.components() {
+        match components.next() {
+            Some(component) if component_key(component) == component_key(prefix_component) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub fn path_ends_with_ci(path: &Path, suffix: &Path) -> bool {
+    let components = components_lower(path);
+    let suffix_components = components_lower(suffix);
+    suffix_components.len() <= components.len()
+        && components[components.len() - suffix_components.len()..] == suffix_components[..]
+}
+
+/// Case-insensitive `Path::strip_prefix`; the remainder keeps the original
+/// spelling of `path`'s components.
+pub fn path_strip_prefix_ci(path: &Path, prefix: &Path) -> Option<PathBuf> {
+    let path_components: Vec<_> = path.components().collect();
+    let prefix_components: Vec<_> = prefix.components().collect();
+    if prefix_components.len() > path_components.len() {
+        return None;
+    }
+    for (path_component, prefix_component) in path_components.iter().zip(&prefix_components) {
+        if component_key(*path_component) != component_key(*prefix_component) {
+            return None;
+        }
+    }
+    let mut rest = PathBuf::new();
+    for component in &path_components[prefix_components.len()..] {
+        rest.push(component.as_os_str());
+    }
+    Some(rest)
+}
+
+/// Stable expansion key distinguishes a grouped node root from the synthetic
+/// root, which share the same empty path.
+pub type TreeFolderKey = (Option<String>, PathBuf, bool);
+pub fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
+    if paths.is_empty() {
+        return Path::new("/").to_path_buf();
+    }
+    if paths.len() == 1 {
+        return paths[0]
+            .ancestors()
+            .find(|ancestor| ancestor.has_root() && ancestor.parent().is_none())
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+    }
+    let mut iter = paths.iter();
+    let first = iter.next().expect("non-empty").clone();
+    let mut prefix = first.clone();
+    for candidate in iter {
+        while !path_starts_with_ci(candidate, &prefix) {
+            if !prefix.pop() {
+                return Path::new("/").to_path_buf();
+            }
+        }
+    }
+    // The basename of the shared path is always shown as a folder, including
+    // when one cwd equals that path and the others descend from it.
+    prefix.parent().map_or(prefix.clone(), Path::to_path_buf)
+}
+
+/// Walk the tree, creating intermediate folder nodes for any portion of
+/// `path` that does not yet exist. Returns the index of the deepest node
+/// matching `path` (creating it on demand).
+pub fn ensure_tree_path(
+    tree: &mut TreeView,
+    parent: usize,
+    path: &Path,
+    cwd: &str,
+    node: &Option<String>,
+) -> usize {
+    if path.as_os_str().is_empty() {
+        return parent;
+    }
+    let mut current = parent;
+    let mut accumulated = PathBuf::new();
+    for component in path.components() {
+        // Skip absolute-path roots: they would create an intermediate
+        // folder whose `file_name()` is `None` (rendered as "(root)")
+        // and contribute nothing to the visible tree. The walker already
+        // anchors the synthetic root; cwd paths are stored relative to it.
+        if matches!(component, std::path::Component::RootDir) {
+            continue;
+        }
+        accumulated.push(component);
+        // Linear-scan the parent's `subfolders` for an existing node with
+        // this exact `accumulated` path. Trees are shallow (≤ a handful of
+        // folders per branch) so the linear scan is cheaper than the cache
+        // bookkeeping it would evict.
+        let next = tree.nodes[current]
+            .subfolders
+            .iter()
+            .copied()
+            .find(|&idx| path_eq_ci(&tree.nodes[idx].path, &accumulated));
+        current = match next {
+            Some(idx) => idx,
+            None => {
+                // Pop components from the original spelling of the cwd.
+                // A remote Unix path viewed on Windows must keep its slashes.
+                let mut absolute = PathBuf::from(normalize_tree_cwd(cwd));
+                for _ in 0..path
+                    .components()
+                    .filter(|c| !matches!(c, std::path::Component::RootDir))
+                    .count()
+                    .saturating_sub(accumulated.components().count())
+                {
+                    absolute.pop();
+                }
+                append_tree_node(
+                    tree,
+                    current,
+                    accumulated.clone(),
+                    Some(absolute.to_string_lossy().into_owned()),
+                    node.clone(),
+                    false,
+                )
+            }
+        };
+    }
+    current
+}
+
+pub fn append_tree_node(
+    tree: &mut TreeView,
+    parent: usize,
+    path: PathBuf,
+    cwd: Option<String>,
+    node: Option<String>,
+    is_node: bool,
+) -> usize {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let idx = tree.nodes.len();
+    tree.nodes.push(TreeNode {
+        path,
+        cwd,
+        node,
+        is_node,
+        name,
+        direct_sessions: Vec::new(),
+        subfolders: Vec::new(),
+    });
+    tree.nodes[parent].subfolders.push(idx);
+    idx
+}
+
+impl TreeNode {
+    pub fn expansion_key(&self) -> TreeFolderKey {
+        (self.node.clone(), self.path.clone(), self.is_node)
+    }
+}
+
+impl TreeView {
+    pub fn is_expanded(&self, node_index: usize, depth: usize) -> bool {
+        let key = self.nodes[node_index].expansion_key();
+        if self.collapsed.contains(&key) {
+            return false;
+        }
+        self.drilled.contains(&key)
+            || self.auto_expand_all
+            || depth < self.auto_depth + usize::from(self.grouped_nodes)
+    }
+}
+
+/// Walk the folder tree into visible rows. Expansion is one level at a time:
+/// an expanded folder shows its immediate child folders, while direct sessions
+/// remain visible regardless of the folder's expanded state.
+pub fn walk_tree_branch(
+    nodes: &[TreeNode],
+    node_idx: usize,
+    depth: usize,
+    auto_depth: usize,
+    drilled: &HashSet<TreeFolderKey>,
+    collapsed: &HashSet<TreeFolderKey>,
+    out: &mut Vec<TreeEntry>,
+) {
+    let node = &nodes[node_idx];
+    if node.direct_sessions.is_empty() && node.subfolders.is_empty() {
+        return;
+    }
+
+    if depth > 0 {
+        out.push(TreeEntry::Folder {
+            node: node_idx,
+            depth,
+        });
+    }
+
+    let key = node.expansion_key();
+    let expanded = if collapsed.contains(&key) {
+        false
+    } else {
+        drilled.contains(&key) || depth < auto_depth
+    };
+    if expanded {
+        for &child_idx in &node.subfolders {
+            walk_tree_branch(
+                nodes,
+                child_idx,
+                depth + 1,
+                auto_depth,
+                drilled,
+                collapsed,
+                out,
+            );
+        }
+        for session_idx in &node.direct_sessions {
+            out.push(TreeEntry::Session {
+                session: *session_idx,
+                depth: depth + 1,
+            });
+        }
+    }
+}
+impl TreeEntry {
+    pub fn depth(self) -> usize {
+        match self {
+            Self::Folder { depth, .. } | Self::Session { depth, .. } => depth,
+        }
+    }
+}

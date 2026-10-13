@@ -1,83 +1,156 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
     paths:
       - .github/workflows/ci.yml
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - scripts/release-version.py
+      - scripts/release-package.py
+      - README.md
+      - ARCHITECTURE.md
+      - MIGRATION.md
+      - CONTRIBUTING.md
+      - docs/**
+      - skills/**
       - src/**
+      - tests/**
+      # The web bundle is embedded into the Rust binary at build time.
+      - web/src/**
+      - web/package.json
+      - web/package-lock.json
+      - web/vite.config.*
+      - web/tsconfig*.json
+      - web/index.html
+  # Manual re-run for a flaky PTY test or a workflow-only change: neither
+  # re-triggers this workflow reliably from a push.
+  workflow_dispatch:
+
+# Cancel in-progress runs on PRs to save minutes; push runs always
+# complete so we never leave main half-tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-oly
+          cache-on-failure: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Documentation contracts (offline)
+        run: python3 tests/docs_sync.py
+
+      - name: Release workflow regressions (offline)
+        run: python3 tests/release_workflow.py
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # Zero-warning gate; per-lint allowances live in [lints.clippy] of
+      # Cargo.toml with rationale.
+      - name: clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
   build-test:
     name: build-test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Observed: ubuntu 13m, macOS 15m, Windows 23m. The bound exists so a
+    # wedged PTY test (a client that never detaches) fails fast instead of
+    # idling to GitHub's 6-hour default.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
 
-      - name: Resolve npm cache directory
-        id: npm-cache-dir
-        shell: bash
-        run: echo "dir=$(npm config get cache)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - name: Cache Cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            ~/.cargo/git/checkouts/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Cache npm registry
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.npm-cache-dir.outputs.dir }}
-          key: ${{ runner.os }}-npm-${{ hashFiles('web/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
+          shared-key: ${{ runner.os }}-oly
+          cache-on-failure: true
 
       - name: Build web
         run: |
           cd web
-          npm install
+          npm ci
           npm run build
 
+      # Full suite: unit tests + every integration/e2e target.
+      # --locked proves Cargo.lock is in sync.
       - name: Test
-        run: |
-          cargo test --test cli_errors
-          cargo test --test e2e_csvlens
-          cargo test --test e2e_daemon
-          # Windows PTY e2e tests require single-threaded execution due to resource contention
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test --test e2e_pty -- --test-threads=1
-          else
-            cargo test --test e2e_pty
-          fi
         shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Windows PTY e2e tests need single-threaded execution
+            # because of resource contention.
+            cargo test --locked -- --test-threads=1
+          else
+            cargo test --locked
+          fi
 
       - name: Build Release
-        run: cargo build --release
+        run: cargo build --release --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Audit only on push to main: gating it out of PR signal keeps the
+    # advisory noise off the merge check while still catching issues
+    # before a release. Add a scheduled trigger in a follow-up if drift
+    # between releases becomes a concern.
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # cargo-audit is pulled as a prebuilt binary rather than built from
+      # source; saves ~60 s per run.
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-audit
+        run: cargo binstall cargo-audit --no-confirm --locked
+
+      - name: Audit dependencies
+        run: cargo audit

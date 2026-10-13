@@ -5,19 +5,23 @@ mod config;
 mod daemon;
 mod db;
 mod error;
+mod federation_crypto;
 mod http;
 mod ipc;
+mod metrics;
+mod mouse;
 mod node;
 mod notification;
 mod protocol;
+mod resume_hint;
 mod session;
 mod storage;
+mod terminal;
 mod terminal_guards;
 mod utils;
 
 use clap::Parser;
-use cli::{ApiKeyCommand, Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
-use crossterm::terminal;
+use cli::{Cli, Commands, DaemonCommand, JoinCommand, NodeCommand, NotifyCommand};
 use error::{AppError, Result};
 use protocol::{ListQuery, ListSortField, RpcRequest, RpcResponse, SortOrder};
 use std::path::{Path, PathBuf};
@@ -33,11 +37,15 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-const OLY_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly/SKILL.md");
-const OLY_APPS_SKILL_MARKDOWN: &str = include_str!("../.github/skills/oly-apps/SKILL.md");
+const OLY_SKILL_MARKDOWN: &str = include_str!("../skills/oly/SKILL.md");
+const OLY_APPS_SKILL_MARKDOWN: &str = include_str!("../skills/oly-apps/SKILL.md");
+const OLY_SUBAGENT_SKILL_MARKDOWN: &str = include_str!("../skills/oly-subagent/SKILL.md");
+const OLY_DAEMON_SKILL_MARKDOWN: &str = include_str!("../skills/oly-daemon/SKILL.md");
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    // Anchors OLY_TIMING marks at process start (before any work).
+    crate::metrics::mark("startup");
     configure_mimalloc_defaults();
 
     let code = match run().await {
@@ -156,13 +164,33 @@ async fn resolve_session_id(
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    // Intercept `--` for `oly send`. clap's behaviour around `--` is
+    // inconsistent when our trailing `chunks` Vec is in play — sometimes
+    // the bare `--` token bubbles through as a chunk, sometimes it
+    // disappears as a positional separator — so we strip it from argv
+    // before clap sees it and hand the trailing slice to `run_send`
+    // separately. For all other subcommands this is a no-op pass-through.
+    //
+    // `free_text` uses tri-state semantics for `run_send`:
+    //   * `None`            → `--` was NOT used (legacy behaviour).
+    //   * `Some("")`        → trailing `--` with no text after → usage error.
+    //   * `Some(content)`   → `--` followed by text → send as one literal.
+    let (cli_args, free_text_os) = cli::split_send_dashdash(std::env::args_os());
+    let cli = Cli::parse_from(cli_args);
+    let free_text: Option<String> = match free_text_os {
+        None => None,
+        Some(values) => cli::join_free_text(&values),
+    };
     let config = config::AppConfig::load()?;
 
     match cli.command {
         Commands::Skill(args) => {
             if args.apps {
                 print!("{}", OLY_APPS_SKILL_MARKDOWN);
+            } else if args.subagent {
+                print!("{}", OLY_SUBAGENT_SKILL_MARKDOWN);
+            } else if args.daemon {
+                print!("{}", OLY_DAEMON_SKILL_MARKDOWN);
             } else {
                 print!("{}", OLY_SKILL_MARKDOWN);
             }
@@ -192,6 +220,7 @@ async fn run() -> Result<()> {
         },
 
         Commands::List(list_args) => client::run_list(&config, list_args).await,
+        Commands::Info(args) => client::run_info(&config, args).await,
 
         Commands::Start(start_args) => {
             let cli::StartArgs {
@@ -211,7 +240,7 @@ async fn run() -> Result<()> {
             let (rows, cols) = if detach {
                 (None, None)
             } else {
-                let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 (Some(rows), Some(cols))
             };
             let inner = RpcRequest::Start {
@@ -231,8 +260,13 @@ async fn run() -> Result<()> {
                         println!("{session_id}");
                         return Ok(());
                     }
-                    if let Err(err) = client::run_attach(&config, &session_id).await {
-                        eprintln!("");
+                    // Interactive attach controls the session by default
+                    // (see AttachArgs::role): the just-started session is
+                    // driven by the terminal that launched it.
+                    if let Err(err) =
+                        client::run_attach(&config, &session_id, Some("controller")).await
+                    {
+                        eprintln!();
                         eprintln!(
                             "warning: started session {session_id}, but failed to attach: {err}"
                         );
@@ -373,94 +407,31 @@ async fn run() -> Result<()> {
         Commands::Attach(attach_args) => {
             let id = resolve_session_id(&config, attach_args.id.clone(), attach_args.node.as_ref())
                 .await?;
+            let role = Some(attach_args.role());
             if attach_args.node.is_some() {
-                client::run_attach_node(&config, &id, attach_args.node).await
+                client::run_attach_node(&config, &id, attach_args.node, role).await
             } else {
-                client::run_attach(&config, &id).await
+                client::run_attach(&config, &id, role).await
             }
         }
 
         Commands::Logs(logs_args) => {
             let id =
                 resolve_session_id(&config, logs_args.id.clone(), logs_args.node.as_ref()).await?;
-            let node = logs_args.node.clone();
-            client::run_logs(
-                &config,
-                &id,
-                logs_args.tail,
-                logs_args.keep_color,
-                logs_args.from_file,
-                logs_args.no_truncate,
-                node,
-                logs_args.wait_for_prompt,
-                logs_args.timeout,
-            )
-            .await
+            client::run_logs(&config, &id, &logs_args).await
+        }
+
+        Commands::Export(export_args) => {
+            let id = resolve_session_id(&config, export_args.id.clone(), export_args.node.as_ref())
+                .await?;
+            client::run_export(&config, &id, export_args.json, export_args.node.as_deref()).await
         }
 
         Commands::Send(send_args) => {
             let id =
                 resolve_session_id(&config, send_args.id.clone(), send_args.node.as_ref()).await?;
-            client::run_send(&config, &id, send_args.node, send_args.chunks).await
+            client::run_send(&config, &id, send_args.node, send_args.chunks, free_text).await
         }
-
-        // ── API key management (primary side) ────────────────────────────────
-        Commands::ApiKey(api_key_args) => match api_key_args.command {
-            ApiKeyCommand::Add(args) => {
-                match ipc::send_request_checked(&config, RpcRequest::ApiKeyAdd { name: args.name })
-                    .await?
-                {
-                    RpcResponse::ApiKeyAdd { plaintext_key } => {
-                        println!(
-                            "API key registered. Key (store it securely — printed only once):"
-                        );
-                        println!("{plaintext_key}");
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-            ApiKeyCommand::List => {
-                match ipc::send_request_checked(&config, RpcRequest::ApiKeyList).await? {
-                    RpcResponse::ApiKeyList { keys } => {
-                        if keys.is_empty() {
-                            println!("No API keys registered.");
-                        } else {
-                            println!("{:<24} {}", "NAME", "CREATED");
-                            for k in keys {
-                                let created = k
-                                    .created_at
-                                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                                    .unwrap_or_else(|| "unknown".to_string());
-                                println!("{:<24} {}", k.name, created);
-                            }
-                        }
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-            ApiKeyCommand::Remove(args) => {
-                match ipc::send_request_checked(
-                    &config,
-                    RpcRequest::ApiKeyRemove {
-                        name: args.name.clone(),
-                    },
-                )
-                .await?
-                {
-                    RpcResponse::ApiKeyRemove { removed } => {
-                        if removed {
-                            println!("API key \"{}\" removed.", args.name);
-                        } else {
-                            eprintln!("API key \"{}\" not found.", args.name);
-                        }
-                        Ok(())
-                    }
-                    _ => Err(AppError::Protocol("unexpected response".into())),
-                }
-            }
-        },
 
         // ── Node listing (primary side) ──────────────────────────────────────
         Commands::Node(node_args) => match node_args.command {
@@ -470,11 +441,29 @@ async fn run() -> Result<()> {
                         if nodes.is_empty() {
                             println!("No secondary nodes connected.");
                         } else {
-                            println!("{}", "NAME");
+                            println!("NAME");
                             for n in nodes {
                                 println!("{}", n);
                             }
                         }
+                        Ok(())
+                    }
+                    _ => Err(AppError::Protocol("unexpected response".into())),
+                }
+            }
+            NodeCommand::Accept(args) => {
+                let name = args.name.clone();
+                match ipc::send_request_checked(
+                    &config,
+                    RpcRequest::NodeAccept {
+                        name: args.name,
+                        id_pub_key: args.id_pub_key,
+                    },
+                )
+                .await?
+                {
+                    RpcResponse::Empty => {
+                        println!("Identity public key registered for node '{}'.", name);
                         Ok(())
                     }
                     _ => Err(AppError::Protocol("unexpected response".into())),
@@ -485,7 +474,12 @@ async fn run() -> Result<()> {
         // ── Join management (secondary side) ─────────────────────────────────
         Commands::Join(join_args) => match join_args.command {
             JoinCommand::Start(args) => {
-                client::run_join(&config, args.url, args.name, args.key).await
+                let Some(pinned) = args.id_pub_key else {
+                    return Err(AppError::Protocol(
+                        "missing --id-pub-key <PRIMARY_PUB_KEY> — `--id-pub-key` is the trust root for the join".into(),
+                    ));
+                };
+                client::run_join(&config, args.url, args.name, Some(pinned)).await
             }
             JoinCommand::Stop(args) => client::run_join_stop(&config, args.name).await,
             JoinCommand::List(args) => {
@@ -505,7 +499,7 @@ async fn run() -> Result<()> {
                                 println!("{:<24}", j.name);
                             }
                         } else {
-                            println!("{:<24} {:<12} {}", "NAME", "STATUS", "PRIMARY URL");
+                            println!("{:<24} {:<12} PRIMARY URL", "NAME", "STATUS");
                             for j in joins {
                                 let status = if j.connected { "connected" } else { "saved" };
                                 println!("{:<24} {:<12} {}", j.name, status, j.primary_url);

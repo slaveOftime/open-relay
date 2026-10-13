@@ -17,7 +17,27 @@ pub fn handle_clipboard_paste(
     id: &str,
     ignore_text: bool,
 ) -> Result<Option<String>> {
-    if let Some(paths) = read_clipboard_files()? {
+    handle_clipboard_paste_with(
+        config,
+        id,
+        ignore_text,
+        read_clipboard_files,
+        read_clipboard_image,
+        read_clipboard_text,
+    )
+}
+
+// Keep OS clipboard access at the boundary so file/image persistence can be
+// verified with isolated data without reading or replacing the user's clipboard.
+pub(crate) fn handle_clipboard_paste_with(
+    config: &AppConfig,
+    id: &str,
+    ignore_text: bool,
+    read_files: impl FnOnce() -> Result<Option<Vec<PathBuf>>>,
+    read_image: impl FnOnce() -> Result<Option<ClipboardImage>>,
+    read_text: impl FnOnce() -> Result<Option<String>>,
+) -> Result<Option<String>> {
+    if let Some(paths) = read_files()? {
         let files_dir = ensure_session_files_dir(config, id)?;
         let mut saved_paths = Vec::with_capacity(paths.len());
         for source_path in paths {
@@ -32,7 +52,7 @@ pub fn handle_clipboard_paste(
         return Ok(Some(format_saved_paths(&saved_paths)));
     }
 
-    if let Some(image) = read_clipboard_image()? {
+    if let Some(image) = read_image()? {
         let files_dir = ensure_session_files_dir(config, id)?;
         let saved_path = save_clipboard_image(&files_dir, image)?;
         return Ok(Some(saved_path.display().to_string()));
@@ -42,7 +62,7 @@ pub fn handle_clipboard_paste(
         return Ok(None);
     }
 
-    read_clipboard_text()
+    read_text()
 }
 
 pub enum RemoteClipboardTransfer {
@@ -106,7 +126,7 @@ fn read_clipboard_files() -> Result<Option<Vec<PathBuf>>> {
 
     match clipboard.get().file_list() {
         Ok(files) => {
-            let files: Vec<PathBuf> = files.into_iter().map(PathBuf::from).collect();
+            let files: Vec<PathBuf> = files.into_iter().collect();
             if files.is_empty() {
                 Ok(None)
             } else {
@@ -265,10 +285,10 @@ fn timestamp_millis() -> u128 {
         .as_millis()
 }
 
-struct ClipboardImage {
-    width: u32,
-    height: u32,
-    bytes: Vec<u8>,
+pub(crate) struct ClipboardImage {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[cfg(test)]

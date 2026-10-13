@@ -67,6 +67,8 @@ pub enum Commands {
     /// List sessions. Order is most recently created last.
     #[command(name = "ls")]
     List(ListArgs),
+    /// Show complete metadata and runtime details for a session.
+    Info(InfoArgs),
     /// Start a new session from an existing session's persisted launch metadata.
     Restart(RestartArgs),
     /// Stop a session by ID.
@@ -76,12 +78,14 @@ pub enum Commands {
     Remove(RemoveArgs),
     /// Attach to a running session.
     Attach(AttachArgs),
-    /// Show session logs. Use runtime screen state if session is running, or `--from-file` to render from the persisted output.log file instead.
+    /// Read rendered views (default tail 40), sampled screen history, or
+    /// exact bounded byte pages (`--since`), optionally after a wait.
     Logs(LogsArgs),
-    /// Send text or keys to a session. Example: `oly send <id> "hello" key:enter`.
+    /// Stream a fixed prefix of canonical filtered bytes (not raw PTY),
+    /// including terminal controls, for files and pipes.
+    Export(ExportArgs),
+    /// Send text, keys, or application mouse input. Example: `oly send <id> mouse:wheel+3`.
     Send(SendArgs),
-    /// Manage API keys on this (primary) daemon.
-    ApiKey(ApiKeyArgs),
     /// Manage this daemon's outbound connections to a primary daemon.
     Join(JoinArgs),
     /// List secondary nodes currently connected to this (primary) daemon.
@@ -91,8 +95,14 @@ pub enum Commands {
 #[derive(Debug, Args)]
 pub struct SkillArgs {
     /// Skill about how to create oly app.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["subagent", "daemon"])]
     pub apps: bool,
+    /// Skill about supervising an agent CLI through oly.
+    #[arg(long, conflicts_with_all = ["apps", "daemon"])]
+    pub subagent: bool,
+    /// Skill about configuring the oly daemon (hot reload, prompt_patterns).
+    #[arg(long, conflicts_with_all = ["apps", "subagent"])]
+    pub daemon: bool,
 }
 
 #[derive(Debug, Args)]
@@ -185,7 +195,9 @@ impl ListStatus {
 
 #[derive(Debug, Args)]
 pub struct ListArgs {
-    /// Filter by title or ID substring (case-insensitive).
+    /// Filter sessions: a bare substring matches id, title, tags, command,
+    /// args, or cwd (case-insensitive). `id:`, `title:`, `tag:`, `cmd:`,
+    /// `args:`, and `cwd:` scope a term to one field. Terms are ANDed.
     #[arg(long)]
     pub search: Option<String>,
     /// Only show sessions containing these tags (repeatable).
@@ -214,11 +226,29 @@ pub struct ListArgs {
     )]
     pub limit: usize,
     /// Target a secondary node by name. Repeat to monitor multiple nodes.
-    #[arg(long, short = 'n', value_name = "NODE")]
+    #[arg(long, short = 'n', value_name = "NODE", conflicts_with = "node_all")]
     pub node: Vec<String>,
-    /// Include sessions from the current (or primary) daemon.
+    /// Target the local daemon and every connected secondary node; follow mode refreshes membership.
+    #[arg(long, conflicts_with = "node", requires = "follow")]
+    pub node_all: bool,
+    /// Include the current (or primary) daemon; already included by --node-all.
     #[arg(long)]
     pub node_local: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct InfoArgs {
+    /// Session ID to inspect. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Print machine-readable JSON instead of the formatted details.
+    #[arg(long)]
+    pub json: bool,
+    /// Colorize details (auto honors NO_COLOR and disables color for pipes).
+    #[arg(long, value_enum, default_value = "auto")]
+    pub color: ColorMode,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -356,7 +386,7 @@ pub struct RemoveArgs {
     /// Session ID to delete. If omitted, uses the most recently created session.
     pub id: Option<String>,
     /// Delete even if the session is still running (it is killed first).
-    #[arg(long)]
+    #[arg(long, short = 'f')]
     pub force: bool,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
@@ -370,38 +400,125 @@ pub struct AttachArgs {
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
+    /// Attach in observe mode: view-only, never drives input or geometry.
+    /// Without this flag an attach controls the session by default.
+    #[arg(long)]
+    pub observe: bool,
+}
+
+impl AttachArgs {
+    /// Wire mode token for the attach subscription. Attach control by
+    /// default (tmux-style: the attaching terminal drives input and
+    /// geometry); `--observe` opts into a view-only attach.
+    pub fn role(&self) -> &'static str {
+        if self.observe {
+            "observe"
+        } else {
+            "controller"
+        }
+    }
 }
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    /// Session ID to show logs for. If omitted, uses the most recently created session.
+    /// Session ID to read. If omitted, uses the most recently created session.
     pub id: Option<String>,
-    /// Number of recent lines to display. By default it uses the current terminal height - 1, or 40 if it cannot be determined.
-    #[arg(long)]
+
+    // ── What to print (default: last 40 text lines) ──
+    /// Print the last N rendered text lines (0..65535; default 40).
+    #[arg(long, value_name = "N", conflicts_with_all = ["screen", "tail_frames"])]
     pub tail: Option<usize>,
-    /// Keep ANSI color codes in output.
-    #[arg(long = "keep-color")]
-    pub keep_color: bool,
-    /// Force rendering from the persisted output.log file instead of live screen state.
-    #[arg(long = "from-file")]
-    pub from_file: bool,
-    /// Do not truncate columns.
-    #[arg(long = "no-truncate")]
-    pub no_truncate: bool,
+    /// Print the current screen: what a viewer would see if they attached
+    /// now, or the final visible grid after exit (including blank states).
+    #[arg(long, conflicts_with_all = ["tail", "tail_frames"])]
+    pub screen: bool,
+    /// Print the last N distinct output-event screen observations,
+    /// oldest first, including blanks (0..1024). Not application frames.
+    #[arg(long = "tail-frames", value_name = "N", conflicts_with_all = ["tail", "screen"])]
+    pub tail_frames: Option<usize>,
+
+    // ── When to print it (optional gate; it never changes what is printed) ──
+    /// Block until this condition holds, then print.
+    #[arg(long, value_enum, value_name = "CONDITION")]
+    pub wait: Option<WaitCondition>,
+    /// Quiet period for `--wait idle`: 500ms, 2s, 1m. Default 800ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
+    pub idle_for: Option<u64>,
+    /// Regex for `--wait match`, searched per logical line of canonical
+    /// output after the start point, including partial prompts. No cross-line
+    /// matches; lines over 1 MiB fail explicitly. Page boundaries are transparent.
+    #[arg(long = "match", value_name = "REGEX")]
+    pub match_: Option<String>,
+    /// Timeout for `--wait`: 500ms, 30s, 2m, 1h; 0 waits forever. Default 30s.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout_ms)]
+    pub timeout: Option<u64>,
+
+    // ── Where to start reading ─────────────────────────────────────────
+    /// Opaque cursor token from an earlier `oly logs` run: print only what
+    /// came after it, as an exact canonical-byte page (not a rendered view).
+    /// JSON encodes bytes as base64. Fails if the session restarted.
+    #[arg(long, value_name = "TOKEN", conflicts_with_all = ["tail", "screen", "tail_frames"])]
+    pub since: Option<String>,
+    /// Maximum bytes in a continuation page (default 256 KiB, max 8 MiB).
+    #[arg(long, value_name = "N", requires = "since")]
+    pub limit_bytes: Option<usize>,
+    /// Print only the current cursor token — the start point for a
+    /// follow-up `--since` — and exit.
+    #[arg(long, conflicts_with_all = ["tail", "screen", "tail_frames", "wait", "since", "timeout", "idle_for", "match_", "limit_bytes"])]
+    pub cursor: bool,
+
+    // ── Formatting and routing ─────────────────────────────────────────
+    /// Colorize rendered ANSI output.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub color: ColorMode,
+    /// Emit one machine-readable JSON object on stdout (diagnostics and
+    /// status lines move to stderr); includes the next cursor.
+    #[arg(long)]
+    pub json: bool,
     /// Target a secondary node by name.
     #[arg(long, short = 'n')]
     pub node: Option<String>,
-    /// Block until the session needs input (or exits), then print logs.
-    #[arg(long = "wait-for-prompt", short = 'w')]
-    pub wait_for_prompt: bool,
-    /// Timeout for --wait-for-prompt. Accepts plain milliseconds or units like 10s, 5m, or 1h.
-    #[arg(
-        long,
-        default_value = "5m",
-        value_name = "DURATION",
-        value_parser = parse_timeout_ms
-    )]
-    pub timeout: u64,
+}
+
+/// When `oly logs --wait` stops blocking and prints.
+/// When to emit ANSI styling in rendered output.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Colorize when stdout is a terminal (default).
+    Auto,
+    /// Always emit styles, even into a pipe.
+    Always,
+    /// Never emit styles.
+    Never,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitCondition {
+    /// New output arrived, or the session ended.
+    #[value(alias = "new")]
+    Output,
+    /// The session is waiting for input — or has ended, so a caller never
+    /// blocks on a prompt that will never arrive.
+    Prompt,
+    /// Output stayed quiet for `--idle-for`.
+    Idle,
+    /// The session ended. The child's exit code is reported on stderr; the
+    /// command itself exits 0 once the lifecycle has reached a terminal state.
+    Exit,
+    /// The `--match` regex appeared in output produced after the start point.
+    Match,
+}
+
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Session ID to export. If omitted, uses the most recently created session.
+    pub id: Option<String>,
+    /// Stream a JSON object containing base64 canonical filtered bytes and size.
+    #[arg(long)]
+    pub json: bool,
+    /// Target a secondary node by name.
+    #[arg(long, short = 'n')]
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -410,10 +527,22 @@ pub struct SendArgs {
     pub id: Option<String>,
     /// Input chunks, processed left to right. Plain text is sent literally.
     /// Prefix with key: for special keys, e.g. key:enter, key:ctrl+c, key:up.
+    /// Use mouse:left@col,row / mouse:middle@col,row / mouse:right@col,row for
+    /// clicks; positions are required and 1-based. Append +N to repeat clicks,
+    /// e.g. mouse:left+2@2,3. Use mouse:wheel+3 for 3 wheel-up ticks, or
+    /// mouse:wheel-3 for down. Wheel positions are optional (@col,row); only
+    /// wheel defaults to the live viewport center. Counts are 1..1000 events, not rows.
+    /// Requires application mouse reporting. Out-of-viewport positions fail.
     /// Use oly-clipboard to send clipboard text or uploaded clipboard files.
     /// Prefix with oly-file:<path> to upload a local file and send the saved session path.
     /// Supported keys: enter, tab, esc, backspace, up/down/left/right, home/end,
     /// pgup/pgdn, del/ins, ctrl+<char>, alt+<char|key>, shift+tab, hex:<bytes>.
+    ///
+    /// Use `--` to switch into free-text mode: every argument after `--` is
+    /// sent as one literal blob joined with single spaces, with no
+    /// `key:` / `mouse:` / `oly-clipboard` / `oly-file:` parsing. Useful for multi-line
+    /// scripts, embedded quotes, or text that happens to start with `key:`.
+    /// Example: `oly send <id> -- echo "hello world" key:enter`.
     #[arg(
         trailing_var_arg = true,
         allow_hyphen_values = true,
@@ -425,37 +554,71 @@ pub struct SendArgs {
     pub node: Option<String>,
 }
 
-// ---------------------------------------------------------------------------
-// API key management (primary side)
-// ---------------------------------------------------------------------------
+/// Split the raw argv on a bare `--` token that appears AFTER the `oly send`
+/// subcommand, so the trailing slice can be sent as one literal blob.
+///
+/// clap's `Cli::parse_from` treats `--` as the standard end-of-options
+/// separator — once it sees `--`, every later token becomes a positional
+/// value of the next available arg. That layer is unpredictable for our
+/// trailing `chunks` Vec (it may or may not surface the bare `--` token),
+/// so we intercept argv ourselves. This only fires for the `send`
+/// subcommand; other subcommands are untouched.
+///
+/// Returns `(pre_args, free_text)`:
+/// - `pre_args` is the argv slice up to (but not including) the `--`. It is
+///   safe to feed to `Cli::parse_from` — no `--` remains.
+/// - `free_text` is `None` when no `--` was found (preserve legacy behavior),
+///   `Some(vec![])` when `--` was the last token (a usage error), or
+///   `Some(values)` to be joined with single spaces and sent verbatim.
+///
+/// Note: this intentionally matches the case-sensitive token `send` at any
+/// index. A session whose ID happens to equal `send` would interfere — but
+/// `(id=send)` is degenerate; users can quote those IDs to disambiguate.
+pub(crate) fn split_send_dashdash<I>(
+    raw: I,
+) -> (Vec<std::ffi::OsString>, Option<Vec<std::ffi::OsString>>)
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let raw: Vec<std::ffi::OsString> = raw.into_iter().collect();
 
-#[derive(Debug, Args)]
-pub struct ApiKeyArgs {
-    #[command(subcommand)]
-    pub command: ApiKeyCommand,
+    let Some(subcmd_idx) = raw.iter().position(|a| a == "send") else {
+        return (raw, None);
+    };
+
+    let search_start = subcmd_idx + 1;
+    let dash_offset = raw[search_start..].iter().position(|a| a == "--");
+    let Some(dash_offset) = dash_offset else {
+        return (raw, None);
+    };
+
+    let dash_idx = search_start + dash_offset;
+    let pre = raw[..dash_idx].to_vec();
+    let post = raw[dash_idx + 1..].to_vec();
+    (pre, Some(post))
 }
 
-#[derive(Debug, Subcommand)]
-pub enum ApiKeyCommand {
-    /// Generate a new API key and print it once. Keys are independent of node names.
-    Add(ApiKeyAddArgs),
-    /// List all registered API keys (names only; raw values are never stored).
-    #[command(name = "ls")]
-    List,
-    /// Remove an API key by name. Nodes using it will be disconnected.
-    Remove(ApiKeyRemoveArgs),
-}
-
-#[derive(Debug, Args)]
-pub struct ApiKeyAddArgs {
-    /// Friendly label for this key (must be unique).
-    pub name: String,
-}
-
-#[derive(Debug, Args)]
-pub struct ApiKeyRemoveArgs {
-    /// Label of the key to remove.
-    pub name: String,
+/// Take the `free_text` Vec produced by `split_send_dashdash` and join it
+/// into the single literal payload that is sent after `--`.
+/// - `None` (no `--`) is the legacy "no free text" signal.
+/// - `Some(empty)` is the trailing-`--`-with-no-text usage error.
+/// - `Some(vec)` is joined with single spaces to mirror how the user typed
+///   it on the command line.
+pub(crate) fn join_free_text(values: &[std::ffi::OsString]) -> Option<String> {
+    if values.is_empty() {
+        // Empty values list reaches here only from `Some(vec![])` above,
+        // which is the trailing-`--`-usage error. Returning Some("") lets
+        // the caller distinguish that from `None` (legacy / `--` absent).
+        Some(String::new())
+    } else {
+        Some(
+            values
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +657,24 @@ pub enum NodeCommand {
     /// List all secondary nodes currently connected to this (primary) daemon.
     #[command(name = "ls")]
     List,
+    /// Authorize a secondary node's id pubkey so it can join this
+    /// primary. Pair this with the line printed by `oly daemon status`
+    /// (or `<state>/identity_key.pub`) on the secondary box.
+    #[command(name = "accept")]
+    Accept(AcceptArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AcceptArgs {
+    /// Name of the secondary node to register the id pubkey for.
+    #[arg(long, short = 'n')]
+    pub name: String,
+    /// Canonical identity public key of the secondary, in the form
+    /// `ed25519 <base64(raw32)>` — the line printed by `oly daemon status`
+    /// on the secondary box, or the contents of
+    /// `<state>/identity_key.pub` on the secondary.
+    #[arg(long, short = 'k', value_name = "PUB_KEY")]
+    pub id_pub_key: String,
 }
 
 #[derive(Debug, Args)]
@@ -501,9 +682,13 @@ pub struct JoinStartArgs {
     /// Name this daemon will be known as on the primary (must be unique per primary).
     #[arg(long, short = 'n')]
     pub name: String,
-    /// API key printed by `oly api-key add` on the primary.
-    #[arg(long, short = 'k')]
-    pub key: String,
+    /// Required canonical identity public key of the primary, in the form
+    /// `ed25519 <base64(raw32)>`. The secondary pins the primary to
+    /// exactly this identifier — the line printed by `oly daemon status`
+    /// on the primary, or the contents of `<state>/identity_key.pub` on
+    /// the primary.
+    #[arg(long, value_name = "PRIMARY_PUB_KEY")]
+    pub id_pub_key: Option<String>,
     #[arg(help = "HTTP base URL of the primary daemon, e.g. http://primary-host:15443")]
     pub url: String,
 }
@@ -525,9 +710,43 @@ pub struct JoinListArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, parse_timeout_ms,
+        Cli, Commands, DaemonCommand, NotificationSetting, NotifyCommand, join_free_text,
+        parse_timeout_ms, split_send_dashdash,
     };
     use clap::Parser;
+    use std::ffi::OsString;
+
+    #[test]
+    fn info_parses_defaults_and_output_options() {
+        let cli = Cli::try_parse_from(["oly", "info"]).unwrap();
+        let Commands::Info(args) = cli.command else {
+            panic!("expected info command");
+        };
+        assert_eq!(args.id, None);
+        assert_eq!(args.node, None);
+        assert!(!args.json);
+        assert_eq!(args.color, super::ColorMode::Auto);
+
+        let cli = Cli::try_parse_from([
+            "oly",
+            "info",
+            "session-1",
+            "--node",
+            "worker-a",
+            "--json",
+            "--color",
+            "never",
+        ])
+        .unwrap();
+        let Commands::Info(args) = cli.command else {
+            panic!("expected info command");
+        };
+        assert_eq!(args.id.as_deref(), Some("session-1"));
+        assert_eq!(args.node.as_deref(), Some("worker-a"));
+        assert!(args.json);
+        assert_eq!(args.color, super::ColorMode::Never);
+        assert!(Cli::try_parse_from(["oly", "info", "--color", "invalid"]).is_err());
+    }
 
     #[test]
     fn restart_parses_required_id_force_and_node() {
@@ -588,16 +807,97 @@ mod tests {
         let Commands::Logs(args) = cli.command else {
             panic!("expected logs command");
         };
-        assert_eq!(args.timeout, 10_000);
+        assert_eq!(args.timeout, Some(10_000));
+    }
+
+    /// The logs surface is three axes: what to print (default tail,
+    /// `--screen`, `--tail-frames`), an optional `--wait` gate, and format
+    /// modifiers. Meaningful combinations parse; meaningless ones are usage
+    /// errors rather than silently ignored flags.
+    #[test]
+    fn logs_surfaces_are_mutually_exclusive() {
+        let ok: &[&[&str]] = &[
+            &["oly", "logs", "s1"],
+            &["oly", "logs", "s1", "--tail", "5"],
+            &["oly", "logs", "s1", "--screen"],
+            &["oly", "logs", "s1", "--tail-frames", "3"],
+            &[
+                "oly",
+                "logs",
+                "s1",
+                "--tail-frames",
+                "3",
+                "--color",
+                "always",
+            ],
+            &["oly", "logs", "s1", "--wait", "exit", "--screen"],
+            &[
+                "oly", "logs", "s1", "--wait", "output", "--since", "tok", "--json",
+            ],
+            &[
+                "oly",
+                "logs",
+                "s1",
+                "--wait",
+                "idle",
+                "--idle-for",
+                "1500ms",
+            ],
+            &[
+                "oly",
+                "logs",
+                "s1",
+                "--wait",
+                "match",
+                "--match",
+                "DONE",
+                "--timeout",
+                "0",
+            ],
+            &["oly", "logs", "s1", "--cursor"],
+            &["oly", "logs", "s1", "--cursor", "--json"],
+            &["oly", "logs", "s1", "--node", "worker", "--screen"],
+        ];
+        for argv in ok {
+            assert!(Cli::try_parse_from(*argv).is_ok(), "should parse: {argv:?}");
+        }
+
+        let err: &[&[&str]] = &[
+            // Two print surfaces.
+            &["oly", "logs", "s1", "--screen", "--tail", "5"],
+            &["oly", "logs", "s1", "--screen", "--tail-frames", "2"],
+            &["oly", "logs", "s1", "--tail", "5", "--tail-frames", "2"],
+            // --cursor prints only a token.
+            &["oly", "logs", "s1", "--cursor", "--tail", "5"],
+            &["oly", "logs", "s1", "--cursor", "--wait", "exit"],
+            // Removed flags are gone, not silently accepted.
+            &["oly", "logs", "s1", "--raw"],
+            &["oly", "logs", "s1", "--from", "10"],
+            &["oly", "logs", "s1", "--from-file"],
+            &["oly", "logs", "s1", "--cols", "120"],
+            &["oly", "logs", "s1", "--keep-color"],
+            &["oly", "logs", "s1", "--exit"],
+            &["oly", "logs", "s1", "--wait-for-prompt"],
+        ];
+        for argv in err {
+            assert!(Cli::try_parse_from(*argv).is_err(), "should fail: {argv:?}");
+        }
     }
 
     #[test]
-    fn logs_timeout_defaults_to_thirty_seconds() {
+    fn logs_timeout_defaults_to_none_so_the_client_picks_it() {
+        // No explicit --timeout: the client applies the default (30s), and
+        // `0` means "wait as long as it takes".
         let cli = Cli::try_parse_from(["oly", "logs", "session-1"]).unwrap();
         let Commands::Logs(args) = cli.command else {
             panic!("expected logs command");
         };
-        assert_eq!(args.timeout, 300_000);
+        assert_eq!(args.timeout, None);
+        let cli = Cli::try_parse_from(["oly", "logs", "session-1", "--timeout", "0"]).unwrap();
+        let Commands::Logs(args) = cli.command else {
+            panic!("expected logs command");
+        };
+        assert_eq!(args.timeout, Some(0));
     }
 
     #[test]
@@ -771,6 +1071,28 @@ mod tests {
     }
 
     #[test]
+    fn list_parses_node_all_for_follow_only() {
+        let cli =
+            Cli::try_parse_from(["oly", "ls", "--follow", "--node-all", "--node-local"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(args.node_all);
+        assert!(args.node_local);
+        let cli = Cli::try_parse_from(["oly", "ls", "--follow", "--node-all"]).unwrap();
+        let Commands::List(args) = cli.command else {
+            panic!("expected list command");
+        };
+        assert!(args.node_all);
+        assert!(!args.node_local);
+        assert!(Cli::try_parse_from(["oly", "ls", "--node-all"]).is_err());
+        assert!(
+            Cli::try_parse_from(["oly", "ls", "--follow", "--node-all", "--node", "worker"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn list_parses_follow_and_rejects_json_combination() {
         let cli = Cli::try_parse_from(["oly", "ls", "--follow"]).unwrap();
         let Commands::List(args) = cli.command else {
@@ -850,5 +1172,189 @@ mod tests {
             panic!("expected daemon start subcommand");
         };
         assert_eq!(args.bind.as_deref(), Some("0.0.0.0"));
+    }
+
+    // ── split_send_dashdash ────────────────────────────────────────────────
+
+    fn os(raw: &[&str]) -> Vec<OsString> {
+        raw.iter().map(|s| OsString::from(*s)).collect()
+    }
+
+    fn to_strs(os: &[OsString]) -> Vec<String> {
+        os.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn dashdash_split_no_separator_returns_none() {
+        let raw = os(&["oly", "send", "abc", "foo", "bar"]);
+        let (pre, post) = split_send_dashdash(raw.clone());
+        assert_eq!(to_strs(&pre), to_strs(&raw));
+        assert!(post.is_none());
+    }
+
+    #[test]
+    fn dashdash_split_other_subcommands_unaffected() {
+        // `--` inside an `oly start --cmd -- arg` form must NOT be intercepted.
+        let raw = os(&["oly", "start", "echo", "--", "hello"]);
+        let (pre, post) = split_send_dashdash(raw.clone());
+        assert_eq!(to_strs(&pre), to_strs(&raw));
+        assert!(post.is_none());
+    }
+
+    #[test]
+    fn dashdash_split_after_head_chunks() {
+        let raw = os(&["oly", "send", "abc", "key:enter", "--", "bar", "baz"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc", "key:enter"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["bar", "baz"]));
+    }
+
+    #[test]
+    fn dashdash_split_immediately_after_id() {
+        let raw = os(&["oly", "send", "abc", "--", "foo"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["foo"]));
+    }
+
+    #[test]
+    fn dashdash_split_no_id_no_chunks() {
+        let raw = os(&["oly", "send", "--", "foo"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["foo"]));
+    }
+
+    #[test]
+    fn dashdash_split_trailing_only_yields_empty_post() {
+        let raw = os(&["oly", "send", "abc", "--"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc"]));
+        assert_eq!(post.expect("free text"), Vec::<OsString>::new());
+    }
+
+    #[test]
+    fn dashdash_split_pre_dashdash_options_remain_in_pre() {
+        // --node appears BEFORE --  → node should still be parsed by clap.
+        let raw = os(&["oly", "send", "abc", "--node", "worker", "--", "bar"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(
+            to_strs(&pre),
+            svec(&["oly", "send", "abc", "--node", "worker"])
+        );
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["bar"]));
+    }
+
+    #[test]
+    fn dashdash_split_only_first_separator_wins() {
+        // A later `--` inside the free text is just another literal token.
+        let raw = os(&["oly", "send", "abc", "--", "echo", "--", "ok"]);
+        let (pre, post) = split_send_dashdash(raw);
+        assert_eq!(to_strs(&pre), svec(&["oly", "send", "abc"]));
+        assert_eq!(
+            to_strs(&post.expect("free text")),
+            svec(&["echo", "--", "ok"])
+        );
+    }
+
+    // ── join_free_text ─────────────────────────────────────────────────────
+
+    fn svec(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn join_free_text_single_space() {
+        let joined = join_free_text(&os(&["echo", "hello", "world"]));
+        assert_eq!(joined.as_deref(), Some("echo hello world"));
+    }
+
+    #[test]
+    fn join_free_text_keeps_key_colon_literal() {
+        // Whole point of `--`: a `key:foo` token in the tail is plain text.
+        let joined = join_free_text(&os(&["echo", "key:enter"]));
+        assert_eq!(joined.as_deref(), Some("echo key:enter"));
+    }
+
+    #[test]
+    fn join_free_text_keeps_oly_file_literal() {
+        // No file upload triggered for `oly-file:...` inside tail.
+        let joined = join_free_text(&os(&["cat", "oly-file:/should/not/upload"]));
+        assert_eq!(joined.as_deref(), Some("cat oly-file:/should/not/upload"));
+    }
+
+    #[test]
+    fn join_free_text_keeps_oly_clipboard_literal() {
+        let joined = join_free_text(&os(&["echo", "oly-clipboard"]));
+        assert_eq!(joined.as_deref(), Some("echo oly-clipboard"));
+    }
+
+    #[test]
+    fn join_free_text_empty_vec_returns_empty_string_some() {
+        // Crucial: distinguishes "no --" (=None) from "--" alone (=Some("")).
+        let joined = join_free_text(&Vec::<OsString>::new());
+        assert_eq!(joined.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn join_free_text_single_token() {
+        let joined = join_free_text(&os(&["hello"]));
+        assert_eq!(joined.as_deref(), Some("hello"));
+    }
+
+    // ── end-to-end: split + parse_from ─────────────────────────────────────
+
+    #[test]
+    fn pre_args_parse_end_to_end_with_node_flag() {
+        // The shell already word-splits argv; `os` takes the same shape.
+        let raw = os(&[
+            "oly", "send", "abc", "--node", "worker", "--", "msg", "line",
+        ]);
+        let (pre, post) = split_send_dashdash(raw);
+        let cli = Cli::try_parse_from(pre).expect("clap should parse pre_args cleanly");
+        let Commands::Send(s) = cli.command else {
+            panic!("expected Send");
+        };
+        assert_eq!(s.id.as_deref(), Some("abc"));
+        assert_eq!(s.node.as_deref(), Some("worker"));
+        assert!(s.chunks.is_empty(), "head chunks are empty: {:?}", s.chunks);
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["msg", "line"]));
+    }
+
+    #[test]
+    fn pre_args_parse_end_to_end_with_chunks_before_separator() {
+        let raw = os(&[
+            "oly",
+            "send",
+            "abc",
+            "yes",
+            "key:enter",
+            "--",
+            "tail",
+            "text",
+        ]);
+        let (pre, post) = split_send_dashdash(raw);
+        let cli = Cli::try_parse_from(pre).expect("clap should parse pre_args cleanly");
+        let Commands::Send(s) = cli.command else {
+            panic!("expected Send");
+        };
+        assert_eq!(s.id.as_deref(), Some("abc"));
+        assert_eq!(s.chunks, svec(&["yes", "key:enter"]));
+        assert_eq!(to_strs(&post.expect("free text")), svec(&["tail", "text"]));
+    }
+
+    #[test]
+    fn pre_args_parse_no_separator_unchanged() {
+        // Pure passthrough: no `--`, no split.
+        let raw = os(&["oly", "send", "abc", "yes", "key:enter"]);
+        let (pre, post) = split_send_dashdash(raw.clone());
+        let cli = Cli::try_parse_from(pre.clone()).expect("clap should parse cleanly");
+        let Commands::Send(s) = cli.command else {
+            panic!("expected Send");
+        };
+        assert_eq!(s.chunks, svec(&["yes", "key:enter"]));
+        assert!(post.is_none(), "post stays None when no `--` found");
     }
 }

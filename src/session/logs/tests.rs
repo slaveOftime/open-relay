@@ -7,18 +7,16 @@
 
 use super::index::LOG_RECORD_FALLBACK_BYTES;
 use super::index::{
-    parse_resize_event, read_persisted_log_page, read_relevant_resize_events, read_resize_events,
-    split_persisted_log_records, split_rendered_log_output, sync_persisted_log_index,
+    read_persisted_log_page, split_persisted_log_records, split_rendered_log_output,
+    tail_window_bytes, viewport_resize_plan,
 };
 use super::render::{
-    parser_cols, parser_rows, render_log_bytes, render_log_file, render_screen,
-    render_screen_history,
+    format_history_rows, parser_cols, parser_rows, render_engine_screen, render_log_bytes,
+    render_log_file,
 };
 use super::{ViewportReplayPlan, ViewportSize};
 use crate::protocol::LogResize;
-use crate::session::persist::append_output_raw;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,9 +33,16 @@ fn expected_fixture(name: &str) -> Vec<u8> {
 }
 
 fn assert_fixture_or_update(name: &str, output: &[u8]) {
+    // Regeneration on Windows targets the platform-specific golden file so the
+    // shared (Unix) fixture is never clobbered by a Windows-only rendering
+    // difference — see `fixture_name`.
+    #[cfg(windows)]
+    let write_name = name.replace(".expected", ".windows.expected");
+    #[cfg(not(windows))]
+    let write_name = name.to_owned();
     let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
-        .join(fixture_name(name));
+        .join(write_name);
     if std::env::var_os("OLY_UPDATE_LOG_FIXTURES").is_some() {
         fs::write(&fixture_path, output).expect("write updated log fixture");
     }
@@ -45,13 +50,24 @@ fn assert_fixture_or_update(name: &str, output: &[u8]) {
     assert_eq!(output, expected_fixture(name));
 }
 
-fn fixture_name(name: &str) -> &str {
+fn fixture_name(name: &str) -> String {
+    // The engine renders identically on every platform for most transcripts, so
+    // they share one golden file. A few emoji-heavy transcripts (the copilot
+    // CLI's model picker) measure some wide glyphs differently on Windows than
+    // on Unix, so they ship a platform-specific golden file; when that file is
+    // present, prefer it. `cfg(windows)` keeps the Unix path — and therefore the
+    // committed shared fixture — byte-for-byte unchanged.
     #[cfg(windows)]
-    if name == "output-copilot.expected" {
-        return "output-copilot.expected.windows";
+    {
+        let windows_name = name.replace(".expected", ".windows.expected");
+        let windows_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join(&windows_name);
+        if windows_path.exists() {
+            return windows_name;
+        }
     }
-
-    name
+    name.to_owned()
 }
 
 fn normalize_fixture_line_endings(bytes: &[u8]) -> Vec<u8> {
@@ -88,12 +104,54 @@ fn temp_session_dir(prefix: &str) -> PathBuf {
 }
 
 #[test]
+fn journal_backed_session_logs_render_and_paginate() {
+    // With a journal present, `oly logs` and the HTTP logs endpoint
+    // read the derived filtered stream — never output.log (which is absent).
+    let dir = std::env::temp_dir().join(format!("oly-logs-journal-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    {
+        let (mut journal, _, _) = crate::session::journal::ShadowJournal::open(&dir).unwrap();
+        for i in 0..40 {
+            journal
+                .record_output(bytes::Bytes::from(format!("line {i:02}\r\n")))
+                .unwrap();
+        }
+        journal.request_sync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while journal.core.durable_seq() < 40 {
+            journal.poll_acks();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    assert!(!dir.join("output.log").exists());
+
+    // Render path (oly logs / RPC GetLogs / HTTP tail).
+    let (output, _resizes) =
+        super::render::render_log_session_tail(&dir, 10, false).expect("render journal logs");
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains("line 39"), "{text:?}");
+
+    // Pagination path (HTTP logs page endpoint).
+    let (records, total) = super::index::read_persisted_log_page(&dir, 0, 5)
+        .expect("paginate journal logs")
+        .expect("journal-backed session has a persisted log page");
+    // Records split on both \r and \n (legacy rule), so each line is two.
+    assert_eq!(total, 80);
+    assert_eq!(records.len(), 5);
+    assert!(records[0].contains("line 00"), "{records:?}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn renders_copilot_transcript_exactly() {
     let log_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("output-copilot.log");
 
-    let output = render_log_file(
+    let (output, _resizes) = render_log_file(
         &log_path,
         40,
         true,
@@ -114,7 +172,7 @@ fn renders_opencode_transcript_exactly() {
         .join("tests")
         .join("output-opencode.log");
 
-    let output = render_log_file(
+    let (output, _resizes) = render_log_file(
         &log_path,
         40,
         true,
@@ -144,10 +202,10 @@ fn keeps_visible_rows_below_cursor() {
 
 #[test]
 fn render_screen_respects_tail_limit() {
-    let mut parser = vt100::Parser::new(4, 80, 0);
-    parser.process(b"\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour");
+    let mut engine = crate::terminal::Terminal::new(4, 80, 0);
+    engine.feed(b"\x1b[1;1Hone\x1b[2;1Htwo\x1b[3;1Hthree\x1b[4;1Hfour");
 
-    let output = render_screen(&parser, 2, false, 80);
+    let output = render_engine_screen(&engine, 2, false, 80);
 
     assert_eq!(String::from_utf8_lossy(&output), "three\nfour\n");
 }
@@ -201,43 +259,42 @@ fn falls_back_when_alt_screen_teardown_clears_final_output() {
 }
 
 #[test]
-fn parses_resize_events() {
-    let parsed = parse_resize_event("resize offset=42 rows=37 cols=105");
-
-    assert_eq!(
-        parsed,
-        Some(LogResize {
-            offset: 42,
-            rows: 37,
-            cols: 105,
-        })
-    );
-}
-
-#[test]
-fn reads_all_resize_events_from_events_log() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "oly-log-render-{}-{}",
+fn resize_events_are_derived_from_the_journal() {
+    let dir = std::env::temp_dir().join(format!(
+        "oly-resize-events-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos()
     ));
+    fs::create_dir_all(&dir).expect("create temp dir");
 
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
+    {
+        let (mut journal, _, _) =
+            crate::session::journal::ShadowJournal::open(&dir).expect("open journal");
+        journal.record_resize(24, 80).expect("initial resize");
+        journal
+            .record_output(bytes::Bytes::from_static(b"0123456789"))
+            .expect("output");
+        journal.record_resize(30, 90).expect("mid resize");
+        journal
+            .record_output(bytes::Bytes::from_static(b"0123456789"))
+            .expect("output");
+        journal.record_resize(37, 105).expect("late resize");
+        journal.request_sync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while journal.core.durable_seq() < 5 {
+            journal.poll_acks();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "journal sync timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 
-    let log_path = temp_dir.join("output.log");
-    let events_path = temp_dir.join("events.log");
-
-    fs::write(&log_path, b"placeholder").expect("write output log");
-    fs::write(
-        &events_path,
-        b"resize offset=0 rows=24 cols=80\nresize offset=10 rows=30 cols=90\nresize offset=20 rows=37 cols=105\n",
-    )
-    .expect("write events log");
-
-    let resizes = read_resize_events(&temp_dir).expect("read resizes");
+    let resizes = crate::session::replay::resize_events(&dir).expect("read resizes");
 
     assert_eq!(
         resizes,
@@ -260,31 +317,35 @@ fn reads_all_resize_events_from_events_log() {
         ]
     );
 
-    let _ = fs::remove_dir_all(&temp_dir);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn keeps_last_resize_before_tail_and_future_resizes() {
-    let temp_dir = std::env::temp_dir().join(format!(
-        "oly-log-render-plan-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let events = vec![
+        LogResize {
+            offset: 0,
+            rows: 24,
+            cols: 80,
+        },
+        LogResize {
+            offset: 100,
+            rows: 30,
+            cols: 90,
+        },
+        LogResize {
+            offset: 140,
+            rows: 37,
+            cols: 105,
+        },
+        LogResize {
+            offset: 220,
+            rows: 50,
+            cols: 140,
+        },
+    ];
 
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-    let log_path = temp_dir.join("output.log");
-    let events_path = temp_dir.join("events.log");
-    fs::write(&log_path, b"placeholder").expect("write output log");
-    fs::write(
-        &events_path,
-        b"resize offset=0 rows=24 cols=80\nresize offset=100 rows=30 cols=90\nresize offset=140 rows=37 cols=105\nresize offset=220 rows=50 cols=140\n",
-    )
-    .expect("write events log");
-
-    let plan = read_relevant_resize_events(&log_path, 120, 200).expect("read relevant resizes");
+    let plan = viewport_resize_plan(&events, 120, 200);
 
     assert_eq!(
         plan,
@@ -301,8 +362,6 @@ fn keeps_last_resize_before_tail_and_future_resizes() {
             }],
         }
     );
-
-    let _ = fs::remove_dir_all(&temp_dir);
 }
 
 #[test]
@@ -368,54 +427,19 @@ fn splits_persisted_logs_by_fallback_size_when_no_boundaries_exist() {
 }
 
 #[test]
-fn persisted_log_index_extends_across_append_boundaries() {
-    let temp_dir = temp_session_dir("oly-log-index");
+fn persisted_log_page_rejects_pre_0_5_output_log_sessions() {
+    // Sessions with only a legacy `output.log` (no journal) fail
+    // loudly instead of silently serving the retired format.
+    let temp_dir = temp_session_dir("oly-log-legacy");
     fs::create_dir_all(&temp_dir).expect("create temp dir");
+    fs::write(temp_dir.join("output.log"), b"alpha\n").expect("write output log");
 
-    let log_path = temp_dir.join("output.log");
-    fs::write(&log_path, b"alpha").expect("write initial output log");
-    sync_persisted_log_index(&log_path).expect("index initial output log");
-
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial page");
-    assert_eq!(lines, vec!["alpha".to_string()]);
-    assert_eq!(total, 1);
-
-    let mut file = fs::OpenOptions::new()
-        .append(true)
-        .open(&log_path)
-        .expect("open output log for append");
-    file.write_all(b" beta\ngamma")
-        .expect("append output log continuation");
-    file.flush().expect("flush appended output log");
-
-    sync_persisted_log_index(&log_path).expect("extend persisted log index");
-
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended page");
-    assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
-    assert_eq!(total, 2);
-
-    let (tail_lines, tail_total) =
-        read_persisted_log_page(&temp_dir, 1, 10).expect("read trailing page");
-    assert_eq!(tail_lines, vec!["gamma".to_string()]);
-    assert_eq!(tail_total, 2);
-
-    let _ = fs::remove_dir_all(&temp_dir);
-}
-
-#[test]
-fn persisted_log_page_rebuilds_index_after_append_output_raw() {
-    let temp_dir = temp_session_dir("oly-log-index-lazy");
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-    append_output_raw(&temp_dir, b"alpha").expect("write initial raw output");
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read initial raw page");
-    assert_eq!(lines, vec!["alpha".to_string()]);
-    assert_eq!(total, 1);
-
-    append_output_raw(&temp_dir, b" beta\ngamma").expect("append raw output continuation");
-    let (lines, total) = read_persisted_log_page(&temp_dir, 0, 10).expect("read extended raw page");
-    assert_eq!(lines, vec!["alpha beta\n".to_string(), "gamma".to_string()]);
-    assert_eq!(total, 2);
+    let err = read_persisted_log_page(&temp_dir, 0, 10)
+        .expect_err("pre-0.5 output.log sessions are an explicit error");
+    assert!(
+        err.contains("pre-0.5"),
+        "error must name the retired format: {err}"
+    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
@@ -431,29 +455,11 @@ fn split_rendered_log_output_drops_final_reset_suffix() {
 }
 
 #[test]
-fn read_persisted_log_total_counts_indexed_records() {
-    let temp_dir = temp_session_dir("oly-log-total");
-    fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-    let log_path = temp_dir.join("output.log");
-    fs::write(&log_path, b"one\ntwo\nthree\nfour\n").expect("write output log");
-    sync_persisted_log_index(&log_path).expect("index output log");
-    assert_eq!(
-        read_persisted_log_page(&temp_dir, 0, 1)
-            .expect("read total")
-            .1,
-        4
-    );
-
-    let _ = fs::remove_dir_all(&temp_dir);
-}
-
-#[test]
 fn screen_history_renders_scrolled_off_rows_only() {
-    let mut parser = vt100::Parser::new(3, 80, 100);
-    parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+    let mut engine = crate::terminal::Terminal::new(3, 80, 100);
+    engine.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
 
-    let output = render_screen_history(parser.screen(), 200).expect("has content");
+    let output = format_history_rows(engine.styled_history_rows(200)).expect("has content");
     let text = String::from_utf8_lossy(&output);
     for row in ["one", "two", "three"] {
         assert!(text.contains(row), "missing row {row} in {text:?}");
@@ -466,14 +472,14 @@ fn screen_history_renders_scrolled_off_rows_only() {
 #[test]
 fn screen_history_respects_tail_limit() {
     // 10 lines on a 3-row screen: scrollback holds rows 1-8.
-    let mut parser = vt100::Parser::new(3, 80, 100);
+    let mut engine = crate::terminal::Terminal::new(3, 80, 100);
     let mut lines = String::new();
     for i in 1..=10 {
         lines.push_str(&format!("row {i:02}\r\n"));
     }
-    parser.process(lines.as_bytes());
+    engine.feed(lines.as_bytes());
 
-    let output = render_screen_history(parser.screen(), 3).expect("has content");
+    let output = format_history_rows(engine.styled_history_rows(3)).expect("has content");
     let text = String::from_utf8_lossy(&output);
     assert!(!text.contains("row 05"));
     assert!(text.contains("row 06"));
@@ -483,13 +489,38 @@ fn screen_history_respects_tail_limit() {
 
 #[test]
 fn screen_history_is_none_without_content() {
-    let parser = vt100::Parser::new(3, 80, 100);
-    assert!(render_screen_history(parser.screen(), 10).is_none());
+    let engine = crate::terminal::Terminal::new(3, 80, 100);
+    assert!(format_history_rows(engine.styled_history_rows(10)).is_none());
 }
 
 #[test]
 fn screen_history_is_none_when_nothing_scrolled_off() {
-    let mut parser = vt100::Parser::new(5, 80, 100);
-    parser.process(b"still visible\r\n");
-    assert!(render_screen_history(parser.screen(), 10).is_none());
+    let mut engine = crate::terminal::Terminal::new(5, 80, 100);
+    engine.feed(b"still visible\r\n");
+    assert!(format_history_rows(engine.styled_history_rows(10)).is_none());
+}
+
+/// `usize::MAX` means "the whole stream" (e.g. `logs --screen`); the tail
+/// arithmetic must saturate instead of overflowing (daemon worker panicked
+/// with "attempt to multiply/add with overflow" on this path).
+#[test]
+fn tail_window_bytes_saturates_on_usize_max_tail() {
+    let bytes = b"one\ntwo\nthree\n";
+    let window = tail_window_bytes(bytes, usize::MAX);
+    assert_eq!(window.bytes, bytes);
+    assert_eq!(window.start_offset, 0);
+    // No trailing newline hits the saturating_add arm too.
+    let window = tail_window_bytes(b"one\ntwo", usize::MAX);
+    assert_eq!(window.bytes, b"one\ntwo");
+}
+
+#[test]
+fn read_tail_bytes_saturates_on_usize_max_tail() {
+    let dir = std::env::temp_dir().join(format!("oly_tail_sat_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let log_path = dir.join("output.log");
+    std::fs::write(&log_path, b"one\ntwo\nthree\n").expect("write log");
+    let window = super::index::read_tail_bytes(&log_path, usize::MAX).expect("read tail");
+    assert_eq!(window.bytes, b"one\ntwo\nthree\n");
+    let _ = std::fs::remove_dir_all(&dir);
 }

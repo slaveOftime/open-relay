@@ -1,16 +1,20 @@
-//! Turning a persisted `output.log` into addressable, paginated records.
+//! Turning a persisted output stream into addressable, paginated records.
 //!
 //! Raw PTY logs have no line framing, so records are cut on terminal-aware
-//! boundaries and their offsets cached in a sidecar `output.log.idx` so
-//! paging does not rescan the whole file.
+//! boundaries. Journal-backed sessions paginate the derived filtered stream
+//! via the streaming replay reader; the legacy `output.log` sidecar index
+//! is retired.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
+use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-
-use crate::{error::Result, protocol::LogResize};
+#[cfg(test)]
+use crate::error::Result;
+use crate::protocol::LogResize;
 
 use super::{ESCAPE_BYTE, OUTPUT_COLOR_RESET_SUFFIX, ViewportReplayPlan};
 
@@ -18,103 +22,54 @@ use super::{ESCAPE_BYTE, OUTPUT_COLOR_RESET_SUFFIX, ViewportReplayPlan};
 /// boundary appears for a long stretch of bytes.
 pub(super) const LOG_RECORD_FALLBACK_BYTES: usize = 2048;
 
-const LOG_INDEX_OFFSETS_FILE: &str = "output.log.idx";
-const LOG_INDEX_META_FILE: &str = "output.log.idx.meta";
-
-pub(super) struct TailBytes {
-    pub(super) bytes: Vec<u8>,
-    pub(super) start_offset: u64,
-    pub(super) end_offset: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 struct LogRecordScannerState {
     current_record: Vec<u8>,
     pending_escape: Vec<u8>,
 }
 
-impl LogRecordScannerState {
-    fn trailing_len(&self) -> u64 {
-        (self.current_record.len() + self.pending_escape.len()) as u64
-    }
-
-    fn has_trailing_record(&self) -> bool {
-        !self.current_record.is_empty() || !self.pending_escape.is_empty()
-    }
+pub(super) struct TailBytes {
+    pub(super) bytes: Vec<u8>,
+    pub(super) start_offset: u64,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PersistedLogIndexMeta {
-    indexed_len: u64,
-    scanner_state: LogRecordScannerState,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct PersistedLogIndex {
-    indexed_len: u64,
-    complete_record_end_offsets: Vec<u64>,
-    scanner_state: LogRecordScannerState,
-}
-
-impl PersistedLogIndex {
-    fn from_meta(meta: PersistedLogIndexMeta, complete_record_end_offsets: Vec<u64>) -> Self {
-        Self {
-            indexed_len: meta.indexed_len,
-            complete_record_end_offsets,
-            scanner_state: meta.scanner_state,
-        }
-    }
-
-    fn to_meta(&self) -> PersistedLogIndexMeta {
-        PersistedLogIndexMeta {
-            indexed_len: self.indexed_len,
-            scanner_state: self.scanner_state.clone(),
-        }
-    }
-
-    fn total_records(&self) -> usize {
-        self.complete_record_end_offsets.len()
-            + usize::from(self.scanner_state.has_trailing_record())
-    }
-
-    fn last_complete_end_offset(&self) -> u64 {
-        self.complete_record_end_offsets
-            .last()
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn is_consistent_with(&self, file_len: u64) -> bool {
-        self.indexed_len <= file_len
-            && self.last_complete_end_offset() <= self.indexed_len
-            && self.scanner_state.trailing_len()
-                <= self
-                    .indexed_len
-                    .saturating_sub(self.last_complete_end_offset())
-    }
-}
-
-/// Read a page of lines from a persisted `output.log`.
+/// Read a page of lines from a session's persisted output.
 ///
-/// Returns `(records, total_record_count)` or `None` if the file can't be
-/// opened. For raw PTY streams, records are split on terminal-aware boundaries
-/// first and fall back to fixed-size chunks when the stream contains no `\n`.
+/// Returns `Ok((records, total_record_count))`, or `Ok(None)` when the
+/// session has no persisted output at all. For raw PTY streams, records are
+/// split on terminal-aware boundaries first and fall back to fixed-size
+/// chunks when the stream contains no `\n`.
+///
+/// Journal-backed sessions paginate the derived filtered stream via the
+/// streaming replay reader (bounded memory). A session with only a
+/// pre-0.5 `output.log` is an explicit error — the legacy fallback is
+/// retired (see MIGRATION.md).
 pub fn read_persisted_log_page(
     session_dir: &Path,
     offset: usize,
     limit: usize,
-) -> Option<(Vec<String>, usize)> {
-    let log_path = session_dir.join("output.log");
-    if let Ok(index) = sync_persisted_log_index(&log_path)
-        && let Ok(records) = read_persisted_log_page_from_index(&log_path, &index, offset, limit)
+) -> std::result::Result<Option<(Vec<String>, usize)>, String> {
+    if session_dir
+        .join(crate::session::journal::JOURNAL_DIR_NAME)
+        .is_dir()
     {
-        return Some((records, index.total_records()));
+        let reader = crate::session::replay::ReplayReader::new(session_dir)
+            .map_err(|err| format!("failed to open the session journal: {err}"))?;
+        let mut page = PaginatedLogRecords::new(offset, limit);
+        scan_persisted_log_records(reader, |record| page.push(record))
+            .map_err(|err| format!("failed to scan the session journal: {err}"))?;
+        return Ok(Some(page.finish()));
     }
 
-    let file = File::open(log_path).ok()?;
-    let mut page = PaginatedLogRecords::new(offset, limit);
-    scan_persisted_log_records(file, |record| page.push(record)).ok()?;
-    Some(page.finish())
+    if session_dir.join("output.log").exists() {
+        return Err(format!(
+            "session log in {} uses the pre-0.5 format (output.log) and is no \
+             longer readable; export it with a 0.x build first, see MIGRATION.md",
+            session_dir.display()
+        ));
+    }
+
+    Ok(None)
 }
 
 pub fn split_rendered_log_output(output: &[u8]) -> Vec<String> {
@@ -237,15 +192,10 @@ where
     F: FnMut(&[u8]),
 {
     fn new(on_record: F) -> Self {
-        Self::from_state(LogRecordScannerState::default(), on_record)
-    }
-
-    fn from_state(state: LogRecordScannerState, on_record: F) -> Self {
-        Self { state, on_record }
-    }
-
-    fn into_state(self) -> LogRecordScannerState {
-        self.state
+        Self {
+            state: LogRecordScannerState::default(),
+            on_record,
+        }
     }
 
     fn process_bytes(&mut self, bytes: &[u8]) {
@@ -350,218 +300,6 @@ where
     }
 }
 
-fn read_persisted_log_page_from_index(
-    log_path: &Path,
-    index: &PersistedLogIndex,
-    offset: usize,
-    limit: usize,
-) -> std::io::Result<Vec<String>> {
-    let total = index.total_records();
-    if limit == 0 || offset >= total {
-        return Ok(Vec::new());
-    }
-
-    let end = offset.saturating_add(limit).min(total);
-    let complete_count = index.complete_record_end_offsets.len();
-    let start_offset = if offset == 0 {
-        0
-    } else {
-        index.complete_record_end_offsets[offset - 1]
-    };
-    let end_offset = if end <= complete_count {
-        index.complete_record_end_offsets[end - 1]
-    } else {
-        index.indexed_len
-    };
-
-    let mut file = File::open(log_path)?;
-    file.seek(SeekFrom::Start(start_offset))?;
-
-    let mut bytes = vec![0u8; (end_offset - start_offset) as usize];
-    file.read_exact(&mut bytes)?;
-
-    let complete_end = end.min(complete_count);
-    let requested_complete_offsets = &index.complete_record_end_offsets[offset..complete_end];
-    let mut records = Vec::with_capacity(end - offset);
-    let mut record_start = 0usize;
-
-    for &record_end in requested_complete_offsets {
-        let relative_end = (record_end - start_offset) as usize;
-        records.push(String::from_utf8_lossy(&bytes[record_start..relative_end]).into_owned());
-        record_start = relative_end;
-    }
-
-    if end > complete_count && record_start < bytes.len() {
-        records.push(String::from_utf8_lossy(&bytes[record_start..]).into_owned());
-    }
-
-    Ok(records)
-}
-
-pub(super) fn sync_persisted_log_index(log_path: &Path) -> std::io::Result<PersistedLogIndex> {
-    let file_len = fs::metadata(log_path)?.len();
-
-    let mut index = match load_persisted_log_index(log_path) {
-        Ok(index) if index.is_consistent_with(file_len) => index,
-        _ => return rebuild_persisted_log_index(log_path, file_len),
-    };
-
-    if index.indexed_len < file_len {
-        let new_offsets = extend_persisted_log_index(log_path, &mut index, file_len)?;
-        append_log_index_offsets(log_path, &new_offsets)?;
-        write_log_index_meta(log_path, &index.to_meta())?;
-    }
-
-    Ok(index)
-}
-
-fn rebuild_persisted_log_index(
-    log_path: &Path,
-    file_len: u64,
-) -> std::io::Result<PersistedLogIndex> {
-    let mut index = PersistedLogIndex::default();
-    let complete_offsets = extend_persisted_log_index(log_path, &mut index, file_len)?;
-    index.complete_record_end_offsets = complete_offsets;
-    write_log_index_offsets(log_path, &index.complete_record_end_offsets)?;
-    write_log_index_meta(log_path, &index.to_meta())?;
-    Ok(index)
-}
-
-fn extend_persisted_log_index(
-    log_path: &Path,
-    index: &mut PersistedLogIndex,
-    file_len: u64,
-) -> std::io::Result<Vec<u64>> {
-    let mut file = File::open(log_path)?;
-    file.seek(SeekFrom::Start(index.indexed_len))?;
-
-    let mut completed_end = index
-        .indexed_len
-        .saturating_sub(index.scanner_state.trailing_len());
-    let mut new_offsets = Vec::new();
-    let state = std::mem::take(&mut index.scanner_state);
-    let mut scanner = LogRecordScanner::from_state(state, |record| {
-        completed_end += record.len() as u64;
-        new_offsets.push(completed_end);
-    });
-
-    process_persisted_log_reader(file, &mut scanner)?;
-    index.scanner_state = scanner.into_state();
-    index.indexed_len = file_len;
-    index
-        .complete_record_end_offsets
-        .extend_from_slice(&new_offsets);
-
-    Ok(new_offsets)
-}
-
-fn load_persisted_log_index(log_path: &Path) -> std::io::Result<PersistedLogIndex> {
-    let meta = read_log_index_meta(log_path)?;
-    let offsets = read_log_index_offsets(log_path)?;
-    Ok(PersistedLogIndex::from_meta(meta, offsets))
-}
-
-fn read_log_index_meta(log_path: &Path) -> std::io::Result<PersistedLogIndexMeta> {
-    let bytes = fs::read(log_index_meta_path(log_path))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
-}
-
-fn read_log_index_offsets(log_path: &Path) -> std::io::Result<Vec<u64>> {
-    let bytes = fs::read(log_index_offsets_path(log_path))?;
-    if bytes.len() % std::mem::size_of::<u64>() != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "log index offsets file has invalid length",
-        ));
-    }
-
-    Ok(bytes
-        .chunks_exact(std::mem::size_of::<u64>())
-        .map(|chunk| {
-            let mut buf = [0u8; std::mem::size_of::<u64>()];
-            buf.copy_from_slice(chunk);
-            u64::from_le_bytes(buf)
-        })
-        .collect())
-}
-
-fn write_log_index_offsets(log_path: &Path, offsets: &[u64]) -> std::io::Result<()> {
-    let mut bytes = Vec::with_capacity(offsets.len() * std::mem::size_of::<u64>());
-    for offset in offsets {
-        bytes.extend_from_slice(&offset.to_le_bytes());
-    }
-
-    fs::write(log_index_offsets_path(log_path), bytes)
-}
-
-fn append_log_index_offsets(log_path: &Path, offsets: &[u64]) -> std::io::Result<()> {
-    if offsets.is_empty() {
-        return Ok(());
-    }
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_index_offsets_path(log_path))?;
-    for offset in offsets {
-        file.write_all(&offset.to_le_bytes())?;
-    }
-    file.flush()
-}
-
-fn write_log_index_meta(log_path: &Path, meta: &PersistedLogIndexMeta) -> std::io::Result<()> {
-    let path = log_index_meta_path(log_path);
-    let temp_path = path.with_extension("meta.tmp");
-    let bytes = serde_json::to_vec(meta)
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(&temp_path, bytes)?;
-    match fs::rename(&temp_path, &path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&path);
-            match fs::rename(&temp_path, &path) {
-                Ok(()) => Ok(()),
-                Err(rename_err) => {
-                    let _ = fs::remove_file(&temp_path);
-                    Err(rename_err)
-                }
-            }
-        }
-        Err(err) => {
-            let _ = fs::remove_file(&temp_path);
-            Err(err)
-        }
-    }
-}
-
-fn log_index_offsets_path(log_path: &Path) -> PathBuf {
-    log_path.with_file_name(LOG_INDEX_OFFSETS_FILE)
-}
-
-fn log_index_meta_path(log_path: &Path) -> PathBuf {
-    log_path.with_file_name(LOG_INDEX_META_FILE)
-}
-
-/// Delete the persisted log-index sidecars for a session directory.
-///
-/// Used after `output.log` is truncated: the cached record offsets and meta
-/// no longer match the file, so they are removed and the index is rebuilt
-/// lazily on the next pagination read. Missing sidecars are not an error.
-pub fn discard_persisted_log_index(dir: &Path) {
-    let log_path = dir.join("output.log");
-    for path in [
-        log_index_offsets_path(&log_path),
-        log_index_meta_path(&log_path),
-    ] {
-        if let Err(err) = fs::remove_file(&path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(?path, %err, "failed to remove stale log index sidecar");
-            }
-        }
-    }
-}
-
 fn find_special_record_byte(bytes: &[u8]) -> Option<usize> {
     bytes
         .iter()
@@ -635,6 +373,7 @@ fn is_alt_screen_toggle(params: &[u8], final_byte: u8) -> bool {
 /// If the seek position doesn't land at byte 0, the first partial line is
 /// dropped to avoid feeding truncated ANSI escape sequences into a downstream
 /// parser (which can corrupt subsequent color state).
+#[cfg(test)]
 pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes> {
     let mut file = File::open(log_path)?;
     let file_size = file.seek(SeekFrom::End(0))?;
@@ -643,7 +382,6 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
         return Ok(TailBytes {
             bytes: Vec::new(),
             start_offset: 0,
-            end_offset: 0,
         });
     }
 
@@ -654,7 +392,11 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
     let ends_with_newline = last_byte[0] == b'\n';
 
     // We want at least `tail * 2` lines, but ensure a minimum of 100 lines for context.
-    let lines_needed = (tail * 2).max(100) + if ends_with_newline { 1 } else { 0 };
+    // Saturate: callers pass usize::MAX for "the whole stream/screen".
+    let lines_needed = tail
+        .saturating_mul(2)
+        .max(100)
+        .saturating_add(usize::from(ends_with_newline));
 
     let chunk_size = 64 * 1024; // 64KB chunks
     let mut position = file_size;
@@ -692,43 +434,60 @@ pub(super) fn read_tail_bytes(log_path: &Path, tail: usize) -> Result<TailBytes>
     Ok(TailBytes {
         bytes,
         start_offset: position,
-        end_offset: file_size,
     })
 }
 
-pub fn read_resize_events(session_dir: &Path) -> Result<Vec<LogResize>> {
-    let events_path = session_dir.join("events.log");
-    let Ok(file) = File::open(events_path) else {
-        return Ok(Vec::new());
-    };
+/// In-memory equivalent of [`read_tail_bytes`] for journal-derived
+/// streams: same tail-window and partial-line-drop semantics.
+pub(super) fn tail_window_bytes(bytes: &[u8], tail: usize) -> TailBytes {
+    if bytes.is_empty() {
+        return TailBytes {
+            bytes: Vec::new(),
+            start_offset: 0,
+        };
+    }
+    let ends_with_newline = bytes.last() == Some(&b'\n');
+    // Saturate: callers pass usize::MAX for "the whole stream/screen".
+    let lines_needed = tail
+        .saturating_mul(2)
+        .max(100)
+        .saturating_add(usize::from(ends_with_newline));
 
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        if let Some(event) = parse_resize_event(&line) {
-            events.push(event);
+    let mut position = bytes.len();
+    let mut lines_found = 0usize;
+    for (i, &byte) in bytes.iter().enumerate().rev() {
+        if byte == b'\n' {
+            lines_found += 1;
+            if lines_found >= lines_needed {
+                position = i + 1;
+                break;
+            }
         }
     }
+    if lines_found < lines_needed {
+        position = 0;
+    }
 
-    Ok(events)
+    TailBytes {
+        bytes: bytes[position..].to_vec(),
+        start_offset: position as u64,
+    }
 }
 
-pub(super) fn read_relevant_resize_events(
-    log_path: &Path,
+/// Pick the resize records relevant to replaying the stream window
+/// `[start_offset, end_offset)`: the geometry in effect at `start_offset`
+/// plus every resize inside the window, rebased to window-relative
+/// offsets. Pure derivation over journal-sourced resize events.
+pub(super) fn viewport_resize_plan(
+    events: &[LogResize],
     start_offset: u64,
     end_offset: u64,
-) -> Result<ViewportReplayPlan> {
-    let Some(session_dir) = log_path.parent() else {
-        return Ok(ViewportReplayPlan::default());
-    };
-
+) -> ViewportReplayPlan {
     let mut initial = None;
     let mut resizes = Vec::new();
-    for event in read_resize_events(session_dir)? {
+    for event in events {
         if event.offset <= start_offset {
-            initial = Some(event);
+            initial = Some(*event);
         } else if event.offset <= end_offset {
             resizes.push(LogResize {
                 offset: event.offset.saturating_sub(start_offset),
@@ -740,32 +499,5 @@ pub(super) fn read_relevant_resize_events(
         }
     }
 
-    Ok(ViewportReplayPlan { initial, resizes })
-}
-
-pub(super) fn parse_resize_event(line: &str) -> Option<LogResize> {
-    let mut offset = None;
-    let mut rows = None;
-    let mut cols = None;
-
-    let mut parts = line.split_ascii_whitespace();
-    if parts.next()? != "resize" {
-        return None;
-    }
-
-    for part in parts {
-        let (key, value) = part.split_once('=')?;
-        match key {
-            "offset" => offset = value.parse::<u64>().ok(),
-            "rows" => rows = value.parse::<u16>().ok().map(|row| row.max(1)),
-            "cols" => cols = value.parse::<u16>().ok().map(|col| col.max(1)),
-            _ => {}
-        }
-    }
-
-    Some(LogResize {
-        offset: offset?,
-        rows: rows?,
-        cols: cols?,
-    })
+    ViewportReplayPlan { initial, resizes }
 }

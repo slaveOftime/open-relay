@@ -19,12 +19,6 @@ pub fn compile_prompt_patterns(patterns: &[String]) -> Vec<regex::Regex> {
 }
 
 /// Returns `true` if any line of `raw_excerpt` matches any compiled pattern.
-/// Convenience wrapper around [`find_prompt_match`].
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn matches_prompt(raw_excerpt: &str, patterns: &[regex::Regex]) -> bool {
-    find_prompt_match(raw_excerpt, patterns).is_some()
-}
-
 /// Returns the source string of the first pattern that matches any line of
 /// `raw_excerpt` (after ANSI stripping), or `None` if nothing matched.
 /// Used by the daemon to include the matched rule in log output.
@@ -138,6 +132,27 @@ impl SessionEvent {
                 last_total_bytes: *last_total_bytes,
                 enabled_for_channels: *enabled_for_channels,
             },
+            SessionEvent::SessionActivity(batch_ref) => {
+                let mut batch = batch_ref.clone();
+                batch.node = merge_node(&batch.node, node);
+                SessionEvent::SessionActivity(batch)
+            }
+            SessionEvent::ResyncRequired {
+                node: existing,
+                reason,
+            } => SessionEvent::ResyncRequired {
+                node: merge_node(existing, node),
+                reason: reason.clone(),
+            },
+            SessionEvent::NodeState {
+                node: name,
+                connected,
+                last_seen,
+            } => SessionEvent::NodeState {
+                node: name.clone(),
+                connected: *connected,
+                last_seen: *last_seen,
+            },
         }
     }
 }
@@ -181,6 +196,33 @@ impl NodeWsMessage {
                 last_total_bytes: *last_total_bytes,
                 enabled_for_channels: *enabled_for_channels,
             },
+            SessionEvent::SessionActivity(batch_ref) => {
+                let mut batch = batch_ref.clone();
+                batch.node = merge_node(&batch.node, node);
+                NodeWsMessage::SessionEvent {
+                    payload: SessionEvent::SessionActivity(batch),
+                }
+            }
+            SessionEvent::ResyncRequired {
+                node: existing,
+                reason,
+            } => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::ResyncRequired {
+                    node: merge_node(existing, node),
+                    reason: reason.clone(),
+                },
+            },
+            SessionEvent::NodeState {
+                node: name,
+                connected,
+                last_seen,
+            } => NodeWsMessage::SessionEvent {
+                payload: SessionEvent::NodeState {
+                    node: name.clone(),
+                    connected: *connected,
+                    last_seen: *last_seen,
+                },
+            },
         }
     }
 }
@@ -197,7 +239,7 @@ fn strip_ansi(input: &str) -> String {
         match chars.peek().copied() {
             Some('[') => {
                 let _ = chars.next();
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if ('@'..='~').contains(&c) {
                         break;
                     }
@@ -206,7 +248,7 @@ fn strip_ansi(input: &str) -> String {
             Some(']') => {
                 let _ = chars.next();
                 let mut prev_esc = false;
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if c == '\x07' {
                         break;
                     }
@@ -235,8 +277,7 @@ mod tests {
     }
 
     fn default_patterns() -> Vec<regex::Regex> {
-        let cfg = crate::config::AppConfig::load().expect("default config");
-        compile_prompt_patterns(&cfg.prompt_patterns)
+        patterns(crate::config::DEFAULT_PROMPT_PATTERNS)
     }
 
     fn sample_summary() -> SessionSummary {
@@ -251,6 +292,7 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2026, 3, 21, 10, 11, 12).unwrap(),
             started_at: None,
             ended_at: None,
+            resume_command: None,
             cwd: Some("C:\\work".to_string()),
             input_needed: true,
             notifications_enabled: false,
@@ -262,6 +304,10 @@ mod tests {
             attach_count: 0,
             foreground_color: None,
             background_color: None,
+            journal_bytes_retained: None,
+            journal_retention_sweeps: None,
+            journal_incarnations_dropped: None,
+            journal_byte_cap: None,
         }
     }
 
@@ -283,6 +329,11 @@ mod tests {
     }
 
     // ── compile / find_prompt_match infrastructure ───────────────────────
+    /// Test-only shorthand: the production API is `find_prompt_match(...).is_some()`.
+    /// The boolean form makes the default-patterns assertions below readable.
+    fn matches_prompt(raw: &str, patterns: &[regex::Regex]) -> bool {
+        find_prompt_match(raw, patterns).is_some()
+    }
 
     #[test]
     fn test_compile_valid_patterns() {
