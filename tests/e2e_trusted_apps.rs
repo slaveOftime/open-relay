@@ -150,6 +150,25 @@ fn trusted_apps_require_opt_in_and_auth_and_can_be_disabled_live() {
             json!({"entry":format!("http://127.0.0.1:{upstream_port}/")}).to_string(),
         )
         .unwrap();
+        // Cross-site browser WS requests must fail before reaching the upstream.
+        let denied = client
+            .get(format!("{base}/apps/proxy/"))
+            .bearer_auth(token)
+            .header("origin", "http://untrusted.example.invalid")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 403);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "rejected origin reached upstream"
+        );
         let upstream = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut socket, _) = listener.accept().await.unwrap();
