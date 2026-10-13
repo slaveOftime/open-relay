@@ -165,6 +165,7 @@ pub async fn serve(state: AppState) {
     // Daemon lifecycle owns the activity sampler, including on HTTP-disabled nodes.
 
     let protected_router = Router::new()
+        .route("/api/static/apps", get(apps::list_static_apps))
         .route("/api/auth/status", get(auth::status))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -233,14 +234,15 @@ pub async fn serve(state: AppState) {
 
     let router = Router::new()
         .route("/api/nodes/join", get(nodes::join_handler))
-        .route("/api/static/apps", get(apps::list_static_apps))
         // Keep the login shell accessible even if wwwroot/login.html exists.
         .route("/login", get(serve_login_page))
         .merge(protected_router)
+        // Install fallback before layers so custom app/static/proxy responses
+        // receive the same security and compression middleware as named routes.
+        .fallback(serve_static_or_proxy)
         .layer(CompressionLayer::new())
         .layer(cors)
         .layer(axum::middleware::from_fn(security_headers))
-        .fallback(serve_static_or_proxy)
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -273,12 +275,21 @@ async fn serve_static_or_proxy(
     let uri = parts.uri.clone();
     let headers = parts.headers.clone();
     let method = parts.method.clone();
+    let trusted_apps_enabled = state.config.get().trusted_apps_enabled;
+    if !trusted_apps_enabled && (uri.path() == "/apps" || uri.path().starts_with("/apps/")) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let wwwroot_dir = state.config.get().wwwroot_dir();
     let auth_token = auth::extract_request_token_parts(&headers, uri.query());
     let bearer = auth::extract_bearer_token(&headers);
     let client_ip = Some(auth::effective_ip(&headers, peer.ip()).to_string());
 
-    match apps::resolve_app_request(wwwroot_dir.clone(), uri.clone()).await {
+    let app_target = if trusted_apps_enabled {
+        apps::resolve_app_request(wwwroot_dir.clone(), uri.clone()).await
+    } else {
+        Ok(None)
+    };
+    match app_target {
         Ok(Some(apps::AppRequestTarget::LocalFile(candidate))) => {
             if let Some(response) = auth::authorize_request(
                 &state,
@@ -319,6 +330,9 @@ async fn serve_static_or_proxy(
             )
             .await;
         }
+        Ok(None) if uri.path().starts_with("/apps/") && uri.path() != "/apps/" => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         Ok(None) => {}
         Err(err) => {
             error!(%err, path = %uri.path(), "failed to resolve app request from wwwroot");
@@ -331,14 +345,17 @@ async fn serve_static_or_proxy(
         Err(status) => return status.into_response(),
     };
 
-    let local_candidate =
+    let local_candidate = if trusted_apps_enabled {
         match apps::find_existing_local_asset(wwwroot_dir.clone(), candidates.clone()).await {
             Ok(candidate) => candidate,
             Err(err) => {
                 error!(%err, path = %uri.path(), "failed to inspect static file in wwwroot");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
-        };
+        }
+    } else {
+        None
+    };
     if let Some(candidate) = local_candidate {
         if let Some(response) =
             auth::authorize_request(&state, uri.path(), auth_token, bearer, client_ip).await
@@ -597,6 +614,7 @@ async fn metrics_middleware(request: Request, next: axum::middleware::Next) -> R
 
 /// Middleware that injects standard security response headers on every reply.
 async fn security_headers(request: Request, next: axum::middleware::Next) -> Response {
+    let trusted_app_route = request.uri().path().starts_with("/apps/");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
@@ -610,11 +628,19 @@ async fn security_headers(request: Request, next: axum::middleware::Next) -> Res
     );
     headers.insert(
         "content-security-policy",
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:",
-        ),
+        HeaderValue::from_static(content_security_policy(trusted_app_route)),
     );
     response
+}
+
+// Inline scripts are allowed only for explicitly enabled trusted app routes.
+// This is not a sandbox: trusted apps share the operator control-plane origin.
+fn content_security_policy(trusted_app_route: bool) -> &'static str {
+    if trusted_app_route {
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:"
+    } else {
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:; font-src 'self' data:; worker-src 'self' blob:"
+    }
 }
 
 /// Resolve an HTTP `MatchedPath` template to the closed histogram label.

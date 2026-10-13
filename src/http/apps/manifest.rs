@@ -14,7 +14,7 @@ use super::html::{
     detect_app_icon_href, extract_app_description, extract_app_icon_href, extract_app_kind,
     extract_title, resolve_manifest_asset_href,
 };
-use super::proxy_targets::{invalid_data, is_private_proxy_target};
+use super::proxy_targets::{invalid_data, is_loopback_proxy_target};
 use super::resolve::{file_exists, find_existing_redirect_asset, normalize_relative_asset_path};
 
 pub const APP_MANIFEST_FILE: &str = "oly.app.json";
@@ -122,11 +122,11 @@ fn resolve_manifest_entry(
                 "app manifest redirect files require a local entry",
             ));
         }
-        // Block proxying to private LAN / link-local addresses to
-        // prevent SSRF via crafted oly.app.json manifests.
-        if is_private_proxy_target(&url) {
+        // Beta proxy scope is explicit loopback literals only: no DNS lookup,
+        // public/LAN targets, URL credentials, or implied remote trust boundary.
+        if !is_loopback_proxy_target(&url) {
             return Err(invalid_data(
-                "app manifest proxy entry must not target private or link-local addresses",
+                "app manifest proxy entry must use a loopback IP literal without URL credentials (127.0.0.1 or [::1])",
             ));
         }
         return Ok(AppEntry::Proxy { entry_url: url });

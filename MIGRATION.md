@@ -26,6 +26,17 @@ switching.** Live processes cannot move between daemons or versions.
 | Configuration | **Flat JSON**; stopped-session age retention only | Remove `max_output_log_bytes` / `max_journal_bytes_per_session`; they now fail explicitly. Live byte caps are unsupported. Do not wrap keys in `limits`. |
 | Daemon status | Effective running flags and endpoint, not just client config | Check the actual endpoint after restart |
 
+### Custom apps are trusted and opt-in
+
+Set flat `"trusted_apps_enabled": true` only after reviewing operator-owned
+apps/services. The default disables custom `/apps/` routes and `wwwroot` overrides,
+not the normal browser terminal/dashboard. App inventory now requires login.
+Inline scripts are allowed on trusted app routes only. Proxy manifests accept
+loopback IP literals (`127.0.0.1`, `[::1]`), not hostnames, public/LAN targets, or
+URL credentials. Existing remote proxy entries need a separate reviewed gateway.
+These apps share the control-plane origin and are **not sandboxed agent output**.
+Disabling the setting blocks new requests, not already-open documents/connections.
+
 ### Configuration validation
 
 An existing unreadable/malformed config or invalid prompt/resume regex now fails

@@ -105,7 +105,7 @@ class DocsSyncTests(unittest.TestCase):
         for name in ("Http", "Notify", "Resume", "WebPush", "Limits"):
             body = re.search(rf"struct {name}Overrides \{{(.*?)\n\}}", CONFIG, re.S).group(1)
             fields.extend(re.findall(r"^    (\w+): Option<", body, re.M))
-        fields.append("log_level")
+        fields.extend(["log_level", "trusted_apps_enabled"])
         skill = (ROOT / "skills/oly-daemon/SKILL.md").read_text()
         table_fields = re.findall(r"^\| `(\w+)` \|", skill, re.M)
         # The startup-override table has flag names, not these config-key rows.

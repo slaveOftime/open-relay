@@ -33,6 +33,9 @@ view-only attach is coordination, not a restricted account.
 
 ## Connect machines
 
+Federation interoperability is **experimental during beta**; read the
+[compatibility policy](./COMPATIBILITY.md) before deployment.
+
 A **primary** routes commands to connected **secondary** daemons. Each owning
 daemon keeps authority over its processes, journal, attach roles, and credits.
 Run compatible versions on all nodes; mixed-version rollout is unsupported.
@@ -145,5 +148,8 @@ keys, actual defaults, and reload behavior, use `oly skill --daemon` or the
 disabled by default and permanently removes session files when enabled. Live
 journal byte caps are unsupported; use OS quotas for hard disk bounds.
 
-To publish an HTML result or proxy a local web app, read `oly skill --apps`
-or the [apps skill](../skills/oly-apps/SKILL.md).
+Custom apps/proxies and `wwwroot` overrides are disabled by default. With operator
+approval, `trusted_apps_enabled: true` enables reviewed code on the control-plane
+origin, **not** isolated/untrusted reports. Proxy entries accept loopback IP
+literals only; no remote hosts or DNS names. Read `oly skill --apps` or the
+[apps skill](../skills/oly-apps/SKILL.md) before enabling.

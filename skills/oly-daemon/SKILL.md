@@ -66,6 +66,7 @@ silently skipped. Startup cannot fall back to defaults on an invalid existing fi
 | `web_push_vapid_private_key` | generated on first load | Live; channels rebuilt; secret |
 | `web_push_proxy` | none | Live subject to CLI/environment overrides |
 | `log_level` | `info` | Live tracing-filter reload |
+| `trusted_apps_enabled` | `false` | Live; opt in to trusted custom apps/proxies and wwwroot overrides |
 | `max_running_sessions` | `50` | Sampled at session start; 0..1000; 0 blocks new sessions |
 | `session_eviction_seconds` | `15` | Live runtime-eviction delay; minimum 1 second |
 | `screen_scrollback_rows` | `5000` | New session engines; 0..100000; existing engines retain their setting |

@@ -339,6 +339,7 @@ pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
         },
         resume: crate::config::ResumeConfig::default(),
         log_level: "info".into(),
+        trusted_apps_enabled: false,
         runtime_overrides: Default::default(),
     }
 }

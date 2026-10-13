@@ -11,6 +11,16 @@ HTTP endpoint. HTTP must be enabled. An app lives under
 `http://127.0.0.1:<PORT>/apps/<app-name>/` with the daemon's HTTP authentication.
 Use the actual bind/port reported by status, not an assumed default.
 
+Custom apps, proxies, and `wwwroot` overrides are **disabled by default**.
+With operator authorization, set the flat config key `"trusted_apps_enabled": true`
+and verify hot reload. This enables **trusted operator code** on the same origin
+as session controls, not a sandbox for untrusted agent output. App routes allow
+inline scripts; the normal control UI keeps its stricter CSP. Do not enable or
+publish arbitrary generated code without reviewing it. App inventory and routes
+require normal HTTP authentication. Disabling hides new app requests but does not
+revoke a document/connection already open; close those or revoke browser sessions
+if immediate access revocation is needed.
+
 ## Static HTML
 
 Create `<ROOT>/wwwroot/apps/<app-name>/index.html` and its assets. No manifest
@@ -52,10 +62,12 @@ A fixed `/apps/<app-name>/` asset base works better than `./` for deep links.
 
 The service must already be running on the **daemon's machine**. Proxy entries
 support HTTP(S) and WebSocket upgrades. Do not combine them with `redirect_files`
-(local entries only). Loopback targets are supported; private LAN/link-local
-literal targets are rejected by the manifest guard. Do not treat this guard as
-a complete security boundary: manifests are trusted operator configuration,
-not something untrusted users should be allowed to publish.
+(local entries only). Beta accepts **loopback IP literals only** (`127.0.0.1` or
+`[::1]`), with no URL credentials. Hostnames (including `localhost`), public/LAN
+addresses, and origin-changing request paths are rejected; no DNS resolution or
+HTTP redirect following expands the scope. Use a separate reviewed reverse proxy
+for remote services. Manifests remain trusted configuration; loopback services
+are not automatically safe to expose to every authenticated operator.
 
 ## Manifest schema
 

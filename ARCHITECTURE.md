@@ -420,8 +420,14 @@ durable journal tail and store a suggestion; they never execute it.
   permanently delete stopped sessions; it defaults to disabled. Use OS quotas
   for hard disk limits.
 - **Trust:** the daemon executes as its OS user, without a sandbox. HTTP login
-  protects operator access; attach roles only coordinate input/resize. Federation
-  uses pinned identities and sealed traffic but has no forward secrecy.
+  protects operator access; attach roles only coordinate input/resize. Custom apps,
+  proxies, and wwwroot overrides require `trusted_apps_enabled` (default false).
+  They are reviewed operator code sharing the control-plane origin, not isolated
+  agent reports. App routes permit inline scripts; normal UI routes do not.
+  Proxy targets are loopback IP literals only, and joined paths cannot change
+  origin. Security middleware covers fallback responses as well as named routes.
+  Federation uses pinned identities and sealed traffic but has no forward secrecy;
+  interoperability remains experimental during beta.
 
 ## Documents
 
@@ -433,4 +439,5 @@ durable journal tail and store a suggestion; they never execute it.
 - [Migration](./MIGRATION.md) — breaking changes and safe upgrade/rollback.
 - [Performance](./PERFORMANCE.md) — data-path measurements and recovery budgets.
 - [Contributing](./CONTRIBUTING.md) — development workflow.
+- [Compatibility](./docs/COMPATIBILITY.md) — beta guarantees and experimental interfaces.
 - [Release checklist](./docs/RELEASING.md) — promotion gates and manual checks.

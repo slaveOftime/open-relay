@@ -918,6 +918,7 @@ mod tests {
             },
             resume: crate::config::ResumeConfig::default(),
             log_level: "info".to_string(),
+            trusted_apps_enabled: false,
             runtime_overrides: Default::default(),
         }
     }

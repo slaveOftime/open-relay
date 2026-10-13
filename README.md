@@ -128,7 +128,7 @@ Open **http://127.0.0.1:15443** for the browser UI, or use
 - [Agent skills](./skills/oly/SKILL.md) — general usage; [worker supervision](./skills/oly-subagent/SKILL.md), [daemon configuration](./skills/oly-daemon/SKILL.md), [web apps](./skills/oly-apps/SKILL.md)
 - [Migration](./MIGRATION.md) — breaking changes and safe upgrades
 - [Architecture](./ARCHITECTURE.md) · [Performance](./PERFORMANCE.md) · [Contributing](./CONTRIBUTING.md)
-- [Release checklist](./docs/RELEASING.md) — gates before promoting the next release
+- [Compatibility](./docs/COMPATIBILITY.md) · [Beta release notes](./docs/RELEASE-NOTES-0.5.0-beta.1.md) · [Release checklist](./docs/RELEASING.md)
 
 MIT licensed. If oly makes your workflow easier, a
 [star on GitHub](https://github.com/slaveOftime/open-relay) helps others find it.

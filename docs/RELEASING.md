@@ -28,6 +28,8 @@ must match each other, but need not already include the prerelease suffix.
 ## Before tagging
 
 - [ ] Choose version/channel and record scope, breaking changes, and known limits.
+      Draft: [0.5.0-beta.1 notes](./RELEASE-NOTES-0.5.0-beta.1.md) and
+      [compatibility policy](./COMPATIBILITY.md).
 - [ ] Ensure `Cargo.toml` and the `oly` entry in `Cargo.lock` match. Verify the
       tag-derived transformation with offline release tests and locked Cargo commands.
 - [ ] Confirm fresh installs and upgrades use the intended npm scoped package,
@@ -39,6 +41,9 @@ must match each other, but need not already include the prerelease suffix.
 - [ ] Write user-facing release notes: why upgrade, incompatibilities, backup /
       rollback, changed flags, and supported platforms. Generated commit notes
       alone are not the migration story.
+- [ ] Authenticate the GitHub CLI and verify the **updated** PR head checks,
+      required reviews and mergeability. Merge that exact head before tagging;
+      tag the merged commit, not an older green SHA or an uncommitted checkout.
 - [ ] Confirm required secrets/permissions (`NPM_TOKEN`, `CARGO_REGISTRY_TOKEN`,
       release uploads, default-branch formula update); check registry version
       availability and retry behavior. Do not overwrite an existing release.

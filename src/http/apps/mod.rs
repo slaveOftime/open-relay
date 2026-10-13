@@ -117,6 +117,9 @@ pub(super) fn ensure_wwwroot(config: &AppConfig) -> io::Result<PathBuf> {
 }
 
 pub(super) async fn list_static_apps(State(state): State<AppState>) -> Response {
+    if !state.config.get().trusted_apps_enabled {
+        return Json(Vec::<StaticApp>::new()).into_response();
+    }
     let wwwroot = state.config.get().wwwroot_dir();
     match discover_static_apps_async(wwwroot).await {
         Ok(apps) => Json(apps).into_response(),
@@ -358,6 +361,7 @@ mod tests {
             },
             resume: crate::config::ResumeConfig::default(),
             log_level: "info".into(),
+            trusted_apps_enabled: true,
             runtime_overrides: Default::default(),
         }
     }
@@ -634,7 +638,7 @@ mod tests {
             app_dir.join(APP_MANIFEST_FILE),
             r#"{
                 "title": "Remote",
-                "entry": "https://example.com/dash/index.html?mode=full"
+                "entry": "http://127.0.0.1:5173/dash/index.html?mode=full"
             }"#,
         )
         .expect("manifest should be written");
@@ -650,9 +654,9 @@ mod tests {
         assert_eq!(
             resolved,
             Some(AppRequestTarget::Proxy(vec![
-                Url::parse("https://example.com/dash/assets/main.js?theme=dark")
+                Url::parse("http://127.0.0.1:5173/dash/assets/main.js?theme=dark")
                     .expect("proxy URL should parse"),
-                Url::parse("https://example.com/assets/main.js?theme=dark")
+                Url::parse("http://127.0.0.1:5173/assets/main.js?theme=dark")
                     .expect("root fallback proxy URL should parse"),
             ]))
         );

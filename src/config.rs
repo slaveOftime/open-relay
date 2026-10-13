@@ -216,6 +216,8 @@ pub struct AppConfig {
     pub web_push: WebPushConfig,
     pub resume: ResumeConfig,
     pub log_level: String,
+    /// Opt-in trusted operator content sharing the control-plane origin.
+    pub trusted_apps_enabled: bool,
     /// CLI/runtime flag overrides, recorded so hot reloads can re-apply them:
     /// a value passed on the command line keeps winning over `config.json`
     /// even after the file is edited.
@@ -270,6 +272,7 @@ struct AppConfigOverrides {
     #[serde(flatten)]
     resume: ResumeOverrides,
     log_level: Option<String>,
+    trusted_apps_enabled: Option<bool>,
     /// Unconsumed flat keys are reported rather than silently ignored.
     #[serde(flatten)]
     unknown: std::collections::BTreeMap<String, serde_json::Value>,
@@ -426,6 +429,7 @@ impl AppConfig {
                 patterns: resume_patterns,
             },
             log_level,
+            trusted_apps_enabled: overrides.trusted_apps_enabled.unwrap_or(false),
             runtime_overrides: RuntimeOverrides::default(),
         }
     }
@@ -519,6 +523,9 @@ impl AppConfig {
         changed.extend(self.resume.diff(&other.resume));
         if self.log_level != other.log_level {
             changed.push("log_level");
+        }
+        if self.trusted_apps_enabled != other.trusted_apps_enabled {
+            changed.push("trusted_apps_enabled");
         }
         changed
     }
@@ -747,6 +754,7 @@ mod tests {
             },
             resume: crate::config::ResumeConfig::default(),
             log_level: "info".to_string(),
+            trusted_apps_enabled: false,
             runtime_overrides: Default::default(),
         }
     }
@@ -1059,6 +1067,19 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn trusted_apps_are_opt_in_and_reloadable() {
+        let base = AppConfig::resolve(PathBuf::from("test-state"), Default::default());
+        assert!(!base.trusted_apps_enabled);
+        let overrides = serde_json::from_str(r#"{"trusted_apps_enabled":true}"#).unwrap();
+        let enabled = AppConfig::resolve(PathBuf::from("test-state"), overrides);
+        assert!(enabled.trusted_apps_enabled);
+        assert_eq!(
+            base.hot_reload_changes(&enabled),
+            vec!["trusted_apps_enabled"]
+        );
     }
 
     #[test]

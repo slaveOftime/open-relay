@@ -51,6 +51,15 @@ pub(super) fn build_proxy_target_urls(
         }
     }
 
+    // URL joining must not expand a valid manifest into a different host.
+    if targets
+        .iter()
+        .any(|target| !is_loopback_proxy_target(target) || target.origin() != entry_url.origin())
+    {
+        return Err(invalid_data(
+            "app proxy request must stay on its configured loopback origin",
+        ));
+    }
     Ok(targets)
 }
 
@@ -92,40 +101,66 @@ pub(super) fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// Returns `true` if the proxy target URL resolves to a private LAN,
-/// link-local, or unspecified address.  Loopback (127.0.0.0/8, ::1) is
-/// intentionally allowed because the primary use-case for proxy entries is
-/// forwarding to local dev servers (e.g. Vite on 127.0.0.1:5173).
-pub(super) fn is_private_proxy_target(url: &Url) -> bool {
-    use std::net::IpAddr;
-
-    let host = match url.host_str() {
-        Some(h) => h,
-        None => return true, // No host → reject
-    };
-
-    // Try to parse as IP directly first.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return is_ssrf_dangerous_ip(&ip);
+/// Only explicit loopback literals are supported; hostnames never enter DNS.
+/// Strip IPv6 URL brackets before parsing; never resolve a domain.
+pub(super) fn is_loopback_proxy_target(url: &Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
     }
-
-    false
+    url.host_str()
+        .and_then(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .ok()
+        })
+        .is_some_and(|ip| ip.is_loopback())
 }
 
-/// Returns `true` for IPs that are SSRF-dangerous: private LAN ranges,
-/// link-local (cloud metadata), and unspecified.  Loopback is allowed.
-pub(super) fn is_ssrf_dangerous_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_private()        // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-                || v4.is_link_local()  // 169.254.0.0/16 (cloud metadata)
-                || v4.is_unspecified() // 0.0.0.0
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_scope_is_loopback_literals_only() {
+        for value in [
+            "http://127.0.0.1:5173/",
+            "https://127.0.0.2/",
+            "http://[::1]:5173/",
+        ] {
+            assert!(
+                is_loopback_proxy_target(&Url::parse(value).unwrap()),
+                "{value}"
+            );
         }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_unspecified() // ::
-                || v6.to_ipv4_mapped().is_some_and(|v4| {
-                    v4.is_private() || v4.is_link_local()
-                })
+        for value in [
+            "http://localhost:5173/",
+            "https://example.com/",
+            "http://10.0.0.1/",
+            "http://169.254.169.254/",
+            "http://0.0.0.0/",
+            "http://[::]/",
+            "http://[fe80::1]/",
+            "http://[fc00::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://user:secret@127.0.0.1/",
+            "ftp://127.0.0.1/",
+        ] {
+            assert!(
+                !is_loopback_proxy_target(&Url::parse(value).unwrap()),
+                "{value}"
+            );
         }
+    }
+
+    #[test]
+    fn joined_targets_never_escape_manifest_origin() {
+        let origin = Url::parse("http://127.0.0.1:5173/dash/").unwrap();
+        assert!(build_proxy_target_urls(&origin, "//example.com/secret", None).is_err());
+        assert!(build_proxy_target_urls(&origin, "http://127.0.0.1:9999/", None).is_err());
+        assert!(build_proxy_target_urls(&origin, "assets/app.js", None).is_ok());
     }
 }
