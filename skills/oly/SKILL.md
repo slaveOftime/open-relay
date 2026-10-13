@@ -191,7 +191,9 @@ oly export <ID>                                           # fixed-prefix canonic
   for a TUI. Views are lossy, with observation cursors only. Start future-byte
   observation using `cursor=$(oly logs <ID> --cursor)`, then `--since "$cursor"
   --wait output --timeout 5m --json`. Decode base64 `.bytes` and chain `.cursor`;
-  drain pages while `.has_more`, including after exit. Empty pages preserve
+  drain pages while `.has_more`, including after exit. Stream `.running` stays
+  true until an exited child's PTY reaches EOF; metadata may already be stopped.
+  Empty pages preserve
   the cursor; timeout exits 2 without advancing it. Do not combine `--since`
   with any explicit view flag. Pages may split UTF-8/control sequences;
   retain decoder/parser state. `--limit-bytes` defaults to 256 KiB, max 8 MiB.

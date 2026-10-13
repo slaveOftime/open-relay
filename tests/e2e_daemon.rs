@@ -818,6 +818,20 @@ fn e2e_federation_primary_secondary_full_lifecycle() {
         String::from_utf8_lossy(&stop.stderr)
     );
 
+    // Stop acknowledges the child lifecycle, not PTY EOF. On Windows the
+    // final ConPTY bytes can arrive after it; separate fixed-prefix exports
+    // made during that drain are legitimately different. A completed attach
+    // waits for output EOF and the journal tail before this equality check.
+    let drained = oly_cmd(&primary_tmp)
+        .args(["attach", &session_id, "--observe", "--node", "worker1"])
+        .output()
+        .expect("wait for remote output stream completion");
+    assert!(
+        drained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drained.stderr)
+    );
+
     // Remote delivery must be byte-identical to local canonical export,
     // including base64 carry and tiny continuation-page boundaries.
     let local = oly_cmd(&secondary_tmp)

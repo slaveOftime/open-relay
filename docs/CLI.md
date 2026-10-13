@@ -237,6 +237,9 @@ done
 
 JSON pages contain `mode: "stream"`, base64 `bytes`, `encoding`,
 `start_cursor`, next `cursor`, `has_more`, `running`, and `exit_code`.
+Stream `running` remains true while an exited child's PTY output is still
+open; metadata status may already be stopped. Attach completion also waits for
+PTY EOF and the readable journal tail, so the final cursor is not premature.
 Drain pages while `has_more`, including after child exit. Empty pages preserve
 the cursor; `has_more` describes the end observed by that read. Page size defaults
 to 256 KiB, max 8 MiB. Pages can split UTF-8 and escape sequences: keep a decoder

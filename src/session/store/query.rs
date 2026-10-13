@@ -32,7 +32,9 @@ pub struct LiveRenderSnapshot {
 }
 
 impl SessionStore {
-    /// Liveness, incarnation and byte offset share one runtime lock.
+    /// Stream liveness, incarnation and byte offset share one runtime lock.
+    /// An exited child may still have PTY bytes in flight; byte-page consumers
+    /// must not see running=false until output EOF makes the end offset final.
     pub async fn stream_observation(
         &self,
         id: &str,
@@ -40,7 +42,7 @@ impl SessionStore {
         if let Ok(handle) = self.lookup_runtime(id).await {
             let rt = handle.read();
             return Some((
-                !rt.is_completed(),
+                !rt.is_completed() || !rt.output_closed,
                 rt.meta.exit_code,
                 rt.filtered_stream_len(),
                 rt.journal_incarnation(),
@@ -76,7 +78,7 @@ impl SessionStore {
         if let Ok(handle) = self.lookup_runtime(id).await {
             let rt = handle.read();
             return Some((
-                !rt.is_completed(),
+                !rt.is_completed() || !rt.output_closed,
                 rt.meta.exit_code,
                 rt.filtered_stream_len(),
                 rt.journal_incarnation(),
@@ -429,6 +431,21 @@ mod tests {
     use chrono::Utc;
 
     use std::time::Duration;
+    #[tokio::test]
+    async fn stream_observation_waits_for_pty_eof_after_child_exit() {
+        let rt = make_runtime("stream-drain", SessionStatus::Stopped, "prefix", None);
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        assert!(store.stream_observation("stream-drain").await.unwrap().0);
+        {
+            let mut rt = rt.write();
+            rt.push_output(b"tail", 4);
+            rt.output_closed = true;
+        }
+        let observation = store.stream_observation("stream-drain").await.unwrap();
+        assert!(!observation.0);
+        assert_eq!(observation.2, 10);
+    }
+
     #[tokio::test]
     async fn session_info_reads_live_fields_without_changing_metadata() {
         let rt = make_runtime("info-live", SessionStatus::Running, "hello", None);

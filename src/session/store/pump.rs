@@ -211,7 +211,11 @@ impl AttachPump {
                     AttachInit {
                         data: snapshot,
                         end_offset,
-                        running: store.is_running(id),
+                        running: {
+                            let (running, output_closed, _) =
+                                store.attach_stream_status(id).await?;
+                            running || !output_closed
+                        },
                         modes,
                         incarnation: init_incarnation,
                     },
@@ -225,7 +229,11 @@ impl AttachPump {
                     AttachInit {
                         data: collect_chunk_bytes(&chunks),
                         end_offset: end,
-                        running: store.is_running(id),
+                        running: {
+                            let (running, output_closed, _) =
+                                store.attach_stream_status(id).await?;
+                            running || !output_closed
+                        },
                         modes,
                         incarnation: init_incarnation,
                     },
@@ -350,7 +358,7 @@ impl AttachPump {
                     if self.completing.is_some() {
                         continue; // already draining the tail
                     }
-                    let (running, _output_closed, exit_code) =
+                    let (running, output_closed, exit_code) =
                         match self.store.attach_stream_status(&self.id).await {
                             Ok(state) => state,
                             Err(err) => {
@@ -359,7 +367,9 @@ impl AttachPump {
                                 return AttachEvent::Closed;
                             }
                         };
-                    if !running {
+                    if !running && output_closed {
+                        // Child exit alone does not close the output stream:
+                        // ConPTY can still deliver buffered tail/mode resets.
                         // Flush the final persisted bytes in bounded windows
                         // before Done so the client sees the complete
                         // stream; Done fires when the drain catches up to
@@ -813,6 +823,7 @@ mod tests {
             let mut rt = rt.write();
             rt.meta.status = SessionStatus::Stopped;
             rt.meta.exit_code = Some(7);
+            rt.output_closed = true;
         }
         match tokio::time::timeout(Duration::from_secs(5), pump.next()).await {
             Ok(AttachEvent::Done {
@@ -825,6 +836,54 @@ mod tests {
             }
             other => panic!("expected done, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exited_child_does_not_end_attach_before_output_eof() {
+        let (store, rt) = running_store("drain1", "").await;
+        {
+            let mut rt = rt.write();
+            rt.meta.status = SessionStatus::Stopped;
+            rt.meta.exit_code = Some(0);
+        }
+        let (mut pump, init) =
+            AttachPump::subscribe(&store, "drain1", None, None, PumpCredit::Uncredited)
+                .await
+                .unwrap();
+        assert!(
+            init.running,
+            "an exited child with an open PTY still has stream output"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), pump.next())
+                .await
+                .is_err(),
+            "attach must not emit Done before PTY EOF"
+        );
+        let dir = rt.read().dir.clone();
+        super::super::testsupport::seed_journal_output(&dir, b"final-tail");
+        emit(&rt, b"final-tail");
+        match tokio::time::timeout(Duration::from_secs(5), pump.next())
+            .await
+            .unwrap()
+        {
+            AttachEvent::Chunk { offset, data } => {
+                assert_eq!(offset, 0);
+                assert_eq!(data, b"final-tail");
+            }
+            _ => panic!("expected final output before Done"),
+        }
+        rt.write()
+            .close_output_stream_at_boundary("test PTY EOF".into(), true);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), pump.next())
+                .await
+                .unwrap(),
+            AttachEvent::Done {
+                final_offset: 10,
+                exit_code: Some(0)
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1194,7 +1253,11 @@ mod tests {
 
         // Clean end: every client drains the tail and sees the same final
         // cursor.
-        rt.write().mark_completed(SessionStatus::Stopped, Some(0));
+        {
+            let mut rt = rt.write();
+            rt.mark_completed(SessionStatus::Stopped, Some(0));
+            rt.close_output_stream_at_boundary("test PTY EOF".into(), true);
+        }
         for _ in 0..500 {
             if clients.iter().all(|client| client.done) {
                 break;

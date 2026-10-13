@@ -413,11 +413,8 @@ pub(super) async fn handle_observe_window(
         }
     };
     let next_offset = from + data.len() as u64;
-    let (running, _, exit_code) = session_store
-        .attach_stream_status(&id)
-        .await
-        .unwrap_or((false, true, None));
     let after = session_store.stream_observation(&id).await;
+    let (running, exit_code) = after.as_ref().map(|v| (v.0, v.1)).unwrap_or((false, None));
     if before.as_ref().map(|v| v.3) != after.as_ref().map(|v| v.3) {
         return RpcResponse::Error {
             message: "session restarted during window read".into(),

@@ -160,6 +160,8 @@ Design points worth knowing before touching this code:
   bounded drain wait, fences its activity counter, and continues recording every
   successful read through EOF. Buffered child output can arrive alongside console
   mode-reset bytes after close starts; timing is not a safe reason to discard it.
+  Attach `Done` and byte-observation stream liveness wait for output EOF, not
+  just the child's terminal lifecycle status. Only then is the final cursor fixed.
 - **A screen repaint is not scrollback.** Windows attach still renders the
   canonical engine screen instead of forwarding ConPTY's wrap-dependent
   bytes, but the same parser delegates through `terminal/render_effects.rs`
