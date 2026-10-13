@@ -253,13 +253,40 @@ Federation rules to preserve:
   or credit checks — everything goes through that node's own daemon.
 - **Relay failure is loud.** Stream frames use bounded queues; a dead
   node ends proxied streams with an explicit error, and connectors
-  reconnect with backoff rather than silently buffering.
+  reconnect with backoff rather than silently buffering. A lagged secondary
+  connector sends its `resync_required` marker directly to its primary,
+  never back into the source event ring: otherwise multiple lagged joins
+  can keep each other lagging and flood logs after a stalled send or sleep.
 
 Where to look: `src/node/registry.rs` (NodeRegistry, proxy_*),
 `src/daemon/rpc_nodes.rs` (secondary connector, nested-IPC relay,
 allowlists), `src/http/nodes.rs` (join endpoint, keepalive, event
 tagging), `src/federation_crypto.rs` (channel-key derivation + signature
 helpers), `src/client/join.rs` (join config + CLI).
+
+## Windows IPC and sleep/resume failures
+
+Local IPC uses `interprocess` → Tokio → Mio Windows named pipes; federation
+uses a separate TCP/WebSocket connection. Network loss during sleep/resume is
+an expected federation disconnect and is retried with backoff. It must not
+terminate the daemon or local sessions. Relayed attaches also use nested local
+IPC, so a remote disconnect can coincide with local pipe teardown.
+
+Windows builds require Mio **1.2.4 or newer** (enforced in `Cargo.toml`). Earlier
+versions can mishandle an overlapped operation that fails just after submission:
+a completion packet still arrives, but its pending state/reference was not
+retained. This can cause a panic in `write_done` (`State::None => unreachable!()`),
+mutex poisoning in subsequent deregister/drop calls, or use-after-free
+(upstream `tokio-rs/mio#2014`). Catching a client-handler panic is not a repair
+for corrupted IOCP state; use the upstream fix.
+
+`src/daemon/crash.rs` records Rust panics in `logs/daemon-crash.log` and detached
+stderr in `logs/daemon-stderr.log`. Preserve the first panic's location: later
+`PoisonError` panics can be secondary failures. Release backtraces may lack
+symbols; a debug build gives better attribution. Actual laptop suspend/resume
+still needs a manual soak test; the Windows IPC regression in
+`tests/e2e_daemon.rs` exercises peer disconnects during queued writes on real
+named pipes without suspending the host.
 
 ## The invariants that matter
 

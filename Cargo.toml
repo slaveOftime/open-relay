@@ -108,6 +108,10 @@ mimalloc = { version = "0.1.52" }
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [target.'cfg(windows)'.dependencies]
+# Transitive through Tokio: 1.2.4 fixes named-pipe use-after-free when an
+# overlapped operation fails just after submission (tokio-rs/mio#2014).
+# Keep a minimum here so lockfile-free installs cannot select the broken code.
+mio = "1.2.4"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Environment", "Win32_System_Kernel", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(windows)'.build-dependencies]

@@ -74,15 +74,7 @@ pub(super) fn spawn_join_connector(
     };
     let session_event_rx = session_event_tx.subscribe();
     let task = tokio::spawn(async move {
-        run_join_connector(
-            join,
-            local_config,
-            session_event_tx,
-            session_event_rx,
-            stop_rx,
-            reporter,
-        )
-        .await;
+        run_join_connector(join, local_config, session_event_rx, stop_rx, reporter).await;
     });
     (task.abort_handle(), stop_tx)
 }
@@ -90,7 +82,6 @@ pub(super) fn spawn_join_connector(
 async fn run_join_connector(
     join: JoinConfig,
     local_config: Arc<AppConfig>,
-    session_event_tx: broadcast::Sender<SessionEvent>,
     mut session_event_rx: broadcast::Receiver<SessionEvent>,
     mut stop_rx: watch::Receiver<bool>,
     mut attempt_report: AttemptReporter,
@@ -102,7 +93,6 @@ async fn run_join_connector(
         match connect_and_relay(
             &join,
             &local_config,
-            &session_event_tx,
             &mut session_event_rx,
             &mut stop_rx,
             &mut attempt_report,
@@ -146,7 +136,6 @@ async fn run_join_connector(
 async fn connect_and_relay(
     join: &JoinConfig,
     local_config: &Arc<AppConfig>,
-    session_event_tx: &broadcast::Sender<SessionEvent>,
     session_event_rx: &mut broadcast::Receiver<SessionEvent>,
     stop_rx: &mut watch::Receiver<bool>,
     attempt_report: &mut AttemptReporter,
@@ -330,37 +319,39 @@ async fn connect_and_relay(
                     _ => break,
                 }
             }
-            session_event = session_event_rx.recv() => {
-                match session_event {
-                    Ok(event) => {
-                        let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
-                        debug!(node = %join.name, event = ?event, "relaying session event to primary");
-                        if !send_node_message(&mut ws_tx, &relay, &mut phase).await {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(node = %join.name, skipped, "session event relay lagged");
-                        // CR-4: surface `resync_required` so the primary's
-                        // SSE listener knows the relay's view diverged and
-                        // that any subsequent activity byte counters lost
-                        // their basis. Continue this loop on lag; the
-                        // encoding pipeline below will resume on the
-                        // next delivered frame.
-                        let _ = session_event_tx.send(SessionEvent::ResyncRequired {
-                            // This daemon owns the dropped events. The primary
-                            // applies our registered secondary name on delivery.
-                            node: None,
-                            reason: Some("relay_lagged".to_string()),
-                        });
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+            session_event = next_relay_event(session_event_rx, &join.name) => {
+                let Some(event) = session_event else { break };
+                let relay = NodeWsMessage::from_session_event(&event, Some(join.name.as_str()));
+                debug!(node = %join.name, event = ?event, "relaying session event to primary");
+                if !send_node_message(&mut ws_tx, &relay, &mut phase).await {
+                    break;
                 }
             }
         }
     }
 
     Ok(false)
+}
+
+/// Convert a local relay gap into a marker for this primary only. Publishing
+/// it back into the source ring lets lagged connectors keep each other lagging
+/// indefinitely (and flood stderr), especially after sleep or a stalled send.
+async fn next_relay_event(
+    rx: &mut broadcast::Receiver<SessionEvent>,
+    node: &str,
+) -> Option<SessionEvent> {
+    match rx.recv().await {
+        Ok(event) => Some(event),
+        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+            warn!(node, skipped, "session event relay lagged");
+            Some(SessionEvent::ResyncRequired {
+                // The primary applies our registered secondary name on delivery.
+                node: None,
+                reason: Some("relay_lagged".to_string()),
+            })
+        }
+        Err(broadcast::error::RecvError::Closed) => None,
+    }
 }
 
 type NodeSocket =
@@ -839,6 +830,57 @@ pub(super) async fn handle_node_proxy_streaming(
 mod tests {
     use super::{is_stream_message_relayable, is_supported_proxied_rpc};
     use crate::protocol::{ListQuery, ListSortField, RpcRequest, SortOrder};
+
+    #[tokio::test]
+    async fn lagged_relays_emit_gap_markers_without_feeding_the_source_ring() {
+        use crate::{protocol::NodeWsMessage, session::SessionEvent};
+        use tokio::sync::broadcast;
+
+        let (tx, mut first) = broadcast::channel(1);
+        let mut second = tx.subscribe();
+        for connected in [true, false] {
+            tx.send(SessionEvent::NodeState {
+                node: "worker".into(),
+                connected,
+                last_seen: None,
+            })
+            .unwrap();
+        }
+        let source_len = tx.len();
+        for rx in [&mut first, &mut second] {
+            let marker = super::next_relay_event(rx, "secondary").await.unwrap();
+            assert!(matches!(
+                &marker,
+                SessionEvent::ResyncRequired { node: None, reason: Some(reason) }
+                    if reason == "relay_lagged"
+            ));
+            assert!(matches!(
+                NodeWsMessage::from_session_event(&marker, Some("secondary")),
+                NodeWsMessage::SessionEvent {
+                    payload: SessionEvent::ResyncRequired { node: Some(node), .. }
+                } if node == "secondary"
+            ));
+            assert_eq!(
+                tx.len(),
+                source_len,
+                "gap reporting must not publish source events"
+            );
+            assert!(matches!(
+                super::next_relay_event(rx, "secondary").await,
+                Some(SessionEvent::NodeState {
+                    connected: false,
+                    ..
+                })
+            ));
+            assert!(rx.is_empty(), "the relay must drain, not generate more lag");
+        }
+        drop(tx);
+        assert!(
+            super::next_relay_event(&mut first, "secondary")
+                .await
+                .is_none()
+        );
+    }
 
     /// Only attach stream messages may ride the mid-stream channel —
     /// it is not a general RPC tunnel.

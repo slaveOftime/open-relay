@@ -12,6 +12,99 @@ use std::{
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// Real Windows named pipes, not `tokio::io::duplex`: peers disappear while
+/// large responses are being written. This exercises Mio's IOCP completion
+/// bookkeeping and interprocess's linger/drop path, implicated in the
+/// sleep/resume crash. A fresh RPC after every batch must reach the same daemon.
+#[cfg(windows)]
+#[test]
+fn e2e_windows_ipc_survives_clients_disconnecting_during_writes() {
+    use interprocess::local_socket::{
+        GenericNamespaced,
+        tokio::{Stream, prelude::*},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("windows_ipc_disconnect");
+    let daemon = start_daemon(&tmp);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let name_string = socket_name_for_tmp(&tmp);
+        let name = name_string.to_ns_name::<GenericNamespaced>().unwrap();
+        let health_frame = b"{\"version\":14,\"payload\":{\"type\":\"health\"}}\n";
+        let mut initial = Stream::connect(name.clone()).await.unwrap();
+        initial.write_all(health_frame).await.unwrap();
+        let mut initial_reader = BufReader::new(initial);
+        let mut line = String::new();
+        timeout(Duration::from_secs(5), initial_reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let baseline: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(baseline["payload"]["type"], "health");
+        let pid = baseline["payload"]["daemon_pid"].clone();
+        drop(initial_reader);
+
+        // Stop a nonexistent session: benign, with an error response larger
+        // than the pipe buffers, so a disconnect can interrupt queued writes.
+        let missing_id = "missing".repeat(32 * 1024);
+        let mut frame = serde_json::to_vec(&json!({
+            "version": 14,
+            "payload": {"type": "stop", "id": missing_id, "grace_seconds": 0}
+        }))
+        .unwrap();
+        frame.push(b'\n');
+        for _ in 0..8 {
+            let mut tasks = tokio::task::JoinSet::new();
+            for delay_ms in [0, 0, 1, 1, 2, 2, 5, 5] {
+                let name = name.clone();
+                let frame = frame.clone();
+                tasks.spawn(async move {
+                    let mut stream = Stream::connect(name).await.unwrap();
+                    timeout(Duration::from_secs(5), stream.write_all(&frame))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    stream.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    drop(stream); // Deliberately never read the response.
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+            let mut stream = timeout(Duration::from_secs(5), Stream::connect(name.clone()))
+                .await
+                .unwrap()
+                .unwrap();
+            stream.write_all(health_frame).await.unwrap();
+            let mut reader = BufReader::new(stream);
+            line.clear();
+            timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["payload"]["type"], "health");
+            assert_eq!(response["payload"]["daemon_pid"], pid);
+        }
+    });
+    drop(daemon); // Wait for teardown/linger before checking for panics.
+    let crash_log = tmp.join("oly/logs/daemon-crash.log");
+    let crashes = fs::read_to_string(crash_log).unwrap_or_default();
+    assert!(
+        crashes.is_empty(),
+        "disconnected clients panicked the daemon: {crashes}"
+    );
+    let stderr = fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap();
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        stderr.contains("os error 232") || stderr.contains("os error 109"),
+        "the stress test must actually exercise disconnected-pipe errors: {stderr}"
+    );
+}
+
 #[test]
 fn e2e_start_spawn_failure_exits_nonzero_with_clear_error() {
     let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
