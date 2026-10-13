@@ -312,6 +312,9 @@ async fn serve_static_or_proxy(
             }
         }
         Ok(Some(apps::AppRequestTarget::Proxy(target_urls))) => {
+            if ws_upgrade.is_ok() && !auth::ws_origin_allowed(&headers) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
             if let Some(response) = auth::authorize_request(
                 &state,
                 uri.path(),
