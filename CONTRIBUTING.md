@@ -70,18 +70,21 @@ python3 tests/release_workflow.py
 
 The docs check validates local links/fences, copied prompt defaults, config
 coverage, and protocol version. Packaging checks use fixture binaries and a
-fake `npm` command; they never publish. See [Release preparation](./docs/RELEASING.md)
-for promotion gates and manual artifact checks.
+fake `npm` command; they never publish. See [How to publish a release](./docs/maintainers/release-process.md)
+for maintainer steps and manual artifact checks.
 
 ### Documentation ownership
 
 - `README.md`: short introduction, install, and quick start (keep under 160 lines).
-- `docs/CLI.md`: detailed user-facing command and byte/view semantics.
-- `docs/REMOTE.md`: remote setup, trust boundaries, notifications, and state.
+- `docs/README.md`: documentation index and naming conventions.
+- `docs/guides/`: ongoing CLI and remote-access guides.
+- `docs/releases/`: version-scoped migration, features, compatibility, and release notes.
+- `docs/maintainers/release-process.md`: publishing steps, version handling, and retries.
 - `ARCHITECTURE.md`: implementation map, invariants, and design trade-offs.
 - `skills/*/SKILL.md`: self-contained agent guidance embedded by `oly skill`.
   Keep the daemon skill's config table/default patterns aligned with `src/config.rs`.
-- `MIGRATION.md`: actual breaking changes and safe backup/upgrade/rollback.
+- `docs/releases/migration-0.5.md`: only breaking changes and safe upgrade/rollback;
+  keep enhancements in `docs/releases/whats-new-0.5.md`.
 
 When behavior changes, update the relevant guide and bundled skill together;
 avoid duplicating exhaustive flag tables in the README. Validate assumptions

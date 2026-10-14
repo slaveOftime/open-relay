@@ -1,4 +1,4 @@
-# Compatibility policy for the 0.5 beta
+# Compatibility for 0.5.x
 
 The beta tests a local-first interactive session supervisor, not a general
 agent framework, application sandbox, or multi-user authorization service.
@@ -28,7 +28,8 @@ It is suitable for early adopters who can back up state and coordinate upgrades.
 
 0.3 recordings are not automatically imported. SQLite migration is forward-only;
 rollback requires restoring a pre-upgrade backup. Never use an old binary on a
-migrated database. Private state includes identity keys, push keys, and session data.
+migrated database. Follow [Migration to 0.5](./migration-0.5.md).
+Private state includes identity keys, push keys, and session data.
 
 During beta we aim to retain readability of earlier **0.5 beta** recordings,
 but do not yet promise a frozen on-disk format. Any incompatible beta update must
@@ -54,6 +55,18 @@ of fsync completion. No supported live journal byte cap is provided in this beta
   close open documents or connections. Review services before exposing them.
 - **Attention hints and resume extraction:** prompt/silence heuristics and configured
   child-output suggestions, not authorization, semantic task state, or automatic execution.
+
+### Private protocol consumers
+
+CLI/daemon IPC uses Protocol **14**. One-shot messages are newline-delimited
+`{"version":14,"payload":...}` envelopes. Attach sends a JSON init line, then
+`[u32 LE payload_len][u8 tag][payload]`: output tag 1 carries an offset and bytes;
+control tag 2 carries bare JSON `RpcResponse`. Browser WebSocket uses a separate
+binary envelope over the attach contract.
+
+Source and fixtures are authoritative: `src/protocol.rs`, `src/ipc.rs`,
+`web/src/api/ws-frames.ts`, and `tests/fixtures/ws_frames.json`. Prefer the
+packaged CLI's JSON/cursor/export commands over implementing private IPC.
 
 ## Before stable 0.5
 

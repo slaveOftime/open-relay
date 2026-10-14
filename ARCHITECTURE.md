@@ -34,7 +34,7 @@ core concern:
    The journal is always on; if it fails, the session
    fails loudly rather than recording nothing (ADR-0002, ADR-0006).
    Sessions left over from pre-0.5 builds (only `output.log`) are rejected
-   with an explicit error (see MIGRATION.md).
+   with an explicit error (see docs/releases/migration-0.5.md).
 2. **One authoritative terminal model.** The daemon's live screen, `oly logs`
    rendering, snapshots, and Windows repaint use the embedded alacritty
    engine (`src/terminal/`). Browsers render the canonical stream with
@@ -327,7 +327,7 @@ invariant descriptions throughout this document):
   bounded queues; a stuck client is resynced or dropped, never buffered
   forever.
 - **Explicit degradation.** Missing, corrupt, or pre-0.5 state produces
-  clear errors (see `MIGRATION.md`), never silently empty output.
+  clear errors (see `docs/releases/migration-0.5.md`), never silently empty output.
 
 ## Reading the code
 
@@ -439,12 +439,12 @@ durable journal tail and store a suggestion; they never execute it.
 ## Documents
 
 - [README](./README.md) — positioning, install, and quick start.
-- [CLI guide](./docs/CLI.md) — commands and log/input contracts.
-- [Remote access](./docs/REMOTE.md) — browser, federation, notifications, and state.
+- [CLI guide](./docs/guides/cli.md) — commands and log/input contracts.
+- [Remote access](./docs/guides/remote-access.md) — browser, federation, notifications, and state.
 - [Skills](./skills/oly/SKILL.md) — bundled agent instructions; configuration lives
   in the [daemon skill](./skills/oly-daemon/SKILL.md).
-- [Migration](./MIGRATION.md) — breaking changes and safe upgrade/rollback.
+- [Migration to 0.5](./docs/releases/migration-0.5.md) — breaking changes and safe upgrade/rollback.
 - [Performance](./PERFORMANCE.md) — data-path measurements and recovery budgets.
 - [Contributing](./CONTRIBUTING.md) — development workflow.
-- [Compatibility](./docs/COMPATIBILITY.md) — beta guarantees and experimental interfaces.
-- [Release checklist](./docs/RELEASING.md) — promotion gates and manual checks.
+- [Compatibility](./docs/releases/compatibility-0.5.md) — beta guarantees and experimental interfaces.
+- [How to publish a release](./docs/maintainers/release-process.md) — maintainer steps and verification.

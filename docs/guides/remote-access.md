@@ -1,6 +1,6 @@
 # Remote access, nodes, and notifications
 
-[README](../README.md) · [CLI guide](./CLI.md) · [Architecture](../ARCHITECTURE.md)
+[Documentation](../README.md) · [CLI guide](./cli.md) · [Architecture](../../ARCHITECTURE.md)
 
 ## Browser access
 
@@ -15,7 +15,7 @@ oly daemon start --detach --no-http # CLI-only daemon
 
 These start variants are alternatives, not ways to reconfigure an already
 running daemon. Listener bind/port changes require a restart, which stops its
-live sessions. See the [daemon skill](../skills/oly-daemon/SKILL.md) for config
+live sessions. See the [daemon skill](../../skills/oly-daemon/SKILL.md) for config
 precedence and hot reload.
 
 Keep HTTP on loopback. For access from a phone or another machine, prefer:
@@ -34,7 +34,7 @@ view-only attach is coordination, not a restricted account.
 ## Connect machines
 
 Federation interoperability is **experimental during beta**; read the
-[compatibility policy](./COMPATIBILITY.md) before deployment.
+[compatibility policy](../releases/compatibility-0.5.md) before deployment.
 
 A **primary** routes commands to connected **secondary** daemons. Each owning
 daemon keeps authority over its processes, journal, attach roles, and credits.
@@ -87,7 +87,7 @@ AES-256-GCM seals application frames and keepalives with ordered sequences.
 There is **no forward secrecy**: later private-seed compromise can expose
 recorded federation traffic. Use trusted transport infrastructure too.
 Federation identity checks and encryption remain required with HTTP `--no-auth`.
-See [Architecture](../ARCHITECTURE.md#node-federation) for protocol details.
+See [Architecture](../../ARCHITECTURE.md#node-federation) for protocol details.
 
 ## Notifications
 
@@ -105,7 +105,7 @@ oly notify send <running-id> --title "Needs review" --body "Inspect the session.
 
 A source session must be running; omit the source when it has ended.
 `notify send` requires a title. Notifications go to humans, **not** another
-agent session. See the [subagent skill](../skills/oly-subagent/SKILL.md) for
+agent session. See the [subagent skill](../../skills/oly-subagent/SKILL.md) for
 worker supervision and optional session-to-session reporting.
 
 Configure a hook in the **flat** `<state>/config.json`:
@@ -144,7 +144,7 @@ normal operator state. Tests use separate temporary directories.
 
 Config is flat JSON, **not** nested under `limits` or `notify`. For available
 keys, actual defaults, and reload behavior, use `oly skill --daemon` or the
-[daemon skill](../skills/oly-daemon/SKILL.md). Stopped-session age retention is
+[daemon skill](../../skills/oly-daemon/SKILL.md). Stopped-session age retention is
 disabled by default and permanently removes session files when enabled. Live
 journal byte caps are unsupported; use OS quotas for hard disk bounds.
 
@@ -152,4 +152,4 @@ Custom apps/proxies and `wwwroot` overrides are disabled by default. With operat
 approval, `trusted_apps_enabled: true` enables reviewed code on the control-plane
 origin, **not** isolated/untrusted reports. Proxy entries accept loopback IP
 literals only; no remote hosts or DNS names. Read `oly skill --apps` or the
-[apps skill](../skills/oly-apps/SKILL.md) before enabling.
+[apps skill](../../skills/oly-apps/SKILL.md) before enabling.

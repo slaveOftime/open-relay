@@ -683,7 +683,7 @@ fn try_load_overrides(state_dir: &Path) -> std::result::Result<AppConfigOverride
         ] {
             if fields.contains_key(key) {
                 return Err(format!(
-                    "{}: {key} was removed: live journal byte caps cannot bound a current incarnation; remove this key and use journal_retention_days for stopped sessions or an OS disk quota (see MIGRATION.md)",
+                    "{}: {key} was removed: live journal byte caps cannot bound a current incarnation; remove this key and use journal_retention_days for stopped sessions or an OS disk quota (see the migration guide)",
                     path.display()
                 ));
             }

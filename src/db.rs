@@ -293,7 +293,7 @@ impl Database {
     pub fn session_output_offset(&self, id: &str) -> u64 {
         let session_dir = self.sessions_dir.join(id);
         // Only journal-backed sessions have a stream; pre-0.5 sessions
-        // report 0 (see MIGRATION.md).
+        // report 0.
         if session_dir
             .join(crate::session::journal::JOURNAL_DIR_NAME)
             .is_dir()

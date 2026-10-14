@@ -43,7 +43,7 @@ pub(super) struct TailBytes {
 /// Journal-backed sessions paginate the derived filtered stream via the
 /// streaming replay reader (bounded memory). A session with only a
 /// pre-0.5 `output.log` is an explicit error — the legacy fallback is
-/// retired (see MIGRATION.md).
+/// retired.
 pub fn read_persisted_log_page(
     session_dir: &Path,
     offset: usize,
@@ -64,7 +64,7 @@ pub fn read_persisted_log_page(
     if session_dir.join("output.log").exists() {
         return Err(format!(
             "session log in {} uses the pre-0.5 format (output.log) and is no \
-             longer readable; export it with a 0.x build first, see MIGRATION.md",
+             longer readable; export it with a 0.x build first; see the migration guide",
             session_dir.display()
         ));
     }
