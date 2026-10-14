@@ -180,6 +180,23 @@ fn render_info(info: &SessionInfo, color: bool, now: DateTime<Utc>) -> String {
         if s.notifications_enabled { "32" } else { "2" },
     );
 
+    if let Some(report) = s.program_status.as_ref() {
+        d.section("Program status (OSC 7501, app-reported)");
+        d.row("State", format!("{:?}", report.state).to_lowercase());
+        d.row(
+            "Kind",
+            optional(report.kind.map(|kind| format!("{kind:?}").to_lowercase())),
+        );
+        d.row(
+            "Progress",
+            optional(report.progress.map(|p| format!("{p}%"))),
+        );
+        d.row("App", optional(report.app.as_deref()));
+        d.row("Record ID", optional(report.id.as_deref()));
+        d.row("Label", optional(report.title.as_deref()));
+        d.row("Message", optional(report.msg.as_deref()));
+    }
+
     d.section("Process");
     d.row("Command", &s.command);
     // JSON quoting preserves empty args, whitespace, and argument boundaries.

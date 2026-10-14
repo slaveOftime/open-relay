@@ -960,6 +960,9 @@ pub struct SessionSummary {
     pub cwd: Option<String>,
     #[serde(default)]
     pub input_needed: bool,
+    /// Most relevant OSC 7501 report. Untrusted app state, not process status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<crate::session::program_status::ProgramStatus>,
     #[serde(default)]
     pub notifications_enabled: bool,
     pub node: Option<String>,

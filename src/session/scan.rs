@@ -5,7 +5,7 @@
 //! 1. answer the terminal-capability probes that need a session-global reply,
 //! 2. strip terminal↔application protocol traffic (device reports, capability
 //!    probes, OSC chatter) that must never reach an attached terminal,
-//! 3. remember the one-way notifications (title, progress, cursor shape) the
+//! 3. remember the one-way notifications (title, progress, program status, cursor shape) the
 //!    screen parser does not model, and
 //! 4. measure how much of the output represents real screen activity.
 //!
@@ -56,6 +56,8 @@ pub struct ScanOut {
     /// Capability probes that need a daemon-generated reply written back to
     /// the child's standard input.
     pub queries: Vec<TerminalQuery>,
+    /// Session-global protocol responses (OSC 7501), never forwarded to clients.
+    pub responses: Vec<Vec<u8>>,
     /// Bytes of `filtered` that only carry one-way terminal signals:
     /// window/icon titles (`OSC 0/1/2`) and progress/busy notifications
     /// (`OSC 9;4`). They are forwarded to clients but do not count as screen
@@ -77,6 +79,7 @@ impl ScanOut {
     fn reset(&mut self) {
         self.filtered.clear();
         self.queries.clear();
+        self.responses.clear();
         self.signal_bytes = 0;
     }
 }
@@ -111,7 +114,10 @@ impl PtyScanner {
     /// at an idle boundary is a safe replay anchor, because the next output
     /// record begins a fresh sequence (idle boundary = replay anchor).
     pub(crate) fn memory_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.pending.capacity() + self.joined.capacity()
+        std::mem::size_of::<Self>()
+            + self.pending.capacity()
+            + self.joined.capacity()
+            + self.signals.program_statuses.memory_bytes()
     }
 
     pub fn is_idle(&self) -> bool {
@@ -222,6 +228,11 @@ impl PtyScanner {
             // payloads (XTVERSION replies, kitty graphics, …) that are never
             // renderable content.
             b'P' | b'_' | b'^' | b'X' => string_sequence(data, start, start + 2),
+            b'c' => {
+                self.signals_dirty |= self.signals.program_statuses.clear();
+                out.filtered.extend_from_slice(&data[start..start + 2]);
+                Some(2)
+            }
             _ => {
                 // Two-byte escapes (charset selection, DECSC, …) pass through.
                 // Anything longer resumes in the ground state, which copies the
@@ -297,7 +308,7 @@ impl PtyScanner {
         }
         let ps_end = cursor;
         let ps_len = ps_end - ps_start;
-        if ps_len == 0 || ps_len > 3 {
+        if ps_len == 0 || ps_len > 5 {
             if cursor >= data.len() {
                 return None;
             }
@@ -335,6 +346,24 @@ impl PtyScanner {
 
         let ps = &data[ps_start..ps_end];
         let payload = &data[payload_start..payload_end];
+
+        if ps == b"7501" {
+            if payload_start != ps_end && end - start <= MAX_PENDING_ESCAPE_BYTES {
+                if payload == b"?" {
+                    let mut reply = b"\x1b]7501;".to_vec();
+                    reply.extend_from_slice(super::program_status::QUERY_REPLY);
+                    reply.extend_from_slice(&data[payload_end..end]);
+                    out.responses.push(reply);
+                } else {
+                    self.record_osc(ps, payload);
+                }
+            }
+            return Some(end - start);
+        }
+
+        if ps == b"133" && payload.split(|b| *b == b';').next() == Some(b"A") {
+            self.signals_dirty |= self.signals.program_statuses.drop_transient();
+        }
 
         if payload.first() == Some(&b'?') {
             match ps {
@@ -693,6 +722,75 @@ mod tests {
         fn queries(&self) -> &[TerminalQuery] {
             &self.out.queries
         }
+    }
+
+    #[test]
+    fn program_status_reports_and_queries_survive_every_chunk_boundary() {
+        for terminator in [b"\x07".as_slice(), b"\x1b\\".as_slice()] {
+            let mut report = b"\x1b]7501;state=blocked:kind=permission:msg=UGxhbg".to_vec();
+            report.extend_from_slice(terminator);
+            for split in 0..=report.len() {
+                let mut harness = Harness::new();
+                let mut filtered = harness.filter(&report[..split]);
+                filtered.extend(harness.filter(&report[split..]));
+                assert!(filtered.is_empty(), "split {split}");
+                let signals = harness.scanner.take_changed_signals().unwrap();
+                let status = signals.program_statuses.current().unwrap();
+                assert_eq!(
+                    status.state,
+                    super::super::program_status::ProgramState::Blocked
+                );
+                assert_eq!(status.msg.as_deref(), Some("Plan"));
+                assert!(signals.restore_bytes().is_empty()); // no host-state leakage
+            }
+            let mut query = b"\x1b]7501;?".to_vec();
+            query.extend_from_slice(terminator);
+            for split in 0..=query.len() {
+                let mut harness = Harness::new();
+                assert!(harness.filter(&query[..split]).is_empty());
+                let mut responses = harness.out.responses.clone();
+                assert!(harness.filter(&query[split..]).is_empty());
+                responses.extend(harness.out.responses.clone());
+                let mut expected = b"\x1b]7501;".to_vec();
+                expected.extend_from_slice(super::super::program_status::QUERY_REPLY);
+                expected.extend_from_slice(terminator);
+                assert_eq!(responses, vec![expected]);
+            }
+        }
+    }
+
+    #[test]
+    fn program_status_limits_resets_and_shell_prompt() {
+        let mut harness = Harness::new();
+        assert_eq!(harness.filter(b"a\x1b]7501;state=working\x07b"), b"ab");
+        assert_eq!(harness.out.meaningful_bytes(), 2);
+        let mut oversized = b"\x1b]7501;state=error:".to_vec();
+        oversized.extend(vec![b'x'; MAX_PENDING_ESCAPE_BYTES]);
+        oversized.push(7);
+        assert!(harness.filter(&oversized).is_empty());
+        assert_eq!(
+            harness
+                .scanner
+                .signals
+                .program_statuses
+                .current()
+                .unwrap()
+                .state,
+            super::super::program_status::ProgramState::Working
+        );
+        assert!(harness.filter(b"\x1b]133;A\x07").is_empty());
+        assert!(harness.scanner.signals.program_statuses.current().is_none());
+        harness.filter(b"\x1b]7501;state=done\x07\x1b[!p\x1b]133;A\x07");
+        assert!(harness.scanner.signals.program_statuses.current().is_some());
+        harness.filter(b"\x1bc");
+        assert!(harness.scanner.signals.program_statuses.current().is_none());
+        assert!(
+            harness
+                .filter(b"\x1b]7501;?:states=idle,working\x07")
+                .is_empty()
+        );
+        assert!(harness.out.responses.is_empty());
+        assert!(harness.filter(b"\x1b]75010;state=blocked\x07").is_empty());
     }
 
     // -----------------------------------------------------------------------

@@ -319,7 +319,7 @@ pub struct SessionRuntime {
     /// How many scrolled-off rows `screen_parser` retains; applied at spawn
     /// and on every resize rebuild.  From `AppConfig::screen_scrollback_rows`.
     pub screen_scrollback_rows: usize,
-    /// Window/icon title, progress and cursor-shape notifications the session
+    /// Window/icon title, progress, program-status and cursor-shape signals the session
     /// last emitted. The screen parser does not model these, so the reader
     /// thread's scanner tracks them and publishes them here for attach
     /// snapshot restoration.
@@ -523,9 +523,18 @@ impl SessionRuntime {
     /// blocks (e.g. waiting on a password prompt before printing anything)
     /// is still treated as having a well-defined "since when has this been
     /// silent" anchor instead of being permanently invisible to silence
-    /// detection.
+    /// detection. With retained OSC 7501 records, the selected report's epoch
+    /// replaces the output epoch so redraws cannot override explicit state.
     pub fn effective_output_epoch(&self) -> Instant {
-        self.last_output_epoch.unwrap_or(self.spawned_at)
+        if self.terminal_signals.program_statuses.current().is_some() {
+            // Explicit reports remain authoritative through spinner/redraw output.
+            self.terminal_signals
+                .program_statuses
+                .changed_at
+                .unwrap_or(self.spawned_at)
+        } else {
+            self.last_output_epoch.unwrap_or(self.spawned_at)
+        }
     }
 
     /// Timestamp of the most recent user-driven activity of any kind:
@@ -565,6 +574,7 @@ impl SessionRuntime {
             resume_command: self.meta.resume_command.clone(),
             cwd: self.meta.cwd.clone(),
             input_needed: self.input_needed(),
+            program_status: self.terminal_signals.program_statuses.current(),
             notifications_enabled: self.meta.notifications_enabled,
             node: None,
             last_total_bytes: self.last_total_bytes,
@@ -648,15 +658,21 @@ impl SessionRuntime {
     /// While the session has no user-chosen title, a terminal-emitted
     /// window/icon title is also adopted as the session title, and the
     /// terminal-emitted foreground/background colours are mirrored into the
-    /// session metadata. Returns `true` when any session metadata changed so
-    /// the caller can broadcast a metadata update.
+    /// session metadata. OSC 7501 changes also require a summary update.
+    /// Returns `true` when metadata or program status changed so the caller
+    /// can broadcast an update.
     pub fn publish_terminal_signals(&mut self, signals: TerminalSignals) -> bool {
         let title_adopted = signals
             .title()
             .is_some_and(|title| self.apply_terminal_title(title));
         let colors_changed = self.apply_terminal_colors(&signals);
+        let status_changed = self.terminal_signals.program_statuses != signals.program_statuses;
+        if self.terminal_signals.program_statuses.current() != signals.program_statuses.current() {
+            // Clearing explicit state must not resurrect an old heuristic hint.
+            self.notified_output_epoch = None;
+        }
         self.terminal_signals = signals;
-        title_adopted || colors_changed
+        title_adopted || colors_changed || status_changed
     }
 
     /// Bytes that restore the session's visible terminal state on a freshly
@@ -758,8 +774,13 @@ impl SessionRuntime {
     }
 
     pub fn input_needed(&self) -> bool {
-        matches!(self.meta.status, SessionStatus::Running)
-            && self.notified_output_epoch.is_some()
+        if !matches!(self.meta.status, SessionStatus::Running) {
+            return false;
+        }
+        if let Some(report) = self.terminal_signals.program_statuses.current() {
+            return report.state == super::program_status::ProgramState::Blocked;
+        }
+        self.notified_output_epoch.is_some()
             && self.notified_output_epoch == Some(self.effective_output_epoch())
     }
 
@@ -971,6 +992,7 @@ impl SessionRuntime {
             return;
         }
         self.output_closed = true;
+        self.terminal_signals.program_statuses.drop_transient();
         self.journal_lifecycle(LifecycleCode::OutputClosed, None, &detail);
         // Anchor the final state so retention and replay can start from
         // the checkpoint instead of the raw prefix; a trailing partial
@@ -1564,10 +1586,10 @@ pub fn spawn_session(
                     }
 
                     // Position queries (CPR/DSR/DA/DECRQM) were answered by
-                    // the engine at their exact stream positions; only the
-                    // session-global OSC colour queries keep the scanner
-                    // path (their answers are position-independent).
-                    for resp in query_responses {
+                    // the engine at their exact stream positions. OSC 7501
+                    // capability replies use the scanner's session-global path.
+                    // Answer feature detection before the engine's DA fallback reply.
+                    for resp in scan_out.responses.drain(..).chain(query_responses) {
                         trace!(
                             session_id = %reader_session_id,
                             bytes = resp.len(),
@@ -1602,9 +1624,12 @@ pub fn spawn_session(
                 }
             }
         };
-        runtime_reader
-            .write()
-            .close_output_stream_at_boundary(close_detail, scanner.is_idle());
+        let summary = {
+            let mut rt = runtime_reader.write();
+            rt.close_output_stream_at_boundary(close_detail, scanner.is_idle());
+            rt.to_summary()
+        };
+        let _ = reader_event_tx.send(SessionEvent::SessionUpdated(summary));
         debug!(session_id = %reader_session_id, "PTY reader thread stopped");
     });
 
@@ -2398,6 +2423,67 @@ mod tests {
         }
         let meaningful = out.meaningful_bytes();
         rt.push_output(&out.filtered, meaningful);
+    }
+
+    #[test]
+    fn program_status_is_immediate_authoritative_and_not_screen_activity() {
+        use super::super::program_status::ProgramState;
+        let mut rt = new_runtime();
+        let mut scanner = PtyScanner::new();
+        push_scanned_with(
+            &mut rt,
+            &mut scanner,
+            b"\x1b]7501;state=blocked:kind=permission\x07",
+        );
+        assert!(rt.input_needed());
+        assert_eq!(rt.last_total_bytes, 0);
+        assert_eq!(rt.filtered_stream_len(), 0);
+        assert!(rt.last_output_epoch.is_none());
+        let epoch = rt.effective_output_epoch();
+        rt.notified_output_epoch = Some(epoch);
+        push_scanned_with(&mut rt, &mut scanner, b"spinner redraw");
+        assert!(rt.input_needed());
+        assert_eq!(rt.effective_output_epoch(), epoch);
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]7501;state=working\x07");
+        assert!(!rt.input_needed());
+        rt.notified_output_epoch = Some(rt.effective_output_epoch());
+        assert!(
+            !rt.input_needed(),
+            "silence must not override explicit working"
+        );
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]7501;state=done\x07");
+        rt.close_output_stream_at_boundary("EOF".into(), true);
+        assert_eq!(
+            rt.to_summary().program_status.unwrap().state,
+            ProgramState::Done
+        );
+        assert!(
+            !rt.attach_snapshot_bytes()
+                .windows(7)
+                .any(|w| w == b"]7501;s")
+        );
+    }
+
+    #[test]
+    fn program_status_clear_does_not_resurrect_old_heuristic_attention() {
+        let mut rt = new_runtime();
+        let mut scanner = PtyScanner::new();
+        push_scanned_with(&mut rt, &mut scanner, b"prompt");
+        rt.notified_output_epoch = Some(rt.effective_output_epoch());
+        assert!(rt.input_needed());
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]7501;state=working\x07");
+        assert!(!rt.input_needed());
+        push_scanned_with(&mut rt, &mut scanner, b"\x1b]7501;state=clear\x07");
+        assert!(!rt.input_needed());
+    }
+
+    #[test]
+    fn program_status_eof_drops_blocked_records() {
+        let mut rt = new_runtime();
+        push_scanned(&mut rt, b"\x1b]7501;state=blocked\x07");
+        assert!(rt.input_needed());
+        rt.close_output_stream_at_boundary("EOF".into(), true);
+        assert!(rt.to_summary().program_status.is_none());
     }
 
     fn refresh_until_completed(rt: &mut SessionRuntime) {

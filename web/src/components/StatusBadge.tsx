@@ -1,4 +1,5 @@
-import type { SessionStatus } from '@/api/types'
+import ProgramStatusBadge from './ProgramStatusBadge'
+import type { ProgramStatus, SessionStatus } from '@/api/types'
 import { Badge, type BadgeProps } from '@/components/ui/badge'
 import { statusLabel } from '@/utils/format'
 
@@ -6,6 +7,7 @@ interface Props {
   status: SessionStatus
   inputNeeded: boolean
   showDot?: boolean
+  programStatus?: ProgramStatus | null
 }
 
 type BadgeVariant = BadgeProps['variant']
@@ -44,23 +46,29 @@ function dotColor(status: SessionStatus, inputNeeded: boolean): string {
   }
 }
 
-export default function StatusBadge({ status, inputNeeded, showDot = true }: Props) {
+export default function StatusBadge({ status, inputNeeded, showDot = true, programStatus }: Props) {
+  // Keep process lifecycle visible alongside explicit application state.
+  if (programStatus) inputNeeded = false
   const variant = statusVariant(status, inputNeeded)
   const label = statusLabel(status, inputNeeded)
-  const shouldPulseDot = inputNeeded || status === 'running'
+  const shouldPulseDot =
+    inputNeeded || (status === 'running' && (!programStatus || programStatus.state === 'working'))
 
   return (
-    <Badge
-      key={`${status}:${inputNeeded ? 'input-needed' : 'status'}`}
-      variant={variant}
-      className="whitespace-nowrap text-xs font-light"
-    >
-      {showDot && (
-        <span
-          className={`w-1.5 h-1.5 rounded-full ${dotColor(status, inputNeeded)} ${shouldPulseDot ? 'animate-pulse' : ''}`}
-        />
-      )}
-      <span>{label}</span>
-    </Badge>
+    <span className="inline-flex items-center gap-1">
+      <Badge
+        key={`${status}:${inputNeeded ? 'input-needed' : 'status'}`}
+        variant={variant}
+        className="whitespace-nowrap text-xs font-light"
+      >
+        {showDot && (
+          <span
+            className={`w-1.5 h-1.5 rounded-full ${dotColor(status, inputNeeded)} ${shouldPulseDot ? 'animate-pulse' : ''}`}
+          />
+        )}
+        <span>{label}</span>
+      </Badge>
+      {programStatus && <ProgramStatusBadge report={programStatus} />}
+    </span>
   )
 }

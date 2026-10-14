@@ -159,7 +159,11 @@ export const SessionRow = memo(function SessionRow({
       case 'status':
         return (
           <TableCell key={columnKey} className="px-3 py-1 whitespace-nowrap">
-            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
+            <StatusBadge
+              status={session.status}
+              inputNeeded={session.input_needed}
+              programStatus={session.program_status}
+            />
           </TableCell>
         )
       case 'created_at':

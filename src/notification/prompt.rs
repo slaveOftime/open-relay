@@ -295,6 +295,7 @@ mod tests {
             resume_command: None,
             cwd: Some("C:\\work".to_string()),
             input_needed: true,
+            program_status: None,
             notifications_enabled: false,
             node: None,
             last_total_bytes: 0,

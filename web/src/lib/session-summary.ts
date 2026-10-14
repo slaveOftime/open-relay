@@ -6,7 +6,7 @@
  * connected nodes, so every key is namespaced by node.
  */
 
-import type { SessionSummary } from '@/api/types'
+import type { ProgramStatus, SessionSummary } from '@/api/types'
 
 /** Normalize a node name to a stable `null`/string pair for key building. */
 export function normalizeNode(node?: string | null): string | null {
@@ -28,6 +28,19 @@ function sameOptionalString(a: string | null | undefined, b: string | null | und
   return (a ?? null) === (b ?? null)
 }
 
+function sameProgramStatus(a?: ProgramStatus | null, b?: ProgramStatus | null): boolean {
+  if (!a || !b) return (a ?? null) === (b ?? null)
+  return (
+    a.state === b.state &&
+    a.progress === b.progress &&
+    sameOptionalString(a.id, b.id) &&
+    sameOptionalString(a.kind, b.kind) &&
+    sameOptionalString(a.app, b.app) &&
+    sameOptionalString(a.title, b.title) &&
+    sameOptionalString(a.msg, b.msg)
+  )
+}
+
 /**
  * Field-by-field comparison so a re-rendered snapshot object that carries the
  * same values does not tear down every subscriber of the store.
@@ -47,6 +60,7 @@ export function sameSessionSummary(a: SessionSummary, b: SessionSummary): boolea
   if (!sameOptionalString(a.resume_command ?? null, b.resume_command ?? null)) return false
   if (!sameOptionalString(a.cwd, b.cwd)) return false
   if (a.input_needed !== b.input_needed) return false
+  if (!sameProgramStatus(a.program_status, b.program_status)) return false
   if (a.notifications_enabled !== b.notifications_enabled) return false
   if (normalizeNode(a.node) !== normalizeNode(b.node)) return false
   if (a.last_total_bytes !== b.last_total_bytes) return false
