@@ -310,6 +310,9 @@ async fn handle_daemon_stop(
     shutdown_tx: &mpsc::UnboundedSender<()>,
 ) -> RpcResponse {
     let stopped = session_store.stop_all_sessions(grace_seconds).await;
+    // Completion alone is too early: retain the daemon while final PTY output
+    // drains and durable resume hints are derived, just as signal shutdown does.
+    session_store.flush_resume_hints_on_shutdown().await;
     let _ = shutdown_tx.send(());
     RpcResponse::DaemonStop { stopped }
 }

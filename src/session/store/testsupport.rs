@@ -344,12 +344,6 @@ pub(crate) fn make_test_config(max_running_sessions: usize) -> AppConfig {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
-    vec![vec![0x03], vec![0x03], vec![0x1a, b'\r']]
-}
-
-#[cfg(not(target_os = "windows"))]
 pub(crate) fn expected_soft_stop_inputs() -> Vec<Vec<u8>> {
     vec![vec![0x03], vec![0x03], vec![0x04]]
 }

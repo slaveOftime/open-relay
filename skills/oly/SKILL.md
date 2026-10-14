@@ -138,6 +138,16 @@ oly rm <ID>           # delete a stopped session + its logs; --force also kills 
 oly ls                # oly ls --json for agents
 ```
 
+- `oly stop <ID> --grace 5` gives the child a bounded chance to exit: Ctrl-C,
+  a second Ctrl-C after `min(500ms, grace/4)`, then Ctrl-D after
+  `min(1s, grace/2)`. Unix process-group SIGTERM follows at `3*grace/4`; the
+  deadline forces tree termination. `--grace 0` skips keys and kills immediately.
+  Ctrl-C may cancel work rather than exit; Ctrl-D depends on terminal mode and
+  pending input, not a PTY close. Queue pressure can delay or prevent keys.
+  Increase grace for slow cleanup, or send known application exit keys first.
+  Verify final logs and exit code, not just stop success. Configured
+  `resume_command` hints appear only after child exit, PTY EOF, journal
+  durability, and the completed-output scan (`oly info <ID> --json`).
 - `oly update` changes session metadata without restarting the session.
 - `--title ""` clears the title. If `--title` is omitted, the existing title is kept.
 - `--tag ""` clears all tags. If `--tag` is omitted, existing tags are kept.

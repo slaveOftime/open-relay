@@ -33,17 +33,12 @@ use crate::{config::ResumePattern, db::Database, session::SessionEventTx};
 
 use super::{SessionError, SessionMeta, SessionStatus, runtime::SessionRuntime};
 
-#[cfg(target_os = "windows")]
-pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x1a, b'\r']];
-
-#[cfg(not(target_os = "windows"))]
+// Application keystrokes on every platform, not process signals or a PTY
+// close. Ctrl-Z is neither Ctrl-D nor a portable termination request.
 pub(super) const SOFT_STOP_INPUTS: &[&[u8]] = &[&[0x03], &[0x03], &[0x04]];
 
-/// Earliest keystroke window some agentic TUIs (claude-code, codex, opencode)
-/// treat as a "press Ctrl-C again to confirm" overlay before reverting. The
-/// second 0x03 stage must arrive inside this window even at long grace
-/// values. Capped at `grace / 4` so a short grace keeps the second nudge
-/// well clear of the SIGTERM midpoint and the deadline.
+/// Keep repeated Ctrl-C inside a short application confirmation window,
+/// while reserving room for Ctrl-D, cleanup, and bounded signal escalation.
 pub(super) const DOUBLE_CTRL_C_DELAY: Duration = Duration::from_millis(500);
 pub(super) const DOUBLE_CTRL_C_DELAY_GRACE_DIVISOR: u32 = 4;
 
@@ -231,8 +226,9 @@ pub(super) fn log_soft_stop_send(
     total_stages: usize,
     input: &[u8],
     start: &Instant,
-) {
-    match pty.try_write_input(input.to_vec()) {
+) -> std::result::Result<(), TrySendError<Vec<u8>>> {
+    let result = pty.try_write_input(input.to_vec());
+    match &result {
         Ok(()) => {
             debug!(
                 session_id,
@@ -240,17 +236,16 @@ pub(super) fn log_soft_stop_send(
                 total_stages,
                 bytes = input.len(),
                 elapsed_ms = start.elapsed().as_millis(),
-                "sent soft-stop input"
+                "queued soft-stop input"
             );
         }
         Err(TrySendError::Full(_)) => {
-            warn!(
+            debug!(
                 session_id,
                 stage,
                 total_stages,
-                bytes = input.len(),
                 elapsed_ms = start.elapsed().as_millis(),
-                "soft-stop input dropped because PTY writer queue is full"
+                "soft-stop input deferred because PTY writer queue is full"
             );
         }
         Err(TrySendError::Closed(_)) => {
@@ -264,6 +259,7 @@ pub(super) fn log_soft_stop_send(
             );
         }
     }
+    result
 }
 
 pub(super) fn build_soft_stop_schedule(
@@ -271,55 +267,22 @@ pub(super) fn build_soft_stop_schedule(
     grace: Duration,
     requested_final_status: SessionStatus,
 ) -> Vec<(Instant, &'static [u8])> {
-    if !matches!(requested_final_status, SessionStatus::Stopped) {
+    if grace.is_zero() || !matches!(requested_final_status, SessionStatus::Stopped) {
         return Vec::new();
     }
 
-    // Plan timestamp for each staged soft-stop input.
-    //
-    // Stage 0 fires immediately at `start`. Stage 1 (the second 0x03 that
-    // confirms an in-TUI "press again to exit" overlay) lands inside the
-    // confirm window regardless of how big `grace` is, by clamping to
-    // `min(DOUBLE_CTRL_C_DELAY, grace / divisor)`. Stage 2 (the EOF/SIGTSTP
-    // fallback) keeps the original `grace * 2/3` so we still try one more
-    // nudge before SIGTERM at the midpoint.
-    let stage_count = SOFT_STOP_INPUTS.len();
-    let grace_cap = grace
-        .checked_div(DOUBLE_CTRL_C_DELAY_GRACE_DIVISOR)
-        .unwrap_or(Duration::ZERO);
-    let one_ctrl_c_delay = if grace.is_zero() {
-        Duration::ZERO
-    } else {
-        DOUBLE_CTRL_C_DELAY.min(grace_cap)
-    };
-    SOFT_STOP_INPUTS
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            let offset = Duration::from_millis(stage_offset_millis(
-                index,
-                stage_count,
-                grace,
-                one_ctrl_c_delay,
-            ));
-            (start + offset, *input)
-        })
+    // All application inputs precede SIGTERM at 3/4 grace. Cap Ctrl-D as
+    // well as the repeat so a long grace buys cleanup time, not delayed keys.
+    let offsets = [
+        Duration::ZERO,
+        DOUBLE_CTRL_C_DELAY.min(grace / DOUBLE_CTRL_C_DELAY_GRACE_DIVISOR),
+        Duration::from_secs(1).min(grace / 2),
+    ];
+    offsets
+        .into_iter()
+        .zip(SOFT_STOP_INPUTS.iter())
+        .map(|(offset, input)| (start + offset, *input))
         .collect()
-}
-
-fn stage_offset_millis(
-    index: usize,
-    stage_count: usize,
-    grace: Duration,
-    one_ctrl_c_delay: Duration,
-) -> u64 {
-    if index == 0 || grace.is_zero() {
-        return 0;
-    }
-    if index == 1 {
-        return one_ctrl_c_delay.as_millis() as u64;
-    }
-    ((grace.as_millis() * index as u128) / stage_count as u128) as u64
 }
 
 #[cfg(test)]
@@ -344,11 +307,8 @@ mod tests {
 
     #[test]
     fn soft_stop_schedule_second_ctrl_c_lands_inside_double_ctrl_c_window() {
-        // For grace=5s, the second 0x03 must arrive inside the ~1.5s
-        // overlay confirm window that modern agentic TUIs (claude-code,
-        // codex, opencode) display after the first Ctrl-C — not at
-        // grace/3 = 1666 ms which can already miss the overlay on slower
-        // machines, and not at grace*2/3 = 3333 ms which definitely does.
+        // A long grace must buy cleanup time, not push the repeated key
+        // outside the application's confirmation window.
         for grace_seconds in [1u64, 5, 15] {
             let grace = Duration::from_secs(grace_seconds);
             let cap = DOUBLE_CTRL_C_DELAY.min(
@@ -371,16 +331,24 @@ mod tests {
     }
 
     #[test]
-    fn soft_stop_schedule_third_stage_offsets_remain_proportional() {
-        // Stage 3 (EOF fallback) keeps the legacy grace*2/3 placement so
-        // programs that really do respond to Ctrl-D/Ctrl-Z still get a
-        // last nudge before SIGTERM at grace/2 and SIGKILL on deadline.
-        let grace = Duration::from_secs(6);
-        let sched = schedule_for_grace(grace);
-        assert_eq!(
-            sched[2].0.duration_since(sched[0].0),
-            Duration::from_millis(4_000)
-        );
+    fn soft_stop_schedule_gives_ctrl_d_time_before_signal_escalation() {
+        for grace in [
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+        ] {
+            let sched = schedule_for_grace(grace);
+            assert_eq!(sched[2].1, &[0x04]);
+            assert_eq!(
+                sched[2].0 - sched[0].0,
+                Duration::from_secs(1).min(grace / 2)
+            );
+            assert!(sched[0].0 < sched[1].0);
+            assert!(sched[1].0 < sched[2].0);
+            assert!(sched[2].0 < sched[0].0 + grace / 4 * 3);
+            assert!(sched[0].0 + grace / 4 * 3 < sched[0].0 + grace);
+        }
     }
 
     #[test]
@@ -391,16 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn soft_stop_schedule_zero_grace_collapses_to_immediate_pair() {
-        // The existing kill_session path passes grace=0 to terminate_runtime.
-        // Even though build_soft_stop_schedule is only consulted when status
-        // == Stopped, a future caller might pass grace=0 plus Stopped; we
-        // must not produce overlapping offsets, so all stages collapse to
-        // t=start.
-        let sched = schedule_for_grace(Duration::ZERO);
-        let start = sched[0].0;
-        for stage in &sched {
-            assert_eq!(stage.0, start, "zero grace must collapse every stage");
-        }
+    fn soft_stop_schedule_zero_grace_skips_application_inputs() {
+        assert!(schedule_for_grace(Duration::ZERO).is_empty());
     }
 }

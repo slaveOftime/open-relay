@@ -71,7 +71,7 @@ silently skipped. Startup cannot fall back to defaults on an invalid existing fi
 | `session_eviction_seconds` | `15` | Live runtime-eviction delay; minimum 1 second |
 | `screen_scrollback_rows` | `5000` | New session engines; 0..100000; existing engines retain their setting |
 | `silence_seconds` | `10` | Live silence fallback; minimum 1 second |
-| `stop_grace_seconds` | `5` | Sampled on stop paths; minimum 1 second |
+| `stop_grace_seconds` | `5` | Live HTTP stop default when grace is omitted; minimum 1 second |
 | `journal_retention_days` | `0` | Hourly stopped-session sweep; 0..36500; `0` keeps everything |
 
 `http_bind` must be an IP address. Duration settings in seconds cannot exceed
@@ -123,9 +123,15 @@ oly daemon status
 oly ls
 ```
 
+Shutdown stops sessions concurrently: Ctrl-C, repeated Ctrl-C, then Ctrl-D
+precede Unix SIGTERM at three-quarters of each grace window and tree kill at
+its deadline. Explicit zero grace skips keys. Use enough grace for application
+cleanup; keys are best-effort, not proof of clean exit. Resume derivation still
+waits for child exit, PTY EOF, and journal durability in a bounded shutdown flush.
 Stop can exit 0 with warnings about forced termination. Check final session
-states, not just the daemon-stop exit code. If IPC says `Access is denied`,
-retry with available approval/escalation; do not launch a replacement daemon
+states, logs, and saved resume hints, not just the daemon-stop exit code.
+If IPC says `Access is denied`, retry with available approval/escalation;
+do not launch a replacement daemon
 unless it is confirmed stopped.
 
 ## Prompt hints: `prompt_patterns`

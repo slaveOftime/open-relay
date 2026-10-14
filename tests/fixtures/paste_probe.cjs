@@ -43,7 +43,7 @@ process.stdin.on('data', chunk => {
         // reads this file when a later step fails, to see whether the bytes
         // it sent were forwarded here instead of being consumed locally.
         // Note the daemon's staged soft-shutdown inputs (Ctrl-C, Ctrl-C,
-        // Ctrl-Z+Enter) also land here when the session is stopped at
+        // Ctrl-D) also land here when the session is stopped at
         // teardown, so expect those on a failed run.
         fs.appendFileSync(afterPath, char);
       }
