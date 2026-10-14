@@ -861,8 +861,8 @@ const DAEMON_SHUTDOWN_GRACE_SECONDS: u64 = 15;
 
 /// Signal-driven shutdown must not orphan managed children — drain
 /// every session (soft stop, process-group SIGTERM, tree kill) before the
-/// daemon exits. `oly daemon stop` drains in the RPC handler before the
-/// shutdown signal even arrives, so both paths converge here.
+/// daemon exits. `oly daemon stop` performs the same termination and resume
+/// flush in its RPC handler before notifying the main loop to exit.
 async fn drain_sessions_for_shutdown(session_store: &SessionStoreHandle) {
     let drained = session_store
         .stop_all_sessions(DAEMON_SHUTDOWN_GRACE_SECONDS)

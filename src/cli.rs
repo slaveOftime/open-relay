@@ -361,7 +361,7 @@ pub struct NotifySendArgs {
 pub struct StopArgs {
     /// Session ID to stop. If omitted, uses the most recently created session.
     pub id: Option<String>,
-    /// Seconds to wait for clean exit before forcibly killing.
+    /// Stop grace in seconds: Ctrl-C, repeated Ctrl-C, then Ctrl-D; Unix SIGTERM at 3/4 grace, tree kill at the deadline. Zero kills immediately.
     #[arg(long, default_value_t = 5)]
     pub grace: u64,
     /// Target a secondary node by name.

@@ -508,15 +508,15 @@ impl SessionStore {
         let grace = Duration::from_secs(grace_seconds);
         let start = Instant::now();
         let deadline = start + grace;
-        let soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
+        let mut soft_stop_schedule = build_soft_stop_schedule(start, grace, requested_final_status);
         let mut next_soft_stop_index = 0usize;
-        // Graceful-drain escalation contract: the app interrupt (soft-stop
-        // input) owns the first half of the grace window; at the midpoint we
-        // ask the whole process group to exit (POSIX SIGTERM — injected
-        // Ctrl-C is not one), and at the deadline the tree is killed.
+        let soft_input_deadline = start + grace / 4 * 3;
+        // Give application keys and their cleanup the first 3/4 of grace.
+        // POSIX SIGTERM then requests process-group exit; the deadline kills
+        // the tree. Queue pressure never extends either escalation deadline.
         let mut group_sigterm_at = (matches!(requested_final_status, SessionStatus::Stopped)
             && !grace.is_zero())
-        .then_some(start + grace / 2);
+        .then_some(soft_input_deadline);
         debug!(
             session_id = %session_id,
             requested_final_status = requested_final_status.as_str(),
@@ -542,20 +542,6 @@ impl SessionStore {
             rt.requested_final_status = Some(requested_final_status);
             rt.meta.status = SessionStatus::Stopping;
         }
-        // Read lock: send first soft-stop input (channel send is &self).
-        if let Some((_, input)) = soft_stop_schedule.first() {
-            let rt = handle.read();
-            log_soft_stop_send(
-                &rt.pty,
-                &session_id,
-                1,
-                soft_stop_schedule.len(),
-                input,
-                &start,
-            );
-            next_soft_stop_index = 1;
-        }
-
         while Instant::now() < deadline {
             {
                 // Brief write lock: poll child exit status.
@@ -571,7 +557,41 @@ impl SessionStore {
                     return true;
                 }
             }
-            // Process-group SIGTERM at the grace midpoint.
+            // Read lock: try the next due key without blocking the runtime.
+            // Retry a full queue on the next poll; after a delayed enqueue,
+            // shift later keys by the same lag to preserve repeat spacing.
+            // This is queue acceptance, not proof of application processing.
+            {
+                let rt = handle.read();
+                if Instant::now() >= soft_input_deadline {
+                    next_soft_stop_index = soft_stop_schedule.len();
+                }
+                if let Some(&(at, input)) = soft_stop_schedule.get(next_soft_stop_index)
+                    && Instant::now() >= at
+                {
+                    match log_soft_stop_send(
+                        &rt.pty,
+                        &session_id,
+                        next_soft_stop_index + 1,
+                        soft_stop_schedule.len(),
+                        input,
+                        &start,
+                    ) {
+                        Ok(()) => {
+                            next_soft_stop_index += 1;
+                            let lag = Instant::now().saturating_duration_since(at);
+                            for (later, _) in &mut soft_stop_schedule[next_soft_stop_index..] {
+                                *later += lag;
+                            }
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            next_soft_stop_index = soft_stop_schedule.len();
+                        }
+                    }
+                }
+            }
+            // Process-group SIGTERM only after the application cleanup window.
             if let Some(at) = group_sigterm_at
                 && Instant::now() >= at
             {
@@ -584,29 +604,23 @@ impl SessionStore {
                 #[cfg(unix)]
                 if let Some(pid) = pid {
                     use crate::session::pty::{SIGTERM, signal_process_group};
-                    debug!(session_id = %session_id, pid, "grace midpoint: SIGTERM to process group");
+                    debug!(session_id = %session_id, pid, "grace escalation: SIGTERM to process group");
                     signal_process_group(pid, SIGTERM);
                 }
             }
-            // Read lock: send any due staged soft-stop inputs.
+            // Wake at stage boundaries even for short grace windows. A full
+            // queue uses the regular poll interval, avoiding a busy retry loop.
+            let now = Instant::now();
+            let mut wake_at = deadline.min(now + TERMINATE_POLL_INTERVAL);
+            if let Some(&(at, _)) = soft_stop_schedule.get(next_soft_stop_index)
+                && at > now
             {
-                let rt = handle.read();
-                while let Some((at, input)) = soft_stop_schedule.get(next_soft_stop_index) {
-                    if Instant::now() < *at {
-                        break;
-                    }
-                    log_soft_stop_send(
-                        &rt.pty,
-                        &session_id,
-                        next_soft_stop_index + 1,
-                        soft_stop_schedule.len(),
-                        input,
-                        &start,
-                    );
-                    next_soft_stop_index += 1;
-                }
+                wake_at = wake_at.min(at);
             }
-            tokio::time::sleep(TERMINATE_POLL_INTERVAL).await;
+            if let Some(at) = group_sigterm_at {
+                wake_at = wake_at.min(at);
+            }
+            tokio::time::sleep(wake_at.saturating_duration_since(now)).await;
         }
 
         let mut rt = handle.write();
@@ -1415,25 +1429,68 @@ mod tests {
             writes.push(bytes);
         }
 
-        // Escalation semantics: the dummy child is a real `sleep` that
-        // never sees the soft-stop input bytes (they land in the test's
-        // channel, not the PTY). Stages due before the grace midpoint are
-        // sent; the midpoint process-group SIGTERM then ends the session
-        // before the final stage comes due. Poll slack: stage 3 is due at
-        // 1333ms, midpoint at 1000ms, poll interval 100ms — no race.
-        //
-        // Windows caveat: there is no POSIX SIGTERM equivalent in the
-        // `cfg(unix)` escalation path, so the dummy child keeps running
-        // until the deadline at 2000ms and all three stages get written.
-        // We gate the count assertion to honour the actual platform
-        // behaviour rather than skip the test entirely; the cross-
-        // platform aspect of "every stage is delivered in order" is
-        // still exercised by collecting `writes` first.
-        let all = expected_soft_stop_inputs();
-        #[cfg(unix)]
-        assert_eq!(writes, all[..all.len() - 1]);
-        #[cfg(not(unix))]
-        assert_eq!(writes, all);
+        // The dummy child never sees these bytes; all application stages
+        // must precede process-group SIGTERM on Unix or deadline kill elsewhere.
+        assert_eq!(writes, expected_soft_stop_inputs());
+    }
+
+    #[tokio::test]
+    async fn stop_zero_grace_and_kill_skip_application_inputs() {
+        for kill in [false, true] {
+            let (rt, mut rx) = make_runtime_writable("immediate-stop", SessionStatus::Running);
+            let store = store_with(vec![rt], make_test_db().await);
+            let start = Instant::now();
+            assert!(if kill {
+                store.kill_session("immediate-stop").await
+            } else {
+                store.stop_session("immediate-stop", 0).await
+            });
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(
+                rx.try_recv().is_err(),
+                "immediate termination must not queue keys"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_stop_retries_full_queue_without_collapsing_repeat_spacing() {
+        let (rt, mut rx) =
+            make_runtime_writable_with_capacity("retry-stop", SessionStatus::Running, 1);
+        rt.read().pty.try_write_input(b"occupied".to_vec()).unwrap();
+        let store = store_with(vec![rt], make_test_db().await);
+        let consume = async {
+            tokio::time::sleep(Duration::from_millis(650)).await;
+            assert_eq!(rx.recv().await.unwrap(), b"occupied");
+            let first = rx.recv().await.unwrap();
+            let first_at = Instant::now();
+            let second = rx.recv().await.unwrap();
+            assert!(
+                first_at.elapsed() >= Duration::from_millis(500),
+                "late keys must not bunch up"
+            );
+            let third = rx.recv().await.unwrap();
+            assert_eq!(vec![first, second, third], expected_soft_stop_inputs());
+        };
+        let (stopped, ()) = tokio::time::timeout(Duration::from_secs(6), async {
+            tokio::join!(store.stop_session("retry-stop", 4), consume)
+        })
+        .await
+        .expect("queue-pressure stop and consumer must remain bounded");
+        assert!(stopped);
+    }
+
+    #[tokio::test]
+    async fn soft_stop_full_queue_does_not_extend_forced_termination_deadline() {
+        let (rt, mut rx) =
+            make_runtime_writable_with_capacity("blocked-stop", SessionStatus::Running, 1);
+        rt.read().pty.try_write_input(b"occupied".to_vec()).unwrap();
+        let store = store_with(vec![rt], make_test_db().await);
+        let start = Instant::now();
+        assert!(store.stop_session("blocked-stop", 1).await);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(rx.try_recv().unwrap(), b"occupied");
+        assert!(rx.try_recv().is_err(), "full queue must not accept stages");
     }
 
     #[tokio::test]

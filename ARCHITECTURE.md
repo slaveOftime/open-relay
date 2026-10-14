@@ -155,6 +155,15 @@ Design points worth knowing before touching this code:
   recover the clipboard action once. Key-up after an observed press must
   not duplicate it. Shortcut bytes inside bracketed paste remain literal.
   Teardown disables mode 9001 before returning control to the parent shell.
+- **Stop keys precede signal escalation.** The shared stop path (CLI/TUI,
+  HTTP/RPC/federation, daemon shutdown) queues Ctrl-C, repeated Ctrl-C at
+  `min(500ms, grace/4)`, then Ctrl-D at `min(1s, grace/2)`. These are application
+  input, not a PTY close or portable signals. Unix process-group SIGTERM waits
+  until `3*grace/4`; tree kill remains at the deadline. Full input queues retry
+  without blocking runtime locks, shift later keys to preserve enqueue spacing,
+  and stop retries at the signal boundary without extending grace. Zero grace
+  and kill bypass keys. Child completion still does not imply output EOF;
+  resume derivation keeps its EOF and journal-durability gates.
 - **ConPTY close is not an output cutoff.** Child exit and a quiet reader do
   not prove the output pipe is empty. Windows defers closing the master with a
   bounded drain wait between processed chunks, fences its activity counter only

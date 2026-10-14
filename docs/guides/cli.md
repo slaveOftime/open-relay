@@ -43,6 +43,28 @@ Omitted update fields are unchanged; repeated tags replace the entire tag list.
 `resume_command`, when configured and detected, is a suggestion from child
 output, not an automatically executed command.
 
+### Graceful stop
+
+`oly stop` defaults to five seconds of grace. While the child is running it
+queues Ctrl-C immediately, a second Ctrl-C after `min(500ms, grace/4)`, and
+Ctrl-D after `min(1s, grace/2)`. On Unix, process-group SIGTERM follows at
+three-quarters of grace; at the deadline oly forcibly kills the process tree.
+`--grace 0` and explicit kill operations skip the keys and kill immediately.
+Daemon shutdown stops sessions concurrently using the same policy.
+
+These are best-effort application keys: Ctrl-C may cancel a request instead of
+exiting; Ctrl-D is an application byte in raw mode and an EOF indication only
+at an empty canonical input line. It does not close the PTY, and Ctrl-Z is not
+used as a substitute. A full input queue gets bounded retries with preserved
+enqueue spacing; congestion or an unresponsive app can still force termination.
+Use a longer grace for slow cleanup, or send the application's known exit keys
+and inspect its response before stopping.
+
+A successful stop does not promise clean application exit or a captured resume
+hint. Inspect final logs and exit code with `oly info <id> --json`. Configured
+resume hints appear only after child exit, PTY EOF, journal durability, and the
+completed-output scan; metadata can say stopped before that scan finishes.
+
 ## Live dashboard and search
 
 ```sh

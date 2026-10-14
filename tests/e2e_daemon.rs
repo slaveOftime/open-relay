@@ -1252,6 +1252,211 @@ fn e2e_session_status_transitions_in_list() {
     );
 }
 
+/// Exercise actual application keys and verify the EOF-drained recording and
+/// persisted hint, not just a successful stop response or queued input.
+#[test]
+fn e2e_graceful_stop_captures_double_ctrl_c_resume_tail() {
+    check_graceful_stop_resume_tail("double");
+}
+
+#[test]
+fn e2e_graceful_stop_captures_ctrl_d_resume_tail() {
+    check_graceful_stop_resume_tail("eof");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_graceful_stop_captures_canonical_eof_resume_tail() {
+    check_graceful_stop_resume_tail("canonical");
+}
+
+fn check_graceful_stop_resume_tail(mode: &str) {
+    assert!(program_exists("node"), "real-PTY fixture requires Node.js");
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir(&format!("graceful_stop_{mode}"));
+    fs::write(
+        tmp.join("oly/config.json"),
+        json!({"resume_patterns": [{
+            "program": "node",
+            "pattern": "helper --resume ([a-z-]+)",
+            "command": "helper --resume $1"
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let daemon = start_daemon(&tmp);
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/graceful_stop_agent.cjs"
+    );
+    let id = start_session(&tmp, &["node", fixture, mode]);
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("STOP-HELPER-READY"),
+        Duration::from_secs(5),
+    )
+    .expect("helper must initialize terminal mode before stop");
+    let stop = oly_cmd(&tmp)
+        .args(["stop", &id, "--grace", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let expected = format!("helper --resume {mode}-clean");
+    let tail = wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("FINAL-TAIL-END"),
+        Duration::from_secs(5),
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "{mode}: clean shutdown tail missing: {}",
+            fetch_logs(&tmp, &id)
+        )
+    });
+    assert!(tail.contains(&expected), "{mode}: resume text missing");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let info = oly_cmd(&tmp)
+            .args(["info", &id, "--json"])
+            .output()
+            .unwrap();
+        assert!(info.status.success());
+        let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+        if info["resume_command"] == expected {
+            assert_eq!(info["exit_code"], 0);
+            assert_eq!(info["status"], "stopped");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{mode}: hint not derived: {info}"
+        );
+        sleep(Duration::from_millis(100));
+    }
+    let export = oly_cmd(&tmp).args(["export", &id]).output().unwrap();
+    assert!(export.status.success());
+    let output = String::from_utf8_lossy(&export.stdout);
+    for index in 0..512 {
+        assert!(
+            output.contains(&format!("FINAL-TAIL-{index:04}-")),
+            "lost tail chunk {index}"
+        );
+    }
+    assert!(output.contains("FINAL-TAIL-END"));
+    drop(daemon);
+    // With no daemon, ls reads SQLite: prove the hint survived persistence.
+    let listing = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+    assert!(listing.status.success());
+    assert!(String::from_utf8_lossy(&listing.stderr).contains("falling back to direct DB access"));
+    let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(listing["items"][0]["resume_command"], expected);
+}
+
+#[test]
+fn e2e_graceful_daemon_shutdown_persists_agent_resume_hints() {
+    assert!(program_exists("node"), "real-PTY fixture requires Node.js");
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("graceful_shutdown_resume");
+    fs::write(tmp.join("oly/config.json"), json!({"resume_patterns": [{
+        "program": "node", "pattern": "helper --resume ([a-z-]+)", "command": "helper --resume $1"
+    }]}).to_string()).unwrap();
+    let daemon = start_daemon(&tmp);
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/graceful_stop_agent.cjs"
+    );
+    let mut ids = Vec::new();
+    for mode in ["double", "eof"] {
+        let id = start_session(&tmp, &["node", fixture, mode]);
+        wait_for_log(
+            &tmp,
+            &id,
+            |log| log.contains("STOP-HELPER-READY"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        ids.push(id);
+    }
+    let stop = oly_cmd(&tmp)
+        .args(["daemon", "stop", "--grace", "5"])
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    drop(daemon); // Wait for actual daemon exit before the DB fallback assertion.
+    let listing = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+    assert!(listing.status.success());
+    assert!(String::from_utf8_lossy(&listing.stderr).contains("falling back to direct DB access"));
+    let listing: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    for (id, mode) in ids.iter().zip(["double", "eof"]) {
+        let summary = listing["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == *id)
+            .unwrap();
+        assert_eq!(
+            summary["resume_command"],
+            format!("helper --resume {mode}-clean")
+        );
+        assert_eq!(summary["status"], "stopped");
+    }
+    // A fresh isolated daemon can replay the persisted journal; logs is not
+    // an offline command. The DB assertions above must precede this restart.
+    let _restarted_daemon = start_daemon(&tmp);
+    for id in &ids {
+        assert!(fetch_logs(&tmp, id).contains("FINAL-TAIL-END"));
+    }
+}
+
+#[test]
+fn e2e_graceful_stop_forces_unresponsive_agent_at_deadline() {
+    assert!(program_exists("node"), "real-PTY fixture requires Node.js");
+    let _lock = E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let tmp = make_tmp_dir("graceful_stop_unresponsive");
+    let _daemon = start_daemon(&tmp);
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/graceful_stop_agent.cjs"
+    );
+    let id = start_session(&tmp, &["node", fixture, "unresponsive"]);
+    wait_for_log(
+        &tmp,
+        &id,
+        |log| log.contains("STOP-HELPER-READY"),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let start = Instant::now();
+    let stop = oly_cmd(&tmp)
+        .args(["stop", &id, "--grace", "1"])
+        .output()
+        .unwrap();
+    assert!(stop.status.success());
+    assert!(start.elapsed() >= Duration::from_secs(1));
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "forced stop must stay bounded"
+    );
+    let info = oly_cmd(&tmp)
+        .args(["info", &id, "--json"])
+        .output()
+        .unwrap();
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout).unwrap();
+    assert_eq!(info["status"], "stopped");
+    assert!(info["resume_command"].is_null());
+    assert!(!fetch_logs(&tmp, &id).contains("FINAL-TAIL-END"));
+}
+
 // The global e2e lock serializes daemon-spawning tests; holding it across
 // awaits is the point (a second daemon must not start mid-test).
 #[allow(clippy::await_holding_lock)]
