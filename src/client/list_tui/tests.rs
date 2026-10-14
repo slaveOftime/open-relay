@@ -190,7 +190,7 @@ fn session_row_keeps_attention_status_more_noticeable_than_session_colours() {
 }
 
 #[test]
-fn inactive_session_row_stays_dimmed_but_keeps_session_background() {
+fn inactive_session_title_is_readable_and_keeps_session_background() {
     let mut item = session("done");
     item.title = Some("finished".to_string());
     item.status = "stopped".to_string();
@@ -202,8 +202,8 @@ fn inactive_session_row_stays_dimmed_but_keeps_session_background() {
 
     let name_x = find_text(&buffer, "finished").expect("name rendered");
     let name_cell = &buffer[(name_x, 0)];
-    // Inactive rows keep the dimmed foreground...
-    assert_eq!(name_cell.fg, ratatui::style::Color::DarkGray);
+    // Inactive titles are brighter than their dimmed command/metadata...
+    assert_eq!(name_cell.fg, ratatui::style::Color::Gray);
     // ...but still show the session's background identity.
     assert_eq!(name_cell.bg, ratatui::style::Color::Rgb(0x00, 0x00, 0x40));
 }
@@ -244,7 +244,7 @@ fn inactive_sessions_have_no_sparkline_and_tree_rows_are_compact() {
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
-    assert!(text.contains("out:0B"));
+    assert!(text.contains("0B"));
     assert!(text.contains("0B/s"));
     assert!(
         active_line.width() < 120,
@@ -1996,7 +1996,7 @@ fn ctrl_d_opens_complete_prefilled_clone_dialog() {
     assert_eq!(dialog.rows.value, "42");
     assert_eq!(dialog.cols.value, "132");
     assert!(!dialog.disable_notifications);
-    assert!(!dialog.attach_after_start);
+    assert!(dialog.attach_after_start);
     assert!(!dialog.remove_original);
     assert!(render_app(&mut app, 120, 30).contains("Duplicate source (worker-a)"));
 }
@@ -2028,7 +2028,7 @@ fn ctrl_n_opens_blank_new_session_dialog_scoped_to_the_viewed_node() {
     assert!(dialog.rows.value.is_empty());
     assert!(dialog.cols.value.is_empty());
     assert!(!dialog.disable_notifications);
-    assert!(!dialog.attach_after_start);
+    assert!(dialog.attach_after_start);
     assert!(!dialog.remove_original);
 
     let rendered = render_app(&mut app, 120, 30);
@@ -2062,6 +2062,7 @@ fn new_session_enter_launches_on_the_viewed_node() {
     };
     assert_eq!(launch.node.as_deref(), Some("worker-a"));
     assert_eq!(launch.command, "bash");
+    assert!(launch.attach_after_start);
     assert!(launch.remove_source.is_none());
     let request = launch.request();
     let RpcRequest::NodeProxy { node, inner } = request else {
@@ -4291,4 +4292,128 @@ fn medium_table_uses_spare_title_space_for_a_muted_command_preview() {
         buffer[(command_x as u16, 3)].fg,
         ratatui::style::Color::Gray
     );
+}
+
+#[test]
+fn new_and_duplicate_attach_defaults_can_be_disabled_and_reset_when_reopened() {
+    for view in [super::ViewMode::List, super::ViewMode::Tree] {
+        for duplicate in [false, true] {
+            for node in [None, Some("worker-a")] {
+                let mut app = App::default();
+                let mut source = session("source");
+                source.command = "benign-helper".into();
+                source.node = node.map(str::to_string);
+                app.replace_sessions(vec![source]);
+                app.view_mode = view;
+                if view == super::ViewMode::Tree {
+                    app.tree.visible = vec![super::TreeEntry::Session {
+                        session: 0,
+                        depth: 1,
+                    }];
+                    app.tree.cursor = 0;
+                }
+                let open = ctrl(KeyCode::Char(if duplicate { 'd' } else { 'n' }));
+                route_key(&mut app, open, node);
+                let dialog = app.clone_dialog.as_mut().expect("dialog opens");
+                assert!(dialog.attach_after_start);
+                if !duplicate {
+                    dialog.command = super::EditText::new("benign-helper".into());
+                }
+                let line =
+                    super::clone_field_line(dialog, super::CloneField::AttachAfterStart, 100, true)
+                        .to_string();
+                assert!(line.contains("[x]  on start"), "{line}");
+                let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), node)
+                else {
+                    panic!("valid dialog should emit a launch");
+                };
+                assert!(launch.attach_after_start);
+                assert_eq!(launch.node.as_deref(), node);
+                assert!(launch.remove_source.is_none());
+                let dialog = app.clone_dialog.as_mut().unwrap();
+                dialog.active = super::CLONE_FIELDS
+                    .iter()
+                    .position(|field| *field == super::CloneField::AttachAfterStart)
+                    .unwrap();
+                route_key(&mut app, key(KeyCode::Char(' ')), node);
+                let dialog = app.clone_dialog.as_ref().unwrap();
+                assert!(!dialog.attach_after_start);
+                let line =
+                    super::clone_field_line(dialog, super::CloneField::AttachAfterStart, 100, true)
+                        .to_string();
+                assert!(line.contains("[ ]  on start"), "{line}");
+                let AppAction::Start(launch) = route_key(&mut app, key(KeyCode::Enter), node)
+                else {
+                    panic!("unchecked dialog should still emit a launch");
+                };
+                assert!(!launch.attach_after_start);
+                assert_eq!(launch.node.as_deref(), node);
+                route_key(&mut app, key(KeyCode::Esc), node);
+                route_key(&mut app, open, node);
+                assert!(
+                    app.clone_dialog.as_ref().unwrap().attach_after_start,
+                    "each fresh dialog must reset to the enabled default"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inactive_titles_are_brighter_than_commands_in_both_views() {
+    use ratatui::style::Color;
+    for status in ["stopped", "failed", "killed"] {
+        for view in [super::ViewMode::List, super::ViewMode::Tree] {
+            for width in [50, 80, 120] {
+                let mut app = App::default();
+                let mut archive = session("archive");
+                archive.title = Some("Archive".into());
+                archive.command = "worker-command".into();
+                archive.status = status.into();
+                archive.started_at = Some(Utc::now() - chrono::Duration::hours(1));
+                archive.ended_at = Some(Utc::now() - chrono::Duration::minutes(30));
+                app.replace_sessions(vec![session("focused"), archive]);
+                app.view_mode = view;
+                app.selected = 0;
+                if view == super::ViewMode::Tree {
+                    app.tree.visible = vec![
+                        super::TreeEntry::Session {
+                            session: 0,
+                            depth: 1,
+                        },
+                        super::TreeEntry::Session {
+                            session: 1,
+                            depth: 1,
+                        },
+                    ];
+                    app.tree.cursor = 0;
+                }
+                let buffer = render_app_buffer(&mut app, width, 12);
+                let lines = buffer_symbols(&buffer, 12);
+                let y = lines
+                    .iter()
+                    .position(|row| row.contains("Archive"))
+                    .expect("inactive title rendered");
+                let row = &lines[y];
+                let title_byte = row.find("Archive").unwrap();
+                let title_x = unicode_width::UnicodeWidthStr::width(&row[..title_byte]);
+                assert_eq!(buffer[(title_x as u16, y as u16)].fg, Color::Gray);
+                if let Some(command_byte) = row.find("worker-command") {
+                    let command_x = unicode_width::UnicodeWidthStr::width(&row[..command_byte]);
+                    assert_eq!(buffer[(command_x as u16, y as u16)].fg, Color::DarkGray);
+                }
+                app.selected = 1;
+                app.tree.cursor = 1;
+                let buffer = render_app_buffer(&mut app, width, 12);
+                let lines = buffer_symbols(&buffer, 12);
+                let y = lines
+                    .iter()
+                    .position(|row| row.contains("Archive"))
+                    .unwrap();
+                let title_byte = lines[y].find("Archive").unwrap();
+                let title_x = unicode_width::UnicodeWidthStr::width(&lines[y][..title_byte]);
+                assert_eq!(buffer[(title_x as u16, y as u16)].fg, Color::White);
+            }
+        }
+    }
 }

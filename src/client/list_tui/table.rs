@@ -288,6 +288,13 @@ pub fn session_row(
     } else {
         text_cell(&name, name_index)
     };
+    // Finished sessions remain easy to identify without brightening their
+    // command preview or metadata. Selected titles inherit the white row style.
+    let name_cell = if !active && !selected {
+        name_cell.style(Style::default().fg(Color::Gray))
+    } else {
+        name_cell
+    };
     let mut cells = vec![
         aligned_cell(Span::styled(status_glyph, status_style), alignments[0]),
         name_cell,

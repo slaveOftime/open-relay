@@ -87,15 +87,27 @@ when needed. `--node-all` requires follow mode; `--json` cannot combine with it.
 | `Enter` | Attach inline |
 | `Ctrl+Enter` | Attach in another terminal window |
 | `Ctrl+G` | Switch compact table / working-directory tree |
-| `Ctrl+D` | Open a clone editor from the selected session |
+| `Ctrl+N` | Open the New Session dialog |
+| `Ctrl+D` | Open the Duplicate dialog from the selected session |
 | `Ctrl+U` | Edit title, tags, and notifications |
 | `Ctrl+K` | Stop the selected running session |
 | `Ctrl+C` | Exit dashboard |
 
-In dialogs, `Tab`/`Ctrl+Tab` move fields, `Space` toggles notifications, and
-`Enter` submits. Compact views prioritize identity/title over command details
-and activity charts when space is limited. The displayed executable basename
-does not change the saved launch command.
+In dialogs, `Tab`/`Ctrl+Tab` move fields, `Space` toggles the focused checkbox,
+and `Enter` submits. New Session (`Ctrl+N`) and Duplicate (`Ctrl+D`) open with
+**Attach on start** checked: after a successful start, the dashboard attaches
+inline to the new session on the chosen node. To start without leaving the
+list, focus **Attach on start** and press `Space` to uncheck it before submitting.
+Each fresh New Session or Duplicate dialog resets the checkbox to checked;
+the Resume dialog remains opt-in. This applies only to the list TUI, not the
+`oly start` CLI default.
+
+Compact views prioritize identity/title over command details and activity
+charts when space is limited. The displayed executable basename does not
+change the saved launch command. In tree rows, activity charts precede the
+output byte count, matching the table; byte counts have no `out:` label.
+Inactive session titles stay brighter than their dimmed commands and metadata
+in both views.
 
 ## Full session inspection
 

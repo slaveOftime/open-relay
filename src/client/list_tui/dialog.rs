@@ -140,7 +140,7 @@ impl CloneDialog {
                     .unwrap_or_default(),
             ),
             disable_notifications: !session.notifications_enabled,
-            attach_after_start: false,
+            attach_after_start: true,
             remove_original: false,
             error: None,
         }
@@ -162,7 +162,7 @@ impl CloneDialog {
             rows: EditText::new(String::new()),
             cols: EditText::new(String::new()),
             disable_notifications: false,
-            attach_after_start: false,
+            attach_after_start: true,
             remove_original: false,
             error: None,
         }
