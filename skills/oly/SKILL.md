@@ -46,6 +46,13 @@ oly start --title "task 1" --cwd /path/to/dir --detach the_cmd --arg1 --arg2
 | `--disable-notifications` | Suppress notifications when you will supervise yourself. |
 | `--node <name>` | Run on a connected secondary node. |
 
+In the list TUI (`oly ls --follow`), `Ctrl+N` (New Session) and `Ctrl+D`
+(Duplicate) open with **Attach on start** checked. A successful start attaches
+inline to the new session on the chosen node. To remain in the list, focus
+**Attach on start** and press `Space` to uncheck it before submitting. Each
+fresh new/duplicate dialog resets it to checked; Resume remains opt-in. This
+is a TUI default only, not a change to `oly start` CLI defaults.
+
 ### 2) Monitor
 
 ```bash

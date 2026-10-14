@@ -243,7 +243,7 @@ fn dense_rows_keep_identity_title_and_age_without_filling_to_the_right_edge() {
                     "no layout padding: {row}"
                 );
                 if width >= 80 {
-                    assert!(row.contains("out:18K"), "{row}");
+                    assert!(row.contains("18K"), "{row}");
                     assert!(!row.contains("pid:"), "{row}");
                     assert!(row.contains("│ runner"), "{row}");
                     assert!(
@@ -277,7 +277,7 @@ fn sparse_screenshot_regression_packs_metrics_next_to_notes_and_codex() {
     let row = text(&line);
     assert_eq!(
         &row.chars().skip(icon_x).collect::<String>(),
-        "◆ 86acb7b Notes 52m out:587K 0B/s wait │ codex"
+        "◆ 86acb7b Notes 52m 587K 0B/s wait │ codex"
     );
     assert!(
         !row.contains('▁'),
@@ -311,7 +311,8 @@ fn density_keeps_output_and_numeric_rate_even_for_long_commands() {
             session_line_with_connector(&item, Some(&rate), connector(1), false, now, width);
         let row = text(&line);
         assert!(line.width() <= width, "{row}");
-        assert!(row.contains("Deploy 3d out:123K 2.0K/s"), "{width}: {row}");
+        assert!(row.contains("Deploy 3d"), "{width}: {row}");
+        assert!(row.contains("123K 2.0K/s"), "{width}: {row}");
         if width >= 80 {
             assert!(row.contains("│ runner"), "{row}");
             assert!(
@@ -466,11 +467,7 @@ fn dense_selection_and_inactive_styles_preserve_status_and_metrics() {
         assert_eq!(buffer[(icon_x as u16 + 2, 0)].fg, style.fg.unwrap());
         assert_eq!(
             buffer[(title_x as u16, 0)].fg,
-            if selected {
-                Color::White
-            } else {
-                Color::DarkGray
-            }
+            if selected { Color::White } else { Color::Gray }
         );
         assert_eq!(
             buffer[(age_x as u16, 0)].fg,
@@ -539,5 +536,47 @@ fn exactly_one_space_separates_session_id_and_title() {
             assert!(!row.contains("view:"), "{row}");
             assert!(line.width() <= width);
         }
+    }
+}
+
+#[test]
+fn tree_output_bytes_have_no_out_label() {
+    let mut item = session();
+    item.title = Some("Notes".into());
+    item.last_total_bytes = 18 * 1024;
+    let (line, _) =
+        session_line_with_connector(&item, None, connector(1), false, Instant::now(), 120);
+    let row = text(&line);
+    assert!(row.contains("Notes 3d 18K 0B/s"), "{row}");
+    assert!(!row.contains("out:"), "{row}");
+}
+
+#[test]
+fn tree_activity_chart_precedes_output_bytes_like_the_table() {
+    let mut item = session();
+    item.title = Some("Notes".into());
+    item.last_total_bytes = 18 * 1024;
+    let now = Instant::now();
+    let mut rate = RateState::new(&item, now);
+    rate.rate = 2048.0;
+    rate.previous_rate = 2048.0;
+    rate.history = [1.0, 2.0, 4.0, 8.0, 16.0].into();
+    let chart = sparkline(Some(&rate), SPARKLINE_WIDTH);
+    for width in [80, 120, 160] {
+        let (line, _) =
+            session_line_with_connector(&item, Some(&rate), connector(1), false, now, width);
+        let row = text(&line);
+        assert!(
+            row.contains(&format!("Notes 3d {chart} 18K 2.0K/s")),
+            "{row}"
+        );
+        assert!(line.width() <= width);
+        let buffer = render_line(line, width);
+        let chart_byte = row.find(&chart).unwrap();
+        let output_byte = row.find("18K").unwrap();
+        let chart_x = UnicodeWidthStr::width(&row[..chart_byte]);
+        let output_x = UnicodeWidthStr::width(&row[..output_byte]);
+        assert_eq!(output_x, chart_x + SPARKLINE_WIDTH + 1);
+        assert_eq!(buffer[(output_x as u16, 0)].symbol(), "1");
     }
 }

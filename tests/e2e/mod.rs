@@ -342,6 +342,35 @@ pub fn wait_for_log(
     None
 }
 
+/// `wait_for_log` for a literal readiness marker, which panics with the last
+/// log seen on timeout. A bare `Option` failure cannot distinguish "the probe
+/// ran but never printed the marker" from "'oly logs' itself returned nothing"
+/// (transient daemon/IPC trouble, or a session that never spawned), and that
+/// distinction is the whole diagnosis. Mirrors the daemon-stderr dump
+/// [`start_daemon`] attaches to its own readiness wait.
+pub fn wait_for_log_or_panic(
+    tmp: &std::path::Path,
+    id: &str,
+    context: &str,
+    marker: &str,
+    timeout: Duration,
+) -> String {
+    let mut last_log = String::new();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let log = fetch_logs(tmp, id);
+        if log.contains(marker) {
+            return log;
+        }
+        last_log = log;
+        sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "{context}: {marker:?} not seen within {timeout:?}; last log (empty means 'oly logs' \
+         returned nothing): {last_log:?}"
+    );
+}
+
 pub fn wait_for_stable_log(tmp: &std::path::Path, id: &str, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     let mut previous_non_empty: Option<String> = None;

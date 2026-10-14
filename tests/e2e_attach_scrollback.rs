@@ -138,14 +138,12 @@ fn e2e_attach_picker_to_chat_preserves_live_and_reattached_scrollback() {
             fixture.to_str().unwrap(),
         ],
     );
-    assert!(
-        wait_for_log(
-            &tmp,
-            &id,
-            |log| log.contains("PICKER_READY"),
-            Duration::from_secs(10)
-        )
-        .is_some()
+    wait_for_log_or_panic(
+        &tmp,
+        &id,
+        "scrollback probe",
+        "PICKER_READY",
+        Duration::from_secs(10),
     );
     let mut outer = OuterTerminal::attach(&tmp, &id);
     outer.wait_for("PICKER_READY");

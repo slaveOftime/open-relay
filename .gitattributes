@@ -1,0 +1,14 @@
+# Line-ending policy: SQLx embeds `migrations/*.sql` at compile time
+# byte-for-byte via `sqlx::migrate!`, and the schema-history table records
+# SHA-384 checksums of that exact byte sequence. A `--autocrlf=true` host
+# (Windows default) rewrites LF to CRLF on checkout, which silently mutates
+# the embedded checksum and the binary fails to start with
+# `migration N was previously applied but has been modified`.
+#
+# Forcing `eol=lf` here keeps the working tree, the git blob, and the bytes
+# embedded into every daemon binary identical on every host.
+migrations/*.sql	text eol=lf
+
+# Treat the rest of the SQL we ship as text the same way so future schema
+# migrations never trip the same wire.
+**/*.sql	text eol=lf

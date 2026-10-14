@@ -401,13 +401,7 @@ fn session_line_with_connector(
 ) -> (Line<'static>, usize) {
     let active = is_active_status(&session.status);
     let (glyph, status_style) = session_status_style(session, selected);
-    let title_style = Style::default().fg(if selected {
-        Color::White
-    } else if active {
-        Color::Gray
-    } else {
-        Color::DarkGray
-    });
+    let title_style = Style::default().fg(if selected { Color::White } else { Color::Gray });
     let dim = Style::default().fg(if selected {
         Color::White
     } else {
@@ -460,10 +454,7 @@ fn session_line_with_connector(
             metrics.push((text, style));
         }
     };
-    add_metric(
-        format!("out:{}", format_bytes(session.last_total_bytes as f64)),
-        dim,
-    );
+    add_metric(format_bytes(session.last_total_bytes as f64), dim);
     if active {
         add_metric(
             format!("{}/s", format_bytes(current_rate)),
@@ -491,23 +482,30 @@ fn session_line_with_connector(
     } else {
         title_budget
     };
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(truncate(&title, title_width), title_style));
-    for (text, style) in metrics {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(text, style));
-    }
-    // Idle flat charts add no information; show history only when it has
-    // actual activity and there is room after the primary metrics.
-    let used = spans.iter().map(Span::width).sum::<usize>();
+    let title = truncate(&title, title_width);
+    // Plan the optional chart against the complete row, then place it before
+    // output bytes, matching the table's age / activity / output ordering.
+    let used = spans.iter().map(Span::width).sum::<usize>()
+        + 1
+        + UnicodeWidthStr::width(title.as_str())
+        + 1
+        + metric_width;
     let has_activity =
         active && rate.is_some_and(|rate| rate.history.iter().any(|value| *value > 0.0));
     if has_activity && width.saturating_sub(used) >= SPARKLINE_WIDTH + 1 + 16 {
+        metrics.insert(
+            1,
+            (
+                sparkline(rate, SPARKLINE_WIDTH),
+                Style::default().fg(rate_color(current_rate, animation_age)),
+            ),
+        );
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(title, title_style));
+    for (text, style) in metrics {
         spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            sparkline(rate, SPARKLINE_WIDTH),
-            Style::default().fg(rate_color(current_rate, animation_age)),
-        ));
+        spans.push(Span::styled(text, style));
     }
     let used = spans.iter().map(Span::width).sum::<usize>();
     let command_width = width.saturating_sub(used + 3);
