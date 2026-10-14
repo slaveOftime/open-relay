@@ -612,7 +612,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let (store, startup_failed_sessions) = {
         let store = SessionStore::with_journal_byte_cap(
             config.limits.session_eviction_seconds,
-            0, // Live journal deletion is disabled; see MIGRATION.md.
+            0, // Live journal deletion is disabled.
             db.clone(),
         );
         store.set_resume_patterns(config.resume.patterns.clone());

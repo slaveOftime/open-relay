@@ -17,9 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCS = [
     ROOT / "README.md",
     ROOT / "ARCHITECTURE.md",
-    ROOT / "MIGRATION.md",
     ROOT / "CONTRIBUTING.md",
-    *sorted((ROOT / "docs").glob("*.md")),
+    *sorted((ROOT / "docs").rglob("*.md")),
     *sorted((ROOT / "skills").glob("*/SKILL.md")),
 ]
 CONFIG = (ROOT / "src/config.rs").read_text()
@@ -78,10 +77,24 @@ class DocsSyncTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         self.assertLessEqual(len(readme.splitlines()), 160)
         self.assertNotIn("## Command reference", readme)
-        for target in ("./docs/CLI.md", "./docs/REMOTE.md", "./MIGRATION.md"):
+        for target in ("./docs/guides/cli.md", "./docs/guides/remote-access.md", "./docs/releases/migration-0.5.md"):
             self.assertIn(target, readme)
         self.assertIn("npm install -g @slaveoftime/oly@beta", readme)
         self.assertIn("Node.js/npm", readme)
+
+    def test_docs_index_covers_nested_documents(self):
+        index = ROOT / "docs/README.md"
+        linked = {
+            (index.parent / target).resolve()
+            for target in re.findall(r"\[[^\]\n]*\]\(([^)\s]+)\)", index.read_text())
+            if not urlsplit(target).scheme
+        }
+        for path in (ROOT / "docs").rglob("*.md"):
+            if path != index:
+                with self.subTest(document=str(path.relative_to(ROOT))):
+                    self.assertIn(path.resolve(), linked, "Document missing from docs index")
+                    self.assertIn(path, DOCS, "Nested document must be checked")
+                    self.assertRegex(path.name, r"^[a-z0-9][a-z0-9.-]*\.md$")
 
     def test_skill_frontmatter_and_embedding(self):
         main = (ROOT / "src/main.rs").read_text()
@@ -116,9 +129,11 @@ class DocsSyncTests(unittest.TestCase):
     def test_migration_protocol_version_matches_source(self):
         protocol = (ROOT / "src/protocol.rs").read_text()
         version = re.search(r"pub const PROTOCOL_VERSION: u16 = (\d+);", protocol).group(1)
-        migration = (ROOT / "MIGRATION.md").read_text()
+        migration = (ROOT / "docs/releases/migration-0.5.md").read_text()
+        compatibility = (ROOT / "docs/releases/compatibility-0.5.md").read_text()
         self.assertIn(f"Protocol **{version}**", migration)
-        self.assertIn(f'{{"version":{version},"payload":...}}', migration)
+        self.assertIn(f"Protocol **{version}**", compatibility)
+        self.assertIn(f'{{"version":{version},"payload":...}}', compatibility)
         for path in DOCS:
             self.assertNotIn("src/session/journal.rs", path.read_text())
 

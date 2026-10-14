@@ -15,7 +15,6 @@ on:
       - scripts/release-package.py
       - README.md
       - ARCHITECTURE.md
-      - MIGRATION.md
       - CONTRIBUTING.md
       - docs/**
       - skills/**

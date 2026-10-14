@@ -72,7 +72,7 @@ pub fn replay_filtered_tail(session_dir: &Path, desired_tail_lines: usize) -> Re
     {
         return Err(crate::error::AppError::Protocol(format!(
             "session log in {} uses the pre-0.5 format (output.log) and is no \
-             longer readable; export it with a 0.x build first, see MIGRATION.md",
+             longer readable; export it with a 0.x build first; see the migration guide",
             session_dir.display()
         )));
     }

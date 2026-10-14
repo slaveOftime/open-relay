@@ -38,10 +38,11 @@ npm install -g @slaveoftime/oly
 The npm package bundles binaries for **Linux x64, macOS Apple Silicon, and
 Windows x64**. No GitHub asset download is needed during installation.
 
-> **0.5 preview:** this development branch targets the breaking 0.5 release.
-> Stable installs currently use the 0.3 line. For published preview artifacts,
-> use `npm install -g @slaveoftime/oly@beta` or a GitHub prerelease.
-> Read the [migration guide](./MIGRATION.md) before switching existing state.
+> **0.5.0-beta.1 is available:** a breaking preview, not the stable channel.
+> Stable installs still use the 0.3 line. Try `npm install -g @slaveoftime/oly@beta`
+> or the [GitHub prerelease](https://github.com/slaveOftime/open-relay/releases/tag/v0.5.0-beta.1).
+> Back up state and read the [migration guide](./docs/releases/migration-0.5.md) before upgrading.
+> See the [release notes and verification](./docs/releases/release-notes-0.5.0-beta.1.md).
 
 <details>
 <summary>Other installation options</summary>
@@ -123,12 +124,13 @@ Open **http://127.0.0.1:15443** for the browser UI, or use
 
 ## Go deeper
 
-- [CLI guide](./docs/CLI.md) — logs, cursors, input, scrolling, and session lifecycle
-- [Remote access](./docs/REMOTE.md) — browser security, connected nodes, and notifications
+- [CLI guide](./docs/guides/cli.md) — logs, cursors, input, scrolling, and session lifecycle
+- [Remote access](./docs/guides/remote-access.md) — browser security, connected nodes, and notifications
 - [Agent skills](./skills/oly/SKILL.md) — general usage; [worker supervision](./skills/oly-subagent/SKILL.md), [daemon configuration](./skills/oly-daemon/SKILL.md), [web apps](./skills/oly-apps/SKILL.md)
-- [Migration](./MIGRATION.md) — breaking changes and safe upgrades
+- [Upgrade to 0.5](./docs/releases/migration-0.5.md) — breaking changes and safe upgrades
 - [Architecture](./ARCHITECTURE.md) · [Performance](./PERFORMANCE.md) · [Contributing](./CONTRIBUTING.md)
-- [Compatibility](./docs/COMPATIBILITY.md) · [Beta release notes](./docs/RELEASE-NOTES-0.5.0-beta.1.md) · [Release checklist](./docs/RELEASING.md)
+- [What's new in 0.5](./docs/releases/whats-new-0.5.md) · [Compatibility](./docs/releases/compatibility-0.5.md)
+- [All documentation](./docs/README.md) · [How to publish a release](./docs/maintainers/release-process.md)
 
 MIT licensed. If oly makes your workflow easier, a
 [star on GitHub](https://github.com/slaveOftime/open-relay) helps others find it.

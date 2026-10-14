@@ -1,6 +1,6 @@
 # CLI guide
 
-[README](../README.md) · [Remote access](./REMOTE.md) · [Daemon configuration](../skills/oly-daemon/SKILL.md)
+[Documentation](../README.md) · [Remote access](./remote-access.md) · [Daemon configuration](../../skills/oly-daemon/SKILL.md)
 
 This guide describes the 0.5 CLI. `oly <command> --help` is the authoritative
 flag reference. Most runtime operations require a running daemon; local

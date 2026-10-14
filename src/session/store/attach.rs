@@ -115,7 +115,7 @@ impl SessionStore {
         let offset = from_byte_offset.unwrap_or(0);
         // The filtered display stream is derived from the raw journal;
         // sessions without a journal are pre-0.5 and unsupported
-        // (the output.log fallback was removed; see MIGRATION.md).
+        // (the output.log fallback was removed).
         if !dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
             warn!(
                 session_id = id,
