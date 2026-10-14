@@ -43,15 +43,12 @@ fn e2e_attach_multiline_terminal_paste_does_not_submit() {
             report.to_str().unwrap(),
         ],
     );
-    assert!(
-        wait_for_log(
-            &tmp,
-            &id,
-            |log| log.contains("PASTE_READY"),
-            Duration::from_secs(10)
-        )
-        .is_some(),
-        "probe did not become ready"
+    wait_for_log_or_panic(
+        &tmp,
+        &id,
+        "paste probe",
+        "PASTE_READY",
+        Duration::from_secs(10),
     );
 
     let pair = native_pty_system()
