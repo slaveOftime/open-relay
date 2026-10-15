@@ -9,10 +9,10 @@ describe('StatusBadge', () => {
     const markup = renderToStaticMarkup(<StatusBadge status="running" inputNeeded />)
 
     expect(markup.match(/Input Needed/g)?.length ?? 0).toBe(1)
-    expect(markup).not.toContain('Running')
+    expect(markup).not.toContain('<span>Running</span>')
   })
 
-  it('shows explicit permission state without hiding process lifecycle', () => {
+  it('shows input-needed alongside permission detail and lifecycle tooltip', () => {
     const markup = renderToStaticMarkup(
       <StatusBadge
         status="running"
@@ -20,7 +20,9 @@ describe('StatusBadge', () => {
         programStatus={{ state: 'blocked', kind: 'permission', msg: '<script>bad</script>' }}
       />
     )
-    expect(markup).toContain('Running')
+    expect(markup).toContain('title="Process: Running"')
+    expect(markup).toContain('Input Needed')
+    expect(markup).not.toContain('<span>Running</span>')
     expect(markup).toContain('Permission Required')
     expect(markup).toContain('Agent-reported (OSC 7501)')
     expect(markup).not.toContain('<script>')
@@ -34,6 +36,30 @@ describe('StatusBadge', () => {
       )
       expect(markup).toContain('OSC 7501')
       expect(markup.includes('42%')).toBe(state === 'working' || state === 'blocked')
+    }
+  )
+
+  it.each(['idle', 'done'] as const)('shows %s as ready without a busy pulse', (state) => {
+    const markup = renderToStaticMarkup(
+      <StatusBadge status="running" inputNeeded programStatus={{ state }} />
+    )
+    expect(markup).toContain('Ready for Input')
+    expect(markup).toContain('title="Process: Running"')
+    expect(markup).toContain(state === 'idle' ? 'Idle' : 'Task Done')
+    expect(markup).not.toContain('<span>Running</span>')
+    expect(markup).not.toContain('animate-pulse')
+  })
+
+  it.each(['stopping', 'stopped', 'killed', 'failed', 'created'] as const)(
+    'does not show %s as ready even with a stale attention flag',
+    (status) => {
+      const markup = renderToStaticMarkup(
+        <StatusBadge status={status} inputNeeded programStatus={{ state: 'done' }} />
+      )
+      expect(markup).not.toContain('Ready for Input')
+      expect(markup).not.toContain('Input Needed')
+      expect(markup).not.toContain('animate-pulse')
+      expect(markup).toContain('Task Done')
     }
   )
 

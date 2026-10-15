@@ -778,7 +778,16 @@ impl SessionRuntime {
             return false;
         }
         if let Some(report) = self.terminal_signals.program_statuses.current() {
-            return report.state == super::program_status::ProgramState::Blocked;
+            use super::program_status::ProgramState;
+            // Attention includes readiness for another instruction, not just
+            // blocked prompts. It is independent of notification delivery.
+            return matches!(
+                report.state,
+                ProgramState::Idle
+                    | ProgramState::Done
+                    | ProgramState::Blocked
+                    | ProgramState::Error
+            );
         }
         self.notified_output_epoch.is_some()
             && self.notified_output_epoch == Some(self.effective_output_epoch())
@@ -2510,6 +2519,45 @@ mod tests {
     }
 
     #[test]
+    fn program_status_attention_is_immediate_and_gated_by_process_lifecycle() {
+        for status in [
+            SessionStatus::Created,
+            SessionStatus::Running,
+            SessionStatus::Stopping,
+            SessionStatus::Stopped,
+            SessionStatus::Killed,
+            SessionStatus::Failed,
+        ] {
+            let mut rt = new_runtime_with(status, 0);
+            rt.set_notifications_enabled(false);
+            let mut scanner = PtyScanner::new();
+            for (state, needs_attention) in [
+                ("idle", true),
+                ("working", false),
+                ("done", true),
+                ("working", false),
+                ("blocked", true),
+                ("error", true),
+            ] {
+                push_scanned_with(
+                    &mut rt,
+                    &mut scanner,
+                    format!("\x1b]7501;state={state}\x07").as_bytes(),
+                );
+                let expected = status == SessionStatus::Running && needs_attention;
+                assert_eq!(rt.input_needed(), expected, "{status:?}/{state}");
+                let summary = rt.to_summary();
+                assert_eq!(summary.status, status.as_str());
+                assert_eq!(summary.input_needed, expected);
+                assert_eq!(rt.last_total_bytes, 0);
+                // Notification delivery/acknowledgement must not govern explicit attention.
+                rt.notified_output_epoch = Some(rt.effective_output_epoch());
+                assert_eq!(rt.input_needed(), expected, "notified {status:?}/{state}");
+            }
+        }
+    }
+
+    #[test]
     fn program_status_clear_does_not_resurrect_old_heuristic_attention() {
         let mut rt = new_runtime();
         let mut scanner = PtyScanner::new();
@@ -2520,6 +2568,17 @@ mod tests {
         assert!(!rt.input_needed());
         push_scanned_with(&mut rt, &mut scanner, b"\x1b]7501;state=clear\x07");
         assert!(!rt.input_needed());
+        for state in ["idle", "done", "error"] {
+            rt.notified_output_epoch = Some(rt.effective_output_epoch());
+            push_scanned_with(
+                &mut rt,
+                &mut scanner,
+                format!("\x1b]7501;state={state}\x07").as_bytes(),
+            );
+            assert!(rt.input_needed());
+            push_scanned_with(&mut rt, &mut scanner, b"\x1b]7501;state=clear\x07");
+            assert!(!rt.input_needed(), "clear {state}");
+        }
     }
 
     #[test]
