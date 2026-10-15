@@ -136,6 +136,17 @@ async function openSearchControl(page: Page) {
   await page.getByRole('button', { name: SEARCH_ICON }).click()
 }
 
+/** Drag the trigger by a delta from wherever it currently sits. */
+async function dragTrigger(page: Page, dx: number, dy: number) {
+  const box = (await page.getByRole('button', { name: SEARCH_ICON }).boundingBox())!
+  const cx = box.x + box.width / 2
+  const cy = box.y + box.height / 2
+  await page.mouse.move(cx, cy)
+  await page.mouse.down()
+  await page.mouse.move(cx + dx, cy + dy, { steps: 6 })
+  await page.mouse.up()
+}
+
 test.beforeEach(async ({ page }) => {
   await mockBackend(page)
   await page.goto('/')
@@ -355,4 +366,51 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
       return inputBox.x + inputBox.width
     })
     .toBeLessThanOrEqual(restored.x + 1)
+})
+
+test('the menu opens over the trigger when there is no room under it', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+
+  // Down into the bottom band: the default spot has ~280px of room under it,
+  // which this cuts to ~100 — less than the menu is tall.
+  await dragTrigger(page, 0, 170)
+  await icon.click()
+  await expect(input).toBeVisible()
+
+  const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
+  const iconBox = (await icon.boundingBox())!
+  // Flipped: the menu's bottom edge clears the trigger's top edge by the usual
+  // small gap, and the whole panel is still on screen. The entrance grows out
+  // of that bottom corner, so the edge holds through it.
+  expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(iconBox.y)
+  expect(iconBox.y - (menuBox.y + menuBox.height)).toBeLessThanOrEqual(16)
+  expect(menuBox.y).toBeGreaterThanOrEqual(0)
+  // Right-aligned as ever: the flip is vertical only.
+  expect(Math.abs(menuBox.x + menuBox.width - (iconBox.x + iconBox.width))).toBeLessThanOrEqual(1)
+})
+
+test('the menu slides into view when the trigger is dragged to the left edge', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+
+  // Past the clamp: the trigger comes to rest on the frame's left margin, where
+  // a 240px panel hanging off its right edge would run off the screen.
+  await dragTrigger(page, -320, 0)
+  await icon.click()
+  await expect(input).toBeVisible()
+
+  const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
+  const iconBox = (await icon.boundingBox())!
+  expect(iconBox.x).toBeLessThan(60)
+  // Still whole, and under the trigger, with its left edge slid back to the
+  // margin by the placement rather than hanging off the screen.
+  expect(menuBox.x + menuBox.width).toBeLessThan(375)
+  expect(menuBox.y).toBeGreaterThanOrEqual(iconBox.y + iconBox.height)
+  expect(menuBox.x).toBeGreaterThanOrEqual(0)
+  // The entrance scales about the top-right corner, so the left edge settles
+  // last — poll it rather than sampling mid-transition.
+  await expect
+    .poll(async () => (await page.getByTestId('session-search-menu').boundingBox())!.x)
+    .toBeLessThan(8)
 })

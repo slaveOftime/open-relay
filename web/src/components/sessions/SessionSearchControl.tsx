@@ -8,7 +8,11 @@
  * search bar grows out of the trigger's right edge toward the left (one merged
  * pill, the trigger as its right cap, the icon itself never moving) and takes
  * focus, and the quick menu — the filter dropdowns the page passes as `menu` —
- * pops up under the trigger, right-aligned with it. A second tap closes both,
+ * pops up under the trigger, right-aligned with it. Since the trigger can be
+ * dragged anywhere the frame allows, that spot is the menu's preference rather
+ * than its rule: `lib/menu-placement` flips it over the trigger when the room
+ * below is short, and slides it sideways when the trigger has run close to the
+ * left edge of the screen. A second tap closes both,
  * as does a tap outside or Escape. There is no second gesture to wait for: a
  * tap acts on its release. The X in the bar is the search's own control — it
  * clears the text, or closes the control when there is nothing to clear. A drag
@@ -17,12 +21,21 @@
  * a travelling press is a move — no hold-then-move, which used to fight the
  * hold that opened the menu).
  */
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { cn } from '@/utils/cn'
 import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
 import { useTapGestures } from '@/hooks/use-tap-gestures'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
+import { DEFAULT_MENU_PLACEMENT, placeMenu, type MenuPlacement } from '@/lib/menu-placement'
 import { Input } from '@/components/ui/input'
 
 /** Where a moved trigger is remembered; the default spot needs no entry. */
@@ -52,8 +65,10 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
   // reach it, since the trigger only toggles the pair.
   const [open, setOpen] = useState(false)
   const [armed, setArmed] = useState(false)
+  const [placement, setPlacement] = useState<MenuPlacement>(DEFAULT_MENU_PLACEMENT)
   const iconRef = useRef<HTMLButtonElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
 
   const duration = reducedMotion ? 0 : ENTER_DURATION_MS
@@ -102,6 +117,39 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     if (open) inputRef.current?.focus()
   }, [open])
 
+  // Place the menu where it fits: the trigger can have been dragged anywhere
+  // the frame allows, so "under its right corner" is only the preferred spot.
+  // Measured from layout boxes — the entrance's scale transform would shrink a
+  // measured rect — in a layout effect, so the menu is never painted in the
+  // wrong place before its entrance arms. Re-measured when the menu itself
+  // changes size (an active filter adds the Clear button) or the window does.
+  useLayoutEffect(() => {
+    if (!open) return
+    const menu = menuRef.current
+    const root = rootRef.current
+    if (!menu || !root) return
+    const place = () => {
+      const next = placeMenu(
+        root.getBoundingClientRect(),
+        { width: menu.offsetWidth, height: menu.offsetHeight },
+        { width: window.innerWidth, height: window.innerHeight }
+      )
+      // Same numbers, same place: bail out rather than re-render on every
+      // resize tick.
+      setPlacement((current) =>
+        current.vertical === next.vertical && current.right === next.right ? current : next
+      )
+    }
+    place()
+    const observer = new ResizeObserver(place)
+    observer.observe(menu)
+    window.addEventListener('resize', place)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', place)
+    }
+  }, [open])
+
   // The control closes on an outside pointerdown or Escape. A pointerdown
   // inside it belongs to it: the bar, the trigger (whose own tap toggles the
   // control), and the menu. A select opens its dropdown in a portal, which
@@ -130,8 +178,8 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
 
   const popStyle: CSSProperties = {
     // Only the pop: the placement needs no translate, since the menu hangs from
-    // the trigger's bottom-right corner. Origin is that corner, so it grows
-    // down and to the left, out of the button it belongs to.
+    // one of the trigger's right corners. The origin is the corner it hangs
+    // from, so it grows out of the button it belongs to.
     transform: armed ? 'scale(1)' : 'scale(0.92)',
     opacity: armed ? 1 : 0,
     transitionDuration: `${duration}ms`,
@@ -250,13 +298,17 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
 
       {open && menu && (
         <div
+          ref={menuRef}
           data-testid="session-search-menu"
-          style={popStyle}
+          // The slide that keeps the menu on screen is placement, not entrance:
+          // the pop keeps its own origin (`mt-2`/`mb-2` is the gap the
+          // placement counted, `MENU_GAP_PX`).
+          style={{ ...popStyle, right: placement.right }}
           className={cn(
-            // Hanging under the trigger's bottom-right corner, right-aligned
-            // with it and a small gap apart — it reads as opening out of the
-            // button, over the list it filters.
-            'absolute right-0 top-full z-40 mt-2 w-60 origin-top-right rounded-lg',
+            'absolute z-40 w-60 rounded-lg',
+            placement.vertical === 'below'
+              ? 'top-full mt-2 origin-top-right'
+              : 'bottom-full mb-2 origin-bottom-right',
             'border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 p-3',
             'shadow-xl backdrop-blur-sm transition-[transform,opacity]',
             armed ? 'pointer-events-auto' : 'pointer-events-none'
