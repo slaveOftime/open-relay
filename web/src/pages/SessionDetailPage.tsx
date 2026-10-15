@@ -1283,9 +1283,17 @@ function SessionDetailPageContent() {
               <span className="hidden sm:inline">Open Relay</span>
             </div>
           </Link>
-          <div className="flex items-center gap-1.5 min-w-0 flex-1">
+          {/* Session metadata is one line to read, not a layout to squeeze: the
+              id and the badges keep their natural size and the strip scrolls
+              when the row is wider than the screen. The actions button sits
+              outside it, so it stays pinned to the right edge whatever part of
+              the strip is showing. */}
+          <div
+            data-testid="session-header-meta"
+            className="flex items-center gap-1.5 min-w-0 flex-1 overflow-x-auto [&>*]:shrink-0"
+          >
             <button
-              className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold truncate hover:text-[hsl(var(--primary))] transition-colors"
+              className="font-mono text-sm text-[hsl(var(--foreground))] font-semibold whitespace-nowrap hover:text-[hsl(var(--primary))] transition-colors"
               onClick={() => setShowMetadataDialog(true)}
             >
               {session?.id}

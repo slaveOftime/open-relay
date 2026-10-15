@@ -136,6 +136,11 @@ primary accent.
 - **Read a module's own tests before writing tests against it.** Three wrong
   tests came from assuming `parseKeySpec` returns null for an unknown key, when
   it throws.
+- **The child carrying `truncate` is the child that pays.** The session detail
+  header's metadata row had exactly one shrinkable item, so a long session id
+  collapsed to its first character while every badge kept its size. Decide "this
+  row never squeezes" on the container — `overflow-x-auto` plus
+  `[&>*]:shrink-0` — and drop the `truncate` that was doing the damage.
 
 ## Avoid
 
