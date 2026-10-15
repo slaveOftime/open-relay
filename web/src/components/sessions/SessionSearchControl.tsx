@@ -4,16 +4,18 @@
  * terminal's scroll handle — so it sits under the thumb and never scrolls away
  * with the list.
  *
- * Collapsed it is that one circular button. A tap — classified only after the
- * double window closes, so a pair never flashes the bar and the keyboard —
- * grows the search bar out of the trigger's right edge toward the left (one
- * merged pill, the trigger as its right cap, the icon itself never moving) and
- * focuses the input; a double tap opens the quick menu instead — the filter
- * dropdowns the page passes as `menu`. The two popups are mutually exclusive,
- * and a tap toggles whichever of them is up. A drag moves the whole control
- * somewhere better and remembers the spot (`useHoldToDrag` with `armMs: 0`:
- * nothing else owns a drag on this button, so a travelling press is a move —
- * no hold-then-move, which used to fight the hold that opened the menu).
+ * Collapsed it is that one circular button. A tap opens the whole control: the
+ * search bar grows out of the trigger's right edge toward the left (one merged
+ * pill, the trigger as its right cap, the icon itself never moving) and takes
+ * focus, and the quick menu — the filter dropdowns the page passes as `menu` —
+ * pops up under the trigger, right-aligned with it. A second tap closes both,
+ * as does a tap outside or Escape. There is no second gesture to wait for: a
+ * tap acts on its release. The X in the bar is the search's own control — it
+ * clears the text, or closes the control when there is nothing to clear. A drag
+ * moves the whole control somewhere better and remembers the spot
+ * (`useHoldToDrag` with `armMs: 0`: nothing else owns a drag on this button, so
+ * a travelling press is a move — no hold-then-move, which used to fight the
+ * hold that opened the menu).
  */
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
@@ -44,97 +46,79 @@ interface Props {
 
 export default function SessionSearchControl({ search, onSearchChange, active, menu }: Props) {
   const reducedMotion = useReducedMotion()
-  const [expanded, setExpanded] = useState(false)
-  const [menuOpen, setMenuOpen] = useState(false)
+  // One state, because the bar and the menu are one popup now: they come up on
+  // the same tap and every dismissal takes both. A half-open control — a filter
+  // panel under a collapsed bar, or the reverse — would have no tap that could
+  // reach it, since the trigger only toggles the pair.
+  const [open, setOpen] = useState(false)
   const [armed, setArmed] = useState(false)
   const iconRef = useRef<HTMLButtonElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
-  const menuRef = useRef<HTMLDivElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
 
   const duration = reducedMotion ? 0 : ENTER_DURATION_MS
 
-  const closeMenu = useCallback(() => {
-    setMenuOpen(false)
-    setArmed(false)
-  }, [])
-  const collapseBar = useCallback(() => {
-    setExpanded(false)
+  const close = useCallback(() => {
+    setOpen(false)
     setArmed(false)
   }, [])
 
   // Drag the trigger: the control follows the pointer and the drop is
   // remembered. There is no hold to wait out — the press has no other drag
   // meaning, so any press that travels past the slop is a move, and taking
-  // the button closes whichever popup is up.
+  // the button closes the control.
   const reposition = useHoldToDrag({
     handleRef: iconRef,
     elementRef: rootRef,
     storageKey: POSITION_KEY,
     armMs: 0,
-    onDragStart: () => {
-      collapseBar()
-      closeMenu()
-    },
+    onDragStart: close,
   })
-
-  const open = expanded || menuOpen
 
   const handlePress = useCallback(() => {
-    if (menuOpen) {
-      closeMenu()
+    if (open) {
+      close()
       return
     }
-    if (expanded) {
-      collapseBar()
-      return
-    }
-    setExpanded(true)
-  }, [closeMenu, collapseBar, expanded, menuOpen])
+    setOpen(true)
+  }, [close, open])
 
-  const press = useTapGestures({
-    onPress: handlePress,
-    // The second tap of a pair is the quick menu, replacing the bar the first
-    // tap just opened.
-    onDoubleTap: () => {
-      collapseBar()
-      setMenuOpen(true)
-    },
-  })
+  // The tap has no double: the control has no second action to offer a pair,
+  // and a tap that waited for one would only feel late.
+  const press = useTapGestures({ onPress: handlePress })
 
   // The menu mounts collapsed and arms on the next frame so its transform
   // transition actually runs (the same pattern QuickKeysMenu uses). The bar
   // animates its width instead and needs no such kick.
   useEffect(() => {
-    if (!menuOpen) return
+    if (!open) return
     const raf = requestAnimationFrame(() => setArmed(true))
     return () => cancelAnimationFrame(raf)
-  }, [menuOpen])
+  }, [open])
 
   // Focus the input once the bar is up: the bar re-opens, so autoFocus (which
   // fires on mount only) cannot do this.
   useEffect(() => {
-    if (expanded) inputRef.current?.focus()
-  }, [expanded])
+    if (open) inputRef.current?.focus()
+  }, [open])
 
-  // The menu closes on an outside pointerdown or Escape. Pointerdowns inside a
-  // menu select's own dropdown (a Radix popper portal) belong to that select;
-  // pointerdowns on the trigger belong to its own tap, which toggles the menu
-  // itself.
+  // The control closes on an outside pointerdown or Escape. A pointerdown
+  // inside it belongs to it: the bar, the trigger (whose own tap toggles the
+  // control), and the menu. A select opens its dropdown in a portal, which
+  // belongs to the select.
   useEffect(() => {
-    if (!menuOpen) return
+    if (!open) return
     const onPointerDown = (event: PointerEvent) => {
       const { target } = event
       if (!(target instanceof Node)) return
-      if (menuRef.current?.contains(target)) return
-      if (iconRef.current?.contains(target)) return
+      if (rootRef.current?.contains(target)) return
       if (target instanceof Element && target.closest('[data-radix-popper-content-wrapper]')) {
         return
       }
-      closeMenu()
+      close()
     }
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') closeMenu()
+      if (event.key === 'Escape') close()
     }
     document.addEventListener('pointerdown', onPointerDown, true)
     document.addEventListener('keydown', onKeyDown)
@@ -142,13 +126,13 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
       document.removeEventListener('pointerdown', onPointerDown, true)
       document.removeEventListener('keydown', onKeyDown)
     }
-  }, [closeMenu, menuOpen])
+  }, [close, open])
 
   const popStyle: CSSProperties = {
-    // The translate folds the vertical centering into the inline transform —
-    // a Tailwind translate class would be overridden by this. Origin is the
-    // right edge, so the menu grows out of the trigger toward the left.
-    transform: armed ? 'translateY(-50%) scale(1)' : 'translateY(-50%) scale(0.92)',
+    // Only the pop: the placement needs no translate, since the menu hangs from
+    // the trigger's bottom-right corner. Origin is that corner, so it grows
+    // down and to the left, out of the button it belongs to.
+    transform: armed ? 'scale(1)' : 'scale(0.92)',
     opacity: armed ? 1 : 0,
     transitionDuration: `${duration}ms`,
     transitionTimingFunction: SPRING_EASE,
@@ -178,14 +162,14 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
           open ? 'opacity-100' : 'opacity-80'
         )}
         style={{
-          width: expanded ? BAR_WIDTH_PX : TRIGGER_SIZE_PX,
+          width: open ? BAR_WIDTH_PX : TRIGGER_SIZE_PX,
           transitionDuration: `${duration}ms`,
         }}
       >
         <div
           className={cn(
             'flex h-full w-56 shrink-0 items-center gap-1 pl-3.5 transition-opacity',
-            expanded ? 'opacity-100' : 'invisible opacity-0'
+            open ? 'opacity-100' : 'invisible opacity-0'
           )}
           style={{ transitionDuration: `${duration}ms` }}
           // Tapping the bar's padding is not a tap elsewhere: keep focus in the
@@ -202,19 +186,21 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
             onBlur={(event) => {
-              // The tap that just opened this bar moves focus to the trigger
-              // as the gesture's default action, which blurs the input right
-              // after it was focused. That move is not a dismissal.
-              if (event.relatedTarget === iconRef.current) return
-              // The bar may already be down: the double tap that opened the
-              // menu hid the focused input, and the browser blurs it for that
-              // — a frame after the menu's entrance arm. Re-collapsing then
-              // would only tear the arm (and the menu's clickability) down.
-              if (!expanded) return
-              collapseBar()
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') collapseBar()
+              // The control may already be down: closing it only hides the
+              // focused input, and the browser blurs it a frame later.
+              if (!open) return
+              // Focus staying inside the control is not a dismissal. That
+              // covers the trigger — the tap that opened the bar moves focus to
+              // it as the gesture's default action — the X button, the menu's
+              // own controls, and the dropdown a menu select opens in its
+              // portal. The search box staying up while a filter is picked is
+              // the point of opening them together.
+              const next = event.relatedTarget
+              if (next instanceof Node && rootRef.current?.contains(next)) return
+              if (next instanceof Element && next.closest('[data-radix-popper-content-wrapper]')) {
+                return
+              }
+              close()
             }}
           />
           <button
@@ -225,7 +211,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
             onPointerDown={(event) => event.preventDefault()}
             onClick={() => {
               if (search) onSearchChange('')
-              else collapseBar()
+              else close()
             }}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[hsl(var(--muted-foreground))] transition-colors hover:text-[hsl(var(--foreground))]"
           >
@@ -234,14 +220,13 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         </div>
       </div>
 
-      {/* The trigger: the bar's right cap, and the tap/double-tap anchor for
-          the menu. */}
+      {/* The trigger: the bar's right cap, and the control's tap anchor. */}
       <button
         ref={iconRef}
         type="button"
         aria-label="Search sessions"
         aria-haspopup="true"
-        aria-expanded={menuOpen}
+        aria-expanded={open}
         {...press.handlers}
         // Only a click with no gesture behind it: the keyboard, assistive
         // tech, a programmatic click. The browser's follow-up click for a tap
@@ -263,16 +248,15 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         )}
       </button>
 
-      {menuOpen && menu && (
+      {open && menu && (
         <div
-          ref={menuRef}
           data-testid="session-search-menu"
           style={popStyle}
           className={cn(
-            // Anchored to the trigger's left, vertically centred on it, with a
-            // small gap — it reads as opening out of the trigger toward the
-            // list, which is where it points.
-            'absolute right-full top-1/2 z-40 mr-2 w-60 origin-right rounded-lg',
+            // Hanging under the trigger's bottom-right corner, right-aligned
+            // with it and a small gap apart — it reads as opening out of the
+            // button, over the list it filters.
+            'absolute right-0 top-full z-40 mt-2 w-60 origin-top-right rounded-lg',
             'border border-[hsl(var(--border))] bg-[hsl(var(--card))]/95 p-3',
             'shadow-xl backdrop-blur-sm transition-[transform,opacity]',
             armed ? 'pointer-events-auto' : 'pointer-events-none'

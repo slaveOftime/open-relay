@@ -272,12 +272,16 @@ rather than accidental:
 ### Found while adding hold-then-drag repositioning (2026-10-10)
 
 42. **The search quick menu can clip off the viewport if the trigger is
-    dragged far left.** `use-hold-to-drag` clamps the trigger inside the page
-    frame, but the menu is `w-60` (240px) and opens to the _left_ of the
-    trigger — once the trigger sits under ~250px from the left edge the panel
-    runs past the viewport. Before repositioning existed the trigger was pinned
-    at `right-5`, where the menu always fit. _Next step:_ measure at open time
-    and flip the menu to the trigger's right (`left-full`) whenever the space
-    to its left is short. The XTerm ring has the same edge exposure but always
-    had it — a radial menu overflows at the corners by design, so it is
-    recorded here rather than treated as a regression.
+    dragged far left or low.** `use-hold-to-drag` clamps the trigger inside the
+    page frame, but the menu is `w-60` (240px) and hangs from the trigger's
+    right edge, growing toward the _left_: once the trigger sits under ~250px
+    from the left edge the panel runs past the viewport. It hangs _below_ the
+    trigger too, so a trigger dragged down into the bottom `70` band — where the
+    default spot has ~280px of room under it — pushes the panel past the bottom
+    edge. Before repositioning existed the trigger was pinned at
+    `right-5 bottom-70`, where the menu always fit. _Next step:_ measure at open
+    time and flip the menu to the trigger's left edge (growing right) when the
+    left is short, or open it upward when the bottom is. The XTerm ring has the
+    same edge exposure but always had it — a radial menu overflows at the
+    corners by design, so it is recorded here rather than treated as a
+    regression.

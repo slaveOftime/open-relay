@@ -3,20 +3,21 @@ import { test, expect, type Page } from '@playwright/test'
 /**
  * The mobile header's search control. The control is mobile-only, so the file
  * runs at a phone viewport in the desktop Chromium project — pointer events
- * make the tap/double-tap/drag gestures identical to touch there.
+ * make the toggling and drag gestures identical to touch there.
  */
 test.use({ viewport: { width: 375, height: 812 } })
 
 // A real touch tap is a different code path from a synthetic mouse click: no
 // mousedown focus, and a click that arrives after the press already focused the
-// search input. The suite's mouse-driven tests cannot see this, so the gestures
-// run under touch input here.
+// search input. The suite's mouse-driven tests cannot see this, so the gesture
+// runs under touch input here.
 test.describe('with touch input', () => {
   test.use({ hasTouch: true })
 
-  test('a tap expands the bar and hands focus to the input', async ({ page }) => {
+  test('a tap opens the bar and the menu, and hands focus to the input', async ({ page }) => {
     const icon = page.getByRole('button', { name: SEARCH_ICON })
     const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+    const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
 
     await icon.tap()
 
@@ -25,33 +26,13 @@ test.describe('with touch input', () => {
     // the trigger as its default action, which would blur the input and close
     // the bar it just opened.
     await expect(input).toBeFocused()
+    // The filters came up with it: the tap opens the whole control.
+    await expect(statusTrigger).toBeVisible()
+
     await page.waitForTimeout(400)
     await expect(input).toBeVisible()
     await expect(input).toBeFocused()
-  })
-
-  test('a double tap opens the quick menu', async ({ page }) => {
-    const icon = page.getByRole('button', { name: SEARCH_ICON })
-    const input = page.getByRole('textbox', { name: SEARCH_INPUT })
-    const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
-
-    const box = (await icon.boundingBox())!
-    const cx = box.x + box.width / 2
-    const cy = box.y + box.height / 2
-
-    // The pair must land inside the 300ms double window, and two awaited CDP
-    // round trips can drift past it under load — a miss classifies as two
-    // singles, which toggle the bar twice and settle back closed. So tap
-    // again until the pair lands; every attempt starts from the same state.
-    for (let attempt = 0; attempt < 4; attempt++) {
-      await page.touchscreen.tap(cx, cy)
-      await page.touchscreen.tap(cx, cy)
-      await page.waitForTimeout(400) // let a missed pair's two singles fire
-      if (await statusTrigger.isVisible()) break
-    }
     await expect(statusTrigger).toBeVisible()
-    // The menu replaced the bar the first tap of the pair opened.
-    await expect(input).toHaveCount(0)
   })
 })
 
@@ -150,9 +131,9 @@ test('the trigger floats at the scroll-handle height, right-aligned', async ({ p
   expect(await icon.evaluate((el) => el.closest('[data-testid="mobile-session-list"]'))).toBeNull()
 })
 
-/** Double-tap the search icon: the quick menu's opener. */
-async function openQuickMenu(page: Page) {
-  await page.getByRole('button', { name: SEARCH_ICON }).dblclick()
+/** One tap on the trigger: the bar and the quick menu come up together. */
+async function openSearchControl(page: Page) {
+  await page.getByRole('button', { name: SEARCH_ICON }).click()
 }
 
 test.beforeEach(async ({ page }) => {
@@ -162,22 +143,28 @@ test.beforeEach(async ({ page }) => {
   await expect(list(page).getByText('beta node session')).toBeVisible()
 })
 
-test('a tap expands the search bar, focuses the input, and blur collapses it', async ({ page }) => {
+test('a tap opens the bar and the menu under the trigger, and a tap closes both', async ({
+  page,
+}) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+  const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
 
-  // Collapsed by default: one floating trigger, no search box.
+  // Collapsed by default: one floating trigger, no search box, no menu.
   await expect(icon).toBeVisible()
   await expect(input).toHaveCount(0)
+  await expect(statusTrigger).toHaveCount(0)
 
+  const collapsed = (await icon.boundingBox())!
   await icon.click()
+
+  // One tap, the whole control: the bar for typing, the menu for filtering.
   await expect(input).toBeVisible()
-  // The whole point of the tap path: type straight away.
   await expect(input).toBeFocused()
+  await expect(statusTrigger).toBeVisible()
 
   // The bar grows out of the trigger, to the left: the trigger itself does not
   // move, and the input sits on its row as one merged pill.
-  const collapsed = (await icon.boundingBox())!
   await input.fill('x')
   const expandedTrigger = (await icon.boundingBox())!
   const inputBox = (await input.boundingBox())!
@@ -186,21 +173,57 @@ test('a tap expands the search bar, focuses the input, and blur collapses it', a
   expect(inputBox.y).toBeLessThan(collapsed.y + collapsed.height)
   expect(inputBox.y + inputBox.height).toBeGreaterThan(collapsed.y)
 
+  // The menu hangs under the trigger's bottom-right corner: below it, right
+  // edges aligned, a small gap between them. The pop's scale grows out of that
+  // corner, so both edges hold through the animation.
+  const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
+  const iconBox = (await icon.boundingBox())!
+  expect(menuBox.y).toBeGreaterThanOrEqual(iconBox.y + iconBox.height)
+  expect(menuBox.y - (iconBox.y + iconBox.height)).toBeLessThanOrEqual(16)
+  expect(Math.abs(menuBox.x + menuBox.width - (iconBox.x + iconBox.width))).toBeLessThanOrEqual(1)
+
+  // Typing drives the list and leaves the menu where it is: the bar and the
+  // menu are one popup, not rivals.
+  await input.fill('bash')
+  await expect(list(page).getByText('alpha bash session')).toBeVisible()
+  await expect(list(page).getByText('beta node session')).toHaveCount(0)
+  await expect(statusTrigger).toBeVisible()
+
+  // A tap on the trigger takes both down again.
+  await icon.click()
+  await expect(input).toHaveCount(0)
+  await expect(statusTrigger).toHaveCount(0)
+})
+
+test('a fast second tap is a second toggle, not a gesture of its own', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+  const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
+
+  await icon.dblclick()
+
+  // The pair is two toggles: the first opened the control, the second closed
+  // it. Nothing waits for a double tap, so nothing opens behind the second tap.
+  await expect(input).toHaveCount(0)
+  await expect(statusTrigger).toHaveCount(0)
+})
+
+test('the X clears the search text, and closes the control once it is empty', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+  const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
+
+  await openSearchControl(page)
   await input.fill('bash')
   await expect(list(page).getByText('alpha bash session')).toBeVisible()
   await expect(list(page).getByText('beta node session')).toHaveCount(0)
 
-  // Moving focus off the bar collapses it back to the icon; the search itself
-  // stays active (the icon carries the active dot).
-  await input.press('Tab')
-  await expect(input).toHaveCount(0)
-  await expect(icon).toBeVisible()
-
-  // Re-opening shows the still-active search, ready to edit.
+  // Closing and re-opening keeps the query: the control remembers it.
   await icon.click()
-  await expect(input).toBeVisible()
-  await expect(input).toBeFocused()
+  await expect(input).toHaveCount(0)
+  await icon.click()
   await expect(input).toHaveValue('bash')
+  await expect(input).toBeFocused()
 
   // The X clears the text but keeps the bar open for a new query…
   await page.getByRole('button', { name: 'Clear search' }).click()
@@ -209,65 +232,54 @@ test('a tap expands the search bar, focuses the input, and blur collapses it', a
   await expect(input).toHaveValue('')
   await expect(list(page).getByText('beta node session')).toBeVisible()
 
-  // …and closes it once the text is gone.
+  // …and closes the control once the text is gone.
   await page.getByRole('button', { name: 'Close search' }).click()
   await expect(input).toHaveCount(0)
+  await expect(statusTrigger).toHaveCount(0)
 })
 
-test('a double tap opens the quick menu, and its follow-up clicks are swallowed', async ({
+test('focus staying inside the control keeps the bar up; leaving it puts it back', async ({
   page,
 }) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
   const statusTrigger = page.getByRole('combobox', { name: 'Filter by status' })
 
-  await openQuickMenu(page)
+  await openSearchControl(page)
+  await expect(input).toBeFocused()
 
-  // The menu is up…
+  // Tabbing onto the bar's own X is not a dismissal: the control is one popup,
+  // and its parts hand focus to each other.
+  await input.press('Tab')
+  await expect(input).toBeVisible()
   await expect(statusTrigger).toBeVisible()
 
-  // …anchored to the trigger's left, centred on it, with a small gap.
-  const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
-  const iconBox = (await icon.boundingBox())!
-  const gap = iconBox.x - (menuBox.x + menuBox.width)
-  expect(menuBox.x + menuBox.width).toBeLessThan(iconBox.x)
-  expect(gap).toBeLessThan(24)
-  // Vertically centred on the trigger (the menu is taller than it).
-  expect(Math.abs(menuBox.y + menuBox.height / 2 - (iconBox.y + iconBox.height / 2))).toBeLessThan(
-    8
-  )
-
-  // …and no search bar is left behind: the menu replaced the bar the first tap
-  // of the pair opened, and the clicks the browser synthesizes for the pair
-  // open nothing further.
+  // Focus leaving the control — with nowhere inside to land — is.
+  await input.focus()
+  await input.evaluate((field) => field.blur())
   await expect(input).toHaveCount(0)
-  await page.waitForTimeout(100)
-  await expect(input).toHaveCount(0)
-
-  // A tap on the icon now just dismisses the menu; it must not expand the
-  // search bar either.
-  await icon.click()
-  await expect(statusTrigger).toBeHidden()
-  await expect(input).toHaveCount(0)
+  await expect(statusTrigger).toHaveCount(0)
+  await expect(icon).toBeVisible()
 })
 
 test('the quick menu changes filters and clears them again', async ({ page }) => {
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
 
-  await openQuickMenu(page)
+  await openSearchControl(page)
   await page.getByRole('combobox', { name: 'Filter by status' }).click()
   await page.getByRole('option', { name: 'Running' }).click()
 
   // The pick applied (the stopped card is gone) and the menu stayed open for
-  // the next change.
+  // the next change — with the search bar still up beside it.
   await expect(list(page).getByText('beta node session')).toHaveCount(0)
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toHaveText(/Running/)
+  await expect(input).toBeVisible()
 
   await page.getByRole('button', { name: 'Clear filters' }).click()
   await expect(list(page).getByText('beta node session')).toBeVisible()
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toHaveText(/All status/)
 
-  // Taps outside the menu dismiss it; the search bar still never opened.
+  // Taps outside the control dismiss it — bar and menu together.
   // (A raw coordinate in the list's empty area, left of the bottom-right
   // trigger cluster and below the cards.)
   await page.mouse.click(60, 400)
@@ -275,7 +287,7 @@ test('the quick menu changes filters and clears them again', async ({ page }) =>
   await expect(input).toHaveCount(0)
 
   // Escape closes it too.
-  await openQuickMenu(page)
+  await openSearchControl(page)
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(page.getByRole('combobox', { name: 'Filter by status' })).toBeHidden()
@@ -292,8 +304,8 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
   const cy = before.y + before.height / 2
 
   // No hold, no arm cue: on this button a travelling press is a move. The
-  // menu — which the old hold used to open mid-press, fighting the drag —
-  // must stay shut the whole way.
+  // control — which the press's own tap would have opened — must stay shut the
+  // whole way.
   await page.mouse.move(cx, cy)
   await page.mouse.down()
   await page.mouse.move(cx - 60, cy + 80, { steps: 6 })
@@ -307,7 +319,7 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
   expect(Math.abs(after.y - (before.y + 80))).toBeLessThanOrEqual(2)
 
   // Taking the button means the press was never a tap: the release's
-  // follow-up click opens no bar.
+  // follow-up click opens nothing.
   await expect(input).toHaveCount(0)
 
   // The new spot survives a reload…
