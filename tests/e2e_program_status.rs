@@ -1,5 +1,4 @@
 //! Benign OSC 7501 producer; real PTY/IPC, isolated daemon, no agent CLI needed.
-#![cfg(unix)]
 mod e2e;
 use e2e::*;
 use serde_json::Value;
@@ -27,6 +26,7 @@ fn wait_status(tmp: &std::path::Path, id: &str, state: &str) -> Value {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn e2e_program_status_query_and_live_transitions() {
     if !program_exists("python3") {
@@ -139,6 +139,101 @@ os.read(0, 1)
         }
         assert!(Instant::now() < deadline, "producer did not exit");
         std::thread::sleep(Duration::from_millis(25));
+    }
+    drop(daemon);
+    std::fs::remove_dir_all(tmp).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn e2e_program_status_conpty_default_enables_pi_style_reports() {
+    assert!(
+        program_exists("node"),
+        "native ConPTY fixture requires Node.js"
+    );
+    let tmp = make_tmp_dir("program_status_conpty");
+    let daemon = start_daemon(&tmp);
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/program-status-agent.cjs"
+    );
+    let out = oly_cmd(&tmp)
+        .args([
+            "start",
+            "--detach",
+            "--disable-notifications",
+            "--tag",
+            "temp",
+            "--tag",
+            "osc7501",
+            "--",
+            "node",
+            fixture,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    let initial = wait_status(&tmp, &id, "idle");
+    assert_eq!(initial["program_status"]["app"], "pi-fixture");
+    for state in ["working", "blocked", "error", "idle", "done"] {
+        let send = oly_cmd(&tmp).args(["send", &id, "x"]).output().unwrap();
+        assert!(
+            send.status.success(),
+            "{}",
+            String::from_utf8_lossy(&send.stderr)
+        );
+        let value = wait_status(&tmp, &id, state);
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["input_needed"], state == "blocked");
+        if state == "blocked" {
+            assert_eq!(value["program_status"]["kind"], "permission");
+            assert_eq!(value["program_status"]["msg"], "Approve?");
+            let prompt = oly_cmd(&tmp)
+                .args(["logs", &id, "--wait", "prompt", "--timeout", "1s"])
+                .output()
+                .unwrap();
+            assert!(
+                prompt.status.success(),
+                "{}",
+                String::from_utf8_lossy(&prompt.stderr)
+            );
+        }
+        let listing = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+        assert!(listing.status.success());
+        let listing: Value = serde_json::from_slice(&listing.stdout).unwrap();
+        assert_eq!(listing["items"][0]["program_status"]["state"], state);
+    }
+    let exported = oly_cmd(&tmp).args(["export", &id]).output().unwrap();
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert!(String::from_utf8_lossy(&exported.stdout).contains("override=1"));
+    assert!(!String::from_utf8_lossy(&exported.stdout).contains("7501"));
+    assert!(
+        oly_cmd(&tmp)
+            .args(["send", &id, "x"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let value = info(&tmp, &id);
+        if value["status"] != "running" {
+            assert_eq!(value["exit_code"], 0);
+            assert_eq!(value["program_status"]["state"], "done");
+            break;
+        }
+        assert!(Instant::now() < deadline, "producer did not exit");
+        std::thread::sleep(Duration::from_millis(50));
     }
     drop(daemon);
     std::fs::remove_dir_all(tmp).unwrap();

@@ -1676,9 +1676,27 @@ pub const OLY_SESSION_ID_ENV: &str = "OLY_SESSION_ID";
 ///
 /// Starts from [`load_spawn_environment`] (the daemon's own environment, with
 /// the Windows user block refreshed) and injects [`OLY_SESSION_ID_ENV`] set to
-/// this session's id.
+/// this session's id. Windows children also get pi's OSC 7501 opt-in when the
+/// user has not set it: ConPTY's built-in DA reply races capability detection.
 fn session_spawn_environment(session_id: &str) -> Vec<(OsString, OsString)> {
-    inject_session_id(load_spawn_environment(), session_id)
+    let env = inject_session_id(load_spawn_environment(), session_id);
+    #[cfg(windows)]
+    let env = default_conpty_program_status(env);
+    env
+}
+
+/// Pi supports reports without querying via PI_PROGRAM_STATUS=1. ConPTY can
+/// answer the trailing DA sentinel before our OSC reply, causing pi to disable
+/// reports. Default only the documented opt-in; preserve every explicit value
+/// (including 0/empty) and use Windows' case-insensitive environment semantics.
+/// Other agents' protocol detection and the canonical scanner stay unchanged.
+#[cfg(any(windows, test))]
+fn default_conpty_program_status(mut env: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    let key = OsStr::new("PI_PROGRAM_STATUS");
+    if !env.iter().any(|(existing, _)| env_key_eq(existing, key)) {
+        env.push((key.to_os_string(), OsString::from("1")));
+    }
+    env
 }
 
 /// Inject [`OLY_SESSION_ID_ENV`] into `env`, replacing any inherited entry.
@@ -1829,6 +1847,33 @@ mod tests {
         assert!(merged.iter().any(|(key, value)| {
             key == OsStr::new("NEW_VALUE") && value == OsStr::new("added")
         }));
+    }
+
+    #[test]
+    fn conpty_program_status_defaults_to_enabled_without_touching_other_env() {
+        let original = vec![(OsString::from("PATH"), OsString::from("tools"))];
+        let env = default_conpty_program_status(original.clone());
+        assert_eq!(env[0], original[0]);
+        assert_eq!(
+            env[1],
+            (OsString::from("PI_PROGRAM_STATUS"), OsString::from("1"))
+        );
+        assert_eq!(default_conpty_program_status(env.clone()), env);
+    }
+
+    #[test]
+    fn conpty_program_status_preserves_every_explicit_override() {
+        for value in ["0", "1", "", "auto"] {
+            let original = vec![(OsString::from("PI_PROGRAM_STATUS"), OsString::from(value))];
+            assert_eq!(default_conpty_program_status(original.clone()), original);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn conpty_program_status_preserves_case_insensitive_override() {
+        let original = vec![(OsString::from("pi_program_status"), OsString::from("0"))];
+        assert_eq!(default_conpty_program_status(original.clone()), original);
     }
 
     #[test]
