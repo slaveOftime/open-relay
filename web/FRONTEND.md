@@ -106,6 +106,17 @@ primary accent.
   `live`, `reconnecting` (a stream that opened before has dropped and retries
   are backing off), `offline`.
 
+## Relative times
+
+- `hooks/use-now.ts` is the shared clock behind a live label ("10s ago" on a
+  session card). One interval serves every subscriber and runs only while
+  something is subscribed; the reading is cached, because
+  `useSyncExternalStore` compares snapshots by identity and a value read fresh
+  per call would re-render forever.
+- Subscribe in the label, not in the row: `SessionAge` renders the clock-backed
+  count for a live session and a plain `formatTimestamp` for a finished one, so
+  a list of finished sessions runs no timer.
+
 ## Lessons — the ones that cost a debugging session
 
 - **Unstable hook dependencies.** An object literal passed into a hook and
@@ -136,6 +147,11 @@ primary accent.
 - **Read a module's own tests before writing tests against it.** Three wrong
   tests came from assuming `parseKeySpec` returns null for an unknown key, when
   it throws.
+- **A fixture that regenerates a timestamp holds a relative label still.**
+  `sessions.spec.ts` reads "Ns ago" off a live card; the page re-fetches the
+  list, so a `created_at` computed inside the route handler was rebuilt on every
+  request and the count never moved — indistinguishable from a clock that never
+  ticked. Build fixtures once, then hand them to the handler.
 
 ## Avoid
 
