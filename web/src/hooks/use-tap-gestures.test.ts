@@ -7,8 +7,9 @@ import { DOUBLE_TAP_MS, SLOP_PX, TapGestures, type TapKind } from './use-tap-ges
  * The handlers are a plain object of DOM callbacks, so the contract can be
  * exercised without a renderer: tap vs double tap, the slop that hands a
  * travelling press to the drag gesture, and the click suppression contract.
- * The single tap is classified only when the double window closes, so the
- * timers are fake and stepped explicitly.
+ * With a double action a single is classified only when the double window
+ * closes, so the timers are fake and stepped explicitly; without one there is
+ * no window at all.
  */
 
 function pressEvent(overrides: Record<string, unknown> = {}): ReactPointerEvent<HTMLButtonElement> {
@@ -30,6 +31,14 @@ function setup(slopPx?: number, doubleMs?: number) {
     onPress: () => taps.push('single'),
     onDoubleTap: () => taps.push('double'),
   })
+  return { taps, gestures }
+}
+
+/** A consumer with no double action — nothing for a single to wait for. */
+function setupTapOnly() {
+  const taps: TapKind[] = []
+  const gestures = new TapGestures()
+  gestures.setCallbacks({ onPress: () => taps.push('single') })
   return { taps, gestures }
 }
 
@@ -165,5 +174,44 @@ describe('TapGestures', () => {
     expect(gestures.isFollowUpClick(1600)).toBe(false)
     // A click from before the gesture is a first activation (assistive tech).
     expect(gestures.isFollowUpClick(1040)).toBe(false)
+  })
+})
+
+describe('TapGestures without a double action', () => {
+  it('fires the tap on release, with no window to wait out', () => {
+    const { taps, gestures } = setupTapOnly()
+    const down = pressEvent()
+
+    gestures.handlers.onPointerDown(down)
+    gestures.handlers.onPointerUp(pressEvent({ timeStamp: 1050 }))
+
+    expect(taps).toEqual(['single'])
+    // And nothing is left waiting to fire later.
+    vi.advanceTimersByTime(DOUBLE_TAP_MS * 2)
+    expect(taps).toEqual(['single'])
+    expect(down.preventDefault).toHaveBeenCalled()
+  })
+
+  it('counts a fast second tap as its own tap, not a pair', () => {
+    const { taps, gestures } = setupTapOnly()
+
+    gestures.handlers.onPointerDown(pressEvent())
+    gestures.handlers.onPointerUp(pressEvent({ timeStamp: 1050 }))
+    gestures.handlers.onPointerDown(pressEvent({ timeStamp: 1100 }))
+    gestures.handlers.onPointerUp(pressEvent({ timeStamp: 1150 }))
+
+    // A consumer with no double is free to treat two taps as two toggles — the
+    // control that opens on the first and closes on the second.
+    expect(taps).toEqual(['single', 'single'])
+  })
+
+  it('still cancels a travelling press', () => {
+    const { taps, gestures } = setupTapOnly()
+
+    gestures.handlers.onPointerDown(pressEvent())
+    gestures.handlers.onPointerMove(pressEvent({ timeStamp: 1020, clientX: SLOP_PX + 5 }))
+    gestures.handlers.onPointerUp(pressEvent({ timeStamp: 1050 }))
+
+    expect(taps).toEqual([])
   })
 })

@@ -780,9 +780,9 @@ export default function SessionsPage() {
     </Select>
   )
 
-  // The quick menu the search icon opens on a long press: the filter dropdowns
-  // that used to live behind the mobile filter toggle. Selects keep the drawer's
-  // handler bodies verbatim.
+  // The quick menu the search icon opens along with the search bar: the filter
+  // dropdowns that used to live behind the mobile filter toggle. Selects keep the
+  // drawer's handler bodies verbatim.
   const filterMenu = (
     <div className="flex flex-col gap-2">
       <Select value={groupBy} onValueChange={(v) => setGroupBy(v as GroupBy)}>
