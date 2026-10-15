@@ -958,6 +958,9 @@ pub struct SessionSummary {
     pub resume_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Running process needs attention or is ready for another instruction.
+    /// Explicit OSC idle/done/blocked/error reports are immediate; working is not.
+    /// This is independent of notification delivery, not approval authority.
     #[serde(default)]
     pub input_needed: bool,
     /// Most relevant OSC 7501 report. Untrusted app state, not process status.

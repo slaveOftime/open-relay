@@ -423,8 +423,11 @@ not charge it as meaningful screen output. Raw reports remain in the one journal
 Up to 256 hierarchical replacement records obey scoped clear, app inheritance,
 RIS reset, and OSC 133 A / PTY EOF transient expiry. The selected report is exposed
 as optional `SessionSummary.program_status` over existing IPC/REST/SSE/federation;
-process lifecycle remains separate. `blocked` drives input-needed immediately;
-retained reports override attention heuristics. Notification epochs advance only
+process lifecycle remains separate. For running processes, idle/done/blocked/error
+set input-needed immediately, independently of notification delivery; working
+suppresses attention. Non-running processes never need input. The browser presents
+live idle/done as readiness, with process lifecycle in the primary badge tooltip.
+Retained reports override attention heuristics. Notification epochs advance only
 when the selected report changes, not on background progress or screen redraws;
 idle/blocked/done/error use the existing suppression/debounce. Idle notifies
 readiness for another instruction, not completion. Text has bounded base64

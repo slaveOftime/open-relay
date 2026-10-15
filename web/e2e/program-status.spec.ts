@@ -63,17 +63,34 @@ for (const mobile of [false, true]) {
         'Permission Required',
       ],
       [{ state: 'done' }, 'Task Done'],
+      [{ state: 'working', progress: 70 }, 'Working 70%'],
       [{ state: 'error' }, 'Task Error'],
       [{ state: 'idle' }, 'Idle'],
+      [{ state: 'working', progress: 90 }, 'Working 90%'],
+      [{ state: 'done' }, 'Task Done'],
     ] as const) {
       await page.evaluate(
         (data) => {
           ;(window as Window & { emitStatus?: (data: unknown) => void }).emitStatus?.(data)
         },
-        { ...session, input_needed: report.state === 'blocked', program_status: report }
+        { ...session, input_needed: report.state !== 'working', program_status: report }
       )
       await expect(view.getByText(label, { exact: true })).toBeVisible()
-      await expect(view.getByText('Running', { exact: true })).toBeVisible()
+      const ready = report.state === 'idle' || report.state === 'done'
+      const primary = ready
+        ? 'Ready for Input'
+        : report.state === 'working'
+          ? 'Running'
+          : 'Input Needed'
+      await expect(view.getByText(primary, { exact: true })).toBeVisible()
+      await expect(view.getByTitle('Process: Running', { exact: true })).toBeVisible()
+      if (report.state !== 'working') {
+        await expect(view.getByText('Running', { exact: true })).toHaveCount(0)
+      }
+      await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(ready ? 1 : 0)
+      await expect(view.getByTitle('Process: Running').locator('.animate-pulse')).toHaveCount(
+        ready ? 0 : 1
+      )
     }
     await page.evaluate(
       (data) => {
@@ -81,7 +98,18 @@ for (const mobile of [false, true]) {
       },
       { ...session, program_status: null }
     )
-    await expect(view.getByText('Idle', { exact: true })).toHaveCount(0)
+    await expect(view.getByText('Task Done', { exact: true })).toHaveCount(0)
+    await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(0)
     await expect(view.getByText('Running', { exact: true })).toBeVisible()
+    await page.evaluate(
+      (data) => {
+        ;(window as Window & { emitStatus?: (data: unknown) => void }).emitStatus?.(data)
+      },
+      { ...session, status: 'stopped', input_needed: false, program_status: { state: 'done' } }
+    )
+    await expect(view.getByText('Stopped', { exact: true })).toBeVisible()
+    await expect(view.getByText('Task Done', { exact: true })).toBeVisible()
+    await expect(view.getByText('Ready for Input', { exact: true })).toHaveCount(0)
+    await expect(view.getByText('Input Needed', { exact: true })).toHaveCount(0)
   })
 }
