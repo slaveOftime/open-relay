@@ -1290,7 +1290,13 @@ function SessionDetailPageContent() {
             >
               {session?.id}
             </button>
-            {session && <StatusBadge status={session.status} inputNeeded={session.input_needed} />}
+            {session && (
+              <StatusBadge
+                status={session.status}
+                inputNeeded={session.input_needed}
+                programStatus={session.program_status}
+              />
+            )}
             {node && (
               <Badge variant="accent" className="inline-flex text-xs font-light">
                 {node}

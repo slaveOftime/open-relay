@@ -121,6 +121,7 @@ pub struct SilentCandidate {
     pub session_id: String,
     pub session_title: Option<String>,
     pub excerpt: String,
+    pub program_status: Option<super::program_status::ProgramStatus>,
     pub output_epoch: Instant,
     pub silence_epoch: Instant,
     pub should_notify: bool,

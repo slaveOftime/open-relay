@@ -342,16 +342,22 @@ pub struct TerminalSignals {
     foreground: Option<Vec<u8>>,
     /// Payload of the most recent default-background-colour set (OSC 11).
     background: Option<Vec<u8>>,
+    /// OSC 7501 records are daemon-owned hints, not replayed onto client hosts.
+    pub(crate) program_statuses: super::program_status::ProgramStatuses,
 }
 
 impl TerminalSignals {
-    /// Record one passthrough Operating System Command.
+    /// Record one retained Operating System Command (including stripped OSC 7501).
     ///
     /// Returns `true` when the retained state actually changed, so the caller
     /// can skip republishing an identical snapshot.
     pub(crate) fn record_osc(&mut self, ps: &[u8], payload: &[u8]) -> bool {
-        if payload.len() > MAX_RETAINED_SIGNAL_PAYLOAD_BYTES {
+        if ps != b"7501" && payload.len() > MAX_RETAINED_SIGNAL_PAYLOAD_BYTES {
             return false;
+        }
+
+        if ps == b"7501" {
+            return self.program_statuses.report(payload);
         }
 
         match ps {

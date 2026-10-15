@@ -1,6 +1,7 @@
 #[derive(Debug, Clone)]
 pub enum NotificationKind {
     InputNeeded,
+    ProgramStatus,
     StartupRecovery,
     Manual,
 }
@@ -8,6 +9,7 @@ pub enum NotificationKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationTriggerRule {
     OsSignal,
+    ProgramStatus,
     RegexPattern,
     Silence,
     LlmCheck,
@@ -17,6 +19,7 @@ impl NotificationTriggerRule {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OsSignal => "os_signal",
+            Self::ProgramStatus => "program_status",
             Self::RegexPattern => "regex_pattern",
             Self::Silence => "silence",
             Self::LlmCheck => "llm_check",
@@ -26,6 +29,7 @@ impl NotificationTriggerRule {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "os_signal" => Some(Self::OsSignal),
+            "program_status" => Some(Self::ProgramStatus),
             "regex_pattern" => Some(Self::RegexPattern),
             "silence" => Some(Self::Silence),
             "llm_check" => Some(Self::LlmCheck),
@@ -38,6 +42,7 @@ impl NotificationKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InputNeeded => "input_needed",
+            Self::ProgramStatus => "program_status",
             Self::StartupRecovery => "startup_recovery",
             Self::Manual => "manual",
         }
@@ -78,7 +83,7 @@ impl NotificationEvent {
                 "{} looks like it is waiting for input.",
                 session_display_name(&session_id, session_title.as_deref())
             ),
-            NotificationTriggerRule::OsSignal => format!(
+            NotificationTriggerRule::OsSignal | NotificationTriggerRule::ProgramStatus => format!(
                 "{} reported that it needs input.",
                 session_display_name(&session_id, session_title.as_deref())
             ),
@@ -100,6 +105,40 @@ impl NotificationEvent {
             trigger_detail,
             node: None,
         }
+    }
+
+    pub fn program_status(
+        session_id: String,
+        session_title: Option<String>,
+        report: &crate::session::program_status::ProgramStatus,
+        fallback_body: String,
+    ) -> Self {
+        use crate::session::program_status::ProgramState;
+        let mut event = Self::input_needed_with_trigger(
+            session_id.clone(),
+            session_title.clone(),
+            report.msg.clone().unwrap_or(fallback_body),
+            NotificationTriggerRule::ProgramStatus,
+            Some(format!("{:?}", report.state).to_lowercase()),
+        );
+        if matches!(
+            report.state,
+            ProgramState::Idle | ProgramState::Done | ProgramState::Error
+        ) {
+            event.kind = NotificationKind::ProgramStatus;
+            let label = match report.state {
+                ProgramState::Idle => "Ready for instruction",
+                ProgramState::Done => "Task completed",
+                _ => "Task error",
+            };
+            event.title = label.to_string();
+            event.description = format!(
+                "{} reported: {}.",
+                session_display_name(&session_id, session_title.as_deref()),
+                label.to_lowercase()
+            );
+        }
+        event
     }
 
     pub fn startup_recovery(sessions: &[crate::session::SessionMeta]) -> Self {
@@ -224,6 +263,36 @@ fn normalize_optional_text(value: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_status_notifications_preserve_task_vs_input_semantics() {
+        use crate::session::program_status::ProgramStatuses;
+        for (state, kind, title) in [
+            ("blocked", "input_needed", "Input required"),
+            ("idle", "program_status", "Ready for instruction"),
+            ("done", "program_status", "Task completed"),
+            ("error", "program_status", "Task error"),
+        ] {
+            let mut statuses = ProgramStatuses::default();
+            statuses.report(format!("state={state}:msg=UGxhbg").as_bytes());
+            let event = NotificationEvent::program_status(
+                "session-1".into(),
+                Some("Fixture".into()),
+                &statuses.current().unwrap(),
+                "fallback".into(),
+            );
+            assert_eq!(event.kind.as_str(), kind);
+            assert_eq!(event.title, title);
+            assert_eq!(event.body, "Plan");
+            assert!(event.description.contains("Fixture"));
+            assert_eq!(event.trigger_rule.unwrap().as_str(), "program_status");
+            assert_eq!(event.trigger_detail.as_deref(), Some(state));
+        }
+        assert_eq!(
+            NotificationTriggerRule::parse("program_status"),
+            Some(NotificationTriggerRule::ProgramStatus)
+        );
+    }
 
     #[test]
     fn input_needed_sets_new_notification_fields() {

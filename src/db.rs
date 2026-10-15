@@ -657,6 +657,7 @@ pub fn meta_to_summary(meta: &SessionMeta, input_needed: bool, total_bytes: u64)
         resume_command: meta.resume_command.clone(),
         cwd: meta.cwd.clone(),
         input_needed,
+        program_status: None,
         notifications_enabled: meta.notifications_enabled,
         node: None,
         last_total_bytes: total_bytes,

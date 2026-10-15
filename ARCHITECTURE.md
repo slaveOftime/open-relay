@@ -415,6 +415,24 @@ The LLM trigger function is currently a stub. None of this establishes task
 completion or approval authority. Resume rules instead scan a completed,
 durable journal tail and store a suggestion; they never execute it.
 
+OSC 7501 reports are parsed by the same `session/scan.rs` sequencing path and
+retained in `TerminalSignals` using `session/program_status.rs`. The scanner
+answers support queries itself (same terminator, constant reply, before fallback
+DA replies), strips the protocol from the canonical display stream, and does
+not charge it as meaningful screen output. Raw reports remain in the one journal.
+Up to 256 hierarchical replacement records obey scoped clear, app inheritance,
+RIS reset, and OSC 133 A / PTY EOF transient expiry. The selected report is exposed
+as optional `SessionSummary.program_status` over existing IPC/REST/SSE/federation;
+process lifecycle remains separate. `blocked` drives input-needed immediately;
+retained reports override attention heuristics. Notification epochs advance only
+when the selected report changes, not on background progress or screen redraws;
+idle/blocked/done/error use the existing suppression/debounce. Idle notifies
+readiness for another instruction, not completion. Text has bounded base64
+and decoded UTF-8 sizes, rejects controls, and disarms direction/invisible
+formatting. Reports are never replayed to client terminals as host state or used
+as approval authority. They are live-derived hints, unavailable after runtime
+eviction or daemon restart; cold reads do not reconstruct program status.
+
 ## Deliberate trade-offs
 
 - **Journal (ADR-0002/0006):** one ordered recording avoids divergent persisted

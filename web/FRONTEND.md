@@ -27,7 +27,11 @@ src/
 
 `components/` also holds a handful of singletons that belong to no group:
 `Logo`, `CommandLogo`, `StatusBadge`, `NodeSelector`, `SseStatusDot`,
-`NotificationToggle`, `ErrorBoundary`.
+`NotificationToggle`, `ErrorBoundary`. `StatusBadge` composes a separate
+`ProgramStatusBadge` for optional OSC 7501 app state, preserving process lifecycle.
+These are plain-text, untrusted reports from the owning session, not verified
+completion or approval authority. `sameSessionSummary` must compare their fields
+so status-only SSE updates reach rows, cards, and details.
 
 ## Conventions
 

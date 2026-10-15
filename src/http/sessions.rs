@@ -1116,6 +1116,7 @@ mod tests {
             resume_command: None,
             cwd: None,
             input_needed: false,
+            program_status: None,
             notifications_enabled: true,
             node: None,
             last_total_bytes: 0,

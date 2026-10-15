@@ -35,6 +35,7 @@ fn session(id: &str) -> SessionSummary {
         resume_command: None,
         cwd: None,
         input_needed: false,
+        program_status: None,
         // Mirrors the daemon default: notifications on unless disabled.
         notifications_enabled: true,
         node: None,

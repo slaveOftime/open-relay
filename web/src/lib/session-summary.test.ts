@@ -25,6 +25,7 @@ const base: SessionSummary = {
   resume_command: 'oly attach session-1',
   cwd: '/tmp',
   input_needed: false,
+  program_status: { state: 'working', app: 'codex', progress: 10 },
   notifications_enabled: true,
   node: 'lab',
   last_total_bytes: 512,
@@ -104,6 +105,10 @@ describe('sameSessionSummary', () => {
       resume_command: () => ({ ...copy(), resume_command: 'something else' }),
       cwd: () => ({ ...copy(), cwd: '/var' }),
       input_needed: () => ({ ...copy(), input_needed: true }),
+      program_status: () => ({
+        ...copy(),
+        program_status: { state: 'blocked', kind: 'permission' },
+      }),
       notifications_enabled: () => ({ ...copy(), notifications_enabled: false }),
       node: () => ({ ...copy(), node: 'other' }),
       last_total_bytes: () => ({ ...copy(), last_total_bytes: 999 }),

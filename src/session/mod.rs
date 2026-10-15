@@ -9,6 +9,7 @@ pub(crate) mod file;
 // the session fails loudly.
 pub(crate) mod journal;
 pub mod logs;
+pub mod program_status;
 pub mod pty;
 pub mod registry;
 pub(crate) mod replay;

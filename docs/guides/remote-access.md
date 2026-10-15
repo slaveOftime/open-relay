@@ -96,6 +96,18 @@ prompt or task completion. A quiet session may still be thinking or blocked.
 Desktop delivery, browser push, and a custom hook can alert the human; always
 inspect the current output before intervening.
 
+For programs emitting OSC 7501, the browser shows an **agent-reported status**
+badge alongside process lifecycle, including permission/question/auth waits and
+optional progress. Reports arrive through the existing session-update stream,
+including federated sessions. Explicit working states suppress guessed
+attention; idle/blocked/done/error reports can notify after the existing 5-second
+activity suppression and configured minimum notification interval. Ordinary
+screen redraws and duplicate reports do not re-notify. Blocked uses notification
+kind `input_needed`; idle/done/error use `program_status`, all with trigger rule
+`program_status`. Idle notifies as **Ready for instruction**, not task completion.
+A task-done badge is the program's claim, not verified success.
+See [OSC 7501 status and lifetime](./cli.md#agent-reported-status-osc-7501).
+
 ```sh
 oly notify enable <id>
 oly notify disable <id>

@@ -20,6 +20,7 @@ struct CandidateSnapshot {
     session_id: String,
     session_title: Option<String>,
     rows: Vec<Vec<u8>>,
+    program_status: Option<crate::session::program_status::ProgramStatus>,
     output_epoch: Instant,
     silence_epoch: Instant,
     should_notify: bool,
@@ -46,7 +47,16 @@ impl SessionStore {
                 .values()
                 .filter_map(|handle| {
                     let rt = handle.read();
-                    if rt.is_completed() {
+                    let program_status = rt.terminal_signals.program_statuses.current();
+                    if rt.is_completed()
+                        && !program_status.as_ref().is_some_and(|r| {
+                            matches!(
+                                r.state,
+                                crate::session::program_status::ProgramState::Done
+                                    | crate::session::program_status::ProgramState::Error
+                            )
+                        })
+                    {
                         return None;
                     }
 
@@ -58,6 +68,11 @@ impl SessionStore {
                     // a session is notified it will not be re-notified unless real
                     // output eventually arrives and advances the epoch.
                     let last_output = rt.effective_output_epoch();
+                    if program_status.as_ref().is_some_and(|r| {
+                        r.state == crate::session::program_status::ProgramState::Working
+                    }) {
+                        return None;
+                    }
 
                     // The newest user-driven activity of any kind: text input,
                     // mouse clicks/hover (delivered as input bytes), resizes,
@@ -95,7 +110,7 @@ impl SessionStore {
                         }
                         None => false,
                     };
-                    let should_notify = !activity_driven;
+                    let should_notify = program_status.is_some() || !activity_driven;
 
                     // Suppress rapid repeat notifications. `last_notified_at` is
                     // normally later than `last_output`, so compare it with `now`;
@@ -131,6 +146,7 @@ impl SessionStore {
                         session_id: rt.meta.id.clone(),
                         session_title: rt.meta.title.clone(),
                         rows,
+                        program_status,
                         output_epoch: last_output,
                         silence_epoch,
                         should_notify,
@@ -160,6 +176,7 @@ impl SessionStore {
                         session_id: snap.session_id,
                         session_title: snap.session_title,
                         excerpt: String::from_utf8_lossy(&excerpt_vec).into_owned(),
+                        program_status: snap.program_status,
                         output_epoch: snap.output_epoch,
                         silence_epoch: snap.silence_epoch,
                         should_notify: snap.should_notify,
@@ -175,13 +192,24 @@ impl SessionStore {
 
     /// Records a successful notification for `session_id` at `output_epoch`.
     /// Re-notification is suppressed until output advances to a new epoch.
-    pub fn mark_notified(&self, session_id: &str, output_epoch: Instant, notified_at: Instant) {
+    /// Returns false if the candidate was superseded while its excerpt rendered.
+    pub fn mark_notified(
+        &self,
+        session_id: &str,
+        output_epoch: Instant,
+        notified_at: Instant,
+    ) -> bool {
         let sessions = self.sessions.load();
         if let Some(handle) = sessions.get(session_id) {
             let mut rt = handle.write();
+            if rt.effective_output_epoch() != output_epoch {
+                return false;
+            }
             rt.notified_output_epoch = Some(output_epoch);
             rt.last_notified_at = Some(notified_at);
+            return true;
         }
+        false
     }
 
     /// Marks a session as awaiting input without recording a delivered notification.
@@ -190,6 +218,9 @@ impl SessionStore {
         if let Some(handle) = sessions.get(session_id) {
             let summary = {
                 let mut rt = handle.write();
+                if rt.effective_output_epoch() != output_epoch {
+                    return;
+                }
                 rt.notified_output_epoch = Some(output_epoch);
                 rt.to_summary()
             };
@@ -209,6 +240,126 @@ mod tests {
     use crate::session::{SessionError, SessionStatus};
 
     use std::time::{Duration, Instant};
+    #[tokio::test]
+    async fn program_status_candidates_override_heuristics_and_deduplicate_redraws() {
+        use crate::session::pty::TerminalSignals;
+        for (state, candidate_expected) in [
+            ("idle", true),
+            ("working", false),
+            ("blocked", true),
+            ("done", true),
+            ("error", true),
+        ] {
+            let rt = make_runtime(
+                "status1",
+                SessionStatus::Running,
+                "Password:",
+                Some(Duration::from_secs(60)),
+            );
+            let mut signals = TerminalSignals::default();
+            signals.record_osc(b"7501", format!("state={state}").as_bytes());
+            signals.program_statuses.changed_at = Some(Instant::now() - Duration::from_secs(10));
+            rt.write().publish_terminal_signals(signals);
+            let store = store_with(vec![rt.clone()], make_test_db().await);
+            let candidates = store
+                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .await;
+            assert_eq!(!candidates.is_empty(), candidate_expected, "{state}");
+            if candidate_expected {
+                let candidate = &candidates[0];
+                assert!(candidate.should_notify);
+                assert!(candidate.program_status.is_some());
+                store.mark_notified("status1", candidate.output_epoch, Instant::now());
+                rt.write().push_output(b"redraw", 6);
+                assert!(
+                    store
+                        .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                        .await
+                        .is_empty()
+                );
+                assert_eq!(rt.read().input_needed(), state == "blocked");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn program_status_idle_respects_suppression_duplicates_and_minimum_interval() {
+        let rt = make_runtime("ready1", SessionStatus::Running, "ready", None);
+        let mut signals = crate::session::pty::TerminalSignals::default();
+        signals.record_osc(b"7501", b"state=idle");
+        signals.program_statuses.changed_at = Some(Instant::now() - Duration::from_secs(10));
+        rt.write().publish_terminal_signals(signals.clone());
+        rt.write().last_input_at = Some(Instant::now());
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        assert!(
+            store
+                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .await
+                .is_empty()
+        );
+        rt.write().last_input_at = None;
+        let candidates = store
+            .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+            .await;
+        assert_eq!(candidates.len(), 1);
+        assert!(store.mark_notified("ready1", candidates[0].output_epoch, Instant::now()));
+        assert!(!signals.record_osc(b"7501", b"state=idle"));
+        rt.write().publish_terminal_signals(signals.clone());
+        rt.write().push_output(b"redraw", 6);
+        assert!(
+            store
+                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .await
+                .is_empty()
+        );
+        signals.record_osc(b"7501", b"state=working");
+        rt.write().publish_terminal_signals(signals.clone());
+        assert!(
+            store
+                .silent_candidates(Duration::ZERO, Duration::ZERO)
+                .await
+                .is_empty()
+        );
+        signals.record_osc(b"7501", b"state=idle");
+        signals.program_statuses.changed_at = Some(Instant::now() - Duration::from_secs(6));
+        rt.write().publish_terminal_signals(signals);
+        assert!(
+            store
+                .silent_candidates(Duration::from_secs(5), Duration::from_secs(60))
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+                .await
+                .len(),
+            1
+        );
+        assert!(
+            !rt.read().input_needed(),
+            "ready is not a blocked approval request"
+        );
+    }
+
+    #[tokio::test]
+    async fn program_status_notifies_completed_tasks_but_rejects_stale_candidates() {
+        let rt = make_runtime("status2", SessionStatus::Stopped, "done", None);
+        let mut signals = crate::session::pty::TerminalSignals::default();
+        signals.record_osc(b"7501", b"state=done");
+        signals.program_statuses.changed_at = Some(Instant::now() - Duration::from_secs(10));
+        rt.write().publish_terminal_signals(signals.clone());
+        let store = store_with(vec![rt.clone()], make_test_db().await);
+        let candidates = store
+            .silent_candidates(Duration::from_secs(5), Duration::ZERO)
+            .await;
+        assert_eq!(candidates.len(), 1);
+        signals.record_osc(b"7501", b"state=error");
+        rt.write().publish_terminal_signals(signals);
+        assert!(!store.mark_notified("status2", candidates[0].output_epoch, Instant::now()));
+        assert!(rt.read().notified_output_epoch.is_none());
+    }
+
     #[tokio::test]
     async fn test_silent_candidates_returns_running_past_silence() {
         let silence = Duration::from_secs(5);

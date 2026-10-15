@@ -142,6 +142,15 @@ second with activity suppression and notification debounce. Regex matches can
 raise attention before the longer silence fallback. There is no active LLM
 prompt detector in the current implementation.
 
+Retained OSC 7501 program-status reports take precedence over regex/silence:
+working suppresses guessed attention, blocked sets input-needed immediately,
+and idle/blocked/done/error can notify through the same activity suppression and
+minimum interval. Duplicate reports and ordinary redraws do not re-notify.
+Notifications use trigger rule `program_status`; done/error use notification
+kind `program_status`, as does idle ("Ready for instruction"); blocked uses
+`input_needed`. Idle means readiness, not completed work. These are untrusted child
+claims, not authorization or verified completion. No extra config is required.
+
 **Omitting** `prompt_patterns` restores the defaults. **`[]` disables regex
 matching**, but silence-based attention hints/notifications remain. A nonempty
 array replaces the complete list; to extend it, copy the defaults and append.

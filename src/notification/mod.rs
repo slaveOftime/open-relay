@@ -96,9 +96,9 @@ pub(super) async fn run_notification_monitor(
                 continue;
             }
 
-            let (trigger_rule, trigger_detail) = if let Some(pattern) =
-                find_prompt_match(&excerpt, &patterns)
-            {
+            let (trigger_rule, trigger_detail) = if candidate.program_status.is_some() {
+                (NotificationTriggerRule::ProgramStatus, None)
+            } else if let Some(pattern) = find_prompt_match(&excerpt, &patterns) {
                 info!(
                     session_id,
                     trigger_rule = NotificationTriggerRule::RegexPattern.as_str(),
@@ -125,13 +125,27 @@ pub(super) async fn run_notification_monitor(
             };
 
             let body = sanitize_notification_excerpt(&excerpt);
-            let event = NotificationEvent::input_needed_with_trigger(
-                session_id.clone(),
-                candidate.session_title.clone(),
-                body,
-                trigger_rule,
-                trigger_detail,
-            );
+            let event = if let Some(report) = candidate.program_status.as_ref() {
+                NotificationEvent::program_status(
+                    session_id.clone(),
+                    candidate.session_title.clone(),
+                    report,
+                    body,
+                )
+            } else {
+                NotificationEvent::input_needed_with_trigger(
+                    session_id.clone(),
+                    candidate.session_title.clone(),
+                    body,
+                    trigger_rule,
+                    trigger_detail,
+                )
+            };
+
+            // Rendering runs off-lock: don't deliver a superseded report.
+            if !session_store.mark_notified(&session_id, output_epoch, Instant::now()) {
+                continue;
+            }
 
             if candidate.enabled_for_channels {
                 let notifier = Arc::clone(&notifier);
@@ -156,8 +170,6 @@ pub(super) async fn run_notification_monitor(
                 event
                     .into_session_event(candidate.last_total_bytes, candidate.enabled_for_channels),
             );
-
-            session_store.mark_notified(&session_id, output_epoch, std::time::Instant::now());
         }
     }
 }

@@ -124,6 +124,33 @@ and arguments, cwd, PID, exit code, resume suggestion, timestamps, output bytes,
 geometry, colors, attached-client count, session directory, journal incarnation,
 and available retention counters/limits. Metadata control characters are escaped.
 
+### Agent-reported status (OSC 7501)
+
+Supporting programs can report `idle`, `working`, `blocked`, `done`, or `error`
+using the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status).
+`oly info` shows a separate **Program status** section; `oly info --json` and
+`oly ls --json` include `program_status` when available. This is application
+state, not the process lifecycle `status` or exit code. `blocked` sets
+`input_needed` immediately, so `oly logs --wait prompt` does not need to wait
+for a silence/regex guess. `idle` means ready for the next instruction, not an
+approval request; it can notify you that the agent is **Ready for instruction**,
+just as `done` can notify you about a result. Neither implies verified success.
+`idle`, `working`, `done`, and `error` do not set `input_needed`.
+
+Reports replace their record completely. oly retains up to 256 hierarchical
+records and presents the most relevant: blocked > error > working > done > idle,
+with the most recently updated record winning ties. `kind` identifies permission,
+question, or authentication requests; optional progress and plain-text messages
+provide context. Programs without retained reports keep the existing heuristics.
+
+Reports are untrusted hints: inspect output and results before approving or
+claiming completion. `clear` removes a record/subtree (without an ID, all);
+full terminal reset clears all records. Shell prompt markers (OSC 133 A) and
+PTY EOF remove working/blocked records, while done/error remain until replaced,
+cleared, runtime eviction, or daemon restart. Status is derived in memory from
+journaled PTY bytes, not separately persisted metadata. OSC 7501 traffic is not
+forwarded into another user's attached terminal or canonical exports.
+
 Stopped/evicted sessions remain inspectable from persisted metadata. Missing
 values appear as `—`; live-only values may be unavailable after eviction or a
 daemon restart. Remote paths refer to the **owning daemon**, not your machine.

@@ -405,6 +405,7 @@ async fn handle_forwarded_session_event(state: &AppState, node_name: &str, paylo
             .and_then(NotificationTriggerRule::parse);
         let maybe_kind = match kind.as_str() {
             "input_needed" => Some(NotificationKind::InputNeeded),
+            "program_status" => Some(NotificationKind::ProgramStatus),
             "startup_recovery" => Some(NotificationKind::StartupRecovery),
             _ => None,
         };

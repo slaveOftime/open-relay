@@ -119,7 +119,11 @@ export const SessionCard = memo(function SessionCard({
               {formatByteSize(session.last_total_bytes)}
             </div>
             <div className="flex-1" />
-            <StatusBadge status={session.status} inputNeeded={session.input_needed} />
+            <StatusBadge
+              status={session.status}
+              inputNeeded={session.input_needed}
+              programStatus={session.program_status}
+            />
           </div>
 
           {/* Row 2: command + title */}

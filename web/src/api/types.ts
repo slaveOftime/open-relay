@@ -57,6 +57,16 @@ export function isSessionStatusFilter(value: unknown): value is SessionStatusFil
   return typeof value === 'string' && sessionStatusFilters.has(value)
 }
 
+export interface ProgramStatus {
+  state: 'idle' | 'working' | 'done' | 'blocked' | 'error'
+  id?: string | null
+  kind?: 'permission' | 'question' | 'auth' | null
+  progress?: number | null
+  app?: string | null
+  title?: string | null
+  msg?: string | null
+}
+
 export interface SessionSummary {
   id: string
   title: string | null
@@ -72,6 +82,8 @@ export interface SessionSummary {
   resume_command?: string | null
   cwd: string | null
   input_needed: boolean
+  /** Untrusted OSC 7501 hint, independent of process status; absent for legacy apps. */
+  program_status?: ProgramStatus | null
   notifications_enabled: boolean
   node?: string | null
   last_total_bytes: number
