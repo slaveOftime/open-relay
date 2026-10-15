@@ -433,6 +433,18 @@ formatting. Reports are never replayed to client terminals as host state or used
 as approval authority. They are live-derived hints, unavailable after runtime
 eviction or daemon restart; cold reads do not reconstruct program status.
 
+Windows ConPTY can consume a primary DA query and answer the child before the
+owning daemon receives/answers the preceding OSC 7501 query. Pi uses that DA reply
+as its negotiation sentinel, so it can disable status output on Windows even
+though unsolicited reports pass through ConPTY and the scanner. Windows child
+environments default pi's documented `PI_PROGRAM_STATUS=1` opt-in only when
+absent, after environment refresh/merge; explicit values and case-insensitive
+keys are preserved. No parser fallback, guessed status, or generic ConPTY
+passthrough change is introduced. A native Windows Node fixture covers the
+opt-in and observable state/list/prompt/export behavior; Unix keeps query/reply
+coverage. The pi terminal library was separately reproduced with automatic
+failure and successful opt-in on Windows build 26200.
+
 ## Deliberate trade-offs
 
 - **Journal (ADR-0002/0006):** one ordered recording avoids divergent persisted

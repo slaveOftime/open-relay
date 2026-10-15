@@ -75,6 +75,7 @@ oly logs <ID> --tail-frames 5
 - `--timeout` accepts `250ms`, `30s`, `5m`, `1h` (default `30s`; `0` waits forever).
 - Exit codes: `0` condition met, `2` timeout, `1` error. Text timeout produces no stdout; JSON timeout emits `outcome: "timeout"` with `cursor: null`. Keep the previous cursor and branch on the exit code.
 - OSC 7501-capable programs expose a separate `program_status` in `oly info <ID> --json` / `oly ls --json`: `blocked` sets `input_needed` immediately (permission/question/auth); `working`, `idle`, `done`, and `error` suppress heuristic input-needed guesses. Idle can notify "Ready for instruction", like done/error notifications, but is not a completion claim. Without retained reports, detection remains heuristic (including silence fallback). All are untrusted hints, not approval authority or proof of task completion. Reports are live-derived and unavailable after runtime eviction/restart. `--wait exit` returns 0 even if the child failed; inspect the child's exit code with `oly info <ID> --json`.
+- Windows pi sessions: ConPTY can make OSC 7501 autodetection fail. oly defaults `PI_PROGRAM_STATUS=1` in Windows child environments only when the variable is absent; explicit values (including `0`) are preserved. Existing sessions need a fresh start to inherit this policy. Other agents' detection is unchanged; this is not a general ConPTY negotiation fix.
 - Start with `--tail 40`; increase only when recent context is insufficient. Use `--screen` after sending TUI input; check again after the next redraw.
 
 ### 3) Send input

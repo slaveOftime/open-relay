@@ -151,6 +151,22 @@ cleared, runtime eviction, or daemon restart. Status is derived in memory from
 journaled PTY bytes, not separately persisted metadata. OSC 7501 traffic is not
 forwarded into another user's attached terminal or canonical exports.
 
+**Windows / pi compatibility:** ConPTY can answer pi's trailing device-attributes
+query before oly's OSC 7501 support reply. Pi then stops emitting status reports,
+even though unsolicited reports are parsed correctly. For Windows child sessions,
+oly defaults pi's documented `PI_PROGRAM_STATUS` opt-in to `1` when that variable
+is absent. Any explicit value (including `0`, which disables reporting) is
+preserved, with case-insensitive Windows environment names. This is a pi-specific
+workaround, not a fix for general ConPTY capability negotiation. On older oly
+builds, launch pi with `PI_PROGRAM_STATUS=1` in its own environment; changing
+oly's child-environment policy only affects newly started sessions. With an
+already-running older daemon, set it inside the child shell rather than only
+in the client shell (the daemon owns the child's environment):
+
+```powershell
+oly start --detach pwsh -NoProfile -Command '$env:PI_PROGRAM_STATUS="1"; pi'
+```
+
 Stopped/evicted sessions remain inspectable from persisted metadata. Missing
 values appear as `—`; live-only values may be unavailable after eviction or a
 daemon restart. Remote paths refer to the **owning daemon**, not your machine.
