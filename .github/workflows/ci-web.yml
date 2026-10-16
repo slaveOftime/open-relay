@@ -3,6 +3,14 @@ name: CI-WEB
 on:
   push:
     branches: [main]
+    paths:
+      - .github/workflows/ci-web.yml
+      - web/**
+      # Trigger on dotfile/js config tweaks that web/** alone misses.
+      - web/eslint.config.*
+      - web/playwright.config.*
+      - web/.prettierrc*
+      - web/.editorconfig
   pull_request:
     branches: [main]
     paths:
@@ -14,6 +22,7 @@ on:
       - web/.prettierrc*
       - web/.editorconfig
   # Manual re-run for a flaky browser run or a workflow-only change.
+  # Dispatch ignores filters.
   workflow_dispatch:
 
 # Same concurrency policy as CI: cancel PR runs, never push runs.

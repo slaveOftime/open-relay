@@ -1,34 +1,55 @@
 name: CI
 
+# Trigger policy: CI owns what the Rust build, the Rust test suite and the
+# release tooling consume. It deliberately does NOT list README.md, docs/ or
+# web/: documentation contracts run in CI-DOCS and the web UI in CI-WEB, so a
+# docs-only or web-only PR never pays for the three-OS matrix.
+#
+# Adding a new top-level directory that build.rs, `include_str!`,
+# `sqlx::migrate!`, `rust-embed` or the manifest reads means adding it here.
+# An omitted input fails silently as a coverage gap, not as a red build.
+#
+# The `paths` list is duplicated under both events because GitHub applies the
+# filter per event and supports no shared reference; keep the two in sync.
 on:
   push:
     branches: [main]
+    paths:
+      - .github/workflows/ci.yml
+      - .github/workflows/release.yml
+      - .cargo/**
+      # Governs the checkout bytes of migrations/*.sql, which sqlx embeds
+      # with a checksum, so an eol-policy edit is a build input.
+      - .gitattributes
+      - Cargo.toml
+      - Cargo.lock
+      - build.rs
+      - assets/**
+      - migrations/**
+      - scripts/**
+      - skills/**
+      - src/**
+      - tests/**
   pull_request:
     branches: [main]
     paths:
       - .github/workflows/ci.yml
       - .github/workflows/release.yml
+      - .cargo/**
+      # Governs the checkout bytes of migrations/*.sql, which sqlx embeds
+      # with a checksum, so an eol-policy edit is a build input.
+      - .gitattributes
       - Cargo.toml
       - Cargo.lock
       - build.rs
-      - scripts/release-version.py
-      - scripts/release-package.py
-      - README.md
-      - ARCHITECTURE.md
-      - CONTRIBUTING.md
-      - docs/**
+      - assets/**
+      - migrations/**
+      - scripts/**
       - skills/**
       - src/**
       - tests/**
-      # The web bundle is embedded into the Rust binary at build time.
-      - web/src/**
-      - web/package.json
-      - web/package-lock.json
-      - web/vite.config.*
-      - web/tsconfig*.json
-      - web/index.html
   # Manual re-run for a flaky PTY test or a workflow-only change: neither
-  # re-triggers this workflow reliably from a push.
+  # re-triggers this workflow reliably from a push. Dispatch ignores filters.
   workflow_dispatch:
 
 # Cancel in-progress runs on PRs to save minutes; push runs always
@@ -63,9 +84,9 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Documentation contracts (offline)
-        run: python3 tests/docs_sync.py
-
+      # Documentation contracts live in CI-DOCS so a docs-only PR is checked
+      # without waking this matrix. The release regressions stay here: they
+      # shell out to cargo, which this job already installs.
       - name: Release workflow regressions (offline)
         run: python3 tests/release_workflow.py
 
