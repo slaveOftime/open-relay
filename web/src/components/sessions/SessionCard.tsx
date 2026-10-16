@@ -13,6 +13,7 @@ import CommandLogo from '@/components/CommandLogo'
 import SessionActivitySparkline from '@/components/sparkline/SessionActivitySparkline'
 import SessionActionConfirmDialog from '@/components/dialogs/SessionActionConfirmDialog'
 import StatusBadge from '@/components/StatusBadge'
+import { SessionAge } from '@/components/sessions/SessionAge'
 import { SessionNotificationButton } from '@/components/sessions/SessionNotificationButton'
 import { SessionPinButton } from '@/components/sessions/SessionPinButton'
 import { SessionTagList } from '@/components/sessions/SessionTagList'
@@ -21,12 +22,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardFooter } from '@/components/ui/card'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { CopyIcon, FileTextIcon, Link2Icon, StopIcon, TrashIcon } from '@radix-ui/react-icons'
-import {
-  formatByteSize,
-  formatTimestamp,
-  normalizeCwdPath,
-  sessionDisplayName,
-} from '@/utils/format'
+import { formatByteSize, normalizeCwdPath, sessionDisplayName } from '@/utils/format'
 import { isTerminalStatus } from '@/utils/session-status'
 
 export const SessionCard = memo(function SessionCard({
@@ -97,6 +93,7 @@ export const SessionCard = memo(function SessionCard({
   return (
     <>
       <Card
+        data-testid="session-card"
         className={`relative rounded-xl shadow-none mx-1 my-2 overflow-hidden flex flex-col transition-colors hover:border-[hsl(var(--border))]/80 ${animateClass} ${opacityClass}`}
       >
         <CardContent className="px-2 pt-2 pb-2 flex flex-col gap-1 relative">
@@ -111,9 +108,7 @@ export const SessionCard = memo(function SessionCard({
             >
               {session.id.slice(0, 7)}
             </button>
-            <span className="text-xs text-[hsl(var(--muted-foreground))] tabular-nums">
-              {formatTimestamp(session.created_at)}
-            </span>
+            <SessionAge session={session} />
             <div className="text-[hsl(var(--muted-foreground))] text-xs font-mono tabular-nums">
               {formatByteSize(session.last_total_bytes)}
             </div>

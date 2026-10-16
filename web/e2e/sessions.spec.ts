@@ -533,3 +533,96 @@ test('the search box clear button is a phone-sized target, not an icon', async (
   await expect(search).toHaveValue('')
   await expect(clear).toHaveCount(0)
 })
+
+test('a mobile card counts a live session up and dates a finished one', async ({ page }) => {
+  await page.route('**/api/auth/status', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ auth_required: false }),
+    })
+  )
+  await page.route('**/api/nodes', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify([]) })
+  )
+  await page.route('**/api/push/public-key', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ public_key: null }),
+    })
+  )
+  await page.route('**/api/push/subscriptions', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: true, deleted: false }),
+    })
+  )
+  await page.route('**/api/sessions/events**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `event: stream_ready\ndata: ${JSON.stringify({ version: 2, nodes: [] })}\n\n`,
+    })
+  )
+  // Fixed at setup, not per response: the page re-fetches the list, and a
+  // `created_at` recomputed on every fetch would hold the age at ten seconds
+  // for as long as the test watched it.
+  const session = (id: string, status: string, ageSeconds: number) => ({
+    id,
+    title: `${id} title`,
+    tags: [],
+    command: 'bash',
+    args: [],
+    pid: 1234,
+    status,
+    created_at: new Date(Date.now() - ageSeconds * 1000).toISOString(),
+    cwd: '/tmp',
+    input_needed: false,
+    node: null,
+    notifications_enabled: true,
+    last_total_bytes: 0,
+  })
+  const items = [
+    session('live-session', 'running', 10),
+    session('done-session', 'stopped', 2 * 86_400),
+  ]
+  await page.route('**/api/sessions**', (route) => {
+    if (new URL(route.request().url()).pathname === '/api/sessions/events') {
+      void route.fallback()
+      return
+    }
+    void route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ items, total: 2, offset: 0, limit: 15 }),
+    })
+  })
+
+  await page.setViewportSize({ width: 375, height: 812 })
+  await page.goto('/')
+
+  const content = page.getByTestId('mobile-session-content')
+  const card = (title: string) => content.getByTestId('session-card').filter({ hasText: title })
+
+  // Still running: a count, and it counts. The first reading is a sample; the
+  // assertion is that a later one is larger, so a stalled clock fails here.
+  const liveAge = card('live-session title').getByText(/^\d+s ago$/)
+  await expect(liveAge).toBeVisible()
+  const seconds = () => liveAge.evaluate((el) => Number(/\d+/.exec(el.textContent ?? '')?.[0]))
+  const firstReading = await seconds()
+  await expect.poll(seconds).toBeGreaterThan(firstReading)
+
+  // Finished: the date it was created, and no counter. The date's shape is
+  // locale-dependent, so only the hour:minute pair is asserted.
+  const doneCard = card('done-session title')
+  await expect(doneCard.getByText(/^\d+d ago$/)).toHaveCount(0)
+  await expect(doneCard.getByText(/\d{1,2}:\d{2}/)).toBeVisible()
+
+  // The card only: the desktop row keeps the exact start time.
+  await page.setViewportSize({ width: 1280, height: 800 })
+  const table = page.getByRole('table')
+  await expect(table.getByText(/^\d+s ago$/)).toHaveCount(0)
+  await expect(table.getByText(/\d{1,2}:\d{2}/).first()).toBeVisible()
+})

@@ -97,8 +97,12 @@ Desktop delivery, browser push, and a custom hook can alert the human; always
 inspect the current output before intervening.
 
 For programs emitting OSC 7501, the browser shows an **agent-reported status**
-badge alongside process lifecycle, including permission/question/auth waits and
-optional progress. Reports arrive through the existing session-update stream,
+badge alongside an attention/lifecycle badge, including permission/question/auth
+waits and optional progress. Live idle/done show **Ready for Input**, with process
+lifecycle in the tooltip; blocked/error show **Input Needed**. These set the
+backend attention flag immediately, even with notifications disabled. Stopped
+processes are never shown as ready just because a done/error report is retained.
+Reports arrive through the existing session-update stream,
 including federated sessions. Explicit working states suppress guessed
 attention; idle/blocked/done/error reports can notify after the existing 5-second
 activity suppression and configured minimum notification interval. Ordinary

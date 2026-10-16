@@ -131,12 +131,21 @@ Supporting programs can report `idle`, `working`, `blocked`, `done`, or `error`
 using the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status).
 `oly info` shows a separate **Program status** section; `oly info --json` and
 `oly ls --json` include `program_status` when available. This is application
-state, not the process lifecycle `status` or exit code. `blocked` sets
-`input_needed` immediately, so `oly logs --wait prompt` does not need to wait
-for a silence/regex guess. `idle` means ready for the next instruction, not an
-approval request; it can notify you that the agent is **Ready for instruction**,
-just as `done` can notify you about a result. Neither implies verified success.
-`idle`, `working`, `done`, and `error` do not set `input_needed`.
+state, not the process lifecycle `status` or exit code. While the process is
+running, `idle`, `done`, `blocked`, and `error` set `input_needed` immediately:
+this flag includes readiness for another instruction and errors needing review,
+not only blocked prompts. `working` clears it and suppresses heuristic guesses.
+Stopped/stopping processes never need input, even with a retained done/error
+report. This works independently of notification enablement or delivery, so
+`oly logs --wait prompt` does not need a silence/regex guess or a notification.
+
+The browser shows **Ready for Input** for live idle/done reports, with the
+agent-reported **Idle** / **Task Done** detail beside it. Process lifecycle stays
+`running` in the API and the badge's tooltip until the child actually exits.
+Blocked/error reports show **Input Needed** with their reason. Idle means ready
+for the next instruction, not an approval request or completed work; it can
+notify **Ready for instruction**, just as done can notify about a result.
+Neither a ready badge nor an app-reported task-done report implies verified success.
 
 In `oly ls --follow`, both table and tree views show a compact program-state
 label beside the session title when a report is available: `[working]`,

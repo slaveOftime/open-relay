@@ -143,8 +143,10 @@ raise attention before the longer silence fallback. There is no active LLM
 prompt detector in the current implementation.
 
 Retained OSC 7501 program-status reports take precedence over regex/silence:
-working suppresses guessed attention, blocked sets input-needed immediately,
-and idle/blocked/done/error can notify through the same activity suppression and
+working suppresses attention; idle/done/blocked/error set input-needed immediately
+while the process is running, independently of notification delivery. Non-running
+processes never need input. Idle/done readiness is not a blocked approval request.
+These states can notify through the same activity suppression and
 minimum interval. Duplicate reports and ordinary redraws do not re-notify.
 Notifications use trigger rule `program_status`; done/error use notification
 kind `program_status`, as does idle ("Ready for instruction"); blocked uses

@@ -271,13 +271,25 @@ rather than accidental:
 
 ### Found while adding hold-then-drag repositioning (2026-10-10)
 
-42. **The search quick menu can clip off the viewport if the trigger is
-    dragged far left.** `use-hold-to-drag` clamps the trigger inside the page
-    frame, but the menu is `w-60` (240px) and opens to the _left_ of the
-    trigger — once the trigger sits under ~250px from the left edge the panel
-    runs past the viewport. Before repositioning existed the trigger was pinned
-    at `right-5`, where the menu always fit. _Next step:_ measure at open time
-    and flip the menu to the trigger's right (`left-full`) whenever the space
-    to its left is short. The XTerm ring has the same edge exposure but always
-    had it — a radial menu overflows at the corners by design, so it is
-    recorded here rather than treated as a regression.
+42. **FIXED** (`placeMenu`, `lib/menu-placement.ts`) — the search quick menu
+    could clip off the viewport. `use-hold-to-drag` clamps the trigger inside
+    the page frame, but the menu is `w-60` (240px), hung from the trigger's
+    right edge and grew toward the _left_: a trigger under ~250px from the left
+    edge pushed the panel off that side. It hung _below_ the trigger too, so a
+    trigger dragged down into the bottom `70` band — where the default spot
+    leaves ~280px of room — pushed the panel off the bottom. Neither was
+    reachable while the trigger was pinned at `right-5 bottom-70`; both arrived
+    with the drag. The placement is measured now instead of assumed: `placeMenu`
+    takes the trigger's box, the menu's rendered size and the viewport, and
+    returns the side to hang from — below while the room is there, over the
+    trigger when it is not, the roomier side when neither fits — plus the
+    `right` offset that slides the panel back until its left edge is on the
+    margin. The component measures in a layout effect, so the menu is never
+    painted in the wrong place before its entrance arms, and measures layout
+    boxes rather than rects, since that entrance's scale would shrink a measured
+    rect. A `ResizeObserver` re-measures when the menu grows (an active filter
+    adds the Clear button) and a `resize` listener when the window changes.
+    Eight unit tests pin the rules, and two e2e specs drive a real drag into
+    each corner. The XTerm ring has the same edge exposure but always had it — a
+    radial menu overflows at the corners by design, so it stays recorded here
+    rather than treated as a regression.

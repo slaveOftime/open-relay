@@ -46,9 +46,9 @@ export default defineConfig({
       // adding the engine to the matrix - what iOS adds here is coverage of
       // the iOS-only attach and keyboard paths.
       // `sessions-search-control` is phone-viewport by construction, and the
-      // gesture it drives (tap vs press-and-hold, and the focus a tap that
-      // opens a search bar must keep) is exactly the class of thing that
-      // differs on WebKit.
+      // gestures it drives — the tap that opens the bar and the filter menu,
+      // the focus that tap must keep, and the drag that moves the trigger — are
+      // exactly the class of thing that differs on WebKit.
       testMatch: /(attach|quick-keys|sessions-search)[^/]*\.spec\.ts/,
       use: { ...MOBILE_SAFARI },
     },

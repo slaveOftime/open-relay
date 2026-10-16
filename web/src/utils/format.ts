@@ -4,8 +4,16 @@ import type { SessionStatus } from '@/api/types'
 // Age / time formatting
 // ---------------------------------------------------------------------------
 
-export function formatAge(createdAt: string): string {
-  const diff = Math.floor((Date.now() - new Date(createdAt).getTime()) / 1000)
+/**
+ * Age of something created at `createdAt`, in the shortest honest unit:
+ * "10s ago", "2m ago", "3h ago", "2d ago". `now` is injectable so a live label
+ * can count from the shared clock (`hooks/use-now`) instead of reading the wall
+ * clock a second time. Clamped at zero: a remote node whose clock runs ahead of
+ * the browser would otherwise render a session created in the future as
+ * "-3s ago".
+ */
+export function formatAge(createdAt: string, now: number = Date.now()): string {
+  const diff = Math.max(0, Math.floor((now - new Date(createdAt).getTime()) / 1000))
   if (diff < 60) return `${diff}s ago`
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
