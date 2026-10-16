@@ -1,6 +1,17 @@
 // Benign agent-like terminal fixture: no network, services, or agent APIs.
 const mode = process.argv[2];
 const raw = mode !== 'canonical';
+// The daemon's graceful stop writes Ctrl-C, then repeats it after
+// min(500ms, grace/4) so the repeat lands inside an application's confirmation
+// window; that spacing is pinned by the unit test
+// `soft_stop_schedule_second_ctrl_c_lands_inside_double_ctrl_c_window`.
+// Delivery, not the schedule, is what varies: a busy host can deliver the
+// repeat late, and the PTY can merge bytes the daemon wrote half a second
+// apart into a single read, which erases the measured gap. So the floor only
+// rejects a press arming itself, the ceiling is the grace these tests pass,
+// and a pair merged into one read counts as the repeat.
+const DOUBLE_PRESS_FLOOR_MS = 100;
+const DOUBLE_PRESS_CEILING_MS = 5000;
 let firstInterrupt;
 let exiting = false;
 
@@ -29,14 +40,20 @@ function finish(marker) {
 
 process.stdin.on('data', chunk => {
   if (exiting) return;
+  let armedThisRead = false;
   for (const key of chunk) {
     const now = performance.now();
     if (mode === 'double' && key === 0x03) {
-      if (firstInterrupt !== undefined && now - firstInterrupt >= 100 && now - firstInterrupt <= 1500) {
+      const gap = firstInterrupt === undefined ? undefined : now - firstInterrupt;
+      const repeated =
+        armedThisRead ||
+        (gap !== undefined && gap >= DOUBLE_PRESS_FLOOR_MS && gap <= DOUBLE_PRESS_CEILING_MS);
+      if (repeated) {
         finish('DOUBLE-CONFIRMED');
         return;
       }
       firstInterrupt = now;
+      armedThisRead = true;
       process.stdout.write('INTERRUPT-CONFIRM\r\n');
     } else if (mode === 'eof' && key === 0x04) {
       finish('CTRL-D-ACCEPTED');

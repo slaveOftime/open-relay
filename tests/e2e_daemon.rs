@@ -1358,6 +1358,23 @@ fn check_graceful_stop_resume_tail(mode: &str) {
     assert_eq!(listing["items"][0]["resume_command"], expected);
 }
 
+/// Grace-escalation outcomes the daemon logs at info level, which is what
+/// `daemon-stderr.log` keeps. When a resume hint fails to derive it is either
+/// "the session never exited cleanly" (forced termination at the deadline) or
+/// "it exited and the hint was lost before the journal was read" — the
+/// distinction is the whole diagnosis, and the DB assertions cannot show it.
+fn grace_escalation_log(tmp: &std::path::Path) -> String {
+    let log = fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default();
+    log.lines()
+        .filter(|line| {
+            line.contains("stopping all sessions")
+                || line.contains("exited at grace deadline")
+                || line.contains("forced termination completed")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn e2e_graceful_daemon_shutdown_persists_agent_resume_hints() {
     assert!(program_exists("node"), "real-PTY fixture requires Node.js");
@@ -1406,7 +1423,9 @@ fn e2e_graceful_daemon_shutdown_persists_agent_resume_hints() {
             .unwrap();
         assert_eq!(
             summary["resume_command"],
-            format!("helper --resume {mode}-clean")
+            format!("helper --resume {mode}-clean"),
+            "{mode}: resume hint not derived from the persisted journal; daemon grace escalation:\n{}",
+            grace_escalation_log(&tmp)
         );
         assert_eq!(summary["status"], "stopped");
     }
