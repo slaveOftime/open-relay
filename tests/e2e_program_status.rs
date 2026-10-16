@@ -26,6 +26,26 @@ fn wait_status(tmp: &std::path::Path, id: &str, state: &str) -> Value {
     }
 }
 
+fn assert_prompt_attention(tmp: &std::path::Path, id: &str, state: &str) {
+    let prompt = oly_cmd(tmp)
+        .args([
+            "logs",
+            id,
+            "--wait",
+            "prompt",
+            "--timeout",
+            if state == "working" { "250ms" } else { "1s" },
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        prompt.status.code(),
+        Some(if state == "working" { 2 } else { 0 }),
+        "prompt gate for {state}: {}",
+        String::from_utf8_lossy(&prompt.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn e2e_program_status_query_and_live_transitions() {
@@ -49,7 +69,7 @@ assert reply == expected, repr(reply)
 while not os.read(0, 1) == b'c':
     pass
 os.write(1, b'query supported\r\n\x1b]7501;state=working:app=fixture\x07')
-for state in [b'blocked:kind=permission:msg=QXBwcm92ZT8=', b'working', b'idle', b'error', b'done']:
+for state in [b'blocked:kind=permission:msg=QXBwcm92ZT8=', b'working', b'idle', b'error', b'done', b'working', b'done']:
     os.read(0, 1)
     os.write(1, b'\x1b]7501;state=' + state + b'\x1b\\')
 # Wait before exiting so the live done report is observable.
@@ -77,7 +97,9 @@ os.read(0, 1)
     assert_eq!(initial["status"], "running");
     assert_eq!(initial["program_status"]["app"], "fixture");
     assert_eq!(initial["input_needed"], false);
-    for state in ["blocked", "working", "idle", "error", "done"] {
+    for state in [
+        "blocked", "working", "idle", "error", "done", "working", "done",
+    ] {
         let send = oly_cmd(&tmp).args(["send", &id, "x"]).output().unwrap();
         assert!(
             send.status.success(),
@@ -86,7 +108,7 @@ os.read(0, 1)
         );
         let value = wait_status(&tmp, &id, state);
         assert_eq!(value["status"], "running");
-        assert_eq!(value["input_needed"], state == "blocked");
+        assert_eq!(value["input_needed"], state != "working");
         assert!(
             value["program_status"]["app"].is_null(),
             "reports replace metadata"
@@ -94,25 +116,18 @@ os.read(0, 1)
         if state == "blocked" {
             assert_eq!(value["program_status"]["kind"], "permission");
             assert_eq!(value["program_status"]["msg"], "Approve?");
-            let prompt = oly_cmd(&tmp)
-                .args(["logs", &id, "--wait", "prompt", "--timeout", "1s"])
-                .output()
-                .unwrap();
-            assert!(
-                prompt.status.success(),
-                "{}",
-                String::from_utf8_lossy(&prompt.stderr)
-            );
-            let list = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
-            assert!(list.status.success());
-            let list: Value = serde_json::from_slice(&list.stdout).unwrap();
-            assert_eq!(list["items"][0]["program_status"]["state"], "blocked");
-            let plain = oly_cmd(&tmp)
-                .args(["info", &id, "--color", "never"])
-                .output()
-                .unwrap();
-            assert!(String::from_utf8_lossy(&plain.stdout).contains("Program status (OSC 7501"));
         }
+        assert_prompt_attention(&tmp, &id, state);
+        let list = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
+        assert!(list.status.success());
+        let list: Value = serde_json::from_slice(&list.stdout).unwrap();
+        assert_eq!(list["items"][0]["program_status"]["state"], state);
+        assert_eq!(list["items"][0]["input_needed"], state != "working");
+        let plain = oly_cmd(&tmp)
+            .args(["info", &id, "--color", "never"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&plain.stdout).contains("Program status (OSC 7501"));
     }
     let logs = oly_cmd(&tmp).args(["export", &id]).output().unwrap();
     assert!(
@@ -134,6 +149,7 @@ os.read(0, 1)
         let value = info(&tmp, &id);
         if value["status"] != "running" {
             assert_eq!(value["program_status"]["state"], "done");
+            assert_eq!(value["input_needed"], false);
             assert_eq!(value["exit_code"], 0);
             break;
         }
@@ -180,6 +196,8 @@ fn e2e_program_status_conpty_default_enables_pi_style_reports() {
     let id = String::from_utf8(out.stdout).unwrap().trim().to_owned();
     let initial = wait_status(&tmp, &id, "idle");
     assert_eq!(initial["program_status"]["app"], "pi-fixture");
+    assert_eq!(initial["input_needed"], true);
+    assert_prompt_attention(&tmp, &id, "idle");
     for state in ["working", "blocked", "error", "idle", "done"] {
         let send = oly_cmd(&tmp).args(["send", &id, "x"]).output().unwrap();
         assert!(
@@ -189,24 +207,17 @@ fn e2e_program_status_conpty_default_enables_pi_style_reports() {
         );
         let value = wait_status(&tmp, &id, state);
         assert_eq!(value["status"], "running");
-        assert_eq!(value["input_needed"], state == "blocked");
+        assert_eq!(value["input_needed"], state != "working");
         if state == "blocked" {
             assert_eq!(value["program_status"]["kind"], "permission");
             assert_eq!(value["program_status"]["msg"], "Approve?");
-            let prompt = oly_cmd(&tmp)
-                .args(["logs", &id, "--wait", "prompt", "--timeout", "1s"])
-                .output()
-                .unwrap();
-            assert!(
-                prompt.status.success(),
-                "{}",
-                String::from_utf8_lossy(&prompt.stderr)
-            );
         }
+        assert_prompt_attention(&tmp, &id, state);
         let listing = oly_cmd(&tmp).args(["ls", "--json"]).output().unwrap();
         assert!(listing.status.success());
         let listing: Value = serde_json::from_slice(&listing.stdout).unwrap();
         assert_eq!(listing["items"][0]["program_status"]["state"], state);
+        assert_eq!(listing["items"][0]["input_needed"], state != "working");
     }
     let exported = oly_cmd(&tmp).args(["export", &id]).output().unwrap();
     assert!(
@@ -230,6 +241,7 @@ fn e2e_program_status_conpty_default_enables_pi_style_reports() {
         if value["status"] != "running" {
             assert_eq!(value["exit_code"], 0);
             assert_eq!(value["program_status"]["state"], "done");
+            assert_eq!(value["input_needed"], false);
             break;
         }
         assert!(Instant::now() < deadline, "producer did not exit");

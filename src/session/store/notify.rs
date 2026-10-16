@@ -277,7 +277,10 @@ mod tests {
                         .await
                         .is_empty()
                 );
-                assert_eq!(rt.read().input_needed(), state == "blocked");
+                assert!(
+                    rt.read().input_needed(),
+                    "explicit {state} remains attention-worthy after notification/redraw"
+                );
             }
         }
     }
@@ -337,8 +340,8 @@ mod tests {
             1
         );
         assert!(
-            !rt.read().input_needed(),
-            "ready is not a blocked approval request"
+            rt.read().input_needed(),
+            "readiness must remain visible even while notification delivery is suppressed"
         );
     }
 

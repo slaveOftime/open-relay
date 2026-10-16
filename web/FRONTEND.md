@@ -28,7 +28,12 @@ src/
 `components/` also holds a handful of singletons that belong to no group:
 `Logo`, `CommandLogo`, `StatusBadge`, `NodeSelector`, `SseStatusDot`,
 `NotificationToggle`, `ErrorBoundary`. `StatusBadge` composes a separate
-`ProgramStatusBadge` for optional OSC 7501 app state, preserving process lifecycle.
+`ProgramStatusBadge` for optional OSC 7501 app state. The backend `input_needed`
+flag includes live idle/done readiness and blocked/error attention. Do not hide
+that flag when an explicit report exists: live idle/done show **Ready for Input**
+without a busy pulse; blocked/error keep **Input Needed** and the app's reason.
+Process lifecycle remains in the primary badge tooltip and API. A non-running
+process must never display ready/input-needed, even if a stale flag arrives.
 These are plain-text, untrusted reports from the owning session, not verified
 completion or approval authority. `sameSessionSummary` must compare their fields
 so status-only SSE updates reach rows, cards, and details.
