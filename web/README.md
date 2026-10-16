@@ -73,6 +73,4 @@ see [Apps skill](../skills/oly-apps/SKILL.md). Never relax the control-plane CSP
 just to run arbitrary generated reports.
 
 - [Design](./DESIGN.md) — visual tokens, density, colors
-- [Refactor plan](./REFACTOR-PLAN.md) — structural work
-- [Backlog](./ISSUES-BACKLOG.md) — recorded findings, not release certification
 - [Compatibility](../docs/releases/compatibility-0.5.md) — beta contract
