@@ -324,6 +324,12 @@ invariant descriptions throughout this document):
 - **Ordered, durable recording.** Every byte the PTY emits reaches the
   journal exactly once, in order; durability is asserted via sync
   acknowledgments, never assumed from timing.
+- **Backpressure before degradation.** The ingest path waits for journal
+  queue room while the appender is momentarily behind — an `fsync`, a
+  competing session — and degrades the session only when no slot frees
+  within the stall deadline. The queue's byte budget stays the hard
+  memory bound, so a slow disk slows a session instead of failing it
+  while a genuinely wedged journal still fails loudly.
 - **Gapless streams.** Attach cursors are `(incarnation, offset)` pairs;
   resume continues exactly, cross-incarnation cursors are fenced, and
   gaps/duplicates are protocol errors — for local, browser, and relayed
