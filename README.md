@@ -150,11 +150,11 @@ Open **http://127.0.0.1:15443** for the browser UI, or use
 
 - [CLI guide](./docs/guides/cli.md) — logs, cursors, input, scrolling, and session lifecycle
 - [Remote access](./docs/guides/remote-access.md) — browser security, connected nodes, and notifications
+- [Troubleshooting](./docs/guides/troubleshooting.md) — expected limits, and what to collect when reporting
 - [Agent skills](./skills/oly/SKILL.md) — general usage; [worker supervision](./skills/oly-subagent/SKILL.md), [daemon configuration](./skills/oly-daemon/SKILL.md), [web apps](./skills/oly-apps/SKILL.md)
 - [Upgrade to 0.5](./docs/releases/migration-0.5.md) — breaking changes and safe upgrades
 - [Architecture](./ARCHITECTURE.md) · [Performance](./PERFORMANCE.md) · [Contributing](./CONTRIBUTING.md)
-- [What's new in 0.5](./docs/releases/whats-new-0.5.md) · [Compatibility](./docs/releases/compatibility-0.5.md)
-- [All documentation](./docs/README.md) · [How to publish a release](./docs/maintainers/release-process.md)
+- [What's new in 0.5](./docs/releases/whats-new-0.5.md) · [Compatibility](./docs/releases/compatibility-0.5.md) · [All documentation](./docs/README.md)
 
 MIT licensed. If oly makes your workflow easier, a
 [star on GitHub](https://github.com/slaveOftime/open-relay) helps others find it.
