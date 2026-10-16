@@ -45,4 +45,13 @@
 - Windows PTY tests: run serially with `cargo test --locked -- --test-threads=1`.
 - In `web/`: `npm ci`, `npm run lint`, `npm run format:check`, `npm test`, `npm run build`.
 - UI interaction/effect/focus changes: run relevant Playwright specs; compilation alone is insufficient.
-- Docs/packaging: `python3 tests/docs_sync.py` and `python3 tests/release_workflow.py`.
+- Docs/packaging: `python3 tests/docs_sync.py` and `python3 tests/release_workflow.py`. Both assume a POSIX host (forward-slash paths, `bash`, `sha256sum`), so run them in WSL/Linux or rely on CI.
+
+## CI layout
+Workflows are scoped by change area, so a PR only runs what its diff can break:
+- `CI` (`ci.yml`) — Rust: fmt, clippy, the three-OS test matrix, audit, and the release-workflow regressions.
+- `CI-WEB` (`ci-web.yml`) — `web/**`: lint, vitest, build, Playwright.
+- `CI-DOCS` (`ci-docs.yml`) — Markdown, `docs/`, `skills/`, `src/**`: the offline documentation contracts.
+
+`CI-DOCS` is separate from `CI` because `docs_sync.py` cross-checks `src/**` and `skills/**` against the docs, so a docs-only change must be checked without waking the Rust matrix. `CI-WEB` covers the web bundle, but `CI` also lists `web/**`: `build.rs` runs the npm build for release profiles and `src/http/mod.rs` embeds `web/dist`, so only `CI` proves the bundle is still embeddable — mirror `build.rs`'s web `cargo:rerun-if-changed` entries there. When a new top-level directory becomes a compile-time input (`include_str!`, `sqlx::migrate!`, a `rust-embed` folder, or a `build.rs` resource), add it to the `ci.yml` trigger lists: an omitted input is a silent coverage gap, not a failure. Every workflow also accepts `workflow_dispatch`, which ignores filters.
+

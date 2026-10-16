@@ -1,0 +1,54 @@
+name: CI-DOCS
+
+# Documentation contracts only: no Rust toolchain, no build, seconds not
+# minutes. Keeping this out of CI means a docs-only PR is checked without
+# waking the three-OS matrix; keeping it out of CI-WEB means the docs are
+# still guarded when only Markdown moves.
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - '*.md'
+      - docs/**
+      - skills/**
+      - src/**
+      - tests/docs_sync.py
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - '*.md'
+      - docs/**
+      - skills/**
+      - src/**
+      - tests/docs_sync.py
+  # Dispatch ignores filters, so a full check is always one click away.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: docs contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Reads README.md, ARCHITECTURE.md, CONTRIBUTING.md, docs/**,
+      # skills/*/SKILL.md and, for the coverage contracts, src/config.rs,
+      # src/main.rs and src/protocol.rs — which is why src/** is a trigger.
+      # It also resolves every local link, so it sees renames of the files
+      # the docs point at (e.g. .github/workflows/release.yml).
+      - name: Documentation contracts (offline)
+        run: python3 tests/docs_sync.py
