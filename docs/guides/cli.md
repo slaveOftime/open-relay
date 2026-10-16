@@ -75,6 +75,10 @@ oly ls --follow --node worker-a --node worker-b --node-local
 oly ls --follow --node-all
 ```
 
+| List view (`Ctrl+G` switches) | Tree view |
+|---|---|
+| [![The list view: sessions grouped by node, with live rate, output, and command columns](../../assets/oly-list-tui.png)](../../assets/oly-list-tui.png) | [![The tree view: the same sessions grouped by working directory](../../assets/oly-list-tui-tree.png)](../../assets/oly-list-tui-tree.png) |
+
 Bare search terms match ID, title, tags, command, arguments, or working
 directory. Terms are ANDed. Scope with `id:`, `title:`, `tag:`/`tags:`,
 `cmd:`/`command:`, `args:`, or `cwd:`; command search also matches arguments.

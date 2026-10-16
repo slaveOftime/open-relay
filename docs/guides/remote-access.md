@@ -18,6 +18,21 @@ running daemon. Listener bind/port changes require a restart, which stops its
 live sessions. See the [daemon skill](../../skills/oly-daemon/SKILL.md) for config
 precedence and hot reload.
 
+The UI groups sessions by working directory and shows live status, output size,
+and activity; the detail page embeds the terminal with text input, quick keys,
+and file upload.
+
+![The session list, grouped by working directory, with live status and activity charts](../../assets/oly-web-sessions-page.png)
+
+![Session detail: live terminal, text input, quick keys, and file upload](../../assets/oly-web-detail-page.png)
+
+The same UI installs as a PWA, with a mobile key bar for keys a soft keyboard
+cannot send.
+
+| Sessions on a phone | Detail on a phone |
+|---|---|
+| [![Mobile session list](../../assets/oly-web-sessions-page-mobile.png)](../../assets/oly-web-sessions-page-mobile.png) | [![Mobile session detail with the key bar](../../assets/oly-web-detail-page-mobile.png)](../../assets/oly-web-detail-page-mobile.png) |
+
 Keep HTTP on loopback. For access from a phone or another machine, prefer:
 
 ```text

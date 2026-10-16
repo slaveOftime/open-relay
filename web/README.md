@@ -3,6 +3,17 @@
 React + TypeScript UI for the oly daemon: session listing, browser terminal
 attach, and mobile-friendly supervision controls.
 
+| Sessions | Detail |
+|---|---|
+| [![Session list grouped by working directory, with live status and activity charts](../assets/oly-web-sessions-page.png)](../assets/oly-web-sessions-page.png) | [![Session detail with the live terminal, text input, quick keys, and file upload](../assets/oly-web-detail-page.png)](../assets/oly-web-detail-page.png) |
+
+Both pages ship as a PWA; the phone layout adds a key bar for keys a soft
+keyboard cannot send.
+
+| Sessions (phone) | Detail (phone) |
+|---|---|
+| [![Mobile session list](../assets/oly-web-sessions-page-mobile.png)](../assets/oly-web-sessions-page-mobile.png) | [![Mobile session detail with the key bar](../assets/oly-web-detail-page-mobile.png)](../assets/oly-web-detail-page-mobile.png) |
+
 ## Run
 
 ```sh

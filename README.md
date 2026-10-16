@@ -4,30 +4,52 @@
   <img src="https://raw.githubusercontent.com/slaveOftime/open-relay/main/assets/icon-demo.svg" width="120" alt="oly logo" />
 </p>
 
-<p align="center"><strong>Your agents keep running. You stay in control.</strong></p>
+<p align="center"><strong>Close your laptop. Your agents keep working. Come back to the one that needs you.</strong></p>
 
 [![npm version](https://img.shields.io/npm/v/@slaveoftime/oly.svg)](https://www.npmjs.com/package/@slaveoftime/oly)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/slaveOftime/open-relay/blob/main/LICENSE)
+
+<p align="center"><img src="./assets/oly-web-and-list-tui.png" width="1000" alt="The oly tree dashboard in a terminal beside the same sessions in the browser UI" /></p>
 
 Run an interactive CLI once. Close your terminal. Come back from another
 terminal or a browser — with the process still running and its output recorded.
 
 `oly` is a local-first session supervisor for coding agents, REPLs, and
-long-running commands that still need a human in the loop. It works with the
-CLI you already use; no model-provider integration required.
-
-https://github.com/user-attachments/assets/bd52a474-d9c4-48a7-824b-8df328a9d5a7
+long-running commands that still need a human in the loop. It runs the CLI you
+already use — no model-provider integration — and serves both the `oly ls
+--follow` dashboard and a password-protected web UI at `http://127.0.0.1:15443`.
 
 ## Why oly?
 
 - **Walk away without losing the job.** The daemon owns the PTY, not your terminal.
+- **See who needs you.** Lifecycle status and agent-reported [program status](./docs/guides/cli.md#agent-reported-status-osc-7501) roll into one list.
 - **Check in, don't babysit.** Read recent output, inspect a live TUI, or wait for a likely input-needed checkpoint.
 - **Intervene without attaching.** Send text, keys, or application mouse input; take over interactively when needed.
-- **Pick up from anywhere.** Use the terminal or browser, and route work to connected machines.
+- **Pick up from anywhere.** Use the terminal or the browser — including your phone — and route work to connected machines.
 - **Give agents a reliable control surface.** JSON metadata, bounded byte pages, and resumable cursors support scripted supervision.
 
 Think **persistent terminal sessions + a supervision API**, not another agent
 framework. Use your shell for quick commands; use oly when a job needs a durable home.
+
+## See it
+
+**Terminal dashboard** — `oly ls --follow` lists every session, or groups them by working directory.
+
+| List view | Tree view |
+|---|---|
+| [![oly ls --follow list view: sessions grouped by node with live rate and output columns](./assets/oly-list-tui.png)](./assets/oly-list-tui.png) | [![oly ls --follow tree view: sessions grouped by working directory](./assets/oly-list-tui-tree.png)](./assets/oly-list-tui-tree.png) |
+
+**Browser UI** — the same daemon from any device, with live status and one-click attach.
+
+[![Browser session list grouped by working directory, with live status and activity charts](./assets/oly-web-sessions-page.png)](./assets/oly-web-sessions-page.png)
+
+[![Browser session detail: live terminal, text input, quick keys, and file upload](./assets/oly-web-detail-page.png)](./assets/oly-web-detail-page.png)
+
+**On a phone** — the web UI installs as a PWA, so you can check a prompt and answer it without a laptop.
+
+| Sessions | Detail |
+|---|---|
+| [![Browser session list on a phone](./assets/oly-web-sessions-page-mobile.png)](./assets/oly-web-sessions-page-mobile.png) | [![Browser session detail on a phone with the mobile key bar](./assets/oly-web-detail-page-mobile.png)](./assets/oly-web-detail-page-mobile.png) |
 
 ## Install
 
@@ -76,7 +98,8 @@ embed the web UI. See [Contributing](./CONTRIBUTING.md) for development setup.
 oly daemon start --detach
 
 # Run your preferred CLI in the background; save the returned session ID.
-oly start --detach --title "fix failing tests" copilot
+oly start --detach copilot
+
 
 # See sessions and inspect recent output.
 oly ls
