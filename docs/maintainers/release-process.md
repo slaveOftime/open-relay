@@ -1,7 +1,7 @@
 # How to publish an oly release
 
 For maintainers. Upgrading an installation? Use [Migration to 0.5](../releases/migration-0.5.md).
-For release status and evidence, see the [versioned release notes](../releases/release-notes-0.5.0-beta.1.md).
+For release status and evidence, see the [versioned release notes](../releases/release-notes-0.5.0-beta.2.md).
 
 ## 1. Choose the version and channel
 

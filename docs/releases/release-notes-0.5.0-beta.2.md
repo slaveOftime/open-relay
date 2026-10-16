@@ -1,8 +1,9 @@
 # oly 0.5.0-beta.2
 
-**Prepared for publication, not yet published. Stable remains 0.3.3. Back up state before upgrading.**
+**Published beta. Stable remains 0.3.3. Back up state before upgrading.**
 
-[What's new in 0.5](./whats-new-0.5.md)
+[GitHub release](https://github.com/slaveOftime/open-relay/releases/tag/v0.5.0-beta.2)
+· [What's new in 0.5](./whats-new-0.5.md)
 · [Upgrade from 0.3](./migration-0.5.md)
 · [Compatibility](./compatibility-0.5.md)
 
@@ -76,24 +77,28 @@ See [Compatibility for 0.5](./compatibility-0.5.md) for the beta contract.
 
 ## Verification
 
-**Not yet published.** The fields below are completed at publication, and are
-the same fields [0.5.0-beta.1](./release-notes-0.5.0-beta.1.md) used to record
-its release.
-
-- Release commit, tagged on `main`: pending.
-- PR-head CI — Rust tests on Linux x64, Linux arm64, macOS Apple Silicon, and
-  Windows x64, `fmt`/Clippy, frontend lint/unit/build/Chromium, and the offline
-  docs contracts: pending.
-- Post-merge `cargo audit`: pending. The audit job runs on `main` pushes, so PR
-  runs skip it.
-- Release workflow — platform tests and builds, uploads, checksums, and npm
-  `beta` publication: pending.
-- Artifact checks — downloaded archives match `SHA256SUMS.txt`, the published
-  npm installation reports `0.5.0-beta.2`, and `beta` moved while `latest`
-  stayed `0.3.3`: pending.
+- Release commit: tag `v0.5.0-beta.2` on merge commit
+  `96ae02d083fba69923129de2bdb8830a0db2e9fe`.
+- PR-head CI for the release-prep PR: `docs contracts` passed in 9s
+  ([run 38890315468](https://github.com/slaveOftime/open-relay/actions/runs/38890315468)).
+  The change is documentation-only, so that is the only status the diff can
+  affect; the Rust matrix and the web bundle were not triggered, by design
+  rather than by omission.
+- Post-merge `cargo audit` on `main`: the release commit changes no source, so
+  push CI did not run for it. The last source-changing push (`9742a90`, the
+  session-list performance merge) had `cargo audit` green.
+- Release workflow
+  ([run 38891124722](https://github.com/slaveOftime/open-relay/actions/runs/38891124722)):
+  all four `build-release` jobs passed — locked tests on Linux x64, Linux arm64,
+  macOS Apple Silicon, and Windows x64 (serial) — and `publish-npm` published.
+  `publish-crates` and `update-homebrew-formula` were skipped, as a beta tag
+  requires.
+- npm: `beta` is `0.5.0-beta.2` and `latest` stays `0.3.3`, read from the
+  registry document directly rather than from a client cache.
+- Artifact checks: in progress.
 
 ### Manual checks — maintainer-reported
 
-To be recorded after publication. Physical-device checks (real Windows
-sleep/resume, mobile and browser access) are the maintainer's report, not a CI
-result; this beta has no such report yet.
+None recorded for this beta. Physical-device checks (real Windows sleep/resume,
+mobile and browser access) are the maintainer's report, not a CI result, and are
+not claimed here.
