@@ -84,7 +84,7 @@ oly notify send --title "Review ready" --description "Check the result."
 oly notify send <running-id> --title "Needs review" --body "Inspect the session."
 ```
 
-Notifications target humans, not other agent sessions (for agent-to-agent coordination, see the [subagent skill](../../skills/oly-subagent/SKILL.md)).
+Notifications target humans, not other agent sessions (for agent-to-agent coordination and inbox discovery, see the [agent-to-agent skill](../../skills/oly-agent-2-agent/SKILL.md) and [subagent skill](../../skills/oly-subagent/SKILL.md)).
 
 To run a custom hook, set `notification_hook` in flat `<state>/config.json`:
 

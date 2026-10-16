@@ -41,6 +41,7 @@ const OLY_SKILL_MARKDOWN: &str = include_str!("../skills/oly/SKILL.md");
 const OLY_APPS_SKILL_MARKDOWN: &str = include_str!("../skills/oly-apps/SKILL.md");
 const OLY_SUBAGENT_SKILL_MARKDOWN: &str = include_str!("../skills/oly-subagent/SKILL.md");
 const OLY_DAEMON_SKILL_MARKDOWN: &str = include_str!("../skills/oly-daemon/SKILL.md");
+const OLY_AGENT_2_AGENT_SKILL_MARKDOWN: &str = include_str!("../skills/oly-agent-2-agent/SKILL.md");
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
@@ -191,6 +192,8 @@ async fn run() -> Result<()> {
                 print!("{}", OLY_SUBAGENT_SKILL_MARKDOWN);
             } else if args.daemon {
                 print!("{}", OLY_DAEMON_SKILL_MARKDOWN);
+            } else if args.agent_2_agent {
+                print!("{}", OLY_AGENT_2_AGENT_SKILL_MARKDOWN);
             } else {
                 print!("{}", OLY_SKILL_MARKDOWN);
             }

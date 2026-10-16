@@ -56,8 +56,9 @@ Every extra LLM turn in the lead agent re-sends the full conversation history. M
    For research, scanning, or multi-phase flows, instruct each worker to write findings to a dedicated file (e.g., `/tmp/flow/worker-a.md`) and print only a short summary. The lead agent reads the compact file instead of ingesting hundreds of lines of terminal output.
 3. **Crystallize state between phases:**
    Across multi-phase workflows, distil verified findings, file ownership, and interfaces into a concise shared brief (e.g., `/tmp/flow/context.md`) and pass that file path to next-phase workers instead of forwarding raw logs.
-4. **Optional push reporting via `$OLY_SESSION_ID`:**
-   `oly` injects `OLY_SESSION_ID` into every session's environment. When an interactive parent or lieutenant coordinates workers, it can pass its own `$OLY_SESSION_ID` in the prompt so workers push a completion note with `oly send <parent-id> -- "DONE: ..."` (plus `oly send <parent-id> key:enter`). Still verify results from the worker's own output/files.
+4. **Asynchronous agent-to-agent (A2A) inbox & push reporting (`oly skill --a2a`):**
+   - **N-to-1 fan-in inbox (recommended for multiple or interactive workers):** Start a lightweight inbox session (`inbox=$(oly start --detach --disable-notifications --title "inbox:lead" --tag inbox sh -c 'stty -onlcr 2>/dev/null; cat >/dev/null')` and `cur=$(oly logs "$inbox" --cursor)`). Pass `$inbox` to workers so they push status/questions via `printf '%s\n' "MSG|from:worker-a|type:done|body:..." | oly send "$inbox"`. Wait on `oly logs "$inbox" --since "$cur" --wait output --timeout 5m` to wake as soon as *any* worker reports.
+   - **Direct TUI push:** Because `oly` injects `OLY_SESSION_ID` into every session's environment, an idle interactive parent can also receive `oly send <parent-id> -- "DONE: ..."` (plus `oly send <parent-id> key:enter`). For peer discovery (`--tag inbox`), shared pub/sub channels, and background auto-wake, run `oly skill --a2a`.
 
 ## 4) Supervising interactive TUI workers
 

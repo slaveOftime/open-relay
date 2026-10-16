@@ -7,7 +7,7 @@
 | [CLI guide](./guides/cli.md) | Sessions, input, attach, logs, cursors, and export |
 | [Remote access](./guides/remote-access.md) | Browser access, nodes, notifications, and state |
 | [Troubleshooting](./guides/troubleshooting.md) | Daemon, attach, logs, browser, and node symptoms |
-| [Agent skills](../skills/oly/SKILL.md) | Embedded guidance; includes worker, daemon, and app skills |
+| [Agent skills](../skills/oly/SKILL.md) | Embedded guidance; includes worker, agent-to-agent, daemon, and app skills |
 
 ## The 0.5 release line
 
