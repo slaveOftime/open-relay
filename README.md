@@ -33,7 +33,7 @@ framework. Use your shell for quick commands; use oly when a job needs a durable
 
 ## See it
 
-**Terminal dashboard** — `oly ls --follow` lists every session, or groups them by working directory.
+**Terminal dashboard** — `oly ls --follow --node-all --limit 5000` lists every session, or groups them by working directory.
 
 | List view | Tree view |
 |---|---|
@@ -117,7 +117,7 @@ Replace `copilot` with `claude`, `codex`, another agent, or any interactive
 command. Pass oly options **before** the child command.
 
 Open **http://127.0.0.1:15443** for the browser UI, or use
-`oly ls --follow` for the live terminal dashboard.
+`oly ls --follow --node-all --limit 5000` for the live terminal dashboard.
 
 ### A few commands worth remembering
 
