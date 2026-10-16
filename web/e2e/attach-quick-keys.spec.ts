@@ -216,8 +216,9 @@ test('a hold-then-drag moves the scroll handle and remembers it', async ({ page 
   await page.mouse.down()
   await expect(handle).toHaveClass(/ring-2/)
   await page.mouse.move(cx - 70, cy + 80, { steps: 6 })
-  // The joystick stood down — the press belongs to the move now.
-  await expect(handle).toHaveClass(/opacity-80/)
+  // The joystick stood down — the press belongs to the move now — so the handle
+  // is back at its resting opacity rather than showing the scroll cue.
+  await expect(handle).toHaveClass(/opacity-70/)
   await page.mouse.up()
 
   // Exact tracking (no clamp: `right-5 bottom-70` leaves room down-left), and
