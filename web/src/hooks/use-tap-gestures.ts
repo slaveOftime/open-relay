@@ -16,7 +16,11 @@ type PressHandlers = Pick<
 export interface TapOptions {
   /** Fires when a press releases still — except as the second tap of a pair. */
   onPress?: () => void
-  /** Fires on the second tap of a pair released within `doubleMs`. */
+  /**
+   * Fires on the second tap of a pair released within `doubleMs`. Supplying it
+   * is what makes a tap wait: with no double action there is nothing a single
+   * could be mistaken for, so it fires on release.
+   */
   onDoubleTap?: () => void
   /** Pointer travel (px) that disqualifies a press from being a tap. */
   slopPx?: number
@@ -25,9 +29,9 @@ export interface TapOptions {
 }
 
 /**
- * How long a tap waits before it counts as a single. The wait is the double
- * check the consumer asked for: a pair must never perform the single action
- * (raise the keyboard, open the bar) on its way to the double's.
+ * How long a tap waits before it counts as a single, when the consumer also has
+ * a double action. The wait is the double check: a pair must never perform the
+ * single action (raise the keyboard, open the bar) on its way to the double's.
  */
 export const DOUBLE_TAP_MS = 300
 /** Pointer travel (px) that cancels a pending tap. */
@@ -40,12 +44,13 @@ export type TapKind = 'single' | 'double'
  * Classifies button presses into taps and double taps — pure, so the contract
  * is testable without a renderer.
  *
- * A still press is classified only when the double window closes: the single
- * tap fires `doubleMs` after its release, unless a second tap lands first,
- * which cancels the wait and fires the double instead. The first tap of a pair
- * must never perform the single action on the way to the double's — the single
- * raises a keyboard and opens a bar that the double would immediately tear
- * down, and the flash reads as a glitch.
+ * A still press is classified when the double window closes — but only when the
+ * consumer has a double action for a single to be mistaken for: with none, the
+ * tap fires on release. With one, the single fires `doubleMs` after its release
+ * unless a second tap lands first, which cancels the wait and fires the double
+ * instead. The first tap of a pair must never perform the single action on the
+ * way to the double's — the single raises a keyboard and opens a bar that the
+ * double would immediately tear down, and the flash reads as a glitch.
  *
  * The browser's follow-up click still can never double-fire: the consumer's
  * `onClick` checks `isFollowUpClick` and lets only click-without-a-gesture
@@ -125,6 +130,12 @@ export class TapGestures {
         // the single it was waiting to become must never run.
         this.cancelPendingSingle()
         this.callbacks.onDoubleTap?.()
+        return
+      }
+      // Nothing to wait for when the consumer has no double action: the tap is
+      // a single, and it is one now.
+      if (!this.callbacks.onDoubleTap) {
+        this.callbacks.onPress?.()
         return
       }
       this.pendingSingle = setTimeout(() => {
