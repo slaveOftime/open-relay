@@ -26,6 +26,25 @@ where
         .join("\n")
 }
 
+/// Why a transcript assertion failed: how much was journaled, the daemon's
+/// own log, and the session logs. A degraded journal reads very
+/// differently from a slow reader, and the daemon log is the only place
+/// that says which; it is not otherwise captured on CI.
+fn transcript_failure_context(tmp: &Path, id: &str, tail: usize) -> String {
+    let journaled = fetch_logs_with_tail(tmp, id, tail);
+    format!(
+        "journaled lines: {}\nJournaled transcript (tail {tail}):\n{journaled}\nDaemon stderr:\n{}\nDaemon logs:\n{}",
+        journaled.lines().count(),
+        fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default(),
+        fs::read_dir(tmp.join("oly/logs"))
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| fs::read_to_string(entry.ok()?.path()).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 fn native_shell_timeout() -> Duration {
     if cfg!(target_os = "windows") {
         Duration::from_secs(12)
@@ -738,8 +757,8 @@ fn e2e_high_bandwidth_output_logs_intact() {
     );
     assert!(
         result.is_some(),
-        "high-bandwidth output did not match the exact expected transcript.\nLogs (tail):\n{}",
-        fetch_logs_with_tail(&tmp, &id, 600)
+        "high-bandwidth output did not match the exact expected transcript.\n{}",
+        transcript_failure_context(&tmp, &id, 600)
     );
 
     let full_log = oly_cmd(&tmp)
@@ -777,15 +796,8 @@ fn e2e_windows_exited_producers_keep_tail_through_console_close() {
                 Duration::from_secs(15)
             )
             .is_some(),
-            "incomplete ConPTY output for {id} (expected {count} lines):\n{}\nDaemon stderr:\n{}\nDaemon logs:\n{}",
-            fetch_logs_with_tail(&tmp, &id, tail),
-            fs::read_to_string(tmp.join("daemon-stderr.log")).unwrap_or_default(),
-            fs::read_dir(tmp.join("oly/logs"))
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| fs::read_to_string(entry.ok()?.path()).ok())
-                .collect::<Vec<_>>()
-                .join("\n")
+            "session {id} is missing journaled output (expected {count} lines).\n{}",
+            transcript_failure_context(&tmp, &id, tail)
         );
         sessions.push((id, tail, expected));
     }

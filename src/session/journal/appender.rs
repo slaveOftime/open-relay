@@ -1,12 +1,12 @@
 //! Daemon-side record pipeline: sequencer core, appender loop and
 //! rolling-segment writer.
 //!
-//! Lifted from `session/journal/mod.rs`. The appender path
+//! Lifted from `session/journal/mod.rs`; the appender path
 //! (`DEFAULT_CACHE_BUDGET_BYTES`, `DEFAULT_QUEUE_CAPACITY`,
-//! `DEFAULT_QUEUE_BUDGET_BYTES`, `DEFAULT_SYNC_INTERVAL`, `SequencerCore`,
-//! `JournalAck`, `AppenderMsg`, `JournalAppender`, `JournalSubmitError`,
-//! `RollingSegmentWriter`, `appender_loop`) is byte-identical to the
-//! previous inline definitions.
+//! `DEFAULT_QUEUE_BUDGET_BYTES`, `DEFAULT_QUEUE_STALL_TIMEOUT`,
+//! `DEFAULT_SYNC_INTERVAL`, `SequencerCore`, `JournalAck`, `AppenderMsg`,
+//! `JournalAppender`, `JournalSubmitError`, `RollingSegmentWriter`,
+//! `appender_loop`) keeps the previous inline definitions' behaviour.
 
 use std::{
     io,
@@ -22,13 +22,25 @@ use super::{
 
 /// Default byte budget for a session's recent replay cache.
 pub const DEFAULT_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
-/// Default message bound for one session's journal queue.
+/// Default message bound for one session's journal queue. The queue is a
+/// staging buffer, not a failure boundary: a producer that finds it full
+/// waits for room instead of degrading a healthy session. See
+/// [`JournalAppender::try_submit`].
 pub const DEFAULT_QUEUE_CAPACITY: usize = 256;
-/// Default byte bound for one session's journal queue. A stalled appender
-/// can therefore hold at most this many bytes of session output before
-/// submission is rejected and the session degrades explicitly — memory
-/// cannot grow indefinitely.
+/// Default byte bound for one session's journal queue. Unlike the message
+/// bound this one *is* a hard boundary: it caps how much session output a
+/// stalled appender may hold before submission is rejected and the
+/// session degrades explicitly, so memory cannot grow indefinitely.
 pub const DEFAULT_QUEUE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// How long a producer waits for a free queue slot before treating the
+/// appender as wedged rather than merely busy.
+///
+/// The ingest path submits roughly one record per PTY read, which is
+/// thousands per second for chatty output, so a fixed queue depth buys
+/// only tens of milliseconds of slack — less than a single `fsync`
+/// against a busy disk. Waiting that out is backpressure; turning it
+/// into a failed session is what this deadline exists to prevent.
+pub const DEFAULT_QUEUE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Default group-sync cadence: the appender syncs at most this long after
 /// the last unsynced append, bounding the crash-loss window without
 /// per-record `fsync` latency on the ingest path (ADR-0002).
@@ -204,6 +216,34 @@ pub(crate) enum AppenderMsg {
     Shutdown,
 }
 
+/// Room-available signal between a producer that found the queue full and
+/// the appender thread that frees slots.
+///
+/// A waiting producer blocks on this rather than polling: timer
+/// granularity (about 15 ms on Windows) is slower than the disk being
+/// waited for, so polling would throttle ingest on the very path that
+/// exists to absorb a slow disk.
+#[derive(Default)]
+pub struct QueueSpace {
+    mutex: parking_lot::Mutex<()>,
+    condvar: parking_lot::Condvar,
+}
+
+impl QueueSpace {
+    /// Wake producers waiting for room, after a message is dequeued.
+    pub(crate) fn released(&self) {
+        let _guard = self.mutex.lock();
+        self.condvar.notify_all();
+    }
+
+    /// Wait for a release while holding the lock, so a release that
+    /// already happened cannot slip between the failed enqueue and the
+    /// wait and cost the waiter a full timeout.
+    fn wait(&self, guard: &mut parking_lot::MutexGuard<'_, ()>, timeout: std::time::Duration) {
+        self.condvar.wait_for(guard, timeout);
+    }
+}
+
 /// The journal appender: sole owner of the active [`SegmentWriter`],
 /// running on its own thread so sequencing and live publication never
 /// perform disk I/O. It validates contiguity, appends in assigned order,
@@ -213,6 +253,10 @@ pub struct JournalAppender {
     pub tx: std::sync::mpsc::SyncSender<AppenderMsg>,
     pub queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub queue_budget_bytes: usize,
+    /// Wakes a producer that found the queue full.
+    pub(crate) space: std::sync::Arc<QueueSpace>,
+    /// How long [`Self::try_submit`] waits for room before degrading.
+    pub(crate) stall_timeout: std::time::Duration,
     #[cfg(test)]
     pub worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -270,9 +314,20 @@ impl JournalAppender {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         let queued_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let worker_queued = std::sync::Arc::clone(&queued_bytes);
+        let space = std::sync::Arc::new(QueueSpace::default());
+        let worker_space = std::sync::Arc::clone(&space);
         let worker = std::thread::Builder::new()
             .name("journal-appender".to_string())
-            .spawn(move || appender_loop(writer, rx, ack_tx, worker_queued, sync_interval))?;
+            .spawn(move || {
+                appender_loop(
+                    writer,
+                    rx,
+                    ack_tx,
+                    worker_queued,
+                    worker_space,
+                    sync_interval,
+                )
+            })?;
         #[cfg(not(test))]
         drop(worker); // only tests join the worker (via shutdown)
         Ok((
@@ -280,6 +335,8 @@ impl JournalAppender {
                 tx,
                 queued_bytes,
                 queue_budget_bytes: DEFAULT_QUEUE_BUDGET_BYTES,
+                space,
+                stall_timeout: DEFAULT_QUEUE_STALL_TIMEOUT,
                 #[cfg(test)]
                 worker: std::sync::Mutex::new(Some(worker)),
             },
@@ -289,9 +346,16 @@ impl JournalAppender {
         ))
     }
 
-    /// Queue an already-sequenced event for append. Fails without
-    /// enqueueing when the queue is full or the byte budget is exhausted;
-    /// the caller must degrade/backpressure, never drop silently.
+    /// Queue an already-sequenced event for append.
+    ///
+    /// Fails without enqueueing when the byte budget is exhausted (the
+    /// hard memory boundary) or the appender is gone. A full message
+    /// queue is *not* a failure: the producer waits up to
+    /// [`DEFAULT_QUEUE_STALL_TIMEOUT`] for a slot and only then reports
+    /// [`JournalSubmitError::QueueFull`], so a momentary stall (an
+    /// `fsync`, or a competing session's I/O) slows the session instead
+    /// of failing it. Callers hold the session's sequencing lock, so the
+    /// wait is what backpressures the PTY reader.
     pub fn try_submit(&self, event: OrderedEvent) -> Result<(), JournalSubmitError> {
         use std::sync::atomic::Ordering;
         let len = event.payload.len();
@@ -300,15 +364,36 @@ impl JournalAppender {
             self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
             return Err(JournalSubmitError::QueueBudgetExhausted);
         }
-        match self.tx.try_send(AppenderMsg::Record(Box::new(event))) {
-            Ok(()) => Ok(()),
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
-                Err(JournalSubmitError::QueueFull)
-            }
+        let mut msg = AppenderMsg::Record(Box::new(event));
+        // Fast path: room available, so no signalling is involved.
+        match self.tx.try_send(msg) {
+            Ok(()) => return Ok(()),
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
-                Err(JournalSubmitError::AppenderDead)
+                return Err(JournalSubmitError::AppenderDead);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => msg = returned,
+        }
+        // Slow path: hold the lock across the remaining attempts so a
+        // release cannot be missed between an attempt and a wait.
+        let mut guard = self.space.mutex.lock();
+        let started = std::time::Instant::now();
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                    return Err(JournalSubmitError::AppenderDead);
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= self.stall_timeout {
+                        self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                        return Err(JournalSubmitError::QueueFull);
+                    }
+                    self.space.wait(&mut guard, self.stall_timeout - elapsed);
+                    msg = returned;
+                }
             }
         }
     }
@@ -335,7 +420,8 @@ impl JournalAppender {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalSubmitError {
-    /// Message bound reached.
+    /// No queue slot came free within the stall deadline: the appender is
+    /// wedged, not merely behind (see [`JournalAppender::try_submit`]).
     QueueFull,
     /// Byte bound reached — the appender is stalled or the session is
     /// producing faster than storage can absorb.
@@ -471,6 +557,7 @@ pub(crate) fn appender_loop(
     rx: std::sync::mpsc::Receiver<AppenderMsg>,
     ack_tx: std::sync::mpsc::Sender<JournalAck>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    space: std::sync::Arc<QueueSpace>,
     sync_interval: std::time::Duration,
 ) {
     use std::sync::atomic::Ordering;
@@ -533,6 +620,11 @@ pub(crate) fn appender_loop(
                 }
             }
         };
+        if msg.is_ok() {
+            // A dequeued message frees a slot: wake a producer waiting for
+            // room before the append below can stall on the disk.
+            space.released();
+        }
         match msg {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 break;

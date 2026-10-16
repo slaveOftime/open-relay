@@ -117,7 +117,7 @@ pub(crate) use open::{JournalCursor, OrderedEvent, RecoveryReport, open, sync_di
 pub(crate) mod appender;
 #[cfg(test)]
 pub(crate) use appender::{
-    AppenderMsg, DEFAULT_QUEUE_BUDGET_BYTES, RollingSegmentWriter, appender_loop,
+    AppenderMsg, DEFAULT_QUEUE_BUDGET_BYTES, QueueSpace, RollingSegmentWriter, appender_loop,
 };
 pub(crate) use appender::{
     DEFAULT_SYNC_INTERVAL, JournalAck, JournalAppender, JournalSubmitError, SequencerCore,
@@ -670,6 +670,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Stall deadline for the deterministic appenders below: long enough
+    /// that a test's own slow drain lands inside it, short enough that a
+    /// knowingly wedged queue fails fast.
+    const TEST_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
+
     /// Build an appender whose queue is never drained, so budget and
     /// capacity behaviour is deterministic.
     fn undrained_appender(capacity: usize, budget: usize) -> JournalAppender {
@@ -681,6 +686,8 @@ mod tests {
             tx,
             queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             queue_budget_bytes: budget,
+            space: std::sync::Arc::new(QueueSpace::default()),
+            stall_timeout: TEST_STALL_TIMEOUT,
             worker: std::sync::Mutex::new(None),
         }
     }
@@ -704,14 +711,79 @@ mod tests {
         );
     }
 
+    /// A queue that never drains is the one case that must still fail: a
+    /// full queue is backpressure only while the appender keeps making
+    /// progress.
     #[test]
-    fn queue_message_capacity_rejects_submission_without_dropping() {
+    fn wedged_appender_rejects_submission_after_stall_deadline() {
         let appender = undrained_appender(1, DEFAULT_QUEUE_BUDGET_BYTES);
         appender.try_submit(event(1, b"a")).unwrap();
+        let started = std::time::Instant::now();
         assert_eq!(
             appender.try_submit(event(2, b"b")),
             Err(JournalSubmitError::QueueFull)
         );
+        assert!(
+            started.elapsed() >= TEST_STALL_TIMEOUT,
+            "a full queue must be waited on before it counts as wedged"
+        );
+        // The rejected record is not enqueued: only the first one holds budget.
+        assert_eq!(
+            appender
+                .queued_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// The counterpart: while the appender is merely behind — the case a
+    /// fixed queue depth cannot distinguish from a wedged one — the
+    /// producer waits for room instead of failing the session, and every
+    /// record still arrives exactly once and in order.
+    #[test]
+    fn busy_appender_backpressures_instead_of_degrading() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        let space = std::sync::Arc::new(QueueSpace::default());
+        let appender = JournalAppender {
+            tx,
+            queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queue_budget_bytes: DEFAULT_QUEUE_BUDGET_BYTES,
+            space: std::sync::Arc::clone(&space),
+            stall_timeout: std::time::Duration::from_secs(30),
+            worker: std::sync::Mutex::new(None),
+        };
+        appender.try_submit(event(1, b"a")).unwrap();
+        appender.try_submit(event(2, b"b")).unwrap();
+
+        // Hold the queue full until the producer below is certainly
+        // waiting, then free one slot and signal it the way the appender
+        // loop does.
+        let drain = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let first = rx.recv().unwrap();
+            space.released();
+            let rest: Vec<_> = rx.into_iter().take(2).collect();
+            (first, rest)
+        });
+
+        let started = std::time::Instant::now();
+        appender
+            .try_submit(event(3, b"c"))
+            .expect("a busy appender must backpressure, not fail the session");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(50),
+            "submit returned without waiting for the released slot"
+        );
+
+        let (first, rest) = drain.join().unwrap();
+        let seqs = std::iter::once(first)
+            .chain(rest)
+            .map(|msg| match msg {
+                AppenderMsg::Record(event) => event.cursor.seq,
+                _ => panic!("unexpected appender message"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seqs, vec![1, 2, 3]);
     }
 
     #[test]
@@ -1842,12 +1914,14 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let (ack_tx, acks) = std::sync::mpsc::channel();
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let space = std::sync::Arc::new(QueueSpace::default());
         let worker = std::thread::spawn(move || {
             appender_loop(
                 writer,
                 rx,
                 ack_tx,
                 queued,
+                space,
                 std::time::Duration::from_millis(10),
             )
         });
@@ -1912,12 +1986,14 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let (ack_tx, acks) = std::sync::mpsc::channel();
         let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let space = std::sync::Arc::new(QueueSpace::default());
         let worker = std::thread::spawn(move || {
             appender_loop(
                 writer,
                 rx,
                 ack_tx,
                 queued,
+                space,
                 // Long cadence: only the shutdown barrier may sync.
                 std::time::Duration::from_secs(3600),
             )
