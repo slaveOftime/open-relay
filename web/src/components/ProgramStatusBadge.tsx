@@ -32,7 +32,7 @@ export default function ProgramStatusBadge({ report }: { report: ProgramStatus }
   return (
     <Badge
       variant={variants[report.state]}
-      className="max-w-full rounded-md px-2 whitespace-normal [overflow-wrap:anywhere] text-xs font-medium leading-4 tabular-nums"
+      className="max-w-full rounded-md px-2 whitespace-normal text-xs font-medium leading-4 tabular-nums"
       title={`Agent-reported (OSC 7501)${detail ? `: ${detail}` : ''}`}
     >
       {label}

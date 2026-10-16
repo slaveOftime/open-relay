@@ -580,7 +580,7 @@ const XTerm = forwardRef<XTermHandle, Props>(function XTerm(
           onContextMenu={(event) => event.preventDefault()}
           className={cn(
             'relative flex h-12 w-12 touch-none select-none items-center justify-center rounded-full border border-[hsl(var(--border))] bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] shadow-lg transition-opacity md:hidden',
-            scrollDragActive ? 'opacity-90' : 'opacity-80',
+            scrollDragActive ? 'opacity-90' : 'opacity-70',
             // The arm cue: the hold elapsed, so the next move is a reposition.
             reposition.armed && 'ring-2 ring-[hsl(var(--primary))]'
           )}

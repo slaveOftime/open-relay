@@ -305,7 +305,7 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
           // placement counted, `MENU_GAP_PX`).
           style={{ ...popStyle, right: placement.right }}
           className={cn(
-            'absolute z-40 w-60 rounded-lg',
+            'absolute z-40 w-60 rounded-lg mr-4',
             placement.vertical === 'below'
               ? 'top-full mt-2 origin-top-right'
               : 'bottom-full mb-2 origin-bottom-right',
