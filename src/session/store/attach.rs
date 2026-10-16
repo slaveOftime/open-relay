@@ -20,8 +20,8 @@ use crate::session::{
 
 use super::super::{SessionError, journal, replay};
 use super::{
-    ATTACH_INPUT_OUTPUT_POLL_INTERVAL, ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT, SessionHandle,
-    SessionStore,
+    ATTACH_INPUT_OUTPUT_POLL_INTERVAL, ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT,
+    PERSISTED_STREAM_LEN_CACHE_ENTRIES, SessionHandle, SessionStore,
 };
 
 impl SessionStore {
@@ -228,36 +228,52 @@ impl SessionStore {
     /// callers (`logs --after`) must not re-scan the whole journal every tick.
     pub(super) async fn persisted_filtered_len(&self, id: &str) -> Option<u64> {
         let dir = self.persisted_session_dir(id).await?;
-        if dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
-            let incarnation = journal::list_incarnations(&dir.join(journal::JOURNAL_DIR_NAME))
-                .ok()?
-                .last()
-                .copied()?;
-            {
-                let state = self.mutable.lock().await;
-                if let Some(&(cached_incarnation, len)) = state.persisted_stream_len_cache.get(id)
-                    && cached_incarnation == incarnation
-                {
-                    return Some(len);
-                }
-            }
-            let scan_dir = dir.clone();
-            let len = tokio::task::spawn_blocking(move || replay::filtered_stream_len(&scan_dir))
-                .await
-                .ok()?
-                .ok()?;
-            let mut state = self.mutable.lock().await;
-            // Completed sessions accumulate; bound the cache.
-            if state.persisted_stream_len_cache.len() >= 1024 {
-                state.persisted_stream_len_cache.clear();
-            }
-            state
-                .persisted_stream_len_cache
-                .insert(id.to_string(), (incarnation, len));
-            Some(len)
-        } else {
-            None
+        self.persisted_filtered_len_in(&dir, id).await
+    }
+
+    /// [`persisted_filtered_len`](Self::persisted_filtered_len) for callers
+    /// that already hold the session row (a list result): row existence is
+    /// established, so skip the per-id `session_exists` round trip and probe
+    /// the session directory directly. Listing thousands of offline rows
+    /// made that redundant query the dominant per-row cost (PERFORMANCE.md).
+    pub(super) async fn persisted_filtered_len_known(&self, id: &str) -> Option<u64> {
+        let dir = self.db.session_dir_by_id(id);
+        self.persisted_filtered_len_in(&dir, id).await
+    }
+
+    /// Shared body of the two entry points above; no existence checks.
+    async fn persisted_filtered_len_in(&self, dir: &Path, id: &str) -> Option<u64> {
+        if !dir.join(journal::JOURNAL_DIR_NAME).is_dir() {
+            return None;
         }
+        let incarnation = journal::list_incarnations(&dir.join(journal::JOURNAL_DIR_NAME))
+            .ok()?
+            .last()
+            .copied()?;
+        {
+            let state = self.mutable.lock().await;
+            if let Some(&(cached_incarnation, len)) = state.persisted_stream_len_cache.get(id)
+                && cached_incarnation == incarnation
+            {
+                return Some(len);
+            }
+        }
+        let scan_dir = dir.to_path_buf();
+        let len = tokio::task::spawn_blocking(move || replay::filtered_stream_len(&scan_dir))
+            .await
+            .ok()?
+            .ok()?;
+        let mut state = self.mutable.lock().await;
+        // Completed sessions accumulate; bound the cache. Insertion order is
+        // list order, so the bound must exceed the offline working set — see
+        // `PERSISTED_STREAM_LEN_CACHE_ENTRIES`.
+        if state.persisted_stream_len_cache.len() >= PERSISTED_STREAM_LEN_CACHE_ENTRIES {
+            state.persisted_stream_len_cache.clear();
+        }
+        state
+            .persisted_stream_len_cache
+            .insert(id.to_string(), (incarnation, len));
+        Some(len)
     }
 
     pub async fn attach_snapshot_init(

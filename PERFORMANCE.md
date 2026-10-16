@@ -109,6 +109,76 @@ state to consult.
 
 **Numbers.** 110–147 ms → p50 1.9 ms daemon-side (table above).
 
+## Session list at scale (added 2026-10-16)
+
+Windows 11, x86_64 dev host, release build (`opt-level = "z"`, fat LTO),
+isolated `OLY_STATE_DIR` seeded with 5000 synthetic offline sessions and no
+journals (worst case for the list path: every row is persisted-only).
+Daemon numbers come from `OLY_TIMING=1 oly ls --limit 5000` and
+`GET /api/metrics`; client numbers from the ignored probes in
+`src/client/list_tui/perf_tests.rs`:
+
+```text
+cargo test --release --bin oly perf_ -- --ignored --nocapture
+```
+
+| Path | Before | After | Notes |
+|---|---|---|---|
+| `oly ls --limit 5000` list RPC (daemon-side) | **~790 ms** | **~205 ms** (4 runs: 204–240 ms) | `ipc: response (list)`; the redundant per-row `session_exists` query left the path |
+| TUI refresh (`replace_sessions`, warm) | 75.6 ms | **29.7 ms** | quiet dashboard, list mode |
+| TUI refresh (`apply_refresh`, warm) | 73.9 ms | **27.6 ms** | |
+| TUI list frame (140×40) | 38.5 ms | **1.9 ms** | middle-of-list selection 36.8 → 2.0 ms |
+| TUI filter keystroke | 24 ms | **9.0 ms** | each keystroke re-filters and rebuilds the tree |
+| TUI tree frame (140×40) | 1.8 ms | **0.8 ms** | |
+| Ctrl+G list↔tree toggle | 51.5 ms | **18.5 ms** | dominated by the tree rebuild |
+| tree `build_tree_nodes` | 49.2 ms | **19.4 ms** | hottest remaining client phase; path compares no longer allocate per component |
+| list-path `session_exists` × 5000 | 438 ms (88 µs/op) | not called | release probe; kept as evidence for the root cause |
+
+### 2. `oly ls -f` with thousands of sessions (2026-10-16) — fixed
+
+**Symptom.** `oly ls -f --node-all --limit 5000` felt sluggish with a few
+thousand sessions: keystrokes lagged and the dashboard's refresh tick
+overran, with the daemon's `list` RPC accounting for most of the time.
+
+**Root causes.**
+
+- **Daemon.** `SessionStore::list_summaries` filled each offline row's
+  OUTPUT via `persisted_filtered_len`, which starts with a `session_exists`
+  SQL round trip. The rows came *from* the sessions table, so the check was
+  redundant at ~88 µs per row (~440 ms at 5000 rows).
+- **Daemon.** `persisted_stream_len_cache` was capped at 1024 entries and
+  cleared wholesale when full, so any list touching more than 1024 offline
+  sessions re-decoded journals (or re-probed them) on every refresh.
+- **Client.** Each 250 ms refresh rebuilt a lowercased search string for
+  every session even with no filter and built attach bookkeeping even with
+  nothing open; the tree sort re-lowercased labels inside the comparator,
+  and every tree path comparison allocated normalized strings.
+- **Client.** Every frame built a `Row` (with truncated cells and spans) for
+  all 5000 sessions, looked up each row's rate through a freshly formatted
+  key string, and rescanned every session for column maxima and aggregate
+  throughput.
+
+**Fix.**
+
+- `list_summaries` uses `persisted_filtered_len_known` — same per-incarnation
+  cache, no existence query — and the cache bound moved to
+  `PERSISTED_STREAM_LEN_CACHE_ENTRIES = 20_000` so a large list stays cached
+  between refreshes.
+- The TUI keeps one parallel `keys: Vec<String>` per list and one lazily
+  built `search_text` index (only while filtering), caches the layout's
+  column maxima (invalidated when the session set changes), builds table
+  rows only for the viewport slice with the selection expressed relative to
+  it, and sums rate values directly for the throughput header.
+- Tree path comparisons (`path_eq_ci`, `path_starts_with_ci`, …) compare OS
+  strings case-insensitively without allocating on the ASCII fast path
+  (falling back to the original normalize + Unicode lowercase semantics),
+  each session's tree path is computed once per rebuild, and tree sort
+  labels are lowercased once instead of once per comparison.
+
+**Numbers.** See the table above: the list RPC is ~4× faster and a
+list-mode frame ~20× faster on the same 5000-session set. The probes and
+the seeding recipe stay available for reruns.
+
 ## Update pipeline (added 2026-10-02)
 
 Activity is produced by **one** `ActivitySampler` per daemon, ticked at
@@ -138,6 +208,14 @@ logs; dedicated metric counters and latency histograms are not implemented.
 
 ## Backlog (measure before optimizing)
 
+- **TUI tree rebuild on every refresh** (2026-10-16): even a list-mode
+  refresh rebuilds the folder tree (~19 ms at 5000 sessions). Skipping
+  rebuilds whose tree inputs (filters plus each session's tree-visible
+  fields) are unchanged would cut quiet-tick cost; the daemon list RPC
+  (~205 ms for 5000 offline rows) is still the larger per-tick cost.
+- **Daemon list at scale** (2026-10-16): `list_summaries` is still ~40 µs
+  per offline row (SQL row build + per-row journal-dir probe). Batching or
+  parallelizing the offline-row fill is the next candidate.
 - **Daemon-down fallback list** (`client/list.rs` → `db.list_summaries`)
   still decodes every journal inline; the rare path is O(total output).
   Same lazy-offset pattern would fix it.

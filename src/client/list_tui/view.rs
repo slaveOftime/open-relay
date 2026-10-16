@@ -18,8 +18,8 @@ use super::dialog_render::{
 };
 use super::effects::render_effects;
 use super::table::{
-    LayoutMode, aggregate_sparkline_data, format_bytes, rate_color, session_row,
-    session_table_columns, session_table_header, truncate,
+    LayoutMode, aggregate_sparkline_data, column_maxima, format_bytes, rate_color, session_row,
+    session_table_columns_with_maxima, session_table_header, truncate,
 };
 use super::tree::ViewMode;
 use super::tree_render::render_tree;
@@ -40,10 +40,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         .iter()
         .filter(|item| item.status == "running")
         .count();
+    // Rates are keyed by session and pruned with the session list in
+    // `replace_sessions`, so the aggregate can iterate values directly
+    // instead of deriving one key string per session per frame.
     let throughput = app
-        .sessions
-        .iter()
-        .filter_map(|session| app.rates.get(&session_key(session)))
+        .rates
+        .values()
         .map(|rate| rate.display_rate(now))
         .sum::<f64>();
     let throughput_width = if area.width >= 80 { 14 } else { 7 };
@@ -177,6 +179,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         let viewport_start = selected_position
             .saturating_sub(viewport_len / 2)
             .min(visible.len().saturating_sub(viewport_len));
+        let viewport_end = (viewport_start + viewport_len).min(visible.len());
         let show_scrollbar = visible.len() > viewport_len;
         let table_area = if show_scrollbar {
             Rect {
@@ -186,20 +189,38 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         } else {
             chunks[1]
         };
-        let columns = session_table_columns(mode, app.show_node, table_area.width, &app.sessions);
-        let rows = visible.iter().enumerate().filter_map(|(position, index)| {
-            app.sessions.get(*index).map(|session| {
-                session_row(
+        if !app.column_maxima_valid {
+            let (node_max, title_max) = column_maxima(&app.sessions);
+            app.node_column_max = node_max;
+            app.title_column_max = title_max;
+            app.column_maxima_valid = true;
+        }
+        let columns = session_table_columns_with_maxima(
+            mode,
+            app.show_node,
+            table_area.width,
+            app.node_column_max,
+            app.title_column_max,
+        );
+        // Rows are built only for the viewport slice; the table then renders
+        // the slice's own window and the selection is expressed relative to
+        // it. Building a `Row` for every one of thousands of sessions was the
+        // dominant cost of a list-mode frame.
+        let rows = visible[viewport_start..viewport_end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, index)| {
+                let session = app.sessions.get(*index)?;
+                Some(session_row(
                     session,
-                    app.rates.get(&session_key(session)),
+                    app.rate_for(*index, session),
                     mode,
                     now,
                     app.show_node,
-                    position == selected_position,
+                    viewport_start + offset == selected_position,
                     &columns,
-                )
-            })
-        });
+                ))
+            });
         // Cell styling preserves semantic status colours on the selection band.
         // One marker cell also makes headers line up exactly with their rows.
         let table = Table::new(rows, columns.iter().copied().map(Constraint::Length))
@@ -207,8 +228,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
             .column_spacing(1)
             .highlight_symbol("▸");
         let mut state = TableState::new()
-            .with_offset(viewport_start)
-            .with_selected(Some(selected_position));
+            .with_offset(0)
+            .with_selected(Some(selected_position.saturating_sub(viewport_start)));
         frame.render_stateful_widget(table, table_area, &mut state);
 
         // Record where each waiting session's row actually landed (one line
@@ -216,29 +237,24 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App) {
         // pulse can be scoped to exactly those rows. A session with
         // notifications disabled never pulses, even while it waits for
         // input: the animation is an attention signal, and the user opted
-        // out of attention signals for that session.
-        for (position, index) in visible.iter().enumerate() {
-            let Some(session) = app.sessions.get(*index) else {
+        // out of attention signals for that session. Only viewport rows can
+        // land on screen, so only they need rects.
+        for offset in 0..viewport_end - viewport_start {
+            let Some(session) = app.sessions.get(visible[viewport_start + offset]) else {
                 continue;
             };
             if !session.input_needed || !session.notifications_enabled {
-                continue;
-            }
-            let Some(row_offset) = position.checked_sub(viewport_start) else {
-                continue;
-            };
-            if row_offset >= viewport_len {
                 continue;
             }
             attention_row_rects.push((
                 session_key(session),
                 Rect {
                     x: table_area.x,
-                    y: table_area.y + 1 + row_offset as u16,
+                    y: table_area.y + 1 + offset as u16,
                     width: 3,
                     height: 1,
                 },
-                position == selected_position,
+                viewport_start + offset == selected_position,
             ));
         }
 

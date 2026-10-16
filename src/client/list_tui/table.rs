@@ -82,22 +82,54 @@ pub fn session_table_widths(mode: LayoutMode, show_node: bool) -> Vec<Constraint
     widths
 }
 
+/// Node-name and title width maxima across the session list. Layout needs
+/// them on every frame; scanning every title per frame measured as a large
+/// share of rendering a 5000-row list, so the app caches these and only
+/// recomputes them when the session set changes.
+pub fn column_maxima(sessions: &[SessionSummary]) -> (usize, usize) {
+    let node_max = sessions
+        .iter()
+        .map(|session| UnicodeWidthStr::width(session.node.as_deref().unwrap_or("local")))
+        .max()
+        .unwrap_or(0);
+    let title_max = sessions
+        .iter()
+        .map(|session| {
+            UnicodeWidthStr::width(session_title(session).as_str())
+                + session_program_status_span(session).map_or(0, |span| span.width() + 1)
+        })
+        .max()
+        .unwrap_or(0);
+    (node_max, title_max)
+}
+
 /// Resolve once for both ellipsis truncation and table rendering. A single
-/// selection-marker cell keeps header and row origins identical.
+/// selection-marker cell keeps header and row origins identical. Kept as the
+/// test-facing convenience entry point; the render path passes cached maxima
+/// to [`session_table_columns_with_maxima`].
+#[allow(dead_code)]
 pub fn session_table_columns(
     mode: LayoutMode,
     show_node: bool,
     width: u16,
     sessions: &[SessionSummary],
 ) -> Vec<u16> {
+    let (node_max, title_max) = column_maxima(sessions);
+    session_table_columns_with_maxima(mode, show_node, width, node_max, title_max)
+}
+
+/// `session_table_columns` with precomputed [`column_maxima`], so the render
+/// path does not rescan every session on every frame.
+pub fn session_table_columns_with_maxima(
+    mode: LayoutMode,
+    show_node: bool,
+    width: u16,
+    node_max: usize,
+    title_max: usize,
+) -> Vec<u16> {
     let mut constraints = session_table_widths(mode, show_node);
     if show_node {
-        let node_width = sessions
-            .iter()
-            .map(|session| UnicodeWidthStr::width(session.node.as_deref().unwrap_or("local")))
-            .max()
-            .unwrap_or(5)
-            .clamp(5, 12);
+        let node_width = node_max.clamp(5, 12);
         // At small widths the title wins over a long machine name.
         let node_limit = match mode {
             LayoutMode::Minimal => 3,
@@ -107,15 +139,7 @@ pub fn session_table_columns(
         constraints[1] = Constraint::Length(node_width.min(node_limit) as u16);
     }
     if mode == LayoutMode::Wide {
-        let title_width = sessions
-            .iter()
-            .map(|session| {
-                UnicodeWidthStr::width(session_title(session).as_str())
-                    + session_program_status_span(session).map_or(0, |span| span.width() + 1)
-            })
-            .max()
-            .unwrap_or(18)
-            .clamp(18, 28);
+        let title_width = title_max.clamp(18, 28);
         constraints[1 + usize::from(show_node)] = Constraint::Length(title_width as u16);
     }
     Layout::horizontal(constraints)

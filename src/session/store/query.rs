@@ -97,16 +97,19 @@ impl SessionStore {
         // in SQL. A live session's whole summary comes from its runtime
         // handle (O(1) counters); only rows without a live handle consult
         // the persisted stream, through the per-incarnation cache in
-        // `persisted_filtered_len`. Decoding journals inline per row made
-        // every list operation O(total journal bytes) — the source of the
-        // "oly ls is mysteriously slow" reports (see PERFORMANCE.md).
+        // `persisted_filtered_len_known` (the rows already came from the
+        // sessions table, so the known-exists variant skips a redundant
+        // `session_exists` round trip per row). Decoding journals inline
+        // per row made every list operation O(total journal bytes) — the
+        // source of the "oly ls is mysteriously slow" reports (see
+        // PERFORMANCE.md).
         let mut sessions = self.db.list_summaries_without_offsets(query).await?;
 
         let live_sessions = self.sessions.load();
         for session in &mut sessions {
             if let Some(handle) = live_sessions.get(&session.id) {
                 *session = handle.read().to_summary();
-            } else if let Some(len) = self.persisted_filtered_len(&session.id).await {
+            } else if let Some(len) = self.persisted_filtered_len_known(&session.id).await {
                 session.last_total_bytes = len;
             }
         }
@@ -492,6 +495,59 @@ mod tests {
         assert_eq!(info.exit_code, Some(9));
         assert!(info.journal_incarnation.is_some());
         assert_eq!(info.session_dir, dir.to_string_lossy());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_summaries_fills_offline_output_from_the_persisted_journal() {
+        let db = make_test_db().await;
+        let mut meta = make_runtime("list-persisted", SessionStatus::Stopped, "", None)
+            .read()
+            .meta
+            .clone();
+        meta.id = format!("list-{}", uuid::Uuid::new_v4());
+        db.insert_session(&meta).await.unwrap();
+        let dir = db.session_dir_by_id(&meta.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_journal_output(&dir, b"saved output\n");
+        // A second, journal-less row keeps the missing-directory path honest.
+        let mut bare = meta.clone();
+        bare.id = format!("bare-{}", uuid::Uuid::new_v4());
+        db.insert_session(&bare).await.unwrap();
+
+        let store = store_with(vec![], db);
+        let query = crate::protocol::ListQuery {
+            search: None,
+            tags: vec![],
+            statuses: vec![],
+            since: None,
+            until: None,
+            limit: 10,
+            offset: 0,
+            sort: Default::default(),
+            order: Default::default(),
+        };
+        let sessions = store.list_summaries(&query).await.unwrap();
+        let bytes_for = |id: &str| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .expect("listed session")
+                .last_total_bytes
+        };
+        assert_eq!(bytes_for(&meta.id), 13);
+        assert_eq!(bytes_for(&bare.id), 0);
+
+        // Repeat lists are served by the incarnation cache.
+        let again = store.list_summaries(&query).await.unwrap();
+        assert_eq!(
+            again
+                .iter()
+                .find(|session| session.id == meta.id)
+                .expect("listed session")
+                .last_total_bytes,
+            13
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

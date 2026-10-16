@@ -117,21 +117,36 @@ fn component_key(component: std::path::Component<'_>) -> String {
         .to_lowercase()
 }
 
-fn components_lower(path: &Path) -> Vec<String> {
-    path.components().map(component_key).collect()
+/// Case-insensitive component equality. The fast path compares the OS strings
+/// directly, which covers the usual ASCII path spellings without allocating;
+/// the fallback preserves the original normalize + Unicode-lowercase
+/// semantics (cross-separator spellings, non-ASCII case folding).
+fn component_eq_ci(a: std::path::Component<'_>, b: std::path::Component<'_>) -> bool {
+    match (a.as_os_str().to_str(), b.as_os_str().to_str()) {
+        (Some(a), Some(b)) if a.eq_ignore_ascii_case(b) => true,
+        _ => component_key(a) == component_key(b),
+    }
 }
 
 /// Component-wise equality that ignores case, so `C:/Foo` and `c:/foo`
 /// bucket into one folder. The first spelling seen keeps the display name.
 pub fn path_eq_ci(a: &Path, b: &Path) -> bool {
-    components_lower(a) == components_lower(b)
+    let mut a_components = a.components();
+    let mut b_components = b.components();
+    loop {
+        match (a_components.next(), b_components.next()) {
+            (None, None) => return true,
+            (Some(a), Some(b)) if component_eq_ci(a, b) => {}
+            _ => return false,
+        }
+    }
 }
 
 pub fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
     let mut components = path.components();
     for prefix_component in prefix.components() {
         match components.next() {
-            Some(component) if component_key(component) == component_key(prefix_component) => {}
+            Some(component) if component_eq_ci(component, prefix_component) => {}
             _ => return false,
         }
     }
@@ -139,10 +154,13 @@ pub fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
 }
 
 pub fn path_ends_with_ci(path: &Path, suffix: &Path) -> bool {
-    let components = components_lower(path);
-    let suffix_components = components_lower(suffix);
-    suffix_components.len() <= components.len()
-        && components[components.len() - suffix_components.len()..] == suffix_components[..]
+    let path_components: Vec<_> = path.components().collect();
+    let suffix_components: Vec<_> = suffix.components().collect();
+    suffix_components.len() <= path_components.len()
+        && path_components[path_components.len() - suffix_components.len()..]
+            .iter()
+            .zip(&suffix_components)
+            .all(|(a, b)| component_eq_ci(*a, *b))
 }
 
 /// Case-insensitive `Path::strip_prefix`; the remainder keeps the original
@@ -154,7 +172,7 @@ pub fn path_strip_prefix_ci(path: &Path, prefix: &Path) -> Option<PathBuf> {
         return None;
     }
     for (path_component, prefix_component) in path_components.iter().zip(&prefix_components) {
-        if component_key(*path_component) != component_key(*prefix_component) {
+        if !component_eq_ci(*path_component, *prefix_component) {
             return None;
         }
     }
@@ -168,22 +186,23 @@ pub fn path_strip_prefix_ci(path: &Path, prefix: &Path) -> Option<PathBuf> {
 /// Stable expansion key distinguishes a grouped node root from the synthetic
 /// root, which share the same empty path.
 pub type TreeFolderKey = (Option<String>, PathBuf, bool);
-pub fn common_path_prefix(paths: &[PathBuf]) -> PathBuf {
+pub fn common_path_prefix<T: AsRef<Path>>(paths: &[T]) -> PathBuf {
     if paths.is_empty() {
         return Path::new("/").to_path_buf();
     }
     if paths.len() == 1 {
         return paths[0]
+            .as_ref()
             .ancestors()
             .find(|ancestor| ancestor.has_root() && ancestor.parent().is_none())
             .unwrap_or_else(|| Path::new("/"))
             .to_path_buf();
     }
     let mut iter = paths.iter();
-    let first = iter.next().expect("non-empty").clone();
-    let mut prefix = first.clone();
+    let first = iter.next().expect("non-empty");
+    let mut prefix = first.as_ref().to_path_buf();
     for candidate in iter {
-        while !path_starts_with_ci(candidate, &prefix) {
+        while !path_starts_with_ci(candidate.as_ref(), &prefix) {
             if !prefix.pop() {
                 return Path::new("/").to_path_buf();
             }

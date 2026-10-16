@@ -3902,6 +3902,60 @@ fn rebuild_visible_repairs_stale_search_index() {
 }
 
 #[test]
+fn search_index_is_only_built_while_filtering() {
+    let mut app = App::default();
+    app.replace_sessions(vec![session("alpha"), session("bravo")]);
+    assert!(
+        app.search_text.is_empty(),
+        "an unfiltered list must not measure every session's search text"
+    );
+
+    // Typing a filter builds the index and filters against it.
+    app.push_filter('b');
+    assert_eq!(app.search_text.len(), app.sessions.len());
+    assert_eq!(app.visible, vec![1]);
+
+    // Replacing the list while filtering keeps the index aligned.
+    app.replace_sessions(vec![session("bravo"), session("charlie")]);
+    assert_eq!(app.search_text.len(), app.sessions.len());
+    assert_eq!(app.visible, vec![0]);
+
+    // Clearing the filter drops the index again on the next list change.
+    app.clear_filter();
+    app.replace_sessions(vec![session("charlie")]);
+    assert!(app.search_text.is_empty());
+    assert_eq!(app.visible, vec![0]);
+}
+
+#[test]
+fn column_maxima_are_cached_and_invalidated_with_the_session_set() {
+    let mut app = App::default();
+    let mut item = session("ident42");
+    item.title = Some("A long descriptive session title".into());
+    item.node = Some("worker-with-a-long-name".into());
+    app.replace_sessions(vec![item]);
+    assert!(!app.column_maxima_valid, "a new list must recompute maxima");
+
+    let (node_max, title_max) = super::column_maxima(&app.sessions);
+    let rendered = render_app(&mut app, 120, 8);
+
+    assert!(rendered.contains("SESSION"));
+    assert!(app.column_maxima_valid);
+    assert_eq!(app.node_column_max, node_max);
+    assert_eq!(app.title_column_max, title_max);
+
+    // An updated summary can resize columns; the next render must recompute.
+    let mut updated = app.sessions[0].clone();
+    updated.title = Some("short".into());
+    app.apply_updated_summary(updated);
+    assert!(!app.column_maxima_valid);
+
+    let rendered = render_app(&mut app, 120, 8);
+    assert!(rendered.contains("short"));
+    assert_eq!(app.title_column_max, super::column_maxima(&app.sessions).1);
+}
+
+#[test]
 fn rate_state_tolerates_a_future_sample_instant() {
     let summary = session("a");
     let now = std::time::Instant::now();
