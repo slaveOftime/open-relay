@@ -5,7 +5,7 @@
 ## Browser access
 
 `oly daemon start --detach` serves the web UI and HTTP API on
-**http://127.0.0.1:15443** by default, protected by a password set at startup.
+**http://127.0.0.1:15443** by default, protected by a startup password.
 
 ```sh
 oly daemon status                  # effective endpoint, auth mode, and paths
@@ -13,66 +13,46 @@ oly daemon start --detach --port 17000
 oly daemon start --detach --no-http # CLI-only daemon
 ```
 
-These start variants are alternatives, not ways to reconfigure an already
-running daemon. Listener bind/port changes require a restart, which stops its
-live sessions. See the [daemon skill](../../skills/oly-daemon/SKILL.md) for config
-precedence and hot reload.
-
-The UI groups sessions by working directory and shows live status, output size,
-and activity; the detail page embeds the terminal with text input, quick keys,
-and file upload.
+Listener bind/port flags apply at startup only; changing them requires a daemon
+restart (which ends live sessions). See the [daemon skill](../../skills/oly-daemon/SKILL.md)
+for `config.json` precedence and hot reload.
 
 ![The session list, grouped by working directory, with live status and activity charts](../../assets/oly-web-sessions-page.png)
 
 ![Session detail: live terminal, text input, quick keys, and file upload](../../assets/oly-web-detail-page.png)
 
-The same UI installs as a PWA, with a mobile key bar for keys a soft keyboard
-cannot send.
+The web UI installs as a PWA on mobile devices (requires a secure context: `https://` or `localhost`) and includes a touch key bar.
 
 | Sessions on a phone | Detail on a phone |
 |---|---|
 | [![Mobile session list](../../assets/oly-web-sessions-page-mobile.png)](../../assets/oly-web-sessions-page-mobile.png) | [![Mobile session detail with the key bar](../../assets/oly-web-detail-page-mobile.png)](../../assets/oly-web-detail-page-mobile.png) |
 
-Keep HTTP on loopback. For access from a phone or another machine, prefer:
+Keep HTTP bound to loopback. For remote or phone access, place `oly` behind an authenticated tunnel or reverse proxy with TLS:
 
 ```text
-browser → authenticated gateway / trusted tunnel → local oly HTTP service
+browser → authenticated gateway / trusted tunnel (SSH, Tailscale, Cloudflare Access) → 127.0.0.1:15443
 ```
 
-Examples include SSH tunnels, Tailscale/Headscale, Cloudflare Access, or a
-reverse proxy with strong authentication and TLS. `--bind 0.0.0.0` exposes the
-listener beyond loopback; it does not add TLS or a sandbox. `--no-auth` disables
-browser/HTTP password authentication and should only be used behind protection
-you control. An authenticated operator can run commands as the daemon user;
-view-only attach is coordination, not a restricted account.
+`--bind 0.0.0.0` exposes the listener without TLS or sandboxing. `--no-auth` disables HTTP password checks and should only be used behind an authenticating proxy. Authenticated operators can execute commands as the daemon OS user.
 
 ## Connect machines
 
-Federation is a supported 0.5 interface. Read the
-[compatibility policy](../releases/compatibility-0.5.md#node-federation) before
-deployment: it has **no forward secrecy** and, in 0.5.x, no primary-side identity
-removal.
+Node federation lets a **primary** daemon route commands and streams to connected **secondary** daemons. Each owning daemon retains authority over its processes, journal, and attach roles. Run matching `oly` versions across all nodes; read the [compatibility policy](../releases/compatibility-0.5.md#node-federation) before deploying.
 
-A **primary** routes commands to connected **secondary** daemons. Each owning
-daemon keeps authority over its processes, journal, attach roles, and credits.
-Run compatible versions on all nodes; mixed-version rollout is unsupported.
-
-Each daemon generates a private 32-byte Ed25519 seed at `<state>/identity_key`
-and publishes `<state>/identity_key.pub`. Exchange and verify **public**
-identities through an independent trusted channel. Never share the private seed.
+Each daemon generates a private Ed25519 seed (`<state>/identity_key`) and public identity (`<state>/identity_key.pub`, shown in `oly daemon status` as `ID-PUB-KEY`). Verify public identities out of band and never share `identity_key`.
 
 ```sh
-# On each machine: read the ID-PUB-KEY line.
+# 1. On each machine: inspect ID-PUB-KEY
 oly daemon status
 
-# On the primary: bind the exact secondary name to its public identity.
+# 2. On the primary: authorize the secondary's name and public key
 oly node accept --name worker-1 --id-pub-key "<secondary public identity>"
 
-# On the secondary: pin the independently verified primary identity.
+# 3. On the secondary: connect and pin the primary's public key
 oly join start --name worker-1 --id-pub-key "<primary public identity>" \
   http://primary-host:15443
 
-# On the primary: inspect and use the connected worker.
+# 4. On the primary: target the connected node with --node
 oly node ls
 oly start --node worker-1 --detach --title "nightly task" claude
 oly ls --node worker-1
@@ -83,74 +63,19 @@ oly attach <id> --node worker-1
 oly stop <id> --node worker-1
 ```
 
-`oly join ls` lists saved outbound joins; `oly join ls --primary` queries the
-local daemon's active primary-side connector inventory. `oly join stop --name
-worker-1` disconnects and removes the saved join. Connectors retry with backoff.
+`oly join ls` lists saved outbound joins on a secondary (`oly join ls --primary` inspects active connector inventory). `oly join stop --name worker-1` disconnects and removes the saved join.
 
-### Trust and encryption
+### Trust, encryption, and rotation
 
-Transport is **WebSocket, not SSH**. Only canonical
-`ed25519 <standard-base64(raw32)>` public identities are accepted. There is no
-SSH-agent integration, OpenSSH import, TOFU, key-discovery endpoint, or shared
-API-key fallback. One identity belongs to one registered name per primary.
-
-Federation v2 binds version, roles, name, both identities, and fresh nonces
-in a signed transcript. Encrypted KeyConfirm/Ready/Joined messages complete
-mutual confirmation before registration or application RPCs. The configured
-pin and accept table are trust anchors; challenges do not replace them.
-
-Static-static X25519 DH derived from the identities feeds HKDF-SHA-256;
-AES-256-GCM seals application frames and keepalives with ordered sequences.
-There is **no forward secrecy**: later private-seed compromise can expose
-recorded federation traffic. Use trusted transport infrastructure too.
-Federation identity checks and encryption remain required with HTTP `--no-auth`.
-See [Architecture](../../ARCHITECTURE.md#node-federation) for protocol details.
-
-### Rotate and decommission
-
-Re-accept a name to replace its identity, after verifying the new public key
-independently. The previous key then fails the next join.
-
-```sh
-# On the primary: rotate the pinned identity for one registered name.
-oly node accept --name worker-1 --id-pub-key "<replacement public identity>"
-
-# On the secondary: disconnect and delete the saved join, then rejoin.
-oly join stop --name worker-1
-oly join start --name worker-1 --id-pub-key "<primary public identity>" \
-  http://primary-host:15443
-```
-
-An already-connected node is **not** disconnected by a rotation, so restart the
-connector to force re-verification. 0.5.x has **no primary-side removal
-command**, and one identity stays bound to one name, so a retired machine's key
-cannot be reused under a different name — generate a new identity on the
-replacement machine instead. For a leaked seed, block the transport path:
-rotating the pin does not eject a connected peer. See
-[Node federation](../releases/compatibility-0.5.md#node-federation).
+- **Transport:** WebSocket (not SSH) using canonical `ed25519 <base64>` identities. No TOFU, SSH-agent, or API-key fallback.
+- **Encryption:** Signed Federation v2 handshake with mutual `KeyConfirm`/`Ready` messages, followed by AES-256-GCM frame encryption derived via static-static X25519 + HKDF-SHA-256. **No forward secrecy** — run federation over a trusted network or tunnel. See [Architecture](../../ARCHITECTURE.md#node-federation).
+- **Key rotation & decommission:** Re-run `oly node accept --name worker-1 --id-pub-key "<new-key>"` on the primary, then restart the secondary connector (`oly join stop` + `oly join start`) so the live connection re-verifies. 0.5.x has no primary-side `node remove` command, and each public key is unique to one node name. See [Node federation](../releases/compatibility-0.5.md#node-federation).
 
 ## Notifications
 
-Input-needed notifications are best-effort attention hints, not proof of a
-prompt or task completion. A quiet session may still be thinking or blocked.
-Desktop delivery, browser push, and a custom hook can alert the human; always
-inspect the current output before intervening.
+Desktop notifications, Web Push, and `notification_hook` alert the human when a session likely needs attention (after a 5s activity-suppression window and `notification_min_interval_seconds` debounce).
 
-For programs emitting OSC 7501, the browser shows an **agent-reported status**
-badge alongside an attention/lifecycle badge, including permission/question/auth
-waits and optional progress. Live idle/done show **Ready for Input**, with process
-lifecycle in the tooltip; blocked/error show **Input Needed**. These set the
-backend attention flag immediately, even with notifications disabled. Stopped
-processes are never shown as ready just because a done/error report is retained.
-Reports arrive through the existing session-update stream,
-including federated sessions. Explicit working states suppress guessed
-attention; idle/blocked/done/error reports can notify after the existing 5-second
-activity suppression and configured minimum notification interval. Ordinary
-screen redraws and duplicate reports do not re-notify. Blocked uses notification
-kind `input_needed`; idle/done/error use `program_status`, all with trigger rule
-`program_status`. Idle notifies as **Ready for instruction**, not task completion.
-A task-done badge is the program's claim, not verified success.
-See [OSC 7501 status and lifetime](./cli.md#agent-reported-status-osc-7501).
+For programs emitting OSC 7501 (`idle`, `working`, `blocked`, `done`, `error`), `working` suppresses heuristic guesses while `idle`/`blocked`/`done`/`error` set `input_needed` immediately and trigger `program_status` / `input_needed` notifications without re-notifying on ordinary redraws. See [OSC 7501 status and lifetime](./cli.md#agent-reported-status-osc-7501).
 
 ```sh
 oly notify enable <id>
@@ -159,12 +84,9 @@ oly notify send --title "Review ready" --description "Check the result."
 oly notify send <running-id> --title "Needs review" --body "Inspect the session."
 ```
 
-A source session must be running; omit the source when it has ended.
-`notify send` requires a title. Notifications go to humans, **not** another
-agent session. See the [subagent skill](../../skills/oly-subagent/SKILL.md) for
-worker supervision and optional session-to-session reporting.
+Notifications target humans, not other agent sessions (for agent-to-agent coordination, see the [subagent skill](../../skills/oly-subagent/SKILL.md)).
 
-Configure a hook in the **flat** `<state>/config.json`:
+To run a custom hook, set `notification_hook` in flat `<state>/config.json`:
 
 ```json
 {
@@ -172,15 +94,7 @@ Configure a hook in the **flat** `<state>/config.json`:
 }
 ```
 
-On Windows, JSON paths need escaped backslashes, such as
-`C:\\scripts\\oly_notify.py`. Hook command placeholders:
-
-- `{kind}`, `{title}` / `{summary}`, `{description}`, `{body}`
-- `{navigation_url}`, `{node}`, `{session_ids}`, `{trigger_rule}`, `{trigger_detail}`
-
-The values are also exported as `OLY_EVENT_*` environment variables. Use a
-trusted helper and treat session-derived text as untrusted input. Hook failures
-are logged without blocking the session or notification pipeline.
+Available placeholders (also exported as `OLY_EVENT_*` env vars): `{kind}`, `{title}` / `{summary}`, `{description}`, `{body}`, `{navigation_url}`, `{node}`, `{session_ids}`, `{trigger_rule}`, `{trigger_detail}`. Treat session-derived text as untrusted input.
 
 ## State and configuration
 
@@ -190,22 +104,8 @@ are logged without blocking the session or notification pipeline.
 | Linux | `$XDG_STATE_HOME/oly` or `~/.local/state/oly` |
 | macOS | `~/Library/Application Support/oly` |
 
-`OLY_STATE_DIR` overrides it. State includes `oly.db`, daemon logs,
-`sessions/<id>/journal/`, generated `config.json`, daemon identity files,
-saved `joins.json`, and optional `wwwroot/apps/` content. Keep private state
-out of shared repositories and backups protected.
+Override with `OLY_STATE_DIR` (use `OLY_STATE_DIR="$PWD/.dev-state"` for development clones). State contains `oly.db`, `logs/`, `sessions/<id>/journal/`, `config.json`, `identity_key`, `joins.json`, and optional `wwwroot/apps/`.
 
-For a development clone, use `OLY_STATE_DIR="$PWD/.dev-state"` rather than the
-normal operator state. Tests use separate temporary directories.
-
-Config is flat JSON, **not** nested under `limits` or `notify`. For available
-keys, actual defaults, and reload behavior, use `oly skill --daemon` or the
-[daemon skill](../../skills/oly-daemon/SKILL.md). Stopped-session age retention is
-disabled by default and permanently removes session files when enabled. Live
-journal byte caps are unsupported; use OS quotas for hard disk bounds.
-
-Custom apps/proxies and `wwwroot` overrides are disabled by default. With operator
-approval, `trusted_apps_enabled: true` enables reviewed code on the control-plane
-origin, **not** isolated/untrusted reports. Proxy entries accept loopback IP
-literals only; no remote hosts or DNS names. Read `oly skill --apps` or the
-[apps skill](../../skills/oly-apps/SKILL.md) before enabling.
+Configuration in `<state>/config.json` is flat JSON:
+- For config keys, defaults, and hot reload, see the [daemon skill](../../skills/oly-daemon/SKILL.md) (`oly skill --daemon`).
+- For trusted web apps and loopback proxies (`trusted_apps_enabled`), see the [apps skill](../../skills/oly-apps/SKILL.md) (`oly skill --apps`).
