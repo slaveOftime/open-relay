@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { DEFAULT_MENU_PLACEMENT, MENU_GAP_PX, placeMenu } from './menu-placement'
+import { DEFAULT_MENU_PLACEMENT, MENU_GAP_PX, MENU_INSET_PX, placeMenu } from './menu-placement'
 
 /**
  * The rules a popup follows when its trigger can be dragged anywhere: under the
@@ -14,6 +14,9 @@ const VIEWPORT = { width: 375, height: 812 }
 const MENU = { width: 240, height: 176 }
 /** `right-5 bottom-70`, the trigger's home: a 48px button 20px in from the right. */
 const AT_HOME = { top: 484, right: 355, bottom: 532 }
+/** Where the menu's left edge lands, margin box and inset included. */
+const menuLeft = (anchorRight: number, placement: { right: number }) =>
+  anchorRight - placement.right - MENU_INSET_PX - MENU.width
 
 describe('placeMenu', () => {
   it('hangs the menu under the trigger when the room is there', () => {
@@ -58,11 +61,11 @@ describe('placeMenu', () => {
     // far short of the menu's 240.
     const placement = placeMenu({ top: 484, right: 52, bottom: 532 }, MENU, VIEWPORT)
 
-    expect(placement.right).toBe(-192)
+    expect(placement.right).toBe(-208)
     // Which puts the menu's left edge exactly on the margin, and its right edge
     // well inside the viewport.
-    expect(52 - placement.right - MENU.width).toBe(4)
-    expect(52 - placement.right).toBeLessThan(VIEWPORT.width)
+    expect(menuLeft(52, placement)).toBe(4)
+    expect(52 - placement.right - MENU_INSET_PX).toBeLessThan(VIEWPORT.width)
   })
 
   it('never slides the menu left of its aligned corner', () => {
@@ -82,14 +85,15 @@ describe('placeMenu', () => {
     })
 
     // Pinned to the margin: there is nothing better to do for the right edge.
-    expect(placement.right).toBe(-144)
-    expect(100 - placement.right - MENU.width).toBe(4)
+    expect(placement.right).toBe(-160)
+    expect(menuLeft(100, placement)).toBe(4)
   })
 
   it('leaves the menu alone when its left edge lands exactly on the margin', () => {
     // A menu whose left edge lands exactly on the margin is left aligned, not
-    // slid: the boundary is inclusive.
-    expect(placeMenu({ top: 484, right: 244, bottom: 532 }, MENU, VIEWPORT).right).toBe(0)
-    expect(placeMenu({ top: 484, right: 243, bottom: 532 }, MENU, VIEWPORT).right).toBe(-1)
+    // slid: the boundary is inclusive, and it is the menu's own `mr-4` inset
+    // that has to clear the trigger's right edge first.
+    expect(placeMenu({ top: 484, right: 260, bottom: 532 }, MENU, VIEWPORT).right).toBe(0)
+    expect(placeMenu({ top: 484, right: 259, bottom: 532 }, MENU, VIEWPORT).right).toBe(-1)
   })
 })

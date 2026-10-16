@@ -7,10 +7,10 @@ import { test, expect, type Page } from '@playwright/test'
  */
 test.use({ viewport: { width: 375, height: 812 } })
 
-// A real touch tap is a different code path from a synthetic mouse click: no
-// mousedown focus, and a click that arrives after the press already focused the
-// search input. The suite's mouse-driven tests cannot see this, so the gesture
-// runs under touch input here.
+// A real touch tap is a different code path from a synthetic mouse click: the
+// compatibility click lands after the browser's own press handling, and no
+// mousedown focuses the button. The suite's mouse-driven tests cannot see this,
+// so the gesture runs under touch input here.
 test.describe('with touch input', () => {
   test.use({ hasTouch: true })
 
@@ -22,9 +22,8 @@ test.describe('with touch input', () => {
     await icon.tap()
 
     await expect(input).toBeVisible()
-    // The bar must keep the input focused: the tap's own click moves focus to
-    // the trigger as its default action, which would blur the input and close
-    // the bar it just opened.
+    // The bar must keep the input focused: the press's default would focus the
+    // trigger, and the bar closes the moment its input loses focus.
     await expect(input).toBeFocused()
     // The filters came up with it: the tap opens the whole control.
     await expect(statusTrigger).toBeVisible()
@@ -111,6 +110,8 @@ async function mockBackend(page: Page) {
 
 const SEARCH_ICON = 'Search sessions'
 const SEARCH_INPUT = 'Search sessions by id, title, command, or working directory'
+/** The menu's own `mr-4`: its visible right edge sits this far inside the trigger's. */
+const MENU_INSET_PX = 16
 
 // At 375px the desktop table still holds the same titles (hidden, but matched
 // by text queries), so card assertions are scoped to the mobile list.
@@ -185,13 +186,16 @@ test('a tap opens the bar and the menu under the trigger, and a tap closes both'
   expect(inputBox.y + inputBox.height).toBeGreaterThan(collapsed.y)
 
   // The menu hangs under the trigger's bottom-right corner: below it, right
-  // edges aligned, a small gap between them. The pop's scale grows out of that
-  // corner, so both edges hold through the animation.
+  // edges aligned but for the menu's own inset, a small gap between them. The
+  // pop's scale grows out of that corner, so both edges hold through the
+  // animation.
   const menuBox = (await page.getByTestId('session-search-menu').boundingBox())!
   const iconBox = (await icon.boundingBox())!
   expect(menuBox.y).toBeGreaterThanOrEqual(iconBox.y + iconBox.height)
   expect(menuBox.y - (iconBox.y + iconBox.height)).toBeLessThanOrEqual(16)
-  expect(Math.abs(menuBox.x + menuBox.width - (iconBox.x + iconBox.width))).toBeLessThanOrEqual(1)
+  expect(
+    Math.abs(menuBox.x + menuBox.width - (iconBox.x + iconBox.width - MENU_INSET_PX))
+  ).toBeLessThanOrEqual(1)
 
   // Typing drives the list and leaves the menu where it is: the bar and the
   // menu are one popup, not rivals.
@@ -329,8 +333,8 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
   expect(Math.abs(after.x - (before.x - 60))).toBeLessThanOrEqual(2)
   expect(Math.abs(after.y - (before.y + 80))).toBeLessThanOrEqual(2)
 
-  // Taking the button means the press was never a tap: the release's
-  // follow-up click opens nothing.
+  // Taking the button means the press was never a tap: the drag swallows the
+  // click that release sends, so nothing opens behind it.
   await expect(input).toHaveCount(0)
 
   // The new spot survives a reload…
@@ -368,6 +372,20 @@ test('a drag relocates the trigger and remembers the spot', async ({ page }) => 
     .toBeLessThanOrEqual(restored.x + 1)
 })
 
+test('a drag that never leaves the button does not toggle the control', async ({ page }) => {
+  const icon = page.getByRole('button', { name: SEARCH_ICON })
+  const input = page.getByRole('textbox', { name: SEARCH_INPUT })
+
+  // A travelling press is a move, not a tap — and this one releases without ever
+  // leaving the 48px button, so the browser still sends the release's click.
+  // That click must not reach the control as an activation of a button the drag
+  // just moved and closed.
+  await dragTrigger(page, 12, 12)
+
+  await expect(icon).toBeVisible()
+  await expect(input).toHaveCount(0)
+})
+
 test('the menu opens over the trigger when there is no room under it', async ({ page }) => {
   const icon = page.getByRole('button', { name: SEARCH_ICON })
   const input = page.getByRole('textbox', { name: SEARCH_INPUT })
@@ -387,7 +405,9 @@ test('the menu opens over the trigger when there is no room under it', async ({ 
   expect(iconBox.y - (menuBox.y + menuBox.height)).toBeLessThanOrEqual(16)
   expect(menuBox.y).toBeGreaterThanOrEqual(0)
   // Right-aligned as ever: the flip is vertical only.
-  expect(Math.abs(menuBox.x + menuBox.width - (iconBox.x + iconBox.width))).toBeLessThanOrEqual(1)
+  expect(
+    Math.abs(menuBox.x + menuBox.width - (iconBox.x + iconBox.width - MENU_INSET_PX))
+  ).toBeLessThanOrEqual(1)
 })
 
 test('the menu slides into view when the trigger is dragged to the left edge', async ({ page }) => {

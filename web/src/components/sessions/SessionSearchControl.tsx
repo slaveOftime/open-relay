@@ -13,13 +13,15 @@
  * than its rule: `lib/menu-placement` flips it over the trigger when the room
  * below is short, and slides it sideways when the trigger has run close to the
  * left edge of the screen. A second tap closes both,
- * as does a tap outside or Escape. There is no second gesture to wait for: a
- * tap acts on its release. The X in the bar is the search's own control — it
- * clears the text, or closes the control when there is nothing to clear. A drag
- * moves the whole control somewhere better and remembers the spot
- * (`useHoldToDrag` with `armMs: 0`: nothing else owns a drag on this button, so
- * a travelling press is a move — no hold-then-move, which used to fight the
- * hold that opened the menu).
+ * as does a tap outside or Escape. The trigger's activation is a plain click:
+ * with no second action to offer, there is no double tap for a tap to wait out,
+ * and no hold for it to serve, so it acts the moment the browser reports it. The
+ * X in the bar is the search's own control — it clears the text, or closes the
+ * control when there is nothing to clear. A drag moves the whole control
+ * somewhere better and remembers the spot (`useHoldToDrag` with `armMs: 0`:
+ * nothing else owns a drag on this button, so a travelling press is a move, and
+ * the click that release still sends is swallowed so the move cannot also
+ * toggle the control).
  */
 import {
   useCallback,
@@ -33,7 +35,6 @@ import {
 import { Cross2Icon, MagnifyingGlassIcon } from '@radix-ui/react-icons'
 import { cn } from '@/utils/cn'
 import { useHoldToDrag } from '@/hooks/use-hold-to-drag'
-import { useTapGestures } from '@/hooks/use-tap-gestures'
 import { useReducedMotion } from '@/hooks/use-reduced-motion'
 import { DEFAULT_MENU_PLACEMENT, placeMenu, type MenuPlacement } from '@/lib/menu-placement'
 import { Input } from '@/components/ui/input'
@@ -90,17 +91,14 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
     onDragStart: close,
   })
 
-  const handlePress = useCallback(() => {
-    if (open) {
-      close()
-      return
-    }
-    setOpen(true)
+  // One tap toggles the whole control: the bar and the menu come up together,
+  // and a second tap takes both down. The button's own click is the entire
+  // gesture — there is nothing behind it to distinguish it from, so it needs no
+  // window to wait in and no press tracking of its own.
+  const toggle = useCallback(() => {
+    if (open) close()
+    else setOpen(true)
   }, [close, open])
-
-  // The tap has no double: the control has no second action to offer a pair,
-  // and a tap that waited for one would only feel late.
-  const press = useTapGestures({ onPress: handlePress })
 
   // The menu mounts collapsed and arms on the next frame so its transform
   // transition actually runs (the same pattern QuickKeysMenu uses). The bar
@@ -275,14 +273,16 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
         aria-label="Search sessions"
         aria-haspopup="true"
         aria-expanded={open}
-        {...press.handlers}
-        // Only a click with no gesture behind it: the keyboard, assistive
-        // tech, a programmatic click. The browser's follow-up click for a tap
-        // is swallowed by the window check — a tap activates twice without it.
-        onClick={(event) => {
-          if (press.isFollowUpClick(event.timeStamp)) return
-          handlePress()
-        }}
+        // The press's default action is to focus the button, which takes the
+        // focus the bar's input is holding — and the blur-close would then race
+        // the click that closes it. The press's pointerdown is left alone:
+        // WebKit sends no click at all for a touch whose pointerdown was
+        // default-prevented, and the click is what toggles the control.
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={toggle}
+        // Long-pressing a touch target raises a platform context menu; a
+        // floating button never wants one.
+        onContextMenu={(event) => event.preventDefault()}
         className={cn(
           'absolute right-0 top-0 z-10 flex h-12 w-12 touch-none select-none',
           'items-center justify-center rounded-full',
@@ -301,8 +301,9 @@ export default function SessionSearchControl({ search, onSearchChange, active, m
           ref={menuRef}
           data-testid="session-search-menu"
           // The slide that keeps the menu on screen is placement, not entrance:
-          // the pop keeps its own origin (`mt-2`/`mb-2` is the gap the
-          // placement counted, `MENU_GAP_PX`).
+          // the pop keeps its own origin. `mt-2`/`mb-2` is the gap the placement
+          // counted (`MENU_GAP_PX`), `mr-4` the inset it counted
+          // (`MENU_INSET_PX`).
           style={{ ...popStyle, right: placement.right }}
           className={cn(
             'absolute z-40 w-60 rounded-lg mr-4',

@@ -24,10 +24,11 @@ export interface MenuPlacement {
   /** `above` flips the menu over the trigger's top edge. */
   vertical: 'below' | 'above'
   /**
-   * CSS `right` offset from the trigger's own box, in px. `0` puts the menu's
-   * right edge on the trigger's; anything negative slides it right, far enough
-   * to bring its left edge back to the margin. Never positive — the menu grows
-   * away from the trigger's right edge, and there is no reason to move it
+   * CSS `right` offset from the trigger's own box, in px. `0` keeps the menu's
+   * margin box on the trigger's right edge — the menu's own `mr-4` inset then
+   * sets its visible right edge. Anything negative slides the menu right, far
+   * enough to bring its left edge back to the margin. Never positive — the menu
+   * grows away from the trigger's right edge, and there is no reason to move it
    * closer in.
    */
   right: number
@@ -35,6 +36,13 @@ export interface MenuPlacement {
 
 /** The menu's clearance from the trigger. Mirrors the `mt-2`/`mb-2` class. */
 export const MENU_GAP_PX = 8
+
+/**
+ * How far the menu is inset from the trigger's right edge, matching the `mr-4`
+ * class on it. The placement counts it, or a margin the CSS adds later would
+ * push the menu that much further off the left edge of the screen.
+ */
+export const MENU_INSET_PX = 16
 
 /** Used before the first measurement, and whenever the menu is closed. */
 export const DEFAULT_MENU_PLACEMENT: MenuPlacement = { vertical: 'below', right: 0 }
@@ -49,7 +57,7 @@ export function placeMenu(
   // the menu's left edge past the margin — then it is slid back to the margin,
   // however far right of the trigger that lands. A menu wider than the screen
   // can only be helped at one end, so the left one wins.
-  const right = Math.min(0, anchor.right - menu.width - margin)
+  const right = Math.min(0, anchor.right - MENU_INSET_PX - menu.width - margin)
 
   // Under the trigger, unless the menu does not fit there — then over it, if
   // that is where the room is. With too little room either way, the bigger side

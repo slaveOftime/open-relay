@@ -17,8 +17,8 @@ interface Options {
   /**
    * How long a press must stay still before a move repositions instead of acts.
    * `0` arms with the press itself: for a control whose press has no hold
-   * meaning of its own (it only taps, double-taps and moves), any travelling
-   * press is already a reposition.
+   * meaning of its own (it only taps and moves), any travelling press is
+   * already a reposition.
    */
   armMs?: number
   /** Pointer travel (px) that abandons arming — a moving press is a normal drag. */
@@ -69,6 +69,10 @@ interface Gesture {
  * With `armMs: 0` the contract is dropped instead: the control arms as the
  * press lands, because its press has no other meaning to protect.
  *
+ * A press that travelled is a move, and the click the browser sends with that
+ * release — the pointer does not have to leave the element for one to arrive —
+ * is swallowed, so a reposition can never also activate the button it moved.
+ *
  * Listeners live outside React on purpose: the components already own their
  * own pointer handlers, and window-level move/up tracking keeps the drag alive
  * when the pointer outruns the element it is carrying.
@@ -107,6 +111,30 @@ export function useHoldToDrag({
 
     let armTimer: ReturnType<typeof setTimeout> | null = null
     let gesture: Gesture | null = null
+
+    // A travelling press is a move, so the click the browser sends with that
+    // release — it arrives whether or not the pointer left the element — must
+    // not reach the consumer as an activation of the button it just moved.
+    // Armed as such a press ends, lifted again by the click that follows it, or
+    // by a task after the release for one that produces none. React listens on
+    // the root, so stopping the event at the handle is what keeps the
+    // consumer's own `onClick` from ever seeing it.
+    let suppressClick = false
+    let releaseSuppression: ReturnType<typeof setTimeout> | null = null
+    const clearSuppression = () => {
+      suppressClick = false
+      if (releaseSuppression) {
+        clearTimeout(releaseSuppression)
+        releaseSuppression = null
+      }
+    }
+    const onClick = (event: MouseEvent) => {
+      if (!suppressClick) return
+      // A click dispatched with the release lands before that task, so this is
+      // the one the move produced.
+      event.stopPropagation()
+      clearSuppression()
+    }
 
     const clearArm = () => {
       if (armTimer) {
@@ -163,6 +191,8 @@ export function useHoldToDrag({
       setArmed(false)
       if (!movingRef.current) return
       movingRef.current = false
+      suppressClick = true
+      if (!releaseSuppression) releaseSuppression = setTimeout(clearSuppression, 0)
       setMoving(false)
       onDragEndRef.current?.()
       if (applied) {
@@ -207,9 +237,12 @@ export function useHoldToDrag({
     }
 
     handle.addEventListener('pointerdown', onPointerDown)
+    handle.addEventListener('click', onClick)
     return () => {
       handle.removeEventListener('pointerdown', onPointerDown)
+      handle.removeEventListener('click', onClick)
       clearArm()
+      clearSuppression()
       window.removeEventListener('pointermove', onPointerMove)
       window.removeEventListener('pointerup', endGesture)
       window.removeEventListener('pointercancel', endGesture)
