@@ -14,7 +14,7 @@
 |---|---|
 | [Upgrade from 0.3.x to 0.5.x](./releases/migration-0.5.md) | Breaking changes, required actions, backup, and rollback |
 | [What's new in 0.5.x](./releases/whats-new-0.5.md) | Features and improvements, separate from migration |
-| [Compatibility for 0.5](./releases/compatibility-0.5.md) | Supported contracts and experimental interfaces |
+| [Compatibility for 0.5](./releases/compatibility-0.5.md) | Supported contracts, node federation trust limits, and private interfaces |
 | [0.5.0-beta.1 release notes](./releases/release-notes-0.5.0-beta.1.md) | Published scope, known limits, and verification |
 
 ## Contributing and maintaining

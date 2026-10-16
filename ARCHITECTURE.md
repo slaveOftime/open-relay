@@ -481,8 +481,10 @@ failure and successful opt-in on Windows build 26200.
   agent reports. App routes permit inline scripts; normal UI routes do not.
   Proxy targets are loopback IP literals only, and joined paths cannot change
   origin. Security middleware covers fallback responses as well as named routes.
-  Federation uses pinned identities and sealed traffic but has no forward secrecy;
-  interoperability remains experimental during beta.
+  Federation uses pinned identities and sealed traffic but has no forward secrecy
+  and no primary-side identity removal in 0.5.x; the
+  [compatibility policy](./docs/releases/compatibility-0.5.md#node-federation)
+  states the trust model and its limits.
 
 ## Documents
 
@@ -494,5 +496,6 @@ failure and successful opt-in on Windows build 26200.
 - [Migration to 0.5](./docs/releases/migration-0.5.md) — breaking changes and safe upgrade/rollback.
 - [Performance](./PERFORMANCE.md) — data-path measurements and recovery budgets.
 - [Contributing](./CONTRIBUTING.md) — development workflow.
-- [Compatibility](./docs/releases/compatibility-0.5.md) — beta guarantees and experimental interfaces.
+- [Compatibility](./docs/releases/compatibility-0.5.md) — supported contracts, node
+  federation limits, and private interfaces.
 - [How to publish a release](./docs/maintainers/release-process.md) — maintainer steps and verification.

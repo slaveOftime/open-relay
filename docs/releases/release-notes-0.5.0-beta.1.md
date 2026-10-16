@@ -13,7 +13,8 @@ Journal-backed recording, inspectable live/final screens, cursor-based output,
 full session metadata, and shared terminal/browser control make interactive
 CLIs easier to supervise. The dashboard, paste/mouse/scrollback handling, and
 Windows output draining are improved. Connected-machine federation uses pinned
-identities and encrypted traffic but remains experimental.
+identities and encrypted traffic; its trust model and limits are in the
+[compatibility policy](./compatibility-0.5.md#node-federation).
 
 ## Breaking changes
 

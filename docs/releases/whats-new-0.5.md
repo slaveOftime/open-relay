@@ -41,12 +41,12 @@ See [CLI guide](../guides/cli.md) and [Agent skills](../../skills/oly/SKILL.md).
 Shared control is not exclusive ownership or multi-user authorization.
 See [Attach](../guides/cli.md#attach-and-scroll) and [Browser access](../guides/remote-access.md#browser-access).
 
-## Experimental connected machines
+## Connected machines
 
 Pinned Ed25519 identities, encrypted readiness, and replay-checked application
 traffic replace the old federation credential paths. Verify public identities
-independently and upgrade nodes together. Federation remains experimental and
-has **no forward secrecy**.
+independently and upgrade nodes together. Federation has **no forward secrecy**
+and, in 0.5.x, no primary-side identity removal.
 
 See [Node setup](../guides/remote-access.md#connect-machines),
 [Compatibility](./compatibility-0.5.md), and

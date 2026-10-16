@@ -48,8 +48,10 @@ view-only attach is coordination, not a restricted account.
 
 ## Connect machines
 
-Federation interoperability is **experimental during beta**; read the
-[compatibility policy](../releases/compatibility-0.5.md) before deployment.
+Federation is a supported 0.5 interface. Read the
+[compatibility policy](../releases/compatibility-0.5.md#node-federation) before
+deployment: it has **no forward secrecy** and, in 0.5.x, no primary-side identity
+removal.
 
 A **primary** routes commands to connected **secondary** daemons. Each owning
 daemon keeps authority over its processes, journal, attach roles, and credits.
@@ -103,6 +105,29 @@ There is **no forward secrecy**: later private-seed compromise can expose
 recorded federation traffic. Use trusted transport infrastructure too.
 Federation identity checks and encryption remain required with HTTP `--no-auth`.
 See [Architecture](../../ARCHITECTURE.md#node-federation) for protocol details.
+
+### Rotate and decommission
+
+Re-accept a name to replace its identity, after verifying the new public key
+independently. The previous key then fails the next join.
+
+```sh
+# On the primary: rotate the pinned identity for one registered name.
+oly node accept --name worker-1 --id-pub-key "<replacement public identity>"
+
+# On the secondary: disconnect and delete the saved join, then rejoin.
+oly join stop --name worker-1
+oly join start --name worker-1 --id-pub-key "<primary public identity>" \
+  http://primary-host:15443
+```
+
+An already-connected node is **not** disconnected by a rotation, so restart the
+connector to force re-verification. 0.5.x has **no primary-side removal
+command**, and one identity stays bound to one name, so a retired machine's key
+cannot be reused under a different name — generate a new identity on the
+replacement machine instead. For a leaked seed, block the transport path:
+rotating the pin does not eject a connected peer. See
+[Node federation](../releases/compatibility-0.5.md#node-federation).
 
 ## Notifications
 
