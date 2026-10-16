@@ -80,7 +80,8 @@ export const SessionRow = memo(function SessionRow({
       ? '[box-shadow:inset_2px_0_0_0_rgb(22_163_74/0.5)]'
       : ''
 
-  const rowOpacity = isTerminalStatus(session.status) ? 'opacity-60' : ''
+  // Retained program reports stay readable even after the process exits.
+  const rowOpacity = isTerminalStatus(session.status) && !session.program_status ? 'opacity-60' : ''
   const animateClass = animateIn ? 'animate-row-slide-in' : ''
 
   function openSession(mode: 'attach' | 'logs') {

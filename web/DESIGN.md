@@ -100,6 +100,20 @@ Use semantic `Badge` variants:
 - `warning` for offline or degraded state.
 - status variants from `StatusBadge` for session state.
 
+Program-status badges have dedicated variants, independent of process lifecycle:
+`program-idle` (blue), `program-working` (cyan), `program-done` (emerald),
+`program-blocked` (amber), and `program-error` (rose/red). The
+`--program-status-<state>` accent and `--program-status-<state>-foreground`
+text tokens define their palette. Use a subtle 12% accent fill, a 30% accent
+border, 6px corners, compact horizontal padding, and medium-weight 12px text;
+light mode uses deeper label tones and
+dark mode uses softer, brighter tones. Keep text contrast at least 4.5:1 on
+both themes and preserve plain-text labels so meaning does not rely on color.
+Wrap program badges inside the available status column/card header instead of
+letting long labels overlap adjacent fields. Inactive sessions with retained
+program reports avoid whole-row opacity so the reports remain readable;
+ordinary inactive sessions keep their existing dimming.
+
 Avoid page-local emerald/amber/red badge recipes; add a variant when a semantic style repeats.
 
 ### Cards, menus, and popovers

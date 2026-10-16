@@ -35,8 +35,11 @@ without a busy pulse; blocked/error keep **Input Needed** and the app's reason.
 Process lifecycle remains in the primary badge tooltip and API. A non-running
 process must never display ready/input-needed, even if a stale flag arrives.
 These are plain-text, untrusted reports from the owning session, not verified
-completion or approval authority. `sameSessionSummary` must compare their fields
-so status-only SSE updates reach rows, cards, and details.
+completion or approval authority. Program-state colors use dedicated `program-*`
+Badge variants and `--program-status-*` theme tokens rather than lifecycle
+variants, so retheming reports does not change process status badges.
+`sameSessionSummary` must compare their fields so status-only SSE updates reach
+rows, cards, and details.
 
 ## Conventions
 

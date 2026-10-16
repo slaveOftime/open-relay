@@ -59,7 +59,7 @@ export default function StatusBadge({ status, inputNeeded, showDot = true, progr
     (status === 'running' && (!programStatus || programStatus.state === 'working'))
 
   return (
-    <span className="inline-flex items-center gap-1">
+    <span className="inline-flex max-w-full flex-wrap items-center gap-1">
       <Badge
         key={`${status}:${inputNeeded ? 'input-needed' : 'status'}`}
         variant={variant}

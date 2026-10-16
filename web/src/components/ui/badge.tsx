@@ -8,7 +8,7 @@ export interface BadgeProps
 
 function Badge({ className, variant, ...props }: BadgeProps) {
   return (
-    <div className={cn(badgeVariants({ variant }), className, 'whitespace-nowrap')} {...props} />
+    <div className={cn(badgeVariants({ variant }), 'whitespace-nowrap', className)} {...props} />
   )
 }
 

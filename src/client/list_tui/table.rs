@@ -9,6 +9,7 @@ use super::app::{RateState, is_active_status};
 use super::constants::SELECTED_ROW_BG;
 use super::constants::{COMPACT_SPARKLINE_WIDTH, SPARK_BLOCKS, SPARKLINE_WIDTH};
 use crate::protocol::SessionSummary;
+use crate::session::program_status::ProgramState;
 use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -108,7 +109,10 @@ pub fn session_table_columns(
     if mode == LayoutMode::Wide {
         let title_width = sessions
             .iter()
-            .map(|session| UnicodeWidthStr::width(session_title(session).as_str()))
+            .map(|session| {
+                UnicodeWidthStr::width(session_title(session).as_str())
+                    + session_program_status_span(session).map_or(0, |span| span.width() + 1)
+            })
             .max()
             .unwrap_or(18)
             .clamp(18, 28);
@@ -190,6 +194,43 @@ pub fn session_title(session: &SessionSummary) -> String {
         })
 }
 
+/// Program state is independent of process lifecycle and input heuristics.
+/// Render only the typed state, never arbitrary report text or guessed labels.
+pub fn session_program_status_span(session: &SessionSummary) -> Option<Span<'static>> {
+    let report = session.program_status.as_ref()?;
+    // Use distinct, bright theme-aware ANSI colors so reports do not blend
+    // into title/metadata gray or inherit a session's own terminal foreground.
+    let (label, color) = match report.state {
+        ProgramState::Idle => ("idle", Color::LightBlue),
+        ProgramState::Working => ("working", Color::LightCyan),
+        ProgramState::Done => ("done", Color::LightGreen),
+        ProgramState::Blocked => ("blocked", Color::LightYellow),
+        ProgramState::Error => ("error", Color::LightRed),
+    };
+    let mut style = Style::default().fg(color);
+    if matches!(report.state, ProgramState::Blocked | ProgramState::Error) {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Some(Span::styled(format!("[{label}]"), style))
+}
+
+/// Keep an entire state badge beside the title when both can fit. Extremely
+/// narrow cells retain identity rather than showing a misleading partial state.
+pub fn session_title_spans(session: &SessionSummary, width: usize) -> Vec<Span<'static>> {
+    let title = session_title(session);
+    if let Some(badge) = session_program_status_span(session)
+        && width >= badge.width() + 2
+    {
+        vec![
+            Span::raw(truncate(&title, width - badge.width() - 1)),
+            Span::raw(" "),
+            badge,
+        ]
+    } else {
+        vec![Span::raw(truncate(&title, width))]
+    }
+}
+
 pub fn aligned_cell(content: impl Into<Line<'static>>, alignment: Alignment) -> Cell<'static> {
     Cell::from(content.into().alignment(alignment))
 }
@@ -268,25 +309,26 @@ pub fn session_row(
     // a useful title or repeating the executable when it is also the title.
     let name_cell = if mode == LayoutMode::Medium && name_width >= 28 && command != name {
         let title_width = (name_width * 3 / 5).min(26);
-        let title = truncate(&name, title_width);
-        let command_width = name_width.saturating_sub(UnicodeWidthStr::width(title.as_str()) + 3);
+        let mut title = session_title_spans(session, title_width);
+        let command_width =
+            name_width.saturating_sub(title.iter().map(Span::width).sum::<usize>() + 3);
+        title.extend([
+            Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate(&command, command_width),
+                Style::default().fg(if selected {
+                    Color::Gray
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+        ]);
+        aligned_cell(Line::from(title), alignments[name_index])
+    } else {
         aligned_cell(
-            Line::from(vec![
-                Span::raw(title),
-                Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    truncate(&command, command_width),
-                    Style::default().fg(if selected {
-                        Color::Gray
-                    } else {
-                        Color::DarkGray
-                    }),
-                ),
-            ]),
+            Line::from(session_title_spans(session, name_width)),
             alignments[name_index],
         )
-    } else {
-        text_cell(&name, name_index)
     };
     // Finished sessions remain easy to identify without brightening their
     // command preview or metadata. Selected titles inherit the white row style.

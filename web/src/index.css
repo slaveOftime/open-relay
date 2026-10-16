@@ -27,6 +27,17 @@
     --radius: 0.375rem;
     --terminal-bg: 210 25% 97%;
     --terminal-fg: 224 71% 10%;
+    /* Application-reported state: separate accents and readable label text. */
+    --program-status-idle: 217 91% 60%;
+    --program-status-idle-foreground: 217 75% 34%;
+    --program-status-working: 188 86% 43%;
+    --program-status-working-foreground: 193 88% 25%;
+    --program-status-done: 160 84% 39%;
+    --program-status-done-foreground: 160 76% 24%;
+    --program-status-blocked: 38 92% 50%;
+    --program-status-blocked-foreground: 32 88% 27%;
+    --program-status-error: 350 89% 60%;
+    --program-status-error-foreground: 347 77% 37%;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -54,6 +65,11 @@
       --scrollbar-thumb-hover: 220 9% 32%;
       --terminal-bg: 220 18% 3%;
       --terminal-fg: 210 20% 92%;
+      --program-status-idle-foreground: 213 97% 78%;
+      --program-status-working-foreground: 187 92% 74%;
+      --program-status-done-foreground: 155 72% 72%;
+      --program-status-blocked-foreground: 43 96% 72%;
+      --program-status-error-foreground: 351 95% 80%;
     }
   }
 
@@ -81,6 +97,11 @@
     --scrollbar-thumb-hover: 220 9% 32%;
     --terminal-bg: 220 18% 3%;
     --terminal-fg: 210 20% 92%;
+    --program-status-idle-foreground: 213 97% 78%;
+    --program-status-working-foreground: 187 92% 74%;
+    --program-status-done-foreground: 155 72% 72%;
+    --program-status-blocked-foreground: 43 96% 72%;
+    --program-status-error-foreground: 351 95% 80%;
   }
 
   * {

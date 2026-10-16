@@ -56,7 +56,7 @@ pub struct TreeView {
     pub nodes: Vec<TreeNode>,
     /// Index of the synthetic root node (path = `PathBuf::new()`).
     pub root: usize,
-    /// Number of folder levels expanded automatically from each tree root.
+    /// Number of path-folder levels initially visible from each tree root.
     pub auto_depth: usize,
     /// Folders explicitly expanded by the user.
     pub drilled: HashSet<TreeFolderKey>,
@@ -97,8 +97,9 @@ impl TreeView {
     }
 }
 
-/// Number of path-folder levels expanded by default under each tree root.
-pub const TREE_AUTO_DEPTH: usize = 1;
+/// Number of path-folder levels initially visible under each tree root.
+/// Node grouping adds its own level without consuming this folder budget.
+pub const TREE_AUTO_DEPTH: usize = 2;
 
 /// Canonical separator form for a stored cwd: remote sessions on a different
 /// OS report paths with the other platform's slashes, and the host `PathBuf`
