@@ -1,71 +1,91 @@
 ---
 name: oly-subagent
-description: Use when a coding agent is authorized to launch or supervise another agent CLI through oly, including sending scoped tasks, handling prompts, monitoring progress, and verifying its result. Not for ordinary terminal commands; use the oly skill instead.
+description: Use when a coding agent is authorized to launch, coordinate, or supervise one or more sub-agent CLIs through oly, including choosing workflow topologies, reducing token cost, sending scoped tasks, monitoring progress, and verifying results.
 ---
 
-# Supervise an agent CLI with oly
+# Orchestrate and supervise sub-agents with oly
 
-Use `oly` as a durable PTY for the **user-authorized** worker CLI. This skill does not authorize delegation, extra agents, remote execution, approval bypass, or changes outside the user's requested scope. For CLI flags, cursors, nodes, and general session mechanics, consult `oly skill` (or `../oly/SKILL.md`). Do not assume a particular provider, model, or prompt flag: use the agent CLI the user chose or one already available in the environment.
+`oly skill --subagent` prints this self-contained guide directly from the `oly` binary (no local file read, `oly skill`, or `oly start --help` is needed for standard workflows).
 
-## Start a scoped worker
+Use `oly` as a durable PTY and supervision runtime for **user-authorized** agent CLIs (`pi`, `codex`, `claude`, etc.). This skill does not authorize delegation, extra agents, approval bypass, or edits outside the user's scope. Use the agent CLI and model already chosen by the user or environment.
 
-Before starting, decide what the worker may change, which workspace/cwd it should use, how it will report results, and what verifies completion. In a shared workspace, assign disjoint write scopes; do not let workers reset, overwrite, or commit someone else's work. Do immediate blocking work yourself rather than launching a worker you must wait on before doing anything else.
+**Core `oly` CLI reference:**
+- `oly daemon status` — check daemon health (`oly daemon start --detach` only if confirmed stopped; never stop/restart a shared daemon).
+- `oly start --detach --disable-notifications --title "<name>" --cwd <dir> [--tag <t>] [--node <n>] <cmd> [args...]` — launch worker and print `<ID>` (`oly` flags go **before** `<cmd>`).
+- `oly logs <ID> --tail <N> --wait <exit|prompt|output|idle|match> --timeout <dur>` — wait for gate (`0` met, `2` timeout, `1` error), then print output.
+- `oly info <ID> --json` — inspect `status`, `exit_code`, `input_needed`, and `program_status`.
+
+## 1) Right-size the topology (lower defaults first)
+
+Multi-agent flows consume more tokens than single-agent work. Choose the **smallest topology** that fits the task:
+
+| Topology | When to use | How to run |
+|---|---|---|
+| **Direct (0 workers)** | Small, immediate, or tightly coupled edits where you would just sit waiting on a single worker. | Do the work directly in your own session. |
+| **Single worker (1)** | Offload a noisy investigation, test/build diagnosis, or isolated module change to keep raw logs out of your context. | Spawn 1 worker, wait for completion, verify its output artifact. |
+| **Fan-out / Map-Reduce** | $N$ independent modules, files, or hypotheses with **disjoint write scopes**. | **Map:** launch $N$ workers in one shell call; each writes a compact result/file. **Reduce:** wait for all in one shell loop, then synthesize/verify. |
+| **Staged pipeline** | Sequential phases with hard gates (`Scan -> Implement -> Review/Test`). | Run Phase 1 workers to produce a compact plan/diff; gate Phase 2 on verified Phase 1 output. |
+| **Hierarchical (Lieutenants)** | Large multi-subsystem work where flat fan-out would bottleneck the lead agent. | Delegate each subsystem to a lieutenant worker that coordinates its own sub-workers and returns one verified summary. |
+
+## 2) Choose worker mode: one-shot vs interactive
+
+- **One-shot / non-interactive mode (default for discrete tasks):**
+  Pass the task prompt directly on the command line (e.g., `pi -p --no-session "..."`, `codex exec "..."`). The worker runs to completion and **exits**, avoiding TUI startup races, modal prompts, and multi-turn polling.
+- **Interactive / TUI mode (for iterative multi-turn steering or human handoff):**
+  Start the interactive CLI (`pi`, `codex`), wait for the UI to settle, and send prompts via `oly send`. Keep the session alive only while follow-up turns are needed.
+
+## 3) Low-token orchestration patterns
+
+Every extra LLM turn in the lead agent re-sends the full conversation history. Minimize lead-agent turns and context growth:
+
+1. **Batch launch + wait in ONE shell call (the "orchestration program"):**
+   Never spend separate tool calls to start Worker A, start Worker B, wait on A, wait on B, and inspect exit codes. Run an entire phase in a single shell block:
+   ```sh
+   # Fan-out + wait + check exit codes in a single tool call:
+   id_a=$(oly start --detach --disable-notifications --title "fix-mod-a" --cwd /path/to/repo \
+     pi -p --no-session "Edit ONLY mod_a.py to <goal>. Run <check>. Print a 3-line summary.")
+   id_b=$(oly start --detach --disable-notifications --title "fix-mod-b" --cwd /path/to/repo \
+     pi -p --no-session "Edit ONLY mod_b.py to <goal>. Run <check>. Print a 3-line summary.")
+
+   oly logs "$id_a" --tail 25 --wait exit --timeout 5m
+   oly logs "$id_b" --tail 25 --wait exit --timeout 5m
+   oly info "$id_a" --json | grep -E '"status"|"exit_code"'
+   oly info "$id_b" --json | grep -E '"status"|"exit_code"'
+   ```
+2. **Exchange compact artifacts via the filesystem, not raw scrollback:**
+   For research, scanning, or multi-phase flows, instruct each worker to write findings to a dedicated file (e.g., `/tmp/flow/worker-a.md`) and print only a short summary. The lead agent reads the compact file instead of ingesting hundreds of lines of terminal output.
+3. **Crystallize state between phases:**
+   Across multi-phase workflows, distil verified findings, file ownership, and interfaces into a concise shared brief (e.g., `/tmp/flow/context.md`) and pass that file path to next-phase workers instead of forwarding raw logs.
+4. **Optional push reporting via `$OLY_SESSION_ID`:**
+   `oly` injects `OLY_SESSION_ID` into every session's environment. When an interactive parent or lieutenant coordinates workers, it can pass its own `$OLY_SESSION_ID` in the prompt so workers push a completion note with `oly send <parent-id> -- "DONE: ..."` (plus `oly send <parent-id> key:enter`). Still verify results from the worker's own output/files.
+
+## 4) Supervising interactive TUI workers
+
+When running an interactive agent CLI instead of one-shot mode:
 
 ```sh
-oly daemon status
-oly start --title "scoped task" --cwd /path/to/repo --detach <agent-cli> [agent-args...]
+# 1. Start detached (or pass the initial prompt directly if the CLI supports it)
+id=$(oly start --detach --disable-notifications --title "worker-tui" --cwd /path/to/repo <agent-cli>)
+
+# 2. Wait for initial UI redraw to settle, then inspect the screen
+oly logs "$id" --wait idle --idle-for 1s --screen --timeout 30s
+
+# 3. Send a bounded task prompt in free-text mode (--), then press Enter separately
+oly send "$id" -- 'Objective: <goal>. Allowed files: <files>. Checks: <cmd>. Report: changed files and test output.'
+oly send "$id" key:enter
+
+# 4. Wait for the worker to need input or finish its turn, then read the screen
+oly logs "$id" --wait prompt --screen --timeout 5m
 ```
 
-Save the returned **session ID** and specify it on every subsequent `oly` call. Use `--node <name>` consistently only if the worker was explicitly started on that node. If a sandbox reports `Access is denied`, the daemon may still be running; retry the failed `oly` command with the available approval mechanism instead of stopping or restarting the daemon. If daemon status genuinely confirms it is stopped, `oly daemon start --detach` is appropriate.
+- **`--` free-text rule:** `oly send <ID> -- '...'` disables `key:`/`mouse:` parsing for all remaining arguments and does **not** press Enter. Always send `oly send <ID> key:enter` as a separate command.
+- **Wait exit codes:** `0` condition met, `2` timeout, `1` error. `--wait exit` returns `0` even if the child failed; always check `exit_code` in `oly info <ID> --json`.
+- **Observe after input:** `oly send` only confirms PTY delivery. On TUI menus/modals, send one step, inspect `oly logs <ID> --screen`, then decide the next step.
 
-Every session knows its own id at runtime: oly injects `OLY_SESSION_ID` into the child's environment, so a worker reads its id with `$OLY_SESSION_ID`, and you can read yours the same way. To give the worker a way to hand results back without you polling its logs, pass your own session id in the task prompt and have it report with `oly send <your-session-id> -- <result>`:
+## 5) Safety, write scopes, and verification
 
-```sh
-# your id (if you run inside an oly session): echo "$OLY_SESSION_ID"
-# hand that literal id to the worker in the task prompt; it then reports back with e.g.:
-#   oly send abc1234 -- changed foo.rs and bar.rs, cargo test passes
-```
-
-Optional — watching the worker's logs below is normally enough — and it recurses: a worker that delegates its own sub worker reads its `$OLY_SESSION_ID` and passes it along the same way, so results can always reach the originating session.
-
-If the CLI supports a documented one-shot prompt option, use it when suitable. Otherwise wait until its input UI is ready (`oly logs <ID> --screen`), then send a bounded task prompt containing the objective, allowed files, constraints, relevant checks, and what to report. Avoid asking the worker to run `oly skill` unless it itself needs oly.
-
-```sh
-oly send <ID> -- 'Implement the scoped change in <files>; run <checks>; report changed files, checks, and any blockers.'
-oly send <ID> key:enter
-```
-
-`--` sends literal text but does **not** interpret `key:enter` after it: send Enter separately. Plain-text prompts that do not need free-text mode can be sent as `oly send <ID> "task" key:enter`.
-
-## Observe, decide, act
-
-```sh
-oly logs <ID> --tail 40 --wait prompt --timeout 5m
-oly logs <ID> --screen                  # current TUI, not a completion signal; pass --color always to keep ANSI in pipes
-oly info <ID> --json                    # exact session metadata and child exit code
-oly ls --json                           # status, node, attach count
-oly logs <ID> --wait exit --timeout 30s # 0 means ended (even if child failed); 2 means timeout
-```
-
-Read fresh output and the current screen before replying. Startup/builds can leave the screen blank temporarily; idle or `input_needed` is a hint, not proof of completion. `oly send` only confirms bytes reached the PTY: check the next screen/output for the worker's actual response. Avoid rapid key sequences on menus; send a step, observe the redraw, then decide the next step. For long-running work, use bounded waits/cursors from `oly skill` instead of polling a full log repeatedly.
-
-Default logs are always tail 40; TUI inspection needs explicit `--screen`.
-Views are lossy observations, not transcripts. For exact future-byte polling,
-start with `cursor=$(oly logs <ID> --cursor)`, then use `--since "$cursor"
---wait output --json`, decode base64 `.bytes`, and chain `.cursor`; drain while
-`.has_more`. Never combine `--since` with a view flag. Timeout preserves the
-cursor; a restart fails explicitly. See the general oly skill for page limits,
-line-scoped match waits, and sampled-frame semantics.
-
-Multiple attached controllers can type concurrently; the last successful resize
-wins geometry. There is no exclusive controller lease. Use
-`oly attach <ID> --observe` for view-only inspection, and coordinate before
-scripted input.
-
-Answer routine, authorized questions using the task context. **Never auto-approve** destructive actions, credential requests, unexpected network access, broad permission changes, or ambiguous choices; pause and ask the user when authorization is needed. An agent CLI's own approval prompts remain in force even when controlled through oly. If another person has attached, coordinate before sending input (`oly ls --json` exposes `attach_count`). Do not interpret echoed prompts or a message sent to another session as an acknowledgement.
-
-## Finish and hand back
-
-Check the worker's final output **and** observable artifacts (diffs, tests, files) before reporting completion. A stopped session alone is not success, and a still-running interactive agent may have finished its task but be waiting at a prompt. Report the worker ID, what actually changed, checks and failures, and any unfinished work. Gracefully exit or stop only sessions you started and no longer need; verify their status and child exit code before assuming a Ctrl+C closed them. Closing your client does not kill a worker, but daemon stop/crash or host reboot ends its live PTY; `restart` is a new run, not recovery of the worker's internal conversation. Do not stop the shared daemon or `oly rm` sessions just to clean up.
-
-If you run inside an oly session, the worker can reach you with `oly send <your-session-id> -- <result>`, where your id is your `$OLY_SESSION_ID` handed to the worker in the task prompt. Prefer watching the worker's durable logs to depending on that message back: delivery/echo is never proof the parent processed it, so require the result in the worker's own log and repeat it in your final answer.
+- **Disjoint write scopes:** Every worker prompt must state: (a) exact objective, (b) **explicit allowed files** (and forbidden files), (c) instruction to stay strictly within `<cwd>` (no parent/`/` filesystem scans), (d) validation command to run, and (e) concise report format. Never let parallel workers edit the same file or run `git reset`/`git checkout`/`git commit` over shared state.
+- **Approval boundaries:** Answer routine, in-scope questions from task context. **Never auto-approve** destructive operations, credential/secret access, unexpected network calls, broad permission escalation, or ambiguous product decisions — pause and ask the user.
+- **Human co-op:** Check `attach_count` in `oly ls --json` before typing into a session a human might be controlling.
+- **Verify observable outcomes:** Neither `input_needed`, `idle`, `program_status: "done"`, echoed input, nor a stopped session proves success. Verify actual diffs (`git diff` / file contents), test results, and child `exit_code` before reporting completion.
+- **Clean up only your own sessions:** Stop interactive workers you started and no longer need (`oly stop <ID> --grace 5`). Retain logs until verification is complete. Never stop the shared daemon (`oly daemon stop` kills all live sessions).
