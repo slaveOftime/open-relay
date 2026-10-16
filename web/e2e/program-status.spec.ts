@@ -117,16 +117,36 @@ for (const mobile of [false, true]) {
 
 // Color regressions are intentionally separate from the SSE lifecycle tests above.
 
+// `lifecycle` becomes the fixture's session status; `lifecycleLabel` is what the
+// status badge renders beside the program badge. They differ for a blocked
+// report: it marks the session input-needed, and the lifecycle badge stays
+// authoritative, so it reads "Input Needed" while the process is still running.
 const colorReports = [
-  { report: { state: 'idle' }, label: 'Idle', lifecycle: 'stopped' },
-  { report: { state: 'working', progress: 42 }, label: 'Working 42%', lifecycle: 'running' },
-  { report: { state: 'done' }, label: 'Task Done', lifecycle: 'stopped' },
+  { report: { state: 'idle' }, label: 'Idle', lifecycle: 'stopped', lifecycleLabel: 'Stopped' },
+  {
+    report: { state: 'working', progress: 42 },
+    label: 'Working 42%',
+    lifecycle: 'running',
+    lifecycleLabel: 'Running',
+  },
+  {
+    report: { state: 'done' },
+    label: 'Task Done',
+    lifecycle: 'stopped',
+    lifecycleLabel: 'Stopped',
+  },
   {
     report: { state: 'blocked', kind: 'permission', progress: 67 },
     label: 'Permission Required 67%',
     lifecycle: 'running',
+    lifecycleLabel: 'Input Needed',
   },
-  { report: { state: 'error' }, label: 'Task Error', lifecycle: 'failed' },
+  {
+    report: { state: 'error' },
+    label: 'Task Error',
+    lifecycle: 'failed',
+    lifecycleLabel: 'Failed',
+  },
 ] as const
 
 type ProgramState = (typeof colorReports)[number]['report']['state']
@@ -263,13 +283,11 @@ async function readBadgeAppearance(badge: Locator, state: ProgramState) {
 async function expectReadableProgramColors(view: Locator) {
   await expect(view.locator('[title^="Agent-reported (OSC 7501)"]')).toHaveCount(5)
   const appearances: Awaited<ReturnType<typeof readBadgeAppearance>>[] = []
-  for (const { report, label, lifecycle } of colorReports) {
+  for (const { report, label, lifecycleLabel } of colorReports) {
     const badge = view.getByText(label, { exact: true })
     await badge.scrollIntoViewIfNeeded()
     await expect(badge).toBeVisible()
     await expect(badge).toHaveAttribute('title', 'Agent-reported (OSC 7501)')
-    const lifecycleLabel =
-      lifecycle === 'running' ? 'Running' : lifecycle === 'failed' ? 'Failed' : 'Stopped'
     await expect(badge.locator('..').getByText(lifecycleLabel, { exact: true })).toBeVisible()
 
     // Wait for finite badge/ancestor transitions and entrance animations, not the
