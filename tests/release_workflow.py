@@ -291,10 +291,22 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )
         for asset, sha in shas.items():
             with self.subTest(asset=asset):
-                # The checksum is rewritten on the line after the matching url.
+                # The checksum is rewritten on the first `sha256` line after
+                # the matching url. `Formula/oly.rb` documents there that its
+                # checksum is generated, so that comment sits directly above
+                # it; the updater tolerates comment lines in between and this
+                # assertion has to allow exactly the same thing. Taking the
+                # first non-comment line keeps it strict: a platform whose
+                # checksum line disappeared must not borrow the next one.
                 lines = updated.splitlines()
                 index = next(i for i, line in enumerate(lines) if f"/{asset}\"" in line)
-                self.assertIn(f'sha256 "{sha}"', lines[index + 1])
+                following = [
+                    line
+                    for line in lines[index + 1 :]
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+                self.assertTrue(following, f"{asset}: nothing follows its url")
+                self.assertIn(f'sha256 "{sha}"', following[0])
         # Exactly the version line plus one checksum line per declared asset.
         before, after = original.splitlines(), updated.splitlines()
         self.assertEqual(len(before), len(after))
